@@ -429,6 +429,39 @@ export async function verifyProgressiveWorkerReportDelivery(
       publishProgressiveWorkerReport(db, executionId, wrongReceipt),
     ).rejects.toThrow("exact durable report");
     expect((await pending())?.sequence).toBe(1);
+    const unrecognizedConflict: typeof fetch = async () =>
+      Response.json(
+        { error: "Remote report cannot forget previously completed cases" },
+        { status: 409 },
+      );
+    expect(
+      await publishProgressiveWorkerReport(
+        db,
+        executionId,
+        unrecognizedConflict,
+      ),
+    ).toEqual({ kind: "quarantined", sequence: 1 });
+    expect(
+      await db.execute(
+        sql`SELECT reason FROM progressive_worker_report_conflicts
+        WHERE sim_job_id=${executionId}::uuid AND sequence=1`,
+      ),
+    ).toEqual([
+      { reason: "Remote report cannot forget previously completed cases" },
+    ]);
+    await db.execute(
+      sql`DELETE FROM progressive_worker_report_conflicts WHERE sim_job_id=${executionId}::uuid AND sequence=1`,
+    );
+    await db.execute(
+      sql`DELETE FROM progressive_worker_reports WHERE sim_job_id=${executionId}::uuid AND sequence=1`,
+    );
+    await capture(reports[0]);
+    expect(
+      await publishNextProgressiveWorkerReport(
+        db,
+        unrecognizedConflict,
+      ),
+    ).toBe(true);
     await db.execute(
       sql`UPDATE sync_api_settings SET upstream_base_url = 'https://changed-fixture.invalid/api/sync/v1' WHERE id = 1`,
     );

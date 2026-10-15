@@ -4,12 +4,19 @@ import type { DB } from "@aerodb/db";
 import type { EngineClient } from "@aerodb/engine-client";
 import { PgDialect } from "drizzle-orm/pg-core";
 
-const hooks = vi.hoisted(() => ({ submit: vi.fn(), observe: vi.fn() }));
+const hooks = vi.hoisted(() => ({
+  submit: vi.fn(),
+  observe: vi.fn(),
+  precalcRecoveries: vi.fn(),
+}));
 vi.mock("../src/progressive-remote-submission", () => ({
   submitProgressiveRemoteJob: hooks.submit,
 }));
 vi.mock("../src/progressive-remote-observation", () => ({
   observeProgressiveRemoteJob: hooks.observe,
+}));
+vi.mock("../src/urans-ladder", () => ({
+  submitRemotePromisePrecalcRecoveries: hooks.precalcRecoveries,
 }));
 vi.mock("../src/engine-backoff", () => ({
   engineBackoffActive: () => false,
@@ -28,6 +35,7 @@ beforeEach(() => {
     "parallel-admission-isolated-fixture-token",
   );
   vi.stubEnv("SWEEPER_ACTIVE_RECONCILE_CONCURRENCY", "4");
+  hooks.precalcRecoveries.mockResolvedValue(false);
 });
 afterEach(() => vi.unstubAllEnvs());
 
@@ -62,8 +70,9 @@ function fixture(reserved = 0, cpuBudget = 4, jobCount = 4) {
         return [{ slots: Math.max(reserved, hooks.submit.mock.calls.length) }];
       if (query.sql.includes("SELECT job.id FROM sim_jobs job")) {
         const limit = Number(query.params.at(-1));
-        expect(limit).toBeGreaterThan(0);
-        expect(limit).toBeLessThanOrEqual(8);
+        expect(limit).toBe(
+          Number(process.env.SWEEPER_ACTIVE_RECONCILE_CONCURRENCY),
+        );
         return jobs.splice(0, limit);
       }
       throw new Error("Unexpected admission query in isolated fixture");

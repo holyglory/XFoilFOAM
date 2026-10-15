@@ -88,18 +88,15 @@ export async function publishProgressiveWorkerReport(
     const body = (await response.json().catch(() => null)) as {
       error?: unknown;
     } | null;
+    const conflictReason = String(body?.error ?? "");
     if (
-      [
-        "Remote report replay changed immutable content",
-        "Final remote execution evidence cannot change after its stop fence",
-        "An acknowledged stopped remote execution cannot resume",
-      ].includes(String(body?.error)) &&
+      conflictReason &&
       (await quarantineProgressiveWorkerReportConflict(db, {
         executionId,
         solverId: String(owned.solver_id),
         sequence: pending.sequence,
         contentSignature: pending.contentSignature,
-        reason: String(body?.error),
+        reason: conflictReason,
       }))
     )
       return { kind: "quarantined", sequence: pending.sequence };
@@ -138,15 +135,12 @@ export async function publishNextProgressiveWorkerReport(
 ): Promise<boolean> {
   const [pending] = await db.execute(progressivePublicationSelectionSql());
   if (!pending) return false;
-  return (
-    (
-      await publishProgressiveWorkerReport(
-        db,
-        String(pending.sim_job_id),
-        fetcher,
-      )
-    ).kind === "published"
+  const result = await publishProgressiveWorkerReport(
+    db,
+    String(pending.sim_job_id),
+    fetcher,
   );
+  return result.kind === "published" || result.kind === "quarantined";
 }
 
 export async function publishProgressiveWorkerReports(
