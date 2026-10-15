@@ -78,6 +78,7 @@ export async function admitProgressiveCfdBatch(
         allowPhysicalTime:
           input.uransRecoveryVersion ===
           REQUIRED_PRECALC_EVIDENCE_RECOVERY_VERSION,
+        campaignLockMode: "skip",
       });
       if (!leases.length) return null;
       const composed = await composeProgressiveCfdJob(connection, leases, {
