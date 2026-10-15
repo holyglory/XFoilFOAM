@@ -62,12 +62,9 @@ def test_docker_command_always_removes_its_exact_owned_container(monkeypatch, tm
     assert len(operations) == (2 if failure == "allocation" else 3)
     if failure != "allocation":
         assert operations[1] == ["docker", "start", "--attach", name]
-    assert "com.docker.compose.project=" in operations[0]
-    assert "com.docker.compose.service=" in operations[0]
-    assert "com.docker.compose.oneoff=true" in operations[0]
-    assert "com.docker.compose.project=" in operations[0]
-    assert "com.docker.compose.service=" in operations[0]
-    assert "com.docker.compose.oneoff=true" in operations[0]
+    assert operations[0].count("com.docker.compose.project=") == 1
+    assert operations[0].count("com.docker.compose.service=") == 1
+    assert operations[0].count("com.docker.compose.oneoff=true") == 1
 
 
 @pytest.mark.parametrize("remaining_code,remaining_ids", [(0, "still-running"), (1, "")])
