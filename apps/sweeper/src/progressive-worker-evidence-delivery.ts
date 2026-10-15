@@ -119,6 +119,7 @@ export async function deliverNextProgressiveWorkerEvidence(
   let importConflictIds: string[] = [];
   let stoppedStorage = false;
   let retryStoppedStorage = false;
+  let rejected: { code?: unknown; error?: unknown } | null = null;
   try {
     await assertProgressiveWorkerEvidenceJob(db, {
       simJobId: executionId,
@@ -194,7 +195,6 @@ export async function deliverNextProgressiveWorkerEvidence(
           body: requestBody,
         },
       );
-    let rejected: { code?: unknown; error?: unknown } | null = null;
     let response = await post("polars");
     responseStatus = response.status;
     if (!response.ok) {
@@ -278,13 +278,21 @@ export async function deliverNextProgressiveWorkerEvidence(
     });
     return true;
   } catch (error) {
+    const responseFailureText = [rejected?.code, rejected?.error]
+      .filter((value) => value !== undefined && value !== null)
+      .map((value) => String(value))
+      .join(" ");
     const transientTransportFailure =
       error instanceof Error &&
       (error.name === "AbortError" ||
         /aborted|timeout|timed out/i.test(error.message));
+    const transientResponseFailure = /aborted|timeout|timed out/i.test(
+      responseFailureText,
+    );
     const conflict =
       ((responseStatus === 409 && !retryStoppedStorage) &&
-        !transientTransportFailure) ||
+        !transientTransportFailure &&
+        !transientResponseFailure) ||
       importConflictIds.length > 0;
     await db.execute(sql`
       INSERT INTO progressive_worker_delivery_failures
