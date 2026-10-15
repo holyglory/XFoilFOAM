@@ -182,7 +182,7 @@ export async function prepareProgressiveRemoteDispatch(
         allowPhysicalTime:
           capabilities.uransRecoveryVersion ===
           REQUIRED_PRECALC_EVIDENCE_RECOVERY_VERSION,
-        campaignLockMode: "wait",
+        campaignLockMode: "skip",
       });
       if (!leases.length)
         throw new RemoteProgressiveAdmissionWait(
