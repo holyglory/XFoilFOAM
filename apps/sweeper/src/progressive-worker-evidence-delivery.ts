@@ -294,7 +294,8 @@ export async function deliverNextProgressiveWorkerEvidence(
       responseFailureText,
     );
     const conflict =
-      ((responseStatus === 409 && !retryStoppedStorage) &&
+      (responseStatus === 409 &&
+        !retryStoppedStorage &&
         !transientTransportFailure &&
         !transientResponseFailure) ||
       importConflictIds.length > 0;

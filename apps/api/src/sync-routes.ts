@@ -5643,67 +5643,88 @@ export async function importPolarPush(
     });
   }
 
-  // Classify staged attempts, promote eligible exact generations, then reload
-  // canonical evidence and rebuild result classification + fit under one
-  // compatibility/revision lock and one transaction. Readers observe either
-  // the old complete generation or the new complete generation.
-  await refreshPolarCacheForRevision(db, airfoilId, revisionId, {
-    afterAttemptClassifications: async (tx) => {
-      const publishableProgressive = await assertProgressivePolarImportScope(
-        tx,
-        progressive,
+  const recordProgressiveEvidenceReceipts = async (tx: DB) => {
+    const publishableProgressive = await assertProgressivePolarImportScope(
+      tx,
+      progressive,
+    );
+    for (const committed of committedPoints) {
+      const entry = progressive.get(committed.aoaDeg);
+      if (!entry) continue;
+      if (!publishableProgressive.has(committed.aoaDeg))
+        retentionOnlyProgressive.add(committed.aoaDeg);
+      progressiveEvidenceReceipts.push(
+        await recordProgressiveRemoteEvidenceReceipt(tx, {
+          ...entry.delivery,
+          resultAttemptId: committed.attemptId,
+          storageOnly: entry.storageOnly,
+        }),
       );
-      for (const committed of committedPoints) {
-        const entry = progressive.get(committed.aoaDeg);
-        if (entry) {
-          if (!publishableProgressive.has(committed.aoaDeg))
-            retentionOnlyProgressive.add(committed.aoaDeg);
-          progressiveEvidenceReceipts.push(
-            await recordProgressiveRemoteEvidenceReceipt(tx, {
-              ...entry.delivery,
-              resultAttemptId: committed.attemptId,
-              storageOnly: entry.storageOnly,
-            }),
-          );
-          if (committed.brokeredUploadId)
-            progressiveArchiveReceipts.push(
-              await readProgressiveEvidenceCustodyReceipt(
-                tx,
-                entry.delivery,
-                committed.brokeredUploadId,
+      if (committed.brokeredUploadId)
+        progressiveArchiveReceipts.push(
+          await readProgressiveEvidenceCustodyReceipt(
+            tx,
+            entry.delivery,
+            committed.brokeredUploadId,
+          ),
+        );
+    }
+    return publishableProgressive;
+  };
+  const progressiveEvidenceOnly =
+    !options.stoppedStorageOnly &&
+    progressive.size === payload.results.length &&
+    payload.results.every(
+      (point) =>
+        point.progressiveEvidence &&
+        point.evidenceArtifacts.length === 0 &&
+        point.media.length === 0 &&
+        point.fieldExtents.length === 0 &&
+        !point.forceHistory,
+    );
+
+  if (progressiveEvidenceOnly) {
+    await db.transaction(async (rawTx) => {
+      await recordProgressiveEvidenceReceipts(rawTx as unknown as DB);
+    });
+  } else {
+    // Classify staged attempts, promote eligible exact generations, then reload
+    // canonical evidence and rebuild result classification + fit under one
+    // compatibility/revision lock and one transaction. Readers observe either
+    // the old complete generation or the new complete generation.
+    await refreshPolarCacheForRevision(db, airfoilId, revisionId, {
+      afterAttemptClassifications: async (tx) => {
+        const publishableProgressive =
+          await recordProgressiveEvidenceReceipts(tx);
+        let promotedAny = false;
+        for (const committed of committedPoints) {
+          if (committed.storageOnlyReplay) continue;
+          if (
+            progressive.has(committed.aoaDeg) &&
+            committed.observedCurrentAttemptId === committed.attemptId
+          )
+            continue;
+          if (
+            progressive.has(committed.aoaDeg) &&
+            !publishableProgressive.has(committed.aoaDeg)
+          )
+            continue;
+          const [incomingClass] = await tx
+            .select({ state: resultClassifications.state })
+            .from(resultClassifications)
+            .where(
+              and(
+                eq(resultClassifications.resultAttemptId, committed.attemptId),
+                inArray(resultClassifications.state, ["accepted", "needs_urans"]),
               ),
-            );
-        }
-      }
-      let promotedAny = false;
-      for (const committed of committedPoints) {
-        if (committed.storageOnlyReplay) continue;
-        if (
-          progressive.has(committed.aoaDeg) &&
-          committed.observedCurrentAttemptId === committed.attemptId
-        )
-          continue;
-        if (
-          progressive.has(committed.aoaDeg) &&
-          !publishableProgressive.has(committed.aoaDeg)
-        )
-          continue;
-        const [incomingClass] = await tx
-          .select({ state: resultClassifications.state })
-          .from(resultClassifications)
-          .where(
-            and(
-              eq(resultClassifications.resultAttemptId, committed.attemptId),
-              inArray(resultClassifications.state, ["accepted", "needs_urans"]),
-            ),
-          )
-          .orderBy(
-            sql`CASE ${resultClassifications.state} WHEN 'accepted' THEN 2 ELSE 1 END DESC`,
-            desc(resultClassifications.updatedAt),
-          )
-          .limit(1);
-        if (!incomingClass) continue;
-        const [manifestCheck] = (await tx.execute(sql`
+            )
+            .orderBy(
+              sql`CASE ${resultClassifications.state} WHEN 'accepted' THEN 2 ELSE 1 END DESC`,
+              desc(resultClassifications.updatedAt),
+            )
+            .limit(1);
+          if (!incomingClass) continue;
+          const [manifestCheck] = (await tx.execute(sql`
           SELECT count(*)::int AS total,
                  count(*) FILTER (
                    WHERE sha256 ~ '^[0-9a-fA-F]{64}$'
@@ -5716,75 +5737,75 @@ export async function importPolarPush(
             AND result_attempt_id = ${committed.attemptId}
             AND kind = 'manifest'
         `)) as unknown as Array<{ total: number; valid: number }>;
-        if (manifestCheck?.total !== 1 || manifestCheck.valid !== 1) continue;
+          if (manifestCheck?.total !== 1 || manifestCheck.valid !== 1) continue;
 
-        let currentRank = -1;
-        if (committed.observedCurrentAttemptId) {
-          const [current] = await tx
-            .select({
-              regime: resultAttempts.regime,
-              evidencePayload: resultAttempts.evidencePayload,
-              state: resultClassifications.state,
+          let currentRank = -1;
+          if (committed.observedCurrentAttemptId) {
+            const [current] = await tx
+              .select({
+                regime: resultAttempts.regime,
+                evidencePayload: resultAttempts.evidencePayload,
+                state: resultClassifications.state,
+              })
+              .from(resultAttempts)
+              .innerJoin(
+                resultClassifications,
+                and(
+                  eq(resultClassifications.resultAttemptId, resultAttempts.id),
+                  inArray(resultClassifications.state, [
+                    "accepted",
+                    "needs_urans",
+                  ]),
+                ),
+              )
+              .where(
+                and(
+                  eq(resultAttempts.id, committed.observedCurrentAttemptId),
+                  eq(resultAttempts.resultId, committed.resultId),
+                ),
+              )
+              .orderBy(
+                sql`CASE ${resultClassifications.state} WHEN 'accepted' THEN 2 ELSE 1 END DESC`,
+                desc(resultClassifications.updatedAt),
+              )
+              .limit(1);
+            if (current) {
+              const currentFidelity = nullableText(
+                jsonObject(current.evidencePayload).fidelity,
+              );
+              currentRank = polarEvidencePublicationRank(
+                current.state as "accepted" | "needs_urans",
+                currentFidelity,
+                current.regime,
+              );
+            }
+          }
+          const incomingRank = polarEvidencePublicationRank(
+            incomingClass.state as "accepted" | "needs_urans",
+            committed.fidelity,
+            committed.regime,
+          );
+          if (incomingRank < currentRank) continue;
+          const promoted = await tx
+            .update(results)
+            .set({
+              ...committed.incomingResult,
+              currentResultAttemptId: committed.attemptId,
             })
-            .from(resultAttempts)
-            .innerJoin(
-              resultClassifications,
-              and(
-                eq(resultClassifications.resultAttemptId, resultAttempts.id),
-                inArray(resultClassifications.state, [
-                  "accepted",
-                  "needs_urans",
-                ]),
-              ),
-            )
             .where(
               and(
-                eq(resultAttempts.id, committed.observedCurrentAttemptId),
-                eq(resultAttempts.resultId, committed.resultId),
+                eq(results.id, committed.resultId),
+                sql`${results.currentResultAttemptId} IS NOT DISTINCT FROM ${committed.observedCurrentAttemptId}`,
               ),
             )
-            .orderBy(
-              sql`CASE ${resultClassifications.state} WHEN 'accepted' THEN 2 ELSE 1 END DESC`,
-              desc(resultClassifications.updatedAt),
-            )
-            .limit(1);
-          if (current) {
-            const currentFidelity = nullableText(
-              jsonObject(current.evidencePayload).fidelity,
-            );
-            currentRank = polarEvidencePublicationRank(
-              current.state as "accepted" | "needs_urans",
-              currentFidelity,
-              current.regime,
-            );
-          }
+            .returning({ id: results.id });
+          promotedAny ||= promoted.length === 1;
         }
-        const incomingRank = polarEvidencePublicationRank(
-          incomingClass.state as "accepted" | "needs_urans",
-          committed.fidelity,
-          committed.regime,
-        );
-        if (incomingRank < currentRank) continue;
-        const promoted = await tx
-          .update(results)
-          .set({
-            ...committed.incomingResult,
-            currentResultAttemptId: committed.attemptId,
-          })
-          .where(
-            and(
-              eq(results.id, committed.resultId),
-              sql`${results.currentResultAttemptId} IS NOT DISTINCT FROM ${committed.observedCurrentAttemptId}`,
-            ),
-          )
-          .returning({ id: results.id });
-        promotedAny ||= promoted.length === 1;
-      }
-      if (promotedAny) {
-        // Compatibility aggregation rebuilds after this transaction. Retire
-        // any current aggregate containing the changed revision now, so the
-        // publication gap is empty rather than pointer-B/cache-A.
-        await tx.execute(sql`
+        if (promotedAny) {
+          // Compatibility aggregation rebuilds after this transaction. Retire
+          // any current aggregate containing the changed revision now, so the
+          // publication gap is empty rather than pointer-B/cache-A.
+          await tx.execute(sql`
           UPDATE polar_compatibility_fit_sets fit
           SET is_current = false, "updatedAt" = now()
           WHERE fit.is_current = true
@@ -5796,9 +5817,10 @@ export async function importPolarPush(
                 AND member.simulation_preset_revision_id = ${revisionId}
             )
         `);
-      }
-    },
-  });
+        }
+      },
+    });
+  }
 
   // Imported solver evidence must cross the same campaign/fidelity boundary
   // as locally ingested evidence. In particular, a brokered accepted FAST
