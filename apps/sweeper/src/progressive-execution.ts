@@ -96,13 +96,13 @@ export async function reconcileProgressiveExecutions(
     SELECT job.id FROM sim_jobs job
     JOIN LATERAL (
       SELECT bool_or(attempt.outcome = 'running') AS unsettled,
-        bool_or((unit.active_seconds >= ${progressiveCfdEffectiveBudgetSql(sql`unit`)} AND NOT EXISTS (
+        bool_or(attempt.outcome = 'running' AND (unit.active_seconds >= ${progressiveCfdEffectiveBudgetSql(sql`unit`)} AND NOT EXISTS (
           SELECT 1 FROM progressive_cfd_evidence receipt WHERE receipt.attempt_token = attempt.token AND receipt.budget_guard_exhausted
         ) AND NOT EXISTS (
           SELECT 1 FROM progressive_cfd_runtime_progress runtime WHERE runtime.attempt_token = attempt.token AND runtime.engine_job_id = job.engine_job_id
-        )) OR NOT epoch.current
+        )) OR (attempt.outcome = 'running' AND (NOT epoch.current
           OR generation.status <> 'active' OR generation.plan_revision_id IS DISTINCT FROM campaign.current_plan_revision_id
-          OR campaign.status NOT IN ('active', 'attention', 'paused')) AS stop_required
+          OR campaign.status NOT IN ('active', 'attention', 'paused')))) AS stop_required
       FROM progressive_cfd_attempts attempt JOIN progressive_cfd_units unit ON unit.id = attempt.unit_id
       JOIN progressive_work work ON work.id = unit.work_id
       JOIN progressive_generations generation ON generation.id = work.generation_id

@@ -5714,6 +5714,34 @@ describe("progressive execution stop and settlement", () => {
     expect(cancelJob).not.toHaveBeenCalled();
   });
 
+  it("does not poll the engine for a stop proof after every attempt is terminal", async () => {
+    const fixture = await fitFixture();
+    await db
+      .update(simJobs)
+      .set({ status: "cancelled", engineState: "cancelled" })
+      .where(eq(simJobs.id, fixture.composed.jobId));
+    await db.execute(sql`
+      UPDATE progressive_cfd_attempts
+      SET outcome = 'cancelled', finished_at = clock_timestamp()
+      WHERE sim_job_id = ${fixture.composed.jobId}::uuid
+    `);
+    await db.execute(sql`
+      UPDATE progressive_cfd_units unit
+      SET state = 'gap', lease_token = NULL, lease_owner = NULL, lease_until = NULL
+      FROM progressive_cfd_attempts attempt
+      WHERE attempt.unit_id = unit.id
+        AND attempt.sim_job_id = ${fixture.composed.jobId}::uuid
+    `);
+    const engine = { cancelJob: vi.fn(), getExecutionStopProof: vi.fn() };
+    expect(
+      await reconcileProgressiveExecutions(db, engine, {
+        jobIds: [fixture.composed.jobId],
+      }),
+    ).toMatchObject({ inspected: 0, errors: [] });
+    expect(engine.cancelJob).not.toHaveBeenCalled();
+    expect(engine.getExecutionStopProof).not.toHaveBeenCalled();
+  });
+
   it.each(["estimate", "accepted", "exclude", "superseded"] as const)(
     "requires accepted evidence rather than a fitted curve to complete precise work (%s)",
     async (mode) => {

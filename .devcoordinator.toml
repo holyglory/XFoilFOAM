@@ -2213,6 +2213,12 @@ requires = ["dependencies", "types", "remote-execution-contract"]
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "progressive remote dispatch"]
 
 [[test.progressive.check]]
+name = "terminal-stop-guard"
+tier = "development"
+requires = ["dependencies", "types"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "does not poll the engine for a stop proof after every attempt is terminal"]
+
+[[test.progressive.check]]
 name = "remote-capabilities"
 tier = "development"
 requires = ["types"]
