@@ -1923,6 +1923,22 @@ async function renewMirroredPromiseLeases(
           OR ${syncSweepPromises.lastHeartbeatAt} <= now() - (${intervalMs}::double precision * interval '1 millisecond')
           OR ${syncSweepPromises.expiresAt} <= now() + (${intervalMs * 2}::double precision * interval '1 millisecond')
         )`,
+        sql`(
+          NOT EXISTS (
+            SELECT 1 FROM sim_jobs assigned_job
+            WHERE assigned_job.request_payload->>'syncPromiseId' = ${syncSweepPromises.id}::text
+              AND assigned_job.request_payload ? 'remoteProgressiveExecution'
+          )
+          OR EXISTS (
+            SELECT 1 FROM sim_jobs live_job
+            WHERE live_job.request_payload->>'syncPromiseId' = ${syncSweepPromises.id}::text
+              AND live_job.request_payload ? 'remoteProgressiveExecution'
+              AND (
+                live_job.status IN ('pending', 'submitted', 'running')
+                OR (live_job.status = 'ingesting' AND live_job.engine_state NOT IN ('completed', 'failed', 'cancelled'))
+              )
+          )
+        )`,
       ),
     )
     .orderBy(syncSweepPromises.expiresAt, syncSweepPromises.id)
