@@ -174,6 +174,15 @@ export async function prepareProgressiveRemoteDispatch(
         throw new RemoteProgressiveAdmissionWait(
           "The worker has no unreserved CPU slots",
         );
+      const [admissionGate] = await connection.execute(sql`
+        SELECT pg_try_advisory_xact_lock(
+          hashtextextended('progressive-cfd-admission', 0)
+        ) AS acquired
+      `);
+      if (!admissionGate?.acquired)
+        throw new RemoteProgressiveAdmissionWait(
+          "Progressive admission is busy with another campaign maintenance pass",
+        );
       admissionPhase = "claim";
       const leases = await claimProgressiveCfdBatch(connection, {
         owner: `remote-progressive-${solverId}`,
