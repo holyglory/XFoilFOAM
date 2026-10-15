@@ -35,6 +35,7 @@ beforeEach(() => {
     "parallel-admission-isolated-fixture-token",
   );
   vi.stubEnv("SWEEPER_ACTIVE_RECONCILE_CONCURRENCY", "4");
+  vi.stubEnv("SWEEPER_REMOTE_MAX_ADMISSIONS_PER_TICK", "");
   hooks.precalcRecoveries.mockResolvedValue(false);
 });
 afterEach(() => vi.unstubAllEnvs());
@@ -51,6 +52,8 @@ function fixture(reserved = 0, cpuBudget = 4, jobCount = 4) {
   const jobs = Array.from({ length: jobCount }, () => ({ id: randomUUID() }));
   const expectedIds = jobs.map((job) => job.id);
   const updates: Record<string, unknown>[] = [];
+  const assignmentLimits: number[] = [];
+  const reservedSnapshots: number[] = [];
   const dialect = new PgDialect();
   const db = {
     select: () => ({
@@ -66,19 +69,33 @@ function fixture(reserved = 0, cpuBudget = 4, jobCount = 4) {
       const query = dialect.sqlToQuery(
         statement as Parameters<PgDialect["sqlToQuery"]>[0],
       );
-      if (query.sql.includes("SUM(GREATEST(job.admission_cpu_slots"))
-        return [{ slots: Math.max(reserved, hooks.submit.mock.calls.length) }];
+      if (query.sql.includes("SUM(GREATEST(job.admission_cpu_slots")) {
+        const slots = Math.max(reserved, hooks.submit.mock.calls.length);
+        reservedSnapshots.push(slots);
+        return [{ slots }];
+      }
       if (query.sql.includes("SELECT job.id FROM sim_jobs job")) {
         const limit = Number(query.params.at(-1));
         expect(limit).toBe(
           Number(process.env.SWEEPER_ACTIVE_RECONCILE_CONCURRENCY),
+        );
+        assignmentLimits.push(limit);
+        expect(limit).toBeLessThanOrEqual(
+          cpuBudget - Math.max(reserved, hooks.submit.mock.calls.length),
         );
         return jobs.splice(0, limit);
       }
       throw new Error("Unexpected admission query in isolated fixture");
     },
   } as unknown as DB;
-  return { db, expectedIds, updates, engine: {} as EngineClient };
+  return {
+    db,
+    expectedIds,
+    updates,
+    assignmentLimits,
+    reservedSnapshots,
+    engine: {} as EngineClient,
+  };
 }
 
 it("starts independent authorization requests without waiting for the first slow response", async () => {
@@ -149,6 +166,25 @@ it("retains full-capacity and safety holds before issuing any request", async ()
   expect(hooks.submit).not.toHaveBeenCalled();
 });
 
+it("does not exceed remote capacity while filling assignment batches", async () => {
+  const scope = fixture(0, 8, 12);
+  hooks.submit.mockResolvedValue({ kind: "submitted" });
+
+  expect(
+    await admitRemoteSolverTick(scope.db, scope.engine, {
+      kind: "allow",
+      meshRecoveryVersion: 1,
+    }),
+  ).toBe(true);
+  expect(scope.assignmentLimits).toEqual([4, 4]);
+  expect(scope.reservedSnapshots).toEqual([0, 4, 8]);
+  expect(hooks.submit).toHaveBeenCalledTimes(8);
+  expect(hooks.submit.mock.calls.map((call) => call[2])).toEqual(
+    scope.expectedIds.slice(0, 8),
+  );
+  expect(Math.max(...scope.reservedSnapshots)).toBeLessThanOrEqual(8);
+});
+
 it("queues rejected starts without waiting for a blocked stop endpoint or claiming stop proof", async () => {
   const scope = fixture();
   hooks.submit.mockResolvedValue({
@@ -189,4 +225,22 @@ it("continues past stale assignment cleanup to reach later fresh assignments", a
   expect(
     scope.updates.filter((update) => update.engineState === "cancel_pending"),
   ).toHaveLength(20);
+});
+
+it("applies the default per-tick admission bound across assignment batches", async () => {
+  const scope = fixture(0, 64, 40);
+  hooks.submit.mockResolvedValue({ kind: "submitted" });
+
+  expect(
+    await admitRemoteSolverTick(scope.db, scope.engine, {
+      kind: "allow",
+      meshRecoveryVersion: 1,
+    }),
+  ).toBe(true);
+  expect(scope.assignmentLimits).toEqual(Array(8).fill(4));
+  expect(hooks.submit).toHaveBeenCalledTimes(32);
+  expect(hooks.submit.mock.calls.map((call) => call[2])).toEqual(
+    scope.expectedIds.slice(0, 32),
+  );
+  expect(Math.max(...scope.reservedSnapshots)).toBeLessThanOrEqual(64);
 });
