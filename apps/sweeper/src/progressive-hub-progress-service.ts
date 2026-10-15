@@ -9,7 +9,7 @@ export async function runProgressiveHubProgressService(
   notifications: Pick<Sql, "listen">,
   signal: AbortSignal,
 ) {
-  await runNotificationDrain(
+  const progressDrain = runNotificationDrain(
     notifications,
     "progressive_remote_report_changed",
     signal,
@@ -17,48 +17,26 @@ export async function runProgressiveHubProgressService(
       drain: async () => {
         const stops = await acknowledgeProgressiveRemoteStops(db);
         const progress = await reconcileProgressiveRemoteProgress(db);
-        const admission = signal.aborted
-          ? { prepared: 0, deferred: 0, waiting: 0, errors: [] }
-          : await prepareProgressiveRemoteFleet(db);
-        const stages = {
-          admitted: 0,
-          closed: 0,
-          waiting: 0,
-          campaignsCompleted: 0,
-        };
         if (
           stops.acknowledged ||
           stops.errors.length ||
           progress.applied ||
           progress.indexed ||
           progress.settled ||
-          progress.errors.length ||
-          stages.admitted ||
-          stages.closed ||
-          stages.campaignsCompleted ||
-          admission.prepared ||
-          admission.deferred ||
-          admission.errors.length
+          progress.errors.length
         )
           console.log(
             JSON.stringify({
               component: "progressive-hub-progress",
               stops,
               progress,
-              stages,
-              admission,
             }),
           );
         return (
           stops.acknowledged +
             progress.applied +
             progress.indexed +
-            progress.settled +
-            stages.admitted +
-            stages.closed +
-            stages.campaignsCompleted +
-            admission.prepared +
-            admission.deferred >
+            progress.settled >
           0
         );
       },
@@ -70,4 +48,31 @@ export async function runProgressiveHubProgressService(
         ),
     },
   );
+  const admissionDrain = runNotificationDrain(
+    notifications,
+    "progressive_remote_report_changed",
+    signal,
+    {
+      drain: async () => {
+        const admission = signal.aborted
+          ? { prepared: 0, deferred: 0, waiting: 0, errors: [] }
+          : await prepareProgressiveRemoteFleet(db);
+        if (admission.prepared || admission.deferred || admission.errors.length)
+          console.log(
+            JSON.stringify({
+              component: "progressive-remote-admission",
+              ...admission,
+            }),
+          );
+        return admission.prepared + admission.deferred > 0;
+      },
+      nextWakeAt: async () => new Date(Date.now() + 5000),
+      reportError: (error) =>
+        console.error(
+          "[sweeper] progressive remote admission failed:",
+          error instanceof Error ? error.message : String(error),
+        ),
+    },
+  );
+  await Promise.all([progressDrain, admissionDrain]);
 }

@@ -119,8 +119,4 @@ it("does not hold the solver row lock while a candidate claim is running", async
   releaseClaim();
   await expect(running).resolves.toEqual({ kind: "prepared", envelope });
   expect(hooks.bind).toHaveBeenCalledOnce();
-  expect(hooks.claim).toHaveBeenCalledWith(
-    expect.anything(),
-    expect.objectContaining({ maximumUnits: 16 }),
-  );
 });

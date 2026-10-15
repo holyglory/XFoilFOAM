@@ -30,11 +30,11 @@ function fixture() {
     waitingReasons: [],
     errors: [],
   });
-  let notify = () => {};
+  const listeners: Array<() => void> = [];
   const unlisten = vi.fn(async () => {});
   const notifications = {
     listen: vi.fn(async (_name: string, callback: () => void) => {
-      notify = callback;
+      listeners.push(callback);
       return { unlisten };
     }),
   } as unknown as Pick<Sql, "listen">;
@@ -53,7 +53,12 @@ function fixture() {
     waiting: 1,
     errors: [],
   });
-  return { db, notifications, unlisten, notify: () => notify() };
+  return {
+    db,
+    notifications,
+    unlisten,
+    notify: () => listeners.forEach((listener) => listener()),
+  };
 }
 
 it("releases exact stop receipts before replay and drains available ordered reports without controller ticks", async () => {
@@ -103,22 +108,19 @@ it("releases exact stop receipts before replay and drains available ordered repo
     owner.signal,
   );
   await vi.advanceTimersByTimeAsync(0);
-  expect(order).toEqual([
-    "stop",
-    "progress",
-    "admission",
-    "stop",
-    "progress",
-    "admission",
-  ]);
+  expect(order).toEqual(
+    expect.arrayContaining(["stop", "progress", "admission"]),
+  );
+  expect(order.indexOf("stop")).toBeLessThan(order.indexOf("progress"));
+  expect(order.filter((entry) => entry === "admission")).toHaveLength(1);
   await vi.advanceTimersByTimeAsync(4999);
-  expect(order).toHaveLength(6);
+  expect(order).toHaveLength(5);
   scope.notify();
   await vi.advanceTimersByTimeAsync(0);
-  expect(order).toHaveLength(9);
+  expect(order).toHaveLength(8);
   owner.abort();
   await running;
-  expect(scope.unlisten).toHaveBeenCalledOnce();
+  expect(scope.unlisten).toHaveBeenCalledTimes(2);
 });
 
 it("keeps the remote admission service independent of stage bookkeeping", async () => {
@@ -135,7 +137,7 @@ it("keeps the remote admission service independent of stage bookkeeping", async 
   expect(prepareProgressiveRemoteFleet).toHaveBeenCalledTimes(2);
   owner.abort();
   await running;
-  expect(scope.unlisten).toHaveBeenCalledOnce();
+  expect(scope.unlisten).toHaveBeenCalledTimes(2);
 });
 
 it("retains notifications and drains an in-flight acknowledgement on shutdown", async () => {
@@ -164,9 +166,9 @@ it("retains notifications and drains an in-flight acknowledgement on shutdown", 
   expect(acknowledgeProgressiveRemoteStops).toHaveBeenCalledOnce();
   release();
   await running;
-  expect(scope.unlisten).toHaveBeenCalledOnce();
+  expect(scope.unlisten).toHaveBeenCalledTimes(2);
   expect(finished).toBe(true);
-  expect(prepareProgressiveRemoteFleet).not.toHaveBeenCalled();
+  expect(prepareProgressiveRemoteFleet).toHaveBeenCalledOnce();
 });
 
 it("keeps filling available assignments without waiting for another controller tick", async () => {
@@ -213,5 +215,49 @@ it("continues after deferring an owned target, then sleeps when no further progr
   expect(prepareProgressiveRemoteFleet).toHaveBeenCalledTimes(2);
   owner.abort();
   await running;
-  expect(scope.unlisten).toHaveBeenCalledOnce();
+  expect(scope.unlisten).toHaveBeenCalledTimes(2);
+});
+
+it("applies new reports while an assignment refill is still pending and waits for it on shutdown", async () => {
+  const scope = fixture();
+  let release!: () => void;
+  vi.mocked(prepareProgressiveRemoteFleet).mockImplementation(
+    () =>
+      new Promise((resolve) => {
+        release = () =>
+          resolve({
+            prepared: 0,
+            deferred: 0,
+            waiting: 1,
+            waitingReasons: [],
+            errors: [],
+          });
+      }),
+  );
+  const owner = new AbortController();
+  let finished = false;
+  const running = runProgressiveHubProgressService(
+    scope.db,
+    scope.notifications,
+    owner.signal,
+  ).then(() => {
+    finished = true;
+  });
+  try {
+    await vi.advanceTimersByTimeAsync(0);
+    expect(prepareProgressiveRemoteFleet).toHaveBeenCalledOnce();
+    expect(reconcileProgressiveRemoteProgress).toHaveBeenCalledOnce();
+    scope.notify();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(reconcileProgressiveRemoteProgress).toHaveBeenCalledTimes(2);
+    expect(prepareProgressiveRemoteFleet).toHaveBeenCalledOnce();
+    owner.abort();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(finished).toBe(false);
+  } finally {
+    owner.abort();
+    release();
+    await running;
+  }
+  expect(finished).toBe(true);
 });

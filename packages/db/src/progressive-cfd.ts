@@ -257,7 +257,9 @@ export async function claimProgressiveCfdUnit(
     const effectiveRecipe = sql`coalesce((SELECT recovery.recipe FROM progressive_cfd_recovery_plans recovery WHERE recovery.unit_id = unit.id ORDER BY recovery.ordinal DESC LIMIT 1),
       (SELECT ${localStepRecipeSql(sql`unit.recipe`, sql`policy.smoothing`)} FROM campaign_local_step_policies policy WHERE policy.id=(${localStepPolicy})), unit.recipe)`;
     const effectiveBudget = progressiveCfdEffectiveBudgetSql(sql`unit`);
-    const pendingBudgetExtension = progressiveCfdBudgetExtensionPendingSql(sql`unit`);
+    const pendingBudgetExtension = progressiveCfdBudgetExtensionPendingSql(
+      sql`unit`,
+    );
     const recoveryParent = sql`(SELECT recovery.parent_job_id FROM progressive_cfd_recovery_plans recovery WHERE recovery.unit_id = unit.id ORDER BY recovery.ordinal DESC LIMIT 1)`;
     const remoteOwner = input.remoteSolverId
       ? sql`EXISTS (SELECT 1 FROM registered_remote_solvers solver
@@ -511,7 +513,9 @@ export async function claimProgressiveCfdUnit(
         RETURNING unit_id
       `);
       if (!claimedExtension)
-        throw new Error("Progressive budget extension was claimed by another attempt");
+        throw new Error(
+          "Progressive budget extension was claimed by another attempt",
+        );
     }
     if (unit.recovery_plan_id)
       await connection.execute(sql`
@@ -675,7 +679,10 @@ export async function heartbeatProgressiveCfdUnit(
       throw new Error("Measured active solver time cannot decrease");
     const total =
       Number(unit.active_seconds) + input.attemptActiveSeconds - previous;
-    const remaining = Math.max(0, Number(unit.effective_budget_seconds) - total);
+    const remaining = Math.max(
+      0,
+      Number(unit.effective_budget_seconds) - total,
+    );
     await connection.execute(sql`
       UPDATE progressive_cfd_attempts SET active_seconds = ${input.attemptActiveSeconds},
         lease_until = clock_timestamp() + ${input.leaseSeconds} * interval '1 second' WHERE token = ${lease.token}

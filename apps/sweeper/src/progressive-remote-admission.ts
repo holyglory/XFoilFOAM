@@ -173,7 +173,6 @@ export async function prepareProgressiveRemoteDispatch(
       const leases = await claimProgressiveCfdBatch(connection, {
         owner: `remote-progressive-${solverId}`,
         remoteSolverId: solverId,
-        maximumUnits: 16,
         leaseSeconds: PROGRESSIVE_REMOTE_START_LEASE_SECONDS,
         requireSweeperEnabled: true,
         solverBudgetVersion: 2,
@@ -300,7 +299,8 @@ async function prepareProgressiveRemoteFleetRun(db: DB) {
       receipt.waiting += 1;
       receipt.waitingReasons.push({
         solverId: String(solver.id),
-        reason: "Remote report reconciliation backlog is throttling new admissions",
+        reason:
+          "Remote report reconciliation backlog is throttling new admissions",
       });
     }
     return receipt;
