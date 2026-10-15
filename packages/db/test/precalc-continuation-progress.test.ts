@@ -1309,6 +1309,13 @@ describe("cross-segment preliminary URANS progress", () => {
             resultAttemptId: attempt.id,
           }),
         ]);
+        await db
+          .update(simPrecalcObligations)
+          .set({ lastOutcome: "continuation_fresh_retry_pending" })
+          .where(eq(simPrecalcObligations.id, obligation.id));
+        expect(
+          await precalcCheckpointCandidatesForObligations(db, [obligation.id]),
+        ).toEqual([]);
       }
 
       await db

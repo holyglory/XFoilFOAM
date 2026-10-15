@@ -3435,7 +3435,8 @@ export async function precalcCheckpointCandidatesForObligations(
       AND COALESCE(obligation.last_outcome, '') NOT IN (
         'aperiodic_contract_retry_pending',
         'numerical_recovery_pending',
-        'fresh_physical_retry_pending'
+        'fresh_physical_retry_pending',
+        'continuation_fresh_retry_pending'
       )
       AND obligation.continuation_no_progress_count <
         ${MAX_PRECALC_NO_PROGRESS_SEGMENTS}
