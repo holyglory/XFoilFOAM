@@ -113,6 +113,7 @@ export async function clearHubWorkerPayloadFields(
         )
       ORDER BY job."updatedAt", job.id
       LIMIT ${limit}
+      FOR UPDATE OF job SKIP LOCKED
     )
     UPDATE sim_jobs job
     SET request_payload = request_payload
