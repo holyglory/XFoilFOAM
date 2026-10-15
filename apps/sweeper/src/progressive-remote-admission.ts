@@ -360,6 +360,7 @@ async function prepareProgressiveRemoteFleetRun(db: DB) {
       prepared: receipt.prepared,
       deferred: receipt.deferred,
       waiting: receipt.waiting,
+      waitingReasons: receipt.waitingReasons.slice(0, 4),
       errors: receipt.errors.length,
     }),
   );
