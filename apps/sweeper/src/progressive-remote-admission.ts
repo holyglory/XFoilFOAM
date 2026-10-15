@@ -89,9 +89,11 @@ export async function prepareProgressiveRemoteDispatch(
     throw new Error(
       "Remote admission requires an exact registered solver identity",
     );
+  let admissionPhase = "start";
   try {
     return await db.transaction(async (transaction) => {
       const connection = transaction as unknown as DB;
+      admissionPhase = "transaction setup";
       await connection.execute(
         sql`SET LOCAL lock_timeout = '2s'; SET LOCAL statement_timeout = '3s'`,
       );
@@ -172,6 +174,7 @@ export async function prepareProgressiveRemoteDispatch(
         throw new RemoteProgressiveAdmissionWait(
           "The worker has no unreserved CPU slots",
         );
+      admissionPhase = "claim";
       const leases = await claimProgressiveCfdBatch(connection, {
         owner: `remote-progressive-${solverId}`,
         remoteSolverId: solverId,
@@ -188,6 +191,7 @@ export async function prepareProgressiveRemoteDispatch(
         throw new RemoteProgressiveAdmissionWait(
           "No eligible campaign cases are ready",
         );
+      admissionPhase = "compose";
       const composed = await composeProgressiveCfdJob(connection, leases, {
         cpuSlots: available,
         meshRecoveryVersion: capabilities.meshRecoveryVersion,
@@ -221,6 +225,7 @@ export async function prepareProgressiveRemoteDispatch(
           INSERT INTO sync_sweep_promise_points (promise_id, airfoil_id, simulation_preset_revision_id, aoa_deg)
           VALUES (${promiseId}::uuid, ${job.airfoil_id}::uuid, ${job.simulation_preset_revision_id}::uuid, ${lease.alpha})
         `);
+      admissionPhase = "bind";
       const bound = await bindProgressiveRemoteDispatch(connection, {
         simJobId: composed.jobId,
         promiseId,
@@ -244,7 +249,7 @@ export async function prepareProgressiveRemoteDispatch(
     )
       return {
         kind: "waiting",
-        reason: "Campaign admission is waiting for a short-lived database lock",
+        reason: `Campaign admission is waiting for a short-lived database lock during ${admissionPhase}`,
       };
     throw error;
   }
