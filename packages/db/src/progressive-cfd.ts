@@ -209,7 +209,7 @@ export async function claimProgressiveCfdUnit(
     solverBudgetVersion?: number | null;
     localTimeStepVersion?: number | null;
     remoteSolverId?: string;
-    campaignLockMode?: "skip" | "wait";
+    campaignLockMode?: "skip" | "wait" | "none";
     sameTarget?: {
       generationId: string;
       targetId: string;
@@ -359,7 +359,8 @@ export async function claimProgressiveCfdUnit(
           AND unit.state = 'pending' AND ${attemptAvailable} AND unit.active_seconds < ${effectiveBudget}
           AND (unit.retry_after IS NULL OR unit.retry_after <= clock_timestamp())
       )
-      ORDER BY campaign.priority DESC, campaign."createdAt", campaign.id LIMIT 1 FOR UPDATE ${input.campaignLockMode === "wait" ? sql`` : sql`SKIP LOCKED`}
+      ORDER BY campaign.priority DESC, campaign."createdAt", campaign.id LIMIT 1
+        ${input.campaignLockMode === "wait" ? sql`FOR UPDATE` : input.campaignLockMode === "none" ? sql`` : sql`FOR UPDATE SKIP LOCKED`}
     `);
     if (!campaign) return null;
     const cohortReadiness = campaign.all_stage3
@@ -496,11 +497,23 @@ export async function claimProgressiveCfdUnit(
     const enabledGuard = input.requireSweeperEnabled
       ? sql`AND EXISTS (SELECT 1 FROM sweeper_state WHERE id = 1 AND enabled)`
       : sql``;
+    const campaignGuard = sql`AND EXISTS (
+      SELECT 1
+      FROM progressive_work selected_work
+      JOIN progressive_generations selected_generation
+        ON selected_generation.id = selected_work.generation_id
+      JOIN sim_campaigns selected_campaign
+        ON selected_campaign.id = selected_generation.campaign_id
+      WHERE selected_work.id = progressive_cfd_units.work_id
+        AND selected_generation.status = 'active'
+        AND selected_generation.plan_revision_id = selected_campaign.current_plan_revision_id
+        AND selected_campaign.status IN ('active', 'attention', 'paused')
+    )`;
     const [leased] = await connection.execute(sql`
       UPDATE progressive_cfd_units SET state = 'leased', lease_token = ${token}, lease_owner = ${input.owner},
         lease_until = clock_timestamp() + ${input.leaseSeconds} * interval '1 second', attempts = attempts + 1,
         error = CASE WHEN retry_after IS NOT NULL THEN NULL ELSE error END, retry_after = NULL
-      WHERE id = ${unit.id} ${enabledGuard}
+      WHERE id = ${unit.id} ${enabledGuard} ${campaignGuard}
       RETURNING id
     `);
     if (!leased) return null;
@@ -576,7 +589,7 @@ export async function claimProgressiveCfdBatch(
     solverBudgetVersion?: number | null;
     localTimeStepVersion?: number | null;
     remoteSolverId?: string;
-    campaignLockMode?: "skip" | "wait";
+    campaignLockMode?: "skip" | "wait" | "none";
   },
 ): Promise<ProgressiveCfdLease[]> {
   return db.transaction(async (transaction) => {
