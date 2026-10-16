@@ -74,7 +74,7 @@ export function progressiveStagingSelectionSql(preferActive: boolean) {
       AND NOT EXISTS (SELECT 1 FROM progressive_worker_evidence_receipts receipt
         WHERE receipt.sim_job_id = report.sim_job_id AND receipt.sequence = report.sequence)
     ORDER BY CASE WHEN report.stopped_engine_job_id = report.sim_job_id::text THEN 0 ELSE 1 END,
-      report.created_at DESC, report.sim_job_id DESC, report.sequence DESC
+      report.created_at, report.sim_job_id, report.sequence
     LIMIT 1`;
   const candidate = (
     active: boolean,
