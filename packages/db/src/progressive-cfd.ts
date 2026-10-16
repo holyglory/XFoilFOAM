@@ -314,6 +314,7 @@ export async function claimProgressiveCfdUnit(
       WHERE previous_work.target_id = work.target_id
         AND previous_generation.campaign_id = generation.campaign_id
         AND previous_generation.id <> generation.id
+        AND previous_generation.status IN ('active', 'attention', 'paused')
         AND generation.epoch_id = ${epoch.id} AND generation.status = 'active'
         AND NOT EXISTS (SELECT 1 FROM progressive_cfd_execution_stops stopped
           WHERE stopped.sim_job_id = previous_job.id AND stopped.engine_job_id = previous_job.engine_job_id)
