@@ -254,73 +254,47 @@ export async function reconcileProgressiveRemoteProgress(
     sim_job_id: string;
     campaign_id: string;
   }>;
-  const jobsByCampaign = new Map<
-    string,
-    Array<(typeof selectedJobs)[number]>
-  >();
-  for (const job of selectedJobs) {
-    const campaignId = String(job.campaign_id);
-    const campaignJobs = jobsByCampaign.get(campaignId) ?? [];
-    campaignJobs.push(job);
-    jobsByCampaign.set(campaignId, campaignJobs);
-  }
   await runWithConcurrency(
-    [...jobsByCampaign.values()],
+    selectedJobs,
     activeReconcileConcurrency(),
-    async (campaignJobs) => {
-      const campaignReceipt = {
-        applied: 0,
-        indexed: 0,
-        stopped: 0,
-        settled: 0,
-        waiting: 0,
-        errors: [] as Array<{ executionId: string; reason: string }>,
-      };
-      for (const job of campaignJobs) {
-        const executionId = String(job.sim_job_id);
-        try {
-          const batch = await applyProgressiveRemoteProgressBatch(
+    async (job) => {
+      const executionId = String(job.sim_job_id);
+      try {
+        const batch = await applyProgressiveRemoteProgressBatch(
+          db,
+          executionId,
+        );
+        receipt.applied += batch.applied;
+        receipt.indexed += batch.indexed;
+        receipt.stopped += batch.stopped;
+        receipt.errors.push(...batch.errors);
+        if (batch.idle && batch.errors.length === 0) {
+          const terminal = await settleProgressiveRemoteJob(
             db,
             executionId,
           );
-          campaignReceipt.applied += batch.applied;
-          campaignReceipt.indexed += batch.indexed;
-          campaignReceipt.stopped += batch.stopped;
-          campaignReceipt.errors.push(...batch.errors);
-          if (batch.idle && batch.errors.length === 0) {
-            const terminal = await settleProgressiveRemoteJob(
-              db,
-              executionId,
+          if (terminal.kind === "settled") receipt.settled += 1;
+          else receipt.waiting += 1;
+        }
+      } catch (error) {
+        receipt.errors.push({
+          executionId,
+          reason: error instanceof Error ? error.message : String(error),
+        });
+      } finally {
+        try {
+          await db.transaction(async (transaction) => {
+            await transaction.execute(
+              sql`UPDATE sim_jobs SET "polledAt" = clock_timestamp() WHERE id = ${executionId}::uuid`,
             );
-            if (terminal.kind === "settled") campaignReceipt.settled += 1;
-            else campaignReceipt.waiting += 1;
-          }
+          });
         } catch (error) {
-          campaignReceipt.errors.push({
+          receipt.errors.push({
             executionId,
             reason: error instanceof Error ? error.message : String(error),
           });
-        } finally {
-          try {
-            await db.transaction(async (transaction) => {
-              await transaction.execute(
-                sql`UPDATE sim_jobs SET "polledAt" = clock_timestamp() WHERE id = ${executionId}::uuid`,
-              );
-            });
-          } catch (error) {
-            campaignReceipt.errors.push({
-              executionId,
-              reason: error instanceof Error ? error.message : String(error),
-            });
-          }
         }
       }
-      receipt.applied += campaignReceipt.applied;
-      receipt.indexed += campaignReceipt.indexed;
-      receipt.stopped += campaignReceipt.stopped;
-      receipt.settled += campaignReceipt.settled;
-      receipt.waiting += campaignReceipt.waiting;
-      receipt.errors.push(...campaignReceipt.errors);
     },
   );
   return receipt;
