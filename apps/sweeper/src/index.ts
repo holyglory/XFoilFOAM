@@ -24,7 +24,8 @@ import { startRemoteSolverFleetHeartbeatTimer } from "./remote-solver";
 const { db, sql, engine } = makeContext();
 const critical = makeIsolatedDatabase(2);
 const retention = makeIsolatedDatabase(1);
-const evidence = makeIsolatedDatabase(4);
+const evidence = makeIsolatedDatabase(8);
+const archive = makeIsolatedDatabase(2);
 try {
   const [syncSettings] = await db
     .select({
@@ -43,6 +44,7 @@ try {
     critical.sql.end(),
     retention.sql.end(),
     evidence.sql.end(),
+    archive.sql.end(),
   ]);
   throw error;
 }
@@ -114,12 +116,12 @@ try {
     {
       name: "progressive-archive-delivery",
       run: (signal) =>
-        runProgressiveArchiveService(evidence.db, evidence.sql, engine, signal),
+        runProgressiveArchiveService(archive.db, archive.sql, engine, signal),
     },
     {
       name: "archive-reclamation",
       run: (signal) =>
-        runArchiveReclaimService(evidence.db, evidence.sql, engine, signal),
+        runArchiveReclaimService(archive.db, archive.sql, engine, signal),
     },
   ]);
 } finally {
