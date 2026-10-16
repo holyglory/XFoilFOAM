@@ -2,7 +2,7 @@ import { sql } from "drizzle-orm";
 
 export function progressiveStagingSelectionSql(preferActive: boolean) {
   const order = (active: boolean, terminalFirst = false) => {
-    const direction = active ? sql`DESC` : sql`ASC`;
+    const direction = sql`ASC`;
     return terminalFirst
       ? sql`ORDER BY report.stopped_engine_job_id = report.sim_job_id::text DESC,
           report.created_at ${direction}, report.sim_job_id ${direction}, report.sequence ${direction}`

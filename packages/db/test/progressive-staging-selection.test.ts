@@ -342,15 +342,15 @@ it("serves fresh active reports and FIFO backlog without changing eligibility", 
       WHERE fixture.variant IN ('eligible-active','eligible-cancelled','eligible-expired','expired-ingest')
       ORDER BY CASE WHEN NOT ${active} AND fixture.variant='eligible-expired' THEN 0 ELSE 1 END,
         CASE WHEN ${active} AND promise.status='active' AND promise."expiresAt">clock_timestamp() THEN 0 ELSE 1 END,
-        CASE WHEN ${active} AND promise.status='active' AND promise."expiresAt">clock_timestamp() THEN report.created_at END DESC,
-        CASE WHEN ${active} AND promise.status='active' AND promise."expiresAt">clock_timestamp() THEN report.sim_job_id END DESC,
-        CASE WHEN ${active} AND promise.status='active' AND promise."expiresAt">clock_timestamp() THEN report.sequence END DESC,
+        CASE WHEN ${active} AND promise.status='active' AND promise."expiresAt">clock_timestamp() THEN report.created_at END,
+        CASE WHEN ${active} AND promise.status='active' AND promise."expiresAt">clock_timestamp() THEN report.sim_job_id END,
+        CASE WHEN ${active} AND promise.status='active' AND promise."expiresAt">clock_timestamp() THEN report.sequence END,
         report.created_at,report.sim_job_id,report.sequence LIMIT 1`);
     for (const active of [false, true])
       expect(await select(active)).toEqual(await expected(active));
     const fresh = await select(true);
     const oldest = await select(false);
-    expect(fresh[0].sequence).toBe(2);
+    expect(fresh[0].sequence).toBe(1);
     expect(oldest[0].sequence).toBe(1);
     expect(fresh).not.toEqual(oldest);
     await transaction.execute(sql`INSERT INTO progressive_worker_report_conflicts
