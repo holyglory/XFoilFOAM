@@ -2621,7 +2621,7 @@ describe("progressive durable stage transitions", () => {
     });
   });
 
-  it("requeues only stopped terminal executions with no measurable evidence and budget left", async () => {
+  it("requeues one bounded retry for stopped terminal executions with no measurable evidence", async () => {
     const fixture = await fitFixture(2, false, [0]);
     const lease = fixture.leases[0];
     await acknowledgeProgressiveCfdExecutionStop(db, {
@@ -2637,7 +2637,7 @@ describe("progressive durable stage transitions", () => {
     await db.execute(sql`
       UPDATE progressive_cfd_units
       SET state = 'gap', lease_token = NULL, lease_owner = NULL, lease_until = NULL,
-        attempts = 1, active_seconds = 0,
+        attempts = 2, active_seconds = 0,
         error = 'terminal execution has no measured case evidence'
       WHERE id = ${lease.id}::uuid
     `);
@@ -2657,6 +2657,58 @@ describe("progressive durable stage transitions", () => {
       error: 'Retrying after terminal execution without measurable case evidence',
     });
     expect(work).toMatchObject({ state: 'pending', error: null });
+
+    await db.execute(sql`
+      UPDATE progressive_cfd_units
+      SET state = 'gap', attempts = 3, active_seconds = 0,
+        error = 'terminal execution has no measured case evidence'
+      WHERE id = ${lease.id}::uuid
+    `);
+    await db.execute(sql`
+      UPDATE progressive_work SET state = 'gap', error = 'terminal execution has no measured case evidence'
+      WHERE id = ${lease.workId}::uuid
+    `);
+    expect(await recoverTerminalProgressiveNoEvidenceGaps(db)).toBe(0);
+    const [attemptLimitUnit] = await db.execute(sql`
+      SELECT state, attempts, active_seconds FROM progressive_cfd_units
+      WHERE id = ${lease.id}::uuid
+    `);
+    expect(attemptLimitUnit).toMatchObject({
+      state: 'gap',
+      attempts: 3,
+      active_seconds: 0,
+    });
+
+    await db.execute(sql`
+      UPDATE progressive_cfd_units
+      SET attempts = 2, active_seconds = active_budget_seconds,
+        error = 'terminal execution has no measured case evidence'
+      WHERE id = ${lease.id}::uuid
+    `);
+    expect(await recoverTerminalProgressiveNoEvidenceGaps(db)).toBe(0);
+    const [budgetUnit] = await db.execute(sql`
+      SELECT state, attempts, active_seconds, active_budget_seconds FROM progressive_cfd_units
+      WHERE id = ${lease.id}::uuid
+    `);
+    expect(budgetUnit).toMatchObject({
+      state: 'gap',
+      attempts: 2,
+    });
+    expect(Number(budgetUnit.active_seconds)).toBe(
+      Number(budgetUnit.active_budget_seconds),
+    );
+
+    const attempts = await db.execute(sql`
+      SELECT token, outcome, sim_job_id, error FROM progressive_cfd_attempts
+      WHERE unit_id = ${lease.id}::uuid
+    `);
+    expect(attempts).toHaveLength(1);
+    expect(attempts[0]).toMatchObject({
+      token: lease.token,
+      outcome: 'failed',
+      sim_job_id: fixture.composed.jobId,
+      error: 'terminal execution has no measured case evidence',
+    });
   });
 
   it.each(["paused", "cancelled"])(

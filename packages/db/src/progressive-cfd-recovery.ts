@@ -4,6 +4,8 @@ import { effectiveProgressiveStageSql } from "./progressive-execution-policy";
 import { progressiveCfdOrdinaryAttemptCountSql } from "./progressive-attempt-budget";
 import { acquireProgressiveAdmissionLock } from "./progressive-admission-lock";
 
+const MAX_TERMINAL_NO_EVIDENCE_ATTEMPTS = 3;
+
 export async function recoverUnboundProgressiveCfdLeases(
   db: DB,
 ): Promise<{ retried: number; gaps: number }> {
@@ -155,27 +157,37 @@ export async function recoverTerminalProgressiveNoEvidenceGaps(
         AND campaign.status IN ('active', 'attention', 'paused')
         AND unit.state = 'gap'
         AND unit.error = 'terminal execution has no measured case evidence'
-        AND unit.attempts < 2
+        AND unit.attempts < ${MAX_TERMINAL_NO_EVIDENCE_ATTEMPTS}
         AND unit.active_seconds < unit.active_budget_seconds
         AND attempt.outcome = 'failed'
+        AND attempt.error = 'terminal execution has no measured case evidence'
+        AND NOT EXISTS (
+          SELECT 1 FROM progressive_cfd_attempts newer
+          WHERE newer.unit_id = unit.id
+            AND (newer.started_at, newer.token) > (attempt.started_at, attempt.token)
+        )
       ORDER BY unit.id
       LIMIT 64
       FOR UPDATE OF generation, work, unit, attempt SKIP LOCKED
     `);
+    let recovered = 0;
     for (const unit of units) {
-      await connection.execute(sql`
+      const [requeued] = await connection.execute(sql`
         UPDATE progressive_cfd_units
         SET state = 'pending', lease_token = NULL, lease_owner = NULL,
           lease_until = NULL, retry_after = NULL,
           error = 'Retrying after terminal execution without measurable case evidence'
         WHERE id = ${unit.id}::uuid AND state = 'gap'
+          AND active_seconds < active_budget_seconds
       `);
+      if (!requeued) continue;
       await connection.execute(sql`
         UPDATE progressive_work
         SET state = 'pending', error = NULL, completed_at = NULL
         WHERE id = ${unit.work_id}::uuid AND state = 'gap'
       `);
+      recovered += 1;
     }
-    return units.length;
+    return recovered;
   });
 }
