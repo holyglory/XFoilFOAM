@@ -64,7 +64,13 @@ export async function prepareProgressivePolarImport(
       engineCaseSlug: point.engineCaseSlug ?? null,
       progressiveEvidence: point.progressiveEvidence,
     });
-    if (!source) continue;
+    if (!source) {
+      if (point.progressiveEvidence)
+        throw new ProgressiveRemoteEvidenceConflict(
+          "Progressive evidence source is not retained yet",
+        );
+      continue;
+    }
     if (
       !solverId ||
       !point.remoteResultId ||

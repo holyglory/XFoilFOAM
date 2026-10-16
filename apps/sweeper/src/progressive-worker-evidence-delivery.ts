@@ -227,6 +227,10 @@ export async function deliverNextProgressiveWorkerEvidence(
       }
     }
     if (!response.ok) {
+      const responseFailureText = [rejected?.code, rejected?.error]
+        .filter((value) => value !== undefined && value !== null)
+        .map((value) => String(value))
+        .join(" ");
       if (response.status === 409 && !stoppedStorage) {
         retryStoppedStorage =
           !stoppedStorage && rejected?.code === "promise_inactive";
@@ -243,7 +247,7 @@ export async function deliverNextProgressiveWorkerEvidence(
         );
       }
       throw new Error(
-        `${stoppedStorage ? "Stopped progressive storage" : "Progressive evidence"} delivery failed (${response.status})`,
+        `${stoppedStorage ? "Stopped progressive storage" : "Progressive evidence"} delivery failed (${response.status})${responseFailureText ? `: ${responseFailureText}` : ""}`,
       );
     }
     const responseBody = (await response.json()) as {
