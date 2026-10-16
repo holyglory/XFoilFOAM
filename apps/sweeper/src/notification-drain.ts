@@ -8,12 +8,14 @@ export async function runNotificationDrain(
     drain: () => Promise<boolean>;
     reportError: (error: unknown) => void;
     nextWakeAt?: () => Promise<Date | null>;
+    pollIntervalMs?: number;
   },
 ): Promise<void> {
   if (signal.aborted) return;
   let pending = true;
   let wake: (() => void) | null = null;
   let retry: ReturnType<typeof setTimeout> | null = null;
+  let poll: ReturnType<typeof setInterval> | null = null;
   let retryNotBefore = 0;
   let unlisten: (() => Promise<void>) | null = null;
   const notify = () => {
@@ -24,6 +26,10 @@ export async function runNotificationDrain(
   try {
     const subscription = await notifications.listen(channel, notify, notify);
     unlisten = () => subscription.unlisten();
+    if (options.pollIntervalMs && options.pollIntervalMs > 0) {
+      poll = setInterval(notify, options.pollIntervalMs);
+      poll.unref?.();
+    }
     while (!signal.aborted) {
       if (!pending || Date.now() < retryNotBefore)
         await new Promise<void>((resolve) => {
@@ -67,6 +73,7 @@ export async function runNotificationDrain(
   } finally {
     signal.removeEventListener("abort", notify);
     if (retry) clearTimeout(retry);
+    if (poll) clearInterval(poll);
     await unlisten?.();
   }
 }

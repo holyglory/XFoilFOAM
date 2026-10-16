@@ -143,6 +143,7 @@ export async function runProgressiveEvidenceService(
                 );
           },
           nextWakeAt: () => nextWakeAt(scope),
+          pollIntervalMs: 5_000,
           reportError:
             options.reportError ??
             ((error) =>
