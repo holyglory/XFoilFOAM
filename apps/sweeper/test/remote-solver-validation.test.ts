@@ -955,6 +955,7 @@ function stubFetch(
   opts: {
     conflictIdsByPolarIndex?: Record<number, string[]>;
     conflictStatuses?: Record<string, "pending" | "promoted" | "archived">;
+    retryableConflictIds?: string[];
     failPolarIndex?: number;
     incompleteMultipartPolarIndex?: number;
     failCancelCount?: number;
@@ -1037,6 +1038,7 @@ function stubFetch(
           conflicts: (body.ids ?? []).map((id) => ({
             id,
             status: opts.conflictStatuses?.[id] ?? "pending",
+            retryable: opts.retryableConflictIds?.includes(id) ?? false,
           })),
         }),
         {
@@ -6766,6 +6768,33 @@ describe("remote solver push validation regressions", () => {
       (await deliveriesForJob(job.id)).find((row) => row.resultId)?.state,
     ).toBe("superseded");
     expect((await readPromise(promiseId)).points[0]?.status).toBe("cancelled");
+  });
+
+  it("retries a pending conflict when the hub marks the exact progressive report ready", async () => {
+    const aoa = 854.301;
+    const job = await seedDoneRemoteJob("conflict-retryable", [aoa]);
+    const promiseId = (job.requestPayload as { syncPromiseId: string })
+      .syncPromiseId;
+    await seedMirroredPromise("conflict-retryable", [aoa], promiseId);
+    const conflictId = randomUUID();
+    const blockedFetch = stubFetch({
+      conflictIdsByPolarIndex: { 1: [conflictId] },
+    });
+
+    await remoteSolverTick(db, {} as never);
+    expect(requests(blockedFetch.fetchMock, "/polars")).toHaveLength(1);
+
+    await db
+      .update(syncRemoteResultDeliveries)
+      .set({ nextAttemptAt: new Date(Date.now() - 1_000) })
+      .where(eq(syncRemoteResultDeliveries.simJobId, job.id));
+    vi.unstubAllGlobals();
+    const retryFetch = stubFetch({
+      conflictStatuses: { [conflictId]: "pending" },
+      retryableConflictIds: [conflictId],
+    });
+    await remoteSolverTick(db, {} as never);
+    expect(requests(retryFetch.fetchMock, "/polars")).toHaveLength(1);
   });
 
   it.each(["failed", "cancelled"] as const)(

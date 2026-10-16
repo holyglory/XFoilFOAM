@@ -7184,16 +7184,28 @@ async function reopenResolvedConflictDeliveries(
   });
   if (!response.ok) return;
   const payload = (await response.json().catch(() => null)) as {
-    conflicts?: Array<{ id?: unknown; status?: unknown }>;
+    conflicts?: Array<{
+      id?: unknown;
+      status?: unknown;
+      retryable?: unknown;
+    }>;
   } | null;
   const statusById = new Map(
     (payload?.conflicts ?? [])
       .filter(
-        (row): row is { id: string; status: "promoted" | "archived" } =>
+        (
+          row,
+        ): row is {
+          id: string;
+          status: "promoted" | "archived" | "pending";
+          retryable: boolean;
+        } =>
           typeof row.id === "string" &&
-          (row.status === "promoted" || row.status === "archived"),
+          (row.status === "promoted" ||
+            row.status === "archived" ||
+            (row.status === "pending" && row.retryable === true)),
       )
-      .map((row) => [row.id, row.status]),
+      .map((row) => [row.id, row]),
   );
   const fullyResolved = blocked.filter(
     (delivery) =>
@@ -7201,11 +7213,11 @@ async function reopenResolvedConflictDeliveries(
       delivery.conflictIds.every((id) => statusById.has(id)),
   );
   const archived = fullyResolved.filter((delivery) =>
-    delivery.conflictIds.some((id) => statusById.get(id) === "archived"),
+    delivery.conflictIds.some((id) => statusById.get(id)?.status === "archived"),
   );
   const reopenIds = fullyResolved
     .filter((delivery) =>
-      delivery.conflictIds.every((id) => statusById.get(id) === "promoted"),
+      delivery.conflictIds.every((id) => statusById.get(id)?.status !== "archived"),
     )
     .map((delivery) => delivery.id);
   const resolvedIds = new Set(fullyResolved.map((delivery) => delivery.id));
