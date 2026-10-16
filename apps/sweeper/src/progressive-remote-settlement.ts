@@ -435,8 +435,10 @@ export async function settleProgressiveRemoteJob(db: DB, executionId: string) {
     await connection.execute(
       sql`SELECT id FROM calculation_epochs WHERE id = ${envelope.scope.epochId}::uuid FOR SHARE`,
     );
-    await connection.execute(sql`SELECT campaign.id FROM sim_campaigns campaign JOIN sim_jobs job ON job.campaign_id = campaign.id
-      WHERE job.id = ${executionId}::uuid FOR UPDATE OF campaign`);
+    const [campaign] = await connection.execute(sql`SELECT campaign.id FROM sim_campaigns campaign JOIN sim_jobs job ON job.campaign_id = campaign.id
+      WHERE job.id = ${executionId}::uuid FOR UPDATE OF campaign SKIP LOCKED`);
+    if (!campaign)
+      return { kind: "waiting" as const, reason: "campaign_lock" };
     const [job] =
       await connection.execute(sql`SELECT engine_job_id, request_payload, status, "ingestedAt",
         ingest_lease_expires_at > clock_timestamp() AS ingestion_owned

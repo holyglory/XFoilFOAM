@@ -27,8 +27,9 @@ export async function acknowledgeLatestProgressiveRemoteStop(
     await connection.execute(
       sql`SELECT id FROM calculation_epochs WHERE id = ${envelope.scope.epochId}::uuid FOR SHARE`,
     );
-    await connection.execute(sql`SELECT campaign.id FROM sim_campaigns campaign JOIN sim_jobs job ON job.campaign_id = campaign.id
-      WHERE job.id = ${executionId}::uuid FOR UPDATE OF campaign`);
+    const [campaign] = await connection.execute(sql`SELECT campaign.id FROM sim_campaigns campaign JOIN sim_jobs job ON job.campaign_id = campaign.id
+      WHERE job.id = ${executionId}::uuid FOR UPDATE OF campaign SKIP LOCKED`);
+    if (!campaign) return false;
     const [job] = await connection.execute(
       sql`SELECT engine_job_id, request_payload FROM sim_jobs WHERE id = ${executionId}::uuid FOR UPDATE`,
     );
