@@ -87,7 +87,7 @@ export async function recoverInactiveProgressiveRemoteGaps(
         AND campaign.status IN ('active', 'attention', 'paused')
         AND unit.state = 'gap'
         AND unit.error = 'Inactive remote delivery has unresolved evidence'
-        AND unit.attempts < 2
+        AND unit.attempts < 3
         AND unit.active_seconds < unit.active_budget_seconds
       ORDER BY unit.id
       LIMIT 64
