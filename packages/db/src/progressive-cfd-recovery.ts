@@ -101,13 +101,13 @@ export async function recoverInactiveProgressiveRemoteGaps(
         FROM progressive_cfd_attempts attempt
         JOIN progressive_cfd_units previous_unit ON previous_unit.id = attempt.unit_id
         JOIN result_attempts raw ON raw.sim_job_id = attempt.sim_job_id
-          AND raw.result_id = result.id
         JOIN progressive_cfd_execution_stops stopped
           ON stopped.sim_job_id = attempt.sim_job_id
           AND stopped.engine_job_id = attempt.sim_job_id::text
         WHERE attempt.unit_id = ${unit.id}::uuid
           AND previous_unit.work_id = ${unit.work_id}::uuid
           AND attempt.sim_job_id IS NOT NULL
+          AND raw.result_id = result.id
           AND result.status = 'queued'
           AND NOT EXISTS (
             SELECT 1 FROM result_classifications classification
