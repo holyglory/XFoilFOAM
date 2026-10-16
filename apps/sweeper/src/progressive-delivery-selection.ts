@@ -35,6 +35,7 @@ export function progressiveDeliverySelectionSql(
         AND (failure.retry_after IS NULL OR failure.retry_after <= clock_timestamp())))`;
   const candidate = (
     active: boolean,
+    excludeActive = false,
   ) => sql`SELECT point.*, job.request_payload, settings.upstream_base_url,
       settings.remote_solver_auth_token, settings.remote_solver_registered_id, settings.instance_id, settings.instance_name,
       promise.id AS promise_id
@@ -48,10 +49,11 @@ export function progressiveDeliverySelectionSql(
       AND promise.source_base_url = settings.upstream_base_url
       AND job.request_payload->>'upstreamBaseUrl' = settings.upstream_base_url
       AND (${!active} OR (promise.status = 'active' AND promise."expiresAt" > clock_timestamp()))
+      ${excludeActive ? sql`AND NOT EXISTS (SELECT 1 FROM active)` : sql``}
     ORDER BY point.is_retry DESC, point.created_at, point.sim_job_id, point.sequence, point.aoa_deg, point.result_attempt_id LIMIT 1`;
   const selected = preferActive
     ? sql`WITH active AS MATERIALIZED (${candidate(true)}),
-        fallback AS (${candidate(false)} WHERE NOT EXISTS (SELECT 1 FROM active))
+        fallback AS (${candidate(false, true)})
       SELECT * FROM active UNION ALL SELECT * FROM fallback`
     : sql`${candidate(false)}`;
   const selectedCandidate = sql`SELECT selected.sim_job_id, selected.sequence, selected.result_attempt_id, selected.point_content_signature,
