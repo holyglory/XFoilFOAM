@@ -1022,6 +1022,12 @@ tier = "development"
 requires = ["types"]
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/progressive-evidence-service.test.ts", "test/service-lifecycle.test.ts"]
 
+[[test.staging-selection.check]]
+name = "progressive-service-maintenance"
+tier = "development"
+requires = ["types"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/progressive-service.test.ts"]
+
 [test.progressive-claim-deferral]
 timeout_seconds = 900
 

@@ -6,6 +6,7 @@ import {
   recoverUnboundProgressiveCfdLeases,
   recoverInactiveProgressiveRemoteGaps,
   recoverTerminalProgressiveNoEvidenceGaps,
+  refreshPolarClassificationsForJob,
   invalidateProgressiveFitPolicy,
   type DB,
   type Sql,
@@ -41,6 +42,48 @@ function configuredProgressiveFitConcurrency(
     "1";
   const value = Number(raw);
   return Number.isSafeInteger(value) && value > 0 ? Math.min(value, 16) : 1;
+}
+
+async function classifyRetainedProgressiveEvidence(db: DB): Promise<number> {
+  const candidates = await db.execute(sql`
+    SELECT job.id, job.airfoil_id, job.simulation_preset_revision_id
+    FROM sim_jobs job
+    JOIN progressive_remote_dispatches dispatch ON dispatch.sim_job_id = job.id
+    JOIN progressive_cfd_execution_stops stopped ON stopped.sim_job_id = job.id
+      AND stopped.engine_job_id = job.engine_job_id
+    JOIN progressive_generations generation
+      ON generation.id::text = job.request_payload->'progressive'->>'generationId'
+    JOIN sim_campaigns campaign ON campaign.id = generation.campaign_id
+    JOIN calculation_epochs epoch ON epoch.id = generation.epoch_id AND epoch.current
+    JOIN progressive_remote_evidence_receipts receipt
+      ON receipt.sim_job_id = job.id AND NOT receipt.storage_only
+    JOIN result_attempts attempt ON attempt.id = receipt.result_attempt_id
+    WHERE generation.status = 'active'
+      AND generation.plan_revision_id = campaign.current_plan_revision_id
+      AND campaign.status IN ('active', 'attention', 'paused')
+      AND job.status IN ('ingesting', 'done', 'failed', 'cancelled')
+      AND job."ingestedAt" IS NULL
+      AND attempt.status = 'done'
+      AND attempt.valid_for_polar
+      AND NOT EXISTS (
+        SELECT 1 FROM result_classifications classification
+        WHERE classification.result_attempt_id = attempt.id
+      )
+    GROUP BY job.id, job.airfoil_id, job.simulation_preset_revision_id
+    ORDER BY min(receipt.received_at), job.id
+    LIMIT 32
+  `);
+  let classified = 0;
+  for (const candidate of candidates) {
+    const rows = await refreshPolarClassificationsForJob(
+      db,
+      String(candidate.airfoil_id),
+      String(candidate.simulation_preset_revision_id),
+      String(candidate.id),
+    );
+    classified += rows.length;
+  }
+  return classified;
 }
 
 export async function runProgressiveBaselineService(
@@ -147,6 +190,17 @@ export async function runProgressiveBaselineService(
           report({
             component: "progressive-terminal-no-evidence-recovery",
             retried: terminalNoEvidenceGaps,
+          });
+        }
+        const retainedClassifications = runMaintenance
+          ? await classifyRetainedProgressiveEvidence(db)
+          : 0;
+        if (retainedClassifications) {
+          pending = true;
+          maintenanceDue = true;
+          report({
+            component: "progressive-terminal-evidence-classification",
+            classified: retainedClassifications,
           });
         }
         if (settings?.remote) continue;
