@@ -74,7 +74,7 @@ export async function recoverInactiveProgressiveRemoteGaps(
     );
     if (!epoch) throw new Error("Calculation epoch is missing");
     const units = await connection.execute(sql`
-      SELECT unit.id
+      SELECT unit.id, unit.work_id
       FROM progressive_cfd_units unit
       JOIN progressive_work work ON work.id = unit.work_id
       JOIN progressive_generations generation ON generation.id = work.generation_id
