@@ -60,7 +60,10 @@ export function progressiveEvidenceWakeSql(
       AND job.request_payload->>'upstreamBaseUrl' = settings.upstream_base_url
       ${scope === "staging" ? sql`AND (job.ingest_lease_token IS NULL OR job.ingest_lease_expires_at IS NOT NULL)` : sql``}
     OFFSET 0`;
-  const deadline = sql`greatest(candidate.retry_after, ${scope === "staging" ? sql`CASE WHEN owned.ingest_lease_token IS NOT NULL THEN owned.ingest_lease_expires_at END` : sql`candidate.claim_until`})`;
+  const deadline = sql`greatest(
+    coalesce(candidate.retry_after, clock_timestamp()),
+    coalesce(${scope === "staging" ? sql`CASE WHEN owned.ingest_lease_token IS NOT NULL THEN owned.ingest_lease_expires_at END` : sql`candidate.claim_until`}, clock_timestamp())
+  )`;
   return ready
     ? sql`SELECT clock_timestamp() AS wake_at FROM (${source}) candidate
       JOIN LATERAL (${ownership}) owned ON true
