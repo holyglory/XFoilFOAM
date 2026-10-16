@@ -169,8 +169,8 @@ export async function stripTerminalJobs(
     ),
   );
   const candidateScanLimit = Math.min(
-    1_024,
-    Math.max(32, config.stripMaxPerTick * 16),
+    64,
+    Math.max(8, config.stripMaxPerTick * 4),
   );
   const candidates = (await db.transaction(async (rawTransaction) => {
     const transaction = rawTransaction as unknown as DB;
