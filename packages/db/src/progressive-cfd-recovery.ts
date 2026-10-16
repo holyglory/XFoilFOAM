@@ -83,7 +83,7 @@ export async function recoverInactiveProgressiveRemoteGaps(
         AND generation.status = 'active'
         AND generation.plan_revision_id = campaign.current_plan_revision_id
         AND ${effectiveProgressiveStageSql()} = work.stage
-        AND work.state = 'pending'
+        AND work.state IN ('pending', 'gap')
         AND campaign.status IN ('active', 'attention', 'paused')
         AND unit.state = 'gap'
         AND unit.error = 'Inactive remote delivery has unresolved evidence'
@@ -151,7 +151,7 @@ export async function recoverTerminalProgressiveNoEvidenceGaps(
         AND generation.status = 'active'
         AND generation.plan_revision_id = campaign.current_plan_revision_id
         AND ${effectiveProgressiveStageSql()} = work.stage
-        AND work.state = 'gap'
+        AND work.state IN ('pending', 'gap')
         AND campaign.status IN ('active', 'attention', 'paused')
         AND unit.state = 'gap'
         AND unit.error = 'terminal execution has no measured case evidence'
