@@ -4,7 +4,7 @@ export function progressiveStagingSelectionSql(preferActive: boolean) {
   const order = (active: boolean, terminalFirst = false) => {
     const direction = active ? sql`DESC` : sql`ASC`;
     return terminalFirst
-      ? sql`ORDER BY report.stopped_engine_job_id = report.sim_job_id::text DESC,
+      ? sql`ORDER BY COALESCE(report.stopped_engine_job_id = report.sim_job_id::text, false) DESC,
           report.created_at ${direction}, report.sim_job_id ${direction}, report.sequence ${direction}`
       : sql`ORDER BY report.created_at ${direction}, report.sim_job_id ${direction}, report.sequence ${direction}`;
   };
