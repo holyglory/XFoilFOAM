@@ -32,33 +32,28 @@ export function progressiveDeliverySelectionSql(
         WHERE conflict.sim_job_id = report.sim_job_id AND conflict.sequence = report.sequence)
       AND (claim.claim_token IS NULL OR claim.claim_expires_at <= clock_timestamp())
       AND (failure.sim_job_id IS NULL OR (${retryableFailure}
-        AND (failure.retry_after IS NULL OR failure.retry_after <= clock_timestamp())))
-    ORDER BY CASE WHEN ${retryableFailure} THEN 0 ELSE 1 END,
-      report.created_at, source.sim_job_id, source.sequence, attempt.aoa_deg, source.result_attempt_id OFFSET 0`;
-  const owned = (
+        AND (failure.retry_after IS NULL OR failure.retry_after <= clock_timestamp())))`;
+  const candidate = (
     active: boolean,
-  ) => sql`SELECT job.request_payload, settings.upstream_base_url,
+  ) => sql`SELECT point.*, job.request_payload, settings.upstream_base_url,
       settings.remote_solver_auth_token, settings.remote_solver_registered_id, settings.instance_id, settings.instance_name,
       promise.id AS promise_id
-    FROM sim_jobs job
+    FROM (${points}) point
+    JOIN sim_jobs job ON job.id = point.sim_job_id
     JOIN sync_sweep_promises promise ON promise.id::text = job.request_payload->>'syncPromiseId'
     JOIN sync_api_settings settings ON settings.id = 1
-    WHERE job.id = point.sim_job_id AND NOT settings.remote_solver_transfer_paused AND settings.remote_solver_auth_token <> ''
+    WHERE NOT settings.remote_solver_transfer_paused AND settings.remote_solver_auth_token <> ''
       AND settings.upstream_base_url IS NOT NULL AND job.request_payload->>'remoteSolver' = 'true'
       AND promise.registered_solver_id = settings.remote_solver_registered_id
       AND promise.source_base_url = settings.upstream_base_url
       AND job.request_payload->>'upstreamBaseUrl' = settings.upstream_base_url
-      AND (${!active} OR (promise.status = 'active' AND promise."expiresAt" > clock_timestamp())) OFFSET 0`;
-  const candidate = (
-    active: boolean,
-  ) => sql`SELECT point.*, owned.* FROM (${points}) point
-    JOIN LATERAL (${owned(active)}) owned ON true`;
-  const order = sql`ORDER BY point.is_retry DESC, point.created_at, point.sim_job_id, point.sequence, point.aoa_deg, point.result_attempt_id LIMIT 1`;
+      AND (${!active} OR (promise.status = 'active' AND promise."expiresAt" > clock_timestamp()))
+    ORDER BY point.is_retry DESC, point.created_at, point.sim_job_id, point.sequence, point.aoa_deg, point.result_attempt_id LIMIT 1`;
   const selected = preferActive
-    ? sql`WITH active AS MATERIALIZED (${candidate(true)} ${order}),
-        fallback AS (${candidate(false)} WHERE NOT EXISTS (SELECT 1 FROM active) ${order})
+    ? sql`WITH active AS MATERIALIZED (${candidate(true)}),
+        fallback AS (${candidate(false)} WHERE NOT EXISTS (SELECT 1 FROM active))
       SELECT * FROM active UNION ALL SELECT * FROM fallback`
-    : sql`${candidate(false)} ${order}`;
+    : sql`${candidate(false)}`;
   const selectedCandidate = sql`SELECT selected.sim_job_id, selected.sequence, selected.result_attempt_id, selected.point_content_signature,
       report.content_signature AS report_signature, report.report, attempt.result_id, attempt.aoa_deg,
       attempt.engine_case_slug, attempt.evidence_payload, selected.request_payload, selected.upstream_base_url,

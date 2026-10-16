@@ -587,7 +587,8 @@ it("preserves exact eligible deliveries, active priority, fallback and cumulativ
         timestamptz '2026-01-01T00:00:00Z' + CASE WHEN variant='eligible-cancelled' THEN interval '0 seconds' ELSE interval '1 second' END AS created_at
       FROM fixture_jobs CROSS JOIN generate_series(1,2) sequence`);
     await transaction.execute(sql`CREATE TEMP TABLE progressive_worker_report_conflicts ON COMMIT DROP AS
-      SELECT id AS sim_job_id,sequence FROM fixture_jobs CROSS JOIN generate_series(1,2) sequence WHERE false`);
+      SELECT id AS sim_job_id,sequence FROM fixture_jobs CROSS JOIN generate_series(1,2) sequence
+      WHERE variant='conflict'`);
     await transaction.execute(sql`CREATE TEMP TABLE result_attempts ON COMMIT DROP AS
       SELECT md5(variant||angle||replay)::uuid AS id,
         CASE WHEN variant='wrong-attempt-job' THEN md5('foreign')::uuid ELSE id END AS sim_job_id,
@@ -613,6 +614,7 @@ it("preserves exact eligible deliveries, active priority, fallback and cumulativ
       JOIN fixture_jobs fixture ON fixture.id=source.sim_job_id WHERE fixture.variant='already-delivered' GROUP BY 1,2`);
     await transaction.execute(sql`CREATE TEMP TABLE progressive_worker_delivery_failures ON COMMIT DROP AS
       SELECT source.sim_job_id,source.point_content_signature,CASE WHEN variant='conflict' THEN 'conflict' ELSE 'retry' END AS state,
+        CASE WHEN variant='conflict' THEN 'requires conflict review' ELSE 'transient timeout' END AS last_error,
         CASE WHEN variant='future-retry' THEN clock_timestamp()+interval '1 day'
           WHEN variant='due-retry' THEN clock_timestamp()-interval '1 day' END AS retry_after
       FROM progressive_worker_evidence_attempts source JOIN fixture_jobs fixture ON fixture.id=source.sim_job_id
@@ -631,9 +633,11 @@ it("preserves exact eligible deliveries, active priority, fallback and cumulativ
       JOIN result_attempts attempt ON attempt.id=source.result_attempt_id
       JOIN sim_jobs job ON job.id=source.sim_job_id JOIN sync_sweep_promises promise ON promise.id=job.id
       CROSS JOIN sync_api_settings settings
-      WHERE fixture.variant IN ('eligible-active','eligible-cancelled','eligible-expired','due-retry')
+      WHERE fixture.variant IN ('eligible-active','eligible-cancelled','eligible-expired','due-retry','conflict')
         AND NOT EXISTS(SELECT 1 FROM progressive_worker_hub_receipts delivered
           WHERE delivered.sim_job_id=source.sim_job_id AND delivered.point_content_signature=source.point_content_signature)
+        AND NOT EXISTS(SELECT 1 FROM progressive_worker_report_conflicts conflict
+          WHERE conflict.sim_job_id=source.sim_job_id AND conflict.sequence=source.sequence)
       ORDER BY CASE WHEN ${active} AND promise.status='active' AND promise."expiresAt">clock_timestamp() THEN 0 ELSE 1 END,
         CASE WHEN fixture.variant='due-retry' THEN 0 ELSE 1 END,
         report.created_at,source.sim_job_id,source.sequence,attempt.aoa_deg,source.result_attempt_id LIMIT 1`);
