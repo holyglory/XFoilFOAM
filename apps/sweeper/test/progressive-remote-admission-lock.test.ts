@@ -122,6 +122,6 @@ it("does not hold the solver row lock while a candidate claim is running", async
   expect(hooks.bind).toHaveBeenCalledOnce();
   expect(hooks.claim).toHaveBeenCalledWith(
     expect.anything(),
-    expect.objectContaining({ campaignLockMode: "wait" }),
+    expect.objectContaining({ campaignLockMode: "skip" }),
   );
 });
