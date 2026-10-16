@@ -10,7 +10,6 @@ export function progressiveDeliverySelectionSql(
       failure.state = 'conflict'
       AND failure.last_error ILIKE ANY (ARRAY[
         '%aborted%', '%timeout%', '%timed out%',
-        '%requires import conflict review%',
         '%source is not retained yet%'
       ])
     )
