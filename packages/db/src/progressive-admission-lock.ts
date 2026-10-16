@@ -9,3 +9,11 @@ export async function tryProgressiveAdmissionLock(db: DB): Promise<boolean> {
   `);
   return Boolean(row?.acquired);
 }
+
+export async function acquireProgressiveAdmissionLock(db: DB): Promise<void> {
+  await db.execute(sql`
+    SELECT pg_advisory_xact_lock(
+      hashtextextended('progressive-cfd-admission', 0)
+    )
+  `);
+}
