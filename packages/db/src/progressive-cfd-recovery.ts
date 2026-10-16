@@ -1,10 +1,21 @@
 import { sql } from "drizzle-orm";
+import { PROGRESSIVE_COMPUTE_POLICY } from "@aerodb/core";
 import type { DB } from "./client";
 import { effectiveProgressiveStageSql } from "./progressive-execution-policy";
-import { progressiveCfdOrdinaryAttemptCountSql } from "./progressive-attempt-budget";
+import {
+  progressiveCfdOrdinaryAttemptCountSql,
+  progressiveCfdPreciseVerificationAvailableSql,
+} from "./progressive-attempt-budget";
 import { acquireProgressiveAdmissionLock } from "./progressive-admission-lock";
+import {
+  progressiveCfdBudgetExtensionPendingSql,
+  progressiveCfdEffectiveBudgetSql,
+} from "./progressive-cfd-budget-extension";
 
-const MAX_TERMINAL_NO_EVIDENCE_ATTEMPTS = 3;
+const TERMINAL_NO_EVIDENCE_REASON =
+  "terminal execution has no measured case evidence";
+const TERMINAL_NO_EVIDENCE_RETRY_REASON =
+  "Retrying after terminal execution without measurable case evidence";
 
 export async function recoverUnboundProgressiveCfdLeases(
   db: DB,
@@ -139,6 +150,38 @@ export async function recoverTerminalProgressiveNoEvidenceGaps(
       sql`SELECT id FROM calculation_epochs WHERE current FOR SHARE`,
     );
     if (!epoch) throw new Error("Calculation epoch is missing");
+    const ordinaryAttempts = progressiveCfdOrdinaryAttemptCountSql();
+    const pendingBudgetExtension = progressiveCfdBudgetExtensionPendingSql(
+      sql`unit`,
+    );
+    const publicationRecovery = sql`EXISTS (
+      SELECT 1 FROM progressive_publication_recoveries recovery
+      WHERE recovery.unit_id = unit.id
+        AND recovery.attempts_before = unit.attempts
+        AND unit.active_seconds >= recovery.active_seconds
+        AND NOT EXISTS (
+          SELECT 1 FROM progressive_publication_recovery_claims claimed
+          WHERE claimed.unit_id = recovery.unit_id
+        )
+    )`;
+    const attemptAvailable = sql`(
+      ${ordinaryAttempts} < 2
+      OR ${publicationRecovery}
+      OR (
+        ${ordinaryAttempts} = 2
+        AND work.stage = 3
+        AND unit.policy_version = ${PROGRESSIVE_COMPUTE_POLICY.version}
+        AND ${progressiveCfdPreciseVerificationAvailableSql()}
+      )
+      OR (
+        ${ordinaryAttempts} = 2
+        AND work.stage = 2
+        AND unit.purpose = 'initial'
+        AND ${pendingBudgetExtension}
+      )
+    )`;
+    const claimEligible = sql`${attemptAvailable}
+      AND unit.active_seconds < ${progressiveCfdEffectiveBudgetSql(sql`unit`)}`;
     const units = await connection.execute(sql`
       SELECT unit.id, unit.work_id
       FROM progressive_cfd_units unit
@@ -155,16 +198,37 @@ export async function recoverTerminalProgressiveNoEvidenceGaps(
         AND ${effectiveProgressiveStageSql()} = work.stage
         AND work.state IN ('pending', 'gap')
         AND campaign.status IN ('active', 'attention', 'paused')
-        AND unit.state = 'gap'
-        AND unit.error = 'terminal execution has no measured case evidence'
-        AND unit.attempts < ${MAX_TERMINAL_NO_EVIDENCE_ATTEMPTS}
-        AND unit.active_seconds < unit.active_budget_seconds
+        AND unit.state IN ('gap', 'pending')
+        AND (
+          (unit.state = 'gap' AND unit.error = ${TERMINAL_NO_EVIDENCE_REASON})
+          OR (
+            unit.state = 'pending'
+            AND unit.error = ${TERMINAL_NO_EVIDENCE_RETRY_REASON}
+          )
+        )
+        AND unit.attempts < 3
+        AND unit.lease_token IS NULL
+        AND unit.lease_owner IS NULL
+        AND unit.lease_until IS NULL
         AND attempt.outcome = 'failed'
-        AND attempt.error = 'terminal execution has no measured case evidence'
+        AND attempt.sim_job_id IS NOT NULL
+        AND attempt.error = ${TERMINAL_NO_EVIDENCE_REASON}
         AND NOT EXISTS (
           SELECT 1 FROM progressive_cfd_attempts newer
           WHERE newer.unit_id = unit.id
             AND (newer.started_at, newer.token) > (attempt.started_at, attempt.token)
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM progressive_cfd_attempts active
+          WHERE active.unit_id = unit.id AND active.outcome = 'running'
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM progressive_cfd_attempts unsettled
+          LEFT JOIN progressive_cfd_execution_stops unsettled_stop
+            ON unsettled_stop.sim_job_id = unsettled.sim_job_id
+          WHERE unsettled.unit_id = unit.id
+            AND unsettled.sim_job_id IS NOT NULL
+            AND unsettled_stop.sim_job_id IS NULL
         )
       ORDER BY unit.id
       LIMIT 64
@@ -173,20 +237,38 @@ export async function recoverTerminalProgressiveNoEvidenceGaps(
     let recovered = 0;
     for (const unit of units) {
       const [requeued] = await connection.execute(sql`
-        UPDATE progressive_cfd_units
+        UPDATE progressive_cfd_units AS unit
         SET state = 'pending', lease_token = NULL, lease_owner = NULL,
           lease_until = NULL, retry_after = NULL,
-          error = 'Retrying after terminal execution without measurable case evidence'
-        WHERE id = ${unit.id}::uuid AND state = 'gap'
-          AND active_seconds < active_budget_seconds
+          error = ${TERMINAL_NO_EVIDENCE_RETRY_REASON}
+        FROM progressive_work work
+        WHERE unit.id = ${unit.id}::uuid
+          AND work.id = unit.work_id
+          AND unit.state = 'gap'
+          AND ${claimEligible}
+        RETURNING unit.id
       `);
-      if (!requeued) continue;
+      if (requeued) {
+        await connection.execute(sql`
+          UPDATE progressive_work
+          SET state = 'pending', error = NULL, completed_at = NULL
+          WHERE id = ${unit.work_id}::uuid AND state = 'gap'
+        `);
+        recovered += 1;
+        continue;
+      }
       await connection.execute(sql`
-        UPDATE progressive_work
-        SET state = 'pending', error = NULL, completed_at = NULL
-        WHERE id = ${unit.work_id}::uuid AND state = 'gap'
+        UPDATE progressive_cfd_units AS unit
+        SET state = 'gap', lease_token = NULL, lease_owner = NULL,
+          lease_until = NULL, retry_after = NULL,
+          error = ${TERMINAL_NO_EVIDENCE_REASON}
+        FROM progressive_work work
+        WHERE unit.id = ${unit.id}::uuid
+          AND work.id = unit.work_id
+          AND unit.state = 'pending'
+          AND NOT (${claimEligible})
+        RETURNING unit.id
       `);
-      recovered += 1;
     }
     return recovered;
   });

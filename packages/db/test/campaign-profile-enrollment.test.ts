@@ -2621,7 +2621,7 @@ describe("progressive durable stage transitions", () => {
     });
   });
 
-  it("requeues one bounded retry for stopped terminal executions with no measurable evidence", async () => {
+  it("requeues one ordinary retry for stopped terminal executions with no measurable evidence", async () => {
     const fixture = await fitFixture(2, false, [0]);
     const lease = fixture.leases[0];
     await acknowledgeProgressiveCfdExecutionStop(db, {
@@ -2637,7 +2637,7 @@ describe("progressive durable stage transitions", () => {
     await db.execute(sql`
       UPDATE progressive_cfd_units
       SET state = 'gap', lease_token = NULL, lease_owner = NULL, lease_until = NULL,
-        attempts = 2, active_seconds = 0,
+        attempts = 1, active_seconds = 0,
         error = 'terminal execution has no measured case evidence'
       WHERE id = ${lease.id}::uuid
     `);
@@ -2707,6 +2707,95 @@ describe("progressive durable stage transitions", () => {
       token: lease.token,
       outcome: 'failed',
       sim_job_id: fixture.composed.jobId,
+      error: 'terminal execution has no measured case evidence',
+    });
+  });
+
+  it("reconciles a stranded terminal retry before normal admission", async () => {
+    const fixture = await fitFixture(2, false, [-1, 0]);
+    const [retryable, stranded] = fixture.leases;
+    await acknowledgeProgressiveCfdExecutionStop(db, {
+      simJobId: fixture.composed.jobId,
+      proof: executionStopProof(fixture.engineJobId),
+    });
+    await db.execute(sql`
+      UPDATE progressive_cfd_attempts
+      SET outcome = 'failed', sim_job_id = ${fixture.composed.jobId}::uuid,
+        error = 'terminal execution has no measured case evidence'
+      WHERE token IN (${retryable.token}::uuid, ${stranded.token}::uuid)
+    `);
+    await db.execute(sql`
+      UPDATE progressive_cfd_units
+      SET state = CASE WHEN id = ${retryable.id}::uuid THEN 'gap' ELSE 'pending' END,
+        lease_token = NULL, lease_owner = NULL, lease_until = NULL,
+        attempts = CASE WHEN id = ${retryable.id}::uuid THEN 1 ELSE 2 END,
+        active_seconds = 0,
+        error = CASE WHEN id = ${retryable.id}::uuid
+          THEN 'terminal execution has no measured case evidence'
+          ELSE 'Retrying after terminal execution without measurable case evidence' END
+      WHERE id IN (${retryable.id}::uuid, ${stranded.id}::uuid)
+    `);
+    await db.execute(sql`
+      UPDATE progressive_work SET state = 'gap', error = 'terminal execution has no measured case evidence'
+      WHERE id = ${retryable.workId}::uuid
+    `);
+
+    expect(await recoverTerminalProgressiveNoEvidenceGaps(db)).toBe(1);
+    const rows = await db.execute(sql`
+      SELECT id, state, attempts, error FROM progressive_cfd_units
+      WHERE id IN (${retryable.id}::uuid, ${stranded.id}::uuid)
+      ORDER BY id
+    `);
+    expect(rows).toContainEqual({
+      id: retryable.id,
+      state: 'pending',
+      attempts: 1,
+      error: 'Retrying after terminal execution without measurable case evidence',
+    });
+    expect(rows).toContainEqual({
+      id: stranded.id,
+      state: 'gap',
+      attempts: 2,
+      error: 'terminal execution has no measured case evidence',
+    });
+    const [work] = await db.execute(sql`
+      SELECT state, error FROM progressive_work WHERE id = ${retryable.workId}::uuid
+    `);
+    expect(work).toMatchObject({ state: 'pending', error: null });
+    const [retryablePending] = await db.execute(sql`
+      SELECT count(*)::int AS count FROM progressive_cfd_units
+      WHERE id = ${stranded.id}::uuid AND state = 'pending'
+    `);
+    expect(retryablePending.count).toBe(0);
+
+    const claimed = await claimProgressiveCfdUnit(db, {
+      owner: 'terminal-no-evidence-normal-claim',
+      leaseSeconds: 120,
+      solverBudgetVersion: 2,
+      localTimeStepVersion: 1,
+      sameTarget: {
+        generationId: retryable.generationId,
+        targetId: retryable.targetId,
+        recipe: retryable.recipe,
+        remainingActiveSeconds: retryable.remainingActiveSeconds,
+        recoveryParentJobId: retryable.recoveryParentJobId ?? null,
+      },
+    });
+    expect(claimed).toMatchObject({ id: retryable.id });
+    const attempts = await db.execute(sql`
+      SELECT outcome FROM progressive_cfd_attempts
+      WHERE unit_id = ${retryable.id}::uuid ORDER BY started_at, token
+    `);
+    expect(attempts.map((attempt) => attempt.outcome)).toEqual(['failed', 'running']);
+
+    expect(await recoverTerminalProgressiveNoEvidenceGaps(db)).toBe(0);
+    const [strandedAfterReplay] = await db.execute(sql`
+      SELECT state, attempts, error FROM progressive_cfd_units
+      WHERE id = ${stranded.id}::uuid
+    `);
+    expect(strandedAfterReplay).toMatchObject({
+      state: 'gap',
+      attempts: 2,
       error: 'terminal execution has no measured case evidence',
     });
   });
