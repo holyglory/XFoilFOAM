@@ -4753,7 +4753,7 @@ export async function importPolarPush(
       resultId: string,
       archiveOnlyReplay = false,
     ) => {
-      const [existingAttempt] = await tx
+      const existingAttempts = await tx
         .select()
         .from(resultAttempts)
         .where(
@@ -4767,31 +4767,31 @@ export async function importPolarPush(
               : isNull(resultAttempts.simJobId),
           ),
         )
-        .limit(1);
-      if (existingAttempt) {
-        if (existingAttempt.resultId !== resultId) {
-          return { kind: "conflict" as const, attempt: existingAttempt };
-        }
-        if (
-          !archiveOnlyReplay &&
-          stableHash(
-            comparableRemoteAttempt(
-              existingAttempt as unknown as Record<string, unknown>,
-            ),
-          ) !==
+        .orderBy(resultAttempts.createdAt, resultAttempts.id);
+      const matchingAttempt = existingAttempts.find(
+        (candidate) =>
+          candidate.resultId === resultId &&
+          (archiveOnlyReplay ||
             stableHash(
               comparableRemoteAttempt(
-                ownedAttemptValues as Record<string, unknown>,
+                candidate as unknown as Record<string, unknown>,
               ),
-            )
-        ) {
-          return { kind: "conflict" as const, attempt: existingAttempt };
-        }
+            ) ===
+              stableHash(
+                comparableRemoteAttempt(
+                  ownedAttemptValues as Record<string, unknown>,
+                ),
+              )),
+      );
+      if (matchingAttempt) {
         return {
           kind: "existing" as const,
-          attempt: { id: existingAttempt.id },
+          attempt: { id: matchingAttempt.id },
         };
       }
+      const existingAttempt = existingAttempts[0];
+      if (existingAttempt && !progressivePoint)
+        return { kind: "conflict" as const, attempt: existingAttempt };
       const [attempt] = await tx
         .insert(resultAttempts)
         .values({
