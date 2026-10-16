@@ -8598,6 +8598,7 @@ export async function registerSyncRoutes(app: FastifyInstance): Promise<void> {
           | "promise_inactive"
           | "progressive_scope_closed"
           | null = null;
+        let progressiveEvidencePending = false;
         let pendingError: string | null = null;
         let permissionError: string | null = null;
         let blobLocks: Awaited<ReturnType<typeof acquireSyncBlobLocks>> | null =
@@ -8652,6 +8653,11 @@ export async function registerSyncRoutes(app: FastifyInstance): Promise<void> {
             conflictError = error.message;
             conflictCode = "progressive_scope_closed";
           } else if (
+            error instanceof ProgressiveRemoteEvidenceConflict &&
+            error.message === "Progressive evidence report has not reached the hub"
+          ) {
+            progressiveEvidencePending = true;
+          } else if (
             error instanceof PolarPromiseScopeError ||
             error instanceof PolarEvidenceBindingError ||
             error instanceof ProgressiveRemoteEvidenceConflict
@@ -8683,6 +8689,11 @@ export async function registerSyncRoutes(app: FastifyInstance): Promise<void> {
           return reply.header("retry-after", "2").code(503).send({
             code: "progressive_cfd_evidence_scope_pending",
             error: pendingError,
+          });
+        if (progressiveEvidencePending)
+          return reply.header("retry-after", "2").code(503).send({
+            code: "progressive_remote_evidence_pending",
+            error: "Progressive evidence report has not reached the hub",
           });
         if (response) {
           // A later exact delivery can make an earlier replay conflict obsolete.
@@ -8734,6 +8745,22 @@ export async function registerSyncRoutes(app: FastifyInstance): Promise<void> {
       .select({
         id: syncImportConflicts.id,
         status: syncImportConflicts.status,
+        dataType: syncImportConflicts.dataType,
+        localHasCurrentAttempt: sql<boolean>`${syncImportConflicts.localSnapshot}->>'currentResultAttemptId' IS NOT NULL`,
+        progressiveReportReady: sql<boolean>`CASE
+          WHEN ${syncImportConflicts.dataType} = 'polars'
+            AND ${syncImportConflicts.incomingPayload}->'progressiveEvidence' IS NOT NULL
+            AND (${syncImportConflicts.incomingPayload}->>'engineJobId') ~ '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+            AND (${syncImportConflicts.incomingPayload}->'progressiveEvidence'->>'sequence') ~ '^[1-9][0-9]{0,18}$'
+            AND (${syncImportConflicts.incomingPayload}->'progressiveEvidence'->>'reportContentSignature') ~ '^[a-f0-9]{64}$'
+          THEN EXISTS (
+            SELECT 1 FROM progressive_remote_reports report
+            WHERE report.sim_job_id = (${syncImportConflicts.incomingPayload}->>'engineJobId')::uuid
+              AND report.sequence = (${syncImportConflicts.incomingPayload}->'progressiveEvidence'->>'sequence')::bigint
+              AND report.content_signature = ${syncImportConflicts.incomingPayload}->'progressiveEvidence'->>'reportContentSignature'
+          )
+          ELSE false
+        END`,
         exactGenerationAccepted: sql<boolean>`coalesce(
           ${syncImportConflicts.status} = 'archived'
           AND ${syncImportConflicts.resolutionNote} = 'automatically cleared: exact promised generation was subsequently accepted', false)`,
@@ -8747,7 +8774,18 @@ export async function registerSyncRoutes(app: FastifyInstance): Promise<void> {
             : undefined,
         ),
       );
-    return { conflicts: rows };
+    return {
+      conflicts: rows.map((row) => ({
+        id: row.id,
+        status: row.status,
+        exactGenerationAccepted: row.exactGenerationAccepted,
+        retryable:
+          row.status === "pending" &&
+          row.dataType === "polars" &&
+          row.progressiveReportReady === true &&
+          row.localHasCurrentAttempt !== true,
+      })),
+    };
   });
 
   app.get("/api/sync/v1/artifacts/:id/download", async (req, reply) => {

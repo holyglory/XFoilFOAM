@@ -87,7 +87,10 @@ export async function reopenResolvedProgressiveConflicts(
   }
   for (const row of blocked) {
     if (
-      !(row.remote_conflict_ids as string[]).every((id) => replayable.has(id))
+      !(row.remote_conflict_ids as string[]).every(
+        (id) => replayable.has(id),
+      ) &&
+      !row.retryable
     )
       continue;
     const changed =

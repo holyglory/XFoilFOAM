@@ -5689,8 +5689,13 @@ async function pushOneRemoteResult(
       const incompleteMultipart =
         response.status === 400 &&
         /missing multipart upload field/i.test(remoteDetail);
+      const progressiveEvidencePending =
+        response.status === 503 &&
+        responsePayload?.error ===
+          "Progressive evidence report has not reached the hub";
       if (
         incompleteMultipart ||
+        progressiveEvidencePending ||
         response.status >= 500 ||
         response.status === 408 ||
         response.status === 429

@@ -171,6 +171,23 @@ export async function verifyProgressiveWorkerEvidenceDelivery(
       expect(await reopenResolvedProgressiveConflicts(db, unused)).toBe(0);
       expect(unused).not.toHaveBeenCalled();
     }
+    await db.execute(sql`UPDATE progressive_worker_delivery_failures
+      SET state='conflict',retry_after=NULL,updated_at=clock_timestamp()-interval '6 minutes',remote_conflict_ids=${JSON.stringify([remoteConflictId])}::jsonb
+      WHERE sim_job_id=${executionId}::uuid`);
+    const retryable = vi.fn(async () =>
+      Response.json({
+        conflicts: [{ id: remoteConflictId, status: "pending", retryable: true }],
+      }),
+    );
+    expect(await reopenResolvedProgressiveConflicts(db, retryable)).toBe(1);
+    const [reopenedRetryable] =
+      await db.execute(sql`SELECT state,retry_after<=clock_timestamp() AS due,remote_conflict_ids
+      FROM progressive_worker_delivery_failures WHERE sim_job_id=${executionId}::uuid`);
+    expect(reopenedRetryable).toMatchObject({
+      state: "retry",
+      due: true,
+      remote_conflict_ids: [],
+    });
     for (const resolution of [
       { status: "archived", exactGenerationAccepted: true },
       { status: "promoted" },
