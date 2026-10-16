@@ -311,12 +311,6 @@ export async function stageNextProgressiveWorkerEvidence(
   try {
     const claimed = await db.transaction(async (transaction) => {
       const connection = transaction as unknown as DB;
-      const [admissionLock] = await connection.execute(sql`
-        SELECT pg_try_advisory_xact_lock(
-          hashtextextended('progressive-worker-evidence-admission', 0)
-        ) AS acquired
-      `);
-      if (!admissionLock?.acquired) return null;
       const [selected] = await connection.execute(
         progressiveStagingSelectionSql(hooks.preferActive === true),
       );
