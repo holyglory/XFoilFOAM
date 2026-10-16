@@ -16,7 +16,8 @@ const TERMINAL_NO_EVIDENCE_REASON =
   "terminal execution has no measured case evidence";
 const TERMINAL_NO_EVIDENCE_RETRY_REASON =
   "Retrying after terminal execution without measurable case evidence";
-const PROGRESSIVE_REMOTE_RECOVERY_UNITS_PER_PASS = 16;
+const PROGRESSIVE_INACTIVE_RECOVERY_UNITS_PER_PASS = 64;
+const PROGRESSIVE_TERMINAL_RECOVERY_UNITS_PER_PASS = 16;
 
 export async function recoverUnboundProgressiveCfdLeases(
   db: DB,
@@ -104,7 +105,7 @@ export async function recoverInactiveProgressiveRemoteGaps(
         AND unit.attempts < 3
         AND unit.active_seconds < unit.active_budget_seconds
       ORDER BY unit.id
-      LIMIT ${PROGRESSIVE_REMOTE_RECOVERY_UNITS_PER_PASS}
+      LIMIT ${PROGRESSIVE_INACTIVE_RECOVERY_UNITS_PER_PASS}
       FOR UPDATE OF generation, work, unit SKIP LOCKED
     `);
     for (const unit of units) {
@@ -232,7 +233,7 @@ export async function recoverTerminalProgressiveNoEvidenceGaps(
             AND unsettled_stop.sim_job_id IS NULL
         )
       ORDER BY unit.id
-      LIMIT ${PROGRESSIVE_REMOTE_RECOVERY_UNITS_PER_PASS}
+      LIMIT ${PROGRESSIVE_TERMINAL_RECOVERY_UNITS_PER_PASS}
       FOR UPDATE OF generation, work, unit, attempt SKIP LOCKED
     `);
     let recovered = 0;
