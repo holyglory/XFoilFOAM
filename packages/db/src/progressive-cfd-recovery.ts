@@ -152,6 +152,54 @@ export async function recoverTerminalProgressiveNoEvidenceGaps(
       sql`SELECT id FROM calculation_epochs WHERE current FOR SHARE`,
     );
     if (!epoch) throw new Error("Calculation epoch is missing");
+    await connection.execute(sql`
+      WITH stranded AS MATERIALIZED (
+        SELECT attempt.token, unit.id AS unit_id
+        FROM progressive_cfd_attempts attempt
+        JOIN progressive_cfd_units unit ON unit.id = attempt.unit_id
+        JOIN progressive_work work ON work.id = unit.work_id
+        JOIN progressive_generations generation ON generation.id = work.generation_id
+        JOIN sim_campaigns campaign ON campaign.id = generation.campaign_id
+        JOIN sim_jobs job ON job.id = attempt.sim_job_id
+        JOIN progressive_cfd_execution_stops stopped ON stopped.sim_job_id = job.id
+          AND stopped.engine_job_id = job.engine_job_id
+        WHERE generation.epoch_id = ${epoch.id}
+          AND generation.status = 'active'
+          AND generation.plan_revision_id = campaign.current_plan_revision_id
+          AND ${effectiveProgressiveStageSql()} = work.stage
+          AND work.state IN ('pending', 'gap')
+          AND campaign.status IN ('active', 'attention', 'paused')
+          AND unit.state = 'leased'
+          AND attempt.outcome = 'running'
+          AND job.status IN ('ingesting', 'done', 'failed', 'cancelled')
+          AND job.engine_state IN ('completed', 'failed', 'cancelled')
+          AND job."updatedAt" <= clock_timestamp() - interval '15 minutes'
+          AND NOT EXISTS (
+            SELECT 1 FROM progressive_cfd_evidence evidence
+            WHERE evidence.attempt_token = attempt.token
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM progressive_cfd_attempts newer
+            WHERE newer.unit_id = unit.id
+              AND (newer.started_at, newer.token) > (attempt.started_at, attempt.token)
+          )
+        ORDER BY unit.id
+        LIMIT ${PROGRESSIVE_TERMINAL_RECOVERY_UNITS_PER_PASS}
+        FOR UPDATE OF attempt, unit, job SKIP LOCKED
+      ), changed AS (
+        UPDATE progressive_cfd_attempts attempt
+        SET outcome = 'failed', finished_at = clock_timestamp(),
+            error = ${TERMINAL_NO_EVIDENCE_REASON}
+        FROM stranded
+        WHERE attempt.token = stranded.token
+        RETURNING stranded.unit_id
+      )
+      UPDATE progressive_cfd_units unit
+      SET state = 'gap', lease_token = NULL, lease_owner = NULL,
+          lease_until = NULL, error = ${TERMINAL_NO_EVIDENCE_REASON}
+      FROM changed
+      WHERE unit.id = changed.unit_id
+    `);
     const ordinaryAttempts = progressiveCfdOrdinaryAttemptCountSql();
     const pendingBudgetExtension = progressiveCfdBudgetExtensionPendingSql(
       sql`unit`,
