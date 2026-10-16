@@ -44,14 +44,14 @@ async function applyProgressiveRemoteProgressInTransaction(
     await connection.execute(
       sql`SELECT id FROM calculation_epochs WHERE id = ${envelope.scope.epochId}::uuid FOR SHARE`,
     );
+    await connection.execute(sql`SELECT campaign.id FROM sim_campaigns campaign JOIN sim_jobs job ON job.campaign_id = campaign.id
+      WHERE job.id = ${executionId}::uuid FOR UPDATE OF campaign`);
     const [job] = await connection.execute(
-      sql`SELECT job.engine_job_id, job.status, job.engine_state, job.completed_cases, job.request_payload,
-        EXISTS (SELECT 1 FROM sim_campaigns campaign WHERE campaign.id = job.campaign_id) AS campaign_owned
-      FROM sim_jobs job WHERE job.id = ${executionId}::uuid FOR UPDATE OF job`,
+      sql`SELECT engine_job_id, status, engine_state, completed_cases, request_payload
+      FROM sim_jobs WHERE id = ${executionId}::uuid FOR UPDATE`,
     );
     if (
       !job ||
-      job.campaign_owned !== true ||
       (job.engine_job_id !== null && job.engine_job_id !== executionId) ||
       canonicalAnalysisJson(
         (job.request_payload as Record<string, unknown>).engineRequest,

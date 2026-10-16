@@ -312,7 +312,7 @@ async function publishAcceptedProgressiveAttempts(db: DB, executionId: string) {
       AND generation.status <> 'cancelled'
       AND generation.plan_revision_id = campaign.current_plan_revision_id
       AND campaign.status IN ('active', 'attention', 'paused', 'completed')
-    FOR SHARE OF epoch FOR UPDATE OF job
+    FOR SHARE OF epoch FOR UPDATE OF campaign, job
   `);
   if (!current || current.ingestion_owned) return;
   if (!current.ingestedAt)
@@ -435,14 +435,14 @@ export async function settleProgressiveRemoteJob(db: DB, executionId: string) {
     await connection.execute(
       sql`SELECT id FROM calculation_epochs WHERE id = ${envelope.scope.epochId}::uuid FOR SHARE`,
     );
+    await connection.execute(sql`SELECT campaign.id FROM sim_campaigns campaign JOIN sim_jobs job ON job.campaign_id = campaign.id
+      WHERE job.id = ${executionId}::uuid FOR UPDATE OF campaign`);
     const [job] =
       await connection.execute(sql`SELECT engine_job_id, request_payload, status, "ingestedAt",
-        ingest_lease_expires_at > clock_timestamp() AS ingestion_owned,
-        EXISTS (SELECT 1 FROM sim_campaigns campaign WHERE campaign.id = job.campaign_id) AS campaign_owned
-      FROM sim_jobs job WHERE job.id = ${executionId}::uuid FOR UPDATE OF job`);
+        ingest_lease_expires_at > clock_timestamp() AS ingestion_owned
+      FROM sim_jobs WHERE id = ${executionId}::uuid FOR UPDATE`);
     if (
       !job ||
-      job.campaign_owned !== true ||
       job.engine_job_id !== executionId ||
       canonicalAnalysisJson(
         (job.request_payload as Record<string, unknown>).engineRequest,
