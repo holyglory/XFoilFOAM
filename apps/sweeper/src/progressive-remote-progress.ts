@@ -21,6 +21,7 @@ import {
 } from "./progressive-progress-selection";
 
 const MAX_PROGRESSIVE_REPORTS_PER_EXECUTION = 16;
+const MAX_PROGRESSIVE_CAMPAIGN_JOBS_PER_TRANSACTION = 8;
 
 async function applyProgressiveRemoteProgressInTransaction(
   db: DB,
@@ -257,7 +258,7 @@ async function reconcileProgressiveRemoteCampaign(
     };
     if (!campaign) return receipt;
 
-    for (const job of jobs) {
+    for (const job of jobs.slice(0, MAX_PROGRESSIVE_CAMPAIGN_JOBS_PER_TRANSACTION)) {
       const executionId = String(job.sim_job_id);
       try {
         await connection.transaction(async (savepoint) => {
