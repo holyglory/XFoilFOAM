@@ -170,6 +170,10 @@ it("prioritizes current unsubmitted remote reports before older running backlog"
     await transaction.execute(sql`CREATE TEMP TABLE progressive_remote_report_inventories (
       sim_job_id uuid,sequence bigint
     ) ON COMMIT DROP`);
+    await transaction.execute(sql`INSERT INTO progressive_remote_progress_receipts
+      VALUES (md5('retained')::uuid,1)`);
+    await transaction.execute(sql`INSERT INTO progressive_remote_report_inventories
+      VALUES (md5('retained')::uuid,1)`);
 
     const selected = await transaction.execute(progressiveReportJobsSql());
 
@@ -221,11 +225,90 @@ it("prioritizes active remote reports before terminal ingestion backlog", async 
   });
 });
 
+it("selects closed terminal jobs with retained evidence for classification settlement", async () => {
+  await client.db.transaction(async (transaction) => {
+    await transaction.execute(sql`CREATE TEMP TABLE sim_campaigns ON COMMIT DROP AS
+      SELECT md5('campaign')::uuid AS id,'active'::text AS status`);
+    await transaction.execute(sql`CREATE TEMP TABLE sim_jobs ON COMMIT DROP AS
+      SELECT md5('retained')::uuid AS id,md5('campaign')::uuid AS campaign_id,
+        'done'::text AS status,'completed'::text AS engine_state,
+        clock_timestamp()-interval '1 hour' AS "updatedAt",
+        clock_timestamp()-interval '1 hour' AS "polledAt"
+      UNION ALL
+      SELECT md5('unretained')::uuid,md5('campaign')::uuid,
+        'done','completed',clock_timestamp()-interval '2 hours',clock_timestamp()-interval '2 hours'`);
+    await transaction.execute(sql`CREATE TEMP TABLE progressive_remote_dispatches ON COMMIT DROP AS
+      SELECT id AS sim_job_id,id AS promise_id FROM sim_jobs`);
+    await transaction.execute(sql`CREATE TEMP TABLE sync_sweep_promises ON COMMIT DROP AS
+      SELECT id,'expired'::text AS status FROM sim_jobs`);
+    await transaction.execute(sql`CREATE TEMP TABLE progressive_remote_reports ON COMMIT DROP AS
+      SELECT id AS sim_job_id,1::bigint AS sequence,clock_timestamp() AS received_at FROM sim_jobs`);
+    await transaction.execute(sql`CREATE TEMP TABLE progressive_remote_progress_receipts (
+      sim_job_id uuid,sequence bigint
+    ) ON COMMIT DROP`);
+    await transaction.execute(sql`CREATE TEMP TABLE progressive_remote_report_inventories (
+      sim_job_id uuid,sequence bigint
+    ) ON COMMIT DROP`);
+    await transaction.execute(sql`CREATE TEMP TABLE progressive_remote_evidence_receipts (
+      sim_job_id uuid,storage_only boolean
+    ) ON COMMIT DROP`);
+    await transaction.execute(sql`INSERT INTO progressive_remote_progress_receipts
+      VALUES (md5('retained')::uuid,1)`);
+    await transaction.execute(sql`INSERT INTO progressive_remote_report_inventories
+      VALUES (md5('retained')::uuid,1)`);
+    await transaction.execute(sql`INSERT INTO progressive_remote_evidence_receipts
+      VALUES (md5('retained')::uuid,false)`);
+    await transaction.execute(sql`CREATE TEMP TABLE progressive_cfd_execution_stops (
+      sim_job_id uuid
+    ) ON COMMIT DROP`);
+    await transaction.execute(sql`INSERT INTO progressive_cfd_execution_stops
+      VALUES (md5('retained')::uuid),(md5('unretained')::uuid)`);
+    await transaction.execute(sql`CREATE TEMP TABLE result_attempts (
+      id uuid,result_id uuid,sim_job_id uuid,status text,valid_for_polar boolean
+    ) ON COMMIT DROP`);
+    await transaction.execute(sql`INSERT INTO result_attempts
+      VALUES (md5('retained-attempt')::uuid,md5('retained-result')::uuid,md5('retained')::uuid,'done',true),
+        (md5('unretained-attempt')::uuid,md5('unretained-result')::uuid,md5('unretained')::uuid,'done',true)`);
+    await transaction.execute(sql`CREATE TEMP TABLE progressive_cfd_attempts (
+      token uuid,sim_job_id uuid,outcome text,unit_id uuid,started_at timestamptz
+    ) ON COMMIT DROP`);
+    await transaction.execute(sql`CREATE TEMP TABLE progressive_cfd_units (
+      id uuid,work_id uuid,state text,lease_token uuid,lease_until timestamptz
+    ) ON COMMIT DROP`);
+    await transaction.execute(sql`CREATE TEMP TABLE progressive_work (
+      id uuid,generation_id uuid,target_id uuid
+    ) ON COMMIT DROP`);
+    await transaction.execute(sql`CREATE TEMP TABLE progressive_generation_cohort_targets (
+      generation_id uuid,target_id uuid,cohort text
+    ) ON COMMIT DROP`);
+    await transaction.execute(sql`CREATE TEMP TABLE results (
+      id uuid,current_result_attempt_id uuid,sim_job_id uuid
+    ) ON COMMIT DROP`);
+    await transaction.execute(sql`CREATE TEMP TABLE result_classifications (
+      result_attempt_id uuid,state text
+    ) ON COMMIT DROP`);
+    await transaction.execute(sql`CREATE TEMP TABLE result_review_verdicts (
+      id uuid,result_id uuid,verdict text,"revokedAt" timestamptz,"createdAt" timestamptz
+    ) ON COMMIT DROP`);
+    const selected = await transaction.execute(progressiveSettlementJobsSql());
+    const [{ id: retainedId }, { id: unretainedId }] =
+      await transaction.execute(
+        sql`SELECT md5('retained')::uuid AS id UNION ALL SELECT md5('unretained')::uuid AS id`,
+      );
+    expect(selected.map((row) => row.sim_job_id)).toContain(
+      retainedId,
+    );
+    expect(selected.map((row) => row.sim_job_id)).not.toContain(
+      unretainedId,
+    );
+  });
+});
+
 it("settles fulfilled and active jobs fairly while expired work keeps arriving", async () => {
   await client.db.transaction(async (transaction) => {
     await transaction.execute(sql`CREATE TEMP TABLE fixture_settlement_jobs ON COMMIT DROP AS
       SELECT md5(variant)::uuid AS id,variant FROM unnest(ARRAY['fulfilled','active','unapplied','unindexed','executing','not-dispatched',
-        'stopped-running','stopped-terminal','done-active','done-closed','done-closed-pointer-gap']) variant
+        'stopped-running','stopped-terminal','done-active','done-closed','done-closed-pointer-gap','done-closed-evidence']) variant
       UNION ALL SELECT md5('expired-'||ordinal)::uuid,'expired-'||ordinal FROM generate_series(1,160) ordinal
       UNION ALL SELECT md5('report-unapplied-'||ordinal)::uuid,'report-unapplied-'||ordinal FROM generate_series(1,24) ordinal
       UNION ALL SELECT md5('report-unindexed-'||ordinal)::uuid,'report-unindexed-'||ordinal FROM generate_series(1,24) ordinal`);
@@ -235,21 +318,21 @@ it("settles fulfilled and active jobs fairly while expired work keeps arriving",
       SELECT id,md5('campaign')::uuid AS campaign_id,
         NULL::text AS engine_job_id,
         CASE WHEN variant IN ('executing','stopped-running') THEN 'running'
-          WHEN variant IN ('stopped-terminal','done-active','done-closed','done-closed-pointer-gap') THEN 'done' ELSE 'ingesting' END AS status,
+          WHEN variant IN ('stopped-terminal','done-active','done-closed','done-closed-pointer-gap','done-closed-evidence') THEN 'done' ELSE 'ingesting' END AS status,
         CASE WHEN variant IN ('executing','stopped-running') THEN 'running' ELSE 'completed' END AS engine_state,
         clock_timestamp()-interval '2 days' AS "updatedAt",
         CASE WHEN variant<>'report-unapplied-1' THEN clock_timestamp()-CASE WHEN variant='fulfilled' THEN interval '1 day' ELSE interval '1 hour' END END AS "polledAt"
       FROM fixture_settlement_jobs`);
     await transaction.execute(sql`CREATE TEMP TABLE results ON COMMIT DROP AS
       SELECT md5('result-'||variant)::uuid AS id,NULL::uuid AS current_result_attempt_id
-      FROM fixture_settlement_jobs WHERE variant='done-closed-pointer-gap'`);
+      FROM fixture_settlement_jobs WHERE variant IN ('done-closed-pointer-gap','done-closed-evidence')`);
     await transaction.execute(sql`CREATE TEMP TABLE result_attempts ON COMMIT DROP AS
       SELECT md5('attempt-'||variant)::uuid AS id,md5('result-'||variant)::uuid AS result_id,
         id AS sim_job_id,'done'::text AS status,true AS valid_for_polar
-      FROM fixture_settlement_jobs WHERE variant='done-closed-pointer-gap'`);
+      FROM fixture_settlement_jobs WHERE variant IN ('done-closed-pointer-gap','done-closed-evidence')`);
     await transaction.execute(sql`CREATE TEMP TABLE result_classifications ON COMMIT DROP AS
       SELECT md5('attempt-'||variant)::uuid AS result_attempt_id,'accepted'::text AS state
-      FROM fixture_settlement_jobs WHERE variant='done-closed-pointer-gap'`);
+      FROM fixture_settlement_jobs WHERE variant IN ('done-closed-pointer-gap','done-closed-evidence')`);
     await transaction.execute(sql`CREATE TEMP TABLE result_review_verdicts (
       id uuid, result_id uuid, verdict text, "revokedAt" timestamptz, "createdAt" timestamptz
     ) ON COMMIT DROP`);
@@ -258,7 +341,7 @@ it("settles fulfilled and active jobs fairly while expired work keeps arriving",
     await transaction.execute(sql`CREATE TEMP TABLE sync_sweep_promises ON COMMIT DROP AS
       SELECT id,CASE WHEN variant LIKE 'expired-%' THEN 'expired'
         WHEN variant IN ('fulfilled','stopped-terminal','done-closed') THEN 'fulfilled'
-        WHEN variant='done-closed-pointer-gap' THEN 'expired' ELSE 'active' END AS status
+        WHEN variant IN ('done-closed-pointer-gap','done-closed-evidence') THEN 'expired' ELSE 'active' END AS status
       FROM fixture_settlement_jobs`);
     await transaction.execute(sql`CREATE TEMP TABLE progressive_remote_reports ON COMMIT DROP AS
       SELECT id AS sim_job_id,1 AS sequence,
@@ -272,6 +355,13 @@ it("settles fulfilled and active jobs fairly while expired work keeps arriving",
     await transaction.execute(sql`CREATE TEMP TABLE progressive_remote_report_inventories ON COMMIT DROP AS
       SELECT id AS sim_job_id,1 AS sequence FROM fixture_settlement_jobs
       WHERE variant<>'unindexed' AND variant NOT LIKE 'report-unindexed-%'`);
+    await transaction.execute(sql`CREATE TEMP TABLE progressive_remote_evidence_receipts (
+      sim_job_id uuid,sequence bigint,point_content_signature text,result_attempt_id uuid,
+      remote_result_id uuid,remote_result_attempt_id uuid,received_at timestamptz,storage_only boolean
+    ) ON COMMIT DROP`);
+    await transaction.execute(sql`INSERT INTO progressive_remote_evidence_receipts
+      SELECT md5('done-closed-evidence')::uuid,1,'signature',md5('attempt-done-closed-evidence')::uuid,
+        md5('result-done-closed-evidence')::uuid,md5('attempt-done-closed-evidence')::uuid,clock_timestamp(),false`);
     await transaction.execute(
       sql`CREATE TEMP TABLE progressive_cfd_execution_stops (sim_job_id uuid) ON COMMIT DROP`,
     );
@@ -289,9 +379,9 @@ it("settles fulfilled and active jobs fairly while expired work keeps arriving",
     );
     await transaction.execute(sql`INSERT INTO progressive_cfd_units
       SELECT id,id,
-        CASE WHEN variant='done-closed-pointer-gap' THEN 'leased' END,
-        CASE WHEN variant='done-closed-pointer-gap' THEN md5('attempt-'||variant)::uuid END,
-        CASE WHEN variant='done-closed-pointer-gap' THEN clock_timestamp()-interval '1 hour' END
+        CASE WHEN variant IN ('done-closed-pointer-gap','done-closed-evidence') THEN 'leased' END,
+        CASE WHEN variant IN ('done-closed-pointer-gap','done-closed-evidence') THEN md5('attempt-'||variant)::uuid END,
+        CASE WHEN variant IN ('done-closed-pointer-gap','done-closed-evidence') THEN clock_timestamp()-interval '1 hour' END
       FROM fixture_settlement_jobs`);
     await transaction.execute(sql`INSERT INTO progressive_work
       SELECT id,md5('generation')::uuid,id FROM fixture_settlement_jobs`);
@@ -300,14 +390,14 @@ it("settles fulfilled and active jobs fairly while expired work keeps arriving",
         'high'
       FROM fixture_settlement_jobs`);
     await transaction.execute(sql`INSERT INTO progressive_cfd_execution_stops
-      SELECT id FROM fixture_settlement_jobs WHERE variant IN ('stopped-running','stopped-terminal','done-closed-pointer-gap')`);
+      SELECT id FROM fixture_settlement_jobs WHERE variant IN ('stopped-running','stopped-terminal','done-closed-pointer-gap','done-closed-evidence')`);
     await transaction.execute(sql`INSERT INTO progressive_cfd_attempts
       SELECT md5('attempt-'||variant)::uuid,id,
         CASE WHEN variant='stopped-terminal' THEN 'complete'
-          WHEN variant='done-closed-pointer-gap' THEN 'cancelled' ELSE 'running' END,
+          WHEN variant IN ('done-closed-pointer-gap','done-closed-evidence') THEN 'cancelled' ELSE 'running' END,
         id,clock_timestamp()-interval '2 hours'
       FROM fixture_settlement_jobs
-      WHERE variant IN ('executing','stopped-running','stopped-terminal','done-closed-pointer-gap')`);
+      WHERE variant IN ('executing','stopped-running','stopped-terminal','done-closed-pointer-gap','done-closed-evidence')`);
     const expectedReports = () =>
       transaction.execute(sql`SELECT job.id AS sim_job_id,job.campaign_id
         FROM sim_jobs job JOIN fixture_settlement_jobs fixture ON fixture.id=job.id
@@ -342,9 +432,9 @@ it("settles fulfilled and active jobs fairly while expired work keeps arriving",
             ON member.generation_id = work.generation_id AND member.target_id = work.target_id
           WHERE attempt.sim_job_id = job.id
         ) cohort_priority ON true
-        WHERE fixture.variant IN ('fulfilled','active','stopped-running','done-active','done-closed-pointer-gap') OR fixture.variant LIKE 'expired-%'
+        WHERE fixture.variant IN ('fulfilled','active','stopped-running','done-active','done-closed-pointer-gap','done-closed-evidence') OR fixture.variant LIKE 'expired-%'
         ORDER BY coalesce(cohort_priority.priority, 1),
-          CASE WHEN fixture.variant IN ('stopped-running','done-active','done-closed-pointer-gap') THEN 1 ELSE 0 END,
+          CASE WHEN fixture.variant IN ('stopped-running','done-active','done-closed-pointer-gap','done-closed-evidence') THEN 1 ELSE 0 END,
           coalesce(job."polledAt",job."updatedAt"),job.id`);
     const jobStates = await transaction.execute(
       sql`SELECT id,status,engine_state FROM sim_jobs ORDER BY id`,
@@ -355,7 +445,7 @@ it("settles fulfilled and active jobs fairly while expired work keeps arriving",
     const allReports = await expectedReports();
     const allSettlements = await expectedSettlements();
     expect(allReports).toHaveLength(50);
-    expect(allSettlements).toHaveLength(165);
+    expect(allSettlements).toHaveLength(166);
     const reports = await transaction.execute(progressiveReportJobsSql());
     expect(reports).toHaveLength(32);
     expect(reports).toEqual(allReports.slice(0, 32));
@@ -375,7 +465,7 @@ it("settles fulfilled and active jobs fairly while expired work keeps arriving",
     const explicitRows =
       await transaction.execute(sql`SELECT id FROM fixture_settlement_jobs
       WHERE variant IN ('fulfilled','unapplied','unindexed','executing','not-dispatched',
-        'stopped-running','stopped-terminal','done-active','done-closed','done-closed-pointer-gap') ORDER BY id`);
+        'stopped-running','stopped-terminal','done-active','done-closed','done-closed-pointer-gap','done-closed-evidence') ORDER BY id`);
     const explicitIds = explicitRows.map((row) => String(row.id));
     for (const [selector, eligible] of [
       [progressiveReportJobsSql, allReports],
@@ -419,11 +509,11 @@ it("settles fulfilled and active jobs fairly while expired work keeps arriving",
     const visited = new Set([...first, ...second].map((row) => row.sim_job_id));
     const terminalRows =
       await transaction.execute(sql`SELECT id FROM fixture_settlement_jobs
-      WHERE variant IN ('fulfilled','active') OR variant LIKE 'expired-%'`);
+      WHERE variant IN ('fulfilled','active','done-closed-evidence') OR variant LIKE 'expired-%'`);
     expect([...visited].sort()).toEqual(
       terminalRows.map((row) => row.id).sort(),
     );
-    expect(visited.size).toBe(162);
+    expect(visited.size).toBe(163);
     const nextReports = await transaction.execute(progressiveReportJobsSql());
     expect(nextReports).toHaveLength(allReports.length - reports.length);
     expect(nextReports).toEqual(await expectedReports());

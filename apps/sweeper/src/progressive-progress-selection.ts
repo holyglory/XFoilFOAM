@@ -93,6 +93,13 @@ export function progressiveSettlementJobsSql(jobIds?: string[]) {
         OR (job.status IN ('done', 'failed', 'cancelled')
           AND EXISTS (SELECT 1 FROM progressive_cfd_execution_stops stopped
             WHERE stopped.sim_job_id = job.id)
+          AND EXISTS (SELECT 1 FROM progressive_remote_evidence_receipts evidence
+            WHERE evidence.sim_job_id = job.id AND NOT evidence.storage_only)
+          AND EXISTS (SELECT 1 FROM result_attempts raw
+            WHERE raw.sim_job_id = job.id AND raw.status = 'done'))
+        OR (job.status IN ('done', 'failed', 'cancelled')
+          AND EXISTS (SELECT 1 FROM progressive_cfd_execution_stops stopped
+            WHERE stopped.sim_job_id = job.id)
           AND EXISTS (SELECT 1
             FROM results result
             JOIN result_attempts raw ON raw.result_id = result.id
