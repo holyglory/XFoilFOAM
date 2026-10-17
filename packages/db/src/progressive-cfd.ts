@@ -309,12 +309,13 @@ export async function claimProgressiveCfdUnit(
       FROM progressive_cfd_attempts previous_attempt
       JOIN progressive_cfd_units previous_unit ON previous_unit.id = previous_attempt.unit_id
       JOIN progressive_work previous_work ON previous_work.id = previous_unit.work_id
-      JOIN progressive_generations previous_generation ON previous_generation.id = previous_work.generation_id
-      JOIN sim_jobs previous_job ON previous_job.id = previous_attempt.sim_job_id
-      WHERE previous_work.target_id = work.target_id
+      JOIN progressive_generations previous_generation
+        ON previous_generation.id = previous_work.generation_id
         AND previous_generation.campaign_id = generation.campaign_id
         AND previous_generation.id <> generation.id
         AND previous_generation.status IN ('active', 'attention', 'paused')
+      JOIN sim_jobs previous_job ON previous_job.id = previous_attempt.sim_job_id
+      WHERE previous_work.target_id = work.target_id
         AND generation.epoch_id = ${epoch.id} AND generation.status = 'active'
         AND NOT EXISTS (SELECT 1 FROM progressive_cfd_execution_stops stopped
           WHERE stopped.sim_job_id = previous_job.id AND stopped.engine_job_id = previous_job.engine_job_id)
