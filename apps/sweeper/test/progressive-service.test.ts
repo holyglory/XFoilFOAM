@@ -106,7 +106,7 @@ it("runs stage maintenance again without a solver notification and cleans its wa
   expect(vi.getTimerCount()).toBe(0);
 });
 
-it("drains retained evidence classifications without waiting for the next timer", async () => {
+it("keeps retained evidence classification on the maintenance cadence", async () => {
   vi.useFakeTimers();
   mocks.reconcileScope.mockResolvedValue(null);
   mocks.initialize.mockResolvedValue(0);
@@ -168,7 +168,7 @@ it("drains retained evidence classifications without waiting for the next timer"
     "preset-1",
     "job-1",
   );
-  expect(mocks.classifyRetained).toHaveBeenCalledTimes(2);
+  expect(mocks.classifyRetained).toHaveBeenCalledOnce();
   expect(reports).toContainEqual({
     component: "progressive-terminal-evidence-classification",
     classified: 1,
