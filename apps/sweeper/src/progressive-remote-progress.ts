@@ -21,7 +21,7 @@ import {
 } from "./progressive-progress-selection";
 
 const MAX_PROGRESSIVE_REPORTS_PER_EXECUTION = 16;
-const MAX_PROGRESSIVE_CAMPAIGN_JOBS_PER_TRANSACTION = 2;
+const MAX_PROGRESSIVE_CAMPAIGN_JOBS_PER_TRANSACTION = 1;
 
 async function applyProgressiveRemoteProgressInTransaction(
   db: DB,
