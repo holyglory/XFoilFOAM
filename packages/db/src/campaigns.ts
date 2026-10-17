@@ -7589,7 +7589,8 @@ export async function listCampaignsFast(
       coalesce(legacy.superseded, 0)::int AS superseded,
       coalesce(legacy.derived, 0)::int AS derived,
       coalesce(legacy.rejected, 0)::int AS rejected,
-      coalesce(legacy.blocked, 0)::int AS blocked
+      coalesce(legacy.blocked, 0)::int AS blocked,
+      activity.activity_at
     FROM selected
     LEFT JOIN legacy ON legacy.campaign_id = selected.id
     LEFT JOIN progressive ON progressive.campaign_id = selected.id
