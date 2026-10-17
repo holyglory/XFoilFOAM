@@ -127,8 +127,9 @@ export async function runProgressiveBaselineBatch(
     }
   } catch (error) {
     const retry =
-      error instanceof EngineError &&
-      (error.status === 502 || error.status === 503 || error.status === 504);
+      (error instanceof TypeError && error.message.trim() === "fetch failed") ||
+      (error instanceof EngineError &&
+        (error.status === 502 || error.status === 503 || error.status === 504));
     for (const lease of pending) {
       try {
         await failProgressiveWork(db, lease, String(error), retry);
