@@ -25,6 +25,7 @@ import {
   continueLane,
   forceReleaseCondition,
   listCampaigns,
+  listCampaignsFast,
   materializeCampaignLaunch,
   pauseCampaign,
   previewAddCampaignAirfoils,
@@ -212,13 +213,20 @@ export async function registerCampaignRoutes(
           ),
         limit: z.coerce.number().int().min(1).max(100).default(25),
         offset: z.coerce.number().int().min(0).default(0),
+        fast: z.enum(["1", "true"]).optional(),
       })
       .parse(req.query);
-    const listing = await listCampaigns(db, {
-      statuses: q.status,
-      limit: q.limit,
-      offset: q.offset,
-    });
+    const listing = q.fast
+      ? await listCampaignsFast(db, {
+          statuses: q.status,
+          limit: q.limit,
+          offset: q.offset,
+        })
+      : await listCampaigns(db, {
+          statuses: q.status,
+          limit: q.limit,
+          offset: q.offset,
+        });
     // Cheap solver-state block (pinned contract): sweeper_state row + active
     // sim_jobs count + the SAME cached engine-health probe the queue endpoint
     // uses — no new probe paths.

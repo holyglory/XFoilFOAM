@@ -187,6 +187,7 @@ export function CampaignsHub({
       const result = await listCampaigns({
         statuses: seg === "active" ? ACTIVE_STATUSES : undefined,
         limit: 50,
+        fast: seg === "active",
       });
       setErr(null);
       setItems(result.items);

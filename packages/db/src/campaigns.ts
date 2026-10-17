@@ -7507,6 +7507,135 @@ export interface CampaignListItem {
 const isoOf = (v: Date | string | null): string | null =>
   v == null ? null : v instanceof Date ? v.toISOString() : v;
 
+export async function listCampaignsFast(
+  db: DB,
+  opts: { statuses?: string[]; limit?: number; offset?: number } = {},
+): Promise<{ items: CampaignListItem[]; total: number }> {
+  const limit = Math.min(Math.max(opts.limit ?? 25, 1), 100);
+  const offset = Math.max(opts.offset ?? 0, 0);
+  const statusFilter =
+    opts.statuses && opts.statuses.length > 0
+      ? sql`WHERE c.status = ANY(${pgTextArray(opts.statuses)}::text[])`
+      : sql``;
+  const rows = (await db.execute(sql`
+    WITH selected AS MATERIALIZED (
+      SELECT c.id, c.slug, c.name, c.status, c.priority, c.notes,
+        c.closed_with_failed_count, c.closed_with_rejected_count,
+        c."completedAt" AS completed_at, c."createdAt" AS created_at,
+        c."updatedAt" AS updated_at, c.current_condition_generation,
+        c.current_plan_revision_id,
+        (SELECT count(*)::int FROM sim_campaign_conditions condition
+          WHERE condition.campaign_id = c.id
+            AND condition.generation = c.current_condition_generation) AS condition_count,
+        (SELECT count(*)::int FROM sim_campaign_airfoils membership
+          JOIN airfoils airfoil ON airfoil.id = membership.airfoil_id
+          WHERE membership.campaign_id = c.id
+            AND airfoil."archivedAt" IS NULL AND airfoil."deletedAt" IS NULL) AS airfoil_count,
+        (SELECT count(*)::int FROM sim_campaign_airfoils membership
+          JOIN airfoils airfoil ON airfoil.id = membership.airfoil_id
+          WHERE membership.campaign_id = c.id
+            AND (airfoil."archivedAt" IS NOT NULL OR airfoil."deletedAt" IS NOT NULL)) AS excluded_airfoil_count,
+        count(*) OVER ()::int AS total
+      FROM sim_campaigns c
+      ${statusFilter}
+      ORDER BY (c.status = 'attention') DESC, c."updatedAt" DESC
+      LIMIT ${limit} OFFSET ${offset}
+    ), legacy AS (
+      SELECT progress.campaign_id,
+        coalesce(sum(progress.requested), 0)::int AS requested,
+        coalesce(sum(progress.solved), 0)::int AS solved,
+        coalesce(sum(progress.failed), 0)::int AS failed,
+        coalesce(sum(progress.running), 0)::int AS running,
+        coalesce(sum(progress.superseded), 0)::int AS superseded,
+        coalesce(sum(progress.derived), 0)::int AS derived,
+        coalesce(sum(progress.rejected), 0)::int AS rejected,
+        coalesce(sum(progress.blocked), 0)::int AS blocked
+      FROM sim_campaign_progress progress
+      JOIN selected ON selected.id = progress.campaign_id
+      JOIN sim_campaign_conditions condition
+        ON condition.id = progress.condition_id
+       AND condition.generation = selected.current_condition_generation
+      GROUP BY progress.campaign_id
+    ), progressive AS (
+      SELECT generation.campaign_id,
+        coalesce(sum(cardinality(scope.angles)), 0)::int AS requested
+      FROM progressive_generations generation
+      JOIN selected ON selected.id = generation.campaign_id
+      JOIN calculation_epochs epoch
+        ON epoch.id = generation.epoch_id AND epoch.current
+      JOIN progressive_generation_targets scope
+        ON scope.generation_id = generation.id
+      WHERE generation.plan_revision_id = selected.current_plan_revision_id
+        AND generation.status <> 'cancelled'
+      GROUP BY generation.campaign_id
+    )
+    SELECT selected.*,
+      coalesce(progressive.requested, legacy.requested, 0)::int AS requested,
+      coalesce(legacy.solved, 0)::int AS solved,
+      coalesce(legacy.failed, 0)::int AS failed,
+      coalesce(legacy.running, 0)::int AS running,
+      coalesce(legacy.superseded, 0)::int AS superseded,
+      coalesce(legacy.derived, 0)::int AS derived,
+      coalesce(legacy.rejected, 0)::int AS rejected,
+      coalesce(legacy.blocked, 0)::int AS blocked
+    FROM selected
+    LEFT JOIN legacy ON legacy.campaign_id = selected.id
+    LEFT JOIN progressive ON progressive.campaign_id = selected.id
+    ORDER BY (selected.status = 'attention') DESC, selected.updated_at DESC
+  `)) as unknown as Array<Record<string, unknown>>;
+  const total = Number(rows[0]?.total ?? 0);
+  return {
+    total,
+    items: rows.map((row) => {
+      const requested = Number(row.requested ?? 0);
+      const solved = Number(row.solved ?? 0);
+      const failed = Number(row.failed ?? 0);
+      const superseded = Number(row.superseded ?? 0);
+      const derived = Number(row.derived ?? 0);
+      const rejected = Number(row.rejected ?? 0);
+      const blocked = Number(row.blocked ?? 0);
+      return {
+        id: String(row.id),
+        slug: String(row.slug),
+        name: String(row.name),
+        status: String(row.status),
+        priority: Number(row.priority),
+        notes: (row.notes as string | null) ?? null,
+        closedWithFailedCount: row.closed_with_failed_count == null ? null : Number(row.closed_with_failed_count),
+        closedWithRejectedCount: row.closed_with_rejected_count == null ? null : Number(row.closed_with_rejected_count),
+        completedAt: isoOf(row.completed_at as Date | string | null),
+        createdAt: isoOf(row.created_at as Date | string | null)!,
+        updatedAt: isoOf(row.updated_at as Date | string | null)!,
+        activityAt: null,
+        conditionCount: Number(row.condition_count),
+        airfoilCount: Number(row.airfoil_count),
+        excludedAirfoilCount: Number(row.excluded_airfoil_count),
+        totals: {
+          requested,
+          solved,
+          failed,
+          running: Number(row.running ?? 0),
+          superseded,
+          derived,
+          rejected,
+          blocked,
+          remaining: Math.max(0, requested - solved - derived - failed - rejected - blocked),
+        },
+        remediation: buildCampaignRemediationSummary({
+          precalcMeshRepairing: 0,
+          blockedMeshQuality: 0,
+          blockedPrecalcExhausted: 0,
+          blockedEngineSubmit: 0,
+          blockedOther: 0,
+        }),
+        reviewBuckets: { awaitingUrans: 0, needsReview: 0 },
+        automaticPrecalcOpen: 0,
+        latestLifecycleEvent: null,
+      };
+    }),
+  };
+}
+
 export async function listCampaigns(
   db: DB,
   opts: { statuses?: string[]; limit?: number; offset?: number } = {},

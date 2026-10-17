@@ -2369,11 +2369,13 @@ export const listCampaigns = (params?: {
   statuses?: string[];
   limit?: number;
   offset?: number;
+  fast?: boolean;
 }) => {
   const qs = new URLSearchParams();
   if (params?.statuses?.length) qs.set("status", params.statuses.join(","));
   if (params?.limit != null) qs.set("limit", String(params.limit));
   if (params?.offset != null) qs.set("offset", String(params.offset));
+  if (params?.fast) qs.set("fast", "1");
   const suffix = qs.toString() ? `?${qs.toString()}` : "";
   return aj<{
     items: AdminCampaignListItem[];
