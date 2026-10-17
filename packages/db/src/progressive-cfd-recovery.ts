@@ -54,7 +54,7 @@ export async function recoverUnboundProgressiveCfdLeases(
         AND generation.status = 'active' AND ${effectiveProgressiveStageSql()} = work.stage AND work.state = 'pending'
         AND unit.state = 'leased' AND unit.lease_until <= clock_timestamp()
         AND attempt.outcome = 'running' AND attempt.sim_job_id IS NULL
-      ORDER BY unit.lease_until, unit.id LIMIT 64 FOR UPDATE OF generation, work, unit, attempt SKIP LOCKED
+      ORDER BY unit.lease_until, unit.id LIMIT 64 FOR UPDATE OF work, unit, attempt SKIP LOCKED
     `);
     for (const unit of units) {
       const retry =
@@ -106,7 +106,7 @@ export async function recoverInactiveProgressiveRemoteGaps(
         AND unit.active_seconds < unit.active_budget_seconds
       ORDER BY unit.id
       LIMIT ${PROGRESSIVE_INACTIVE_RECOVERY_UNITS_PER_PASS}
-      FOR UPDATE OF generation, work, unit SKIP LOCKED
+      FOR UPDATE OF work, unit SKIP LOCKED
     `);
     for (const unit of units) {
       await connection.execute(sql`
@@ -282,7 +282,7 @@ export async function recoverTerminalProgressiveNoEvidenceGaps(
         )
       ORDER BY unit.id
       LIMIT ${PROGRESSIVE_TERMINAL_RECOVERY_UNITS_PER_PASS}
-      FOR UPDATE OF generation, work, unit, attempt SKIP LOCKED
+      FOR UPDATE OF work, unit, attempt SKIP LOCKED
     `);
     let recovered = 0;
     for (const unit of units) {
