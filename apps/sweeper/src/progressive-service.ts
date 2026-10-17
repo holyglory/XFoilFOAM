@@ -197,7 +197,6 @@ export async function runProgressiveBaselineService(
           : 0;
         if (retainedClassifications) {
           pending = true;
-          maintenanceDue = true;
           report({
             component: "progressive-terminal-evidence-classification",
             classified: retainedClassifications,
