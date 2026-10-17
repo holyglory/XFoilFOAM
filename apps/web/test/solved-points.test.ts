@@ -8,6 +8,7 @@ import { mergeSolvedPointsPages, stepSolvedPoint } from "../lib/solved-points";
 function row(id: string, aoa: number): AdminSolvedPoint {
   return {
     resultId: id,
+    resultAttemptId: "attempt-1",
     simJobId: "job-1",
     airfoilSlug: "naca0012",
     airfoilName: "NACA 0012",

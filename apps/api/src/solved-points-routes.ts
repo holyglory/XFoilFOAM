@@ -64,7 +64,8 @@ export async function registerSolvedPointsRoutes(app: FastifyInstance): Promise<
     const [rows, [today]] = await Promise.all([
       db
         .select({
-          resultId: results.id,
+        resultId: results.id,
+          resultAttemptId: results.currentResultAttemptId,
           simJobId: results.simJobId,
           airfoilSlug: airfoils.slug,
           airfoilName: airfoils.name,
@@ -96,6 +97,7 @@ export async function registerSolvedPointsRoutes(app: FastifyInstance): Promise<
     return {
       items: page.map((row) => ({
         resultId: row.resultId,
+        resultAttemptId: row.resultAttemptId,
         simJobId: row.simJobId,
         airfoilSlug: row.airfoilSlug,
         airfoilName: row.airfoilName,

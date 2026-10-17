@@ -785,6 +785,7 @@ export const getAdminQueue = (scope: AdminQueueScope = "all") =>
  *  set) — derived/mirrored display points are never listed here. */
 export interface AdminSolvedPoint {
   resultId: string;
+  resultAttemptId: string | null;
   simJobId: string | null;
   airfoilSlug: string;
   airfoilName: string;

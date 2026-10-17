@@ -275,6 +275,7 @@ afterAll(async () => {
 type SolvedPointsBody = {
   items: Array<{
     resultId: string;
+    resultAttemptId: string | null;
     simJobId: string | null;
     airfoilSlug: string;
     airfoilName: string;
@@ -310,6 +311,7 @@ describe("GET /api/admin/solved-points", () => {
     const first = body.items[0];
     expect(first.airfoilSlug).toBe(unique);
     expect(first.airfoilName).toBe(`${unique} Airfoil`);
+    expect(first.resultAttemptId).toBeNull();
     expect(first.aoaDeg).toBe(4);
     expect(first.cl).toBeCloseTo(0.62, 6);
     expect(first.cd).toBeCloseTo(0.02, 6);

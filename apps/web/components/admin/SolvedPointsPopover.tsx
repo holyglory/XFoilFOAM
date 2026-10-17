@@ -16,8 +16,8 @@ import type { FieldId, FieldTrackPoint } from "@aerodb/core";
 import type { Point, SimulationDetail } from "@aerodb/core";
 import { type CSSProperties, useCallback, useEffect, useRef, useState } from "react";
 
-import { type AdminSolvedPoint, getSolvedPoints } from "@/lib/admin";
-import { getCachedSim, getSim, prefetchSimDetails } from "@/lib/api";
+import { getPointAttemptSim, type AdminSolvedPoint, getSolvedPoints } from "@/lib/admin";
+import { getCachedSim } from "@/lib/api";
 import { mergeSolvedPointsPages, stepSolvedPoint } from "@/lib/solved-points";
 import { C, MONO } from "@/lib/tokens";
 import { SimModal } from "../detail/SimModal";
@@ -171,7 +171,13 @@ export function SolvedPointsPopover({
     if (!openRow) return;
     let cancelled = false;
     setSimMessage(null);
-    getSim(openRow.airfoilSlug, openRow.reynolds ?? 0, openRow.aoaDeg, openRow.resultId)
+    if (!openRow.resultAttemptId) {
+      setSimMessage("No immutable stored solver attempt is attached to this result.");
+      return () => {
+        cancelled = true;
+      };
+    }
+    getPointAttemptSim(openRow.resultId, openRow.resultAttemptId)
       .then((d) => {
         if (cancelled) return;
         setSim(d);
@@ -202,19 +208,6 @@ export function SolvedPointsPopover({
     setOpenRow(row);
     setPlaying(true);
   }, []);
-
-  useEffect(() => {
-    if (!openRow) return;
-    prefetchSimDetails(
-      items.map((row) => ({
-        slug: row.airfoilSlug,
-        re: row.reynolds ?? 0,
-        aoa: row.aoaDeg,
-        resultId: row.resultId,
-      })),
-      simField,
-    );
-  }, [items, openRow, simField]);
 
   const step = useCallback(
     async (direction: -1 | 1) => {
