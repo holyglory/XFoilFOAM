@@ -280,7 +280,7 @@ export async function recoverTerminalProgressiveNoEvidenceGaps(
             AND unsettled.sim_job_id IS NOT NULL
             AND unsettled_stop.sim_job_id IS NULL
         )
-      ORDER BY unit.id
+      ORDER BY unit.attempts, unit.id
       LIMIT ${PROGRESSIVE_TERMINAL_RECOVERY_UNITS_PER_PASS}
       FOR UPDATE OF work, unit, attempt SKIP LOCKED
     `);
