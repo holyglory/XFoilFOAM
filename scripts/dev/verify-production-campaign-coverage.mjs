@@ -122,6 +122,15 @@ try {
       },
     }),
   );
+  assert(
+    cardRenderedAt - cardWaitStartedAt < 1000,
+    `Campaign card took ${cardRenderedAt - cardWaitStartedAt} ms after the campaigns surface became visible`,
+  );
+  assert(
+    listResponse?.requestStartedAt != null &&
+      listResponse.responseReceivedAt - listResponse.requestStartedAt < 1000,
+    "Campaign list API exceeded the 1 second response budget",
+  );
   assert(listResponse, "Authenticated campaign list response was not captured");
   assert.equal(listResponse.item?.id, campaignId);
   assert(listResponse.item?.updatedAt, "Campaign list response omitted updatedAt");
