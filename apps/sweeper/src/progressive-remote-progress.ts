@@ -22,6 +22,8 @@ import {
 
 const MAX_PROGRESSIVE_REPORTS_PER_EXECUTION = 16;
 const MAX_PROGRESSIVE_CAMPAIGN_JOBS_PER_RECONCILIATION = 16;
+const MAX_PROGRESSIVE_REPORT_JOBS_PER_RECONCILIATION = 8;
+const MAX_PROGRESSIVE_TERMINAL_JOBS_PER_RECONCILIATION = 8;
 
 async function applyProgressiveRemoteProgressInTransaction(
   db: DB,
@@ -310,7 +312,10 @@ export async function reconcileProgressiveRemoteProgress(
   const terminalJobs = await db.execute(
     progressiveSettlementJobsSql(options.jobIds),
   );
-  const selectedJobs = [...jobs, ...terminalJobs] as unknown as Array<ProgressiveProgressJob>;
+  const selectedJobs = [
+    ...terminalJobs.slice(0, MAX_PROGRESSIVE_TERMINAL_JOBS_PER_RECONCILIATION),
+    ...jobs.slice(0, MAX_PROGRESSIVE_REPORT_JOBS_PER_RECONCILIATION),
+  ] as unknown as Array<ProgressiveProgressJob>;
   const groupedJobs = new Map<string, ProgressiveProgressJob[]>();
   for (const job of selectedJobs) {
     const campaignJobs = groupedJobs.get(String(job.campaign_id)) ?? [];
