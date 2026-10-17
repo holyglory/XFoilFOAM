@@ -24,6 +24,10 @@ const MAX_PROGRESSIVE_REPORTS_PER_EXECUTION = 16;
 const MAX_PROGRESSIVE_CAMPAIGN_JOBS_PER_RECONCILIATION = 16;
 const MAX_PROGRESSIVE_REPORT_JOBS_PER_RECONCILIATION = 8;
 const MAX_PROGRESSIVE_TERMINAL_JOBS_PER_RECONCILIATION = 8;
+const HIGH_PROGRESSIVE_REPORTS_PER_EXECUTION = 32;
+const HIGH_PROGRESSIVE_CAMPAIGN_JOBS_PER_RECONCILIATION = 32;
+const HIGH_PROGRESSIVE_REPORT_JOBS_PER_RECONCILIATION = 16;
+const HIGH_PROGRESSIVE_TERMINAL_JOBS_PER_RECONCILIATION = 16;
 
 async function applyProgressiveRemoteProgressInTransaction(
   db: DB,
@@ -185,6 +189,7 @@ export async function applyProgressiveRemoteProgress(
 async function applyProgressiveRemoteProgressBatch(
   db: DB,
   executionId: string,
+  reportLimit = MAX_PROGRESSIVE_REPORTS_PER_EXECUTION,
 ) {
   const batchReceipt = {
     applied: 0,
@@ -195,7 +200,7 @@ async function applyProgressiveRemoteProgressBatch(
   };
   for (
     let reportPass = 0;
-    reportPass < MAX_PROGRESSIVE_REPORTS_PER_EXECUTION;
+    reportPass < reportLimit;
     reportPass += 1
   ) {
     try {
@@ -244,6 +249,8 @@ async function reconcileProgressiveRemoteCampaign(
   db: DB,
   _campaignId: string,
   jobs: readonly ProgressiveProgressJob[],
+  reportLimit: number,
+  campaignJobLimit: number,
 ): Promise<ProgressiveProgressReceipt> {
   const receipt: ProgressiveProgressReceipt = {
     applied: 0,
@@ -256,11 +263,15 @@ async function reconcileProgressiveRemoteCampaign(
 
   for (const job of jobs.slice(
     0,
-    MAX_PROGRESSIVE_CAMPAIGN_JOBS_PER_RECONCILIATION,
+    campaignJobLimit,
   )) {
     const executionId = String(job.sim_job_id);
     try {
-      const batch = await applyProgressiveRemoteProgressBatch(db, executionId);
+      const batch = await applyProgressiveRemoteProgressBatch(
+        db,
+        executionId,
+        reportLimit,
+      );
       receipt.applied += batch.applied;
       receipt.indexed += batch.indexed;
       receipt.stopped += batch.stopped;
@@ -312,9 +323,26 @@ export async function reconcileProgressiveRemoteProgress(
   const terminalJobs = await db.execute(
     progressiveSettlementJobsSql(options.jobIds),
   );
+  const reportBacklogIsPressured = jobs.length >= 32;
+  const reportLimit = reportBacklogIsPressured
+    ? HIGH_PROGRESSIVE_REPORTS_PER_EXECUTION
+    : MAX_PROGRESSIVE_REPORTS_PER_EXECUTION;
+  const campaignJobLimit = reportBacklogIsPressured
+    ? HIGH_PROGRESSIVE_CAMPAIGN_JOBS_PER_RECONCILIATION
+    : MAX_PROGRESSIVE_CAMPAIGN_JOBS_PER_RECONCILIATION;
   const selectedJobs = [
-    ...terminalJobs.slice(0, MAX_PROGRESSIVE_TERMINAL_JOBS_PER_RECONCILIATION),
-    ...jobs.slice(0, MAX_PROGRESSIVE_REPORT_JOBS_PER_RECONCILIATION),
+    ...terminalJobs.slice(
+      0,
+      reportBacklogIsPressured
+        ? HIGH_PROGRESSIVE_TERMINAL_JOBS_PER_RECONCILIATION
+        : MAX_PROGRESSIVE_TERMINAL_JOBS_PER_RECONCILIATION,
+    ),
+    ...jobs.slice(
+      0,
+      reportBacklogIsPressured
+        ? HIGH_PROGRESSIVE_REPORT_JOBS_PER_RECONCILIATION
+        : MAX_PROGRESSIVE_REPORT_JOBS_PER_RECONCILIATION,
+    ),
   ] as unknown as Array<ProgressiveProgressJob>;
   const groupedJobs = new Map<string, ProgressiveProgressJob[]>();
   for (const job of selectedJobs) {
@@ -332,6 +360,8 @@ export async function reconcileProgressiveRemoteProgress(
           db,
           campaignId,
           campaignJobs,
+          reportLimit,
+          campaignJobLimit,
         );
         receipt.applied += batch.applied;
         receipt.indexed += batch.indexed;
