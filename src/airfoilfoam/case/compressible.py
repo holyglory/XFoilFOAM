@@ -49,12 +49,7 @@ class CompressibleCaseBuilder(CaseBuilder):
         self.local_time_step_smoothing = (
             0.02 if self.solver.local_time_step_smoothing is None else self.solver.local_time_step_smoothing
         )
-        steady_command = (
-            "xfoilfoamRhoSimpleFoam"
-            if solver_family in {"rhoSimpleFoam", "rhoPimpleFoam"}
-            and gas.transport_model == "polynomial"
-            else solver_family
-        )
+        steady_command = solver_family
         self.dialect = replace(
             self.dialect, steady_solver_command=steady_command,
             transient_solver_command="rhoCentralFoam" if solver_family == "rhoCentralFoam" else "rhoPimpleFoam",

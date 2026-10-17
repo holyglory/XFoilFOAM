@@ -238,6 +238,8 @@ def test_source_fitted_material_loads_the_native_library_in_every_solver_and_con
     case.write(tmp_path)
     library = 'libs            ("/opt/xfoilfoam-thermophysics/lib/libxfoilfoamThermophysics.so");'
     assert library in (tmp_path / "system/controlDict").read_text()
+    if family == "rhoSimpleFoam":
+        assert case.dialect.steady_solver_command == "rhoSimpleFoam"
     assert "muCoeffs<8>" in (tmp_path / "constant/thermophysicalProperties").read_text()
     case.write_transient(tmp_path, start_time=0, end_time=0.01, delta_t=1e-7, write_interval=1e-4, max_delta_t=1e-5)
     assert library in (tmp_path / "system/controlDict").read_text()
