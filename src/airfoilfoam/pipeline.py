@@ -8388,7 +8388,20 @@ def run_case(
                 cancel_check=lambda: _check_cancel(cancel_check),
             )
             _check_cancel(cancel_check)
-            check_material_domain(case_dir, res)
+            try:
+                check_material_domain(case_dir, res)
+            except MaterialDomainError as error:
+                logger.warning(
+                    "steady initialization left the declared material domain; "
+                    "allowing the configured fallback: %s",
+                    error,
+                )
+                return RunResult(
+                    command=res.command,
+                    returncode=res.returncode or 1,
+                    stdout=res.stdout + f"\n{error}\n",
+                    timed_out=res.timed_out,
+                )
             return res
 
         # 4/5. solve, with an automatic first-order fallback for fragile cases
