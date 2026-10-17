@@ -21,7 +21,7 @@ import {
 } from "./progressive-progress-selection";
 
 const MAX_PROGRESSIVE_REPORTS_PER_EXECUTION = 16;
-const MAX_PROGRESSIVE_CAMPAIGN_JOBS_PER_TRANSACTION = 1;
+const MAX_PROGRESSIVE_CAMPAIGN_JOBS_PER_RECONCILIATION = 1;
 
 async function applyProgressiveRemoteProgressInTransaction(
   db: DB,
@@ -240,57 +240,45 @@ type ProgressiveProgressReceipt = {
 
 async function reconcileProgressiveRemoteCampaign(
   db: DB,
-  campaignId: string,
+  _campaignId: string,
   jobs: readonly ProgressiveProgressJob[],
 ): Promise<ProgressiveProgressReceipt> {
-  return db.transaction(async (transaction) => {
-    const connection = transaction as unknown as DB;
-    const [campaign] = await connection.execute(sql`
-      SELECT id FROM sim_campaigns WHERE id = ${campaignId}::uuid FOR UPDATE
-    `);
-    const receipt: ProgressiveProgressReceipt = {
-      applied: 0,
-      indexed: 0,
-      stopped: 0,
-      settled: 0,
-      waiting: campaign ? 0 : jobs.length,
-      errors: [],
-    };
-    if (!campaign) return receipt;
+  const receipt: ProgressiveProgressReceipt = {
+    applied: 0,
+    indexed: 0,
+    stopped: 0,
+    settled: 0,
+    waiting: 0,
+    errors: [],
+  };
 
-    for (const job of jobs.slice(0, MAX_PROGRESSIVE_CAMPAIGN_JOBS_PER_TRANSACTION)) {
-      const executionId = String(job.sim_job_id);
-      try {
-        await connection.transaction(async (savepoint) => {
-          const batch = await applyProgressiveRemoteProgressBatch(
-            savepoint as unknown as DB,
-            executionId,
-          );
-          receipt.applied += batch.applied;
-          receipt.indexed += batch.indexed;
-          receipt.stopped += batch.stopped;
-          receipt.errors.push(...batch.errors);
-          if (batch.idle && batch.errors.length === 0) {
-            const terminal = await settleProgressiveRemoteJob(
-              savepoint as unknown as DB,
-              executionId,
-            );
-            if (terminal.kind === "settled") receipt.settled += 1;
-            else receipt.waiting += 1;
-          }
-          await savepoint.execute(
-            sql`UPDATE sim_jobs SET "polledAt" = clock_timestamp() WHERE id = ${executionId}::uuid`,
-          );
-        });
-      } catch (error) {
-        receipt.errors.push({
-          executionId,
-          reason: error instanceof Error ? error.message : String(error),
-        });
+  for (const job of jobs.slice(
+    0,
+    MAX_PROGRESSIVE_CAMPAIGN_JOBS_PER_RECONCILIATION,
+  )) {
+    const executionId = String(job.sim_job_id);
+    try {
+      const batch = await applyProgressiveRemoteProgressBatch(db, executionId);
+      receipt.applied += batch.applied;
+      receipt.indexed += batch.indexed;
+      receipt.stopped += batch.stopped;
+      receipt.errors.push(...batch.errors);
+      if (batch.idle && batch.errors.length === 0) {
+        const terminal = await settleProgressiveRemoteJob(db, executionId);
+        if (terminal.kind === "settled") receipt.settled += 1;
+        else receipt.waiting += 1;
       }
+      await db.execute(
+        sql`UPDATE sim_jobs SET "polledAt" = clock_timestamp() WHERE id = ${executionId}::uuid`,
+      );
+    } catch (error) {
+      receipt.errors.push({
+        executionId,
+        reason: error instanceof Error ? error.message : String(error),
+      });
     }
-    return receipt;
-  });
+  }
+  return receipt;
 }
 
 export async function reconcileProgressiveRemoteProgress(
