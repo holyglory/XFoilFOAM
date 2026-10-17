@@ -5,7 +5,12 @@
 // points never appear here, and solvedToday is a real indexed count for the
 // current server day, always computed over the same scope as the rows it
 // accompanies.
-import { airfoils, resultClassifications, results } from "@aerodb/db";
+import {
+  airfoils,
+  resultClassifications,
+  results,
+  simulationPresetRevisions,
+} from "@aerodb/db";
 import { and, count, desc, eq, isNotNull, sql, type SQL } from "drizzle-orm";
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
@@ -72,6 +77,7 @@ export async function registerSolvedPointsRoutes(app: FastifyInstance): Promise<
           aoaDeg: results.aoaDeg,
           speed: results.speed,
           reynolds: results.reynolds,
+          revisionReynolds: simulationPresetRevisions.reynolds,
           cl: results.cl,
           cd: results.cd,
           clCd: results.clCd,
@@ -80,6 +86,10 @@ export async function registerSolvedPointsRoutes(app: FastifyInstance): Promise<
         })
         .from(results)
         .innerJoin(airfoils, eq(airfoils.id, results.airfoilId))
+        .leftJoin(
+          simulationPresetRevisions,
+          eq(simulationPresetRevisions.id, results.simulationPresetRevisionId),
+        )
         .leftJoin(resultClassifications, eq(resultClassifications.resultId, results.id))
         .where(and(...pageConditions))
         .orderBy(desc(results.solvedAt), desc(results.id))
@@ -103,7 +113,10 @@ export async function registerSolvedPointsRoutes(app: FastifyInstance): Promise<
         airfoilName: row.airfoilName,
         aoaDeg: row.aoaDeg,
         speed: row.speed == null ? null : Number(row.speed),
-        reynolds: row.reynolds == null ? null : Number(row.reynolds),
+        reynolds:
+          row.reynolds == null && row.revisionReynolds == null
+            ? null
+            : Number(row.reynolds ?? row.revisionReynolds),
         cl: row.cl == null ? null : Number(row.cl),
         cd: row.cd == null ? null : Number(row.cd),
         clCd: row.clCd == null ? null : Number(row.clCd),

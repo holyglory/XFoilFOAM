@@ -830,6 +830,7 @@ export async function assembleAdminSim(
       result: results,
       attempt: resultAttempts,
       airfoilName: airfoils.name,
+      revisionReynolds: simulationPresetRevisions.reynolds,
     })
     .from(results)
     .innerJoin(
@@ -847,11 +848,19 @@ export async function assembleAdminSim(
         eq(resultAttempts.source, "solved"),
       ),
     )
+    .innerJoin(
+      simulationPresetRevisions,
+      eq(
+        simulationPresetRevisions.id,
+        results.simulationPresetRevisionId,
+      ),
+    )
     .innerJoin(airfoils, eq(airfoils.id, results.airfoilId))
     .where(eq(results.id, resultId))
     .limit(1);
   if (!selected) return null;
   const projected = selectedResultProjection(selected.result, selected.attempt);
-  if (!finiteStored(projected.reynolds) || projected.reynolds <= 0) return null;
-  return solvedDetail(selected.airfoilName, projected.reynolds, projected);
+  const effectiveRe = projected.reynolds ?? selected.revisionReynolds;
+  if (!finiteStored(effectiveRe) || effectiveRe <= 0) return null;
+  return solvedDetail(selected.airfoilName, effectiveRe, projected);
 }
