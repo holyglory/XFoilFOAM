@@ -5,7 +5,7 @@
 // only from real API fields (never optimistic text), real progress bars from
 // counters, per-row Duplicate/Open, 10 s polling paused on hidden tabs.
 
-import { useCallback, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import {
   type AdminCampaignListItem,
@@ -55,6 +55,7 @@ const STATUS_COLOR: Record<string, string> = {
 };
 
 export interface CampaignsHubProps {
+  initialList?: Awaited<ReturnType<typeof listCampaigns>> | null;
   onOpenCampaign: (id: string) => void;
   onNewCampaign: (kind: "polar_sweep" | "ld_refine") => void;
   /** Router-navigates to ?section=queue (the Solver page). */
@@ -160,19 +161,24 @@ function kindChip(summary: AdminCampaignSummary | undefined): string | null {
 }
 
 export function CampaignsHub({
+  initialList,
   onOpenCampaign,
   onNewCampaign,
   onOpenSolver,
   onOpenPoints,
 }: CampaignsHubProps) {
   const [segment, setSegment] = useState<"active" | "all">("active");
-  const [items, setItems] = useState<AdminCampaignListItem[] | null>(null);
-  const [total, setTotal] = useState(0);
+  const [items, setItems] = useState<AdminCampaignListItem[] | null>(
+    initialList?.items ?? null,
+  );
+  const [total, setTotal] = useState(initialList?.total ?? 0);
   const [summaries, setSummaries] = useState<
     Record<string, AdminCampaignSummary>
   >({});
   const [solverPayload, setSolverPayload] =
-    useState<AdminCampaignsSolverState | null>(null);
+    useState<AdminCampaignsSolverState | null>(
+      initialList?.solverState ?? null,
+    );
   const [err, setErr] = useState<string | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [busyAction, setBusyAction] = useState<"duplicate" | "resume" | null>(
@@ -180,6 +186,13 @@ export function CampaignsHub({
   );
   const segmentRef = useRef(segment);
   segmentRef.current = segment;
+
+  useEffect(() => {
+    if (!initialList || items != null) return;
+    setItems(initialList.items);
+    setTotal(initialList.total);
+    setSolverPayload(initialList.solverState ?? null);
+  }, [initialList, items]);
 
   const refresh = useCallback(async () => {
     try {

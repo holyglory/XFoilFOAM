@@ -87,6 +87,7 @@ import {
   getAdminQueue,
   getAdminSync,
   getAdminSimulationSetup,
+  listCampaigns,
   patchSweeper,
   patchAdminSync,
   patchAdminRemoteSolverPolicy,
@@ -137,6 +138,8 @@ import { CampaignsHub } from "./campaigns/CampaignsHub";
 import { CampaignWizard } from "./campaigns/CampaignWizard";
 import { usePoll } from "./campaigns/usePoll";
 import { stashDuplicatePrefill } from "./campaigns/wizard-draft";
+
+type PrefetchedCampaignList = Awaited<ReturnType<typeof listCampaigns>>;
 
 type Section =
   | "simulations"
@@ -318,6 +321,8 @@ const label: CSSProperties = {
 
 export function AdminConsole() {
   const [me, setMe] = useState<AdminMe | null>(null);
+  const [prefetchedCampaigns, setPrefetchedCampaigns] =
+    useState<PrefetchedCampaignList | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [email, setEmail] = useState("");
@@ -456,11 +461,18 @@ export function AdminConsole() {
   }, []);
 
   useEffect(() => {
-    // Parallelize the first paint: the Solver page's scoped queue fetch starts
-    // alongside adminMe instead of waiting for the auth gate to resolve.
     if (section === "queue") {
       const prefetchScope = solverScopeForTab(parseSolverTab(tabParam));
       if (prefetchScope) prefetchQueueScope(prefetchScope);
+    }
+    if (section === "simulations" && !campaignParam && !wizardKind) {
+      void listCampaigns({
+        statuses: ["active", "paused", "attention"],
+        limit: 50,
+        fast: true,
+      })
+        .then(setPrefetchedCampaigns)
+        .catch(() => undefined);
     }
     adminMe()
       .then(setMe)
@@ -1269,6 +1281,7 @@ export function AdminConsole() {
           )}
           {section === "simulations" && !campaignParam && !wizardKind && (
             <CampaignsHub
+              initialList={prefetchedCampaigns}
               onOpenCampaign={openCampaign}
               onNewCampaign={openWizard}
               onOpenSolver={() => navigate({ section: "queue" }, "push")}
