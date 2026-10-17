@@ -56,7 +56,7 @@ def test_explicit_flow_contract_round_trips_and_scopes_commands(request_payload,
     assert is_compressible(runner)
     assert is_density_based(runner) == (family == "rhoCentralFoam")
     dialect = dialect_for_runner(runner)
-    assert dialect.steady_solver_command == ("rhoCentralFoam" if family == "rhoCentralFoam" else "rhoSimpleFoam")
+    assert dialect.steady_solver_command == family
     assert dialect.transient_solver_command == ("rhoCentralFoam" if family == "rhoCentralFoam" else "rhoPimpleFoam")
     assert dialect_for_runner(BudgetedRunner(runner, 900)) == dialect
     assert dialect_for_runner(RecordedRunner()) == OPENCFD_2606
@@ -329,7 +329,7 @@ def test_density_pipeline_skips_pseudo_steady_and_preserves_shared_mesh(request_
 
 @pytest.mark.parametrize("timing", [(None, None), (1e-4, 1e-5)])
 @pytest.mark.parametrize("family,fallback,expected", [
-    ("rhoPimpleFoam", False, ["potentialFoam -initialiseUBCs -pName pXfoilfoamInitial", "rhoSimpleFoam"]),
+    ("rhoPimpleFoam", False, ["potentialFoam -initialiseUBCs -pName pXfoilfoamInitial", "rhoPimpleFoam"]),
     ("rhoPimpleFoam", True, []),
     ("rhoCentralFoam", False, []),
 ])

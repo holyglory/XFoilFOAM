@@ -29,7 +29,13 @@ def configure_flow_execution(runner, request: PolarRequest) -> None:
         raise ValueError("Compressible execution is missing its resolved gas state")
     runner.flow_execution = CompressibleExecution(family, gas, state, prandtl)
     transient = "rhoCentralFoam" if family == "rhoCentralFoam" else "rhoPimpleFoam"
-    steady = "rhoCentralFoam" if family == "rhoCentralFoam" else "rhoSimpleFoam"
+    steady = (
+        "rhoCentralFoam"
+        if family == "rhoCentralFoam"
+        else "rhoPimpleFoam"
+        if family == "rhoPimpleFoam"
+        else "rhoSimpleFoam"
+    )
     runner.flow_dialect = replace(
         base,
         steady_solver_command=steady,
