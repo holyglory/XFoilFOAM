@@ -7568,6 +7568,18 @@ export async function listCampaignsFast(
       WHERE generation.plan_revision_id = selected.current_plan_revision_id
         AND generation.status <> 'cancelled'
       GROUP BY generation.campaign_id
+    ), activity AS (
+      SELECT job.campaign_id,
+        max(greatest(
+          job."updatedAt",
+          coalesce(job."polledAt", job."updatedAt"),
+          coalesce(job."submittedAt", job."updatedAt"),
+          coalesce(job."ingestedAt", job."updatedAt"),
+          coalesce(job."finishedAt", job."updatedAt")
+        )) AS activity_at
+      FROM sim_jobs job
+      JOIN selected ON selected.id = job.campaign_id
+      GROUP BY job.campaign_id
     )
     SELECT selected.*,
       coalesce(progressive.requested, legacy.requested, 0)::int AS requested,
@@ -7581,6 +7593,7 @@ export async function listCampaignsFast(
     FROM selected
     LEFT JOIN legacy ON legacy.campaign_id = selected.id
     LEFT JOIN progressive ON progressive.campaign_id = selected.id
+    LEFT JOIN activity ON activity.campaign_id = selected.id
     ORDER BY (selected.status = 'attention') DESC, selected.updated_at DESC
   `)) as unknown as Array<Record<string, unknown>>;
   const total = Number(rows[0]?.total ?? 0);
@@ -7606,7 +7619,7 @@ export async function listCampaignsFast(
         completedAt: isoOf(row.completed_at as Date | string | null),
         createdAt: isoOf(row.created_at as Date | string | null)!,
         updatedAt: isoOf(row.updated_at as Date | string | null)!,
-        activityAt: null,
+        activityAt: isoOf(row.activity_at as Date | string | null),
         conditionCount: Number(row.condition_count),
         airfoilCount: Number(row.airfoil_count),
         excludedAirfoilCount: Number(row.excluded_airfoil_count),
