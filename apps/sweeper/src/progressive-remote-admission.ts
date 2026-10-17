@@ -184,7 +184,7 @@ export async function prepareProgressiveRemoteDispatch(
           "Progressive admission is busy with another campaign maintenance pass",
         );
       admissionPhase = "claim";
-      const leases = await claimProgressiveCfdBatch(connection, {
+      const claimInput = {
         owner: `remote-progressive-${solverId}`,
         remoteSolverId: solverId,
         leaseSeconds: PROGRESSIVE_REMOTE_START_LEASE_SECONDS,
@@ -195,7 +195,15 @@ export async function prepareProgressiveRemoteDispatch(
           capabilities.uransRecoveryVersion ===
           REQUIRED_PRECALC_EVIDENCE_RECOVERY_VERSION,
         campaignLockMode: "skip",
-      });
+      } as const;
+      let leases = await claimProgressiveCfdBatch(connection, claimInput);
+      if (!leases.length) {
+        await connection.execute(sql`SET LOCAL lock_timeout = '750ms'`);
+        leases = await claimProgressiveCfdBatch(connection, {
+          ...claimInput,
+          campaignLockMode: "wait",
+        });
+      }
       if (!leases.length)
         throw new RemoteProgressiveAdmissionWait(
           "No eligible campaign cases are ready",
