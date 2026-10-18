@@ -8378,10 +8378,21 @@ def run_case(
             )
             if not seeded and not is_density_based(runner):
                 # Potential-flow initialisation greatly stabilises the cold RANS start.
-                potential = _potential_initialization(case_dir, runner, patches, dialect)
-                _checked_initialization_result(
-                    case_dir, potential, stage="potentialFoam"
-                )
+                try:
+                    potential = _potential_initialization(case_dir, runner, patches, dialect)
+                    _checked_initialization_result(
+                        case_dir, potential, stage="potentialFoam"
+                    )
+                except MaterialDomainError as error:
+                    logger.warning(
+                        "compressible potential initialization left the material domain; "
+                        "continuing from uniform freestream: %s",
+                        error,
+                    )
+                    outcome.quality_warnings.append(
+                        "potential-flow initialization rejected by material-domain guard; "
+                        "steady solve continued from uniform freestream"
+                    )
             _check_cancel(cancel_check)
             res = solve_cold_steady(
                 case_dir, runner, sp, n_proc, steady_timeout, seeded=seeded,

@@ -13,7 +13,7 @@ from airfoilfoam.openfoam.budget import BudgetedRunner
 from airfoilfoam.openfoam.dialects import OPENCFD_2606, dialect_for_runner
 from airfoilfoam.openfoam.execution import configure_flow_execution, is_compressible, is_density_based
 from airfoilfoam.openfoam.rans_hold import root_entry
-from airfoilfoam.openfoam.runner import InfrastructureError, RunResult, Runner
+from airfoilfoam.openfoam.runner import InfrastructureError, MaterialDomainError, RunResult, Runner
 from airfoilfoam.thermodynamics import GasThermodynamics, ThermodynamicState
 
 
@@ -325,6 +325,57 @@ def test_density_pipeline_skips_pseudo_steady_and_preserves_shared_mesh(request_
     assert len(finalized) == (2 if marched else 1)
     assert all(source == mesh_dir for _, source in linked + finalized)
     assert runner.commands == []
+
+
+def test_density_steady_case_continues_from_uniform_freestream_after_material_seed_rejection(
+    request_payload, monkeypatch, tmp_path
+):
+    request_payload["solver"].update(flow_solver_family="rhoSimpleFoam", force_transient=False)
+    request = PolarRequest.model_validate(request_payload)
+    runner = RecordedRunner()
+    configure_flow_execution(runner, request)
+    airfoil = Airfoil.from_contour("ag24", parse_airfoil(request.airfoil.coordinates))
+    patches = [
+        BoundaryPatch("airfoil", "wall"),
+        BoundaryPatch("inlet", "inlet"),
+        BoundaryPatch("outlet", "outlet"),
+        BoundaryPatch("frontAndBack", "empty"),
+    ]
+    mesher = SimpleNamespace(patches=lambda _: patches, cell_count=lambda _: 0)
+    mesh_dir = tmp_path / "mesh"
+    mesh_dir.mkdir()
+    monkeypatch.setattr(pipeline, "resolve_mesh_params", lambda mesh, *_: mesh)
+    monkeypatch.setattr(pipeline, "_link_mesh", lambda *_: None)
+    monkeypatch.setattr(
+        pipeline,
+        "_potential_initialization",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            MaterialDomainError("isolated material-domain seed rejection")
+        ),
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "_finalize_outcome",
+        lambda case_dir, outcome, *args, **kwargs: setattr(outcome, "cl", 0.1),
+    )
+
+    outcome = pipeline.run_case(
+        tmp_path / "case",
+        airfoil,
+        request.cases()[0],
+        request.fluid,
+        request.roughness,
+        request.mesh,
+        request.solver,
+        mesher,
+        runner,
+        mesh_dir=mesh_dir,
+        render_images=False,
+    )
+
+    assert outcome.error is None
+    assert outcome.cl == 0.1
+    assert runner.commands == ["rhoSimpleFoam"]
 
 
 @pytest.mark.parametrize("timing", [(None, None), (1e-4, 1e-5)])
