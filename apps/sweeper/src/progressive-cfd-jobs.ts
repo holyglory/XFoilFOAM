@@ -185,6 +185,10 @@ export async function composeProgressiveCfdJob(
     request.expected_execution_pool = pool.routingKey;
     request.expected_mesh_recovery_version = input.meshRecoveryVersion;
     request.solver = { ...request.solver, warm_start: true };
+    const configuredSolverProcesses = execution.snapshot.scheduling.solverProcesses;
+    const solverProcesses =
+      configuredSolverProcesses ??
+      (transient ? Math.min(4, Math.max(1, input.cpuSlots)) : null);
     if (continuation) {
       if (!transient || fidelity !== "precalc")
         throw new Error("Progressive continuation requires preliminary URANS");
@@ -198,6 +202,12 @@ export async function composeProgressiveCfdJob(
     request.resources = {
       ...request.resources,
       case_concurrency: 1,
+      ...(solverProcesses != null
+        ? {
+            solver_processes: solverProcesses,
+            cpu_budget: solverProcesses,
+          }
+        : {}),
       ...(mixedBudgets
         ? {
             case_solver_allocations: leases
