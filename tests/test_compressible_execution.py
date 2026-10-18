@@ -428,3 +428,65 @@ def test_transient_preparation_preserves_compressible_state_during_velocity_init
     assert float(root_entry(control, "writeInterval")) == pytest.approx(expected_cadence)
     assert float(root_entry(control, "maxDeltaT")) == pytest.approx(timing[1] or 2e-7)
     assert all((case_dir / name).read_bytes() == value for name, value in protected.items())
+
+
+def test_compressible_steady_material_failure_restarts_from_potential_seed(
+    request_payload, monkeypatch, tmp_path
+):
+    request_payload["solver"].update(
+        flow_solver_family="rhoSimpleFoam", force_transient=False
+    )
+    request = PolarRequest.model_validate(request_payload)
+    runner = RecordedRunner()
+    configure_flow_execution(runner, request)
+    airfoil = Airfoil.from_contour("ag24", parse_airfoil(request.airfoil.coordinates))
+    patches = [
+        BoundaryPatch("airfoil", "wall"),
+        BoundaryPatch("inlet", "inlet"),
+        BoundaryPatch("outlet", "outlet"),
+        BoundaryPatch("frontAndBack", "empty"),
+    ]
+    mesh_dir = tmp_path / "mesh"
+    mesh_dir.mkdir()
+    monkeypatch.setattr(
+        pipeline,
+        "get_mesher",
+        lambda _: SimpleNamespace(patches=lambda _: patches),
+    )
+    monkeypatch.setattr(pipeline, "_link_mesh", lambda *_: None)
+    monkeypatch.setattr(pipeline, "shared_mesh_qa_verified", lambda _: True)
+    monkeypatch.setattr(
+        pipeline,
+        "_potential_initialization",
+        lambda *_: RunResult("potentialFoam", 0, "potential seed"),
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "check_material_domain",
+        lambda *_: (_ for _ in ()).throw(
+            MaterialDomainError("steady material-domain rejection")
+        ),
+    )
+    quality_warnings = []
+    case_dir = tmp_path / "case"
+
+    pipeline._prepare_transient_case(
+        case_dir,
+        airfoil,
+        request.mesh,
+        request.cases()[0],
+        request.fluid,
+        request.roughness,
+        request.solver,
+        runner,
+        1,
+        30,
+        shared_mesh_dir=mesh_dir,
+        quality_warnings=quality_warnings,
+    )
+
+    assert runner.commands == ["rhoSimpleFoam"]
+    assert (case_dir / "0" / "U").is_file()
+    assert (case_dir / "log.simpleFoam.init").is_file()
+    assert not (case_dir / ".compressible-potential-seed").exists()
+    assert any("restarted from the potential-flow seed" in item for item in quality_warnings)
