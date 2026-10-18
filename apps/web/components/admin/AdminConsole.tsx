@@ -141,6 +141,7 @@ import { usePoll } from "./campaigns/usePoll";
 import { stashDuplicatePrefill } from "./campaigns/wizard-draft";
 
 type PrefetchedCampaignList = Awaited<ReturnType<typeof listCampaigns>>;
+export type AdminBootstrap = Awaited<ReturnType<typeof getAdminBootstrap>>;
 
 type Section =
   | "simulations"
@@ -320,10 +321,18 @@ const label: CSSProperties = {
   marginBottom: 8,
 };
 
-export function AdminConsole() {
-  const [me, setMe] = useState<AdminMe | null>(null);
+export function AdminConsole({
+  initialBootstrap,
+}: {
+  initialBootstrap?: AdminBootstrap | null;
+}) {
+  const [me, setMe] = useState<AdminMe | null>(
+    initialBootstrap?.me ?? null,
+  );
   const [prefetchedCampaigns, setPrefetchedCampaigns] =
-    useState<PrefetchedCampaignList | null>(null);
+    useState<PrefetchedCampaignList | null>(
+      initialBootstrap?.campaigns ?? null,
+    );
   const [err, setErr] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [email, setEmail] = useState("");
@@ -468,7 +477,7 @@ export function AdminConsole() {
     }
     const campaignHub =
       section === "simulations" && !campaignParam && !wizardKind;
-    if (campaignHub) {
+    if (campaignHub && initialBootstrap === undefined) {
       void getAdminBootstrap({
         statuses: ["active", "paused", "attention"],
         limit: 50,
@@ -482,7 +491,7 @@ export function AdminConsole() {
             .then(setMe)
             .catch((e) => setErr((e as Error).message)),
         );
-    } else {
+    } else if (initialBootstrap === null || initialBootstrap === undefined) {
       adminMe()
         .then(setMe)
         .catch((e) => setErr((e as Error).message));
