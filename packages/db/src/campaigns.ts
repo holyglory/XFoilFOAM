@@ -29,7 +29,10 @@ import {
   recomputeProgressForCampaign,
   USER_TERMINAL_CAMPAIGN_RESULT_SQL,
 } from "./campaign-execution";
-import { readCampaignDerivedSummaryMetrics } from "./campaign-summary-metrics";
+import {
+  readCampaignDerivedSummaryMetrics,
+  StaleWhileRefreshCache,
+} from "./campaign-summary-metrics";
 import type { DB } from "./client";
 import {
   inheritLocalStepPolicy,
@@ -7507,7 +7510,7 @@ export interface CampaignListItem {
 const isoOf = (v: Date | string | null): string | null =>
   v == null ? null : v instanceof Date ? v.toISOString() : v;
 
-export async function listCampaignsFast(
+async function loadCampaignsFast(
   db: DB,
   opts: { statuses?: string[]; limit?: number; offset?: number } = {},
 ): Promise<{ items: CampaignListItem[]; total: number }> {
@@ -7648,6 +7651,54 @@ export async function listCampaignsFast(
       };
     }),
   };
+}
+
+const CAMPAIGN_LIST_FAST_TTL_MS = 5_000;
+const campaignListFastCache =
+  new StaleWhileRefreshCache<{ items: CampaignListItem[]; total: number }>({
+    ttlMs: CAMPAIGN_LIST_FAST_TTL_MS,
+    maxEntries: 32,
+  });
+
+function campaignListFastCacheKey(opts: {
+  statuses?: string[];
+  limit?: number;
+  offset?: number;
+}): string {
+  return JSON.stringify({
+    statuses: [...(opts.statuses ?? [])].sort(),
+    limit: opts.limit ?? 25,
+    offset: opts.offset ?? 0,
+  });
+}
+
+export async function listCampaignsFast(
+  db: DB,
+  opts: { statuses?: string[]; limit?: number; offset?: number } = {},
+): Promise<{ items: CampaignListItem[]; total: number }> {
+  if (process.env.NODE_ENV === "test") return loadCampaignsFast(db, opts);
+  const key = campaignListFastCacheKey(opts);
+  return (
+    await campaignListFastCache.get(key, () => loadCampaignsFast(db, opts))
+  ).value;
+}
+
+/** Warm the exact projection used by the simulations hub before the API starts
+ * accepting production traffic. The cached value is a truthful snapshot; a
+ * later request refreshes it in the background after the short TTL. */
+export async function warmActiveCampaignList(
+  db: DB,
+  limit = 50,
+): Promise<number> {
+  const opts = {
+    statuses: ["active", "paused", "attention"],
+    limit: Math.min(Math.max(Math.trunc(limit), 1), 100),
+    offset: 0,
+  };
+  await campaignListFastCache.warm(campaignListFastCacheKey(opts), () =>
+    loadCampaignsFast(db, opts),
+  );
+  return campaignListFastCache.has(campaignListFastCacheKey(opts)) ? 1 : 0;
 }
 
 export async function listCampaigns(

@@ -1,7 +1,10 @@
 import cookie from "@fastify/cookie";
 import cors from "@fastify/cors";
 import multipart from "@fastify/multipart";
-import { warmActiveCampaignDerivedSummaryMetrics } from "@aerodb/db";
+import {
+  warmActiveCampaignDerivedSummaryMetrics,
+  warmActiveCampaignList,
+} from "@aerodb/db";
 import Fastify, { type FastifyInstance } from "fastify";
 
 import { registerAdminRoutes } from "./admin-routes";
@@ -35,10 +38,13 @@ export async function buildServer(): Promise<FastifyInstance> {
     evidenceUploadReconciler.start();
     if (process.env.NODE_ENV === "production") {
       try {
-        const warmed = await warmActiveCampaignDerivedSummaryMetrics(db);
+        const [warmed, warmedLists] = await Promise.all([
+          warmActiveCampaignDerivedSummaryMetrics(db),
+          warmActiveCampaignList(db),
+        ]);
         app.log.info(
-          { campaigns: warmed },
-          "prewarmed active campaign summary analytics",
+          { campaigns: warmed, lists: warmedLists },
+          "prewarmed active campaign summaries",
         );
       } catch (error) {
         app.log.error({ err: error }, "active campaign summary prewarm failed");
