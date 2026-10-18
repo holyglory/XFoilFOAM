@@ -118,9 +118,15 @@ def _cache(tmp_path: Path) -> EngineCache:
 def _ladder_meshers(monkeypatch, events: list[tuple[str, float | None]]):
     names = (
         pipeline.MESH_RECOVERY_PUBLIC_MESHER,
+        "blockmesh-cgrid-finite-edge",
         *pipeline.MESH_RECOVERY_MESHER_CANDIDATES,
     )
     meshers = {name: CountingMesher(name, events) for name in names}
+    monkeypatch.setattr(
+        pipeline,
+        "BlockMeshCGrid",
+        lambda **_: meshers["blockmesh-cgrid-finite-edge"],
+    )
     monkeypatch.setattr(pipeline, "get_mesher", lambda name: meshers[name])
     return meshers[pipeline.MESH_RECOVERY_PUBLIC_MESHER], meshers
 
@@ -276,7 +282,7 @@ def test_recovery_tries_segmented_candidates_in_order_and_stops_on_early_success
     tmp_path, sharp_naca0012_selig_text, naca0012_selig_text, monkeypatch, finite_trailing_edge
 ):
     airfoil = _airfoil(naca0012_selig_text if finite_trailing_edge else sharp_naca0012_selig_text)
-    expected_mesher = "cartesian2d-external-boundary-layer" if finite_trailing_edge else pipeline.MESH_RECOVERY_MESHER_CANDIDATES[0]
+    expected_mesher = "blockmesh-cgrid-finite-edge" if finite_trailing_edge else pipeline.MESH_RECOVERY_MESHER_CANDIDATES[0]
     initial = MeshParams(first_cell_height_chords=0.01575)
     cache = _cache(tmp_path)
     events: list[tuple[str, float | None]] = []

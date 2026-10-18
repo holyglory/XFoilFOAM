@@ -49,6 +49,7 @@ from .evidence_store import (
     EvidenceUnavailableError,
 )
 from .meshing.base import MESH_WRITE_PRECISION, Mesher, MeshResult, get_mesher
+from .meshing.blockmesh import BlockMeshCGrid, FINITE_EDGE_TOPOLOGY
 from .material_domain import check_material_domain, material_domain_failure
 from .models import (
     AperiodicMeanCertificate,
@@ -9161,13 +9162,16 @@ def prepare_mesh_with_recovery(
 
     original_height = resolved.first_cell_height_chords
     last_error: Optional[DeterministicMeshError] = None
-    candidates_for_geometry = (
-        ("cartesian2d-external-boundary-layer",)
-        if airfoil.has_finite_trailing_edge
-        else MESH_RECOVERY_MESHER_CANDIDATES
-    )
-    for candidate_name in candidates_for_geometry:
-        candidate_mesher = get_mesher(candidate_name)
+    if airfoil.has_finite_trailing_edge:
+        candidates_for_geometry = (
+            ("blockmesh-cgrid-finite-edge", BlockMeshCGrid(topology=FINITE_EDGE_TOPOLOGY)),
+            ("cartesian2d-external-boundary-layer", get_mesher("cartesian2d-external-boundary-layer")),
+        )
+    else:
+        candidates_for_geometry = tuple(
+            (name, get_mesher(name)) for name in MESH_RECOVERY_MESHER_CANDIDATES
+        )
+    for candidate_name, candidate_mesher in candidates_for_geometry:
         heights: list[float | None] = [original_height]
         caps = [MESH_RECOVERY_MAX_FIRST_CELL_HEIGHT_CHORDS]
         if candidate_name in MESH_RECOVERY_FINE_WALL_MESHERS:
