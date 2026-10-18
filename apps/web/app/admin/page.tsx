@@ -26,8 +26,23 @@ async function loadAdminBootstrap(): Promise<AdminBootstrap | null> {
   }
 }
 
-export default async function AdminPage() {
-  const initialBootstrap = await loadAdminBootstrap();
+type AdminPageProps = {
+  searchParams?: Promise<{
+    section?: string;
+    campaign?: string;
+    wizard?: string;
+  }>;
+};
+
+export default async function AdminPage({
+  searchParams,
+}: AdminPageProps) {
+  const params = (await searchParams) ?? {};
+  const isCampaignHub =
+    (params.section ?? "simulations") === "simulations" &&
+    !params.campaign &&
+    !params.wizard;
+  const initialBootstrap = isCampaignHub ? await loadAdminBootstrap() : null;
   return (
     <AppShell active="admin">
       <div style={{ maxWidth: 1280, margin: "0 auto", padding: "24px 22px 56px" }}>

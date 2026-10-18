@@ -630,10 +630,13 @@ export function CampaignsHub({
                           : "Resume"}
                       </button>
                     )}
-                    <button
-                      type="button"
+                    <a
                       data-testid={`campaign-open-${item.slug}`}
-                      onClick={() => onOpenCampaign(item.id)}
+                      href={`/admin?campaign=${encodeURIComponent(item.id)}`}
+                      onClick={(event) => {
+                        event.preventDefault();
+                        onOpenCampaign(item.id);
+                      }}
                       style={{
                         ...ghostBtn,
                         padding: "5px 10px",
@@ -643,7 +646,7 @@ export function CampaignsHub({
                       }}
                     >
                       Open
-                    </button>
+                    </a>
                     <button
                       type="button"
                       data-testid={`campaign-duplicate-${item.slug}`}
