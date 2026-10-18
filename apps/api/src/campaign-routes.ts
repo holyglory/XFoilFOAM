@@ -35,11 +35,19 @@ import {
   resumeCampaign,
 } from "@aerodb/db";
 import { sql } from "drizzle-orm";
-import type { FastifyInstance, FastifyReply } from "fastify";
+import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { z } from "zod";
 
 import { getCachedEngineHealth } from "./admin-routes";
-import { requireAdmin, sessionEmail } from "./admin-auth";
+import {
+  COOKIE_NAME,
+  adminAuthProviders,
+  authMode,
+  googleAllowedDomain,
+  requireAdmin,
+  sessionEmail,
+  verifySession,
+} from "./admin-auth";
 import { db } from "./db";
 import { makeEngineClient } from "./engine-client";
 import { readSweeperState } from "./services/sweeper-state";
@@ -156,6 +164,141 @@ function sendCampaignError(reply: FastifyReply, e: unknown): FastifyReply {
   throw e;
 }
 
+const campaignListQuery = z
+  .object({
+    status: z
+      .string()
+      .optional()
+      .transform((v) =>
+        v
+          ?.split(",")
+          .map((x) => x.trim())
+          .filter(Boolean),
+      ),
+    limit: z.coerce.number().int().min(1).max(100).default(25),
+    offset: z.coerce.number().int().min(0).default(0),
+    fast: z.enum(["1", "true"]).optional(),
+  })
+  .strict();
+
+type CampaignListQuery = z.infer<typeof campaignListQuery>;
+type EngineHealthSnapshot = Awaited<ReturnType<typeof getCachedEngineHealth>>;
+
+const FAST_LIST_ENGINE_HEALTH_UNKNOWN =
+  "engine health snapshot unavailable without waiting for a live probe";
+
+function adminMeForRequest(req: FastifyRequest) {
+  const mode = authMode();
+  const providers = adminAuthProviders();
+  const google = {
+    enabled: providers.google,
+    allowedDomain: googleAllowedDomain(),
+    loginUrl: "/api/admin/oauth/google?returnTo=/admin",
+  };
+  if (mode === "dev") {
+    return {
+      authed: true,
+      mode,
+      email: null,
+      provider: null,
+      providers,
+      google,
+    };
+  }
+  const session = verifySession(
+    (req as { cookies?: Record<string, string> }).cookies?.[COOKIE_NAME],
+  );
+  return {
+    authed: !!session,
+    mode,
+    email: session?.email ?? null,
+    provider: session?.provider ?? null,
+    providers,
+    google,
+  };
+}
+
+function engineHealthForList(
+  nonBlocking: boolean,
+): Promise<EngineHealthSnapshot> {
+  const probe = getCachedEngineHealth(makeEngineClient());
+  if (!nonBlocking) return probe;
+
+  let snapshot: EngineHealthSnapshot | null = null;
+  return Promise.race([
+    probe.then(
+      (value) => {
+        snapshot = value;
+      },
+      () => undefined,
+    ),
+    Promise.resolve(),
+  ]).then(
+    () =>
+      snapshot ?? {
+        health: null,
+        error: FAST_LIST_ENGINE_HEALTH_UNKNOWN,
+      },
+  );
+}
+
+async function readCampaignList(
+  q: CampaignListQuery,
+  options: { nonBlockingEngine: boolean },
+) {
+  const listingPromise = q.fast
+    ? listCampaignsFast(db, {
+        statuses: q.status,
+        limit: q.limit,
+        offset: q.offset,
+      })
+    : listCampaigns(db, {
+        statuses: q.status,
+        limit: q.limit,
+        offset: q.offset,
+      });
+  const [listing, sweeper, engineSnapshot, jobsRows] = await Promise.all([
+    listingPromise,
+    readSweeperState(),
+    engineHealthForList(options.nonBlockingEngine),
+    db.execute(sql`
+      SELECT count(*)::int AS n FROM sim_jobs WHERE status IN ('submitted', 'running', 'ingesting')
+    `),
+  ]);
+  const [jobsRow] = jobsRows as unknown as Array<{ n: number }>;
+  const { health, error: engineError } = engineSnapshot;
+  return {
+    ...listing,
+    solverState: {
+      heartbeatAt: isoOrNull(sweeper?.heartbeatAt),
+      enabled: Boolean(sweeper?.enabled),
+      engineUnreachableSince: isoOrNull(sweeper?.engineUnreachableSince),
+      engineHealthy:
+        health == null
+          ? options.nonBlockingEngine
+            ? null
+            : false
+          : !engineError,
+      engineHealthError: engineError,
+      activeJobCount: Number(jobsRow?.n ?? 0),
+      lastTickStartedAt: isoOrNull(sweeper?.lastTickStartedAt),
+      lastTickCompletedAt: isoOrNull(sweeper?.lastTickCompletedAt),
+      diskAdmissionBlocked: Boolean(sweeper?.diskAdmissionBlocked),
+      diskAdmissionReason: sweeper?.diskAdmissionReason ?? null,
+      diskUsedPct: sweeper?.diskUsedPct ?? null,
+      diskFreeBytes: sweeper?.diskFreeBytes ?? null,
+      diskRequiredFreeBytes: sweeper?.diskRequiredFreeBytes ?? null,
+      diskCheckedAt: isoOrNull(sweeper?.diskCheckedAt),
+      admissionFenceActive: Boolean(sweeper?.admissionFenceActive),
+      lastAdmissionFenceAt: isoOrNull(sweeper?.lastAdmissionFenceAt),
+      lastAdmissionFenceReason: sweeper?.lastAdmissionFenceReason ?? null,
+      lastAdmissionFenceDetails: sanitizeAdmissionFenceContext(
+        sweeper?.lastAdmissionFenceDetails,
+      ),
+    },
+  };
+}
+
 export async function registerCampaignRoutes(
   app: FastifyInstance,
 ): Promise<void> {
@@ -199,70 +342,24 @@ export async function registerCampaignRoutes(
     },
   );
 
-  app.get("/api/admin/campaigns", { preHandler: requireAdmin }, async (req) => {
-    const q = z
-      .object({
-        status: z
-          .string()
-          .optional()
-          .transform((v) =>
-            v
-              ?.split(",")
-              .map((x) => x.trim())
-              .filter(Boolean),
-          ),
-        limit: z.coerce.number().int().min(1).max(100).default(25),
-        offset: z.coerce.number().int().min(0).default(0),
-        fast: z.enum(["1", "true"]).optional(),
-      })
-      .parse(req.query);
-    const listing = q.fast
-      ? await listCampaignsFast(db, {
-          statuses: q.status,
-          limit: q.limit,
-          offset: q.offset,
-        })
-      : await listCampaigns(db, {
-          statuses: q.status,
-          limit: q.limit,
-          offset: q.offset,
-        });
-    // Cheap solver-state block (pinned contract): sweeper_state row + active
-    // sim_jobs count + the SAME cached engine-health probe the queue endpoint
-    // uses — no new probe paths.
-    const sweeper = await readSweeperState();
-    const { health, error: engineError } =
-      await getCachedEngineHealth(makeEngineClient());
-    const [jobsRow] = (await db.execute(sql`
-      SELECT count(*)::int AS n FROM sim_jobs WHERE status IN ('submitted', 'running', 'ingesting')
-    `)) as unknown as Array<{ n: number }>;
-    return {
-      ...listing,
-      solverState: {
-        heartbeatAt: isoOrNull(sweeper?.heartbeatAt),
-        enabled: Boolean(sweeper?.enabled),
-        engineUnreachableSince: isoOrNull(sweeper?.engineUnreachableSince),
-        engineHealthy: Boolean(health) && !engineError,
-        activeJobCount: Number(jobsRow?.n ?? 0),
-        // Tick-progress pair (liveness/progress split, migration 0033) —
-        // lets every solverState consumer derive the amber tick_stalled
-        // state instead of a false red while a tick crawls on a slow engine.
-        lastTickStartedAt: isoOrNull(sweeper?.lastTickStartedAt),
-        lastTickCompletedAt: isoOrNull(sweeper?.lastTickCompletedAt),
-        diskAdmissionBlocked: Boolean(sweeper?.diskAdmissionBlocked),
-        diskAdmissionReason: sweeper?.diskAdmissionReason ?? null,
-        diskUsedPct: sweeper?.diskUsedPct ?? null,
-        diskFreeBytes: sweeper?.diskFreeBytes ?? null,
-        diskRequiredFreeBytes: sweeper?.diskRequiredFreeBytes ?? null,
-        diskCheckedAt: isoOrNull(sweeper?.diskCheckedAt),
-        admissionFenceActive: Boolean(sweeper?.admissionFenceActive),
-        lastAdmissionFenceAt: isoOrNull(sweeper?.lastAdmissionFenceAt),
-        lastAdmissionFenceReason: sweeper?.lastAdmissionFenceReason ?? null,
-        lastAdmissionFenceDetails: sanitizeAdmissionFenceContext(
-          sweeper?.lastAdmissionFenceDetails,
+  app.get(
+    "/api/admin/bootstrap",
+    { preHandler: requireAdmin },
+    async (req) => {
+      const q = campaignListQuery.parse(req.query);
+      return {
+        me: adminMeForRequest(req),
+        campaigns: await readCampaignList(
+          { ...q, fast: "1" },
+          { nonBlockingEngine: true },
         ),
-      },
-    };
+      };
+    },
+  );
+
+  app.get("/api/admin/campaigns", { preHandler: requireAdmin }, async (req) => {
+    const q = campaignListQuery.parse(req.query);
+    return readCampaignList(q, { nonBlockingEngine: Boolean(q.fast) });
   });
 
   // ---- wizard reuse preview (§5.4; read-only, POST body) ----

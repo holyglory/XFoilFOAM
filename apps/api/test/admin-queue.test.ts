@@ -279,6 +279,45 @@ afterAll(async () => {
   process.env = { ...ORIGINAL_ENV };
 }, 30_000);
 
+describe("authenticated campaign bootstrap with a saturated engine", () => {
+  it("returns auth and real campaign data without waiting for engine health", async () => {
+    const started = Date.now();
+    const res = await app.inject({
+      method: "GET",
+      url: "/api/admin/bootstrap?status=active,paused,attention&limit=50",
+      headers: { cookie: adminCookie },
+    });
+    const elapsed = Date.now() - started;
+
+    expect(res.statusCode).toBe(200);
+    expect(elapsed).toBeLessThan(1_000);
+    expect(res.json()).toMatchObject({
+      me: {
+        authed: true,
+        mode: "prod",
+        email: ADMIN_EMAIL,
+        provider: "password",
+      },
+      campaigns: {
+        items: expect.any(Array),
+        total: expect.any(Number),
+        solverState: {
+          engineHealthy: null,
+          engineHealthError: expect.stringContaining("without waiting"),
+        },
+      },
+    });
+  });
+
+  it("keeps the bootstrap endpoint behind the admin session", async () => {
+    const res = await app.inject({
+      method: "GET",
+      url: "/api/admin/bootstrap?limit=1",
+    });
+    expect(res.statusCode).toBe(401);
+  });
+});
+
 describe("queue payload with a saturated (3 s) engine", () => {
   it("scope=activity answers well under 1 s cold and presents missing engine data honestly", async () => {
     const started = Date.now();

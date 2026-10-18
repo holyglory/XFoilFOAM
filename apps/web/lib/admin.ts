@@ -2348,7 +2348,8 @@ export interface AdminCampaignsSolverState {
   heartbeatAt: string | null;
   enabled: boolean;
   engineUnreachableSince: string | null;
-  engineHealthy: boolean;
+  engineHealthy: boolean | null;
+  engineHealthError?: string | null;
   activeJobCount: number;
   /** Tick-progress pair (liveness/progress split, migration 0033). */
   lastTickStartedAt: string | null;
@@ -2382,6 +2383,22 @@ export const listCampaigns = (params?: {
     total: number;
     solverState: AdminCampaignsSolverState;
   }>(`/api/admin/campaigns${suffix}`);
+};
+
+export const getAdminBootstrap = (params?: {
+  statuses?: string[];
+  limit?: number;
+  offset?: number;
+}) => {
+  const qs = new URLSearchParams();
+  if (params?.statuses?.length) qs.set("status", params.statuses.join(","));
+  if (params?.limit != null) qs.set("limit", String(params.limit));
+  if (params?.offset != null) qs.set("offset", String(params.offset));
+  const suffix = qs.toString() ? `?${qs.toString()}` : "";
+  return aj<{
+    me: AdminMe;
+    campaigns: Awaited<ReturnType<typeof listCampaigns>>;
+  }>(`/api/admin/bootstrap${suffix}`);
 };
 
 export const getCampaign = (id: string) =>

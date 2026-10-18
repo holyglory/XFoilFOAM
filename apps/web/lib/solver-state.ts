@@ -44,7 +44,8 @@ export interface SolverStateInput {
   heartbeatAt: string | null;
   enabled: boolean;
   engineUnreachableSince: string | null;
-  engineHealthy: boolean;
+  engineHealthy: boolean | null;
+  engineHealthError?: string | null;
   engineBuildMismatch?: boolean;
   /** celery introspection failed — ALWAYS a secondary chip, never primary. */
   engineQueueError?: boolean;
@@ -115,7 +116,7 @@ export interface SolverStateListPayload {
   heartbeatAt: string | null;
   enabled: boolean;
   engineUnreachableSince: string | null;
-  engineHealthy: boolean;
+  engineHealthy: boolean | null;
   activeJobCount: number;
   lastTickStartedAt: string | null;
   lastTickCompletedAt: string | null;
@@ -332,6 +333,18 @@ export function deriveSolverState(
       headline: `Engine unreachable since ${timeOfDay(input.engineUnreachableSince)} — no jobs are being submitted.`,
       detail:
         "Submissions are held with backoff; composed work is released, jobs are not marked failed.",
+      secondary,
+    };
+  }
+
+  if (input.engineHealthy == null) {
+    return {
+      state: "unknown",
+      tone: "amber",
+      headline: "Engine status is still loading.",
+      detail:
+        input.engineHealthError ??
+        "The campaign data is real; the latest engine health snapshot is not available yet.",
       secondary,
     };
   }

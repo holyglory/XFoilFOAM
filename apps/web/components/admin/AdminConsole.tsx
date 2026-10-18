@@ -84,6 +84,7 @@ import {
   deleteSolverProfile,
   deleteSweepDefinition,
   getAdminMediums,
+  getAdminBootstrap,
   getAdminQueue,
   getAdminSync,
   getAdminSimulationSetup,
@@ -465,18 +466,27 @@ export function AdminConsole() {
       const prefetchScope = solverScopeForTab(parseSolverTab(tabParam));
       if (prefetchScope) prefetchQueueScope(prefetchScope);
     }
-    if (section === "simulations" && !campaignParam && !wizardKind) {
-      void listCampaigns({
+    const campaignHub =
+      section === "simulations" && !campaignParam && !wizardKind;
+    if (campaignHub) {
+      void getAdminBootstrap({
         statuses: ["active", "paused", "attention"],
         limit: 50,
-        fast: true,
       })
-        .then(setPrefetchedCampaigns)
-        .catch(() => undefined);
+        .then(({ me: bootstrapMe, campaigns }) => {
+          setMe(bootstrapMe);
+          setPrefetchedCampaigns(campaigns);
+        })
+        .catch(() =>
+          adminMe()
+            .then(setMe)
+            .catch((e) => setErr((e as Error).message)),
+        );
+    } else {
+      adminMe()
+        .then(setMe)
+        .catch((e) => setErr((e as Error).message));
     }
-    adminMe()
-      .then(setMe)
-      .catch((e) => setErr((e as Error).message));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 

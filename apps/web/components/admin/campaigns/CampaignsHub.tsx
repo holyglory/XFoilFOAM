@@ -241,6 +241,7 @@ export function CampaignsHub({
           enabled: solverPayload.enabled,
           engineUnreachableSince: solverPayload.engineUnreachableSince,
           engineHealthy: solverPayload.engineHealthy,
+          engineHealthError: solverPayload.engineHealthError,
           activeJobCount: solverPayload.activeJobCount,
           lastTickStartedAt: solverPayload.lastTickStartedAt ?? null,
           lastTickCompletedAt: solverPayload.lastTickCompletedAt ?? null,
