@@ -5251,8 +5251,6 @@ def _prepare_transient_case(
         logger.info("transient %s warm-started from steady field %s", tcase, steady_field_dir)
         return tmesh, patches
     if freestream_fallback:
-        if is_compressible(runner):
-            return tmesh, patches
         # A rejected full-steady field means this condition is hostile to
         # SIMPLE initialisation — skip the in-case short simpleFoam init (its
         # own field is garbage at exactly these cells). But PURE uniform
@@ -5266,9 +5264,7 @@ def _prepare_transient_case(
             "skipping the in-case short simpleFoam init",
             tcase,
         )
-        potential = runner.application(
-            tcase, dialect.potential_foam_command, timeout=600
-        )
+        potential = _potential_initialization(tcase, runner, patches, dialect)
         _checked_initialization_result(
             tcase, potential, stage="potentialFoam"
         )

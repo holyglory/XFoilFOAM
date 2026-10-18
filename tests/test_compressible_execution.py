@@ -381,7 +381,7 @@ def test_density_steady_case_continues_from_uniform_freestream_after_material_se
 @pytest.mark.parametrize("timing", [(None, None), (1e-4, 1e-5)])
 @pytest.mark.parametrize("family,fallback,expected", [
     ("rhoPimpleFoam", False, ["potentialFoam -initialiseUBCs -pName pXfoilfoamInitial", "rhoPimpleFoam"]),
-    ("rhoPimpleFoam", True, []),
+    ("rhoPimpleFoam", True, ["potentialFoam -initialiseUBCs -pName pXfoilfoamInitial"]),
     ("rhoCentralFoam", False, []),
 ])
 def test_transient_preparation_preserves_compressible_state_during_velocity_initialization(request_payload, monkeypatch, tmp_path, family, fallback, expected, timing):
