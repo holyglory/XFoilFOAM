@@ -127,6 +127,10 @@ try {
     `Campaign card took ${cardRenderedAt - cardWaitStartedAt} ms after the campaigns surface became visible`,
   );
   assert(
+    cardRenderedAt - listRouteStartedAt < 1000,
+    `Campaign card took ${cardRenderedAt - listRouteStartedAt} ms from navigation`,
+  );
+  assert(
     listResponse?.requestStartedAt != null &&
       listResponse.responseReceivedAt - listResponse.requestStartedAt < 1000,
     "Campaign list API exceeded the 1 second response budget",

@@ -493,8 +493,10 @@ export function AdminConsole() {
     }
   };
 
+  const campaignListAuthenticated = prefetchedCampaigns !== null;
+
   // ---- auth gate ----
-  if (!me) {
+  if (!me && !campaignListAuthenticated) {
     return (
       <div
         style={{ fontFamily: MONO, fontSize: 13, color: C.muted, padding: 40 }}
@@ -503,7 +505,7 @@ export function AdminConsole() {
       </div>
     );
   }
-  if (!me.authed) {
+  if (me && !me.authed) {
     const googleProvider = me.providers?.google || me.google?.enabled;
     const passwordProvider = me.providers?.password ?? true;
     const googleDomain = me.google?.allowedDomain || "vr.ae";
@@ -604,6 +606,7 @@ export function AdminConsole() {
   }
 
   // ---- authed shell: header + sidebar menu + section ----
+  const displayMode = me?.mode ?? "prod";
   return (
     <div>
       <style jsx global>{`
@@ -1126,19 +1129,21 @@ export function AdminConsole() {
             fontFamily: MONO,
             fontSize: 10,
             letterSpacing: "0.08em",
-            color: me.mode === "prod" ? C.teal : C.amber,
-            border: `1px solid ${me.mode === "prod" ? C.tealBorder : C.stroke}`,
-            background: me.mode === "prod" ? C.tealFill : "transparent",
+            color: displayMode === "prod" ? C.teal : C.amber,
+            border: `1px solid ${displayMode === "prod" ? C.tealBorder : C.stroke}`,
+            background: displayMode === "prod" ? C.tealFill : "transparent",
             borderRadius: 5,
             padding: "3px 8px",
           }}
         >
-          {me.mode === "prod"
-            ? `PROD · ${me.provider === "google" ? "Google · " : ""}${me.email}`
+          {displayMode === "prod"
+            ? me?.email
+              ? `PROD · ${me.provider === "google" ? "Google · " : ""}${me.email}`
+              : "PROD · authenticating…"
             : "DEV · auth off"}
         </span>
         <div style={{ marginLeft: "auto", display: "flex", gap: 8 }}>
-          {me.mode === "prod" && (
+          {displayMode === "prod" && (
             <button
               type="button"
               disabled={busy}
