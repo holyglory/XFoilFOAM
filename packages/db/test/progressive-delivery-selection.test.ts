@@ -120,7 +120,7 @@ it("keeps the oldest multi-report backlog selected after a bounded pass", async 
       sql`SELECT id FROM sim_jobs WHERE id=md5('old-backlog')::uuid`,
     );
     const first = await transaction.execute(progressiveReportJobsSql());
-    expect(first).toHaveLength(32);
+    expect(first).toHaveLength(33);
     expect(first[0].sim_job_id).toBe(oldJob.id);
 
     await transaction.execute(sql`INSERT INTO progressive_remote_progress_receipts
@@ -131,7 +131,7 @@ it("keeps the oldest multi-report backlog selected after a bounded pass", async 
       WHERE id=md5('old-backlog')::uuid`);
 
     const second = await transaction.execute(progressiveReportJobsSql());
-    expect(second).toHaveLength(32);
+    expect(second).toHaveLength(33);
     expect(second[0].sim_job_id).toBe(oldJob.id);
     expect(
       await transaction.execute(sql`SELECT min(received_at) AS received_at
@@ -447,8 +447,8 @@ it("settles fulfilled and active jobs fairly while expired work keeps arriving",
     expect(allReports).toHaveLength(50);
     expect(allSettlements).toHaveLength(166);
     const reports = await transaction.execute(progressiveReportJobsSql());
-    expect(reports).toHaveLength(32);
-    expect(reports).toEqual(allReports.slice(0, 32));
+    expect(reports).toHaveLength(50);
+    expect(reports).toEqual(allReports);
     const [oldestReport] = await transaction.execute(
       sql`SELECT id FROM fixture_settlement_jobs WHERE variant='report-unapplied-1'`,
     );
