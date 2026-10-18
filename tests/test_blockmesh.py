@@ -47,6 +47,12 @@ def test_mesher_registered():
     assert isinstance(legacy, BlockMeshCGrid)
     assert legacy.topology == "legacy"
     assert legacy.user_selectable is True
+    finite_edge = get_mesher("blockmesh-cgrid-finite-edge")
+    assert isinstance(finite_edge, BlockMeshCGrid)
+    assert finite_edge.topology == FINITE_EDGE_TOPOLOGY
+    assert finite_edge.user_selectable is False
+    assert finite_edge.name not in list_meshers()
+    assert finite_edge.name in list_meshers(include_internal=True)
     for segments in SEGMENTED_NORMAL_COUNTS:
         name = f"blockmesh-cgrid-segmented-normal-{segments}"
         candidate = get_mesher(name)
@@ -127,7 +133,7 @@ def test_finite_edge_trial_preserves_both_endpoints_and_closes_the_base(name, re
     assert f"hex (61 84 83 0 147 170 169 86) (50 {edge_cells} 1)" in text
     assert mesher.cache_version == "finite-edge-central-wake-v1"
     assert mesher.user_selectable is False
-    assert mesher.name not in list_meshers(include_internal=True)
+    assert mesher.name in list_meshers(include_internal=True)
 
 
 def test_finite_edge_trial_refuses_a_zero_thickness_wake(sharp_naca0012_selig_text):

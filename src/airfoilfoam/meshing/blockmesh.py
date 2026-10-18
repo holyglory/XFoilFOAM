@@ -909,6 +909,7 @@ class BlockMeshCGrid(Mesher):
 
 
 register_mesher(BlockMeshCGrid())
+register_mesher(BlockMeshCGrid(topology=FINITE_EDGE_TOPOLOGY))
 for _segments in SEGMENTED_NORMAL_COUNTS:
     register_mesher(BlockMeshCGrid.segmented_normal(_segments))
 for _segments in SEGMENTED_TE_NORMAL_COUNTS:
