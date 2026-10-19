@@ -6,8 +6,8 @@ import {
 } from "../src/progressive-cfd-jobs";
 
 describe("progressive fast solver process cap", () => {
-  it("keeps the existing four-process default", () => {
-    expect(progressiveFastSolverProcesses(96, "")).toBe(4);
+  it("uses the three-process fast-stage default", () => {
+    expect(progressiveFastSolverProcesses(96, "")).toBe(3);
   });
 
   it("allows an explicit eight-process fast-stage experiment", () => {
@@ -18,9 +18,9 @@ describe("progressive fast solver process cap", () => {
     expect(progressiveFastSolverProcesses(96, "64")).toBe(8);
   });
 
-  it("falls back to four for malformed or non-positive values", () => {
-    expect(progressiveFastSolverProcesses(96, "invalid")).toBe(4);
-    expect(progressiveFastSolverProcesses(96, "0")).toBe(4);
+  it("falls back to three for malformed or non-positive values", () => {
+    expect(progressiveFastSolverProcesses(96, "invalid")).toBe(3);
+    expect(progressiveFastSolverProcesses(96, "0")).toBe(3);
   });
 
   it("never exceeds the available admission slots", () => {

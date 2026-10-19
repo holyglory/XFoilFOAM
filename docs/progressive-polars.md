@@ -1181,7 +1181,7 @@ twelve-hour ceiling is finite; continuation requires measured quality progress.
 Exhaustion remains unresolved work, not successful campaign completion. Reuse
 compatible meshes and warm starts. Benchmark physical cores versus SMT/MPI by
 useful throughput rather than assuming nominal thread count means equal capacity.
-The fast-stage transient fallback uses four solver processes by default. An
+The fast-stage transient fallback uses three solver processes by default. An
 operator benchmark may set `SWEEPER_PROGRESSIVE_FAST_SOLVER_PROCESSES` to a
 value from one through eight; the setting is capped at eight, applies only when
 the immutable setup does not specify a process count, and leaves
