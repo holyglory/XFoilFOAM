@@ -142,6 +142,10 @@ try {
     `Campaign card took ${cardRenderedAt - cardWaitStartedAt} ms after the campaigns surface became visible`,
   );
   assert(
+    cardRenderedAt - listRouteStartedAt < 1000,
+    `Campaign card took ${cardRenderedAt - listRouteStartedAt} ms from navigation`,
+  );
+  assert(
     browserTiming?.domContentLoaded < 1000,
     `Admin document became interactive too slowly: ${browserTiming?.domContentLoaded ?? "unknown"}ms`,
   );
