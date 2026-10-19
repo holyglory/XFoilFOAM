@@ -10,6 +10,8 @@ import {
   effectiveProgressiveStageSql,
   progressiveCfdAdmissionSql,
   progressiveCohortReadinessSql,
+  progressiveExecutionPolicySql,
+  progressiveFastTargetSettledSql,
   progressiveInitialCoverageCompleteSql,
 } from "./progressive-execution-policy";
 
@@ -47,12 +49,15 @@ async function finishCampaigns(db: DB, epochId: string): Promise<number> {
 export async function advanceProgressiveCfdStages(db: DB) {
   const hasEvidence = sql`evidence_target.target_id IS NOT NULL`;
   const ready = sql`
-    NOT EXISTS (
+      NOT EXISTS (
       SELECT 1 FROM progressive_cfd_units unit
       JOIN progressive_stage_unsettled_units unsettled ON unsettled.unit_id = unit.id
       WHERE unit.work_id = work.id
-    ) AND (work.stage = 3 OR (
-      ${progressiveInitialCoverageCompleteSql()} AND NOT EXISTS (
+      ) AND (work.stage = 3 OR (
+      (
+        ${progressiveInitialCoverageCompleteSql()} OR
+        (${progressiveExecutionPolicySql()} AND ${progressiveFastTargetSettledSql()})
+      ) AND NOT EXISTS (
         SELECT 1 FROM progressive_work baseline JOIN progressive_prediction_links link ON link.work_id = baseline.id
         JOIN progressive_polar_fit_work fit ON fit.prediction_id = link.prediction_id
         WHERE baseline.generation_id = generation.id AND baseline.target_id = work.target_id AND baseline.stage = 1

@@ -126,6 +126,11 @@ precise CFD while higher-speed fast work may remain pending. Low means a finite,
 nonnegative Mach value below 1; exactly Mach 1, missing, malformed and negative
 Mach values belong to the high cohort and cannot be treated as subsonic.
 
+Within the low cohort, a target whose own FAST scope is settled may begin its
+precise grid while other low-Mach targets continue FAST work. This overlap does
+not admit any high-Mach work: the low cohort remains the exclusive admission
+frontier until every low precise obligation is settled.
+
 Every current generation's low precise work must close successfully before a
 new high CFD claim is issued. A fast gap can advance into precise recovery; a
 precise gap keeps the high cohort waiting. In-flight, locked, deferred or

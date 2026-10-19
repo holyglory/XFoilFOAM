@@ -19,12 +19,39 @@ export function progressiveExecutionPolicySql(generation = "generation") {
       AND execution_policy.policy = ${SUBSONIC_THROUGH_PRECISE_POLICY})`;
 }
 
+export function progressiveFastTargetSettledSql(
+  generation = "generation",
+  targetId: SQL = sql`work.target_id`,
+) {
+  return sql`EXISTS (
+    SELECT 1
+    FROM progressive_work fast_work
+    WHERE fast_work.generation_id = ${sql.raw(generation)}.id
+      AND fast_work.target_id = ${targetId}
+      AND fast_work.stage = 2
+      AND EXISTS (
+        SELECT 1 FROM progressive_cfd_units fast_unit
+        WHERE fast_unit.work_id = fast_work.id
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM progressive_cfd_units fast_unit
+        WHERE fast_unit.work_id = fast_work.id
+          AND fast_unit.state NOT IN ('complete', 'gap')
+      )
+  )`;
+}
+
 export function effectiveProgressiveStageSql(
   generation = "generation",
   targetId: SQL = sql`work.target_id`,
 ) {
   return sql`CASE WHEN ${progressiveExecutionPolicySql(generation)} THEN (
-    SELECT cursor.stage FROM progressive_generation_cohorts cursor
+    SELECT CASE
+      WHEN cursor.stage = 2 AND work.stage = 3
+        AND ${progressiveFastTargetSettledSql(generation, targetId)}
+      THEN 3
+      ELSE cursor.stage
+    END FROM progressive_generation_cohorts cursor
     JOIN progressive_generation_cohort_targets member ON member.generation_id = cursor.generation_id AND member.cohort = cursor.cohort
     WHERE cursor.generation_id = ${sql.raw(generation)}.id AND member.target_id = ${targetId}
   ) ELSE ${sql.raw(generation)}.stage END`;
