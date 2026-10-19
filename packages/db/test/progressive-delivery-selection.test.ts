@@ -187,6 +187,44 @@ it("prioritizes current unsubmitted remote reports before older running backlog"
   });
 });
 
+it("drains pending remote jobs carrying their own stopped execution identity first", async () => {
+  await client.db.transaction(async (transaction) => {
+    await transaction.execute(sql`CREATE TEMP TABLE sim_jobs ON COMMIT DROP AS
+      SELECT md5('stopped-pending')::uuid AS id,md5('campaign')::uuid AS campaign_id,
+        md5('stopped-pending')::text AS engine_job_id,'pending'::text AS status,
+        timestamptz '2026-10-01T02:00:00Z' AS "updatedAt",
+        timestamptz '2026-10-01T01:00:00Z' AS "polledAt"
+      UNION ALL
+      SELECT md5('active-running')::uuid,md5('campaign')::uuid,
+        md5('active-running-engine')::text,'running'::text,
+        timestamptz '2026-10-02T02:00:00Z',timestamptz '2026-10-02T01:00:00Z'`);
+    await transaction.execute(sql`CREATE TEMP TABLE progressive_remote_dispatches ON COMMIT DROP AS
+      SELECT id AS sim_job_id FROM sim_jobs`);
+    await transaction.execute(sql`CREATE TEMP TABLE progressive_remote_reports ON COMMIT DROP AS
+      SELECT md5('stopped-pending')::uuid AS sim_job_id,1::bigint AS sequence,
+        timestamptz '2026-10-01T00:00:00Z' AS received_at
+      UNION ALL
+      SELECT md5('active-running')::uuid,1,
+        timestamptz '2026-10-02T00:00:00Z'`);
+    await transaction.execute(sql`CREATE TEMP TABLE progressive_remote_progress_receipts (
+      sim_job_id uuid,sequence bigint
+    ) ON COMMIT DROP`);
+    await transaction.execute(sql`CREATE TEMP TABLE progressive_remote_report_inventories (
+      sim_job_id uuid,sequence bigint
+    ) ON COMMIT DROP`);
+
+    const selected = await transaction.execute(progressiveReportJobsSql());
+
+    expect(selected[0]?.sim_job_id).toBe(
+      (
+        await transaction.execute(
+          sql`SELECT id FROM sim_jobs WHERE id=md5('stopped-pending')::uuid`,
+        )
+      )[0]?.id,
+    );
+  });
+});
+
 it("prioritizes active remote reports before terminal ingestion backlog", async () => {
   await client.db.transaction(async (transaction) => {
     await transaction.execute(sql`CREATE TEMP TABLE sim_jobs ON COMMIT DROP AS
