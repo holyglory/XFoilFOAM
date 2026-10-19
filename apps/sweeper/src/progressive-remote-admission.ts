@@ -19,7 +19,7 @@ import {
 } from "./progressive-claim-deferral";
 import { REQUIRED_PRECALC_EVIDENCE_RECOVERY_VERSION } from "./build-request";
 
-const PROGRESSIVE_REPORT_BACKPRESSURE_LIMIT = 2_000;
+const PROGRESSIVE_REPORT_BACKPRESSURE_LIMIT = 10_000;
 
 export interface ProgressiveRemoteCapabilities {
   localTimeStepVersion?: number | null;
