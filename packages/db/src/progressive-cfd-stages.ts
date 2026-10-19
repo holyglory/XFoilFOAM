@@ -108,6 +108,13 @@ export async function advanceProgressiveCfdStages(db: DB) {
         AND campaign.status IN ('active', 'attention', 'paused')
         AND work.stage = ${effectiveProgressiveStageSql()}
         AND work.state = 'pending'
+        AND (
+          NOT EXISTS (
+            SELECT 1 FROM campaign_progressive_execution_policies policy
+            WHERE policy.campaign_id = campaign.id
+          )
+          OR work.stage = 3
+        )
         AND EXISTS (
           SELECT 1 FROM progressive_cfd_units unit
           WHERE unit.work_id = work.id
