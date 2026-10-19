@@ -82,7 +82,7 @@ export async function recoverStaleProgressiveRemoteDispatches(
           WHERE evidence_attempt.sim_job_id = job.id
         )
       ORDER BY job."updatedAt", job.id
-      LIMIT ${input.expectedJobs}
+      LIMIT ${input.expectedJobs}::int
       FOR UPDATE OF job, promise SKIP LOCKED
     `);
     if (candidates.length !== input.expectedJobs)
@@ -137,7 +137,7 @@ export async function recoverStaleProgressiveRemoteDispatches(
               'authoritativeLeaseLoss', true,
               'remoteCancellation', jsonb_build_object(
                 'disposition', 'operator_release',
-                'reason', ${STALE_HZ_RESET_REASON}
+                'reason', ${STALE_HZ_RESET_REASON}::text
               )
             )
         WHERE id = ${promiseId}::uuid
