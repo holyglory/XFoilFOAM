@@ -100,6 +100,7 @@ export async function recoverStaleProgressiveRemoteDispatches(
         SET outcome = 'failed', finished_at = clock_timestamp(),
           error = ${STALE_HZ_RESET_REASON}
         WHERE attempt.sim_job_id = ${jobId}::uuid AND attempt.outcome = 'running'
+        RETURNING attempt.token
       `);
       const updatedUnits = await connection.execute(sql`
         UPDATE progressive_cfd_units unit
@@ -109,6 +110,7 @@ export async function recoverStaleProgressiveRemoteDispatches(
         WHERE attempt.sim_job_id = ${jobId}::uuid
           AND attempt.unit_id = unit.id
           AND attempt.error = ${STALE_HZ_RESET_REASON}
+        RETURNING unit.id
       `);
       await connection.execute(sql`
         UPDATE progressive_work work
