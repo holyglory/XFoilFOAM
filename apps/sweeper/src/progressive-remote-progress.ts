@@ -24,10 +24,11 @@ const MAX_PROGRESSIVE_REPORTS_PER_EXECUTION = 16;
 const MAX_PROGRESSIVE_CAMPAIGN_JOBS_PER_RECONCILIATION = 16;
 const MAX_PROGRESSIVE_REPORT_JOBS_PER_RECONCILIATION = 8;
 const MAX_PROGRESSIVE_TERMINAL_JOBS_PER_RECONCILIATION = 8;
-const HIGH_PROGRESSIVE_REPORTS_PER_EXECUTION = 64;
+const HIGH_PROGRESSIVE_REPORTS_PER_EXECUTION = 256;
 const HIGH_PROGRESSIVE_CAMPAIGN_JOBS_PER_RECONCILIATION = 64;
 const HIGH_PROGRESSIVE_REPORT_JOBS_PER_RECONCILIATION = 48;
 const HIGH_PROGRESSIVE_TERMINAL_JOBS_PER_RECONCILIATION = 32;
+const PROGRESSIVE_REPORTS_PER_TRANSACTION = 8;
 
 async function applyProgressiveRemoteProgressInTransaction(
   db: DB,
@@ -201,25 +202,52 @@ async function applyProgressiveRemoteProgressBatch(
   for (
     let reportPass = 0;
     reportPass < reportLimit;
-    reportPass += 1
+    reportPass += PROGRESSIVE_REPORTS_PER_TRANSACTION
   ) {
     try {
-      const result = await db.transaction(async (transaction) =>
-        applyProgressiveRemoteProgressInTransaction(
-          transaction as unknown as DB,
-          executionId,
-        ),
-      );
-      if (result.kind === "indexed") batchReceipt.indexed += 1;
-      if (result.kind === "applied") {
-        batchReceipt.applied += 1;
-        if (result.stopped) batchReceipt.stopped += 1;
-      }
-      if (result.kind === "idle") {
+      const chunk = await db.transaction(async (transaction) => {
+        const chunkReceipt = {
+          applied: 0,
+          indexed: 0,
+          stopped: 0,
+          idle: false,
+          waiting: false,
+        };
+        const connection = transaction as unknown as DB;
+        for (
+          let chunkPass = 0;
+          chunkPass < PROGRESSIVE_REPORTS_PER_TRANSACTION &&
+          reportPass + chunkPass < reportLimit;
+          chunkPass += 1
+        ) {
+          const result = await applyProgressiveRemoteProgressInTransaction(
+            connection,
+            executionId,
+          );
+          if (result.kind === "indexed") chunkReceipt.indexed += 1;
+          if (result.kind === "applied") {
+            chunkReceipt.applied += 1;
+            if (result.stopped) chunkReceipt.stopped += 1;
+          }
+          if (result.kind === "idle") {
+            chunkReceipt.idle = true;
+            break;
+          }
+          if (result.kind === "waiting") {
+            chunkReceipt.waiting = true;
+            break;
+          }
+        }
+        return chunkReceipt;
+      });
+      batchReceipt.indexed += chunk.indexed;
+      batchReceipt.applied += chunk.applied;
+      batchReceipt.stopped += chunk.stopped;
+      if (chunk.idle) {
         batchReceipt.idle = true;
         break;
       }
-      if (result.kind === "waiting") break;
+      if (chunk.waiting) break;
     } catch (error) {
       batchReceipt.errors.push({
         executionId,
@@ -261,10 +289,7 @@ async function reconcileProgressiveRemoteCampaign(
     errors: [],
   };
 
-  for (const job of jobs.slice(
-    0,
-    campaignJobLimit,
-  )) {
+  for (const job of jobs.slice(0, campaignJobLimit)) {
     const executionId = String(job.sim_job_id);
     try {
       const batch = await applyProgressiveRemoteProgressBatch(

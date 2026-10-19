@@ -14,6 +14,7 @@ import {
   type ProgressiveRemoteExecutionEnvelope,
   type ProgressiveRansPromotion,
   progressiveCfdEffectiveBudgetSql,
+  ProgressiveCfdEvidenceScopeClosed,
 } from "@aerodb/db";
 import { readProgressiveRemoteRetention } from "@aerodb/db/progressive-remote-retention";
 import { refreshPolarClassificationsForJob } from "@aerodb/db/polar-cache";
@@ -402,7 +403,16 @@ async function recoveryPromotions(
 }
 
 export async function settleProgressiveRemoteJob(db: DB, executionId: string) {
-  await publishAcceptedProgressiveAttempts(db, executionId);
+  try {
+    await publishAcceptedProgressiveAttempts(db, executionId);
+  } catch (error) {
+    if (
+      !(error instanceof ProgressiveCfdEvidenceScopeClosed) &&
+      !(error instanceof Error &&
+        error.message === "Obsolete or settled progressive CFD execution scope")
+    )
+      throw error;
+  }
   return db.transaction(async (transaction) => {
     const connection = transaction as unknown as DB;
     const [dispatch] =

@@ -101,6 +101,41 @@ export async function verifyProgressiveWorkerObservation(
   await db.execute(
     sql`UPDATE sync_api_settings SET remote_solver_enabled = false WHERE id = 1`,
   );
+  const hubDispatchRollback = new Error(
+    "Restore hub outbound role-isolation fixture",
+  );
+  await expect(
+    db.transaction(async (transaction) => {
+      const connection = transaction as unknown as DB;
+      await connection.execute(sql`
+        INSERT INTO progressive_remote_dispatches(
+          sim_job_id, promise_id, solver_id, cpu_slots, content_signature, envelope
+        ) VALUES (
+          ${executionId}::uuid, ${envelope.promiseId}::uuid,
+          ${envelope.solverId}::uuid, 1, ${envelope.contentSignature},
+          ${JSON.stringify(envelope)}::jsonb
+        )
+      `);
+      engine.getJob.mockClear();
+      engine.getResult.mockClear();
+      engine.cancelJob.mockClear();
+      engine.getExecutionStopProof.mockClear();
+      expect(
+        await reconcileProgressiveRemoteWorker(
+          connection,
+          engine as unknown as EngineClient,
+          { jobIds: [executionId] },
+        ),
+      ).toMatchObject({
+        inspected: 0,
+        reported: 0,
+        stopped: 0,
+        errors: [],
+      });
+      expect(engine.cancelJob).not.toHaveBeenCalled();
+      throw hubDispatchRollback;
+    }),
+  ).rejects.toBe(hubDispatchRollback);
   engine.getJob.mockRejectedValueOnce(
     new EngineError("isolated missing engine job", 404),
   );

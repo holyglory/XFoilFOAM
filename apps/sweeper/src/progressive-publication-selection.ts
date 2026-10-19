@@ -1,6 +1,14 @@
 import { sql } from "drizzle-orm";
 
-export function progressivePublicationSelectionSql() {
+export function progressivePublicationSelectionSql(lane = 0, laneCount = 1) {
+  if (
+    !Number.isSafeInteger(lane) ||
+    !Number.isSafeInteger(laneCount) ||
+    laneCount < 1 ||
+    lane < 0 ||
+    lane >= laneCount
+  )
+    throw new Error("Progressive publication lane is out of range");
   return sql`
     WITH settings AS MATERIALIZED (
       SELECT remote_solver_registered_id,upstream_base_url FROM sync_api_settings
@@ -10,6 +18,7 @@ export function progressivePublicationSelectionSql() {
       SELECT report.sim_job_id FROM progressive_worker_reports report
       WHERE report.acknowledged_at IS NULL
         AND report.report->>'solverId' = (SELECT remote_solver_registered_id::text FROM settings)
+        AND ${laneCount === 1 ? sql`TRUE` : sql`mod((hashtext(report.sim_job_id::text)::bigint & 2147483647), ${laneCount}) = ${lane}`}
         AND (SELECT true FROM sim_jobs job CROSS JOIN settings
           JOIN sync_sweep_promises promise ON promise.id::text = job.request_payload->>'syncPromiseId'
           WHERE job.id = report.sim_job_id

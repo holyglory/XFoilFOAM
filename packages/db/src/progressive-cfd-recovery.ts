@@ -16,8 +16,18 @@ const TERMINAL_NO_EVIDENCE_REASON =
   "terminal execution has no measured case evidence";
 const TERMINAL_NO_EVIDENCE_RETRY_REASON =
   "Retrying after terminal execution without measurable case evidence";
+const RECOVERABLE_TERMINAL_GAP_REASONS = [
+  TERMINAL_NO_EVIDENCE_REASON,
+  "fast pass has no informative accepted evidence",
+  "precise evidence remains unresolved",
+  "Stale HZ remote execution released during disposable solver reset",
+] as const;
+const RECOVERABLE_TERMINAL_GAP_REASONS_SQL = sql`(${sql.join(
+  RECOVERABLE_TERMINAL_GAP_REASONS.map((reason) => sql`${reason}`),
+  sql`, `,
+)})`;
 const PROGRESSIVE_INACTIVE_RECOVERY_UNITS_PER_PASS = 64;
-const PROGRESSIVE_TERMINAL_RECOVERY_UNITS_PER_PASS = 16;
+const PROGRESSIVE_TERMINAL_RECOVERY_UNITS_PER_PASS = 64;
 
 export async function recoverUnboundProgressiveCfdLeases(
   db: DB,
@@ -250,7 +260,7 @@ export async function recoverTerminalProgressiveNoEvidenceGaps(
         AND campaign.status IN ('active', 'attention', 'paused')
         AND unit.state IN ('gap', 'pending')
         AND (
-          (unit.state = 'gap' AND unit.error = ${TERMINAL_NO_EVIDENCE_REASON})
+          (unit.state = 'gap' AND unit.error IN ${RECOVERABLE_TERMINAL_GAP_REASONS_SQL})
           OR (
             unit.state = 'pending'
             AND unit.error = ${TERMINAL_NO_EVIDENCE_RETRY_REASON}
@@ -262,7 +272,7 @@ export async function recoverTerminalProgressiveNoEvidenceGaps(
         AND unit.lease_until IS NULL
         AND attempt.outcome = 'failed'
         AND attempt.sim_job_id IS NOT NULL
-        AND attempt.error = ${TERMINAL_NO_EVIDENCE_REASON}
+        AND attempt.error IN ${RECOVERABLE_TERMINAL_GAP_REASONS_SQL}
         AND NOT EXISTS (
           SELECT 1 FROM progressive_cfd_attempts newer
           WHERE newer.unit_id = unit.id

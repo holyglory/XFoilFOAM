@@ -2810,6 +2810,43 @@ describe("progressive durable stage transitions", () => {
     });
   });
 
+  it("reopens bounded stale-HZ gaps without reopening exhausted budgets", async () => {
+    const fixture = await fitFixture(2, false, [0]);
+    const lease = fixture.leases[0];
+    await acknowledgeProgressiveCfdExecutionStop(db, {
+      simJobId: fixture.composed.jobId,
+      proof: executionStopProof(fixture.engineJobId),
+    });
+    const reason =
+      "Stale HZ remote execution released during disposable solver reset";
+    await db.execute(sql`
+      UPDATE progressive_cfd_attempts
+      SET outcome = 'failed', sim_job_id = ${fixture.composed.jobId}::uuid,
+        error = ${reason}
+      WHERE token = ${lease.token}::uuid
+    `);
+    await db.execute(sql`
+      UPDATE progressive_cfd_units
+      SET state = 'gap', lease_token = NULL, lease_owner = NULL,
+        lease_until = NULL, attempts = 1, active_seconds = 0, error = ${reason}
+      WHERE id = ${lease.id}::uuid
+    `);
+    await db.execute(sql`
+      UPDATE progressive_work SET state = 'gap', error = ${reason}
+      WHERE id = ${lease.workId}::uuid
+    `);
+    expect(await recoverTerminalProgressiveNoEvidenceGaps(db)).toBe(1);
+    const [reopened] = await db.execute(sql`
+      SELECT state, attempts, error FROM progressive_cfd_units
+      WHERE id = ${lease.id}::uuid
+    `);
+    expect(reopened).toMatchObject({
+      state: 'pending',
+      attempts: 1,
+      error: 'Retrying after terminal execution without measurable case evidence',
+    });
+  });
+
   it.each(["paused", "cancelled"])(
     "recovers unbound bookkeeping without reactivating a %s campaign",
     async (status) => {
@@ -3819,6 +3856,7 @@ describe("progressive CPU admission", () => {
           .where(eq(simJobs.id, job.id));
         const bound = await bindProgressiveRemoteDispatch(db, assignment);
         expect(bound.replayed).toBe(false);
+        expect(await clearHubWorkerPayloadFields(db)).toBe(0);
         expect(bound.envelope.request).toEqual(
           JSON.parse(JSON.stringify(composed.request)),
         );

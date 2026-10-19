@@ -5985,6 +5985,16 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
         });
       }
 
+      if (cancellation.remoteProgressive) {
+        return {
+          cancelled: true,
+          engineCancelled: false,
+          engineCancelPending: true,
+          remoteCancellationPending: true,
+          engineCancelError: null,
+        };
+      }
+
       let engineCancelError: string | null = null;
       if (cancellation.engineJobId) {
         try {

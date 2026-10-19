@@ -8,12 +8,21 @@ export async function runProgressiveReportService(
   signal: AbortSignal,
   options: {
     publish?: () => Promise<boolean>;
+    lane?: number;
+    laneCount?: number;
     reportError?: (error: unknown) => void;
   } = {},
 ): Promise<void> {
   if (signal.aborted) return;
   const publish =
-    options.publish ?? (() => publishProgressiveWorkerReports(db));
+    options.publish ??
+    (() =>
+      publishProgressiveWorkerReports(
+        db,
+        fetch,
+        options.lane ?? 0,
+        options.laneCount ?? 1,
+      ));
   const reportError =
     options.reportError ??
     ((error) =>

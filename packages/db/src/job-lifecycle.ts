@@ -51,7 +51,12 @@ export const CANCELLABLE_SIM_JOB_STATUSES = [
 ] as const;
 
 export type SimJobCancellationClaim =
-  | { kind: "cancelled"; jobId: string; engineJobId: string | null }
+  | {
+      kind: "cancelled";
+      jobId: string;
+      engineJobId: string | null;
+      remoteProgressive: boolean;
+    }
   | { kind: "not_cancellable"; status: string | null };
 
 /** Atomically claim admin cancellation and release only claims owned by the
@@ -200,11 +205,18 @@ export async function claimSimJobCancellation(
           payload.uransRequestId,
         );
       }
+      const [remoteDispatch] = await tx.execute(sql`
+        SELECT EXISTS (
+          SELECT 1 FROM progressive_remote_dispatches
+          WHERE sim_job_id = ${claimed.id}::uuid
+        ) AS remote_progressive
+      `);
       return {
         claim: {
           kind: "cancelled" as const,
           jobId: claimed.id,
           engineJobId: claimed.engineJobId,
+          remoteProgressive: Boolean(remoteDispatch?.remote_progressive),
         },
         campaignIds: settlement.campaignIds,
       };

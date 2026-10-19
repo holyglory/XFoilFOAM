@@ -99,11 +99,15 @@ export async function reconcileProgressiveRemoteWorker(
         OR engine_state IN ('cancelling', 'cancel_pending')
     )
     SELECT job.id FROM active_jobs job
-    JOIN progressive_remote_dispatches dispatch ON dispatch.sim_job_id = job.id
-    JOIN sync_sweep_promises promise ON promise.id = dispatch.promise_id
+    JOIN sync_sweep_promises promise ON promise.id::text = job.request_payload->>'syncPromiseId'
     JOIN sync_api_settings settings ON settings.id = 1
-    WHERE promise.registered_solver_id = settings.remote_solver_registered_id
-      AND promise.source_base_url = settings.upstream_base_url
+    WHERE job.request_payload->>'remoteSolver' = 'true' AND job.request_payload ? 'remoteProgressiveExecution'
+      AND NOT EXISTS (
+        SELECT 1 FROM progressive_remote_dispatches dispatch
+        WHERE dispatch.sim_job_id = job.id
+      )
+      AND promise.registered_solver_id = settings.remote_solver_registered_id
+      AND promise.source_base_url = job.request_payload->>'upstreamBaseUrl'
       AND EXISTS (SELECT 1 FROM progressive_worker_reports report WHERE report.sim_job_id = job.id
         AND report.stopped_engine_job_id = job.id::text)
       ${
@@ -132,19 +136,24 @@ export async function reconcileProgressiveRemoteWorker(
   });
   const candidates = await db.execute(sql`
     SELECT job.id, job.engine_job_id, job.request_payload,
-      dispatch.content_signature AS assignment_signature,
+      coalesce(intent.assignment_signature, job.request_payload#>>'{remoteProgressiveExecution,contentSignature}') AS assignment_signature,
       settings.remote_solver_auth_token AS auth_token, settings.upstream_base_url,
       promise.source_base_url,
       (NOT settings.remote_solver_enabled OR job.status = 'cancelled'
         OR promise.status <> 'active' OR promise."expiresAt" <= clock_timestamp()
         OR ${staleRemoteExecutionSql(sql`job.id`)}) AS stop_required
-    FROM sim_jobs job
-    JOIN progressive_remote_dispatches dispatch ON dispatch.sim_job_id = job.id
-    JOIN sync_sweep_promises promise ON promise.id = dispatch.promise_id
+    FROM sim_jobs job LEFT JOIN progressive_worker_submission_intents intent ON intent.sim_job_id = job.id
+    JOIN sync_sweep_promises promise ON promise.id::text = job.request_payload->>'syncPromiseId'
     JOIN sync_api_settings settings ON settings.id = 1
     WHERE NOT settings.remote_solver_transfer_paused
+      AND job.request_payload->>'remoteSolver' = 'true'
+      AND job.request_payload ? 'remoteProgressiveExecution'
+      AND NOT EXISTS (
+        SELECT 1 FROM progressive_remote_dispatches dispatch
+        WHERE dispatch.sim_job_id = job.id
+      )
       AND promise.registered_solver_id = settings.remote_solver_registered_id
-      AND (job.engine_job_id IS NOT NULL OR dispatch.created_at <= clock_timestamp() - ${PROGRESSIVE_REMOTE_START_AUTHORIZATION_MS + ENGINE_SUBMIT_TIMEOUT_MS} * interval '1 millisecond'
+      AND (job.engine_job_id IS NOT NULL OR intent.created_at <= clock_timestamp() - ${PROGRESSIVE_REMOTE_START_AUTHORIZATION_MS + ENGINE_SUBMIT_TIMEOUT_MS} * interval '1 millisecond'
         OR NOT settings.remote_solver_enabled OR job.status IN ('done', 'failed', 'cancelled')
         OR promise.status <> 'active' OR promise."expiresAt" <= clock_timestamp())
       AND ((job.engine_job_id IS NOT NULL AND job.engine_job_id <> job.id::text) OR NOT EXISTS (
@@ -157,7 +166,7 @@ export async function reconcileProgressiveRemoteWorker(
               AND (report.report#>>'{status,failure_disposition}' IN ('deterministic_mesh', 'infrastructure')
                 OR report.report#>>'{status,continuation_failure_kind}' = 'permanent'
                 OR report.report#>>'{status,message}' LIKE '%continuation_source_permanent:%')))
-          AND report.assignment_signature = dispatch.content_signature)))
+          AND report.assignment_signature = coalesce(intent.assignment_signature, job.request_payload#>>'{remoteProgressiveExecution,contentSignature}')))
       ${
         options.jobIds
           ? sql`AND job.id IN (${sql.join(
@@ -179,10 +188,14 @@ export async function reconcileProgressiveRemoteWorker(
         throw new Error(
           "Foreign engine identity requires explicit reconciliation; CPU ownership is retained",
         );
+      const payload = candidate.request_payload as Record<string, unknown>;
       const baseUrl = canonicalRemoteHubBaseUrl(
         String(candidate.upstream_base_url ?? ""),
       );
-      if (baseUrl !== candidate.source_base_url)
+      if (
+        baseUrl !== candidate.source_base_url ||
+        baseUrl !== payload.upstreamBaseUrl
+      )
         throw new Error(
           "Progressive observation upstream differs from the registered assignment",
         );

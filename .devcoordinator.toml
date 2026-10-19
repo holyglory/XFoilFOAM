@@ -2237,6 +2237,12 @@ requires = ["dependencies", "types", "remote-execution-contract"]
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "progressive remote dispatch"]
 
 [[test.progressive.check]]
+name = "terminal-gap-recovery"
+tier = "development"
+requires = ["dependencies", "types"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "reopens bounded stale-HZ gaps"]
+
+[[test.progressive.check]]
 name = "terminal-stop-guard"
 tier = "development"
 requires = ["dependencies", "types"]

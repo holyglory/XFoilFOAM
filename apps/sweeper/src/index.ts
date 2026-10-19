@@ -25,6 +25,7 @@ const { db, sql, engine } = makeContext();
 const critical = makeIsolatedDatabase(2);
 const retention = makeIsolatedDatabase(1);
 const evidence = makeIsolatedDatabase(8);
+const reports = makeIsolatedDatabase(8);
 const archive = makeIsolatedDatabase(2);
 try {
   const [syncSettings] = await db
@@ -44,6 +45,7 @@ try {
     critical.sql.end(),
     retention.sql.end(),
     evidence.sql.end(),
+    reports.sql.end(),
     archive.sql.end(),
   ]);
   throw error;
@@ -98,11 +100,14 @@ try {
       name: "progressive-polars",
       run: (signal) => runProgressiveBaselineService(db, sql, engine, signal),
     },
-    {
-      name: "progressive-report-delivery",
-      run: (signal) =>
-        runProgressiveReportService(evidence.db, evidence.sql, signal),
-    },
+    ...Array.from({ length: 8 }, (_, lane) => ({
+      name: `progressive-report-delivery-${lane}`,
+      run: (signal: AbortSignal) =>
+        runProgressiveReportService(reports.db, reports.sql, signal, {
+          lane,
+          laneCount: 8,
+        }),
+    })),
     {
       name: "progressive-compact-evidence",
       run: (signal) =>
@@ -132,6 +137,7 @@ try {
     critical.sql.end(),
     retention.sql.end(),
     evidence.sql.end(),
+    reports.sql.end(),
   ]);
 }
 console.log("[sweeper] stopped");

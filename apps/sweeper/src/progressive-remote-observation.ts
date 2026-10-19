@@ -33,28 +33,30 @@ export async function observeProgressiveRemoteJob(
 ) {
   const [owned] = await db.execute(sql`
     SELECT job.engine_job_id, job.request_payload,
-      dispatch.envelope AS remote_progressive_execution,
-      dispatch.content_signature AS assignment_signature,
+      coalesce(intent.assignment_signature, job.request_payload#>>'{remoteProgressiveExecution,contentSignature}') AS assignment_signature,
       (SELECT report.report FROM progressive_worker_reports report
         WHERE report.sim_job_id = job.id
           AND report.acknowledged_at IS NOT NULL
-          AND report.assignment_signature = dispatch.content_signature
+          AND report.assignment_signature = coalesce(intent.assignment_signature, job.request_payload#>>'{remoteProgressiveExecution,contentSignature}')
           AND report.stopped_engine_job_id = job.id::text
         ORDER BY report.sequence DESC LIMIT 1) AS durable_final_report,
       (SELECT report.content_signature FROM progressive_worker_reports report
         WHERE report.sim_job_id = job.id
           AND report.acknowledged_at IS NOT NULL
-          AND report.assignment_signature = dispatch.content_signature
+          AND report.assignment_signature = coalesce(intent.assignment_signature, job.request_payload#>>'{remoteProgressiveExecution,contentSignature}')
           AND report.stopped_engine_job_id = job.id::text
         ORDER BY report.sequence DESC LIMIT 1) AS durable_final_content_signature,
       promise.id AS promise_id, promise.registered_solver_id AS solver_id
     FROM sim_jobs job
-    JOIN progressive_remote_dispatches dispatch ON dispatch.sim_job_id = job.id
-    JOIN sync_sweep_promises promise ON promise.id = dispatch.promise_id
+    LEFT JOIN progressive_worker_submission_intents intent ON intent.sim_job_id = job.id
+    JOIN sync_sweep_promises promise ON promise.id::text = job.request_payload->>'syncPromiseId'
     JOIN sync_api_settings settings ON settings.id = 1
     WHERE job.id = ${executionId}::uuid
+      AND job.request_payload->>'remoteSolver' = 'true'
+      AND (intent.sim_job_id IS NOT NULL OR ${options.stop === true})
+      AND (job.request_payload ? 'remoteProgressiveExecution')
       AND promise.registered_solver_id = settings.remote_solver_registered_id
-      AND promise.source_base_url = settings.upstream_base_url
+      AND promise.source_base_url = job.request_payload->>'upstreamBaseUrl'
   `);
   if (!owned)
     throw new Error(
@@ -66,7 +68,7 @@ export async function observeProgressiveRemoteJob(
     );
   const payload = owned.request_payload as Record<string, unknown>;
   const envelope = verifyProgressiveRemoteExecution(
-    owned.remote_progressive_execution,
+    payload.remoteProgressiveExecution,
     {
       solverId: String(owned.solver_id),
       promiseId: String(owned.promise_id),

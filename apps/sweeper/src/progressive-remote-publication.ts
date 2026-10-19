@@ -9,7 +9,6 @@ import {
 } from "@aerodb/db";
 import { sql } from "drizzle-orm";
 import {
-  progressivePublicationBatchSelectionSql,
   progressivePublicationSelectionSql,
 } from "./progressive-publication-selection";
 import { fetchProgressiveRemote } from "./progressive-remote-http";
@@ -138,8 +137,12 @@ export async function publishProgressiveWorkerReport(
 export async function publishNextProgressiveWorkerReport(
   db: DB,
   fetcher: typeof fetch = fetch,
+  lane = 0,
+  laneCount = 1,
 ): Promise<boolean> {
-  const [pending] = await db.execute(progressivePublicationSelectionSql());
+  const [pending] = await db.execute(
+    progressivePublicationSelectionSql(lane, laneCount),
+  );
   if (!pending) return false;
   const result = await publishProgressiveWorkerReport(
     db,
@@ -152,30 +155,19 @@ export async function publishNextProgressiveWorkerReport(
 export async function publishProgressiveWorkerReports(
   db: DB,
   fetcher: typeof fetch = fetch,
+  lane = 0,
+  laneCount = 1,
 ): Promise<boolean> {
-  const pending = await db.execute(progressivePublicationBatchSelectionSql());
-  if (!pending.length) return false;
-  const results = await Promise.allSettled(
-    pending.map((row) =>
-      publishProgressiveWorkerReport(db, String(row.sim_job_id), fetcher),
-    ),
-  );
-  const failures = results.filter(
-    (result): result is PromiseRejectedResult => result.status === "rejected",
-  );
-  const published = results.some(
-    (result) =>
-      result.status === "fulfilled" &&
-      ["published", "quarantined"].includes(result.value.kind),
-  );
-  if (failures.length) {
-    const reason = failures[0].reason;
-    if (published)
-      throw new AggregateError(
-        failures.map((failure) => failure.reason),
-        `Progressive report batch had ${failures.length} publication failure(s)`,
-      );
-    throw reason;
+  let published = false;
+  for (let index = 0; index < 32; index += 1) {
+    const next = await publishNextProgressiveWorkerReport(
+      db,
+      fetcher,
+      lane,
+      laneCount,
+    );
+    if (!next) break;
+    published = true;
   }
   return published;
 }
