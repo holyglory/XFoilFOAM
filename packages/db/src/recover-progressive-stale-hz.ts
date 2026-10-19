@@ -8,6 +8,7 @@ const olderThanMinutes = olderThanText === undefined ? undefined : Number(olderT
 if (
   !campaignId ||
   !Number.isSafeInteger(expectedJobs) ||
+  expectedJobs < 0 ||
   !["--dry-run", "--apply"].includes(mode) ||
   (olderThanMinutes !== undefined && !Number.isSafeInteger(olderThanMinutes)) ||
   process.argv.length > 6

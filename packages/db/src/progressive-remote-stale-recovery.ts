@@ -15,13 +15,14 @@ export type ProgressiveRemoteStaleRecoveryResult = {
   candidateJobs: number;
   releasedJobs: string[];
   releasedUnits: number;
+  reopenedUnits: number;
 };
 
 function assertInput(input: ProgressiveRemoteStaleRecoveryInput) {
   if (
     !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(input.campaignId) ||
     !Number.isSafeInteger(input.expectedJobs) ||
-    input.expectedJobs < 1 ||
+    input.expectedJobs < 0 ||
     input.expectedJobs > 100 ||
     (input.olderThanMinutes !== undefined &&
       (!Number.isSafeInteger(input.olderThanMinutes) ||
@@ -154,10 +155,49 @@ export async function recoverStaleProgressiveRemoteDispatches(
       if (!updatedAttempts.length)
         throw new Error(`Stale HZ recovery changed no attempts for ${jobId}`);
     }
+    const staleGaps = await connection.execute(sql`
+      SELECT unit.id, unit.work_id
+      FROM progressive_cfd_units unit
+      JOIN progressive_work work ON work.id = unit.work_id
+      JOIN progressive_generations generation ON generation.id = work.generation_id
+      JOIN sim_campaigns campaign ON campaign.id = generation.campaign_id
+      WHERE generation.campaign_id = ${input.campaignId}::uuid
+        AND generation.status = 'active'
+        AND generation.plan_revision_id = campaign.current_plan_revision_id
+        AND campaign.status IN ('active', 'attention', 'paused')
+        AND work.state IN ('pending', 'gap')
+        AND unit.state = 'gap'
+        AND unit.error = ${STALE_HZ_RESET_REASON}
+        AND unit.attempts < 3
+        AND unit.active_seconds < unit.active_budget_seconds
+        AND NOT EXISTS (
+          SELECT 1 FROM progressive_cfd_attempts attempt
+          JOIN progressive_cfd_evidence evidence ON evidence.attempt_token = attempt.token
+          WHERE attempt.unit_id = unit.id
+        )
+      ORDER BY unit.id
+      LIMIT 2048
+      FOR UPDATE OF work, unit SKIP LOCKED
+    `);
+    for (const unit of staleGaps) {
+      await connection.execute(sql`
+        UPDATE progressive_cfd_units
+        SET state = 'pending', lease_token = NULL, lease_owner = NULL,
+          lease_until = NULL, retry_after = NULL,
+          error = 'Retrying after stale HZ remote execution reset'
+        WHERE id = ${unit.id}::uuid AND state = 'gap'
+      `);
+      await connection.execute(sql`
+        UPDATE progressive_work
+        SET state = 'pending', error = NULL, completed_at = NULL
+        WHERE id = ${unit.work_id}::uuid AND state = 'gap'
+      `);
+    }
     return {
       candidateJobs: candidates.length,
       releasedJobs,
       releasedUnits,
+      reopenedUnits: staleGaps.length,
     };
   });
 }
