@@ -21,6 +21,7 @@
     "backfill:airfoil-symmetry": "tsx src/backfill-airfoil-symmetry.ts",
     "recover:progressive-storage-evidence": "tsx src/recover-progressive-storage-evidence.ts",
     "recover:progressive-fast-budget": "tsx src/recover-progressive-fast-budget.ts",
+    "recover:progressive-stale-hz": "tsx src/recover-progressive-stale-hz.ts",
     "reset": "tsx src/reset.ts && corepack pnpm run migrate && corepack pnpm run seed",
     "studio": "drizzle-kit studio",
     "test": "vitest run",
