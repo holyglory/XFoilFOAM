@@ -15,6 +15,7 @@ import {
 
 export const ADAPTIVE_FAST_REFINEMENT_DEFERRED_ERROR =
   "adaptive fast refinement deferred before precise low-Mach stage";
+const PROGRESSIVE_STAGE_OPEN_UNIT_THRESHOLD = 8192;
 
 async function finishCampaigns(db: DB, epochId: string): Promise<number> {
   const completed = await db.execute(sql`
@@ -109,7 +110,7 @@ export async function advanceProgressiveCfdStages(db: DB) {
         AND work.stage = ${effectiveProgressiveStageSql()}
         AND work.state = 'pending'
         AND unit.state NOT IN ('complete', 'gap')
-      OFFSET 8192 LIMIT 1
+      OFFSET ${PROGRESSIVE_STAGE_OPEN_UNIT_THRESHOLD} LIMIT 1
     `);
     if (largeOpenCurrentStage) return { ...receipt, waiting: 1 };
     const [campaign] = await connection.execute(sql`

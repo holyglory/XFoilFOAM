@@ -7375,6 +7375,11 @@ export const progressiveCfdUnits = pgTable(
     completeIdx: index("progressive_cfd_units_complete_idx")
       .on(table.workId)
       .where(sql`${table.state} = 'complete'`),
+    openWorkIdx: index("progressive_cfd_units_open_work_idx")
+      .on(table.workId, table.state)
+      .where(
+        sql`${table.state} IN ('pending', 'leased', 'blocked', 'cancelled')`,
+      ),
     alphaCheck: check(
       "progressive_cfd_units_aoa_deg_check",
       sql`${table.aoaDeg} BETWEEN -180 AND 180`,

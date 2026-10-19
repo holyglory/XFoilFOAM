@@ -1303,6 +1303,13 @@
       "when": 1792368000078,
       "tag": "0185_progressive_initial_unit_lookup_idx",
       "breakpoints": true
+    },
+    {
+      "idx": 186,
+      "version": "7",
+      "when": 1792383717715,
+      "tag": "0186_progressive_cfd_open_work_idx",
+      "breakpoints": true
     }
   ]
 }

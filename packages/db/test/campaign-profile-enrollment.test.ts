@@ -1493,6 +1493,16 @@ beforeAll(async () => {
   expect(completeUnitIndexes).toEqual([
     { indexname: "progressive_cfd_units_complete_idx" },
   ]);
+  const openUnitIndexes = await db.execute(sql`
+    SELECT indexname
+    FROM pg_indexes
+    WHERE schemaname = 'public'
+      AND tablename = 'progressive_cfd_units'
+      AND indexname = 'progressive_cfd_units_open_work_idx'
+  `);
+  expect(openUnitIndexes).toEqual([
+    { indexname: "progressive_cfd_units_open_work_idx" },
+  ]);
   const [category] = await db
     .insert(categories)
     .values({ slug: PREFIX, name: PREFIX, path: PREFIX, depth: 0 })
