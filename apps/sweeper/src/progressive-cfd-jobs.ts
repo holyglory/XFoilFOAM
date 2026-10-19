@@ -24,7 +24,7 @@ import { claimAoas } from "./claim";
 import { requireExecutionPoolForSetup } from "./engine-pool";
 import { ProgressiveEvidenceCellOwned } from "./progressive-claim-deferral";
 
-const DEFAULT_PROGRESSIVE_FAST_SOLVER_PROCESSES = 3;
+const DEFAULT_PROGRESSIVE_FAST_SOLVER_PROCESSES = 4;
 const MAX_PROGRESSIVE_FAST_SOLVER_PROCESSES = 8;
 
 export function progressiveFastSolverProcesses(
