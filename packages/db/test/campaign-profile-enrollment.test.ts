@@ -3836,15 +3836,15 @@ describe("progressive CPU admission", () => {
             '{"remoteSolver":true,"solverId":"fixture","syncPromiseId":"fixture","upstreamBaseUrl":"https://fixture.invalid/api/sync/v1","remoteProgressiveExecution":{}}'::jsonb
           WHERE id = ${job.id}::uuid
         `);
-        expect(await clearHubWorkerPayloadFields(db)).toBe(1);
-        const [cleanedHubPayload] = await db.execute(sql`
+        expect(await clearHubWorkerPayloadFields(db)).toBe(0);
+        const [retainedHubPayload] = await db.execute(sql`
           SELECT request_payload ? 'remoteSolver' AS remote_solver,
             request_payload ? 'remoteProgressiveExecution' AS remote_execution
           FROM sim_jobs WHERE id = ${job.id}::uuid
         `);
-        expect(cleanedHubPayload).toEqual({
-          remote_solver: false,
-          remote_execution: false,
+        expect(retainedHubPayload).toEqual({
+          remote_solver: true,
+          remote_execution: true,
         });
         const forecastRollback = new Error(
           "isolated disk attribution rollback",
@@ -4167,6 +4167,19 @@ describe("progressive CPU admission", () => {
           active_seconds: 1,
         });
         expect(await progressiveRemoteReservedSlots(db, solverId)).toBe(0);
+        await db.execute(
+          sql`UPDATE sim_jobs SET "ingestedAt" = clock_timestamp() WHERE id = ${job.id}::uuid`,
+        );
+        expect(await clearHubWorkerPayloadFields(db)).toBe(1);
+        const [cleanedHubPayload] = await db.execute(sql`
+          SELECT request_payload ? 'remoteSolver' AS remote_solver,
+            request_payload ? 'remoteProgressiveExecution' AS remote_execution
+          FROM sim_jobs WHERE id = ${job.id}::uuid
+        `);
+        expect(cleanedHubPayload).toEqual({
+          remote_solver: false,
+          remote_execution: false,
+        });
       } finally {
         await db.execute(
           sql`DELETE FROM progressive_remote_dispatches WHERE sim_job_id = ${job.id}::uuid`,

@@ -132,6 +132,12 @@ export async function clearHubWorkerPayloadFields(
       JOIN progressive_remote_dispatches dispatch ON dispatch.sim_job_id = job.id
       JOIN sync_api_settings settings ON settings.id = 1
       WHERE NOT settings.remote_solver_enabled
+        AND job."ingestedAt" IS NOT NULL
+        AND EXISTS (
+          SELECT 1 FROM progressive_cfd_execution_stops stopped
+          WHERE stopped.sim_job_id = job.id
+            AND stopped.engine_job_id = job.id::text
+        )
         AND (
           job.request_payload ? 'remoteSolver'
           OR job.request_payload ? 'solverId'
