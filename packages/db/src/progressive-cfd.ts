@@ -444,6 +444,7 @@ export async function claimProgressiveCfdUnit(
       ORDER BY CASE WHEN target.mach < 1.0 THEN 0 WHEN target.mach >= 1.0 THEN 1 ELSE 2 END,
         CASE WHEN target.mach >= 1.0 THEN target.mach END ASC NULLS LAST,
         generation.created_at, generation.id, CASE WHEN ${pendingBudgetExtension} THEN 0 ELSE 1 END,
+        CASE WHEN work.stage = 3 THEN 0 ELSE 1 END,
         CASE WHEN unit.purpose = 'initial' THEN 0 ELSE 1 END,
         unit.retry_after NULLS FIRST, unit.retry_after, unit.ordinal, work.target_id LIMIT 1 FOR UPDATE OF generation, work, unit SKIP LOCKED
       )`;
