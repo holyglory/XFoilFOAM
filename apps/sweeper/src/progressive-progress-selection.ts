@@ -45,9 +45,10 @@ export function progressiveReportJobsSql(jobIds?: string[]) {
         job.engine_job_id IS NULL AND job.status = 'pending' AND state.has_indexed
       ))
       AND EXISTS (SELECT 1 FROM progressive_remote_dispatches dispatch WHERE dispatch.sim_job_id = job.id)
-    ORDER BY CASE WHEN job.status = 'pending' AND job.engine_job_id IS NULL THEN 0
-      WHEN job.status IN ('submitted', 'running') THEN 1
-      ELSE 2 END,
+    ORDER BY CASE WHEN state.has_unapplied THEN 0 ELSE 1 END,
+      CASE WHEN job.status = 'pending' AND job.engine_job_id IS NULL THEN 0
+        WHEN job.status IN ('submitted', 'running') THEN 1
+        ELSE 2 END,
       state.oldest_unapplied_report NULLS LAST,
       coalesce(job."polledAt", job."updatedAt"), job.id LIMIT ${PROGRESSIVE_REPORT_JOB_LIMIT}`;
 }
