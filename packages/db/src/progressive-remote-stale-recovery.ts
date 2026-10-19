@@ -51,7 +51,7 @@ export async function recoverStaleProgressiveRemoteDispatches(
       WHERE job.campaign_id = ${input.campaignId}::uuid
         AND job.status IN ('pending', 'submitted', 'running', 'ingesting')
         AND promise.status IN ('expired', 'cancelled')
-        AND job."updatedAt" <= clock_timestamp() - (${olderThanMinutes} || ' minutes')::interval
+        AND job."updatedAt" <= clock_timestamp() - (${olderThanMinutes}::int * interval '1 minute')
         AND campaign.status IN ('active', 'attention', 'paused')
         AND EXISTS (
           SELECT 1
