@@ -62,12 +62,36 @@ export async function progressiveRemoteAdmissionReservedSlots(
       AND NOT EXISTS (
         SELECT 1
         FROM sim_jobs job
-        JOIN sync_sweep_promises promise ON promise.id = dispatch.promise_id
         WHERE job.id = dispatch.sim_job_id
-          AND job.status = 'pending'
-          AND job.engine_job_id IS NULL
-          AND job.engine_state IS NULL
-          AND (promise.status <> 'active' OR promise."expiresAt" <= clock_timestamp())
+          AND (
+            job.status IN ('done', 'failed')
+            OR job.engine_state IN ('completed', 'failed', 'cancelled')
+            OR (
+              job.status = 'cancelled'
+              AND (
+                job.engine_state = 'cancelled'
+                OR (job.engine_job_id IS NULL AND job.engine_state IS NULL)
+              )
+            )
+            OR (
+              job.status = 'pending'
+              AND job.engine_job_id IS NULL
+              AND job.engine_state IS NULL
+              AND EXISTS (
+                SELECT 1 FROM progressive_cfd_attempts attempt
+                WHERE attempt.sim_job_id = job.id
+              )
+              AND NOT EXISTS (
+                SELECT 1
+                FROM progressive_cfd_attempts attempt
+                JOIN progressive_cfd_units unit ON unit.id = attempt.unit_id
+                WHERE attempt.sim_job_id = job.id
+                  AND attempt.outcome = 'running'
+                  AND unit.state = 'leased'
+                  AND unit.lease_until > clock_timestamp()
+              )
+            )
+          )
       )
   `);
   return Number(row.reserved);
