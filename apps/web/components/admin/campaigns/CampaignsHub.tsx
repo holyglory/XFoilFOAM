@@ -56,7 +56,6 @@ const STATUS_COLOR: Record<string, string> = {
 
 export interface CampaignsHubProps {
   initialList?: Awaited<ReturnType<typeof listCampaigns>> | null;
-  onOpenCampaign: (id: string) => void;
   onNewCampaign: (kind: "polar_sweep" | "ld_refine") => void;
   /** Router-navigates to ?section=queue (the Solver page). */
   onOpenSolver: () => void;
@@ -162,7 +161,6 @@ function kindChip(summary: AdminCampaignSummary | undefined): string | null {
 
 export function CampaignsHub({
   initialList,
-  onOpenCampaign,
   onNewCampaign,
   onOpenSolver,
   onOpenPoints,
@@ -633,10 +631,6 @@ export function CampaignsHub({
                     <a
                       data-testid={`campaign-open-${item.slug}`}
                       href={`/admin?campaign=${encodeURIComponent(item.id)}`}
-                      onClick={(event) => {
-                        event.preventDefault();
-                        onOpenCampaign(item.id);
-                      }}
                       style={{
                         ...ghostBtn,
                         padding: "5px 10px",

@@ -1306,7 +1306,6 @@ export function AdminConsole({
           {section === "simulations" && !campaignParam && !wizardKind && (
             <CampaignsHub
               initialList={prefetchedCampaigns}
-              onOpenCampaign={openCampaign}
               onNewCampaign={openWizard}
               onOpenSolver={() => navigate({ section: "queue" }, "push")}
               onOpenPoints={openCampaignPoints}

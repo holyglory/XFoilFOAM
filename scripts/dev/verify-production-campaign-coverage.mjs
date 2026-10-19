@@ -182,6 +182,9 @@ try {
   await expect(page.getByTestId("campaign-instrument-hero")).toContainText(
     /of [1-9][0-9,]+/,
   );
+  const campaignHeroText = await page
+    .getByTestId("campaign-instrument-hero")
+    .innerText();
   await expect(page.getByTestId("matrix-scroll")).toBeVisible({
     timeout: 30000,
   });
@@ -201,6 +204,7 @@ try {
       profile: "2032c",
       curveCoverage: "26/26",
       progressiveViewer: true,
+      campaignHeroText,
     }),
   );
 } finally {
