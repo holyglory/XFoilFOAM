@@ -11,6 +11,7 @@ import type { DB } from "../src/client";
 import type { ProgressiveRemoteExecutionEnvelope } from "../src/progressive-remote-execution";
 import { analysisContentHash } from "../src/analysis-target";
 import { acknowledgeProgressiveWorkerReport } from "../src/progressive-worker-reports";
+import { normalizeProgressiveRemoteReportJson } from "../src/progressive-remote-report";
 import { observeProgressiveRemoteJob } from "../../../apps/sweeper/src/progressive-remote-observation";
 import { solverQueuePressure } from "../../../apps/sweeper/src/submit-lifecycle";
 import { reconcileProgressiveRemoteWorker } from "../../../apps/sweeper/src/progressive-remote-reconciliation";
@@ -29,6 +30,7 @@ export async function verifyProgressiveWorkerObservation(
   envelope: ProgressiveRemoteExecutionEnvelope,
   proofFactory: (executionId: string) => EngineExecutionStopProof,
   mode: "timeout" | "success",
+  includeInvalidUnicodeDiagnostics = false,
 ) {
   const executionId = envelope.scope.executionId;
   const runtime = {
@@ -82,6 +84,12 @@ export async function verifyProgressiveWorkerObservation(
       },
     ],
   };
+  if (includeInvalidUnicodeDiagnostics) {
+    status.message = "engine status\u0000diagnostic";
+    result.message = "engine result\u0000diagnostic";
+  }
+  const persistedResult = () =>
+    normalizeProgressiveRemoteReportJson(result) as JobResult;
   const proof = proofFactory(executionId);
   const engine = {
     baseUrl: "http://isolated-progressive-engine.invalid",
@@ -254,11 +262,13 @@ export async function verifyProgressiveWorkerObservation(
     const [stored] = await db.execute(
       sql`SELECT report FROM progressive_worker_reports WHERE sim_job_id = ${executionId}::uuid AND sequence = 1`,
     );
-    expect((stored.report as { result: JobResult }).result).toEqual(result);
+    expect((stored.report as { result: JobResult }).result).toEqual(
+      persistedResult(),
+    );
     const evidenceInput = {
       simJobId: executionId,
       engineJobId: executionId,
-      result,
+      result: persistedResult(),
       reportSequence: 1,
     };
     expect(await assertProgressiveWorkerEvidenceJob(db, evidenceInput)).toBe(
@@ -276,7 +286,7 @@ export async function verifyProgressiveWorkerObservation(
         engineJobId: randomUUID(),
       }),
     ).rejects.toThrow("exact owned report");
-    const changedResult = structuredClone(result);
+    const changedResult = structuredClone(persistedResult());
     changedResult.polars[0].attempts![0].cl = 99;
     await expect(
       assertProgressiveWorkerEvidenceJob(db, {
@@ -292,7 +302,7 @@ export async function verifyProgressiveWorkerObservation(
         await assertProgressiveWorkerEvidenceJob(db, {
           simJobId: ordinaryId,
           engineJobId: ordinaryId,
-          result,
+          result: persistedResult(),
         }),
       ).toBe(false);
       await expect(
@@ -423,7 +433,7 @@ export async function verifyProgressiveWorkerObservation(
             WHERE sim_job_id=${executionId}::uuid ORDER BY sequence DESC LIMIT 1`);
             expect(
               (sealed.report as unknown as { result: JobResult }).result,
-            ).toEqual(result);
+            ).toEqual(persistedResult());
           }
           expect(repairingEngine.cancelJob).toHaveBeenCalledTimes(1);
           throw restore;
@@ -493,6 +503,14 @@ export async function verifyProgressiveWorkerObservation(
     expect((latest.report as { result: JobResult }).result.state).toBe(
       "cancelled",
     );
+    const [projected] = await db.execute(sql`
+      SELECT status, engine_state, error FROM sim_jobs WHERE id = ${executionId}::uuid
+    `);
+    expect(projected).toEqual({
+      status: "cancelled",
+      engine_state: "cancelled",
+      error: "engine statusdiagnostic",
+    });
   }
   expect(
     await reconcileProgressiveRemoteWorker(

@@ -31,6 +31,29 @@ export interface ProgressiveRemoteReport {
   stopProof: EngineExecutionStopProof | null;
 }
 
+export function normalizeProgressiveRemoteReportJson<T>(value: T): T {
+  const normalize = (current: unknown, path: string): unknown => {
+    if (typeof current === "string") return current.replaceAll("\u0000", "");
+    if (Array.isArray(current))
+      return current.map((item, index) => normalize(item, `${path}[${index}]`));
+    if (current !== null && typeof current === "object") {
+      const result: Record<string, unknown> = {};
+      for (const [key, item] of Object.entries(current)) {
+        const normalizedKey = normalize(key, `${path}.<key>`) as string;
+        if (Object.hasOwn(result, normalizedKey))
+          throw new Error(
+            `Progressive report normalization would merge object keys at ${path}`,
+          );
+        result[normalizedKey] = normalize(item, `${path}.${normalizedKey}`);
+      }
+      return result;
+    }
+    return current;
+  };
+
+  return normalize(value, "$") as T;
+}
+
 export function progressiveReportedPointSources(result: JobResult) {
   const candidates = result.polars.flatMap((polar) =>
     [...polar.points, ...(polar.attempts ?? [])].map((point) => ({

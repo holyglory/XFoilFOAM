@@ -4033,6 +4033,7 @@ describe("progressive CPU admission", () => {
           bound.envelope,
           executionStopProof,
           "success",
+          true,
         );
         await verifyProgressiveWorkerJobMirror(
           db,

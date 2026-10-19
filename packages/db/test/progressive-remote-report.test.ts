@@ -6,8 +6,10 @@ import type { PolarRequest } from "../../engine-client/src/types";
 import { sealProgressiveRemoteExecution } from "../src/progressive-remote-execution";
 import { progressiveRemoteReportInventory } from "../src/progressive-remote-inventory";
 import { terminalReportHasNoPhysicalEvidence } from "../src/progressive-remote-retention";
+import { analysisContentHash } from "../src/analysis-target";
 import {
   isFinalProgressiveRemoteReport,
+  normalizeProgressiveRemoteReportJson,
   validateProgressiveRemoteReportOrder,
   validateProgressiveRemoteReport,
   resolveProgressiveReportedPoint,
@@ -135,6 +137,25 @@ it("recognizes terminal infrastructure reports with no physical evidence", () =>
     { kind: "log" },
   ];
   expect(terminalReportHasNoPhysicalEvidence(input.report)).toBe(false);
+});
+
+it("normalizes NUL diagnostics before validation and signs the persisted representation", () => {
+  const { assignment, report } = fixture();
+  report.status.message = "status\u0000diagnostic";
+  report.result!.message = "result\u0000diagnostic";
+  const normalized = normalizeProgressiveRemoteReportJson(report);
+
+  expect(normalized.status.message).toBe("statusdiagnostic");
+  expect(normalized.result!.message).toBe("resultdiagnostic");
+  expect(normalized.result!.polars[0].attempts![0].cl).toBe(
+    report.result!.polars[0].attempts![0].cl,
+  );
+  expect(normalized.result!.polars[0].attempts![0].evidence_artifacts).toEqual(
+    report.result!.polars[0].attempts![0].evidence_artifacts,
+  );
+  const validated = validateProgressiveRemoteReport(normalized, assignment);
+  expect(validated.contentSignature).toBe(analysisContentHash(normalized));
+  expect(validated.report).toEqual(normalized);
 });
 
 describe("remote progressive incremental report validation", () => {

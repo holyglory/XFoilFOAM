@@ -22,6 +22,7 @@ export async function verifyProgressiveWorkerJobMirror(
   source: ProgressiveRemoteExecutionEnvelope,
   stopProof: (executionId: string) => EngineExecutionStopProof,
   submissionMode: "timeout" | "success" | "never-authorized" = "timeout",
+  includeInvalidUnicodeDiagnostics = false,
 ) {
   const executionId = randomUUID();
   const promiseId = randomUUID();
@@ -194,6 +195,7 @@ export async function verifyProgressiveWorkerJobMirror(
         source.promiseId,
         stopProof,
         submissionMode,
+        includeInvalidUnicodeDiagnostics,
       );
     const [promise] = await db.execute(
       sql`SELECT request_payload FROM sync_sweep_promises WHERE id = ${promiseId}::uuid`,

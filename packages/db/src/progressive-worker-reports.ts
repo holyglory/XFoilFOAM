@@ -8,6 +8,7 @@ import {
   isMeasuredCancelledProgressiveRemoteReport,
   validateProgressiveRemoteReport,
   validateProgressiveRemoteReportOrder,
+  normalizeProgressiveRemoteReportJson,
   type ProgressiveRemoteReport,
 } from "./progressive-remote-report";
 
@@ -182,7 +183,10 @@ export async function enqueueProgressiveWorkerReport(
       SELECT sequence, content_signature, report FROM progressive_worker_reports
       WHERE sim_job_id = ${input.executionId}::uuid ORDER BY sequence DESC LIMIT 1
     `);
-    const content = { ...input, version: 1 as const };
+    const content = normalizeProgressiveRemoteReportJson({
+      ...input,
+      version: 1 as const,
+    });
     if (latest) {
       const replay = validateProgressiveRemoteReport(
         { ...content, sequence: Number(latest.sequence) },

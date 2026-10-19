@@ -25,6 +25,7 @@ export async function verifyProgressiveWorkerSubmission(
   sourcePromiseId: string,
   stopProof: (executionId: string) => EngineExecutionStopProof,
   mode: "timeout" | "success",
+  includeInvalidUnicodeDiagnostics = false,
 ) {
   const executionId = envelope.scope.executionId;
   const [settings] = await db.execute(
@@ -207,7 +208,13 @@ export async function verifyProgressiveWorkerSubmission(
       await submitProgressiveRemoteJob(db, engine, executionId, authorization),
     ).toMatchObject({ kind: "observe" });
     expect(engineSubmit).toHaveBeenCalledTimes(1);
-    await verifyProgressiveWorkerObservation(db, envelope, stopProof, mode);
+    await verifyProgressiveWorkerObservation(
+      db,
+      envelope,
+      stopProof,
+      mode,
+      includeInvalidUnicodeDiagnostics,
+    );
   } finally {
     await db.execute(
       sql`DELETE FROM progressive_worker_reports WHERE sim_job_id = ${executionId}::uuid`,
