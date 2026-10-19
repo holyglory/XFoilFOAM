@@ -95,13 +95,13 @@ export async function recoverStaleProgressiveRemoteDispatches(
     for (const candidate of candidates) {
       const jobId = String(candidate.id);
       const promiseId = String(candidate.promise_id);
-      const [updatedAttempts] = await connection.execute(sql`
+      const updatedAttempts = await connection.execute(sql`
         UPDATE progressive_cfd_attempts attempt
         SET outcome = 'failed', finished_at = clock_timestamp(),
           error = ${STALE_HZ_RESET_REASON}
         WHERE attempt.sim_job_id = ${jobId}::uuid AND attempt.outcome = 'running'
       `);
-      const [updatedUnits] = await connection.execute(sql`
+      const updatedUnits = await connection.execute(sql`
         UPDATE progressive_cfd_units unit
         SET state = 'gap', lease_token = NULL, lease_owner = NULL,
           lease_until = NULL, retry_after = NULL, error = ${STALE_HZ_RESET_REASON}
@@ -148,8 +148,8 @@ export async function recoverStaleProgressiveRemoteDispatches(
         WHERE promise_id = ${promiseId}::uuid AND status = 'active'
       `);
       releasedJobs.push(jobId);
-      releasedUnits += Number(updatedUnits.count ?? updatedUnits.length ?? 0);
-      if (!Number(updatedAttempts.count ?? updatedAttempts.length))
+      releasedUnits += updatedUnits.length;
+      if (!updatedAttempts.length)
         throw new Error(`Stale HZ recovery changed no attempts for ${jobId}`);
     }
     return {
