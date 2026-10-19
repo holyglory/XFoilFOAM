@@ -97,6 +97,28 @@ export async function advanceProgressiveCfdStages(db: DB) {
           WHERE attempt.unit_id = unit.id
         )
     `);
+    const [settledCurrentStage] = await connection.execute(sql`
+      SELECT 1
+      FROM progressive_work work
+      JOIN progressive_generations generation ON generation.id = work.generation_id
+      JOIN sim_campaigns campaign ON campaign.id = generation.campaign_id
+      WHERE generation.epoch_id = ${epoch.id}
+        AND generation.status = 'active'
+        AND generation.plan_revision_id = campaign.current_plan_revision_id
+        AND campaign.status IN ('active', 'attention', 'paused')
+        AND work.stage = ${effectiveProgressiveStageSql()}
+        AND work.state = 'pending'
+        AND EXISTS (
+          SELECT 1 FROM progressive_cfd_units unit
+          WHERE unit.work_id = work.id
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM progressive_cfd_units unit
+          WHERE unit.work_id = work.id
+            AND unit.state NOT IN ('complete', 'gap')
+        )
+      LIMIT 1
+    `);
     const [largeOpenCurrentStage] = await connection.execute(sql`
       SELECT 1
       FROM progressive_cfd_units unit
@@ -112,7 +134,8 @@ export async function advanceProgressiveCfdStages(db: DB) {
         AND unit.state NOT IN ('complete', 'gap')
       OFFSET ${PROGRESSIVE_STAGE_OPEN_UNIT_THRESHOLD} LIMIT 1
     `);
-    if (largeOpenCurrentStage) return { ...receipt, waiting: 1 };
+    if (largeOpenCurrentStage && !settledCurrentStage)
+      return { ...receipt, waiting: 1 };
     const [campaign] = await connection.execute(sql`
       WITH progressive_stage_unsettled_units AS MATERIALIZED (
         SELECT DISTINCT attempt.unit_id
