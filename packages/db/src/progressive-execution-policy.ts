@@ -44,11 +44,14 @@ export function progressiveFastTargetSettledSql(
 export function effectiveProgressiveStageSql(
   generation = "generation",
   targetId: SQL = sql`work.target_id`,
+  workStage: SQL | null = sql`work.stage`,
 ) {
+  const preciseOverlap = workStage
+    ? sql`${workStage} = 3 AND ${progressiveFastTargetSettledSql(generation, targetId)}`
+    : progressiveFastTargetSettledSql(generation, targetId);
   return sql`CASE WHEN ${progressiveExecutionPolicySql(generation)} THEN (
     SELECT CASE
-      WHEN cursor.stage = 2 AND work.stage = 3
-        AND ${progressiveFastTargetSettledSql(generation, targetId)}
+      WHEN cursor.stage = 2 AND ${preciseOverlap}
       THEN 3
       ELSE cursor.stage
     END FROM progressive_generation_cohorts cursor
