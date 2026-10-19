@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "tsx watch src/index.ts",
     "start": "tsx src/index.ts",
+    "recover:accepted-progressive-gaps": "tsx src/recover-accepted-progressive-gaps.ts",
     "media-repair": "tsx src/media-repair-worker.ts",
     "evidence-storage-backfill": "tsx src/evidence-storage-backfill.ts",
     "predictions:repair": "tsx src/repair-missing-predictions-cli.ts",

@@ -102,7 +102,7 @@ async function settleInactiveUndeliveredExecution(
   };
 }
 
-async function promoteRetainedProgressiveAttempts(
+export async function promoteRetainedProgressiveAttempts(
   db: DB,
   input: {
     executionId: string;
