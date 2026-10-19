@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  progressivePreciseCaseConcurrency,
   progressiveFastSolverProcesses,
   progressivePreciseSolverProcesses,
   progressiveSolverProcessesForStage,
@@ -42,6 +43,11 @@ describe("progressive fast solver process cap", () => {
   it("clamps precise-stage process requests to available slots and eight", () => {
     expect(progressivePreciseSolverProcesses(3, "8")).toBe(3);
     expect(progressivePreciseSolverProcesses(96, "64")).toBe(8);
+  });
+
+  it("allows two precise cases to share four benchmark slots", () => {
+    expect(progressivePreciseCaseConcurrency(96, 2, "2")).toBe(2);
+    expect(progressivePreciseCaseConcurrency(3, 2, "2")).toBe(1);
   });
 
   it("keeps steady jobs without a transient process override", () => {

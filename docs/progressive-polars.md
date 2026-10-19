@@ -1193,7 +1193,10 @@ the immutable setup does not specify a process count, and leaves
 precise-stage jobs unchanged. A separate benchmark may set
 `SWEEPER_PROGRESSIVE_PRECISE_SOLVER_PROCESSES` from one through eight; it is
 also capped at eight and applies only when the immutable setup does not specify
-a process count. Both settings affect only newly admitted jobs.
+a process count. `SWEEPER_PROGRESSIVE_PRECISE_CASE_CONCURRENCY` may be set from
+one through four for the same unconfigured precise jobs; its CPU allocation is
+the product of process count and case concurrency. Both settings affect only
+newly admitted jobs.
 `case_concurrency=1` plus the precise-stage fallback unchanged. Compare
 accepted points per hour, solver seconds per accepted point, CPU utilization,
 and failure dispositions before adopting a higher value.
