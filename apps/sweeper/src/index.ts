@@ -23,6 +23,7 @@ import { startRemoteSolverFleetHeartbeatTimer } from "./remote-solver";
 
 const { db, sql, engine } = makeContext();
 const critical = makeIsolatedDatabase(2);
+const hubProgress = makeIsolatedDatabase(4);
 const retention = makeIsolatedDatabase(1);
 const evidence = makeIsolatedDatabase(8);
 const reports = makeIsolatedDatabase(8);
@@ -43,6 +44,7 @@ try {
   await Promise.all([
     sql.end(),
     critical.sql.end(),
+    hubProgress.sql.end(),
     retention.sql.end(),
     evidence.sql.end(),
     reports.sql.end(),
@@ -75,7 +77,12 @@ try {
     },
     {
       name: "progressive-hub-progress",
-      run: (signal) => runProgressiveHubProgressService(db, sql, signal),
+      run: (signal) =>
+        runProgressiveHubProgressService(
+          hubProgress.db,
+          hubProgress.sql,
+          signal,
+        ),
     },
     {
       name: "progressive-remote-observation",
@@ -135,6 +142,7 @@ try {
   await Promise.all([
     sql.end(),
     critical.sql.end(),
+    hubProgress.sql.end(),
     retention.sql.end(),
     evidence.sql.end(),
     reports.sql.end(),
