@@ -25,6 +25,7 @@ import { requireExecutionPoolForSetup } from "./engine-pool";
 import { ProgressiveEvidenceCellOwned } from "./progressive-claim-deferral";
 
 const DEFAULT_PROGRESSIVE_FAST_SOLVER_PROCESSES = 4;
+const DEFAULT_PROGRESSIVE_PRECISE_SOLVER_PROCESSES = 4;
 const MAX_PROGRESSIVE_FAST_SOLVER_PROCESSES = 8;
 
 export function progressiveFastSolverProcesses(
@@ -45,17 +46,36 @@ export function progressiveFastSolverProcesses(
   return Math.min(requested, availableCpuSlots);
 }
 
+export function progressivePreciseSolverProcesses(
+  cpuSlots: number,
+  raw = process.env.SWEEPER_PROGRESSIVE_PRECISE_SOLVER_PROCESSES,
+): number {
+  const availableCpuSlots = Math.max(1, Math.trunc(cpuSlots));
+  if (raw == null || raw.trim() === "")
+    return Math.min(
+      DEFAULT_PROGRESSIVE_PRECISE_SOLVER_PROCESSES,
+      availableCpuSlots,
+    );
+  const parsed = Number(raw);
+  const requested =
+    Number.isInteger(parsed) && parsed >= 1
+      ? Math.min(parsed, MAX_PROGRESSIVE_FAST_SOLVER_PROCESSES)
+      : DEFAULT_PROGRESSIVE_PRECISE_SOLVER_PROCESSES;
+  return Math.min(requested, availableCpuSlots);
+}
+
 export function progressiveSolverProcessesForStage(
   stage: number,
   transient: boolean,
   cpuSlots: number,
   configuredSolverProcesses: number | null | undefined,
   raw = process.env.SWEEPER_PROGRESSIVE_FAST_SOLVER_PROCESSES,
+  preciseRaw = process.env.SWEEPER_PROGRESSIVE_PRECISE_SOLVER_PROCESSES,
 ): number | null {
   if (configuredSolverProcesses != null) return configuredSolverProcesses;
   if (!transient) return null;
   if (stage === 2) return progressiveFastSolverProcesses(cpuSlots, raw);
-  return Math.min(4, Math.max(1, Math.trunc(cpuSlots)));
+  return progressivePreciseSolverProcesses(cpuSlots, preciseRaw);
 }
 
 export async function composeProgressiveCfdJob(

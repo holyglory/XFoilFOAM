@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   progressiveFastSolverProcesses,
+  progressivePreciseSolverProcesses,
   progressiveSolverProcessesForStage,
 } from "../src/progressive-cfd-jobs";
 
@@ -29,6 +30,18 @@ describe("progressive fast solver process cap", () => {
 
   it("keeps the precise-stage fallback at four processes", () => {
     expect(progressiveSolverProcessesForStage(3, true, 96, null, "8")).toBe(4);
+  });
+
+  it("allows a bounded eight-process precise-stage benchmark", () => {
+    expect(progressivePreciseSolverProcesses(96, "8")).toBe(8);
+    expect(
+      progressiveSolverProcessesForStage(3, true, 96, null, "", "8"),
+    ).toBe(8);
+  });
+
+  it("clamps precise-stage process requests to available slots and eight", () => {
+    expect(progressivePreciseSolverProcesses(3, "8")).toBe(3);
+    expect(progressivePreciseSolverProcesses(96, "64")).toBe(8);
   });
 
   it("keeps steady jobs without a transient process override", () => {

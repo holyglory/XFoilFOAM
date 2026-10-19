@@ -1190,6 +1190,10 @@ The fast-stage transient fallback uses four solver processes by default. An
 operator benchmark may set `SWEEPER_PROGRESSIVE_FAST_SOLVER_PROCESSES` to a
 value from one through eight; the setting is capped at eight, applies only when
 the immutable setup does not specify a process count, and leaves
+precise-stage jobs unchanged. A separate benchmark may set
+`SWEEPER_PROGRESSIVE_PRECISE_SOLVER_PROCESSES` from one through eight; it is
+also capped at eight and applies only when the immutable setup does not specify
+a process count. Both settings affect only newly admitted jobs.
 `case_concurrency=1` plus the precise-stage fallback unchanged. Compare
 accepted points per hour, solver seconds per accepted point, CPU utilization,
 and failure dispositions before adopting a higher value.
