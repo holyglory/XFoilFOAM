@@ -325,26 +325,49 @@ export function stageEta(input: {
     unsteadyOpen: number;
     verifyOpen: number;
   } | null;
+  progressive?: Pick<
+    NonNullable<AdminCampaignSummary["progressive"]>,
+    "openPoints"
+  > | null;
   rate: { pointsLast24h: number; measuredSince: string } | null | undefined;
   nowMs?: number;
 }): StageEta | null {
   const { phase, rate } = input;
-  if (!rate || !input.stageOpenByPhase) return null;
+  if (!rate || (!input.stageOpenByPhase && !input.progressive)) return null;
   if (rate.pointsLast24h <= 0) return null;
   const now = input.nowMs ?? Date.now();
   const since = new Date(rate.measuredSince).getTime();
   if (!Number.isFinite(since) || now - since < ETA_MIN_WINDOW_MS) return null;
   let stage: 1 | 2 | 3;
   let open: number;
-  if (phase === "running_rans") {
+  if (input.progressive) {
+    if (input.progressive.openPoints.neuralfoil > 0) {
+      stage = 1;
+      open = input.progressive.openPoints.neuralfoil;
+    } else if (input.progressive.openPoints.fast > 0) {
+      stage = 2;
+      open = input.progressive.openPoints.fast;
+    } else if (input.progressive.openPoints.precise > 0) {
+      stage = 3;
+      open = input.progressive.openPoints.precise;
+    } else {
+      return null;
+    }
+  } else if (phase === "running_rans") {
+    const legacy = input.stageOpenByPhase;
+    if (!legacy) return null;
     stage = 1;
-    open = input.stageOpenByPhase.ransOpen;
+    open = legacy.ransOpen;
   } else if (phase === "running_precalc") {
+    const legacy = input.stageOpenByPhase;
+    if (!legacy) return null;
     stage = 2;
-    open = input.stageOpenByPhase.unsteadyOpen;
+    open = legacy.unsteadyOpen;
   } else if (phase === "running_refinement") {
+    const legacy = input.stageOpenByPhase;
+    if (!legacy) return null;
     stage = 3;
-    open = input.stageOpenByPhase.verifyOpen;
+    open = legacy.verifyOpen;
   } else {
     return null; // completed / no phase — nothing to estimate
   }

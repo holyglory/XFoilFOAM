@@ -397,6 +397,7 @@ export function CampaignDetail({
       : `${completionPercent < 1 ? completionPercent.toFixed(2) : completionPercent.toFixed(1)}%`;
   const throughput = campaignThroughputPresentation(rate);
   const eta = stageEta({
+    progressive: summary.progressive,
     phase: summary.phase,
     stageOpenByPhase: summary.tierCounts
       ? {

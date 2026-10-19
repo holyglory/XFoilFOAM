@@ -312,6 +312,20 @@ describe("stageEta", () => {
     expect(eta2.label).toBe("~27 h");
   });
 
+  it("uses the progressive stage when legacy phase still says RANS", () => {
+    const eta = stageEta({
+      phase: "running_rans",
+      stageOpenByPhase: opens,
+      progressive: {
+        openPoints: { neuralfoil: 0, fast: 100, precise: 200 },
+      },
+      rate: stableRate,
+      nowMs: NOW,
+    })!;
+    expect(eta.stage).toBe(2);
+    expect(eta.hours).toBeCloseTo(25, 10);
+  });
+
   it("MUST-HIDE: no rate payload, zero measured rate, or missing tier counts", () => {
     expect(
       stageEta({
