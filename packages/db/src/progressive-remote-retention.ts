@@ -37,7 +37,7 @@ export async function readProgressiveRemoteRetention(
   executionId: string,
 ) {
   const [latest] =
-    await db.execute(sql`SELECT report.report, report.sequence, report.content_signature,
+    await db.execute(sql`SELECT report.report, report.sequence, report.content_signature, report.received_at,
       dispatch.envelope FROM progressive_remote_dispatches dispatch
     JOIN LATERAL (SELECT report, sequence, content_signature, received_at FROM progressive_remote_reports
       WHERE sim_job_id = dispatch.sim_job_id ORDER BY sequence DESC LIMIT 1) report ON true
