@@ -39,7 +39,7 @@ export async function requeueProgressiveCompletionRetries(
         AND campaign.status IN ('active', 'attention', 'paused')
         AND work.state IN ('pending', 'gap')
         AND unit.state = 'gap'
-        AND unit.attempts = 2
+        AND unit.attempts IN (1, 2)
         AND unit.active_seconds < unit.active_budget_seconds
         AND attempt.outcome = 'failed'
         AND attempt.error IN (${sql.join(COMPLETION_RETRY_REASONS.map((reason) => sql`${reason}`), sql`, `)})
@@ -82,7 +82,7 @@ export async function requeueProgressiveCompletionRetries(
         SET state = 'pending', lease_token = NULL, lease_owner = NULL,
           lease_until = NULL, retry_after = NULL,
           error = 'Completion retry admitted after an under-budget unresolved attempt'
-        WHERE id = ${unit.id}::uuid AND state = 'gap' AND attempts = 2
+        WHERE id = ${unit.id}::uuid AND state = 'gap' AND attempts IN (1, 2)
       `);
       await connection.execute(sql`
         UPDATE progressive_work SET state = 'pending', error = NULL, completed_at = NULL
