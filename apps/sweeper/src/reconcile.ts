@@ -49,6 +49,7 @@ import {
   solverIncidentReason,
   sweeperState,
   URANS_RECOVERY_REMEDIATION_VERSION,
+  validateProgressiveExecutionStopProof,
 } from "@aerodb/db";
 import {
   EVIDENCE_BACKED_WAVE2_RESULT_SQL,
@@ -71,6 +72,7 @@ import {
   classifyQueueLifecycle,
   engineQueueListsJob,
   type EngineClient,
+  type EngineExecutionStopProof,
   type EngineQueueState,
   type JobResult,
   type JobRuntimeSummary,
@@ -4129,6 +4131,28 @@ async function handlePollMiss(
   );
 }
 
+async function durableProgressiveStopProof(
+  db: DB,
+  simJobId: string,
+  engineJobId: string,
+): Promise<EngineExecutionStopProof | null> {
+  const [stored] = await db.execute(sql`
+    SELECT engine_job_id, proof
+    FROM progressive_cfd_execution_stops
+    WHERE sim_job_id = ${simJobId}::uuid
+      AND engine_job_id = ${engineJobId}
+    LIMIT 1
+  `);
+  if (!stored || stored.engine_job_id !== engineJobId) return null;
+  const proof = stored.proof as EngineExecutionStopProof;
+  try {
+    validateProgressiveExecutionStopProof(proof);
+  } catch {
+    return null;
+  }
+  return proof.job_id === engineJobId ? proof : null;
+}
+
 /** Poll in-flight engine jobs; completed jobs ingest, transient engine misses recover or requeue. */
 export async function reconcileProgressiveCfdJob(
   db: DB,
@@ -4173,8 +4197,22 @@ export async function reconcileProgressiveCfdJob(
     )
       return;
   } else {
-    const proof = await engine.getExecutionStopProof(job.engineJobId, route);
-    if (!proof.execution_stopped) return;
+    let proof = await durableProgressiveStopProof(
+      db,
+      job.id,
+      job.engineJobId,
+    );
+    if (!proof) {
+      proof = await engine.getExecutionStopProof(job.engineJobId, route);
+      if (!proof.execution_stopped) {
+        proof = await durableProgressiveStopProof(
+          db,
+          job.id,
+          job.engineJobId,
+        );
+        if (!proof) return;
+      }
+    }
     await acknowledgeProgressiveCfdExecutionStop(db, {
       simJobId: job.id,
       proof,

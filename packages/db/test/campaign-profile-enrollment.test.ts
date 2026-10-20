@@ -5993,6 +5993,61 @@ describe("progressive execution stop and settlement", () => {
     expect(cancelJob).not.toHaveBeenCalled();
   });
 
+  it("settles terminal progressive work from an exact durable stop proof", async () => {
+    const fixture = await fitFixture();
+    const proof = {
+      ...executionStopProof(fixture.engineJobId),
+      fence: "cancel_marker" as const,
+      ownership_basis: "recorded_execution_namespace" as const,
+    };
+    await db
+      .update(simJobs)
+      .set({
+        status: "ingesting",
+        engineState: "cancelled",
+        updatedAt: new Date(Date.now() - 20 * 60_000),
+      })
+      .where(eq(simJobs.id, fixture.composed.jobId));
+    await db.execute(sql`
+      INSERT INTO progressive_cfd_execution_stops
+        (sim_job_id, engine_job_id, epoch_id, proof, proof_signature, observed_at)
+      VALUES
+        (${fixture.composed.jobId}, ${fixture.engineJobId}, ${fixture.leases[0].epochId},
+         ${JSON.stringify(proof)}::jsonb, ${analysisContentHash(proof)}, clock_timestamp())
+    `);
+    const engine = {
+      getJob: vi.fn().mockResolvedValue({
+        job_id: fixture.engineJobId,
+        state: "cancelled",
+        completed_cases: 0,
+        total_cases: fixture.leases.length,
+      }),
+      getExecutionStopProof: vi
+        .fn()
+        .mockRejectedValue(new Error("stop endpoint unavailable")),
+      getResult: vi
+        .fn()
+        .mockRejectedValue(new EngineError("result missing", 404)),
+    };
+    const [job] = await db
+      .select()
+      .from(simJobs)
+      .where(eq(simJobs.id, fixture.composed.jobId));
+
+    await reconcileProgressiveCfdJob(db, engine as never, job);
+
+    const [finished] = await db
+      .select()
+      .from(simJobs)
+      .where(eq(simJobs.id, fixture.composed.jobId));
+    expect(finished).toMatchObject({
+      status: "cancelled",
+      engineState: "cancelled",
+      ingestedAt: expect.any(Date),
+    });
+    expect(engine.getExecutionStopProof).not.toHaveBeenCalled();
+  });
+
   it("does not poll the engine for a stop proof after every attempt is terminal", async () => {
     const fixture = await fitFixture();
     await db
