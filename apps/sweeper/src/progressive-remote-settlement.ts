@@ -476,10 +476,6 @@ export async function settleProgressiveRemoteJob(db: DB, executionId: string) {
           report.received_at <= clock_timestamp() - interval '30 minutes'
           AND report.report#>>'{stopProof,execution_stopped}' = 'true'
           AND report.report#>>'{status,state}' IN ('completed', 'failed', 'cancelled')
-          AND (
-            report.report->'result' IS NULL
-            OR report.report#>>'{result,state}' NOT IN ('completed', 'failed', 'cancelled')
-          )
         )
       LIMIT 1`);
     if (pending) return { kind: "waiting" as const, reason: "report_progress" };
