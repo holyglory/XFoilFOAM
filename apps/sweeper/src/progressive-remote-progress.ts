@@ -301,7 +301,13 @@ async function reconcileProgressiveRemoteCampaign(
       receipt.indexed += batch.indexed;
       receipt.stopped += batch.stopped;
       receipt.errors.push(...batch.errors);
-      if (batch.idle && batch.errors.length === 0) {
+      const obsoleteScopeOnly =
+        batch.errors.length > 0 &&
+        batch.errors.every(
+          (error) =>
+            error.reason === "Obsolete or settled progressive CFD execution scope",
+        );
+      if ((batch.idle || obsoleteScopeOnly) && (batch.errors.length === 0 || obsoleteScopeOnly)) {
         const terminal = await settleProgressiveRemoteJob(db, executionId);
         if (terminal.kind === "settled") receipt.settled += 1;
         else receipt.waiting += 1;

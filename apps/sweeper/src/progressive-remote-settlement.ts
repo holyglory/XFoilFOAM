@@ -471,7 +471,17 @@ export async function settleProgressiveRemoteJob(db: DB, executionId: string) {
     const [pending] =
       await connection.execute(sql`SELECT sequence FROM progressive_remote_reports report
       WHERE sim_job_id = ${executionId}::uuid AND NOT EXISTS (SELECT 1 FROM progressive_remote_progress_receipts receipt
-        WHERE receipt.sim_job_id = report.sim_job_id AND receipt.sequence = report.sequence) LIMIT 1`);
+        WHERE receipt.sim_job_id = report.sim_job_id AND receipt.sequence = report.sequence)
+        AND NOT (
+          report.received_at <= clock_timestamp() - interval '30 minutes'
+          AND report.report#>>'{stopProof,execution_stopped}' = 'true'
+          AND report.report#>>'{status,state}' IN ('completed', 'failed', 'cancelled')
+          AND (
+            report.report->'result' IS NULL
+            OR report.report#>>'{result,state}' NOT IN ('completed', 'failed', 'cancelled')
+          )
+        )
+      LIMIT 1`);
     if (pending) return { kind: "waiting" as const, reason: "report_progress" };
     const [stop] = await connection.execute(
       sql`SELECT sim_job_id FROM progressive_cfd_execution_stops WHERE sim_job_id = ${executionId}::uuid`,
