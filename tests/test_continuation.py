@@ -32,7 +32,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from airfoilfoam import evidence_runtime, jobs, pipeline, physics
+from airfoilfoam import evidence_runtime, jobs, pipeline
 from airfoilfoam.capabilities import URANS_RECOVERY_VERSION
 from airfoilfoam.celery_app import TASK_TIME_LIMIT_MARGIN_S, task_hard_time_limit_s
 from airfoilfoam.config import get_settings
@@ -1825,39 +1825,16 @@ def test_execute_job_continuation_wiring(monkeypatch, naca0012_selig_text):
     assert completed_count_observations == [True]
 
 
-def test_execute_job_continuation_missing_source_falls_back_to_fresh_solve(
+def test_execute_job_continuation_missing_source_fails_honestly(
     monkeypatch, naca0012_selig_text
 ):
-    """A permanent continuation-source loss retries the exact physics fresh."""
+    """A missing saved case fails without inventing a fresh CFD execution."""
 
-    solved = []
+    def forbid(*_args, **_kwargs):
+        raise AssertionError("must not solve when the continuation source is missing")
 
-    def fake_prepare(*args, **_kwargs):
-        return SimpleNamespace(n_cells=321), args[2], False
-
-    def fake_run_case(*args, **_kwargs):
-        solved.append(_kwargs.get("resume"))
-        spec = args[2]
-        fluid = args[3]
-        return CaseOutcome(
-            spec=spec,
-            reynolds=physics.reynolds(spec.speed, spec.chord, fluid.nu),
-            cl=0.8,
-            cd=0.1,
-            cm=-0.04,
-            cl_cd=8.0,
-            converged=True,
-            fidelity="urans_full",
-        )
-
-    monkeypatch.setattr(
-        jobs,
-        "get_mesher",
-        lambda _name: SimpleNamespace(name="fake", cache_version="test"),
-    )
-    monkeypatch.setattr(jobs, "prepare_mesh_with_recovery", fake_prepare)
-    monkeypatch.setattr(jobs, "run_case", fake_run_case)
-
+    monkeypatch.setattr(jobs, "run_case", forbid)
+    monkeypatch.setattr(jobs, "prepare_mesh_with_recovery", forbid)
     request = _continuation_request(
         naca0012_selig_text,
         continue_from=ContinueFrom(engine_job_id="f" * 32, case_slug="never_existed"),
@@ -1866,15 +1843,15 @@ def test_execute_job_continuation_missing_source_falls_back_to_fresh_solve(
     store = JobStore(settings)
     result = jobs.execute_job("continuation-missing-src", request, store=store, settings=settings)
 
-    assert result.state.value == "completed"
+    assert result.state.value == "failed"
     assert result.failure_disposition is None
-    assert result.continuation_failure_kind is None
-    assert len(solved) == 1
-    assert solved[0] is None
-    assert len(result.polars) == 1
-    assert len(result.polars[0].points) == 1
+    assert result.continuation_failure_kind == ContinuationFailureKind.permanent
+    assert "continuation failed" in (result.message or "")
+    assert "not found" in (result.message or "")
+    assert result.polars == [] or all(not polar.points for polar in result.polars)
     status = store.read_status("continuation-missing-src")
-    assert status is not None and status.state.value == "completed"
+    assert status is not None and status.state.value == "failed"
+    assert status.continuation_failure_kind == ContinuationFailureKind.permanent
 
 
 def test_execute_job_continuation_transient_storage_failure_is_typed(

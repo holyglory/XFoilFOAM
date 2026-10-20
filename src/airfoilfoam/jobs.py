@@ -627,27 +627,6 @@ def execute_job(
             )
         except OpenFOAMError as exc:
             permanent = isinstance(exc, ContinuationPermanentError)
-            if permanent:
-                logger.warning(
-                    "continuation: job %s lost its immutable restart source; "
-                    "falling back to a fresh solve with the same physical request",
-                    job_id,
-                )
-                fresh_request = request.model_copy(
-                    update={
-                        "continue_from": None,
-                        "budget_override_s": None,
-                        "corrective_tail_periods": None,
-                    }
-                )
-                return execute_job(
-                    job_id,
-                    fresh_request,
-                    store=store,
-                    settings=settings,
-                    progress=progress,
-                    budget_started=budget_started,
-                )
             failure_disposition = (
                 None if permanent else FailureDisposition.infrastructure
             )
