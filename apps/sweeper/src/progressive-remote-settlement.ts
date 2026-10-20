@@ -508,6 +508,36 @@ export async function settleProgressiveRemoteJob(db: DB, executionId: string) {
       connection,
       executionId,
     );
+    if (retained.kind === "terminal_without_result") {
+      await acknowledgeProgressiveCfdExecutionStop(connection, {
+        simJobId: executionId,
+        proof: retained.report.stopProof!,
+      });
+      await connection.execute(sql`
+        UPDATE sim_jobs SET
+          status = ${retained.report.status.state}::sim_job_status,
+          engine_state = ${retained.report.status.state},
+          completed_cases = ${retained.report.status.completed_cases},
+          total_cases = ${retained.report.status.total_cases},
+          "ingestedAt" = clock_timestamp(),
+          "finishedAt" = clock_timestamp(),
+          "updatedAt" = clock_timestamp(),
+          error = ${retained.report.status.message ?? "Remote execution stopped without a terminal result"},
+          ingest_lease_token = NULL,
+          ingest_lease_claimed_at = NULL,
+          ingest_lease_expires_at = NULL
+        WHERE id = ${executionId}::uuid
+      `);
+      await releaseResultClaimsForJob(connection, executionId, [
+        "queued",
+        "running",
+      ]);
+      await retireSettledProgressivePromise(connection, executionId);
+      return {
+        kind: "settled" as const,
+        counts: await settleProgressiveCfdExecution(connection, executionId),
+      };
+    }
     if (retained.kind === "waiting") {
       if (
         retained.reason === "raw_evidence" ||
