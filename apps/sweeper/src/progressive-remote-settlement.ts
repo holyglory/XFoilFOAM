@@ -339,6 +339,59 @@ type RetainedExecution = Extract<
   { kind: "retained" }
 >;
 
+async function settleObsoleteProgressiveRemoteJob(
+  db: DB,
+  executionId: string,
+) {
+  return db.transaction(async (transaction) => {
+    const connection = transaction as unknown as DB;
+    const units = await connection.execute(sql`
+      SELECT attempt.token, unit.id
+      FROM progressive_cfd_attempts attempt
+      JOIN progressive_cfd_units unit ON unit.id = attempt.unit_id
+      WHERE attempt.sim_job_id = ${executionId}::uuid
+        AND attempt.outcome = 'running'
+      FOR UPDATE OF attempt, unit
+    `);
+    for (const unit of units) {
+      await connection.execute(sql`
+        UPDATE progressive_cfd_attempts
+        SET outcome = 'cancelled', finished_at = clock_timestamp(),
+            error = 'obsolete execution physically stopped'
+        WHERE token = ${unit.token}::uuid
+      `);
+      await connection.execute(sql`
+        UPDATE progressive_cfd_units
+        SET state = 'gap', lease_token = NULL, lease_owner = NULL,
+            lease_until = NULL, error = 'obsolete execution physically stopped'
+        WHERE id = ${unit.id}::uuid AND state <> 'complete'
+      `);
+    }
+    await connection.execute(sql`
+      UPDATE sim_jobs
+      SET status = 'cancelled', engine_state = 'cancelled',
+          "ingestedAt" = coalesce("ingestedAt", clock_timestamp()),
+          "finishedAt" = coalesce("finishedAt", clock_timestamp()),
+          "updatedAt" = clock_timestamp(),
+          error = 'obsolete execution physically stopped',
+          ingest_lease_token = NULL, ingest_lease_claimed_at = NULL,
+          ingest_lease_expires_at = NULL
+      WHERE id = ${executionId}::uuid
+    `);
+    await releaseResultClaimsForJob(connection, executionId, [
+      "queued",
+      "running",
+    ]);
+    return {
+      complete: 0,
+      retry: 0,
+      gaps: units.length,
+      cancelled: 0,
+      waiting: 0,
+    };
+  });
+}
+
 async function recoveryPromotions(
   db: DB,
   envelope: ProgressiveRemoteExecutionEnvelope,
@@ -471,13 +524,7 @@ export async function settleProgressiveRemoteJob(db: DB, executionId: string) {
     const [pending] =
       await connection.execute(sql`SELECT sequence FROM progressive_remote_reports report
       WHERE sim_job_id = ${executionId}::uuid AND NOT EXISTS (SELECT 1 FROM progressive_remote_progress_receipts receipt
-        WHERE receipt.sim_job_id = report.sim_job_id AND receipt.sequence = report.sequence)
-        AND NOT (
-          report.received_at <= clock_timestamp() - interval '30 minutes'
-          AND report.report#>>'{stopProof,execution_stopped}' = 'true'
-          AND report.report#>>'{status,state}' IN ('completed', 'failed', 'cancelled')
-        )
-      LIMIT 1`);
+        WHERE receipt.sim_job_id = report.sim_job_id AND receipt.sequence = report.sequence) LIMIT 1`);
     if (pending) return { kind: "waiting" as const, reason: "report_progress" };
     const [stop] = await connection.execute(
       sql`SELECT sim_job_id FROM progressive_cfd_execution_stops WHERE sim_job_id = ${executionId}::uuid`,
@@ -500,50 +547,16 @@ export async function settleProgressiveRemoteJob(db: DB, executionId: string) {
     if (!scope.current_scope) {
       await connection.execute(sql`UPDATE sim_jobs SET status = 'cancelled', "finishedAt" = coalesce("finishedAt", clock_timestamp())
         WHERE id = ${executionId}::uuid`);
-      await releaseResultClaimsForJob(connection, executionId, [
-        "queued",
-        "running",
-      ]);
       await retireSettledProgressivePromise(connection, executionId);
       return {
         kind: "settled" as const,
-        counts: await settleProgressiveCfdExecution(connection, executionId),
+        counts: await settleObsoleteProgressiveRemoteJob(connection, executionId),
       };
     }
     const retained = await readProgressiveRemoteRetention(
       connection,
       executionId,
     );
-    if (retained.kind === "terminal_without_result") {
-      await acknowledgeProgressiveCfdExecutionStop(connection, {
-        simJobId: executionId,
-        proof: retained.report.stopProof!,
-      });
-      await connection.execute(sql`
-        UPDATE sim_jobs SET
-          status = ${retained.report.status.state}::sim_job_status,
-          engine_state = ${retained.report.status.state},
-          completed_cases = ${retained.report.status.completed_cases},
-          total_cases = ${retained.report.status.total_cases},
-          "ingestedAt" = clock_timestamp(),
-          "finishedAt" = clock_timestamp(),
-          "updatedAt" = clock_timestamp(),
-          error = ${retained.report.status.message ?? "Remote execution stopped without a terminal result"},
-          ingest_lease_token = NULL,
-          ingest_lease_claimed_at = NULL,
-          ingest_lease_expires_at = NULL
-        WHERE id = ${executionId}::uuid
-      `);
-      await releaseResultClaimsForJob(connection, executionId, [
-        "queued",
-        "running",
-      ]);
-      await retireSettledProgressivePromise(connection, executionId);
-      return {
-        kind: "settled" as const,
-        counts: await settleProgressiveCfdExecution(connection, executionId),
-      };
-    }
     if (retained.kind === "waiting") {
       if (
         retained.reason === "raw_evidence" ||
