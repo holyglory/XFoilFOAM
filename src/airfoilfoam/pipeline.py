@@ -5276,16 +5276,19 @@ def _prepare_transient_case(
     # Unconditional steady (RANS) initialisation stage, for the URANS-only path
     # too: even a short, non-converged SIMPLE field gives the transient a
     # developed, already-separated start instead of violent uniform flow.
-    potential_seed = None
-    if is_compressible(runner):
-        potential_seed = tcase / ".compressible-potential-seed"
-        shutil.copytree(tcase / "0", potential_seed)
+    # Keep the potential-flow fields available for a numerical SIMPLE failure.
+    # The steady stage is only a transient seed; a condemned seed must never be
+    # allowed to become the starting state for pimpleFoam.
+    potential_seed = tcase / ".compressible-potential-seed"
+    shutil.copytree(tcase / "0", potential_seed)
     try:
         init = runner.solver(tcase, dialect.steady_solver_command, n_proc, timeout=timeout)
         _check_cancel(cancel_check)
         (tcase / "log.simpleFoam.init").write_text(init.stdout)
-        _isolate_steady_initialization_postprocessing(tcase)
         check_material_domain(tcase, init)
+        if not bool(getattr(init, "ok", False)):
+            _checked_solver_result(tcase, init)
+        _isolate_steady_initialization_postprocessing(tcase)
     except MaterialDomainError:
         if not is_compressible(runner) or potential_seed is None:
             raise
@@ -5298,9 +5301,18 @@ def _prepare_transient_case(
                 "compressible steady initialization exceeded the material domain; "
                 "transient fallback restarted from the potential-flow seed"
             )
+    except HardSolverError as error:
+        _isolate_failed_steady_initialization(tcase)
+        zero = tcase / "0"
+        shutil.rmtree(zero)
+        shutil.copytree(potential_seed, zero)
+        if quality_warnings is not None:
+            quality_warnings.append(
+                "steady numerical initialization failed; transient fallback "
+                f"restarted from the potential-flow seed: {error}"
+            )
     finally:
-        if potential_seed is not None:
-            shutil.rmtree(potential_seed, ignore_errors=True)
+        shutil.rmtree(potential_seed, ignore_errors=True)
     # The steady initialisation is only a convenience seed for pimpleFoam. When
     # the whole polar has already been promoted because RANS is fragile, failing
     # here with the same SIMPLE problem should not prevent the transient attempt.

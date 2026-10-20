@@ -15,6 +15,7 @@ No real OpenFOAM solves; runners are faked with prod-shaped logs/outputs.
 """
 import logging
 import math
+import signal
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -32,6 +33,7 @@ from airfoilfoam.openfoam.runner import (
     DeterministicMeshError,
     InfrastructureError,
     OpenFOAMError,
+    RunResult,
     _run_subprocess,
 )
 from airfoilfoam.pipeline import (
@@ -620,6 +622,98 @@ def test_prepare_transient_case_urans_only_falls_back_to_unconditional_steady_in
         / "0"
         / "coefficient.dat"
     ).is_file()
+
+
+def test_prepare_transient_case_numerical_steady_failure_restarts_from_potential_seed(
+    tmp_path, monkeypatch
+):
+    """A SIGFPE in the optional SIMPLE seed must not poison pimpleFoam."""
+    calls: list[str] = []
+
+    class FakeRunner:
+        def application(self, case_dir, cmd, *args, **kwargs):
+            calls.append(cmd.split()[0])
+            if cmd.startswith("potentialFoam"):
+                (Path(case_dir) / "0" / "U").write_text("potential seed")
+            return SimpleNamespace(ok=True, stdout="", check=lambda: None)
+
+        def solver(self, case_dir, app, *_args, **_kwargs):
+            calls.append(app)
+            assert app == "simpleFoam"
+            (Path(case_dir) / "0" / "U").write_text("condemned steady field")
+            (Path(case_dir) / "1").mkdir()
+            (Path(case_dir) / "1" / "U").write_text("partial failed field")
+            return RunResult(app, -signal.SIGFPE, "SIGFPE in simpleFoam")
+
+    monkeypatch.setattr(pipeline, "CaseBuilder", FakeCaseBuilder)
+    monkeypatch.setattr(pipeline, "_link_mesh", lambda *a, **k: None)
+    monkeypatch.setattr(pipeline, "shared_mesh_qa_verified", lambda _: True)
+
+    warnings: list[str] = []
+    tcase = tmp_path / "case" / "transient"
+    pipeline._prepare_transient_case(
+        tcase,
+        airfoil=None,
+        resolved=MeshParams(),
+        spec=CaseSpec(chord=0.25, speed=15.0, aoa_deg=4.0),
+        fluid=FLUID,
+        roughness=RoughnessParams(),
+        solver_params=SolverParams(force_transient=True),
+        runner=FakeRunner(),
+        n_proc=1,
+        timeout=60,
+        shared_mesh_dir=tmp_path / "mesh",
+        quality_warnings=warnings,
+    )
+
+    assert calls == ["potentialFoam", "simpleFoam"]
+    assert (tcase / "0" / "U").read_text() == "potential seed"
+    assert (tcase / "log.simpleFoam.init").is_file()
+    assert (
+        tcase
+        / pipeline.STEADY_INITIALIZATION_EVIDENCE_DIR
+        / "time"
+        / "1"
+        / "U"
+    ).read_text() == "partial failed field"
+    assert any("steady numerical initialization failed" in item for item in warnings)
+
+
+def test_prepare_transient_case_non_numerical_steady_failure_stays_infrastructure(
+    tmp_path, monkeypatch
+):
+    """A launch failure must stop before transient execution."""
+    calls: list[str] = []
+
+    class FailedRunner:
+        def application(self, _case_dir, cmd, *args, **kwargs):
+            calls.append(cmd.split()[0])
+            return SimpleNamespace(ok=True, stdout="", check=lambda: None)
+
+        def solver(self, _case_dir, app, *_args, **_kwargs):
+            calls.append(app)
+            return RunResult(app, 127, "simpleFoam executable unavailable")
+
+    monkeypatch.setattr(pipeline, "CaseBuilder", FakeCaseBuilder)
+    monkeypatch.setattr(pipeline, "_link_mesh", lambda *a, **k: None)
+    monkeypatch.setattr(pipeline, "shared_mesh_qa_verified", lambda _: True)
+
+    with pytest.raises(InfrastructureError, match="Command could not be launched"):
+        pipeline._prepare_transient_case(
+            tmp_path / "case" / "transient",
+            airfoil=None,
+            resolved=MeshParams(),
+            spec=CaseSpec(chord=0.25, speed=15.0, aoa_deg=4.0),
+            fluid=FLUID,
+            roughness=RoughnessParams(),
+            solver_params=SolverParams(force_transient=True),
+            runner=FailedRunner(),
+            n_proc=1,
+            timeout=60,
+            shared_mesh_dir=tmp_path / "mesh",
+        )
+
+    assert calls == ["potentialFoam", "simpleFoam"]
 
 
 @pytest.mark.parametrize("initialization_iterations,expected", [(None, 600), (1200, 1200)])
