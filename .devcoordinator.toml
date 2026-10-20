@@ -751,6 +751,12 @@ tier = "development"
 requires = ["workspace"]
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "settles terminal progressive work from an exact durable stop proof"]
 
+[[test.recovery-plan-retry.check]]
+name = "mixed-runtime-settlement"
+tier = "development"
+requires = ["workspace"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "progressive remote dispatch pins mixed terminal and active progress"]
+
 [test.mach3-startup-fields]
 timeout_seconds = 300
 

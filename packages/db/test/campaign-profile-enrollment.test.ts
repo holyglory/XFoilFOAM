@@ -3494,6 +3494,222 @@ describe("progressive live solver accounting", () => {
       cancel.mockRestore();
     }
   });
+
+  it("progressive remote dispatch pins mixed terminal and active progress, then settles the final report without mutating obsolete history", async () => {
+    const scope = await cfdEvidenceFixture();
+    const first = scope.leases[0];
+    const second = scope.leases[1];
+    const limitSeconds =
+      scope.composed.request.resources!.case_solver_budget_seconds!;
+    const allocationFor = (lease: ProgressiveCfdLease) => ({
+      chord: scope.execution.snapshot.referenceGeometry.referenceLengthM,
+      speed: scope.execution.snapshot.flowState.speedMps,
+      aoa_deg: lease.alpha,
+      limit_seconds: limitSeconds,
+    });
+    const progress = (
+      firstSeconds: number,
+      secondSeconds: number,
+      observedAt: string,
+      solverRunning = true,
+    ) => ({
+      version: 1 as const,
+      job_id: scope.engineJobId,
+      observed_at: observedAt,
+      cases: [
+        {
+          ...allocationFor(first),
+          solver_active_seconds: firstSeconds,
+          solver_running: solverRunning,
+        },
+        {
+          ...allocationFor(second),
+          solver_active_seconds: secondSeconds,
+          solver_running: solverRunning,
+        },
+      ],
+    });
+
+    await expect(
+      recordProgressiveCfdRuntimeProgress(db, {
+        simJobId: scope.composed.jobId,
+        engineJobId: randomUUID(),
+        progress: progress(1, 1, "2026-09-07T07:00:00.000001Z"),
+      }),
+    ).rejects.toThrow("ownership");
+    const wrongProgressIdentity = progress(
+      1,
+      1,
+      "2026-09-07T07:00:00.000001Z",
+    );
+    wrongProgressIdentity.job_id = randomUUID();
+    await expect(
+      recordProgressiveCfdRuntimeProgress(db, {
+        simJobId: scope.composed.jobId,
+        engineJobId: scope.engineJobId,
+        progress: wrongProgressIdentity,
+      }),
+    ).rejects.toThrow("Invalid exact-job solver budget observation");
+    expect(
+      await recordProgressiveCfdRuntimeProgress(db, {
+        simJobId: scope.composed.jobId,
+        engineJobId: scope.engineJobId,
+        progress: progress(10, 5, "2026-09-07T07:00:00.000001Z"),
+      }),
+    ).toEqual({ updated: 2, replayed: 0, stale: 0 });
+
+    const evidenceId = await scope.save(25, "rans", second.alpha);
+    await db
+      .update(resultAttempts)
+      .set({
+        status: "done",
+        validForPolar: true,
+        evidencePayload: {
+          solver_active_seconds: 25,
+          converged: true,
+          cl: 0.2,
+          cd: 0.02,
+          cm: -0.03,
+        },
+      })
+      .where(eq(resultAttempts.id, evidenceId));
+    await db.execute(sql`
+      INSERT INTO result_classifications(result_attempt_id, airfoil_id, simulation_preset_revision_id, aoa_deg, classifier_version, state)
+      SELECT id, airfoil_id, simulation_preset_revision_id, aoa_deg, 'mixed-runtime-settlement', 'accepted'::result_classification_state
+      FROM result_attempts WHERE id = ${evidenceId}
+    `);
+    await scope.record([evidenceId]);
+    await db.execute(sql`UPDATE progressive_cfd_attempts
+      SET outcome = 'complete', finished_at = clock_timestamp()
+      WHERE token = ${first.token}`);
+    await db.execute(sql`UPDATE progressive_cfd_units
+      SET state = 'complete', lease_token = NULL, lease_owner = NULL, lease_until = NULL
+      WHERE id = ${first.id}`);
+
+    const solverId = randomUUID();
+    const promiseId = randomUUID();
+    const [job] = await db
+      .select()
+      .from(simJobs)
+      .where(eq(simJobs.id, scope.composed.jobId));
+    await db.execute(sql`
+      INSERT INTO registered_remote_solvers(id, instance_id, instance_name, cpu_capacity, cpu_budget, max_active_polar_promises)
+      VALUES (${solverId}::uuid, ${randomUUID()}, 'mixed runtime fixture', 96, 96, 96)
+    `);
+    await db.execute(sql`
+      INSERT INTO sync_sweep_promises(id, registered_solver_id, airfoil_id, simulation_preset_revision_id, aoa_count, "expiresAt")
+      VALUES (${promiseId}::uuid, ${solverId}::uuid, ${job.airfoilId}::uuid,
+        ${job.simulationPresetRevisionId}::uuid, ${scope.leases.length}, clock_timestamp() + interval '1 hour')
+    `);
+    for (const lease of scope.leases)
+      await db.execute(sql`
+        INSERT INTO sync_sweep_promise_points(promise_id, airfoil_id, simulation_preset_revision_id, aoa_deg)
+        VALUES (${promiseId}::uuid, ${job.airfoilId}::uuid, ${job.simulationPresetRevisionId}::uuid, ${lease.alpha})
+      `);
+    try {
+      const bound = await bindProgressiveRemoteDispatch(db, {
+        simJobId: job.id,
+        solverId,
+        promiseId,
+      });
+      const terminal: ProgressiveRemoteReport = {
+        version: 1,
+        solverId,
+        promiseId,
+        executionId: job.id,
+        assignmentSignature: bound.envelope.contentSignature,
+        sequence: 1,
+        status: {
+          job_id: job.id,
+          state: "failed",
+          total_cases: scope.leases.length,
+          completed_cases: scope.leases.length,
+          message: "mixed runtime terminal fixture",
+          solver_budget_progress: progress(
+            900,
+            26,
+            "2026-09-07T07:00:01.000001Z",
+            false,
+          ),
+        },
+        result: {
+          job_id: job.id,
+          state: "failed",
+          polars: [],
+        },
+        stopProof: executionStopProof(job.id),
+      };
+      await storeProgressiveRemoteReport(db, {
+        solverId,
+        promiseId,
+        executionId: job.id,
+        report: terminal,
+      });
+      expect(await applyProgressiveRemoteProgress(db, job.id)).toMatchObject({
+        kind: "applied",
+        sequence: 1,
+        stopped: true,
+      });
+      expect(
+        await db.execute(sql`SELECT count(*)::int AS count
+          FROM progressive_remote_progress_receipts WHERE sim_job_id = ${job.id}::uuid`),
+      ).toEqual([{ count: 1 }]);
+      const [afterProgress] = await db.execute(sql`
+        SELECT unit.id, unit.state, unit.active_seconds, attempt.outcome, attempt.active_seconds AS attempt_seconds
+        FROM progressive_cfd_units unit
+        JOIN progressive_cfd_attempts attempt ON attempt.unit_id = unit.id
+        WHERE attempt.sim_job_id = ${job.id}::uuid
+        ORDER BY unit.ordinal
+      `);
+      expect(afterProgress).toMatchObject({
+        id: first.id,
+        state: "complete",
+        active_seconds: 10,
+        outcome: "complete",
+        attempt_seconds: 10,
+      });
+      expect(
+        await settleProgressiveRemoteJob(db, job.id),
+      ).toMatchObject({ kind: "settled", counts: { complete: 1 } });
+      const [afterSettlement] = await db.execute(sql`
+        SELECT unit.id, unit.state, unit.active_seconds, attempt.outcome, attempt.active_seconds AS attempt_seconds
+        FROM progressive_cfd_units unit
+        JOIN progressive_cfd_attempts attempt ON attempt.unit_id = unit.id
+        WHERE attempt.sim_job_id = ${job.id}::uuid AND unit.id = ${second.id}
+      `);
+      expect(afterSettlement).toMatchObject({
+        id: second.id,
+        state: "complete",
+        active_seconds: 26,
+        outcome: "complete",
+        attempt_seconds: 26,
+      });
+      expect(
+        await recordProgressiveCfdRuntimeProgress(db, {
+          simJobId: job.id,
+          engineJobId: job.id,
+          progress: progress(900, 900, "2026-09-07T07:00:02.000001Z", false),
+        }),
+      ).toEqual({ updated: 0, replayed: 0, stale: 0 });
+      await expect(
+        recordProgressiveCfdRuntimeProgress(db, {
+          simJobId: job.id,
+          engineJobId: randomUUID(),
+          progress: progress(900, 900, "2026-09-07T07:00:02.000001Z", false),
+        }),
+      ).rejects.toThrow("ownership");
+    } finally {
+      await db.execute(
+        sql`DELETE FROM progressive_remote_dispatches WHERE sim_job_id = ${job.id}::uuid`,
+      );
+      await db.execute(
+        sql`DELETE FROM sync_sweep_promises WHERE id = ${promiseId}::uuid`,
+      );
+      await db.execute(
+        sql`DELETE FROM registered_remote_solvers WHERE id = ${solverId}::uuid`,
+      );
+    }
+  }, 120_000);
 });
 
 describe("progressive CPU admission", () => {

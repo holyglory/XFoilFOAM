@@ -11,8 +11,6 @@ import {
 import type { ProgressiveRemoteExecutionEnvelope } from "./progressive-remote-execution";
 import type { ProgressiveRemoteReport } from "./progressive-remote-report";
 
-const TERMINAL_REPORT_FINALIZATION_GRACE_MS = 30 * 60 * 1000;
-
 export function terminalReportHasNoPhysicalEvidence(
   report: ProgressiveRemoteReport,
 ): boolean {
@@ -37,9 +35,9 @@ export async function readProgressiveRemoteRetention(
   executionId: string,
 ) {
   const [latest] =
-    await db.execute(sql`SELECT report.report, report.sequence, report.content_signature, report.received_at,
+    await db.execute(sql`SELECT report.report, report.sequence, report.content_signature,
       dispatch.envelope FROM progressive_remote_dispatches dispatch
-    JOIN LATERAL (SELECT report, sequence, content_signature, received_at FROM progressive_remote_reports
+    JOIN LATERAL (SELECT report, sequence, content_signature FROM progressive_remote_reports
       WHERE sim_job_id = dispatch.sim_job_id ORDER BY sequence DESC LIMIT 1) report ON true
     WHERE dispatch.sim_job_id = ${executionId}::uuid`);
   if (!latest)
@@ -50,19 +48,8 @@ export async function readProgressiveRemoteRetention(
   );
   if (contentSignature !== latest.content_signature)
     throw new Error("Remote retention has changed final report bytes");
-  if (!isFinalProgressiveRemoteReport(report)) {
-    const terminalWithoutResult =
-      report.stopProof?.execution_stopped === true &&
-      ["completed", "failed", "cancelled"].includes(report.status.state) &&
-      (report.result === null ||
-        !["completed", "failed", "cancelled"].includes(report.result.state)) &&
-      Number.isFinite(Date.parse(String(latest.received_at))) &&
-      Date.parse(String(latest.received_at)) <=
-        Date.now() - TERMINAL_REPORT_FINALIZATION_GRACE_MS;
-    if (terminalWithoutResult)
-      return { kind: "terminal_without_result" as const, report };
+  if (!isFinalProgressiveRemoteReport(report))
     return { kind: "waiting" as const, reason: "final_report" as const };
-  }
   const [missingInventory] =
     await db.execute(sql`SELECT report.sequence FROM progressive_remote_reports report
     LEFT JOIN progressive_remote_report_inventories inventory USING (sim_job_id, sequence)

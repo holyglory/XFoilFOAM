@@ -56,15 +56,36 @@ interface BoundUnit {
   };
 }
 
+type JobScopePolicy = "strict" | "runtime";
+
+function isRuntimeProgressActiveUnit(unit: BoundUnit): boolean {
+  return (
+    unit.latest_attempt === true &&
+    unit.outcome === "running" &&
+    ["leased", "blocked"].includes(unit.state)
+  );
+}
+
+function isRuntimeProgressObsoleteUnit(unit: BoundUnit): boolean {
+  return (
+    !isRuntimeProgressActiveUnit(unit) &&
+    (!unit.latest_attempt ||
+      ["complete", "failed", "expired", "cancelled"].includes(unit.outcome) ||
+      ["complete", "gap", "cancelled"].includes(unit.state))
+  );
+}
+
 async function lockJobScope(
   db: DB,
   simJobId: string,
   engineJobId: string,
   options: {
     recoveryScope?: ProgressiveStorageEvidenceRecoveryScope;
+    policy?: JobScopePolicy;
   } = {},
 ) {
   const recoveryScope = options.recoveryScope;
+  const policy = options.policy ?? "strict";
   if (recoveryScope) await assertProgressiveStorageEvidenceRecoveryHost(db);
   const [job] = await db.execute(sql`
     SELECT job.airfoil_id, job.engine_job_id, job.campaign_id, job.status, job."ingestedAt", job.ingest_lease_expires_at,
@@ -183,8 +204,11 @@ async function lockJobScope(
                 unit.lease_until == null ||
                 new Date(String(unit.lease_until)).getTime() > Date.now()
               : unit.lease_token != null || unit.lease_until != null)
-          : unit.outcome !== "running" ||
-            !["leased", "blocked"].includes(unit.state)),
+          : policy === "runtime"
+            ? !isRuntimeProgressActiveUnit(unit) &&
+              !isRuntimeProgressObsoleteUnit(unit)
+            : unit.outcome !== "running" ||
+              !["leased", "blocked"].includes(unit.state)),
     )
   )
     throw new ProgressiveCfdEvidenceScopeClosed(
@@ -423,6 +447,7 @@ export async function recordProgressiveCfdRuntimeProgress(
       connection,
       input.simJobId,
       input.engineJobId,
+      { policy: "runtime" },
     );
     if (!scope)
       throw new Error(
@@ -456,6 +481,7 @@ export async function recordProgressiveCfdRuntimeProgress(
           "Runtime budget observation differs from its immutable physical case allocation",
         );
       seen.add(observed.aoa_deg);
+      if (!isRuntimeProgressActiveUnit(unit)) continue;
       const observation = {
         job_id: input.engineJobId,
         observed_at: progress.observed_at,
