@@ -4,6 +4,7 @@ import type { DB } from "./client";
 import { effectiveProgressiveStageSql } from "./progressive-execution-policy";
 import {
   progressiveCfdOrdinaryAttemptCountSql,
+  progressiveCfdCompletionRetryAvailableSql,
   progressiveCfdPreciseVerificationAvailableSql,
 } from "./progressive-attempt-budget";
 import { acquireProgressiveAdmissionLock } from "./progressive-admission-lock";
@@ -226,6 +227,7 @@ export async function recoverTerminalProgressiveNoEvidenceGaps(
     )`;
     const attemptAvailable = sql`(
       ${ordinaryAttempts} < 2
+      OR ${progressiveCfdCompletionRetryAvailableSql()}
       OR ${publicationRecovery}
       OR (
         ${ordinaryAttempts} = 2

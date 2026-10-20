@@ -987,7 +987,11 @@ failures never establish an unsteady diagnosis. Omitted angles have no invented
 RANS evidence, and all replacement requests retain the original mesh settings.
 
 Compute policy `progressive-compute-v2` keeps fast work and ordinary retries limited
-to two submissions. Older sealed policies cannot acquire the new third submission.
+to two submissions. A current campaign may receive one additional,
+budget-bounded completion retry for a terminal no-evidence, non-informative
+fast, or unresolved precise cell. It applies only to those exact gap reasons,
+preserves all prior attempts, and never turns missing evidence into a success.
+Older sealed policies cannot acquire any other new submission.
 During precise
 work, an accepted preliminary URANS result from original-sweep recovery may
 authorize exactly one third submission for full URANS verification. That separate

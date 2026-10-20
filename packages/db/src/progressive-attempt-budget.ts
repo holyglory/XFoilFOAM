@@ -20,6 +20,28 @@ export function progressiveCfdOrdinaryAttemptCountSql(alias = "unit") {
   ) THEN 1 ELSE 0 END - ${progressiveCfdNeverStartedAttemptCountSql(alias)})`;
 }
 
+export function progressiveCfdCompletionRetryAvailableSql(
+  unitAlias = "unit",
+  workAlias = "work",
+) {
+  const unit = sql.identifier(unitAlias);
+  const work = sql.identifier(workAlias);
+  return sql`(
+    ${unit}.attempts = 2
+    AND ${unit}.active_seconds < ${unit}.active_budget_seconds
+    AND (
+      (${work}.stage = 2 AND ${unit}.error IN (
+        'terminal execution has no measured case evidence',
+        'fast pass has no informative accepted evidence'
+      ))
+      OR (${work}.stage = 3 AND ${unit}.error IN (
+        'terminal execution has no measured case evidence',
+        'precise evidence remains unresolved'
+      ))
+    )
+  )`;
+}
+
 export function progressiveCfdPreciseVerificationAvailableSql(
   alias = "unit",
   settlingAttemptAlias?: string,
