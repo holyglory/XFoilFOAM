@@ -60,7 +60,6 @@ try {
           WHERE running.unit_id = unit.id AND running.outcome = 'running')
       ORDER BY unit.id, raw."solvedAt" DESC NULLS LAST, raw.id
       LIMIT ${expectedCount}::int
-      FOR UPDATE OF unit, work SKIP LOCKED
     `);
     if (candidates.length !== expectedCount)
       throw new Error(
