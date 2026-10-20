@@ -232,6 +232,13 @@ export async function observeProgressiveRemoteJob(
         );
       result = await engine.getResult(executionId, route);
     }
+    if (status.state === "cancelled" && result?.state === "running") {
+      result = {
+        ...result,
+        state: "cancelled",
+        message: status.message ?? result.message ?? "Remote execution stopped",
+      };
+    }
   }
   const receipt = await enqueueProgressiveWorkerReport(db, {
     executionId,
