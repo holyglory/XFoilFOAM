@@ -6,6 +6,7 @@ import { resolveProgressiveRemoteEvidence } from "./progressive-remote-evidence"
 import type { ProgressiveRemoteEvidenceDelivery } from "./progressive-remote-evidence-receipts";
 import {
   isFinalProgressiveRemoteReport,
+  progressiveReportedPointSources,
   validateProgressiveRemoteReport,
 } from "./progressive-remote-report";
 import type { ProgressiveRemoteExecutionEnvelope } from "./progressive-remote-execution";
@@ -27,6 +28,25 @@ export function terminalReportHasNoPhysicalEvidence(
         (!attempt.evidence_artifacts || attempt.evidence_artifacts.length === 0) &&
         (attempt.failure_disposition != null || attempt.error != null),
     )
+  );
+}
+
+export function terminalReportNoPhysicalEvidenceSignatures(
+  report: ProgressiveRemoteReport,
+) {
+  if (!report.result || !["failed", "cancelled"].includes(report.result.state))
+    return new Set<string>();
+  return new Set(
+    progressiveReportedPointSources(report.result)
+      .filter(({ point }) => {
+        const coefficients = [point.cl, point.cd, point.cm];
+        return (
+          coefficients.every((value) => value == null) &&
+          (!point.evidence_artifacts || point.evidence_artifacts.length === 0) &&
+          (point.failure_disposition != null || point.error != null)
+        );
+      })
+      .map((source) => source.contentSignature),
   );
 }
 
@@ -76,8 +96,11 @@ export async function readProgressiveRemoteRetention(
     throw new Error(
       "Remote retention exceeds the bounded source-attempt inventory",
     );
+  const terminalNoEvidence = terminalReportNoPhysicalEvidenceSignatures(report);
   const missingEvidence = sources.filter(
-    (source) => source.result_attempt_id == null,
+    (source) =>
+      source.result_attempt_id == null &&
+      !terminalNoEvidence.has(String(source.point_content_signature)),
   ).length;
   if (missingEvidence && terminalReportHasNoPhysicalEvidence(report))
     return { kind: "retained" as const, report, sources: [] };
@@ -96,6 +119,11 @@ export async function readProgressiveRemoteRetention(
   }> = [];
   let pendingArchives = 0;
   for (const source of sources) {
+    if (
+      source.result_attempt_id == null &&
+      terminalNoEvidence.has(String(source.point_content_signature))
+    )
+      continue;
     if (
       source.storage_only !== true &&
       (!source.evidence_signature ||

@@ -5,7 +5,10 @@ import type { ProgressiveExecutionScope } from "../../engine-client/src/progress
 import type { PolarRequest } from "../../engine-client/src/types";
 import { sealProgressiveRemoteExecution } from "../src/progressive-remote-execution";
 import { progressiveRemoteReportInventory } from "../src/progressive-remote-inventory";
-import { terminalReportHasNoPhysicalEvidence } from "../src/progressive-remote-retention";
+import {
+  terminalReportHasNoPhysicalEvidence,
+  terminalReportNoPhysicalEvidenceSignatures,
+} from "../src/progressive-remote-retention";
 import { analysisContentHash } from "../src/analysis-target";
 import {
   isFinalProgressiveRemoteReport,
@@ -136,6 +139,31 @@ it("recognizes terminal infrastructure reports with no physical evidence", () =>
   input.report.result!.polars[0].attempts![0].evidence_artifacts = [
     { kind: "log" },
   ];
+  expect(terminalReportHasNoPhysicalEvidence(input.report)).toBe(false);
+});
+
+it("classifies only artifact-free failed points in a mixed terminal report", () => {
+  const input = fixture();
+  input.report.status.state = "failed";
+  input.report.result!.state = "failed";
+  input.report.result!.polars[0].attempts![0].evidence_artifacts = [
+    { kind: "log" },
+  ];
+  const failedPoint = {
+    ...input.report.result!.polars[0].attempts![0],
+    aoa_deg: 5,
+    cl: null,
+    cd: null,
+    cm: null,
+    error: "HardSolverError: SIGFPE",
+    failure_disposition: "hard_solver" as const,
+    evidence_artifacts: [],
+  };
+  input.report.result!.polars[0].attempts = [
+    input.report.result!.polars[0].attempts![0],
+    failedPoint,
+  ];
+  expect(terminalReportNoPhysicalEvidenceSignatures(input.report).size).toBe(1);
   expect(terminalReportHasNoPhysicalEvidence(input.report)).toBe(false);
 });
 
