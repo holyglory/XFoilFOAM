@@ -196,7 +196,15 @@ export function buildPolarRequest(opts: {
         ? { flow_solver_family: setup.solver.flowSolverFamily }
         : {}),
       ...(compressible
-        ? { turbulent_prandtl: setup.solver.turbulentPrandtl }
+        ? {
+            turbulent_prandtl: setup.solver.turbulentPrandtl,
+            ...(setup.solver.compressibleFarfieldBoundary
+              ? {
+                  compressible_farfield_boundary:
+                    setup.solver.compressibleFarfieldBoundary,
+                }
+              : {}),
+          }
         : {}),
       turbulence: {
         model: setup.solver.turbulenceModel as TurbulenceModelName,

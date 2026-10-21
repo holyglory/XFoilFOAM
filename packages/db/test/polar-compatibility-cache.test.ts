@@ -309,23 +309,24 @@ describe("physics compatibility hash contract", () => {
       targetYPlus: 40,
     });
     const density = { ...snapshot, derived: { ...snapshot.derived, mach: 2 } };
-    expect(progressiveRecipes(density, 0.2)).toEqual(
-      progressiveRecipes(density, 4.9),
-    );
-    expect(progressiveRecipes(density, 0.2).precise).toMatchObject({
-      recipe_id: "openfoam-precise-v1",
-      mesh: { targetYPlus: 1 },
+    expect(progressiveRecipes(density, 0.2).fast).toMatchObject({
+      compressibleFarfieldBoundary: "density_static_freestream",
+      recipe_id: "openfoam-fast-wall-v2",
+      mesh: { targetYPlus: 40 },
     });
-    expect(progressiveRecipes(density, 0.2).precise).not.toHaveProperty(
-      "wallSpacing",
-    );
+    expect(progressiveRecipes(density, 0.2).precise).toMatchObject({
+      compressibleFarfieldBoundary: "density_static_freestream",
+      recipe_id: "openfoam-precise-wall-v2",
+      mesh: { targetYPlus: 40 },
+    });
     const thresholdDensity = {
       ...snapshot,
       derived: { ...snapshot.derived, mach: 1.2 },
     };
-    expect(progressiveRecipes(thresholdDensity, 0.2).precise.mesh).toMatchObject(
-      { targetYPlus: 1 },
-    );
+    expect(progressiveRecipes(thresholdDensity, 0.2).precise).toMatchObject({
+      compressibleFarfieldBoundary: "density_static_freestream",
+      mesh: { targetYPlus: 40 },
+    });
   });
   it("preserves legacy hashes for absent initialization and separates explicit limits", () => {
     const withLimit = (iterations: number | null | undefined) => ({
@@ -340,23 +341,21 @@ describe("physics compatibility hash contract", () => {
       physicsHashForSnapshot(withLimit(1200)),
     );
   });
-  it("keeps local pseudo-time numerics distinct without altering the precise recipe", () => {
+  it("routes high-Mach progressive work through the pressure density recipe", () => {
     const density = structuredClone(snapshot);
     density.derived.mach = 3;
-    density.solver.flowSolverFamily = "rhoCentralFoam";
     const original = structuredClone(density);
     const recipes = progressiveRecipes(density);
     expect(recipes.fast).toMatchObject({
-      recipe_id: "openfoam-fast-density-local-v1",
-      timeCoordinate: "local_pseudo_time_iterations",
-      mesh: { targetYPlus: 40 },
-      solver: { nIterations: 5000, momentumScheme: "upwind" },
+      compressibleFarfieldBoundary: "density_static_freestream",
     });
-    expect(recipes.precise).not.toHaveProperty("timeCoordinate");
+    expect(recipes.fast).not.toHaveProperty("timeCoordinate");
+    expect(recipes.precise).toMatchObject({
+      compressibleFarfieldBoundary: "density_static_freestream",
+    });
     expect(density).toEqual(original);
     const physicalTimeHash = physicsHashForSnapshot(density);
-    density.solver.timeCoordinate = "local_pseudo_time_iterations";
-    expect(physicsHashForSnapshot(density)).not.toBe(physicalTimeHash);
+    expect(physicsHashForSnapshot(density)).toBe(physicalTimeHash);
   });
   it("normalizes the legacy local-step default but separates new numerical values", () => {
     const legacy = physicsHashForSnapshot(snapshot);
@@ -377,8 +376,7 @@ describe("physics compatibility hash contract", () => {
     const original = structuredClone(configured);
     const recipes = progressiveRecipes(configured);
     expect(recipes.fast).toMatchObject({
-      recipe_id: "openfoam-fast-density-local-v2",
-      solver: { localTimeStepSmoothing: 0.2 },
+      compressibleFarfieldBoundary: "density_static_freestream",
     });
     expect(recipes.precise.solver).not.toHaveProperty("localTimeStepSmoothing");
     configured.derived.mach = 0.2;

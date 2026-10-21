@@ -74,8 +74,8 @@ export function selectProgressiveSolver(input: {
     );
   if (input.mach >= PROGRESSIVE_COMPUTE_POLICY.densityBasedMachThreshold)
     return {
-      solver: "rhoCentralFoam",
-      reason: "supersonic_density_based",
+      solver: "rhoPimpleFoam",
+      reason: "supersonic_pressure_density_farfield",
       pressureKind: "absolute",
     };
   const localSonicMargin =

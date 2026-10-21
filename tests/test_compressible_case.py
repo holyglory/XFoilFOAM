@@ -230,6 +230,29 @@ def test_subsonic_and_sonic_pressure_cases_retain_open_farfield(tmp_path, gas, s
     assert "freestreamPressure" in (tmp_path / "0/p").read_text()
 
 
+def test_density_aware_pressure_farfield_is_explicit_for_high_mach(tmp_path, gas, state):
+    case = builder(
+        gas,
+        state,
+        "rhoPimpleFoam",
+        3,
+        time_window=window(),
+        solver=SolverParams(
+            force_transient=True,
+            compressible_farfield_boundary="density_static_freestream",
+        ),
+    )
+    case.write(tmp_path)
+    velocity = " ".join((tmp_path / "0/U").read_text().split())
+    pressure = " ".join((tmp_path / "0/p").read_text().split())
+    identity = json.loads((tmp_path / "constant/numericalExecution.json").read_text())
+    assert "inlet { type fixedValue;" in velocity
+    assert "outlet { type zeroGradient;" in velocity
+    assert "inlet { type fixedValue;" in pressure
+    assert "outlet { type zeroGradient;" in pressure
+    assert identity["compressible_farfield_boundary"] == "density_static_freestream"
+
+
 @pytest.mark.parametrize("family,mach", [("rhoPimpleFoam", 0.8), ("rhoPimpleFoam", 3), ("rhoCentralFoam", 2), ("rhoCentralFoam", 3)])
 def test_transient_gas_cases_use_real_physical_time_and_shock_schemes(tmp_path, gas, state, family, mach):
     case = builder(gas, state, family, mach, time_window=window())

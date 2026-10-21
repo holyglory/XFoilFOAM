@@ -408,7 +408,7 @@ ALL_IMAGE_FIELDS: tuple[ImageField, ...] = tuple(ImageField)
 
 class SolverParams(BaseModel):
     flow_solver_family: Optional[Literal["simpleFoam", "pimpleFoam", "rhoSimpleFoam", "rhoPimpleFoam", "rhoCentralFoam"]] = None
-    compressible_farfield_boundary: Literal["static_freestream", "total_inlet_static_outlet"] = Field(
+    compressible_farfield_boundary: Literal["static_freestream", "density_static_freestream", "total_inlet_static_outlet"] = Field(
         default="static_freestream",
         description="Farfield contract for pressure-based compressible cases. The total-inlet recipe derives total values from the configured static operating state.",
     )
@@ -889,8 +889,10 @@ class PolarRequest(BaseModel):
             raise ValueError(
                 "quiescent_initial_velocity requires a versioned compressible rhoPimpleFoam force-transient request"
             )
-        if self.solver.compressible_farfield_boundary != "static_freestream" and family != "rhoSimpleFoam":
+        if self.solver.compressible_farfield_boundary == "total_inlet_static_outlet" and family != "rhoSimpleFoam":
             raise ValueError("The total-inlet static-outlet farfield recipe requires steady rhoSimpleFoam")
+        if self.solver.compressible_farfield_boundary == "density_static_freestream" and family != "rhoPimpleFoam":
+            raise ValueError("The density-aware farfield recipe requires transient rhoPimpleFoam")
         if self.solver.compressible_startup != "potential" and family != "rhoSimpleFoam":
             raise ValueError("Alternative compressible startup recipes require rhoSimpleFoam")
         if self.solver.compressible_energy_form != "sensibleInternalEnergy" and not compressible:

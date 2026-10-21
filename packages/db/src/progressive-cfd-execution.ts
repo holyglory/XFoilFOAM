@@ -207,6 +207,12 @@ export async function materializeProgressiveCfdExecution(
       | ProgressiveTimeCoordinate
       | undefined;
     const turbulentPrandtl = lease.recipe.turbulentPrandtl;
+    const compressibleFarfieldBoundary = lease.recipe
+      .compressibleFarfieldBoundary as
+      | "static_freestream"
+      | "density_static_freestream"
+      | "total_inlet_static_outlet"
+      | undefined;
     if (
       !mesh ||
       !solver ||
@@ -363,6 +369,9 @@ export async function materializeProgressiveCfdExecution(
         ...(timeCoordinate ? { timeCoordinate } : {}),
         ...(family.startsWith("rho")
           ? { turbulentPrandtl: turbulentPrandtl as number }
+          : {}),
+        ...(compressibleFarfieldBoundary
+          ? { compressibleFarfieldBoundary }
           : {}),
       },
     };

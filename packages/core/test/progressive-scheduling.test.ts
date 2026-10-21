@@ -73,7 +73,7 @@ describe("progressive solver routing", () => {
     );
     for (const mach of [1.2, 2, 3])
       expect(selectProgressiveSolver({ ...steady, mach }).solver).toBe(
-        "rhoCentralFoam",
+        "rhoPimpleFoam",
       );
     for (const mach of [-1, 3.001, NaN, Infinity])
       expect(() => selectProgressiveSolver({ ...steady, mach })).toThrow();

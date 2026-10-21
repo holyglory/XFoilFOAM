@@ -86,6 +86,7 @@ class CompressibleCaseBuilder(CaseBuilder):
     def _write_numerical_execution(self) -> None:
         self._p("constant", "numericalExecution.json").write_text(json.dumps({
             "version": 1, "solver_family": self.solver_family,
+            "compressible_farfield_boundary": self.solver.compressible_farfield_boundary,
             "time_coordinate": "local_pseudo_time_iterations" if self.local_steady else "steady_iterations" if self.solver_family == "rhoSimpleFoam" else "physical_time_seconds",
             "physical_time_history": self.solver_family != "rhoSimpleFoam" and not self.local_steady,
             **({"local_time_step_smoothing": self.local_time_step_smoothing} if self.local_steady else {}),
@@ -207,7 +208,10 @@ class CompressibleCaseBuilder(CaseBuilder):
         velocity = f"uniform {vector(freestream.ux, freestream.uy, freestream.uz)}"
         pressure = f"uniform {self.state.pressure_pa:.12g}"
         temperature = f"uniform {self.state.temperature_k:.12g}"
-        supersonic = self.solver_family == "rhoCentralFoam"
+        supersonic = (
+            self.solver_family == "rhoCentralFoam"
+            or self.solver.compressible_farfield_boundary == "density_static_freestream"
+        )
         self._write_field("U", "volVectorField", dimensions(0, 1, -1, 0, 0, 0, 0), velocity, {
             self.inlet: {"type": "fixedValue" if supersonic else "freestreamVelocity", "value": Raw(velocity), **({} if supersonic else {"freestreamValue": Raw(velocity)})},
             self.outlet: {"type": "zeroGradient"} if supersonic else {"type": "freestreamVelocity", "freestreamValue": Raw(velocity), "value": Raw(velocity)},

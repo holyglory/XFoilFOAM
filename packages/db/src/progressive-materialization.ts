@@ -46,7 +46,8 @@ export function progressiveRecipes(
     transition: "fully_turbulent",
     validation: "unvalidated",
   };
-  const localDensity =
+  const localDensity = false;
+  const densityFarfield =
     snapshot.derived.mach !== null &&
     snapshot.derived.mach >=
       PROGRESSIVE_COMPUTE_POLICY.densityBasedMachThreshold;
@@ -64,6 +65,9 @@ export function progressiveRecipes(
     },
     fast: {
       ...common,
+      ...(densityFarfield
+        ? { compressibleFarfieldBoundary: "density_static_freestream" }
+        : {}),
       recipe_id: localDensity
         ? localTimeStepSmoothing != null && localTimeStepSmoothing !== 0.02
           ? "openfoam-fast-density-local-v2"
@@ -103,6 +107,9 @@ export function progressiveRecipes(
     },
     precise: {
       ...common,
+      ...(densityFarfield
+        ? { compressibleFarfieldBoundary: "density_static_freestream" }
+        : {}),
       recipe_id:
         !localDensity && usesWallFunction
           ? "openfoam-precise-wall-v2"

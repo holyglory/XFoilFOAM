@@ -111,6 +111,10 @@ export interface SimulationSetupSnapshot {
     flowSolverFamily?: ProgressiveSolverFamily;
     timeCoordinate?: import("@aerodb/core").ProgressiveTimeCoordinate;
     turbulentPrandtl?: number;
+    compressibleFarfieldBoundary?:
+      | "static_freestream"
+      | "density_static_freestream"
+      | "total_inlet_static_outlet";
   };
   scheduling: Omit<
     InferSelectModel<typeof schedulingProfiles>,
