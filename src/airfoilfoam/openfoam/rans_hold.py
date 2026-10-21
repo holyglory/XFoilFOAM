@@ -77,7 +77,7 @@ def complete_rans_hold(directory, result, runner, parameters, spec, n_proc, time
     if not isinstance(runner, BudgetedRunner):
         return result
     family = dialect_for_runner(runner).steady_solver_command
-    if (family not in {"simpleFoam", "rhoSimpleFoam"}
+    if (family not in {"simpleFoam", "rhoSimpleFoam", "xfoilfoamRhoSimpleFoam"}
             or parameters.force_transient or not result.ok or not parse_convergence(result.stdout).converged):
         return result
     directory = Path(directory)

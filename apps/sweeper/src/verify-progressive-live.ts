@@ -370,9 +370,18 @@ const retainNativeEngineEvidence = async (options: {
   const retainedJobs: RetainedNativeJob[] = [];
   let artifactOrdinal = 0;
 
-  const canonicalFilePath = (jobId: string, value: string): string => {
+  const canonicalFilePath = (
+    jobId: string,
+    value: string,
+    caseSlug: string | null,
+  ): string => {
+    const raw = String(value);
+    const reference =
+      raw.startsWith("/") || raw.includes("://")
+        ? raw
+        : `cases/${caseSlug ?? assert.fail("Native point is missing its case slug")}/${raw}`;
     const base = new URL(options.engine.fileUrl(jobId, ""));
-    const url = new URL(value, base);
+    const url = new URL(reference, base);
     assert.equal(url.origin, base.origin);
     assert(url.pathname.startsWith(base.pathname));
     const path = url.pathname.slice(base.pathname.length);
@@ -500,7 +509,11 @@ const retainNativeEngineEvidence = async (options: {
             },
           };
           for (const artifact of point.evidence_artifacts ?? []) {
-            const originalPath = canonicalFilePath(jobId, artifact.path);
+            const originalPath = canonicalFilePath(
+              jobId,
+              artifact.url ?? artifact.path,
+              point.case_slug ?? null,
+            );
             await storeArtifact({
               jobId,
               sourceType: "evidence_artifact",
@@ -519,7 +532,11 @@ const retainNativeEngineEvidence = async (options: {
             });
           }
           for (const [field, path] of Object.entries(point.images ?? {})) {
-            const originalPath = canonicalFilePath(jobId, path);
+            const originalPath = canonicalFilePath(
+              jobId,
+              path,
+              point.case_slug ?? null,
+            );
             await storeArtifact({
               jobId,
               sourceType: "image",

@@ -116,6 +116,23 @@ def test_gas_state_and_transport_are_consistent(gas, state):
         pressure_coefficient(state.pressure_pa, state, gas.density(state), 0)
 
 
+def test_enthalpy_recipe_changes_only_the_compressible_energy_contract(tmp_path, gas, state):
+    case = builder(gas, state, solver=SolverParams(compressible_energy_form="sensibleEnthalpy"))
+    case.write(tmp_path)
+    thermo = (tmp_path / "constant/thermophysicalProperties").read_text()
+    schemes = (tmp_path / "system/fvSchemes").read_text()
+    solution = (tmp_path / "system/fvSolution").read_text()
+    assert "energy          sensibleEnthalpy;" in thermo
+    assert "div(phi,h)" in schemes and "div(phi,e)" not in schemes
+    assert "h               1e-05;" in solution and "e               1e-05;" not in solution
+
+
+def test_consistent_pressure_recipe_is_explicit(tmp_path, gas, state):
+    case = builder(gas, state, solver=SolverParams(compressible_pressure_consistent=True))
+    case.write(tmp_path)
+    assert "consistent      yes;" in (tmp_path / "system/fvSolution").read_text()
+
+
 def test_sutherland_preserves_reference_and_explicit_conductivity_contract(gas):
     model = GasThermodynamics(**{**gas.model_dump(), "transport_model": "sutherland", "sutherland_temperature_k": 110.4, "prandtl": None})
     assert model.dynamic_viscosity(model.reference_temperature_k) == pytest.approx(model.reference_dynamic_viscosity)
@@ -146,6 +163,7 @@ def test_explicit_nasa7_case_writes_the_supplied_caloric_model(tmp_path, gas, st
     assert "sensibleInternalEnergy" in thermo
 
 
+
 def test_compressible_pressure_energy_and_force_normalization(tmp_path, gas, state):
     case = builder(gas, state)
     case.write(tmp_path)
@@ -170,6 +188,39 @@ def test_compressible_pressure_energy_and_force_normalization(tmp_path, gas, sta
     assert "p { solver GAMG;" in solution
     assert "transonic no;" in solution
     assert "U 0.3;" in solution
+
+
+def test_pressure_first_energy_order_selects_the_governed_solver(tmp_path, gas, state):
+    case = builder(gas, state, solver=SolverParams(compressible_pressure_energy_order="pressure_first"))
+    case.write(tmp_path)
+    control = " ".join((tmp_path / "system/controlDict").read_text().split())
+    identity = json.loads((tmp_path / "constant/numericalExecution.json").read_text())
+    assert "application xfoilfoamRhoSimpleFoam;" in control
+    assert identity["compressible_pressure_energy_order"] == "pressure_first"
+
+
+def test_total_inlet_static_outlet_farfield_preserves_reference_state(tmp_path, gas, state):
+    case = builder(gas, state, solver=SolverParams(compressible_farfield_boundary="total_inlet_static_outlet"))
+    case.write(tmp_path)
+    pressure = (tmp_path / "0/p").read_text()
+    temperature = (tmp_path / "0/T").read_text()
+    normalized_pressure = " ".join(pressure.split())
+    normalized_temperature = " ".join(temperature.split())
+    identity = json.loads((tmp_path / "constant/numericalExecution.json").read_text())
+    gamma = gas.gamma_at(state.temperature_k)
+    mach = case.spec.speed / gas.speed_of_sound(state)
+    ratio = 1 + 0.5 * (gamma - 1) * mach * mach
+    total_pressure = state.pressure_pa * ratio ** (gamma / (gamma - 1))
+    total_temperature = state.temperature_k * ratio
+    assert "type totalPressure;" in normalized_pressure
+    assert f"p0 uniform {total_pressure:.12g};" in normalized_pressure
+    assert "psi thermo:psi;" in normalized_pressure and f"gamma {gamma};" in normalized_pressure
+    assert "outlet { type freestreamPressure;" in normalized_pressure
+    assert "type inletOutletTotalTemperature;" in normalized_temperature
+    assert f"T0 uniform {total_temperature:.12g};" in normalized_temperature
+    assert identity["compressible_farfield_boundary"] == "total_inlet_static_outlet"
+    assert identity["farfield_reference"]["static_pressure_pa"] == state.pressure_pa
+    assert identity["farfield_reference"]["static_temperature_k"] == state.temperature_k
 
 
 @pytest.mark.parametrize("mach", [0.72, 0.9, 1])

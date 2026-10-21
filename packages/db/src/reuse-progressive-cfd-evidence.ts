@@ -1,12 +1,15 @@
 import { createClient } from "./client";
+import { initializeProgressiveCfdWork } from "./progressive-cfd";
 import { reuseAcceptedProgressiveCfdEvidence } from "./progressive-recipe-adoption";
+import { MAX_PROGRESSIVE_CFD_REUSE_UNITS } from "./progressive-cfd-reuse";
 import { sql as drizzleSql } from "drizzle-orm";
 
 const [campaignId, mode = "--dry-run"] = process.argv.slice(2);
 if (
   !campaignId ||
+  !/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(campaignId) ||
   !["--dry-run", "--apply"].includes(mode) ||
-  process.argv.length > 4
+  process.argv.slice(2).length > 2
 )
   throw new Error(
     "Usage: reuse-progressive-cfd-evidence CAMPAIGN_UUID [--dry-run|--apply]",
@@ -15,7 +18,12 @@ if (
 const { db, sql } = createClient({ max: 1 });
 const rollback = new Error("reviewed dry-run rollback");
 let result:
-  | { generationId: string; previousGenerationIds: string[]; reused: number }
+  | {
+      generationId: string;
+      previousGenerationIds: string[];
+      reused: number;
+      limit: number;
+    }
   | undefined;
 try {
   await db
@@ -36,13 +44,24 @@ try {
       const previousGenerationIds = (
         adoption.previous_generation_ids as unknown[]
       ).map(String);
-      const reused = await reuseAcceptedProgressiveCfdEvidence(
-        connection,
+      await initializeProgressiveCfdWork(connection, campaignId);
+      let reused = 0;
+      for (let pass = 0; pass < 256; pass += 1) {
+        const batch = await reuseAcceptedProgressiveCfdEvidence(
+          connection,
+          generationId,
+          previousGenerationIds,
+          String(epoch.id),
+        );
+        reused += batch;
+        if (batch === 0) break;
+      }
+      result = {
         generationId,
         previousGenerationIds,
-        String(epoch.id),
-      );
-      result = { generationId, previousGenerationIds, reused };
+        reused,
+        limit: MAX_PROGRESSIVE_CFD_REUSE_UNITS,
+      };
       if (mode === "--dry-run") throw rollback;
     })
     .catch((error) => {

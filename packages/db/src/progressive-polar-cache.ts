@@ -216,6 +216,23 @@ export async function claimProgressivePolarFit(
         }
         WHERE generation.epoch_id=${epoch.id}
           ${input.currentCampaignEvidenceOnly ? sql`AND generation.status<>'cancelled'` : sql``}
+        UNION
+        SELECT DISTINCT successor_work.target_id
+        FROM progressive_cfd_evidence_reuses reuse
+        JOIN progressive_cfd_units successor ON successor.id=reuse.successor_unit_id
+        JOIN progressive_work successor_work ON successor_work.id=successor.work_id
+        JOIN progressive_generations successor_generation
+          ON successor_generation.id=successor_work.generation_id
+        JOIN sim_campaigns successor_campaign
+          ON successor_campaign.id=successor_generation.campaign_id
+        WHERE successor_generation.epoch_id=${epoch.id}
+          AND successor_generation.status<>'cancelled'
+          ${
+            input.currentCampaignEvidenceOnly
+              ? sql`AND successor_campaign.current_plan_revision_id=successor_generation.plan_revision_id
+            AND successor_campaign.status IN ('active','attention','paused','completed')`
+              : sql``
+          }
       )`
           : sql``
       }

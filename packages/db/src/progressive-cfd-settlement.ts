@@ -633,3 +633,508 @@ export async function recoverOperatorVerifiedStaleRemoteDispatches(
   }
   return { recoveredJobs, settledUnits };
 }
+
+const STALE_REMOTE_DISPATCH_RECOVERY_KEY =
+  "progressiveStaleRemoteDispatchRecovery";
+const STALE_REMOTE_DISPATCH_RECOVERY_KIND =
+  "stale_remote_dispatch_recovery_v1";
+const MAX_STALE_REMOTE_DISPATCH_RECOVERY_COUNT = 256;
+const UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+export type StaleRemoteDispatchRecoveryPair = {
+  jobId: string;
+  promiseId: string;
+};
+
+type StaleRemoteDispatchRecoveryMarker = {
+  version: 1;
+  kind: typeof STALE_REMOTE_DISPATCH_RECOVERY_KIND;
+  batchId: string;
+  expectedCount: number;
+  operator: string;
+  crossHostAbsenceConfirmed: true;
+  dispatches: StaleRemoteDispatchRecoveryPair[];
+  markedAt: string;
+  recoveredAt?: string;
+  disposition?: string;
+};
+
+function validateStaleRemoteDispatchRecoveryInput(input: {
+  dispatches: readonly StaleRemoteDispatchRecoveryPair[];
+  expectedCount: number;
+  operator: string;
+  crossHostAbsenceConfirmed: boolean;
+}) {
+  if (
+    !Number.isSafeInteger(input.expectedCount) ||
+    input.expectedCount < 1 ||
+    input.expectedCount > MAX_STALE_REMOTE_DISPATCH_RECOVERY_COUNT ||
+    input.dispatches.length !== input.expectedCount ||
+    new Set(input.dispatches.map((dispatch) => dispatch.jobId)).size !==
+      input.expectedCount ||
+    new Set(input.dispatches.map((dispatch) => dispatch.promiseId)).size !==
+      input.expectedCount ||
+    input.dispatches.some(
+      (dispatch) =>
+        !UUID_RE.test(dispatch.jobId) || !UUID_RE.test(dispatch.promiseId),
+    )
+  )
+    throw new Error(
+      "Stale remote recovery requires an exact bounded job/promise list and expected count",
+    );
+  if (!input.operator.trim())
+    throw new Error("Stale remote recovery requires an operator identity");
+  if (input.crossHostAbsenceConfirmed !== true)
+    throw new Error(
+      "Stale remote recovery requires an explicit cross-host absence confirmation",
+    );
+}
+
+function parseStaleRemoteDispatchRecoveryMarker(
+  value: unknown,
+): StaleRemoteDispatchRecoveryMarker | null {
+  if (!value || typeof value !== "object") return null;
+  const candidate = value as Partial<StaleRemoteDispatchRecoveryMarker>;
+  const expectedCount = candidate.expectedCount;
+  if (
+    candidate.version !== 1 ||
+    candidate.kind !== STALE_REMOTE_DISPATCH_RECOVERY_KIND ||
+    typeof candidate.batchId !== "string" ||
+    !UUID_RE.test(candidate.batchId) ||
+    typeof expectedCount !== "number" ||
+    !Number.isSafeInteger(expectedCount) ||
+    expectedCount < 1 ||
+    expectedCount > MAX_STALE_REMOTE_DISPATCH_RECOVERY_COUNT ||
+    typeof candidate.operator !== "string" ||
+    candidate.crossHostAbsenceConfirmed !== true ||
+    !Array.isArray(candidate.dispatches) ||
+    candidate.dispatches.length !== expectedCount ||
+    candidate.dispatches.some(
+      (dispatch) =>
+        !dispatch ||
+        typeof dispatch !== "object" ||
+        typeof (dispatch as StaleRemoteDispatchRecoveryPair).jobId !== "string" ||
+        typeof (dispatch as StaleRemoteDispatchRecoveryPair).promiseId !==
+          "string" ||
+        !UUID_RE.test((dispatch as StaleRemoteDispatchRecoveryPair).jobId) ||
+        !UUID_RE.test((dispatch as StaleRemoteDispatchRecoveryPair).promiseId),
+    )
+  )
+    return null;
+  return candidate as StaleRemoteDispatchRecoveryMarker;
+}
+
+async function selectGuardedStaleRemoteDispatch(
+  db: DB,
+  dispatch: StaleRemoteDispatchRecoveryPair,
+  batchId?: string,
+) {
+  const batchFilter =
+    batchId == null
+      ? sql``
+      : sql`AND promise.response_payload#>>'{progressiveStaleRemoteDispatchRecovery,batchId}' = ${batchId}`;
+  return db.execute(sql`
+    SELECT dispatch.sim_job_id, dispatch.promise_id, dispatch.solver_id,
+      promise.status AS promise_status, promise.response_payload,
+      job.campaign_id, job.status AS job_status, job.engine_job_id, job.engine_state,
+      job.request_payload,
+      attempt.token, attempt.outcome, attempt.active_seconds AS attempt_active_seconds,
+      unit.id AS unit_id, unit.state AS unit_state, unit.lease_token,
+      unit.active_seconds AS unit_active_seconds,
+      generation.id AS generation_id, generation.epoch_id,
+      generation.campaign_id AS generation_campaign_id,
+      generation.plan_revision_id AS generation_plan_revision_id,
+      generation.status AS generation_status, generation.stage,
+      epoch.current AS epoch_current, campaign.status AS campaign_status,
+      campaign.current_plan_revision_id,
+      work.id AS work_id, work.target_id, work.stage AS work_stage,
+      attempt_counts.total_attempts, attempt_counts.running_attempts
+    FROM progressive_remote_dispatches dispatch
+    JOIN sync_sweep_promises promise ON promise.id = dispatch.promise_id
+    JOIN sim_jobs job ON job.id = dispatch.sim_job_id
+    CROSS JOIN LATERAL (
+      SELECT count(*)::integer AS total_attempts,
+        count(*) FILTER (WHERE candidate.outcome = 'running')::integer AS running_attempts
+      FROM progressive_cfd_attempts candidate
+      WHERE candidate.sim_job_id = job.id
+    ) attempt_counts
+    JOIN progressive_cfd_attempts attempt ON attempt.sim_job_id = job.id
+    JOIN progressive_cfd_units unit ON unit.id = attempt.unit_id
+    JOIN progressive_work work ON work.id = unit.work_id
+    JOIN progressive_generations generation ON generation.id = work.generation_id
+    JOIN calculation_epochs epoch ON epoch.id = generation.epoch_id
+    JOIN sim_campaigns campaign ON campaign.id = generation.campaign_id
+    WHERE dispatch.sim_job_id = ${dispatch.jobId}::uuid
+      AND dispatch.promise_id = ${dispatch.promiseId}::uuid
+      AND promise.registered_solver_id = dispatch.solver_id
+      AND promise.status IN ('expired', 'cancelled')
+      AND job.status = 'pending'
+      AND job.engine_job_id IS NULL
+      AND job.engine_state IS NULL
+      AND job.request_payload->'progressive'->>'generationId' = generation.id::text
+      AND job.request_payload->'progressive'->>'epochId' = generation.epoch_id::text
+      AND job.request_payload->'progressive'->>'targetId' = work.target_id
+      AND job.request_payload->'progressive'->>'stage' = work.stage::text
+      AND job.request_payload->'progressive'->>'recipeId' = attempt.execution_recipe_id
+      AND jsonb_typeof(job.request_payload->'progressive'->'tokens') = 'array'
+      AND EXISTS (
+        SELECT 1
+        FROM jsonb_array_elements_text(job.request_payload->'progressive'->'tokens') token_value
+        WHERE token_value = attempt.token::text
+      )
+      AND generation.status = 'active'
+      AND epoch.current
+      AND generation.plan_revision_id = campaign.current_plan_revision_id
+      AND campaign.status IN ('active', 'attention', 'paused')
+      AND work.state = 'pending'
+      AND unit.state = 'leased'
+      AND unit.lease_token = attempt.token
+      AND attempt.active_seconds = 0
+      AND unit.active_seconds = 0
+      AND attempt_counts.total_attempts > 0
+      AND NOT EXISTS (SELECT 1 FROM progressive_remote_reports report
+        WHERE report.sim_job_id = job.id)
+      AND NOT EXISTS (SELECT 1 FROM progressive_remote_progress_receipts receipt
+        WHERE receipt.sim_job_id = job.id)
+      AND NOT EXISTS (SELECT 1 FROM progressive_remote_report_inventories inventory
+        WHERE inventory.sim_job_id = job.id)
+      AND NOT EXISTS (SELECT 1 FROM progressive_remote_report_sources source
+        WHERE source.sim_job_id = job.id)
+      AND NOT EXISTS (SELECT 1 FROM progressive_remote_evidence_receipts evidence
+        WHERE evidence.sim_job_id = job.id)
+      AND NOT EXISTS (
+        SELECT 1 FROM progressive_cfd_evidence evidence
+        JOIN progressive_cfd_attempts evidence_attempt
+          ON evidence_attempt.token = evidence.attempt_token
+        WHERE evidence_attempt.sim_job_id = job.id)
+      AND NOT EXISTS (
+        SELECT 1 FROM progressive_cfd_runtime_progress runtime
+        JOIN progressive_cfd_attempts runtime_attempt
+          ON runtime_attempt.token = runtime.attempt_token
+        WHERE runtime_attempt.sim_job_id = job.id)
+      AND NOT EXISTS (SELECT 1 FROM result_attempts raw
+        WHERE raw.sim_job_id = job.id)
+      AND NOT EXISTS (SELECT 1 FROM results result
+        WHERE result.sim_job_id = job.id)
+      AND NOT EXISTS (SELECT 1 FROM progressive_worker_reports worker_report
+        WHERE worker_report.sim_job_id = job.id)
+      AND NOT EXISTS (SELECT 1 FROM progressive_cfd_execution_stops stopped
+        WHERE stopped.sim_job_id = job.id)
+      ${batchFilter}
+    FOR UPDATE OF promise, job, campaign, generation, work, unit, attempt
+  `);
+}
+
+function dispatchPairKey(dispatch: StaleRemoteDispatchRecoveryPair) {
+  return dispatch.jobId + ":" + dispatch.promiseId;
+}
+
+export async function markProgressiveStaleRemoteDispatchRecovery(
+  db: DB,
+  input: {
+    dispatches: readonly StaleRemoteDispatchRecoveryPair[];
+    expectedCount: number;
+    operator: string;
+    crossHostAbsenceConfirmed: boolean;
+  },
+): Promise<{ batchId: string; marked: number }> {
+  validateStaleRemoteDispatchRecoveryInput(input);
+  const dispatches = input.dispatches.map((dispatch) => ({ ...dispatch }));
+  const marker: StaleRemoteDispatchRecoveryMarker = {
+    version: 1,
+    kind: STALE_REMOTE_DISPATCH_RECOVERY_KIND,
+    batchId: randomUUID(),
+    expectedCount: input.expectedCount,
+    operator: input.operator.trim(),
+    crossHostAbsenceConfirmed: true,
+    dispatches,
+    markedAt: new Date().toISOString(),
+  };
+  return db.transaction(async (transaction) => {
+    const connection = transaction as unknown as DB;
+    for (const dispatch of dispatches) {
+      const rows = await selectGuardedStaleRemoteDispatch(connection, dispatch);
+      if (
+        !rows.length ||
+        Number(rows[0].total_attempts) !== rows.length ||
+        Number(rows[0].running_attempts) !== rows.length ||
+        rows.some((row) => row.outcome !== "running")
+      )
+        {
+          const diagnostics = await connection.execute(sql`
+            SELECT promise.status AS promise_status, job.status AS job_status,
+              job.engine_state, job.request_payload->'progressive' AS progressive,
+              attempt.outcome, attempt.active_seconds AS attempt_active_seconds,
+              unit.state AS unit_state, unit.lease_token,
+              unit.active_seconds AS unit_active_seconds,
+              generation.id AS generation_id, generation.epoch_id,
+              generation.status AS generation_status, epoch.current AS epoch_current,
+              campaign.status AS campaign_status,
+              campaign.current_plan_revision_id,
+              generation.plan_revision_id AS generation_plan_revision_id,
+              work.target_id, work.stage,
+              attempt.execution_recipe_id
+            FROM progressive_remote_dispatches dispatch
+            JOIN sync_sweep_promises promise ON promise.id = dispatch.promise_id
+            JOIN sim_jobs job ON job.id = dispatch.sim_job_id
+            JOIN progressive_cfd_attempts attempt ON attempt.sim_job_id = job.id
+            JOIN progressive_cfd_units unit ON unit.id = attempt.unit_id
+            JOIN progressive_work work ON work.id = unit.work_id
+            JOIN progressive_generations generation ON generation.id = work.generation_id
+            JOIN calculation_epochs epoch ON epoch.id = generation.epoch_id
+            JOIN sim_campaigns campaign ON campaign.id = generation.campaign_id
+            WHERE dispatch.sim_job_id = ${dispatch.jobId}::uuid
+              AND dispatch.promise_id = ${dispatch.promiseId}::uuid
+          `);
+          throw new Error(
+            "Stale remote recovery guard failed for " +
+              dispatch.jobId +
+              "/" +
+              dispatch.promiseId +
+              ": " +
+              JSON.stringify(diagnostics).slice(0, 4000),
+          );
+        }
+      const payload = rows[0].response_payload as
+        | Record<string, unknown>
+        | null
+        | undefined;
+      if (
+        parseStaleRemoteDispatchRecoveryMarker(
+          payload?.[STALE_REMOTE_DISPATCH_RECOVERY_KEY],
+        )
+      )
+        throw new Error(
+          "Stale remote recovery is already marked for " +
+            dispatch.jobId +
+            "/" +
+            dispatch.promiseId,
+        );
+    }
+    for (const dispatch of dispatches)
+      await connection.execute(sql`
+        UPDATE sync_sweep_promises
+        SET response_payload = coalesce(response_payload, '{}'::jsonb)
+          || jsonb_build_object(
+            ${STALE_REMOTE_DISPATCH_RECOVERY_KEY},
+            ${JSON.stringify(marker)}::jsonb
+          ),
+          "updatedAt" = clock_timestamp()
+        WHERE id = ${dispatch.promiseId}::uuid
+          AND status IN ('expired', 'cancelled')
+      `);
+    return { batchId: marker.batchId, marked: dispatches.length };
+  });
+}
+
+export async function recoverMarkedProgressiveStaleRemoteDispatches(
+  db: DB,
+  options: { maxBatches?: number } = {},
+): Promise<{
+  batches: number;
+  recovered: number;
+  cpuSlotsReleased: number;
+  skipped: Array<{ batchId: string; reason: string }>;
+}> {
+  const maxBatches = options.maxBatches ?? 1;
+  if (!Number.isSafeInteger(maxBatches) || maxBatches < 1 || maxBatches > 8)
+    throw new Error("Invalid stale remote recovery batch limit");
+  return db.transaction(async (transaction) => {
+    const connection = transaction as unknown as DB;
+    const batches = await connection.execute(sql`
+      SELECT promise.response_payload#>>'{progressiveStaleRemoteDispatchRecovery,batchId}' AS batch_id
+      FROM sync_sweep_promises promise
+      JOIN progressive_remote_dispatches dispatch ON dispatch.promise_id = promise.id
+      WHERE promise.response_payload#>>'{progressiveStaleRemoteDispatchRecovery,kind}' = ${STALE_REMOTE_DISPATCH_RECOVERY_KIND}
+        AND promise.response_payload#>>'{progressiveStaleRemoteDispatchRecovery,version}' = '1'
+        AND promise.response_payload#>>'{progressiveStaleRemoteDispatchRecovery,recoveredAt}' IS NULL
+        AND promise.response_payload#>>'{progressiveStaleRemoteDispatchRecovery,expectedCount}' ~ '^[1-9][0-9]{0,2}$'
+      GROUP BY promise.response_payload#>>'{progressiveStaleRemoteDispatchRecovery,batchId}'
+      ORDER BY promise.response_payload#>>'{progressiveStaleRemoteDispatchRecovery,batchId}'
+      LIMIT ${maxBatches}
+    `);
+    const receipt = {
+      batches: 0,
+      recovered: 0,
+      cpuSlotsReleased: 0,
+      skipped: [] as Array<{ batchId: string; reason: string }>,
+    };
+    for (const batch of batches) {
+      const batchId = String(batch.batch_id);
+      const markedRows = await connection.execute(sql`
+        SELECT dispatch.sim_job_id, dispatch.promise_id, dispatch.cpu_slots,
+          promise.response_payload
+        FROM progressive_remote_dispatches dispatch
+        JOIN sync_sweep_promises promise ON promise.id = dispatch.promise_id
+        JOIN sim_jobs job ON job.id = dispatch.sim_job_id
+        WHERE promise.response_payload#>>'{progressiveStaleRemoteDispatchRecovery,batchId}' = ${batchId}
+          AND promise.response_payload#>>'{progressiveStaleRemoteDispatchRecovery,recoveredAt}' IS NULL
+        FOR UPDATE OF promise, job
+      `);
+      const firstPayload = markedRows[0]?.response_payload as
+        | Record<string, unknown>
+        | null
+        | undefined;
+      const marker = parseStaleRemoteDispatchRecoveryMarker(
+        firstPayload?.[STALE_REMOTE_DISPATCH_RECOVERY_KEY],
+      );
+      const markedPairs = new Set(
+        markedRows.map((row) =>
+          dispatchPairKey({
+            jobId: String(row.sim_job_id),
+            promiseId: String(row.promise_id),
+          }),
+        ),
+      );
+      const markerPairs = marker
+        ? new Set(marker.dispatches.map(dispatchPairKey))
+        : new Set<string>();
+      if (
+        !marker ||
+        marker.batchId !== batchId ||
+        marker.dispatches.length !== marker.expectedCount ||
+        markedRows.length !== marker.expectedCount ||
+        markedPairs.size !== marker.expectedCount ||
+        markerPairs.size !== marker.expectedCount ||
+        [...markedPairs].some((pair) => !markerPairs.has(pair))
+      ) {
+        receipt.skipped.push({
+          batchId,
+          reason: "marker does not cover the exact current dispatch set",
+        });
+        continue;
+      }
+      const guarded = new Map<
+        string,
+        Awaited<ReturnType<typeof selectGuardedStaleRemoteDispatch>>
+      >();
+      let guardFailure: string | null = null;
+      for (const dispatch of marker.dispatches) {
+        const rows = await selectGuardedStaleRemoteDispatch(
+          connection,
+          dispatch,
+          batchId,
+        );
+        if (
+          !rows.length ||
+          Number(rows[0].total_attempts) !== rows.length ||
+          Number(rows[0].running_attempts) !== rows.length ||
+          rows.some((row) => row.outcome !== "running")
+        ) {
+          guardFailure =
+            "guard failed for " + dispatch.jobId + "/" + dispatch.promiseId;
+          break;
+        }
+        guarded.set(dispatch.jobId, rows);
+      }
+      if (guardFailure || guarded.size !== marker.expectedCount) {
+        receipt.skipped.push({
+          batchId,
+          reason: guardFailure ?? "guarded dispatch set is incomplete",
+        });
+        continue;
+      }
+      let batchSlots = 0;
+      for (const dispatch of marker.dispatches) {
+        const rows = guarded.get(dispatch.jobId)!;
+        const proof: EngineExecutionStopProof = {
+          version: 1,
+          job_id: dispatch.jobId,
+          execution_stopped: true,
+          producer_stopped: true,
+          namespace_verified: true,
+          remaining: [],
+          observed_at: new Date().toISOString(),
+          error: null,
+          fence: "cancel_marker",
+          ownership_basis: "never_started_cancellation_fence",
+        };
+        await connection.execute(sql`
+          UPDATE sim_jobs
+          SET engine_job_id = ${dispatch.jobId},
+            status = 'cancelled',
+            engine_state = 'cancelled',
+            "finishedAt" = coalesce("finishedAt", clock_timestamp()),
+            "updatedAt" = clock_timestamp(),
+            error = 'Operator-authorized recovery of a stale unstarted remote dispatch'
+          WHERE id = ${dispatch.jobId}::uuid
+            AND status = 'pending'
+            AND engine_job_id IS NULL
+            AND engine_state IS NULL
+        `);
+        await acknowledgeProgressiveCfdExecutionStop(connection, {
+          simJobId: dispatch.jobId,
+          proof,
+        });
+        await connection.execute(sql`
+          UPDATE progressive_cfd_attempts
+          SET outcome = 'failed',
+            finished_at = clock_timestamp(),
+            error = 'Stale remote dispatch was cancelled before engine submission'
+          WHERE sim_job_id = ${dispatch.jobId}::uuid AND outcome = 'running'
+        `);
+        await connection.execute(sql`
+          UPDATE progressive_cfd_units unit
+          SET state = 'gap',
+            lease_token = NULL,
+            lease_owner = NULL,
+            lease_until = NULL,
+            error = 'Stale remote dispatch was cancelled before engine submission'
+          FROM progressive_cfd_attempts attempt
+          WHERE attempt.unit_id = unit.id
+            AND attempt.sim_job_id = ${dispatch.jobId}::uuid
+            AND attempt.outcome = 'failed'
+        `);
+        const settled = await settleProgressiveCfdExecution(
+          connection,
+          dispatch.jobId,
+          { recoverNeverStarted: true },
+        );
+        if (
+          settled.retry + settled.gaps !== rows.length ||
+          settled.waiting !== 0
+        )
+          throw new Error(
+            "Stale remote recovery did not settle every unit for " +
+              dispatch.jobId,
+          );
+        batchSlots += Number(
+          markedRows.find(
+            (row) => String(row.sim_job_id) === dispatch.jobId,
+          )?.cpu_slots ?? 0,
+        );
+      }
+      for (const dispatch of marker.dispatches) {
+        await connection.execute(sql`
+          UPDATE sync_sweep_promises
+          SET status = 'cancelled',
+            "cancelledAt" = coalesce("cancelledAt", clock_timestamp()),
+            "updatedAt" = clock_timestamp(),
+            response_payload = jsonb_set(
+              coalesce(response_payload, '{}'::jsonb),
+              '{progressiveStaleRemoteDispatchRecovery}',
+              coalesce(
+                response_payload->'progressiveStaleRemoteDispatchRecovery',
+                '{}'::jsonb
+              ) || jsonb_build_object(
+                'recoveredAt', clock_timestamp(),
+                'disposition', 'never_started_cancelled'
+              ),
+              true
+            )
+          WHERE id = ${dispatch.promiseId}::uuid
+        `);
+        await connection.execute(sql`
+          UPDATE sync_sweep_promise_points
+          SET status = 'cancelled', "updatedAt" = clock_timestamp()
+          WHERE promise_id = ${dispatch.promiseId}::uuid AND status = 'active'
+        `);
+      }
+      receipt.batches += 1;
+      receipt.recovered += marker.expectedCount;
+      receipt.cpuSlotsReleased += batchSlots;
+    }
+    return receipt;
+  });
+}

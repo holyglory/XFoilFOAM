@@ -408,6 +408,54 @@ ALL_IMAGE_FIELDS: tuple[ImageField, ...] = tuple(ImageField)
 
 class SolverParams(BaseModel):
     flow_solver_family: Optional[Literal["simpleFoam", "pimpleFoam", "rhoSimpleFoam", "rhoPimpleFoam", "rhoCentralFoam"]] = None
+    compressible_farfield_boundary: Literal["static_freestream", "total_inlet_static_outlet"] = Field(
+        default="static_freestream",
+        description="Farfield contract for pressure-based compressible cases. The total-inlet recipe derives total values from the configured static operating state.",
+    )
+    compressible_startup: Literal["potential", "uniform_freestream", "isentropic_potential"] = Field(
+        default="potential",
+        description="Pressure-based compressible startup recipe. The diagnostic alternatives are restricted to rhoSimpleFoam and never widen the gas material range.",
+    )
+    compressible_energy_form: Literal["sensibleInternalEnergy", "sensibleEnthalpy"] = Field(
+        default="sensibleInternalEnergy",
+        description="Energy variable used by pressure-based compressible OpenFOAM. Enthalpy is an explicit numerical recipe, not a change to the gas material.",
+    )
+    compressible_pressure_consistent: bool = Field(
+        default=False,
+        description="Use OpenFOAM consistent SIMPLE pressure coupling for pressure-based compressible diagnosis.",
+    )
+    compressible_pressure_solver: Literal["GAMG", "PBiCGStab"] = Field(
+        default="GAMG",
+        description="Linear solver for the compressible pressure equation.",
+    )
+    compressible_pressure_min_factor: Optional[float] = Field(
+        default=None,
+        gt=0,
+        le=1,
+        description="Optional absolute pressure floor as a fraction of the configured reference pressure.",
+    )
+    compressible_transonic: bool = Field(
+        default=False,
+        description="Use the OpenFOAM transonic pressure-flux branch for a pressure-based compressible steady solve.",
+    )
+    compressible_density_subsonic: bool = Field(
+        default=False,
+        description="Explicitly permit the density-based local-steady recipe below Mach 1.2 for a governed diagnostic.",
+    )
+    compressible_energy_relaxation: float = Field(
+        default=0.7,
+        gt=0,
+        le=1,
+        description="Equation relaxation for the compressible energy variable.",
+    )
+    compressible_energy_advection: Literal["momentum", "upwind"] = Field(
+        default="momentum",
+        description="Advection scheme for compressible energy and kinetic-energy fluxes.",
+    )
+    compressible_pressure_energy_order: Literal["standard", "pressure_first"] = Field(
+        default="standard",
+        description="Pressure-energy segregated update order for the governed rhoSimpleFoam diagnostic.",
+    )
     turbulent_prandtl: Optional[float] = Field(default=None, gt=0, allow_inf_nan=False)
     local_time_step_smoothing: Optional[float] = Field(
         default=None, strict=True, ge=0, le=1, allow_inf_nan=False,
@@ -841,6 +889,24 @@ class PolarRequest(BaseModel):
             raise ValueError(
                 "quiescent_initial_velocity requires a versioned compressible rhoPimpleFoam force-transient request"
             )
+        if self.solver.compressible_farfield_boundary != "static_freestream" and family != "rhoSimpleFoam":
+            raise ValueError("The total-inlet static-outlet farfield recipe requires steady rhoSimpleFoam")
+        if self.solver.compressible_startup != "potential" and family != "rhoSimpleFoam":
+            raise ValueError("Alternative compressible startup recipes require rhoSimpleFoam")
+        if self.solver.compressible_energy_form != "sensibleInternalEnergy" and not compressible:
+            raise ValueError("Compressible energy forms require a rho solver family")
+        if self.solver.compressible_pressure_consistent and not compressible:
+            raise ValueError("Compressible pressure coupling requires a rho solver family")
+        if self.solver.compressible_pressure_min_factor is not None and not compressible:
+            raise ValueError("Compressible pressure limits require a rho solver family")
+        if self.solver.compressible_transonic and not compressible:
+            raise ValueError("Compressible transonic pressure requires a rho solver family")
+        if self.solver.compressible_energy_relaxation != 0.7 and not compressible:
+            raise ValueError("Compressible energy relaxation requires a rho solver family")
+        if self.solver.compressible_energy_advection != "momentum" and not compressible:
+            raise ValueError("Compressible energy advection requires a rho solver family")
+        if self.solver.compressible_pressure_energy_order != "standard" and family != "rhoSimpleFoam":
+            raise ValueError("The pressure-first energy order requires steady rhoSimpleFoam")
         if compressible:
             gas, state = self.fluid.gas, self.flow_state
             if gas is None or state is None or self.solver.turbulent_prandtl is None:
@@ -856,7 +922,7 @@ class PolarRequest(BaseModel):
                 mach = speed / gas.speed_of_sound(state)
                 if not math.isfinite(mach) or mach <= 0 or mach > 3 + 1e-12:
                     raise ValueError("Compressible execution requires Mach greater than zero and at most three")
-                if family == "rhoCentralFoam" and mach < 1.2 - 1e-12:
+                if family == "rhoCentralFoam" and mach < 1.2 - 1e-12 and not self.solver.compressible_density_subsonic:
                     raise ValueError("Density-based execution requires Mach at least 1.2")
         elif self.fluid.gas is not None or self.flow_state is not None or self.solver.turbulent_prandtl is not None:
             raise ValueError("Gas state and thermal transport require an explicit compressible solver family")

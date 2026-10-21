@@ -1,7 +1,11 @@
 import { sql } from "drizzle-orm";
 import { FAST_WALL_SPACING_POLICY } from "@aerodb/core";
 import type { DB } from "./client";
-import { cancelObsoleteProgressiveCfdUnits } from "./progressive-cfd";
+import {
+  cancelObsoleteProgressiveCfdUnits,
+  initializeProgressiveCfdWork,
+} from "./progressive-cfd";
+import { reuseAcceptedProgressiveCfdEvidence } from "./progressive-cfd-reuse";
 import { materializeProgressiveCampaignScope } from "./progressive-materialization";
 import { analysisContentHash } from "./analysis-target";
 import {
@@ -9,6 +13,9 @@ import {
   type SealedPolarTarget,
   validateNeuralFoilPredictionPayload,
 } from "./progressive-campaigns";
+
+export { MAX_PROGRESSIVE_CFD_REUSE_UNITS } from "./progressive-cfd-reuse";
+export { reuseAcceptedProgressiveCfdEvidence } from "./progressive-cfd-reuse";
 
 export async function reusePreviousBaselines(
   db: DB,
@@ -81,129 +88,6 @@ export async function reusePreviousBaselines(
         )})`);
       reused += links.length;
     }
-  }
-  await advanceGeneration(db, generationId);
-  return reused;
-}
-
-export async function reuseAcceptedProgressiveCfdEvidence(
-  db: DB,
-  generationId: string,
-  previousIds: string[],
-  epochId: string,
-) {
-  if (!previousIds.length) return 0;
-  const previous = sql.join(
-    previousIds.map((id) => sql`${id}::uuid`),
-    sql`, `,
-  );
-  const candidates: Record<string, unknown>[] = await db.execute(sql`
-    SELECT successor.id AS successor_unit_id,
-      successor.aoa_deg AS successor_aoa,
-      successor.recipe AS successor_recipe,
-      successor_scope.revision_id AS successor_revision_id,
-      successor_target.airfoil_id AS successor_airfoil_id,
-      successor_target.physical AS successor_physical,
-      source_attempt.token AS source_attempt_token,
-      source_attempt.execution_recipe_id AS source_execution_recipe_id,
-      source_attempt.active_seconds AS source_active_seconds,
-      source_generation.id AS source_generation_id,
-      evidence.result_attempt_id AS source_result_attempt_id,
-      evidence.evidence_signature AS source_evidence_signature,
-      result_attempt.evidence_payload AS source_evidence_payload,
-      result_attempt.airfoil_id AS source_airfoil_id,
-      result_attempt.aoa_deg AS source_aoa,
-      result_attempt.simulation_preset_revision_id AS source_result_revision_id
-    FROM progressive_cfd_units successor
-    JOIN progressive_work successor_work ON successor_work.id=successor.work_id
-    JOIN progressive_generations successor_generation
-      ON successor_generation.id=successor_work.generation_id
-    JOIN progressive_generation_targets successor_scope
-      ON successor_scope.generation_id=successor_generation.id
-      AND successor_scope.target_id=successor_work.target_id
-    JOIN polar_analysis_targets successor_target
-      ON successor_target.id=successor_work.target_id
-    JOIN progressive_work source_work
-      ON source_work.target_id=successor_work.target_id
-      AND source_work.stage=successor_work.stage
-    JOIN progressive_generations source_generation
-      ON source_generation.id=source_work.generation_id
-      AND source_generation.id IN (${previous})
-    JOIN progressive_cfd_units source_unit
-      ON source_unit.work_id=source_work.id
-      AND source_unit.aoa_deg=successor.aoa_deg
-      AND source_unit.state='complete'
-    JOIN progressive_cfd_attempts source_attempt
-      ON source_attempt.unit_id=source_unit.id
-      AND source_attempt.outcome='complete'
-    JOIN progressive_cfd_evidence evidence
-      ON evidence.attempt_token=source_attempt.token
-    JOIN result_attempts result_attempt
-      ON result_attempt.id=evidence.result_attempt_id
-    JOIN result_classifications classification
-      ON classification.result_attempt_id=result_attempt.id
-      AND classification.state='accepted'
-    JOIN sim_jobs source_job ON source_job.id=source_attempt.sim_job_id
-    JOIN progressive_cfd_execution_stops stopped
-      ON stopped.sim_job_id=source_job.id
-      AND stopped.engine_job_id=source_job.engine_job_id
-      AND stopped.epoch_id=${epochId}::uuid
-    LEFT JOIN progressive_cfd_evidence_reuses reuse
-      ON reuse.successor_unit_id=successor.id
-    WHERE successor_work.generation_id=${generationId}::uuid
-      AND successor_work.state='pending'
-      AND successor.state='pending'
-      AND successor_work.stage IN (2,3)
-      AND source_generation.epoch_id=${epochId}::uuid
-      AND source_job.status IN ('done','failed','cancelled')
-      AND source_job."ingestedAt" IS NOT NULL
-      AND result_attempt.status='done'
-      AND result_attempt.source='solved'
-      AND result_attempt.valid_for_polar
-      AND result_attempt.airfoil_id=successor_target.airfoil_id
-      AND result_attempt.aoa_deg=successor.aoa_deg
-      AND reuse.successor_unit_id IS NULL
-    ORDER BY successor.id, source_attempt.finished_at DESC NULLS LAST, source_attempt.token
-  `);
-  let reused = 0;
-  const seen = new Set<string>();
-  for (const row of candidates) {
-    const successorUnitId = String(row.successor_unit_id);
-    if (seen.has(successorUnitId)) continue;
-    seen.add(successorUnitId);
-    if (
-      !row.source_execution_recipe_id ||
-      analysisContentHash({
-        sourceRevisionId: String(row.successor_revision_id),
-        recipe: row.successor_recipe,
-      }) !== String(row.source_execution_recipe_id) ||
-      String(row.source_airfoil_id) !== String(row.successor_airfoil_id) ||
-      Number(row.source_aoa) !== Number(row.successor_aoa) ||
-      !row.source_evidence_payload ||
-      analysisContentHash(row.source_evidence_payload) !==
-        String(row.source_evidence_signature)
-    )
-      continue;
-    const [inserted] = await db.execute(sql`
-      INSERT INTO progressive_cfd_evidence_reuses(
-        successor_unit_id,source_attempt_token,source_result_attempt_id,
-        source_evidence_signature,source_generation_id,source_execution_recipe_id
-      ) VALUES(
-        ${successorUnitId}::uuid,${row.source_attempt_token}::uuid,
-        ${row.source_result_attempt_id}::uuid,${row.source_evidence_signature},
-        ${row.source_generation_id}::uuid,${row.source_execution_recipe_id}
-      ) ON CONFLICT (successor_unit_id) DO NOTHING
-      RETURNING successor_unit_id
-    `);
-    if (!inserted) continue;
-    const [completed] = await db.execute(sql`
-      UPDATE progressive_cfd_units
-      SET state='complete',lease_token=NULL,lease_owner=NULL,lease_until=NULL,
-        error=NULL
-      WHERE id=${successorUnitId}::uuid AND state='pending'
-      RETURNING id
-    `);
-    if (completed) reused += 1;
   }
   await advanceGeneration(db, generationId);
   return reused;
@@ -310,12 +194,18 @@ export async function adoptProgressiveWallPolicy(db: DB, campaignId: string) {
       generationIds,
       String(epoch.id),
     );
-    const reusedCfd = await reuseAcceptedProgressiveCfdEvidence(
-      connection,
-      successor.id,
-      generationIds,
-      String(epoch.id),
-    );
+    await initializeProgressiveCfdWork(connection, campaignId);
+    let reusedCfd = 0;
+    for (let pass = 0; pass < 256; pass += 1) {
+      const batch = await reuseAcceptedProgressiveCfdEvidence(
+        connection,
+        successor.id,
+        generationIds,
+        String(epoch.id),
+      );
+      reusedCfd += batch;
+      if (batch === 0) break;
+    }
     await connection.execute(sql`
       INSERT INTO progressive_recipe_adoptions(epoch_id,campaign_id,plan_revision_id,policy,previous_generation_ids,generation_id)
       VALUES(${epoch.id},${campaignId}::uuid,${campaign.current_plan_revision_id},${FAST_WALL_SPACING_POLICY},ARRAY[${ids}],${successor.id})

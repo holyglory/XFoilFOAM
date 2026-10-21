@@ -156,13 +156,21 @@ export async function advanceProgressiveCfdStages(db: DB) {
         WHERE attempt.outcome = 'running'
           OR (attempt.sim_job_id IS NOT NULL AND stopped.sim_job_id IS NULL)
       ), progressive_stage_evidence_targets AS MATERIALIZED (
-        SELECT DISTINCT source_work.target_id
+      SELECT DISTINCT source_work.target_id
         FROM progressive_cfd_evidence evidence
         JOIN progressive_cfd_attempts source_attempt ON source_attempt.token = evidence.attempt_token
         JOIN progressive_cfd_units source_unit ON source_unit.id = source_attempt.unit_id
         JOIN progressive_work source_work ON source_work.id = source_unit.work_id
         JOIN progressive_generations source_generation ON source_generation.id = source_work.generation_id
         WHERE source_generation.epoch_id = ${epoch.id}
+        UNION
+        SELECT DISTINCT successor_work.target_id
+        FROM progressive_cfd_evidence_reuses reuse
+        JOIN progressive_cfd_units successor_unit ON successor_unit.id = reuse.successor_unit_id
+        JOIN progressive_work successor_work ON successor_work.id = successor_unit.work_id
+        JOIN progressive_generations successor_generation ON successor_generation.id = successor_work.generation_id
+        WHERE successor_generation.epoch_id = ${epoch.id}
+          AND successor_generation.status <> 'cancelled'
       ), candidate_campaigns AS MATERIALIZED (
         SELECT campaign.id, campaign.priority, campaign."createdAt"
         FROM sim_campaigns campaign
@@ -236,6 +244,14 @@ export async function advanceProgressiveCfdStages(db: DB) {
         JOIN progressive_work source_work ON source_work.id = source_unit.work_id
         JOIN progressive_generations source_generation ON source_generation.id = source_work.generation_id
         WHERE source_generation.epoch_id = ${epoch.id}
+        UNION
+        SELECT DISTINCT successor_work.target_id
+        FROM progressive_cfd_evidence_reuses reuse
+        JOIN progressive_cfd_units successor_unit ON successor_unit.id = reuse.successor_unit_id
+        JOIN progressive_work successor_work ON successor_work.id = successor_unit.work_id
+        JOIN progressive_generations successor_generation ON successor_generation.id = successor_work.generation_id
+        WHERE successor_generation.epoch_id = ${epoch.id}
+          AND successor_generation.status <> 'cancelled'
       ), ${progressiveCohortReadinessSql(
         String(epoch.id),
         sql`generation.campaign_id = ${campaign.id}`,
@@ -381,14 +397,29 @@ export async function advanceProgressiveCfdStages(db: DB) {
           } else {
             modelId = String(scope.model_id);
             const costs = await connection.execute(sql`
-            SELECT measured.result_attempt_id, measured.solver_active_seconds FROM (
-            SELECT DISTINCT ON (attempt.token) evidence.result_attempt_id, evidence.solver_active_seconds FROM progressive_cfd_evidence evidence
-            JOIN progressive_cfd_attempts attempt ON attempt.token = evidence.attempt_token
-            JOIN progressive_cfd_units unit ON unit.id = attempt.unit_id
-            WHERE unit.work_id = ${scope.id} AND evidence.solver_active_seconds > 0
-              AND evidence.solver_active_seconds < 'Infinity'::double precision
-            ORDER BY attempt.token, evidence.solver_active_seconds DESC, evidence.result_attempt_id
-            ) measured ORDER BY measured.solver_active_seconds, measured.result_attempt_id
+            SELECT measured.result_attempt_id, max(measured.solver_active_seconds) AS solver_active_seconds
+            FROM (
+              SELECT evidence.result_attempt_id, evidence.solver_active_seconds
+              FROM progressive_cfd_evidence evidence
+              JOIN progressive_cfd_attempts attempt ON attempt.token = evidence.attempt_token
+              JOIN progressive_cfd_units unit ON unit.id = attempt.unit_id
+              WHERE unit.work_id = ${scope.id}
+                AND evidence.solver_active_seconds > 0
+                AND evidence.solver_active_seconds < 'Infinity'::double precision
+              UNION ALL
+              SELECT source_evidence.result_attempt_id, source_evidence.solver_active_seconds
+              FROM progressive_cfd_evidence_reuses reuse
+              JOIN progressive_cfd_units unit ON unit.id = reuse.successor_unit_id
+              JOIN progressive_cfd_evidence source_evidence
+                ON source_evidence.attempt_token = reuse.source_attempt_token
+                AND source_evidence.result_attempt_id = reuse.source_result_attempt_id
+                AND source_evidence.evidence_signature = reuse.source_evidence_signature
+              WHERE unit.work_id = ${scope.id}
+                AND source_evidence.solver_active_seconds > 0
+                AND source_evidence.solver_active_seconds < 'Infinity'::double precision
+            ) measured
+            GROUP BY measured.result_attempt_id
+            ORDER BY solver_active_seconds, measured.result_attempt_id
           `);
             if (costs.length) {
               const cost = costs[Math.floor(costs.length / 2)];

@@ -34,7 +34,12 @@ class CompressibleCaseBuilder(CaseBuilder):
         mach = self.spec.speed / gas.speed_of_sound(state)
         if not math.isfinite(mach) or mach <= 0 or (mach > 3 and not math.isclose(mach, 3, rel_tol=0, abs_tol=1e-12)):
             raise ValueError("The progressive compressible recipe is restricted to Mach 0 through 3")
-        if solver_family == "rhoCentralFoam" and mach < 1.2 and not math.isclose(mach, 1.2, rel_tol=0, abs_tol=1e-12):
+        if (
+            solver_family == "rhoCentralFoam"
+            and mach < 1.2
+            and not self.solver.compressible_density_subsonic
+            and not math.isclose(mach, 1.2, rel_tol=0, abs_tol=1e-12)
+        ):
             raise ValueError("The density-based progressive recipe requires Mach at least 1.2")
         if solver_family != "rhoSimpleFoam" and time_window is None and not (solver_family == "rhoCentralFoam" and not self.solver.force_transient):
             raise ValueError("Transient compressible solvers require an explicit physical-time window")
@@ -49,7 +54,15 @@ class CompressibleCaseBuilder(CaseBuilder):
         self.local_time_step_smoothing = (
             0.02 if self.solver.local_time_step_smoothing is None else self.solver.local_time_step_smoothing
         )
-        steady_command = solver_family
+        steady_command = (
+            "xfoilfoamRhoSimpleFoam"
+            if solver_family in {"rhoSimpleFoam", "rhoPimpleFoam"}
+            and (
+                self.solver.compressible_pressure_energy_order == "pressure_first"
+                or gas.transport_model == "polynomial"
+            )
+            else solver_family
+        )
         self.dialect = replace(
             self.dialect, steady_solver_command=steady_command,
             transient_solver_command="rhoCentralFoam" if solver_family == "rhoCentralFoam" else "rhoPimpleFoam",

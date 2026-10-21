@@ -229,10 +229,86 @@ export async function verifyProgressiveRemoteReportInventory(
         (SELECT count(*)::integer FROM result_attempts WHERE sim_job_id = ${executionId}::uuid) AS attempts`);
       expect(counts).toEqual({ received: 0, attempts: 0 });
       await verifyRetainedReports(connection, executionId);
-      for (let sequence = 3; sequence <= final.sequence; sequence += 1)
-        expect(
-          await applyProgressiveRemoteProgress(connection, executionId),
-        ).toMatchObject({ kind: "applied", sequence });
+      await connection.execute(sql`CREATE TEMP TABLE progressive_report_retry_source ON COMMIT DROP AS
+        SELECT sim_job_id, sequence, content_signature, report, received_at
+        FROM progressive_remote_reports
+        WHERE sim_job_id=${executionId}::uuid AND sequence=${final.sequence}`);
+      await connection.execute(sql`
+        CREATE FUNCTION pg_temp.progressive_test_fail_poll() RETURNS trigger
+        LANGUAGE plpgsql AS $$
+        BEGIN
+          IF NEW."polledAt" IS DISTINCT FROM OLD."polledAt"
+            AND current_setting('progressive_test.fail_poll', true) = '1' THEN
+            RAISE EXCEPTION 'synthetic progress polling failure';
+          END IF;
+          RETURN NEW;
+        END;
+        $$`);
+      await connection.execute(sql`
+        CREATE TRIGGER progressive_test_fail_poll
+        BEFORE UPDATE ON sim_jobs
+        FOR EACH ROW EXECUTE FUNCTION pg_temp.progressive_test_fail_poll()`);
+      await connection.execute(sql`SET LOCAL progressive_test.fail_poll = '1'`);
+      await connection.execute(sql`DELETE FROM progressive_remote_reports
+        WHERE sim_job_id=${executionId}::uuid AND sequence=${final.sequence}`);
+      await connection.execute(sql`
+        INSERT INTO progressive_remote_reports
+          (sim_job_id, sequence, content_signature, report, received_at)
+        SELECT sim_job_id, sequence, repeat('0', 64), report, received_at
+        FROM progressive_report_retry_source`);
+      const failedDrain = await reconcileProgressiveRemoteProgress(connection, {
+        jobIds: [executionId],
+      });
+      expect(failedDrain).toMatchObject({
+        applied: 2,
+        indexed: 0,
+        stopped: 0,
+      });
+      expect(failedDrain.errors).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            executionId,
+            reason: expect.stringContaining(
+              "Remote progress bytes differ from their immutable receipt",
+            ),
+          }),
+          expect.objectContaining({
+            executionId,
+            reason: expect.stringContaining(
+              "synthetic progress polling failure",
+            ),
+          }),
+        ]),
+      );
+      expect(
+        (
+          await connection.execute(sql`SELECT sequence FROM progressive_remote_progress_receipts
+            WHERE sim_job_id=${executionId}::uuid ORDER BY sequence`)
+        ).map((row) => Number(row.sequence)),
+      ).toEqual([1, 2, 3, 4]);
+      await connection.execute(sql`SET LOCAL progressive_test.fail_poll = '0'`);
+      await connection.execute(sql`DELETE FROM progressive_remote_reports
+        WHERE sim_job_id=${executionId}::uuid AND sequence=${final.sequence}`);
+      await connection.execute(sql`
+        INSERT INTO progressive_remote_reports
+          (sim_job_id, sequence, content_signature, report, received_at)
+        SELECT sim_job_id, sequence, content_signature, report, received_at
+        FROM progressive_report_retry_source`);
+      const retriedDrain = await reconcileProgressiveRemoteProgress(connection, {
+        jobIds: [executionId],
+      });
+      expect(retriedDrain).toMatchObject({
+        applied: 1,
+        indexed: 0,
+        stopped: 1,
+        errors: [],
+      });
+      expect(
+        (
+          await connection.execute(sql`SELECT sequence FROM progressive_remote_progress_receipts
+            WHERE sim_job_id=${executionId}::uuid ORDER BY sequence`)
+        ).map((row) => Number(row.sequence)),
+      ).toEqual([1, 2, 3, 4, 5]);
       await connection.execute(sql`UPDATE sim_campaigns SET status='active'
         WHERE id=(SELECT campaign_id FROM sim_jobs WHERE id=${executionId}::uuid)`);
       for (const status of [

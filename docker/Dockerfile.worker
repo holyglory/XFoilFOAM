@@ -27,6 +27,8 @@ COPY src/airfoilfoam/native/acoustic-startup /build/acoustic-startup
 RUN bash -lc 'source /usr/lib/openfoam/openfoam2606/etc/bashrc || exit 1; set -e; export FOAM_USER_LIBBIN=/opt/xfoilfoam-thermophysics/lib FOAM_USER_APPBIN=/opt/xfoilfoam-thermophysics/bin; wmake /build/acoustic-startup'
 COPY src/airfoilfoam/native/steady-convergence /build/steady-convergence
 RUN bash -lc 'source /usr/lib/openfoam/openfoam2606/etc/bashrc || exit 1; set -e; export FOAM_USER_LIBBIN=/opt/xfoilfoam-thermophysics/lib; wmake libso /build/steady-convergence'
+COPY src/airfoilfoam/native/pressure-first-rho-simple /build/pressure-first-rho-simple
+RUN bash -lc 'source /usr/lib/openfoam/openfoam2606/etc/bashrc || exit 1; set -e; export FOAM_USER_APPBIN=/opt/xfoilfoam-thermophysics/bin; mkdir -p "$FOAM_USER_APPBIN"; wmake /build/pressure-first-rho-simple'
 
 FROM thermophysics-build AS thermophysics-check
 COPY scripts/materials/native-probe /build/native-probe
@@ -96,7 +98,7 @@ ENV AIRFOILFOAM_OPENFOAM_RUNNER=local \
     C_FORCE_ROOT=1 \
     PYTHONUNBUFFERED=1 \
     VIRTUAL_ENV=/opt/airfoilfoam-venv \
-    PATH=/opt/airfoilfoam-venv/bin:${PATH}
+    PATH=/opt/xfoilfoam-thermophysics/bin:/opt/airfoilfoam-venv/bin:${PATH}
 
 RUN python3 -m venv "${VIRTUAL_ENV}"
 WORKDIR /app
@@ -108,6 +110,7 @@ RUN python3 -m pip install --no-cache-dir --require-hashes -r /tmp/build-require
 COPY --from=thermophysics-build /opt/xfoilfoam-thermophysics/lib /opt/xfoilfoam-thermophysics/lib
 COPY --from=thermophysics-build /opt/xfoilfoam-thermophysics/bin /opt/xfoilfoam-thermophysics/bin
 COPY --from=thermophysics-build /opt/xfoilfoam-thermophysics/library.sha256 /opt/xfoilfoam-thermophysics/library.sha256
+RUN bash -lc 'source /usr/lib/openfoam/openfoam2606/etc/bashrc >/dev/null 2>&1; set -eu; test -x /opt/xfoilfoam-thermophysics/bin/xfoilfoamRhoSimpleFoam; test "$(command -v xfoilfoamRhoSimpleFoam)" = /opt/xfoilfoam-thermophysics/bin/xfoilfoamRhoSimpleFoam; xfoilfoamRhoSimpleFoam -help >/dev/null 2>&1'
 COPY pyproject.toml README.md ./
 COPY src ./src
 RUN PYTHONPATH=src python3 -c "from pathlib import Path; from airfoilfoam.provenance import write_application_source_sha256; write_application_source_sha256(Path('/app'))" \

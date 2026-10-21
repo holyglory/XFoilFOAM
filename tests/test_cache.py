@@ -269,13 +269,37 @@ def test_solver_signature_tracks_bc_relevant_fields(monkeypatch):
     # iteration/scheme knobs do not change the 0/ boundary conditions
     more_iters = SolverParams(n_iterations=5000, momentum_scheme="upwind")
     assert EngineCache.solver_signature(more_iters, RoughnessParams()) == base
+    assert EngineCache.solver_signature(
+        SolverParams(compressible_startup="uniform_freestream"), RoughnessParams()
+    ) != base
+    assert EngineCache.solver_signature(
+        SolverParams(compressible_farfield_boundary="total_inlet_static_outlet"), RoughnessParams()
+    ) != base
+    assert EngineCache.solver_signature(
+        SolverParams(compressible_energy_form="sensibleEnthalpy"), RoughnessParams()
+    ) != base
+    assert EngineCache.solver_signature(
+        SolverParams(compressible_pressure_consistent=True), RoughnessParams()
+    ) != base
+    assert EngineCache.solver_signature(
+        SolverParams(compressible_pressure_solver="PBiCGStab"), RoughnessParams()
+    ) != base
+    assert EngineCache.solver_signature(
+        SolverParams(compressible_pressure_min_factor=0.1), RoughnessParams()
+    ) != base
+    assert EngineCache.solver_signature(
+        SolverParams(compressible_transonic=True), RoughnessParams()
+    ) != base
+    assert EngineCache.solver_signature(
+        SolverParams(compressible_energy_advection="upwind"), RoughnessParams()
+    ) != base
+    assert EngineCache.solver_signature(
+        SolverParams(compressible_pressure_energy_order="pressure_first"), RoughnessParams()
+    ) != base
     # A solver-march policy change invalidates old accepted-looking fields: a
     # cache entry can be byte-perfect yet come from the alternate A18 branch.
     monkeypatch.setattr(cache_module, "STEADY_RANS_MARCHER_SEED_VERSION", "legacy-march")
     assert EngineCache.solver_signature(SolverParams(), RoughnessParams()) != base
-    assert EngineCache.solver_signature(
-        SolverParams(quiescent_initial_velocity=True), RoughnessParams()
-    ) != base
 
 
 # --------------------------------------------------------------------------- #

@@ -182,8 +182,18 @@ class EngineCache:
         payload = json.dumps(
             {
                 "steadyRansMarcher": STEADY_RANS_MARCHER_SEED_VERSION,
-                "flowSolverFamily": solver_params.flow_solver_family,
-                "quiescentInitialVelocity": solver_params.quiescent_initial_velocity,
+            "flowSolverFamily": solver_params.flow_solver_family,
+            "compressibleFarfieldBoundary": solver_params.compressible_farfield_boundary,
+            "compressibleStartup": solver_params.compressible_startup,
+                "compressibleEnergyForm": solver_params.compressible_energy_form,
+                "compressiblePressureConsistent": solver_params.compressible_pressure_consistent,
+                "compressiblePressureSolver": solver_params.compressible_pressure_solver,
+                "compressiblePressureMinFactor": solver_params.compressible_pressure_min_factor,
+                "compressibleTransonic": solver_params.compressible_transonic,
+                "compressibleDensitySubsonic": solver_params.compressible_density_subsonic,
+                "compressibleEnergyRelaxation": solver_params.compressible_energy_relaxation,
+                "compressibleEnergyAdvection": solver_params.compressible_energy_advection,
+                "compressiblePressureEnergyOrder": solver_params.compressible_pressure_energy_order,
                 "turbulentPrandtl": solver_params.turbulent_prandtl,
                 "turbulence": {
                     "model": solver_params.turbulence.model.value,

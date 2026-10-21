@@ -107,3 +107,23 @@ def test_summary_keeps_all_counts_and_extrema_when_range_metadata_is_bounded():
     assert len(details["declared_temperature_ranges_k"]) == 16
     assert details["declared_temperature_ranges_truncated"] is True
     assert material_temperature_diagnostics("Temperature min 50 max 2100\nConfigured material range 100 -> 2000\n")["warning_count"] == 0
+
+
+def test_diagnostic_temperature_guard_rejects_nonpositive_internal_field(tmp_path, monkeypatch):
+    monkeypatch.setenv("AIRFOILFOAM_DIAGNOSTIC_FINITE_T_GUARD", "1")
+    field = tmp_path / "0" / "T"
+    field.parent.mkdir()
+    field.write_text("internalField uniform -2.5;\n")
+    failure = material_domain_failure(tmp_path, RunResult("rhoSimpleFoam", 0, ""))
+    assert isinstance(failure, MaterialDomainError)
+    diagnostic = json.loads((tmp_path / "material-domain-diagnostic.json").read_text())
+    assert diagnostic["finite_positive_temperature_guard"]["valid"] is False
+    assert diagnostic["finite_positive_temperature_guard"]["invalid_value_count"] == 1
+
+
+def test_diagnostic_temperature_guard_accepts_finite_positive_internal_field(tmp_path, monkeypatch):
+    monkeypatch.setenv("AIRFOILFOAM_DIAGNOSTIC_FINITE_T_GUARD", "1")
+    field = tmp_path / "0" / "T"
+    field.parent.mkdir()
+    field.write_text("internalField nonuniform List<scalar> 3 (288.15 290.0 301.2);\n")
+    assert material_domain_failure(tmp_path, RunResult("rhoSimpleFoam", 0, "")) is None

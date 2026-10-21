@@ -214,9 +214,23 @@ def _case_builder(runner, airfoil, patches, resolved, spec, fluid, roughness, so
     )
 
 
-def _potential_initialization(case_dir, runner, patches, dialect):
+def _uses_potential_compressible_startup(runner, solver_params) -> bool:
+    return not (
+        is_compressible(runner)
+        and getattr(solver_params, "compressible_startup", "potential") == "uniform_freestream"
+        and getattr(solver_params, "flow_solver_family", None) == "rhoSimpleFoam"
+    )
+
+
+def _potential_initialization(case_dir, runner, patches, dialect, solver_params=None):
     if is_compressible(runner):
-        return initialize_compressible_velocity(case_dir, runner, patches, dialect.potential_foam_command)
+        return initialize_compressible_velocity(
+            case_dir,
+            runner,
+            patches,
+            dialect.potential_foam_command,
+            startup_mode=getattr(solver_params, "compressible_startup", "potential"),
+        )
     return runner.application(case_dir, dialect.potential_foam_command, timeout=600)
 
 
@@ -5237,6 +5251,8 @@ def _prepare_transient_case(
     _check_cancel(cancel_check)
     if is_density_based(runner):
         return tmesh, patches
+    if not _uses_potential_compressible_startup(runner, solver_params):
+        return tmesh, patches
     # Preferred warm start: continue from an ACCEPTED in-job steady RANS field
     # solved on the SAME shared mesh (URANS-only jobs run that stage first).
     # Non-converged/non-accepted full steady fields are filtered by
@@ -5264,13 +5280,13 @@ def _prepare_transient_case(
             "skipping the in-case short simpleFoam init",
             tcase,
         )
-        potential = _potential_initialization(tcase, runner, patches, dialect)
+        potential = _potential_initialization(tcase, runner, patches, dialect, solver_params)
         _checked_initialization_result(
             tcase, potential, stage="potentialFoam"
         )
         _check_cancel(cancel_check)
         return tmesh, patches
-    potential = _potential_initialization(tcase, runner, patches, dialect)
+    potential = _potential_initialization(tcase, runner, patches, dialect, solver_params)
     _checked_initialization_result(tcase, potential, stage="potentialFoam")
     _check_cancel(cancel_check)
     # Unconditional steady (RANS) initialisation stage, for the URANS-only path
@@ -8420,7 +8436,7 @@ def run_case(
             if not seeded and not is_density_based(runner):
                 # Potential-flow initialisation greatly stabilises the cold RANS start.
                 try:
-                    potential = _potential_initialization(case_dir, runner, patches, dialect)
+                    potential = _potential_initialization(case_dir, runner, patches, dialect, sp)
                     _checked_initialization_result(
                         case_dir, potential, stage="potentialFoam"
                     )
@@ -9497,8 +9513,12 @@ def _solve_cold_marched(
             polar_dir, airfoil, spec.chord, resolved, spec, fluid, roughness, sp,
             runner, cache, cancel_check=cancel_check,
         )
-        if not seeded and not is_density_based(runner):
-            potential = _potential_initialization(polar_dir, runner, patches, dialect)
+        if (
+            not seeded
+            and not is_density_based(runner)
+            and _uses_potential_compressible_startup(runner, solver_params)
+        ):
+            potential = _potential_initialization(polar_dir, runner, patches, dialect, solver_params)
             _checked_initialization_result(
                 polar_dir, potential, stage="potentialFoam"
             )

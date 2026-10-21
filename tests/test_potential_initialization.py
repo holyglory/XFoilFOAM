@@ -7,12 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from airfoilfoam.meshing.base import BoundaryPatch
-from airfoilfoam.openfoam.potential_initialization import (
-    adiabatic_velocity_limit_squared,
-    initialize_compressible_velocity,
-    initialize_quiescent_velocity,
-    internal_velocity_squared,
-)
+from airfoilfoam.openfoam.potential_initialization import adiabatic_velocity_limit_squared, initialize_compressible_velocity, internal_velocity_squared
 from airfoilfoam.openfoam.runner import InfrastructureError, RunResult
 from airfoilfoam.thermodynamics import GasThermodynamics, ThermodynamicState
 
@@ -57,37 +52,6 @@ def latest_evidence(case_dir):
     return case_dir / "pressure_initialization" / receipt["attempt_directory"]
 
 
-def test_quiescent_initialization_preserves_boundaries_and_is_idempotent(tmp_path):
-    runner, patches = fixture(tmp_path)
-    velocity = tmp_path / "0/U"
-    velocity.write_text(
-        "internalField uniform (100 0 0);\n"
-        "boundaryField { inlet { type fixedValue; value uniform (100 0 0); } "
-        "wall { type noSlip; } outlet { type zeroGradient; } }\n"
-    )
-    original_boundary = velocity.read_text().split("boundaryField", 1)[1]
-    receipt = initialize_quiescent_velocity(tmp_path)
-    assert receipt["aerodynamic_evidence"] is False
-    assert "internalField uniform (0 0 0);" in velocity.read_text()
-    assert velocity.read_text().split("boundaryField", 1)[1] == original_boundary
-    assert (tmp_path / "0/p").read_text() == "physical pressure"
-    assert (tmp_path / "0/T").read_text() == "physical temperature"
-    receipt_path = tmp_path / "system" / "quiescent-initialization" / receipt["attempt_directory"] / "receipt.json"
-    receipt_bytes = receipt_path.read_bytes()
-    assert initialize_quiescent_velocity(tmp_path) == receipt
-    assert receipt_path.read_bytes() == receipt_bytes
-
-
-def test_quiescent_initialization_rejects_nonuniform_and_unreceipted_zero(tmp_path):
-    runner, patches = fixture(tmp_path)
-    (tmp_path / "0/U").write_text("internalField nonuniform List<vector> 1 ((100 0 0));")
-    with pytest.raises(InfrastructureError, match="uniform internal velocity"):
-        initialize_quiescent_velocity(tmp_path)
-    (tmp_path / "0/U").write_text("internalField uniform (0 0 0);")
-    with pytest.raises(InfrastructureError, match="matching quiescent receipt"):
-        initialize_quiescent_velocity(tmp_path)
-
-
 def test_potential_velocity_preserves_real_pressure_and_temperature(tmp_path):
     runner, patches = fixture(tmp_path)
     initialize_compressible_velocity(tmp_path, runner, patches, "potentialFoam -writephi -writep -writePhi -withFunctionObjects -initialiseUBCs")
@@ -100,6 +64,36 @@ def test_potential_velocity_preserves_real_pressure_and_temperature(tmp_path):
     assert runner.calls[0][1:] == (1, 600)
     assert receipt["version"] == 3 and receipt["applied"] is True
     assert receipt["fallback_reason"] is None
+
+
+def test_isentropic_potential_seed_updates_only_internal_thermodynamic_fields(tmp_path):
+    runner, patches = fixture(tmp_path)
+    (tmp_path / "0/p").write_text(
+        "internalField uniform 101325;\n"
+        "boundaryField { upstream { type fixedValue; value uniform 101325; } "
+        "downstream { type zeroGradient; } wall { type zeroGradient; } }\n"
+    )
+    (tmp_path / "0/T").write_text(
+        "internalField uniform 300;\n"
+        "boundaryField { upstream { type fixedValue; value uniform 300; } "
+        "downstream { type zeroGradient; } wall { type zeroGradient; } }\n"
+    )
+    original_boundaries = {
+        name: (tmp_path / name).read_text().split("boundaryField", 1)[1]
+        for name in ("0/p", "0/T")
+    }
+    initialize_compressible_velocity(
+        tmp_path, runner, patches, "potentialFoam", startup_mode="isentropic_potential"
+    )
+    for name in ("0/p", "0/T"):
+        content = (tmp_path / name).read_text()
+        assert "nonuniform List<scalar> 2" in content
+        assert content.split("boundaryField", 1)[1] == original_boundaries[name]
+    assert (tmp_path / "constant/thermophysicalProperties").read_text() == "selected material"
+    receipt = json.loads((tmp_path / "pressure-initialization.json").read_text())
+    assert receipt["startup_mode"] == "isentropic_potential"
+    assert receipt["thermodynamic_seed"]["minimum_temperature_k"] > 0
+    assert receipt["protected_boundary_sha256"]
 
 
 @pytest.mark.parametrize("options,error", [({"change_physics": True}, InfrastructureError), ({"failure": True}, RuntimeError)])

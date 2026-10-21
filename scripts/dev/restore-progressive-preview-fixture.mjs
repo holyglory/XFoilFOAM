@@ -66,6 +66,23 @@ const assertEngineIdentity = (actual, expected, label) => {
     assert.equal(actual[field], expected[field], `${label}.${field} changed`);
   }
 };
+const syncEngineRuntime = (engine) => {
+  assert(engine, "Native point is missing runtime identity");
+  return {
+    family: engine.family,
+    distribution: engine.distribution,
+    version: engine.version,
+    numericsRevision: engine.numerics_revision,
+    adapterContractVersion: engine.adapter_contract_version,
+    buildId: engine.build_id,
+    sourceRevision: engine.source_revision ?? null,
+    imageDigest: engine.image_digest ?? null,
+    applicationSourceSha256: engine.application_source_sha256 ?? null,
+    packageSha256: engine.package_sha256 ?? null,
+    binarySha256: engine.binary_sha256 ?? null,
+    architecture: engine.architecture ?? null,
+  };
+};
 const readRetainedFile = async (path, expected, label) => {
   assert(handoffRoot && typeof path === "string" && path.length > 0);
   assert(Number.isSafeInteger(expected.byteSize) && expected.byteSize >= 0);
@@ -242,8 +259,12 @@ const request = async (path, method = "GET", data, sync = false) => {
     redirect: "error",
     signal: AbortSignal.timeout(120000),
   });
-  assert(response.ok, `${method} ${path} returned ${response.status}`);
-  return response.json();
+  const responseText = await response.text();
+  assert(
+    response.ok,
+    `${method} ${path} returned ${response.status}: ${responseText.slice(0, 2048)}`,
+  );
+  return responseText ? JSON.parse(responseText) : null;
 };
 const permissionValues = (payload) =>
   payload.permissions
@@ -257,6 +278,24 @@ const destination = new URL(
   "../../.codex-artifacts/preview-fixture-recovery/",
   import.meta.url,
 );
+const fitDiagnostics = {
+  kind: "retained-native-preview-fit-diagnostics",
+  sourceRunId,
+  sourceJobId: native.job_id,
+  fixtureCampaignId: null,
+  revisionId: null,
+  imported: null,
+  campaignSnapshots: [],
+  polls: [],
+};
+const writeFitDiagnostics = async (conclusion = null) => {
+  await mkdir(destination, { recursive: true });
+  await writeFile(
+    new URL("fit-diagnostics.json", destination),
+    `${JSON.stringify({ ...fitDiagnostics, conclusion, checkedAt: new Date().toISOString() })}\n`,
+    { mode: 0o600 },
+  );
+};
 const restoreAccess = async (saved) => {
   await request("/api/admin/sync", "PATCH", {
     enabled: saved.enabled,
@@ -325,9 +364,13 @@ const download = async (path, expected = null) => {
   }
   return { bytes, sha256, byteSize: bytes.length };
 };
-const canonicalArtifactPath = (jobId, value) => {
+const canonicalArtifactPath = (jobId, value, caseSlug) => {
   const raw = String(value);
   assert(!raw.includes("://"), "Native artifact path must be local to the job");
+  if (!raw.startsWith("/") && !raw.startsWith("jobs/")) {
+    assert(caseSlug, "Native point is missing its case slug");
+    return `cases/${caseSlug}/${raw}`;
+  }
   const text = raw.replace(/^\/+/, "");
   const prefix = `jobs/${jobId}/files/`;
   if (text.startsWith("jobs/")) {
@@ -435,7 +478,11 @@ for (const [polarIndex, polar] of native.polars.entries()) {
       ? retainedPointReference(polarIndex, pointIndex, point)
       : null;
     for (const artifact of point.evidence_artifacts) {
-      const originalPath = canonicalArtifactPath(native.job_id, artifact.path);
+      const originalPath = canonicalArtifactPath(
+        native.job_id,
+        artifact.url ?? artifact.path,
+        point.case_slug ?? null,
+      );
       const stored = retainedHandoff
         ? await readRetainedArtifact(
             pointReference,
@@ -451,7 +498,7 @@ for (const [polarIndex, polar] of native.polars.entries()) {
         artifact.path.split("/").at(-1),
       );
       evidenceArtifacts.push({
-        kind: artifact.kind,
+        kind: artifact.kind === "mesh_evidence" ? "mesh" : artifact.kind,
         field: artifact.field,
         role: artifact.role,
         mimeType: artifact.mime_type,
@@ -468,7 +515,11 @@ for (const [polarIndex, polar] of native.polars.entries()) {
       });
     }
     for (const [field, path] of Object.entries(point.images ?? {})) {
-      const originalPath = canonicalArtifactPath(native.job_id, path);
+      const originalPath = canonicalArtifactPath(
+        native.job_id,
+        path,
+        point.case_slug ?? null,
+      );
       const retained = retainedHandoff
         ? await readRetainedArtifact(
             pointReference,
@@ -560,7 +611,7 @@ for (const [polarIndex, polar] of native.polars.entries()) {
       frameTrack: point.frame_track,
       steadyHistory: point.steady_history,
       methodKey: point.method_key,
-      engine: point.engine ?? native.engine,
+      engine: syncEngineRuntime(point.engine ?? native.engine),
       engineJobId: native.job_id,
       engineCaseSlug: point.case_slug,
       remoteResultId: contributor.resultId,
@@ -639,6 +690,8 @@ try {
     refPressurePa: snapshot.material.refPressurePa,
     speedOfSound: snapshot.material.speedOfSound,
     gasThermodynamics: snapshot.material.gasThermodynamics,
+    dynamicViscosity: snapshot.flowState.dynamicViscosity,
+    kinematicViscosity: snapshot.flowState.kinematicViscosity,
     ...viscosity,
     viscosityModel: viscosity.model,
     viscosityTable:
@@ -729,6 +782,8 @@ try {
     },
   });
   fixtureCampaignId = launched.campaign.id;
+  fitDiagnostics.fixtureCampaignId = fixtureCampaignId;
+  fitDiagnostics.revisionId = revisionId;
   const manifest = new FormData();
   manifest.append(
     "manifest",
@@ -743,6 +798,19 @@ try {
   imported = await request("/api/sync/v1/polars", "POST", manifest, true);
   assert.deepEqual(imported.conflictIds, []);
   assert.equal(imported.imported, 2);
+  fitDiagnostics.imported = {
+    imported: imported.imported,
+    attempts: imported.attempts,
+    artifacts: imported.artifacts,
+    media: imported.media,
+    conflictIds: imported.conflictIds,
+    progressiveEvidenceReceipts: imported.progressiveEvidenceReceipts ?? null,
+    progressiveArchiveReceipts: imported.progressiveArchiveReceipts ?? null,
+    sourceResultIds: report.refined[0].explanation.contributors
+      .filter((item) => item.resultId && item.attemptId)
+      .map((item) => ({ resultId: item.resultId, attemptId: item.attemptId })),
+  };
+  await writeFitDiagnostics();
 } finally {
   if (syncEnabled) {
     await restoreAccess({
@@ -759,6 +827,7 @@ const deadline = Date.now() + 120000;
 let series;
 let bindings = [];
 let waitMs = 250;
+let lastCampaignSnapshotAt = 0;
 while (Date.now() < deadline) {
   const response = await fetch(`${origin}/api/airfoils/ag24`, {
     signal: AbortSignal.timeout(15000),
@@ -773,6 +842,33 @@ while (Date.now() < deadline) {
           (item) => item.resultId && item.attemptId,
         ),
     ) ?? [];
+  const poll = {
+    at: new Date().toISOString(),
+    candidateCount: candidates.length,
+    candidates: candidates.map((candidate) => ({
+      targetId: candidate.targetId,
+      modelId: candidate.modelId,
+      kind: candidate.kind,
+      primaryMethod: candidate.primaryMethod,
+      curveMethods: candidate.curves.map((curve) => curve.method),
+      contributorCount: candidate.explanation?.contributors?.length ?? 0,
+    })),
+  };
+  fitDiagnostics.polls.push(poll);
+  if (Date.now() - lastCampaignSnapshotAt >= 5000) {
+    const campaign = await request(`/api/admin/campaigns/${fixtureCampaignId}`);
+    fitDiagnostics.campaignSnapshots.push({
+      at: poll.at,
+      progressive: campaign.progressive ?? null,
+      conditions: (campaign.conditions ?? []).map((condition) => ({
+        id: condition.id,
+        progressive: condition.progressive ?? null,
+      })),
+      scheduler: campaign.scheduler ?? null,
+    });
+    lastCampaignSnapshotAt = Date.now();
+    await writeFitDiagnostics();
+  }
   for (const candidate of candidates) {
     const candidateBindings = [];
     for (const contributor of candidate.explanation.contributors) {
@@ -829,6 +925,7 @@ assert(
   series,
   "The imported native evidence has not reached a real composite polar",
 );
+await writeFitDiagnostics("composite_polar_observed");
 const receipt = {
   kind: "retained-native-preview-recovery",
   sourceJobId: native.job_id,
