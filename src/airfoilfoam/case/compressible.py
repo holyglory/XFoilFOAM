@@ -43,6 +43,15 @@ class CompressibleCaseBuilder(CaseBuilder):
             raise ValueError("The density-based progressive recipe requires Mach at least 1.2")
         if solver_family != "rhoSimpleFoam" and time_window is None and not (solver_family == "rhoCentralFoam" and not self.solver.force_transient):
             raise ValueError("Transient compressible solvers require an explicit physical-time window")
+        if solver_family == "rhoCentralFoam" and self.solver.compressible_energy_form != "sensibleInternalEnergy":
+            raise ValueError("rhoCentralFoam requires sensible internal energy")
+        if self.solver.compressible_pressure_energy_order == "pressure_first" and solver_family != "rhoSimpleFoam":
+            raise ValueError("The pressure-first energy order requires steady rhoSimpleFoam")
+        if self.solver.compressible_farfield_boundary == "total_inlet_static_outlet":
+            if solver_family != "rhoSimpleFoam":
+                raise ValueError("The total-inlet static-outlet farfield requires steady rhoSimpleFoam")
+            if gas.heat_capacity_model != "constant_cp":
+                raise ValueError("The total-inlet boundary requires constant heat capacity and gamma")
         self.gas = gas
         self.state = state
         self.solver_family = solver_family
@@ -56,11 +65,7 @@ class CompressibleCaseBuilder(CaseBuilder):
         )
         steady_command = (
             "xfoilfoamRhoSimpleFoam"
-            if solver_family in {"rhoSimpleFoam", "rhoPimpleFoam"}
-            and (
-                self.solver.compressible_pressure_energy_order == "pressure_first"
-                or gas.transport_model == "polynomial"
-            )
+            if self.solver.compressible_pressure_energy_order == "pressure_first"
             else solver_family
         )
         self.dialect = replace(
@@ -71,8 +76,20 @@ class CompressibleCaseBuilder(CaseBuilder):
             y_plus_command=f"{steady_command} -postProcess -func yPlus -latestTime",
         )
 
+    def _farfield_total_values(self) -> tuple[float, float, float]:
+        gamma = self.gas.gamma_at(self.state.temperature_k)
+        mach = self.spec.speed / self.gas.speed_of_sound(self.state)
+        ratio = 1 + 0.5 * (gamma - 1) * mach * mach
+        return (
+            self.state.pressure_pa * ratio ** (gamma / (gamma - 1)),
+            self.state.temperature_k * ratio,
+            gamma,
+        )
+
     def _write_constant(self, turb) -> None:
-        write_foam_dict(self._p("constant", "thermophysicalProperties"), "dictionary", "thermophysicalProperties", self.gas.openfoam_dictionary())
+        thermophysical = self.gas.openfoam_dictionary()
+        thermophysical["thermoType"]["energy"] = self.solver.compressible_energy_form
+        write_foam_dict(self._p("constant", "thermophysicalProperties"), "dictionary", "thermophysicalProperties", thermophysical)
         write_foam_dict(self._p("constant", "turbulenceProperties"), "dictionary", "turbulenceProperties", {
             "simulationType": "RAS", "RAS": {"RASModel": turb.ras_model, "turbulence": "on", "printCoeffs": "on"},
         })
@@ -84,9 +101,23 @@ class CompressibleCaseBuilder(CaseBuilder):
         self._write_numerical_execution()
 
     def _write_numerical_execution(self) -> None:
+        farfield_reference = {}
+        if self.solver.compressible_farfield_boundary == "total_inlet_static_outlet":
+            total_pressure, total_temperature, gamma = self._farfield_total_values()
+            farfield_reference = {"farfield_reference": {
+                "static_pressure_pa": self.state.pressure_pa,
+                "static_temperature_k": self.state.temperature_k,
+                "total_pressure_pa": total_pressure,
+                "total_temperature_k": total_temperature,
+                "gamma": gamma,
+            }}
         self._p("constant", "numericalExecution.json").write_text(json.dumps({
             "version": 1, "solver_family": self.solver_family,
+            "compressible_startup": self.solver.compressible_startup,
+            "compressible_energy_form": self.solver.compressible_energy_form,
+            "compressible_pressure_energy_order": self.solver.compressible_pressure_energy_order if self.solver_family == "rhoSimpleFoam" else "standard",
             "compressible_farfield_boundary": self.solver.compressible_farfield_boundary,
+            **farfield_reference,
             "time_coordinate": "local_pseudo_time_iterations" if self.local_steady else "steady_iterations" if self.solver_family == "rhoSimpleFoam" else "physical_time_seconds",
             "physical_time_history": self.solver_family != "rhoSimpleFoam" and not self.local_steady,
             **({"local_time_step_smoothing": self.local_time_step_smoothing} if self.local_steady else {}),
@@ -168,9 +199,11 @@ class CompressibleCaseBuilder(CaseBuilder):
         else:
             prefix = "" if transient else "bounded "
             momentum = prefix + ("Gauss upwind" if self.solver.momentum_scheme == "upwind" else "Gauss linearUpwind limited")
+            energy = prefix + "Gauss upwind" if self.solver.compressible_energy_advection == "upwind" else momentum
+            energy_field = "h" if self.solver.compressible_energy_form == "sensibleEnthalpy" else "e"
             schemes["divSchemes"] = {
-                "default": "none", "div(phi,U)": momentum, "div(phi,e)": momentum,
-                "div(phi,K)": momentum, "div(phi,Ekp)": momentum,
+                "default": "none", "div(phi,U)": momentum, f"div(phi,{energy_field})": energy,
+                "div(phi,K)": energy, "div(phi,Ekp)": energy,
                 "div(phiv,p)": "Gauss upwind",
                 "div(phid,p)": "Gauss upwind", "div((phi|interpolate(rho)),p)": prefix + "Gauss upwind",
                 "div(((rho*nuEff)*dev2(T(grad(U)))))": "Gauss linear", **turb.div_schemes,
@@ -179,8 +212,14 @@ class CompressibleCaseBuilder(CaseBuilder):
 
     def _write_fv_solution(self, turb) -> None:
         transport = {"solver": "PBiCGStab", "preconditioner": "DILU", "tolerance": 1e-8, "relTol": 0.01}
-        pressure = {"solver": "GAMG", "smoother": "GaussSeidel", "tolerance": 1e-7, "relTol": 0.01}
-        variables = "|".join(["U", "e", "h", *turb.solver_vars])
+        pressure = (
+            {"solver": "PBiCGStab", "preconditioner": "DILU", "tolerance": 1e-7, "relTol": 0.01}
+            if self.solver.compressible_pressure_solver == "PBiCGStab"
+            else {"solver": "GAMG", "smoother": "GaussSeidel", "tolerance": 1e-7, "relTol": 0.01}
+        )
+        energy_field = "h" if self.solver.compressible_energy_form == "sensibleEnthalpy" else "e"
+        energy_fields = ["e", "h"] if self.solver_family == "rhoCentralFoam" else [energy_field]
+        variables = "|".join(["U", *energy_fields, *turb.solver_vars])
         solution = {"solvers": {"p": pressure, "pFinal": {**pressure, "relTol": 0},
                                 f'"({variables})"': transport, f'"({variables})Final"': {**transport, "relTol": 0}}}
         if self.solver_family == "rhoCentralFoam":
@@ -193,14 +232,16 @@ class CompressibleCaseBuilder(CaseBuilder):
             solution["solvers"]["Phi"] = {"solver": "GAMG", "smoother": "DIC", "tolerance": 1e-6, "relTol": 0.01}
             solution["potentialFlow"] = {"nNonOrthogonalCorrectors": 10}
             if self.solver_family == "rhoSimpleFoam":
-                solution["SIMPLE"] = {"nNonOrthogonalCorrectors": 1, "consistent": "no", "pMinFactor": 0.1, "pMaxFactor": 2,
-                                      "transonic": "no", "residualControl": {name: self.solver.convergence_tolerance for name in ["p", "U", "e", *turb.solver_vars]}}
+                solution["SIMPLE"] = {"nNonOrthogonalCorrectors": 1, "consistent": "yes" if self.solver.compressible_pressure_consistent else "no", "pMinFactor": 0.1, "pMaxFactor": 2,
+                                      "transonic": "yes" if self.solver.compressible_transonic else "no", "residualControl": {name: self.solver.convergence_tolerance for name in ["p", "U", energy_field, *turb.solver_vars]}}
+                if self.solver.compressible_pressure_min_factor is not None:
+                    solution["SIMPLE"]["pMin"] = self.state.pressure_pa * self.solver.compressible_pressure_min_factor
             else:
                 solution["solvers"]["rho"] = {"solver": "diagonal"}
                 solution["solvers"]["rhoFinal"] = {"solver": "diagonal"}
                 solution["PIMPLE"] = {"momentumPredictor": "yes", "nOuterCorrectors": 3, "nCorrectors": 2,
                                       "nNonOrthogonalCorrectors": 1, "transonic": "yes"}
-            solution["relaxationFactors"] = {"fields": {"p": 0.3, "rho": 0.01}, "equations": {"U": 0.3 if self.solver_family == "rhoSimpleFoam" else 0.7, "e": 0.7, **{name: 0.5 for name in turb.solver_vars}}}
+            solution["relaxationFactors"] = {"fields": {"p": 0.3, "rho": 0.01}, "equations": {"U": 0.3 if self.solver_family == "rhoSimpleFoam" else 0.7, energy_field: self.solver.compressible_energy_relaxation, **{name: 0.5 for name in turb.solver_vars}}}
         write_foam_dict(self._p("system", "fvSolution"), "dictionary", "fvSolution", solution)
 
     def _write_zero(self, turb) -> None:
@@ -212,19 +253,30 @@ class CompressibleCaseBuilder(CaseBuilder):
             self.solver_family == "rhoCentralFoam"
             or self.solver.compressible_farfield_boundary == "density_static_freestream"
         )
+        total_inlet = self.solver.compressible_farfield_boundary == "total_inlet_static_outlet"
+        inlet_pressure = {"type": "freestreamPressure", "freestreamValue": Raw(pressure)}
+        inlet_temperature = {"type": "fixedValue", "value": Raw(temperature)}
+        outlet_temperature = {"type": "inletOutlet", "inletValue": Raw(temperature), "value": Raw(temperature)}
+        if total_inlet:
+            total_pressure, total_temperature, gamma = self._farfield_total_values()
+            inlet_pressure = {"type": "totalPressure", "p0": Raw(f"uniform {total_pressure:.12g}"),
+                              "psi": "thermo:psi", "gamma": gamma, "value": Raw(pressure)}
+            inlet_temperature = {"type": "inletOutletTotalTemperature", "T0": Raw(f"uniform {total_temperature:.12g}"),
+                                 "psi": "thermo:psi", "gamma": gamma, "inletValue": Raw(temperature), "value": Raw(temperature)}
+            outlet_temperature = inlet_temperature.copy()
         self._write_field("U", "volVectorField", dimensions(0, 1, -1, 0, 0, 0, 0), velocity, {
             self.inlet: {"type": "fixedValue" if supersonic else "freestreamVelocity", "value": Raw(velocity), **({} if supersonic else {"freestreamValue": Raw(velocity)})},
             self.outlet: {"type": "zeroGradient"} if supersonic else {"type": "freestreamVelocity", "freestreamValue": Raw(velocity), "value": Raw(velocity)},
             self.wall: {"type": "noSlip"}, self.empty: {"type": "empty"},
         })
         self._write_field("p", "volScalarField", dimensions(1, -1, -2, 0, 0, 0, 0), pressure, {
-            self.inlet: {"type": "fixedValue", "value": Raw(pressure)} if supersonic else {"type": "freestreamPressure", "freestreamValue": Raw(pressure)},
+            self.inlet: {"type": "fixedValue", "value": Raw(pressure)} if supersonic else inlet_pressure,
             self.outlet: {"type": "zeroGradient"} if supersonic else {"type": "freestreamPressure", "freestreamValue": Raw(pressure)},
             self.wall: {"type": "zeroGradient"}, self.empty: {"type": "empty"},
         })
         self._write_field("T", "volScalarField", dimensions(0, 0, 0, 1, 0, 0, 0), temperature, {
-            self.inlet: {"type": "fixedValue", "value": Raw(temperature)},
-            self.outlet: {"type": "zeroGradient"} if supersonic else {"type": "inletOutlet", "inletValue": Raw(temperature), "value": Raw(temperature)},
+            self.inlet: inlet_temperature,
+            self.outlet: {"type": "zeroGradient"} if supersonic else outlet_temperature,
             self.wall: {"type": "zeroGradient"}, self.empty: {"type": "empty"},
         })
         self._write_field("alphat", "volScalarField", dimensions(1, -1, -1, 0, 0, 0, 0), "uniform 0", {
@@ -239,6 +291,8 @@ class CompressibleCaseBuilder(CaseBuilder):
     def write_transient(self, case_dir, start_time, end_time, delta_t, write_interval=None, max_delta_t=None) -> None:
         if self.local_steady:
             raise ValueError("Local pseudo-time cannot be continued as physical-time URANS")
+        if self.solver.compressible_farfield_boundary == "total_inlet_static_outlet":
+            raise ValueError("The total-inlet static-outlet farfield requires steady rhoSimpleFoam, not physical-time continuation")
         if write_interval is None or max_delta_t is None:
             raise ValueError("Compressible continuation needs explicit physical step and retained-field cadence")
         self._case_dir = case_dir

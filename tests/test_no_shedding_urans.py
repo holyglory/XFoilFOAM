@@ -17,6 +17,7 @@ absent force data is an honest failure.
 """
 import json
 import math
+import re
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -195,6 +196,66 @@ def test_absent_history_is_not_no_shedding():
     # No force data at all is NOT no-shedding: it is an honest failure, and
     # there is nothing to average.
     assert not is_no_shedding(None)
+
+
+@pytest.mark.parametrize(
+    "span_s,courant,enabled,noisy_moment,corrupt,ripple,expected_courant",
+    [
+        (0.02, 4.0, True, False, False, False, 4.0),
+        (0.02, 4.0, True, False, False, True, 4.0),
+        (0.003, 4.0, True, False, False, False, 1.0),
+        (0.02, 4.0, False, False, False, False, 1.0),
+        (0.02, 4.0, True, True, False, False, 1.0),
+        (0.02, 4.0, True, False, True, False, 1.0),
+        (0.02, 0.5, True, False, False, False, 0.5),
+        (0.02, 15.0, True, False, False, False, 1.0),
+    ],
+)
+def test_quiet_startup_releases_bounded_timestep_without_accepting_short_history(
+    tmp_path, span_s, courant, enabled, noisy_moment, corrupt, ripple, expected_courant,
+):
+    system = tmp_path / "system"
+    system.mkdir()
+    startup_courant = min(courant, 1.0)
+    startup_step = 1.3333333333333334e-6
+    control = system / "controlDict"
+    control.write_text(
+        f"maxCo {startup_courant:g};\nmaxDeltaT {startup_step:.12g};\n"
+        "writeInterval 0.000373345;\nrunTimeModifiable true;\n"
+    )
+    coefficient = tmp_path / "postProcessing/forceCoeffs1/600/coefficient.dat"
+    coefficient.parent.mkdir(parents=True)
+    rows = ["# Time Cd Cl CmPitch"]
+    for sample_index in range(401):
+        timestamp = 600.0 + span_s * sample_index / 400.0
+        lift = -0.0444 + (0.0002 * math.sin(2.0 * math.pi * (timestamp - 600.0) / 0.005) if ripple else 0.0)
+        moment = -0.099 + (0.01 * math.sin(sample_index) if noisy_moment else 0.0)
+        if corrupt and sample_index == 400:
+            moment = math.nan
+        rows.append(f"{timestamp:.12f} 0.0243765 {lift:.12g} {moment:.12g}")
+    coefficient.write_text("\n".join(rows) + "\n")
+    solver = SolverParams(
+        force_transient=True, urans_fidelity="full", transient_max_courant=courant,
+    )
+    spec = CaseSpec(chord=0.05, speed=30.0, aoa_deg=-5.0)
+    monitor = pipeline._make_urans_monitor(
+        tmp_path, spec, 600.0, solver_params=solver,
+        settled_max_courant=courant, startup_max_delta_t=startup_step,
+        allow_quiet_startup_release=enabled,
+    )
+    monitor()
+    text = control.read_text()
+    assert f"maxCo {expected_courant:g};" in text
+    expected_step = startup_step * (courant if expected_courant > startup_courant else 1.0)
+    assert float(re.search(r"maxDeltaT\s+([^;]+);", text)[1]) == pytest.approx(expected_step)
+    if not ripple:
+        assert "writeInterval 0.000373345;" in text
+    assert "stopAt" not in text
+    assert not (tmp_path / pipeline.URANS_EARLY_STOP_MARKER).exists()
+    history = force_history(coefficient, speed=spec.speed, chord=spec.chord, discard_fraction=0.4)
+    quality = evaluate_urans_quality(tmp_path, history, speed=spec.speed, chord=spec.chord)
+    assert not quality.ok
+    assert not quality.no_shedding
 
 
 # --- decision routes through evaluate_urans_quality -----------------------

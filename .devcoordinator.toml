@@ -1,5 +1,31 @@
 schema = 2
 
+[test.low-mach-throughput-repair]
+timeout_seconds = 1200
+env = { PYTHONPATH = "src", PYTHONDONTWRITEBYTECODE = "1" }
+
+[[test.low-mach-throughput-repair.check]]
+name = "source-contract"
+tier = "development"
+command = [".venv/bin/python", "-m", "pytest", "tests/test_no_shedding_urans.py", "tests/test_frame_track.py", "-q"]
+
+[[test.low-mach-throughput-repair.check]]
+name = "native-timestep-comparison"
+tier = "pre-merge"
+requires = ["source-contract"]
+timeout_seconds = 1000
+command = [".venv/bin/python", ".codex-artifacts/low-mach-throughput-20261022/timestep_canary.py"]
+retained_artifacts = [{ name = "fx61147-native-timestep-comparison", path = ".codex-artifacts/low-mach-throughput-20261022/native-output", max_bytes = 268435456 }]
+
+[test.compressible-dictionary-repair]
+timeout_seconds = 180
+env = { PYTHONPATH = "src", PYTHONDONTWRITEBYTECODE = "1" }
+
+[[test.compressible-dictionary-repair.check]]
+name = "source-contract"
+tier = "development"
+command = [".venv/bin/python", "-m", "pytest", "tests/test_compressible_case.py", "tests/test_compressible_execution.py", "-q"]
+
 [test.cfd-source-geometry]
 timeout_seconds = 1800
 

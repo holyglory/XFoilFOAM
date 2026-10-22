@@ -3612,6 +3612,7 @@ def _make_urans_monitor(
     solver_params: Optional[SolverParams] = None,
     settled_max_courant: Optional[float] = None,
     startup_max_delta_t: Optional[float] = None,
+    allow_quiet_startup_release: bool = False,
 ) -> Callable[[], None]:
     configured_max_courant = (
         solver_params.transient_max_courant
@@ -3649,6 +3650,50 @@ def _make_urans_monitor(
             min_frames_per_cycle=URANS_MIN_FRAMES_PER_CYCLE,
         )
         period = result.period_s
+        if (
+            allow_quiet_startup_release
+            and solver_params is not None
+            and solver_params.force_transient
+            and solver_params.urans_fidelity == UransFidelity.full
+            and not state.get("courant_released")
+            and not state.get("impulse_recovery_armed")
+            and settled_max_courant is not None
+            and URANS_STARTUP_MAX_COURANT < float(settled_max_courant) <= 4.0
+            and startup_max_delta_t is not None
+            and math.isfinite(startup_max_delta_t)
+            and startup_max_delta_t > 0
+            and coefficient_invalid_value_times(coeff_files).size == 0
+        ):
+            quiet_history = compute_force_history(
+                coeff_files,
+                spec.speed,
+                spec.chord,
+                solver_params.transient_discard_fraction,
+                alpha_deg=spec.aoa_deg,
+                section_thickness_ratio=spec.section_thickness_ratio,
+            )
+            initial_period = physics.shedding_period(
+                spec.speed, spec.chord, strouhal=TRANSIENT_INITIAL_STROUHAL
+            )
+            startup_observation = 2.0 * initial_period
+            if (
+                is_no_shedding(quiet_history)
+                and quiet_history.t[-1] - quiet_history.t[0] >= startup_observation
+            ):
+                _set_control_dict_entries(
+                    tcase / "system" / "controlDict",
+                    {
+                        "maxCo": float(settled_max_courant),
+                        "maxDeltaT": min(
+                            startup_max_delta_t,
+                            STARTUP_MAX_DELTA_T_FACTOR * initial_period / 5000.0,
+                        ) * (
+                            float(settled_max_courant) / URANS_STARTUP_MAX_COURANT
+                        ),
+                        "runTimeModifiable": True,
+                    },
+                )
+                state["courant_released"] = True
         if period is not None and period > 0 and math.isfinite(period):
             previous = state.get("cadence_period")
             if previous is None or abs(float(previous) - period) / max(period, 1e-12) > 0.15:
@@ -5501,6 +5546,7 @@ def _run_transient_attempt(
                 solver_params=pass_params,
                 settled_max_courant=settled_max_courant,
                 startup_max_delta_t=pass_max_delta_t,
+                allow_quiet_startup_release=not is_compressible(runner),
             ),
         )
         wall_seconds += max(0.0, time.monotonic() - solve_started)

@@ -1,4 +1,5 @@
 from pathlib import Path
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -8,13 +9,14 @@ from airfoilfoam import pipeline
 from airfoilfoam.airfoil import Airfoil, parse_airfoil
 from airfoilfoam.cache import EngineCache
 from airfoilfoam.meshing.base import BoundaryPatch
-from airfoilfoam.models import PolarRequest, SolverParams
+from airfoilfoam.models import CaseSpec, PolarRequest, SolverParams
 from airfoilfoam.openfoam.budget import BudgetedRunner
 from airfoilfoam.openfoam.dialects import OPENCFD_2606, dialect_for_runner
 from airfoilfoam.openfoam.execution import configure_flow_execution, is_compressible, is_density_based
 from airfoilfoam.openfoam.rans_hold import root_entry
 from airfoilfoam.openfoam.runner import InfrastructureError, MaterialDomainError, RunResult, Runner
 from airfoilfoam.thermodynamics import GasThermodynamics, ThermodynamicState
+from airfoilfoam.transport import PolynomialTransport
 
 
 class RecordedRunner(Runner):
@@ -83,6 +85,48 @@ def test_explicit_variable_calorics_reach_the_request_scoped_execution(request_p
     assert runner.flow_execution.gas.heat_capacity_at(800) == pytest.approx(gas.gas_constant * 3.8)
     assert runner.flow_execution.gas.openfoam_dictionary()["thermoType"]["thermo"] == "janaf"
     assert PolarRequest.model_validate_json(request.model_dump_json()) == request
+
+
+@pytest.mark.parametrize("family,mach", [("rhoSimpleFoam", 0.72), ("rhoPimpleFoam", 0.95), ("rhoCentralFoam", 3)])
+def test_source_fitted_requests_keep_the_requested_stock_solver(request_payload, tmp_path, family, mach):
+    fixture = json.loads((Path(__file__).parent / "fixtures/air-thermophysics-audit.json").read_text())
+    transport = PolynomialTransport.model_validate(fixture["transport"])
+    gas = GasThermodynamics(
+        gas_constant=fixture["gas_constant"], heat_capacity_model="nasa7", nasa7=fixture["calorics"],
+        transport_model="polynomial", polynomial_transport=transport, reference_temperature_k=298,
+        reference_dynamic_viscosity=transport.dynamic_viscosity(298),
+        provenance="Isolated source-derived request routing regression",
+    )
+    state = ThermodynamicState.model_validate(request_payload["flow_state"])
+    request_payload["fluid"] = {
+        "gas": gas.model_dump(), "density": gas.density(state),
+        "dynamic_viscosity": gas.dynamic_viscosity(state.temperature_k),
+    }
+    request_payload["speeds"] = [mach * gas.speed_of_sound(state)]
+    request_payload["solver"].update(flow_solver_family=family, force_transient=family != "rhoSimpleFoam")
+    runner = RecordedRunner()
+    request = PolarRequest.model_validate(request_payload)
+    configure_flow_execution(runner, request)
+    dialect = dialect_for_runner(runner)
+    assert dialect.steady_solver_command == family
+    assert dialect.control_solver_value_steady == family
+    assert dialect.y_plus_command.startswith(f"{family} ")
+    assert dialect.transient_solver_command == ("rhoCentralFoam" if family == "rhoCentralFoam" else "rhoPimpleFoam")
+    airfoil = Airfoil.from_contour("ag24", parse_airfoil(request.airfoil.coordinates))
+    patches = [BoundaryPatch("airfoil", "wall"), BoundaryPatch("inlet", "inlet"),
+               BoundaryPatch("outlet", "outlet"), BoundaryPatch("frontAndBack", "empty")]
+    case = pipeline._case_builder(
+        runner, airfoil, patches, request.mesh,
+        CaseSpec(chord=request.chord_lengths[0], speed=request.speeds[0], aoa_deg=0),
+        request.fluid, request.roughness, request.solver,
+    )
+    case.write(tmp_path)
+    assert case.dialect == dialect
+    control = " ".join((tmp_path / "system/controlDict").read_text().split())
+    assert f"application {family};" in control
+    assert "/opt/xfoilfoam-thermophysics/lib/libxfoilfoamThermophysics.so" in control
+    thermophysical = (tmp_path / "constant/thermophysicalProperties").read_text()
+    assert "janaf" in thermophysical and "muCoeffs<8>" in thermophysical
 
 
 def test_request_rejects_calorics_that_cover_freestream_but_not_stagnation(request_payload):

@@ -116,21 +116,58 @@ def test_gas_state_and_transport_are_consistent(gas, state):
         pressure_coefficient(state.pressure_pa, state, gas.density(state), 0)
 
 
-def test_enthalpy_recipe_changes_only_the_compressible_energy_contract(tmp_path, gas, state):
-    case = builder(gas, state, solver=SolverParams(compressible_energy_form="sensibleEnthalpy"))
+@pytest.mark.parametrize("family", ["rhoSimpleFoam", "rhoPimpleFoam"])
+@pytest.mark.parametrize("energy_form,energy_field,unused_field", [
+    ("sensibleInternalEnergy", "e", "h"), ("sensibleEnthalpy", "h", "e"),
+])
+def test_enthalpy_recipe_changes_only_the_compressible_energy_contract(tmp_path, gas, state, family, energy_form, energy_field, unused_field):
+    case = builder(gas, state, family, time_window=window() if family == "rhoPimpleFoam" else None,
+                   solver=SolverParams(force_transient=family == "rhoPimpleFoam", compressible_energy_form=energy_form,
+                                       compressible_energy_relaxation=0.2))
     case.write(tmp_path)
-    thermo = (tmp_path / "constant/thermophysicalProperties").read_text()
-    schemes = (tmp_path / "system/fvSchemes").read_text()
-    solution = (tmp_path / "system/fvSolution").read_text()
-    assert "energy          sensibleEnthalpy;" in thermo
-    assert "div(phi,h)" in schemes and "div(phi,e)" not in schemes
-    assert "h               1e-05;" in solution and "e               1e-05;" not in solution
+    thermo = " ".join((tmp_path / "constant/thermophysicalProperties").read_text().split())
+    schemes = " ".join((tmp_path / "system/fvSchemes").read_text().split())
+    solution = " ".join((tmp_path / "system/fvSolution").read_text().split())
+    assert f"energy {energy_form};" in thermo
+    assert f"div(phi,{energy_field})" in schemes and f"div(phi,{unused_field})" not in schemes
+    assert f"{energy_field} 0.2;" in solution and f"{unused_field} 0.2;" not in solution
+    assert f'"(U|{energy_field}|k|omega)"' in solution
+    if family == "rhoSimpleFoam":
+        assert f"{energy_field} 1e-05;" in solution and f"{unused_field} 1e-05;" not in solution
+    protected = (tmp_path / "constant/thermophysicalProperties").read_bytes()
+    case.write_transient(tmp_path, 0, 0.01, 1e-8, write_interval=1e-4, max_delta_t=1e-6)
+    assert (tmp_path / "constant/thermophysicalProperties").read_bytes() == protected
+    assert f"div(phi,{energy_field})" in (tmp_path / "system/fvSchemes").read_text()
+    identity = json.loads((tmp_path / "constant/numericalExecution.json").read_text())
+    assert identity["compressible_energy_form"] == energy_form
+    assert gas.openfoam_dictionary()["thermoType"]["energy"] == "sensibleInternalEnergy"
 
 
-def test_consistent_pressure_recipe_is_explicit(tmp_path, gas, state):
-    case = builder(gas, state, solver=SolverParams(compressible_pressure_consistent=True))
+@pytest.mark.parametrize("consistent", [False, True])
+def test_consistent_pressure_recipe_is_explicit(tmp_path, gas, state, consistent):
+    case = builder(gas, state, solver=SolverParams(compressible_pressure_consistent=consistent))
     case.write(tmp_path)
-    assert "consistent      yes;" in (tmp_path / "system/fvSolution").read_text()
+    solution = " ".join((tmp_path / "system/fvSolution").read_text().split())
+    assert f"consistent {'yes' if consistent else 'no'};" in solution
+
+
+def test_pressure_diagnostic_controls_reach_the_generated_equations(tmp_path, gas, state):
+    case = builder(gas, state, solver=SolverParams(
+        compressible_pressure_solver="PBiCGStab", compressible_pressure_min_factor=0.5,
+        compressible_transonic=True, compressible_energy_advection="upwind",
+    ))
+    case.write(tmp_path)
+    solution = " ".join((tmp_path / "system/fvSolution").read_text().split())
+    schemes = " ".join((tmp_path / "system/fvSchemes").read_text().split())
+    assert "p { solver PBiCGStab; preconditioner DILU; tolerance 1e-07; relTol 0.01; }" in solution
+    assert "pFinal { solver PBiCGStab; preconditioner DILU; tolerance 1e-07; relTol 0; }" in solution
+    assert "transonic yes;" in solution and f"pMin {state.pressure_pa * 0.5:g};" in solution
+    assert "div(phi,U) bounded Gauss linearUpwind limited;" in schemes
+    for field in ["e", "K", "Ekp"]:
+        assert f"div(phi,{field}) bounded Gauss upwind;" in schemes
+    reference = json.loads((tmp_path / "constant/aerodynamicReference.json").read_text())
+    assert reference["pressure_pa"] == state.pressure_pa
+    assert reference["temperature_k"] == state.temperature_k
 
 
 def test_sutherland_preserves_reference_and_explicit_conductivity_contract(gas):
@@ -161,6 +198,8 @@ def test_explicit_nasa7_case_writes_the_supplied_caloric_model(tmp_path, gas, st
     normalized = " ".join(thermo.split())
     assert "Tlow 150;" in normalized and "Thigh 1500;" in normalized
     assert "sensibleInternalEnergy" in thermo
+    with pytest.raises(ValueError, match="constant heat capacity"):
+        builder(variable, state, solver=SolverParams(compressible_farfield_boundary="total_inlet_static_outlet"))
 
 
 
@@ -197,6 +236,13 @@ def test_pressure_first_energy_order_selects_the_governed_solver(tmp_path, gas, 
     identity = json.loads((tmp_path / "constant/numericalExecution.json").read_text())
     assert "application xfoilfoamRhoSimpleFoam;" in control
     assert identity["compressible_pressure_energy_order"] == "pressure_first"
+    assert case.dialect.steady_solver_command == "xfoilfoamRhoSimpleFoam"
+    assert case.dialect.y_plus_command.startswith("xfoilfoamRhoSimpleFoam ")
+    case.write_transient(tmp_path, 0, 0.01, 1e-8, write_interval=1e-4, max_delta_t=1e-6)
+    control = " ".join((tmp_path / "system/controlDict").read_text().split())
+    identity = json.loads((tmp_path / "constant/numericalExecution.json").read_text())
+    assert "application rhoPimpleFoam;" in control
+    assert identity["compressible_pressure_energy_order"] == "standard"
 
 
 def test_total_inlet_static_outlet_farfield_preserves_reference_state(tmp_path, gas, state):
@@ -221,6 +267,16 @@ def test_total_inlet_static_outlet_farfield_preserves_reference_state(tmp_path, 
     assert identity["compressible_farfield_boundary"] == "total_inlet_static_outlet"
     assert identity["farfield_reference"]["static_pressure_pa"] == state.pressure_pa
     assert identity["farfield_reference"]["static_temperature_k"] == state.temperature_k
+    assert identity["farfield_reference"]["total_pressure_pa"] == pytest.approx(total_pressure)
+    assert identity["farfield_reference"]["total_temperature_k"] == pytest.approx(total_temperature)
+    reference = json.loads((tmp_path / "constant/aerodynamicReference.json").read_text())
+    assert reference["pressure_pa"] == state.pressure_pa and reference["temperature_k"] == state.temperature_k
+    assert gas.heat_capacity_at(state.temperature_k) * (total_temperature - state.temperature_k) == pytest.approx(0.5 * case.spec.speed ** 2)
+    protected = {path: path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()}
+    with pytest.raises(ValueError, match="steady rhoSimpleFoam"):
+        case.write_transient(tmp_path, 0, 0.01, 1e-8, write_interval=1e-4, max_delta_t=1e-6)
+    assert {path: path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()} == protected
+    assert case.solver_family == "rhoSimpleFoam" and case.time_window is None
 
 
 @pytest.mark.parametrize("mach", [0.72, 0.9, 1])
@@ -286,6 +342,12 @@ def test_compressible_inputs_reject_mismatched_state_and_missing_timing(gas, sta
         builder(gas, state, "rhoCentralFoam", 3.01, time_window=window())
     with pytest.raises(ValueError, match="at least 1.2"):
         builder(gas, state, "rhoCentralFoam", 0.8, time_window=window())
+    with pytest.raises(ValueError, match="sensible internal energy"):
+        builder(gas, state, "rhoCentralFoam", 3, time_window=window(),
+                solver=SolverParams(force_transient=True, compressible_energy_form="sensibleEnthalpy"))
+    with pytest.raises(ValueError, match="pressure-first"):
+        builder(gas, state, "rhoPimpleFoam", time_window=window(),
+                solver=SolverParams(force_transient=True, compressible_pressure_energy_order="pressure_first"))
 
 
 def test_pressure_based_continuation_never_reverts_to_incompressible_dictionaries(tmp_path, gas, state):
@@ -312,8 +374,8 @@ def test_source_fitted_material_loads_the_native_library_in_every_solver_and_con
     case.write(tmp_path)
     library = 'libs            ("/opt/xfoilfoam-thermophysics/lib/libxfoilfoamThermophysics.so");'
     assert library in (tmp_path / "system/controlDict").read_text()
-    if family == "rhoSimpleFoam":
-        assert case.dialect.steady_solver_command == "rhoSimpleFoam"
+    assert case.dialect.steady_solver_command == family
+    assert case.dialect.y_plus_command.startswith(f"{family} ")
     assert "muCoeffs<8>" in (tmp_path / "constant/thermophysicalProperties").read_text()
     case.write_transient(tmp_path, start_time=0, end_time=0.01, delta_t=1e-7, write_interval=1e-4, max_delta_t=1e-5)
     assert library in (tmp_path / "system/controlDict").read_text()
