@@ -1,5 +1,47 @@
 schema = 2
 
+[test.low-mach-exact-geometry-regrade]
+timeout_seconds = 300
+env = { PYTHONPATH = "src:.", PYTHONDONTWRITEBYTECODE = "1" }
+
+[[test.low-mach-exact-geometry-regrade.check]]
+name = "retained-raw-grading"
+tier = "development"
+command = [".venv/bin/python", ".codex-artifacts/low-mach-full-duration-20261022/regrade_exact_geometry.py"]
+retained_artifacts = [{ name = "fx61147-exact-geometry-regrade", path = ".codex-artifacts/low-mach-full-duration-20261022/geometry-regrade", max_bytes = 16777216 }]
+
+[test.low-mach-full-duration]
+timeout_seconds = 18000
+env = { PYTHONPATH = "src", PYTHONDONTWRITEBYTECODE = "1" }
+
+[[test.low-mach-full-duration.check]]
+name = "source-contract"
+tier = "development"
+command = [".venv/bin/python", "-m", "pytest", "tests/test_no_shedding_urans.py", "tests/test_frame_track.py", "-q"]
+
+[[test.low-mach-full-duration.check]]
+name = "candidate"
+tier = "pre-merge"
+requires = ["source-contract"]
+timeout_seconds = 17000
+command = [".venv/bin/python", "-m", "scripts.materials.validate_low_mach_timestep", "--input-directory", ".codex-artifacts/low-mach-throughput-20261022", "--destination", ".codex-artifacts/low-mach-full-duration-20261022", "--variant", "candidate", "--end-time", "600.075", "--timeout", "16000"]
+retained_artifacts = [{ name = "fx61147-full-duration-candidate", path = ".codex-artifacts/low-mach-full-duration-20261022/candidate", max_bytes = 1073741824 }]
+
+[[test.low-mach-full-duration.check]]
+name = "refined"
+tier = "pre-merge"
+requires = ["source-contract"]
+timeout_seconds = 17000
+command = [".venv/bin/python", "-m", "scripts.materials.validate_low_mach_timestep", "--input-directory", ".codex-artifacts/low-mach-throughput-20261022", "--destination", ".codex-artifacts/low-mach-full-duration-20261022", "--variant", "refined", "--end-time", "600.075", "--timeout", "16000"]
+retained_artifacts = [{ name = "fx61147-full-duration-refined", path = ".codex-artifacts/low-mach-full-duration-20261022/refined", max_bytes = 1073741824 }]
+
+[[test.low-mach-full-duration.check]]
+name = "comparison"
+tier = "pre-merge"
+after = ["candidate", "refined"]
+command = [".venv/bin/python", "-m", "scripts.materials.validate_low_mach_timestep", "--destination", ".codex-artifacts/low-mach-full-duration-20261022", "--compare"]
+retained_artifacts = [{ name = "fx61147-full-duration-comparison", path = ".codex-artifacts/low-mach-full-duration-20261022/comparison", max_bytes = 16777216 }]
+
 [test.low-mach-throughput-repair]
 timeout_seconds = 1200
 env = { PYTHONPATH = "src", PYTHONDONTWRITEBYTECODE = "1" }

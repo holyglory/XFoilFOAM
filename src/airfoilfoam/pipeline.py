@@ -5546,7 +5546,6 @@ def _run_transient_attempt(
                 solver_params=pass_params,
                 settled_max_courant=settled_max_courant,
                 startup_max_delta_t=pass_max_delta_t,
-                allow_quiet_startup_release=not is_compressible(runner),
             ),
         )
         wall_seconds += max(0.0, time.monotonic() - solve_started)

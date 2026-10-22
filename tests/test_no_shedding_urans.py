@@ -198,6 +198,59 @@ def test_absent_history_is_not_no_shedding():
     assert not is_no_shedding(None)
 
 
+@pytest.mark.parametrize("span_s,corrupt,accepted", [(0.075, False, True), (0.0333, False, False), (0.075, True, False)])
+def test_retained_timestep_validation_uses_actual_physical_horizon_and_raw_certificate(
+    tmp_path, span_s, corrupt, accepted,
+):
+    from scripts.materials.validate_low_mach_timestep import SPEC, grade_case
+
+    coefficient = tmp_path / "postProcessing/forceCoeffs1/600/coefficient.dat"
+    coefficient.parent.mkdir(parents=True)
+    rows = ["# Time Cd Cl CmPitch"]
+    for sample_index in range(2001):
+        timestamp = 600.0000008 + span_s * sample_index / 2000.0
+        lift = "nan" if corrupt and sample_index == 2000 else "-0.0444"
+        rows.append(f"{timestamp:.12f} 0.0243765 {lift} -0.099")
+    coefficient.write_text("\n".join(rows) + "\n")
+    original = coefficient.read_bytes()
+    result = grade_case(tmp_path, SPEC, SolverParams(force_transient=True, urans_fidelity="full"))
+
+    assert result["acceptance_gates_passed"] is accepted
+    assert result["required_no_shedding_observation_s"] == pytest.approx(0.07)
+    assert result["invalid_raw_samples"] == int(corrupt)
+    if accepted:
+        certificate = result["no_shedding_certificate"]
+        assert certificate["certified"]
+        assert certificate["observed_observation_s"] == pytest.approx(0.07)
+        assert certificate["observation_end_time"] == pytest.approx(600.0750008)
+        assert result["post_discard_history"]["window_end"] - result["post_discard_history"]["window_start"] < 0.07
+        assert result["urans_cycle_certificate"] is None
+    else:
+        assert result["no_shedding_certificate"] is None
+    assert coefficient.read_bytes() == original
+
+
+def test_retained_timestep_comparison_uses_exact_shared_window_without_rewriting_evidence(tmp_path):
+    from scripts.materials.validate_low_mach_timestep import matched_window
+
+    coefficient = tmp_path / "postProcessing/forceCoeffs1/600/coefficient.dat"
+    coefficient.parent.mkdir(parents=True)
+    timestamps = [600.0, 600.004, 600.01, 600.04, 600.071, 600.076]
+    coefficient.write_text("# Time Cd Cl CmPitch\n" + "".join(
+        f"{timestamp:.12f} 0.024 {-0.0444 + 0.01 * (timestamp - 600.0):.12g} -0.099\n"
+        for timestamp in timestamps
+    ))
+    original = coefficient.read_bytes()
+    window = matched_window(tmp_path, 600.005, 600.075)
+    assert window["start"] == 600.005
+    assert window["end"] == 600.075
+    assert window["duration_s"] == pytest.approx(0.07)
+    assert window["channels"]["cl"]["mean"] == pytest.approx(-0.0440)
+    assert coefficient.read_bytes() == original
+    with pytest.raises(ValueError, match="complete comparison window"):
+        matched_window(tmp_path, 600.005, 600.08)
+
+
 @pytest.mark.parametrize(
     "span_s,courant,enabled,noisy_moment,corrupt,ripple,expected_courant",
     [
@@ -1077,7 +1130,8 @@ def test_restart_boundary_force_impulses_do_not_mint_false_shedding(tmp_path):
     assert history.cd_mean == pytest.approx(0.025)
 
 
-def test_no_shedding_mean_equals_average_of_steady_history(tmp_path, monkeypatch):
+@pytest.mark.parametrize("force_transient", [False, True])
+def test_no_shedding_mean_equals_average_of_steady_history(tmp_path, monkeypatch, force_transient):
     cl_true, cd_true, cm_true = 0.0009, 0.0121, -0.0004
 
     class FakeRunner:
@@ -1087,11 +1141,17 @@ def test_no_shedding_mean_equals_average_of_steady_history(tmp_path, monkeypatch
             # Retain about 4.27 s, safely beyond the shared 4.2 s slow-shedding
             # observation floor after the default 40% startup discard.
             _write_flat_coeff(coeff, cl_true, cd_true, cm_true, n=712)
+            assert monitor is not None
+            monitor()
             return SimpleNamespace(ok=True, stdout="pimple ok")
 
     monkeypatch.setattr(pipeline, "CaseBuilder", _FakeCaseBuilder)
     tcase = tmp_path / "transient"
     (tcase / "0").mkdir(parents=True)
+
+    control = tcase / "system/controlDict"
+    control.parent.mkdir()
+    control.write_text("maxCo 1;\nmaxDeltaT 0.00008;\nwriteInterval 0.01;\nrunTimeModifiable true;\n")
 
     result = _run_transient_attempt(
         tcase,
@@ -1101,12 +1161,13 @@ def test_no_shedding_mean_equals_average_of_steady_history(tmp_path, monkeypatch
         spec=CaseSpec(chord=1.0, speed=10.0, aoa_deg=0.0),
         fluid=FluidProperties(density=1.225, kinematic_viscosity=1.5e-5),
         roughness=RoughnessParams(),
-        solver_params=SolverParams(),
+        solver_params=SolverParams(force_transient=force_transient, urans_fidelity="full", transient_max_courant=4.0),
         runner=FakeRunner(),
         n_proc=1,
         timeout=120,
         run_time=7.2,
-        delta_t=0.001,
+        delta_t=0.00004,
+        max_delta_t=0.00008,
     )
 
     # No crash, and a valid steady-equivalent result.
@@ -1118,6 +1179,8 @@ def test_no_shedding_mean_equals_average_of_steady_history(tmp_path, monkeypatch
     assert result.avg.cl == pytest.approx(cl_true, abs=1e-9)
     assert result.avg.cd == pytest.approx(cd_true, abs=1e-9)
     assert result.avg.cm == pytest.approx(cm_true, abs=1e-9)
+    assert float(re.search(r"maxCo\s+([^;]+);", control.read_text())[1]) == 1.0
+    assert float(re.search(r"maxDeltaT\s+([^;]+);", control.read_text())[1]) == pytest.approx(0.00008)
 
 
 def test_early_stop_no_shedding_uses_trailing_physical_horizon(
