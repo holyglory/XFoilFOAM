@@ -350,7 +350,8 @@ async function readPreciseBusyCounts(
       JOIN progressive_work work ON work.id=unit.work_id
       JOIN progressive_generations generation ON generation.id=work.generation_id
       LEFT JOIN sim_jobs job ON job.id=attempt.sim_job_id
-      LEFT JOIN progressive_cfd_execution_stops stopped ON stopped.sim_job_id=job.id
+      LEFT JOIN progressive_cfd_execution_stops stopped
+        ON stopped.sim_job_id=job.id AND stopped.engine_job_id=job.engine_job_id
       WHERE generation.id IN (${ids}) AND generation.campaign_id=${campaignId}::uuid
         AND generation.epoch_id=${epochId}::uuid
     )
