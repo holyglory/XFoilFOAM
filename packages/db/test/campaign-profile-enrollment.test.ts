@@ -11997,6 +11997,26 @@ describe("subsonic through precise priority", () => {
     return lease;
   }
 
+  it("keeps precise selection adoption busy until stopped attempts are settled", async () => {
+    const fixture = await cfdEvidenceFixture(undefined, 2, [], [0]);
+    await adoptProgressiveSubsonicPriority(db, fixture.campaignId);
+    await acknowledgeProgressiveCfdExecutionStop(db, {
+      simJobId: fixture.composed.jobId,
+      proof: executionStopProof(fixture.engineJobId),
+    });
+    await db.update(simJobs).set({ status: "cancelled", engineState: "cancelled" })
+      .where(eq(simJobs.id, fixture.composed.jobId));
+    await db.execute(sql`UPDATE progressive_cfd_units SET state='blocked',lease_token=NULL,lease_owner=NULL,lease_until=NULL
+      WHERE id=${fixture.leases[0].id}`);
+    const pending = await previewProgressivePreciseSelectionPolicy(db, fixture.campaignId);
+    expect(pending.busy.runningAttempts).toBe(fixture.leases.length);
+    expect(pending.busy.unsettledExecutions).toBe(fixture.leases.length);
+    expect(await db.execute(sql`SELECT outcome FROM progressive_cfd_attempts
+      WHERE sim_job_id=${fixture.composed.jobId}`)).toEqual([{ outcome: "running" }]);
+    expect(await db.execute(sql`SELECT generation_id FROM progressive_recipe_adoptions
+      WHERE campaign_id=${fixture.campaignId}`)).toHaveLength(0);
+  }, 120_000);
+
   it("adopts a missing precise selection policy and replays idempotently", async () => {
     const campaignId = await campaign();
     const legacy = await sealProgressiveGeneration(

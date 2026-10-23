@@ -74,7 +74,6 @@ export async function recordProgressiveCfdRecoveryPlans(
   simJobId: string,
   promotions: ProgressiveRansPromotion[] = [],
 ): Promise<number> {
-  if (promotions.length === 0) return 0;
   if (promotions.length > 1)
     throw new Error(
       "Progressive recovery requires one exact physical condition",

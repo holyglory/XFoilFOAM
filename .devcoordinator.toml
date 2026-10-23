@@ -23,7 +23,19 @@ command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vites
 name = "adoption-and-recovery"
 tier = "development"
 requires = ["types"]
-command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "adopts a missing precise selection policy|rejects an unknown precise selection policy|preserves a predecessor fast gap|reuses accepted fast evidence"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "keeps precise selection adoption busy|adopts a missing precise selection policy|rejects an unknown precise selection policy|preserves a predecessor fast gap|reuses accepted fast evidence"]
+
+[[test.precise-selection.check]]
+name = "targeted-recovery"
+tier = "development"
+requires = ["types", "adoption-and-recovery"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "bounded progressive numerical recovery"]
+
+[[test.precise-selection.check]]
+name = "informative-reuse"
+tier = "development"
+requires = ["types"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/progressive-cfd-reuse.test.ts"]
 
 [test.low-mach-exact-geometry-regrade]
 timeout_seconds = 300

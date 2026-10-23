@@ -2,6 +2,7 @@ import { sql } from "drizzle-orm";
 import type { DB } from "./client";
 import { analysisContentHash } from "./analysis-target";
 import { tryProgressiveAdmissionLock } from "./progressive-admission-lock";
+import { SOURCE_GEOMETRY_POLICY_VERSION } from "./progressive-evidence-geometry";
 
 export const MAX_PROGRESSIVE_CFD_REUSE_UNITS = 256;
 
@@ -269,8 +270,10 @@ export async function reuseInformativeProgressiveCfdEvidence(
       JOIN progressive_cfd_units source_unit
         ON source_unit.work_id = source_work.id
         AND source_unit.aoa_deg = successor.aoa_deg
+        AND source_unit.state = 'complete'
       JOIN progressive_cfd_attempts source_attempt
         ON source_attempt.unit_id = source_unit.id
+        AND source_attempt.outcome = 'complete'
       JOIN progressive_cfd_execution_recipes execution_recipe
         ON execution_recipe.id = source_attempt.execution_recipe_id
         AND execution_recipe.source_revision_id = successor_scope.revision_id
@@ -282,12 +285,30 @@ export async function reuseInformativeProgressiveCfdEvidence(
         AND raw.sim_job_id = source_attempt.sim_job_id
       JOIN sim_jobs source_job ON source_job.id = source_attempt.sim_job_id
         AND source_job.engine_job_id = raw.engine_job_id
+      JOIN LATERAL (
+        SELECT prediction.id FROM neuralfoil_predictions prediction
+        WHERE prediction.target_id = source_work.target_id
+          AND prediction.epoch_id = source_generation.epoch_id
+        ORDER BY prediction.created_at DESC, prediction.id DESC LIMIT 1
+      ) current_prediction ON true
+      JOIN progressive_polar_fit_work fit
+        ON fit.prediction_id = current_prediction.id AND fit.state = 'ready'
+      JOIN progressive_polar_models model
+        ON model.id = fit.model_id AND model.prediction_id = current_prediction.id
+      JOIN progressive_polar_geometry_verifications verification
+        ON verification.model_id = model.id
+        AND verification.policy_version = ${SOURCE_GEOMETRY_POLICY_VERSION}
+        AND verification.source_geometry_compatible
+      JOIN progressive_polar_model_evidence model_evidence
+        ON model_evidence.model_id = model.id
+        AND model_evidence.attempt_token = source_attempt.token
+        AND model_evidence.result_attempt_id = raw.id
       JOIN progressive_cfd_execution_stops stopped
         ON stopped.sim_job_id = source_job.id
         AND stopped.engine_job_id = source_job.engine_job_id
         AND stopped.epoch_id = ${epochId}::uuid
       WHERE successor_work.generation_id = ${generationId}::uuid
-        AND successor_work.stage IN (2, 3) AND successor_work.state = 'pending'
+        AND successor_work.stage = 2 AND successor_work.state = 'pending'
         AND successor.state = 'pending' AND successor.lease_token IS NULL
         AND successor.lease_owner IS NULL AND successor.lease_until IS NULL
         AND source_job.status IN ('done', 'failed', 'cancelled')
@@ -306,6 +327,12 @@ export async function reuseInformativeProgressiveCfdEvidence(
         AND evidence.solver_active_seconds < 'Infinity'::double precision
         AND COALESCE(raw.evidence_payload->>'failure_disposition', '')
           NOT IN ('infrastructure', 'deterministic_mesh', 'material_domain')
+        AND EXISTS (
+          SELECT 1 FROM jsonb_array_elements(model.response->'estimate'->'contributors') contributor
+          WHERE contributor->>'attempt_id' = raw.id::text
+            AND contributor->>'result_id' = raw.result_id::text
+            AND contributor->>'method' = 'openfoam_fast'
+        )
         AND NOT EXISTS (
           SELECT 1 FROM result_classifications classification
           WHERE classification.result_attempt_id = raw.id AND classification.state = 'accepted'
