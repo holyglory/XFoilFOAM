@@ -304,7 +304,6 @@ export async function reuseInformativeProgressiveCfdEvidence(
         AND raw.cm < 'Infinity'::double precision
         AND evidence.solver_active_seconds > 0
         AND evidence.solver_active_seconds < 'Infinity'::double precision
-        AND (raw.status = 'failed' OR raw.converged IS FALSE)
         AND COALESCE(raw.evidence_payload->>'failure_disposition', '')
           NOT IN ('infrastructure', 'deterministic_mesh', 'material_domain')
         AND NOT EXISTS (

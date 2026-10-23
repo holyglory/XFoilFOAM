@@ -457,10 +457,6 @@ async function readUnsupportedFastCells(db: DB, generationIds: string[]) {
             AND informative_raw.cm < 'Infinity'::double precision
             AND informative_evidence.solver_active_seconds > 0
             AND informative_evidence.solver_active_seconds < 'Infinity'::double precision
-            AND (
-              informative_raw.status='failed'
-              OR informative_raw.converged IS FALSE
-            )
             AND coalesce(informative_raw.evidence_payload->>'failure_disposition','')
               NOT IN ('infrastructure','deterministic_mesh','material_domain')
             AND NOT EXISTS (
