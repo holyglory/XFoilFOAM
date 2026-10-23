@@ -26,7 +26,7 @@ export async function recoverStaleProgressiveCancellations(
     const connection = transaction as unknown as DB;
     await acquireProgressiveAdmissionLock(connection);
     const candidates = await connection.execute(sql`
-      SELECT DISTINCT job.id
+      SELECT job.id
       FROM sim_jobs job
       JOIN progressive_cfd_attempts attempt ON attempt.sim_job_id=job.id
       JOIN progressive_cfd_units unit ON unit.id=attempt.unit_id
@@ -43,6 +43,7 @@ export async function recoverStaleProgressiveCancellations(
         AND attempt.outcome='running'
         AND NOT EXISTS (SELECT 1 FROM progressive_cfd_evidence evidence WHERE evidence.attempt_token=attempt.token)
         AND NOT EXISTS (SELECT 1 FROM progressive_cfd_execution_stops stop WHERE stop.sim_job_id=job.id)
+      GROUP BY job.id
       ORDER BY job.id LIMIT ${input.expectedJobs}::int FOR UPDATE OF job SKIP LOCKED
     `);
     if (candidates.length !== input.expectedJobs)
