@@ -362,14 +362,12 @@ async function readPreciseBusyCounts(
         AND stopped_engine_job_id IS NOT DISTINCT FROM engine_job_id
         AND stopped_epoch_id IS NOT DISTINCT FROM ${epochId}::uuid
       ))::int AS running_attempts,
-      count(DISTINCT token) FILTER (WHERE NOT (
-        job_status='cancelled' AND stopped_sim_job_id IS NOT NULL
-        AND stopped_engine_job_id IS NOT DISTINCT FROM engine_job_id
-        AND stopped_epoch_id IS NOT DISTINCT FROM ${epochId}::uuid
-      ) AND (outcome='running' OR
-        (sim_job_id IS NOT NULL AND (stopped_sim_job_id IS NULL
-          OR stopped_engine_job_id IS DISTINCT FROM engine_job_id
-          OR stopped_epoch_id IS DISTINCT FROM ${epochId}::uuid)))
+      count(DISTINCT token) FILTER (WHERE
+        (outcome='running' AND NOT (
+          job_status='cancelled' AND stopped_sim_job_id IS NOT NULL
+          AND stopped_engine_job_id IS NOT DISTINCT FROM engine_job_id
+          AND stopped_epoch_id IS NOT DISTINCT FROM ${epochId}::uuid
+        ))
         OR job_status IN ('pending','submitted','running','ingesting')
         OR ingest_lease_expires_at>clock_timestamp())::int AS unsettled_executions,
       count(DISTINCT job_id) FILTER (WHERE job_status IN ('pending','submitted','running','ingesting')
