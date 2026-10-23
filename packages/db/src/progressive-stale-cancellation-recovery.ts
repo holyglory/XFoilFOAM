@@ -28,22 +28,24 @@ export async function recoverStaleProgressiveCancellations(
     const candidates = await connection.execute(sql`
       SELECT job.id
       FROM sim_jobs job
-      JOIN progressive_cfd_attempts attempt ON attempt.sim_job_id=job.id
-      JOIN progressive_cfd_units unit ON unit.id=attempt.unit_id
-      JOIN progressive_work work ON work.id=unit.work_id
-      JOIN progressive_generations generation ON generation.id=work.generation_id
-      JOIN sim_campaigns campaign ON campaign.id=generation.campaign_id
+      JOIN sim_campaigns campaign ON campaign.id=${input.campaignId}::uuid
       WHERE campaign.id=${input.campaignId}::uuid
-        AND generation.status='active'
-        AND generation.plan_revision_id=campaign.current_plan_revision_id
         AND campaign.status IN ('active','attention','paused')
         AND job.status='cancelled' AND job.engine_state='cancel_pending'
         AND job.completed_cases=0
         AND job."updatedAt" <= clock_timestamp() - (${olderThanMinutes}::int * interval '1 minute')
-        AND attempt.outcome='running'
-        AND NOT EXISTS (SELECT 1 FROM progressive_cfd_evidence evidence WHERE evidence.attempt_token=attempt.token)
+        AND EXISTS (
+          SELECT 1
+          FROM progressive_cfd_attempts attempt
+          JOIN progressive_cfd_units unit ON unit.id=attempt.unit_id
+          JOIN progressive_work work ON work.id=unit.work_id
+          JOIN progressive_generations generation ON generation.id=work.generation_id
+          WHERE attempt.sim_job_id=job.id AND attempt.outcome='running'
+            AND generation.status='active'
+            AND generation.plan_revision_id=campaign.current_plan_revision_id
+            AND NOT EXISTS (SELECT 1 FROM progressive_cfd_evidence evidence WHERE evidence.attempt_token=attempt.token)
+        )
         AND NOT EXISTS (SELECT 1 FROM progressive_cfd_execution_stops stop WHERE stop.sim_job_id=job.id)
-      GROUP BY job.id
       ORDER BY job.id LIMIT ${input.expectedJobs}::int FOR UPDATE OF job SKIP LOCKED
     `);
     if (candidates.length !== input.expectedJobs)
