@@ -14,6 +14,9 @@ export const PROGRESSIVE_COMPUTE_POLICY = {
   turbulentPrandtl: 0.85,
 } as const;
 
+export const PRECISE_SOLVER_SELECTION_POLICY =
+  "precise-evidence-driven-flow-v1" as const;
+
 export type ProgressiveSolverFamily =
   | "simpleFoam"
   | "pimpleFoam"

@@ -20,7 +20,13 @@ import {
   storeRepairedPrediction,
 } from "../src/progressive-prediction-repair";
 import { acknowledgeLatestProgressiveRemoteStop } from "../../../apps/sweeper/src/progressive-remote-stop-receipt";
-import { adoptProgressiveWallPolicy } from "../src/progressive-recipe-adoption";
+import {
+  adoptProgressivePreciseSelectionPolicy,
+  adoptProgressiveWallPolicy,
+  previewProgressivePreciseSelectionPolicy,
+  reuseAcceptedProgressiveCfdEvidence,
+  reusePreviousBaselines,
+} from "../src/progressive-recipe-adoption";
 import { adoptProgressiveNumerics2, prepareSourcePreservingDefaults } from "../src/progressive-numerics-transition";
 import { OPENCFD_2606_SOLVER_IMPLEMENTATION_ID, OPENCFD_2606_NUMERICS2_SOLVER_IMPLEMENTATION_ID, OPENCFD_2606_EXECUTION_POOL_ID, OPENCFD_2606_NUMERICS2_EXECUTION_POOL_ID } from "../src/solver-implementations";
 import { adoptProgressiveLocalTimeStepPolicy, inheritLocalStepPolicy } from "../src/campaign-local-step-policy";
@@ -32,6 +38,7 @@ import {
   evaluateGasState,
   materialPhysicsValues,
   parseCoordinates,
+  PRECISE_SOLVER_SELECTION_POLICY,
 } from "@aerodb/core";
 import { sourceAirModel } from "../../core/test/fixtures/source-air-model";
 import { progressivePredictionFixture as predictionFixture } from "../test-support/progressive-prediction";
@@ -11989,6 +11996,96 @@ describe("subsonic through precise priority", () => {
     expect(lease).toMatchObject({ stage: 3, targetId: fast.targetId, generationId: fixture.generationId });
     return lease;
   }
+
+  it("adopts a missing precise selection policy and replays idempotently", async () => {
+    const campaignId = await campaign();
+    const legacy = await sealProgressiveGeneration(
+      db,
+      await progressiveScope(campaignId, "legacy-precise-selection"),
+    );
+    await adoptProgressiveSubsonicPriority(db, campaignId);
+    await db.execute(sql`UPDATE sweeper_state SET enabled=false WHERE id=1`);
+    expect(await previewProgressivePreciseSelectionPolicy(db, campaignId)).toMatchObject({
+      ready: true,
+      affectedTargetCount: 1,
+      unsupportedFastCells: 0,
+    });
+    const adopted = await adoptProgressivePreciseSelectionPolicy(db, campaignId);
+    expect(adopted).toMatchObject({
+      kind: "adopted",
+      previous_generation_ids: [legacy.id],
+      reused_cfd: 0,
+    });
+    const [successor] = await db.execute(sql`SELECT recipes FROM progressive_generation_targets
+      WHERE generation_id=${adopted.generation_id}`);
+    expect(successor.recipes.precise).toMatchObject({
+      selectionPolicy: PRECISE_SOLVER_SELECTION_POLICY,
+    });
+    expect(await adoptProgressivePreciseSelectionPolicy(db, campaignId)).toMatchObject({
+      kind: "replayed",
+      generation_id: adopted.generation_id,
+    });
+  }, 120_000);
+
+  it("rejects an unknown precise selection policy without changing the generation", async () => {
+    const campaignId = await campaign();
+    const legacyScope = await progressiveScope(campaignId, "unknown-precise-selection");
+    (legacyScope.targets[0].recipes.precise as Record<string, unknown>).selectionPolicy =
+      "unknown-selection-policy";
+    const legacy = await sealProgressiveGeneration(db, legacyScope);
+    await adoptProgressiveSubsonicPriority(db, campaignId);
+    await db.execute(sql`UPDATE sweeper_state SET enabled=false WHERE id=1`);
+    await expect(adoptProgressivePreciseSelectionPolicy(db, campaignId)).rejects.toThrow(
+      "Unknown precise solver selection policy",
+    );
+    expect(await db.execute(sql`SELECT status FROM progressive_generations WHERE id=${legacy.id}`)).toEqual([
+      { status: "active" },
+    ]);
+  }, 120_000);
+
+  it("preserves a predecessor fast gap during precise selection adoption", async () => {
+    const campaignId = await campaign();
+    const legacy = await sealProgressiveGeneration(
+      db,
+      await progressiveScope(campaignId, "precise-fast-gap"),
+    );
+    await adoptProgressiveSubsonicPriority(db, campaignId);
+    const baseline = (await claim([1]))!;
+    await storeNeuralFoilPrediction(db, baseline, predictionFixture(baseline));
+    await initializeProgressiveCfdWork(db);
+    const fast = (await claimCfd())!;
+    await db.execute(sql`UPDATE progressive_cfd_attempts SET outcome='failed',finished_at=clock_timestamp()
+      WHERE token=${fast.token}`);
+    await db.execute(sql`UPDATE progressive_cfd_units SET state='gap',lease_token=NULL,lease_owner=NULL,lease_until=NULL
+      WHERE id=${fast.id}`);
+    await db.execute(sql`UPDATE sweeper_state SET enabled=false WHERE id=1`);
+    const adopted = await adoptProgressivePreciseSelectionPolicy(db, campaignId);
+    expect(adopted).toMatchObject({ kind: "adopted", previous_generation_ids: [legacy.id] });
+    expect(
+      await db.execute(sql`SELECT unit.state FROM progressive_cfd_units unit
+        JOIN progressive_work work ON work.id=unit.work_id WHERE work.generation_id=${adopted.generation_id}`),
+    ).toContainEqual({ state: "gap" });
+  }, 120_000);
+
+  it("reuses accepted fast evidence from a full materialized recipe", async () => {
+    const fixture = await scope(true);
+    await initializeProgressiveCfdWork(db);
+    const fast = (await claimCfd())!;
+    expect((await finish(fast, true)).settlement).toMatchObject({ complete: 1 });
+    await advanceProgressiveCfdStages(db);
+    await db.execute(sql`UPDATE progressive_generations SET status='complete' WHERE id=${fixture.generationId}`);
+    const successor = await materializeProgressiveCampaignScope(
+      db,
+      fixture.campaignId,
+      undefined,
+      "precise-reuse-test",
+    );
+    expect(successor).not.toBeNull();
+    await reusePreviousBaselines(db, successor!.id, [fixture.generationId], fixture.epochId);
+    await initializeProgressiveCfdWork(db);
+    expect(await reuseAcceptedProgressiveCfdEvidence(db, successor!.id, [fixture.generationId], fixture.epochId)).toBeGreaterThan(0);
+    await db.execute(sql`DELETE FROM progressive_cfd_evidence_reuses WHERE source_generation_id=${fixture.generationId}`);
+  }, 120_000);
 
   it("settles all baselines, advances low fast gaps into precise before high fast, and releases high after accepted precise closure", async () => {
     const fixture = await scope(true);

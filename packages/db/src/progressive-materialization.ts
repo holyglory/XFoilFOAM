@@ -3,6 +3,7 @@ import {
   airfoilConcaveCurvature,
   fastWallSpacing,
   FAST_WALL_SPACING_POLICY,
+  PRECISE_SOLVER_SELECTION_POLICY,
   PROGRESSIVE_COMPUTE_POLICY,
 } from "@aerodb/core";
 import type { DB } from "./client";
@@ -107,6 +108,7 @@ export function progressiveRecipes(
     },
     precise: {
       ...common,
+      selectionPolicy: PRECISE_SOLVER_SELECTION_POLICY,
       ...(densityFarfield
         ? { compressibleFarfieldBoundary: "density_static_freestream" }
         : {}),
@@ -228,6 +230,7 @@ export async function materializeProgressiveCampaignScope(
       planRevisionId: intent.revisionId,
       scopeKey: analysisContentHash({
         subsonicWallSpacingPolicy: FAST_WALL_SPACING_POLICY,
+        preciseSolverSelectionPolicy: PRECISE_SOLVER_SELECTION_POLICY,
         plan: intent.revisionId,
         profiles: profiles.map((profile) => profile.id),
         ...(requestVersion ? { requestVersion } : {}),

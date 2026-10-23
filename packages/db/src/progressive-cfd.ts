@@ -9,6 +9,7 @@ import {
 } from "./progressive-execution-policy";
 import {
   initialFastAnchors,
+  PRECISE_SOLVER_SELECTION_POLICY,
   PROGRESSIVE_COMPUTE_POLICY,
   selectProgressiveSolver,
   type ProgressiveSolverFamily,
@@ -81,7 +82,11 @@ export const MAX_PRECISE_CFD_BATCH_UNITS = 8;
 
 export function preciseProgressiveSolverSelection(
   selection: Record<string, unknown>,
+  policy?: unknown,
 ): Record<string, unknown> {
+  if (policy === PRECISE_SOLVER_SELECTION_POLICY) return { ...selection };
+  if (policy !== undefined)
+    throw new Error("Unknown precise solver selection policy");
   const family = selection.solver;
   if (family === "simpleFoam")
     return {
@@ -173,7 +178,10 @@ export async function initializeProgressiveCfdWork(
         selection:
           scope.stage === 2
             ? selection
-            : preciseProgressiveSolverSelection(selection),
+            : preciseProgressiveSolverSelection(
+                selection,
+                scope.recipes.precise.selectionPolicy,
+              ),
         turbulentPrandtl:
           selection.pressureKind === "absolute"
             ? PROGRESSIVE_COMPUTE_POLICY.turbulentPrandtl

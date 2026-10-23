@@ -1,5 +1,30 @@
 schema = 2
 
+[test.precise-selection]
+timeout_seconds = 1200
+
+[test.precise-selection.postgres]
+image = "postgres:16-alpine"
+database = "aerodb"
+user = "aerodb"
+
+[[test.precise-selection.check]]
+name = "types"
+tier = "development"
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "typecheck"]
+
+[[test.precise-selection.check]]
+name = "routing"
+tier = "development"
+requires = ["types"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/progressive-remote-execution.test.ts"]
+
+[[test.precise-selection.check]]
+name = "adoption-and-recovery"
+tier = "development"
+requires = ["types"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "adopts a missing precise selection policy|rejects an unknown precise selection policy|preserves a predecessor fast gap|reuses accepted fast evidence"]
+
 [test.low-mach-exact-geometry-regrade]
 timeout_seconds = 300
 env = { PYTHONPATH = "src:.", PYTHONDONTWRITEBYTECODE = "1" }

@@ -7,6 +7,7 @@ import {
   sealProgressiveRemoteExecution,
   verifyProgressiveRemoteExecution,
 } from "../src/progressive-remote-execution";
+import { PRECISE_SOLVER_SELECTION_POLICY } from "@aerodb/core";
 import { preciseProgressiveSolverSelection } from "../src/progressive-cfd";
 
 function fixture() {
@@ -61,13 +62,36 @@ function fixture() {
 }
 
 describe("immutable remote progressive execution envelope", () => {
-  it("uses transient pressure refinement for precise subsonic selections", () => {
+  it("preserves legacy transient replay and supports explicit precise selection policy", () => {
+    const steady = {
+      solver: "simpleFoam",
+      pressureKind: "kinematic",
+    };
+    expect(preciseProgressiveSolverSelection(steady)).toMatchObject({
+      solver: "pimpleFoam",
+      reason: "precise_transient_refinement",
+    });
     expect(
-      preciseProgressiveSolverSelection({
-        solver: "simpleFoam",
-        pressureKind: "kinematic",
-      }),
-    ).toMatchObject({ solver: "pimpleFoam", reason: "precise_transient_refinement" });
+      preciseProgressiveSolverSelection(
+        steady,
+        PRECISE_SOLVER_SELECTION_POLICY,
+      ),
+    ).toEqual(steady);
+    expect(
+      preciseProgressiveSolverSelection(
+        {
+          solver: "rhoSimpleFoam",
+          pressureKind: "absolute",
+        },
+        PRECISE_SOLVER_SELECTION_POLICY,
+      ),
+    ).toEqual({
+      solver: "rhoSimpleFoam",
+      pressureKind: "absolute",
+    });
+    expect(() =>
+      preciseProgressiveSolverSelection(steady, "unknown-policy"),
+    ).toThrow("Unknown precise solver selection policy");
     expect(
       preciseProgressiveSolverSelection({
         solver: "rhoSimpleFoam",
