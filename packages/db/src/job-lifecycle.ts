@@ -59,6 +59,12 @@ export type SimJobCancellationClaim =
     }
   | { kind: "not_cancellable"; status: string | null };
 
+export function isRemoteProgressiveRequest(payload: unknown): boolean {
+  if (!payload || typeof payload !== "object") return false;
+  const remoteSolver = (payload as Record<string, unknown>).remoteSolver;
+  return remoteSolver === true || remoteSolver === "true";
+}
+
 /** Atomically claim admin cancellation and release only claims owned by the
  * won status transition. PostgreSQL rechecks the status predicate after a
  * concurrent ingest transition, so cancel-vs-ingest has exactly one winner. */
@@ -216,7 +222,9 @@ export async function claimSimJobCancellation(
           kind: "cancelled" as const,
           jobId: claimed.id,
           engineJobId: claimed.engineJobId,
-          remoteProgressive: Boolean(remoteDispatch?.remote_progressive),
+          remoteProgressive:
+            Boolean(remoteDispatch?.remote_progressive) &&
+            isRemoteProgressiveRequest(claimed.requestPayload),
         },
         campaignIds: settlement.campaignIds,
       };
