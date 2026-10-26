@@ -12,6 +12,7 @@ vi.mock("@aerodb/db", async (original) => ({
 }));
 
 import { applyProgressiveRemoteProgress } from "../src/progressive-remote-progress";
+import { selectPendingProgressiveRemoteReport } from "../src/progressive-remote-settlement";
 
 afterEach(() => vi.resetAllMocks());
 
@@ -67,4 +68,48 @@ it("projects an immutable remote report without taking the campaign lock", async
   const jobQuery = dialect.sqlToQuery(execute.mock.calls[3][0]).sql;
   expect(jobQuery).toContain("FROM sim_jobs");
   expect(jobQuery).toContain("FOR UPDATE");
+});
+
+it("uses a contiguous receipt prefix to bound retained report history", async () => {
+  const executionId = "11111111-1111-4111-8111-111111111111";
+  const execute = vi
+    .fn()
+    .mockResolvedValueOnce([
+      { min_sequence: "1", max_sequence: "17535", receipt_count: "17535" },
+    ])
+    .mockResolvedValueOnce([{ sequence: "17536" }]);
+  const db = { execute } as unknown as DB;
+
+  await expect(
+    selectPendingProgressiveRemoteReport(db, executionId),
+  ).resolves.toEqual([{ sequence: "17536" }]);
+
+  const dialect = new PgDialect();
+  const query = dialect.sqlToQuery(execute.mock.calls[1][0]).sql;
+  expect(query).toContain(" > $2::bigint");
+  expect(query).toContain("ORDER BY");
+  expect(query).toContain("stopProof,execution_stopped");
+  expect(query).not.toContain("NOT EXISTS");
+});
+
+it("falls back to the exact anti-join for a non-prefix receipt history", async () => {
+  const executionId = "11111111-1111-4111-8111-111111111111";
+  const execute = vi
+    .fn()
+    .mockResolvedValueOnce([
+      { min_sequence: "1", max_sequence: "3", receipt_count: "2" },
+    ])
+    .mockResolvedValueOnce([{ sequence: "2" }]);
+  const db = { execute } as unknown as DB;
+
+  await expect(
+    selectPendingProgressiveRemoteReport(db, executionId),
+  ).resolves.toEqual([{ sequence: "2" }]);
+
+  const dialect = new PgDialect();
+  const query = dialect.sqlToQuery(execute.mock.calls[1][0]).sql;
+  expect(query).toContain("NOT EXISTS");
+  expect(query).toContain("ORDER BY");
+  expect(query).toContain("stopProof,execution_stopped");
+  expect(query).not.toContain(" > $2::bigint");
 });

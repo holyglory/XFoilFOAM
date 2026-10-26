@@ -455,6 +455,79 @@ async function recoveryPromotions(
   ];
 }
 
+type ProgressiveRemoteReceiptPrefix = {
+  min_sequence?: unknown;
+  max_sequence?: unknown;
+  receipt_count?: unknown;
+};
+
+function contiguousReceiptPrefixEnd(
+  receiptPrefix: ProgressiveRemoteReceiptPrefix | undefined,
+) {
+  if (!receiptPrefix || receiptPrefix.receipt_count == null) return null;
+  let receiptCount: bigint;
+  try {
+    receiptCount = BigInt(String(receiptPrefix.receipt_count));
+  } catch {
+    return null;
+  }
+  if (receiptCount === 0n)
+    return receiptPrefix.min_sequence == null &&
+      receiptPrefix.max_sequence == null
+      ? "0"
+      : null;
+  if (
+    receiptPrefix.min_sequence == null ||
+    receiptPrefix.max_sequence == null
+  )
+    return null;
+  try {
+    if (
+      BigInt(String(receiptPrefix.min_sequence)) !== 1n ||
+      BigInt(String(receiptPrefix.max_sequence)) !== receiptCount
+    )
+      return null;
+  } catch {
+    return null;
+  }
+  return String(receiptPrefix.max_sequence);
+}
+
+export async function selectPendingProgressiveRemoteReport(
+  db: DB,
+  executionId: string,
+) {
+  const [receiptPrefix] = await db.execute(sql`
+    SELECT min(sequence) AS min_sequence, max(sequence) AS max_sequence,
+      count(*)::bigint AS receipt_count
+    FROM progressive_remote_progress_receipts
+    WHERE sim_job_id = ${executionId}::uuid
+  `);
+  const prefixEnd = contiguousReceiptPrefixEnd(receiptPrefix);
+  if (prefixEnd !== null)
+    return db.execute(sql`SELECT report.sequence
+      FROM progressive_remote_reports report
+      WHERE report.sim_job_id = ${executionId}::uuid
+        AND report.sequence > ${prefixEnd}::bigint
+        AND NOT (
+          report.received_at <= clock_timestamp() - interval '30 minutes'
+          AND report.report#>>'{stopProof,execution_stopped}' = 'true'
+          AND report.report#>>'{status,state}' IN ('completed', 'failed', 'cancelled')
+        )
+      ORDER BY report.sequence LIMIT 1`);
+  return db.execute(sql`SELECT report.sequence
+    FROM progressive_remote_reports report
+    WHERE report.sim_job_id = ${executionId}::uuid
+      AND NOT EXISTS (SELECT 1 FROM progressive_remote_progress_receipts receipt
+        WHERE receipt.sim_job_id = report.sim_job_id AND receipt.sequence = report.sequence)
+      AND NOT (
+        report.received_at <= clock_timestamp() - interval '30 minutes'
+        AND report.report#>>'{stopProof,execution_stopped}' = 'true'
+        AND report.report#>>'{status,state}' IN ('completed', 'failed', 'cancelled')
+      )
+    ORDER BY report.sequence LIMIT 1`);
+}
+
 export async function settleProgressiveRemoteJob(db: DB, executionId: string) {
   try {
     await publishAcceptedProgressiveAttempts(db, executionId);
@@ -521,16 +594,10 @@ export async function settleProgressiveRemoteJob(db: DB, executionId: string) {
       );
     if (job.ingestion_owned)
       return { kind: "waiting" as const, reason: "ingestion_owner" };
-    const [pending] =
-      await connection.execute(sql`SELECT sequence FROM progressive_remote_reports report
-      WHERE sim_job_id = ${executionId}::uuid AND NOT EXISTS (SELECT 1 FROM progressive_remote_progress_receipts receipt
-        WHERE receipt.sim_job_id = report.sim_job_id AND receipt.sequence = report.sequence)
-        AND NOT (
-          report.received_at <= clock_timestamp() - interval '30 minutes'
-          AND report.report#>>'{stopProof,execution_stopped}' = 'true'
-          AND report.report#>>'{status,state}' IN ('completed', 'failed', 'cancelled')
-        )
-      LIMIT 1`);
+    const [pending] = await selectPendingProgressiveRemoteReport(
+      connection,
+      executionId,
+    );
     if (pending) return { kind: "waiting" as const, reason: "report_progress" };
     const [stop] = await connection.execute(
       sql`SELECT sim_job_id FROM progressive_cfd_execution_stops WHERE sim_job_id = ${executionId}::uuid`,
