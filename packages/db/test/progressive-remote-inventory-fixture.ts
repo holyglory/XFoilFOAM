@@ -1,7 +1,12 @@
+import { randomUUID } from "node:crypto";
 import { sql } from "drizzle-orm";
 import { expect } from "vitest";
 import type { DB } from "../src/client";
 import type { ProgressiveRemoteReport } from "../src/progressive-remote-report";
+import { resultAttempts, results } from "../src/schema";
+import { resolveProgressiveRemoteEvidence } from "../src/progressive-remote-evidence";
+import { recordProgressiveRemoteEvidenceReceipt } from "../src/progressive-remote-evidence-receipts";
+import { progressiveRemotePointProjection } from "../src/progressive-remote-point-projection";
 import { storeProgressiveRemoteReport } from "../src/progressive-remote-reports";
 import { readProgressiveRemoteRetention } from "../src/progressive-remote-retention";
 import {
@@ -294,9 +299,12 @@ export async function verifyProgressiveRemoteReportInventory(
           (sim_job_id, sequence, content_signature, report, received_at)
         SELECT sim_job_id, sequence, content_signature, report, received_at
         FROM progressive_report_retry_source`);
-      const retriedDrain = await reconcileProgressiveRemoteProgress(connection, {
-        jobIds: [executionId],
-      });
+      const retriedDrain = await reconcileProgressiveRemoteProgress(
+        connection,
+        {
+          jobIds: [executionId],
+        },
+      );
       expect(retriedDrain).toMatchObject({
         applied: 1,
         indexed: 0,
@@ -445,8 +453,10 @@ export async function verifyProgressiveRemoteReportInventory(
                 sql`SELECT count(*)::integer AS count FROM result_attempts WHERE sim_job_id=${executionId}::uuid`,
               );
               expect(rows.count).toBe(0);
-              if (status === "cancelled")
+              if (status === "cancelled") {
                 await verifyPublicationRecovery(scoped, executionId);
+                await verifyBoundedRetentionHistory(scoped, changed, final);
+              }
             }
             expect(
               await scoped.execute(sql`SELECT sequence,content_signature FROM progressive_remote_reports
@@ -463,4 +473,294 @@ export async function verifyProgressiveRemoteReportInventory(
   } catch (error) {
     if (error !== rollback) throw error;
   }
+}
+
+async function verifyBoundedRetentionHistory(
+  db: DB,
+  running: ProgressiveRemoteReport,
+  final: ProgressiveRemoteReport,
+) {
+  const rollback = new Error("Restore bounded retention history fixture");
+  await expect(
+    db.transaction(async (transaction) => {
+      const connection = transaction as unknown as DB;
+      const executionId = final.executionId;
+      const [original] =
+        await connection.execute(sql`SELECT report FROM progressive_remote_reports
+        WHERE sim_job_id=${executionId}::uuid AND sequence=2`);
+      const repeated = original.report as ProgressiveRemoteReport;
+      let finalSequence = final.sequence;
+      const appendHistory = async (history: ProgressiveRemoteReport[]) => {
+        await connection.execute(sql`DELETE FROM progressive_remote_reports
+          WHERE sim_job_id=${executionId}::uuid AND sequence=${finalSequence}`);
+        const rows = [...history, final].map((report, offset) => {
+          const stored = { ...report, sequence: finalSequence + offset };
+          const inventory = progressiveRemoteReportInventory(stored);
+          return { sequence: stored.sequence, report: stored, ...inventory };
+        });
+        finalSequence += history.length;
+        const payload = JSON.stringify(rows);
+        await connection.execute(sql`INSERT INTO progressive_remote_reports
+          (sim_job_id,sequence,content_signature,report)
+          SELECT ${executionId}::uuid,sequence,"reportContentSignature",report
+          FROM jsonb_to_recordset(${payload}::jsonb)
+            AS item(sequence bigint,"reportContentSignature" text,report jsonb)`);
+        await connection.execute(sql`INSERT INTO progressive_remote_report_inventories
+          (sim_job_id,sequence,report_content_signature,inventory_signature,source_count)
+          SELECT ${executionId}::uuid,sequence,"reportContentSignature","inventorySignature",jsonb_array_length(sources)
+          FROM jsonb_to_recordset(${payload}::jsonb)
+            AS item(sequence bigint,"reportContentSignature" text,"inventorySignature" text,sources jsonb)`);
+        await connection.execute(sql`INSERT INTO progressive_remote_report_sources
+          (sim_job_id,sequence,point_content_signature,aoa_deg,case_slug)
+          SELECT ${executionId}::uuid,item.sequence,source.point_content_signature,source.aoa_deg,source.case_slug
+          FROM jsonb_to_recordset(${payload}::jsonb) AS item(sequence bigint,sources jsonb)
+          CROSS JOIN LATERAL jsonb_to_recordset(item.sources)
+            AS source(point_content_signature text,aoa_deg double precision,case_slug text)`);
+      };
+      await appendHistory(Array.from({ length: 2050 }, () => repeated));
+      const [history] =
+        await connection.execute(sql`SELECT count(*)::integer AS count
+        FROM progressive_remote_report_sources WHERE sim_job_id=${executionId}::uuid`);
+      expect(history.count).toBe(2052);
+      expect(
+        await readProgressiveRemoteRetention(connection, executionId),
+      ).toMatchObject({
+        kind: "waiting",
+        reason: "raw_evidence",
+        sourceCount: 2,
+        pendingCount: 2,
+      });
+      for (const sequence of [1, 2]) {
+        const restore = new Error("Restore missing historical inventory");
+        await expect(
+          connection.transaction(async (nested) => {
+            const scoped = nested as unknown as DB;
+            await scoped.execute(sql`DELETE FROM progressive_remote_report_inventories
+            WHERE sim_job_id=${executionId}::uuid AND sequence=${sequence}`);
+            expect(
+              await readProgressiveRemoteRetention(scoped, executionId),
+            ).toEqual({
+              kind: "waiting",
+              reason: "source_inventory",
+            });
+            throw restore;
+          }),
+        ).rejects.toBe(restore);
+      }
+      const missingSource = new Error("Restore incomplete source inventory");
+      await expect(
+        connection.transaction(async (nested) => {
+          const scoped = nested as unknown as DB;
+          await scoped.execute(sql`DELETE FROM progressive_remote_report_sources
+          WHERE sim_job_id=${executionId}::uuid AND sequence=2`);
+          expect(
+            await readProgressiveRemoteRetention(scoped, executionId),
+          ).toEqual({
+            kind: "waiting",
+            reason: "source_inventory",
+          });
+          throw missingSource;
+        }),
+      ).rejects.toBe(missingSource);
+      const originalPoint =
+        progressiveRemoteReportInventory(repeated).sources[0];
+      for (const identity of [
+        { aoa: originalPoint.aoa_deg + 0.125, slug: originalPoint.case_slug },
+        { aoa: originalPoint.aoa_deg, slug: "conflicting-retention-case" },
+        { aoa: originalPoint.aoa_deg, slug: null },
+      ]) {
+        const restore = new Error("Restore conflicting source identity");
+        await expect(
+          connection.transaction(async (nested) => {
+            const scoped = nested as unknown as DB;
+            await scoped.execute(sql`DELETE FROM progressive_remote_report_sources
+            WHERE sim_job_id=${executionId}::uuid AND sequence=${final.sequence}`);
+            await scoped.execute(sql`INSERT INTO progressive_remote_report_sources
+            (sim_job_id,sequence,point_content_signature,aoa_deg,case_slug)
+            VALUES (${executionId}::uuid,${final.sequence},${originalPoint.point_content_signature},${identity.aoa},${identity.slug})`);
+            expect(
+              await readProgressiveRemoteRetention(scoped, executionId),
+            ).toMatchObject({
+              kind: "waiting",
+              reason: "raw_evidence",
+              sourceCount: 3,
+              pendingCount: 3,
+            });
+            throw restore;
+          }),
+        ).rejects.toBe(restore);
+      }
+
+      const receiptRollback = new Error("Restore exact historical receipt");
+      await expect(
+        connection.transaction(async (nested) => {
+          const scoped = nested as unknown as DB;
+          const inventory = progressiveRemoteReportInventory(repeated);
+          const point = inventory.sources[0];
+          const delivery = {
+            solverId: final.solverId,
+            promiseId: final.promiseId,
+            engineJobId: executionId,
+            aoaDeg: point.aoa_deg,
+            engineCaseSlug: point.case_slug,
+            remoteResultId: randomUUID(),
+            remoteResultAttemptId: randomUUID(),
+            progressiveEvidence: {
+              sequence: repeated.sequence,
+              reportContentSignature: inventory.reportContentSignature,
+              pointContentSignature: point.point_content_signature,
+            },
+          };
+          const source = await resolveProgressiveRemoteEvidence(
+            scoped,
+            delivery,
+          );
+          if (!source) throw new Error("Missing historical retention source");
+          const projection = progressiveRemotePointProjection(source);
+          const [job] =
+            await scoped.execute(sql`SELECT airfoil_id,bc_ids,simulation_preset_revision_id
+          FROM sim_jobs WHERE id=${executionId}::uuid`);
+          const [existing] = await scoped.execute(sql`SELECT id FROM results
+          WHERE airfoil_id=${job.airfoil_id}::uuid
+            AND simulation_preset_revision_id=${job.simulation_preset_revision_id}::uuid AND aoa_deg=${point.aoa_deg}`);
+          const resultId = existing ? String(existing.id) : randomUUID();
+          if (!existing)
+            await scoped.insert(results).values({
+              id: resultId,
+              airfoilId: String(job.airfoil_id),
+              bcId: (job.bc_ids as string[])[0],
+              simulationPresetRevisionId: String(
+                job.simulation_preset_revision_id,
+              ),
+              aoaDeg: point.aoa_deg,
+              status: "queued",
+              source: "queued",
+              simJobId: executionId,
+            });
+          const attemptId = randomUUID();
+          await scoped.insert(resultAttempts).values({
+            id: attemptId,
+            resultId,
+            airfoilId: String(job.airfoil_id),
+            bcId: (job.bc_ids as string[])[0],
+            simulationPresetRevisionId: String(
+              job.simulation_preset_revision_id,
+            ),
+            simJobId: executionId,
+            aoaDeg: projection.aoaDeg,
+            status: projection.status,
+            source: projection.source,
+            regime: projection.regime,
+            cl: projection.cl,
+            cd: projection.cd,
+            cm: projection.cm,
+            clCd: projection.clCd,
+            clStd: projection.clStd,
+            cdStd: projection.cdStd,
+            cmStd: projection.cmStd,
+            stalled: projection.stalled,
+            unsteady: projection.unsteady,
+            converged: projection.converged,
+            finalResidual: projection.finalResidual,
+            iterations: projection.iterations,
+            yPlusAvg: projection.yPlusAvg,
+            yPlusMax: projection.yPlusMax,
+            nCells: projection.nCells,
+            firstOrderFallback: projection.firstOrderFallback,
+            strouhal: projection.strouhal,
+            error: projection.error,
+            qualityWarnings: projection.qualityWarnings,
+            methodKey: projection.methodKey,
+            engineJobId: projection.engineJobId,
+            engineCaseSlug: projection.engineCaseSlug,
+            evidencePayload: projection.evidencePayload,
+            validForPolar: false,
+          });
+          expect(
+            await recordProgressiveRemoteEvidenceReceipt(scoped, {
+              ...delivery,
+              resultAttemptId: attemptId,
+              storageOnly: true,
+            }),
+          ).toMatchObject({
+            sequence: 2,
+            resultAttemptId: attemptId,
+            storageOnly: true,
+          });
+          expect(
+            await readProgressiveRemoteRetention(scoped, executionId),
+          ).toMatchObject({
+            kind: "waiting",
+            reason: "raw_evidence",
+            sourceCount: 2,
+            pendingCount: 1,
+          });
+          await scoped.execute(sql`DELETE FROM progressive_remote_reports
+          WHERE sim_job_id=${executionId}::uuid AND sequence=${running.sequence}`);
+          expect(
+            await readProgressiveRemoteRetention(scoped, executionId),
+          ).toMatchObject({
+            kind: "waiting",
+            reason: "archives",
+            sourceCount: 1,
+            pendingCount: 1,
+          });
+          const missingCfd = new Error(
+            "Restore missing immutable CFD evidence",
+          );
+          await expect(
+            scoped.transaction(async (isolated) => {
+              const corrupted = isolated as unknown as DB;
+              await corrupted.execute(sql`DELETE FROM progressive_remote_evidence_receipts
+            WHERE sim_job_id=${executionId}::uuid AND point_content_signature=${point.point_content_signature}`);
+              await corrupted.execute(sql`INSERT INTO progressive_remote_evidence_receipts
+            (sim_job_id,sequence,point_content_signature,result_attempt_id,remote_result_id,remote_result_attempt_id,storage_only)
+            VALUES (${executionId}::uuid,${repeated.sequence},${point.point_content_signature},${attemptId}::uuid,
+              ${delivery.remoteResultId}::uuid,${delivery.remoteResultAttemptId}::uuid,false)`);
+              await expect(
+                readProgressiveRemoteRetention(corrupted, executionId),
+              ).rejects.toThrow(
+                "Remote retention differs from its immutable CFD evidence receipt",
+              );
+              throw missingCfd;
+            }),
+          ).rejects.toBe(missingCfd);
+          await scoped.execute(
+            sql`DELETE FROM result_attempts WHERE id=${attemptId}::uuid`,
+          );
+          expect(
+            await readProgressiveRemoteRetention(scoped, executionId),
+          ).toMatchObject({
+            kind: "waiting",
+            reason: "raw_evidence",
+            sourceCount: 1,
+            pendingCount: 1,
+          });
+          throw receiptRollback;
+        }),
+      ).rejects.toBe(receiptRollback);
+
+      const generations = Array.from({ length: 2047 }, (_, offset) => {
+        const report = structuredClone(running);
+        report.result!.polars[0].attempts![0].error = `isolated retention generation ${offset}`;
+        return report;
+      });
+      await appendHistory(generations.slice(0, 2046));
+      expect(
+        await readProgressiveRemoteRetention(connection, executionId),
+      ).toMatchObject({
+        kind: "waiting",
+        reason: "raw_evidence",
+        sourceCount: 2048,
+        pendingCount: 2048,
+      });
+      await appendHistory(generations.slice(2046));
+      await expect(
+        readProgressiveRemoteRetention(connection, executionId),
+      ).rejects.toThrow(
+        "Remote retention exceeds the bounded source-attempt inventory",
+      );
+      throw rollback;
+    }),
+  ).rejects.toBe(rollback);
 }

@@ -25,7 +25,8 @@ export function terminalReportHasNoPhysicalEvidence(
     attempts.length > 0 &&
     attempts.every(
       (attempt) =>
-        (!attempt.evidence_artifacts || attempt.evidence_artifacts.length === 0) &&
+        (!attempt.evidence_artifacts ||
+          attempt.evidence_artifacts.length === 0) &&
         (attempt.failure_disposition != null || attempt.error != null),
     )
   );
@@ -42,7 +43,8 @@ export function terminalReportNoPhysicalEvidenceSignatures(
         const coefficients = [point.cl, point.cd, point.cm];
         return (
           coefficients.every((value) => value == null) &&
-          (!point.evidence_artifacts || point.evidence_artifacts.length === 0) &&
+          (!point.evidence_artifacts ||
+            point.evidence_artifacts.length === 0) &&
           (point.failure_disposition != null || point.error != null)
         );
       })
@@ -79,19 +81,23 @@ export async function readProgressiveRemoteRetention(
           WHERE source.sim_job_id = inventory.sim_job_id AND source.sequence = inventory.sequence)) LIMIT 1`);
   if (missingInventory)
     return { kind: "waiting" as const, reason: "source_inventory" as const };
-  const sources =
-    await db.execute(sql`SELECT DISTINCT source.point_content_signature, source.aoa_deg, source.case_slug,
+  const sources = await db.execute(sql`WITH source_identities AS MATERIALIZED (
+      SELECT DISTINCT source.point_content_signature, source.aoa_deg, source.case_slug
+      FROM progressive_remote_report_sources source
+      WHERE source.sim_job_id = ${executionId}::uuid AND source.sequence <= ${report.sequence}
+      ORDER BY source.point_content_signature, source.aoa_deg, source.case_slug LIMIT 2049
+    )
+    SELECT source.point_content_signature, source.aoa_deg, source.case_slug,
       receipt.sequence, receipt.remote_result_id, receipt.remote_result_attempt_id, receipt.result_attempt_id, receipt.storage_only,
       owned_report.content_signature AS report_content_signature, raw.evidence_payload, evidence.evidence_signature
-    FROM progressive_remote_report_sources source
+    FROM source_identities source
     LEFT JOIN progressive_remote_evidence_receipts receipt
-      ON receipt.sim_job_id = source.sim_job_id AND receipt.point_content_signature = source.point_content_signature
+      ON receipt.sim_job_id = ${executionId}::uuid AND receipt.point_content_signature = source.point_content_signature
     LEFT JOIN progressive_remote_reports owned_report ON owned_report.sim_job_id = receipt.sim_job_id
       AND owned_report.sequence = receipt.sequence
     LEFT JOIN result_attempts raw ON raw.id = receipt.result_attempt_id
     LEFT JOIN progressive_cfd_evidence evidence ON evidence.result_attempt_id = raw.id
-    WHERE source.sim_job_id = ${executionId}::uuid AND source.sequence <= ${report.sequence}
-    ORDER BY source.point_content_signature LIMIT 2049`);
+    ORDER BY source.point_content_signature, source.aoa_deg, source.case_slug`);
   if (sources.length > 2048)
     throw new Error(
       "Remote retention exceeds the bounded source-attempt inventory",
@@ -127,7 +133,8 @@ export async function readProgressiveRemoteRetention(
     if (
       source.storage_only !== true &&
       (!source.evidence_signature ||
-        analysisContentHash(source.evidence_payload) !== source.evidence_signature)
+        analysisContentHash(source.evidence_payload) !==
+          source.evidence_signature)
     )
       throw new Error(
         "Remote retention differs from its immutable CFD evidence receipt",

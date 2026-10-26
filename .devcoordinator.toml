@@ -1,7 +1,24 @@
 schema = 2
 
+[test.precise-steady-low-mach]
+timeout_seconds = 2100
+env = { PYTHONPATH = "src:.", PYTHONDONTWRITEBYTECODE = "1" }
+
+[[test.precise-steady-low-mach.check]]
+name = "driver-contract"
+tier = "development"
+command = [".venv/bin/python", "-m", "pytest", "tests/test_validate_precise_steady.py", "-q"]
+
+[[test.precise-steady-low-mach.check]]
+name = "native-fx61147-steady-rans"
+tier = "pre-merge"
+requires = ["driver-contract"]
+timeout_seconds = 2100
+command = [".venv/bin/python", "scripts/materials/validate_precise_steady.py", "--request", ".codex-artifacts/low-mach-throughput-20261022/source/request.json", "--mesh-archive", ".codex-artifacts/low-mach-throughput-20261022/fx61147-exact-mesh.tar.gz", "--destination", ".codex-artifacts/low-mach-throughput-20261022/precise-steady-rans"]
+retained_artifacts = [{ name = "fx61147-precise-steady-rans", path = ".codex-artifacts/low-mach-throughput-20261022/precise-steady-rans", max_bytes = 1073741824 }]
+
 [test.precise-selection]
-timeout_seconds = 1200
+timeout_seconds = 2400
 
 [test.precise-selection.postgres]
 image = "postgres:16-alpine"
@@ -17,13 +34,13 @@ command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "typecheck"]
 name = "routing"
 tier = "development"
 requires = ["types"]
-command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/progressive-remote-execution.test.ts"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/progressive-remote-execution.test.ts", "test/progressive-remote-report.test.ts"]
 
 [[test.precise-selection.check]]
 name = "adoption-and-recovery"
 tier = "development"
 requires = ["types"]
-command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "keeps precise selection adoption busy|adopts a missing precise selection policy|rejects an unknown precise selection policy|preserves a predecessor fast gap|reuses accepted fast evidence"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "keeps precise selection adoption busy|adopts a missing precise selection policy|rejects an unknown precise selection policy|preserves a predecessor fast gap|reuses accepted fast evidence|progressive remote dispatch pins one exact request"]
 
 [[test.precise-selection.check]]
 name = "targeted-recovery"
@@ -36,6 +53,21 @@ name = "informative-reuse"
 tier = "development"
 requires = ["types"]
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/progressive-cfd-reuse.test.ts"]
+
+[[test.precise-selection.check]]
+name = "steady-driver-contract"
+tier = "development"
+env = { PYTHONPATH = "src:.", PYTHONDONTWRITEBYTECODE = "1" }
+command = [".venv/bin/python", "-m", "pytest", "tests/test_validate_precise_steady.py", "-q"]
+
+[[test.precise-selection.check]]
+name = "native-fx61147-steady-rans"
+tier = "pre-merge"
+requires = ["steady-driver-contract"]
+timeout_seconds = 2100
+env = { PYTHONPATH = "src:.", PYTHONDONTWRITEBYTECODE = "1" }
+command = [".venv/bin/python", "scripts/materials/validate_precise_steady.py", "--request", ".codex-artifacts/low-mach-throughput-20261022/source/request.json", "--mesh-archive", ".codex-artifacts/low-mach-throughput-20261022/fx61147-exact-mesh.tar.gz", "--destination", ".codex-artifacts/precise-recovery-20261026/native-steady"]
+retained_artifacts = [{ name = "fx61147-precise-steady-rans", path = ".codex-artifacts/precise-recovery-20261026/native-steady", max_bytes = 1073741824 }]
 
 [test.low-mach-exact-geometry-regrade]
 timeout_seconds = 300
