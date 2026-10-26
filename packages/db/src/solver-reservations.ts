@@ -2,8 +2,7 @@ import { sql, type SQL } from "drizzle-orm";
 
 export function solverLocalExecutionSql(alias = "sim_jobs"): SQL {
   const job = sql.identifier(alias);
-  return sql`NOT EXISTS (SELECT 1 FROM progressive_remote_dispatches remote_dispatch
-    WHERE remote_dispatch.sim_job_id = ${job}.id)`;
+  return sql`NOT coalesce(${job}.request_payload ? 'remoteProgressiveExecution', false)`;
 }
 
 export function solverDirectLifecycleSql(alias = "sim_jobs"): SQL {
