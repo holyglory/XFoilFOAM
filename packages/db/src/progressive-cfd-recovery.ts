@@ -278,6 +278,7 @@ export async function recoverTerminalProgressiveNoEvidenceGaps(
         AND unit.lease_token IS NULL
         AND unit.lease_owner IS NULL
         AND unit.lease_until IS NULL
+        AND (unit.retry_after IS NULL OR unit.retry_after <= clock_timestamp())
         AND (
           attempt.outcome = 'failed'
           OR (
@@ -321,7 +322,11 @@ export async function recoverTerminalProgressiveNoEvidenceGaps(
       const [requeued] = await connection.execute(sql`
         UPDATE progressive_cfd_units AS unit
         SET state = 'pending', lease_token = NULL, lease_owner = NULL,
-          lease_until = NULL, retry_after = NULL,
+          lease_until = NULL,
+          retry_after = CASE WHEN unit.error IN (
+            'obsolete execution physically stopped',
+            'unstarted submission retry budget exhausted or history incomplete'
+          ) THEN clock_timestamp() + interval '5 minutes' ELSE NULL END,
           error = ${TERMINAL_NO_EVIDENCE_RETRY_REASON}
         FROM progressive_work work
         WHERE unit.id = ${unit.id}::uuid
