@@ -460,12 +460,97 @@ export async function verifyProgressiveWorkerReportDelivery(
     expect((await pending())?.sequence).toBe(1);
     const transientConflict: typeof fetch = async () =>
       Response.json(
-        { error: "Remote reports must arrive in their durable publication order" },
+        {
+          error:
+            "Remote reports must arrive in their durable publication order",
+        },
         { status: 409 },
       );
     await expect(
       publishProgressiveWorkerReport(db, executionId, transientConflict),
     ).rejects.toThrow("Remote report publication failed (409)");
+    expect((await pending())?.sequence).toBe(1);
+    expect(
+      await db.execute(
+        sql`SELECT reason FROM progressive_worker_report_conflicts
+        WHERE sim_job_id=${executionId}::uuid AND sequence=1`,
+      ),
+    ).toEqual([]);
+    const staleOwner: typeof fetch = async () =>
+      Response.json(
+        { error: "remote solver does not own this execution" },
+        { status: 403 },
+      );
+    const staleOwnerRollback = new Error(
+      "Restore stale-owner publication fixture",
+    );
+    await expect(
+      db.transaction(async (transaction) => {
+        const connection = transaction as unknown as DB;
+        expect(
+          await publishProgressiveWorkerReport(
+            connection,
+            executionId,
+            staleOwner,
+          ),
+        ).toEqual({ kind: "quarantined", sequence: 1 });
+        expect(
+          await connection.execute(
+            sql`SELECT reason FROM progressive_worker_report_conflicts
+            WHERE sim_job_id=${executionId}::uuid AND sequence=1`,
+          ),
+        ).toEqual([{ reason: "remote solver does not own this execution" }]);
+        expect(
+          await connection.execute(
+            sql`SELECT acknowledged_at IS NOT NULL AS acknowledged
+            FROM progressive_worker_reports
+            WHERE sim_job_id=${executionId}::uuid AND sequence=1`,
+          ),
+        ).toEqual([{ acknowledged: true }]);
+        expect(
+          (
+            await readPendingProgressiveWorkerReport(connection, {
+              executionId,
+              solverId: envelope.solverId,
+            })
+          )?.sequence,
+        ).toBe(2);
+        const publishNext: typeof fetch = async (_url, options) => {
+          const body = JSON.parse(String(options?.body));
+          return Response.json({
+            received: true,
+            receipt: await storeProgressiveRemoteReport(connection, {
+              solverId: envelope.solverId,
+              promiseId: body.promiseId,
+              executionId,
+              report: body.report,
+            }),
+          });
+        };
+        expect(
+          await publishProgressiveWorkerReport(
+            connection,
+            executionId,
+            publishNext,
+          ),
+        ).toEqual({ kind: "published", sequence: 2 });
+        expect(
+          (
+            await readPendingProgressiveWorkerReport(connection, {
+              executionId,
+              solverId: envelope.solverId,
+            })
+          )?.sequence,
+        ).toBe(3);
+        throw staleOwnerRollback;
+      }),
+    ).rejects.toBe(staleOwnerRollback);
+    expect((await pending())?.sequence).toBe(1);
+    const otherForbidden: typeof fetch = async () =>
+      Response.json({ error: "push disabled for polars" }, { status: 403 });
+    await expect(
+      publishProgressiveWorkerReport(db, executionId, otherForbidden),
+    ).rejects.toThrow("Remote report publication failed (403)");
     expect((await pending())?.sequence).toBe(1);
     expect(
       await db.execute(

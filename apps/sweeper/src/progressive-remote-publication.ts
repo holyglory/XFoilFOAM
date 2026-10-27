@@ -8,9 +8,7 @@ import {
   type DB,
 } from "@aerodb/db";
 import { sql } from "drizzle-orm";
-import {
-  progressivePublicationSelectionSql,
-} from "./progressive-publication-selection";
+import { progressivePublicationSelectionSql } from "./progressive-publication-selection";
 import { fetchProgressiveRemote } from "./progressive-remote-http";
 
 const immutableReportConflictReasons = new Set([
@@ -18,6 +16,7 @@ const immutableReportConflictReasons = new Set([
   "Final remote execution evidence cannot change after its stop fence",
   "An acknowledged stopped remote execution cannot resume",
 ]);
+const staleRemoteOwnerReason = "remote solver does not own this execution";
 
 export async function publishProgressiveWorkerReport(
   db: DB,
@@ -102,6 +101,22 @@ export async function publishProgressiveWorkerReport(
         sequence: pending.sequence,
         contentSignature: pending.contentSignature,
         reason: conflictReason,
+      }))
+    )
+      return { kind: "quarantined", sequence: pending.sequence };
+  }
+  if (response.status === 403) {
+    const body = (await response.json().catch(() => null)) as {
+      error?: unknown;
+    } | null;
+    if (
+      body?.error === staleRemoteOwnerReason &&
+      (await quarantineProgressiveWorkerReportConflict(db, {
+        executionId,
+        solverId: String(owned.solver_id),
+        sequence: pending.sequence,
+        contentSignature: pending.contentSignature,
+        reason: staleRemoteOwnerReason,
       }))
     )
       return { kind: "quarantined", sequence: pending.sequence };
