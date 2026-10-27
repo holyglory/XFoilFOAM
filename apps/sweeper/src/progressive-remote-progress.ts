@@ -132,7 +132,11 @@ async function applyProgressiveRemoteProgressInTransaction(
       WHERE attempt.sim_job_id = ${executionId}::uuid AND generation.status = 'active' AND work.stage = ${effectiveProgressiveStageSql()}
         AND generation.plan_revision_id = campaign.current_plan_revision_id AND campaign.status IN ('active', 'attention', 'paused')
         AND attempt.outcome = 'running' AND unit.state IN ('leased', 'blocked')) AS accepts_progress`);
-    if (report.status.solver_budget_progress && scope.accepts_progress)
+    if (
+      report.status.solver_budget_progress &&
+      scope.accepts_progress &&
+      report.status.state !== "cancelled"
+    )
       await recordProgressiveCfdRuntimeProgress(connection, {
         simJobId: executionId,
         engineJobId: executionId,
