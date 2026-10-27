@@ -779,6 +779,21 @@ export async function settleProgressiveRemoteJob(db: DB, executionId: string) {
         counts: await settleObsoleteProgressiveRemoteJob(connection, executionId),
       };
     }
+    const [materialFailure] = await connection.execute(sql`
+      SELECT EXISTS (
+        SELECT 1
+        FROM progressive_cfd_attempts attempt
+        JOIN progressive_cfd_evidence receipt ON receipt.attempt_token = attempt.token
+        JOIN result_attempts raw ON raw.id = receipt.result_attempt_id
+        WHERE attempt.sim_job_id = ${executionId}::uuid
+          AND raw.evidence_payload->>'failure_disposition' = 'material_domain'
+      ) AS present
+    `);
+    if (materialFailure?.present === true)
+      await recordProgressiveCfdMaterialDomainRecoveryPlans(
+        connection,
+        executionId,
+      );
     const retained = await readProgressiveRemoteRetention(
       connection,
       executionId,
