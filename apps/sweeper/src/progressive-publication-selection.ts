@@ -1,6 +1,12 @@
 import { sql } from "drizzle-orm";
 
-export function progressivePublicationSelectionSql(lane = 0, laneCount = 1) {
+export type ProgressivePublicationPass = "active" | "backlog";
+
+export function progressivePublicationSelectionSql(
+  lane = 0,
+  laneCount = 1,
+  pass: ProgressivePublicationPass = "active",
+) {
   if (
     !Number.isSafeInteger(lane) ||
     !Number.isSafeInteger(laneCount) ||
@@ -20,28 +26,55 @@ export function progressivePublicationSelectionSql(lane = 0, laneCount = 1) {
       JOIN sim_jobs job ON job.request_payload->>'syncPromiseId' = promise.id::text
       CROSS JOIN settings
       JOIN LATERAL (
-        SELECT report.sim_job_id, report.created_at
+        SELECT report.sim_job_id, report.created_at, report.report->>'solverId' AS report_solver_id
         FROM progressive_worker_reports report
         WHERE report.sim_job_id = job.id
           AND report.acknowledged_at IS NULL
-          AND report.report->>'solverId' = settings.remote_solver_registered_id::text
         ORDER BY report.sequence
         LIMIT 1
-      ) report ON TRUE
-      WHERE promise.status = 'active' AND promise."expiresAt" > clock_timestamp()
+      ) report ON report.report_solver_id = settings.remote_solver_registered_id::text
+      WHERE ${pass === "active" ? sql`TRUE` : sql`FALSE`}
+        AND promise.status = 'active' AND promise."expiresAt" > clock_timestamp()
         AND promise.registered_solver_id = settings.remote_solver_registered_id
         AND promise.source_base_url = settings.upstream_base_url
         AND job.status IN ('pending', 'submitted', 'running', 'ingesting')
         AND job.request_payload->>'upstreamBaseUrl' = settings.upstream_base_url
         AND job.request_payload->>'remoteSolver' = 'true'
-        AND ${laneCount === 1 ? sql`TRUE` : sql`mod((hashtext(report.sim_job_id::text)::bigint & 2147483647), ${laneCount}) = ${lane}`}
+        AND ${laneCount === 1 ? sql`TRUE` : sql`mod((hashtext(job.id::text)::bigint & 2147483647), ${laneCount}) = ${lane}`}
       ORDER BY report.created_at, report.sim_job_id
       LIMIT 1
     ), fallback_candidate AS MATERIALIZED (
+      ${
+        laneCount > 1
+          ? sql`
+      SELECT report.sim_job_id, report.created_at, report.sequence
+      FROM sim_jobs job
+      JOIN sync_sweep_promises promise ON promise.id::text = job.request_payload->>'syncPromiseId'
+      CROSS JOIN settings
+      JOIN LATERAL (
+        SELECT report.sim_job_id, report.created_at, report.sequence, report.report->>'solverId' AS report_solver_id
+        FROM progressive_worker_reports report
+        WHERE report.sim_job_id = job.id
+          AND report.acknowledged_at IS NULL
+        ORDER BY report.sequence LIMIT 1
+      ) report ON report.report_solver_id = settings.remote_solver_registered_id::text
+      WHERE promise.registered_solver_id = settings.remote_solver_registered_id
+        AND promise.source_base_url = settings.upstream_base_url
+        AND job.request_payload->>'upstreamBaseUrl' = settings.upstream_base_url
+        AND job.request_payload->>'remoteSolver' = 'true'
+        AND mod((hashtext(job.id::text)::bigint & 2147483647), ${laneCount}) = ${lane}
+      ORDER BY report.created_at, report.sim_job_id, report.sequence LIMIT 1
+      `
+          : sql`
       SELECT report.sim_job_id, report.created_at, report.sequence
       FROM progressive_worker_reports report
       WHERE report.acknowledged_at IS NULL
         AND report.report->>'solverId' = (SELECT remote_solver_registered_id::text FROM settings)
+        AND report.sequence = (
+          SELECT head.sequence FROM progressive_worker_reports head
+          WHERE head.sim_job_id = report.sim_job_id AND head.acknowledged_at IS NULL
+          ORDER BY head.sequence LIMIT 1
+        )
         AND ${laneCount === 1 ? sql`TRUE` : sql`mod((hashtext(report.sim_job_id::text)::bigint & 2147483647), ${laneCount}) = ${lane}`}
         AND (SELECT true FROM sim_jobs job CROSS JOIN settings
           JOIN sync_sweep_promises promise ON promise.id::text = job.request_payload->>'syncPromiseId'
@@ -52,6 +85,8 @@ export function progressivePublicationSelectionSql(lane = 0, laneCount = 1) {
             AND job.request_payload->>'remoteSolver' = 'true'
         ) IS TRUE
       ORDER BY report.created_at, report.sim_job_id, report.sequence LIMIT 1
+      `
+      }
     )
     SELECT sim_job_id FROM active_candidate
     UNION ALL
@@ -82,6 +117,11 @@ export function progressivePublicationBatchSelectionSql(limit = 32) {
       CROSS JOIN settings
       WHERE report.acknowledged_at IS NULL
         AND report.report->>'solverId' = settings.remote_solver_registered_id::text
+        AND report.sequence = (
+          SELECT head.sequence FROM progressive_worker_reports head
+          WHERE head.sim_job_id = report.sim_job_id AND head.acknowledged_at IS NULL
+          ORDER BY head.sequence LIMIT 1
+        )
         AND promise.registered_solver_id = settings.remote_solver_registered_id
         AND promise.source_base_url = settings.upstream_base_url
         AND job.request_payload->>'upstreamBaseUrl' = settings.upstream_base_url

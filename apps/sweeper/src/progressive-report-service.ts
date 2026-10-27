@@ -1,5 +1,8 @@
 import type { DB, Sql } from "@aerodb/db";
-import { publishProgressiveWorkerReports } from "./progressive-remote-publication";
+import {
+  publishProgressiveWorkerReports,
+  type ProgressivePublicationCursor,
+} from "./progressive-remote-publication";
 import { runNotificationDrain } from "./notification-drain";
 
 export async function runProgressiveReportService(
@@ -14,6 +17,9 @@ export async function runProgressiveReportService(
   } = {},
 ): Promise<void> {
   if (signal.aborted) return;
+  const publicationCursor: ProgressivePublicationCursor = {
+    nextPass: "active",
+  };
   const publish =
     options.publish ??
     (() =>
@@ -22,6 +28,7 @@ export async function runProgressiveReportService(
         fetch,
         options.lane ?? 0,
         options.laneCount ?? 1,
+        publicationCursor,
       ));
   const reportError =
     options.reportError ??

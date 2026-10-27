@@ -1161,6 +1161,18 @@ requires = ["schema", "types"]
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/progressive-staging-selection.test.ts"]
 
 [[test.staging-selection.check]]
+name = "publication-focused"
+tier = "development"
+requires = ["schema", "types"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/progressive-publication-selection.test.ts"]
+
+[[test.staging-selection.check]]
+name = "publication-services"
+tier = "development"
+requires = ["types"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/progressive-report-service.test.ts"]
+
+[[test.staging-selection.check]]
 name = "settlement-evidence"
 tier = "development"
 requires = ["schema", "types"]

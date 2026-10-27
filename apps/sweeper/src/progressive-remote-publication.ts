@@ -9,7 +9,10 @@ import {
   type DB,
 } from "@aerodb/db";
 import { sql } from "drizzle-orm";
-import { progressivePublicationSelectionSql } from "./progressive-publication-selection";
+import {
+  progressivePublicationSelectionSql,
+  type ProgressivePublicationPass,
+} from "./progressive-publication-selection";
 import { fetchProgressiveRemote } from "./progressive-remote-http";
 
 const immutableReportConflictReasons = new Set([
@@ -18,6 +21,10 @@ const immutableReportConflictReasons = new Set([
   "An acknowledged stopped remote execution cannot resume",
 ]);
 const staleRemoteOwnerReason = "remote solver does not own this execution";
+
+export interface ProgressivePublicationCursor {
+  nextPass: ProgressivePublicationPass;
+}
 
 export async function publishProgressiveWorkerReport(
   db: DB,
@@ -153,9 +160,10 @@ export async function publishNextProgressiveWorkerReport(
   fetcher: typeof fetch = fetch,
   lane = 0,
   laneCount = 1,
+  pass: ProgressivePublicationPass = "active",
 ): Promise<boolean> {
   const [pending] = await db.execute(
-    progressivePublicationSelectionSql(lane, laneCount),
+    progressivePublicationSelectionSql(lane, laneCount, pass),
   );
   if (!pending) return false;
   const result = await publishProgressiveWorkerReport(
@@ -171,14 +179,18 @@ export async function publishProgressiveWorkerReports(
   fetcher: typeof fetch = fetch,
   lane = 0,
   laneCount = 1,
+  cursor: ProgressivePublicationCursor = { nextPass: "active" },
 ): Promise<boolean> {
   let published = false;
   for (let index = 0; index < 32; index += 1) {
+    const pass = cursor.nextPass;
+    cursor.nextPass = pass === "active" ? "backlog" : "active";
     const next = await publishNextProgressiveWorkerReport(
       db,
       fetcher,
       lane,
       laneCount,
+      pass,
     );
     if (!next) break;
     published = true;
