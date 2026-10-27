@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import {
   effectiveProgressiveStageSql,
+  progressiveFastTargetSettledSql,
   progressiveAdmissionFrontierSql,
   progressiveCfdAdmissionSql,
   progressiveCohortInitializedSql,
@@ -307,6 +308,10 @@ export async function claimProgressiveCfdUnit(
           sql`, `,
         )})`
       : sql`true`;
+    const preciseTargetReady = sql`(${progressiveFastTargetSettledSql(
+      "generation",
+      sql`work.target_id`,
+    )})`;
     const familyFilter = sql`(${selectedFamilies})
       AND (${input.localTimeStepVersion === 1} OR NULLIF((${effectiveRecipe})->'solver'->'localTimeStepSmoothing', 'null'::jsonb) IS NULL)
       AND (${input.allowPhysicalTime !== false}
@@ -401,6 +406,7 @@ export async function claimProgressiveCfdUnit(
             AND generation.plan_revision_id = (SELECT current_plan_revision_id FROM sim_campaigns WHERE id = ${campaign.id})
             AND generation.status = 'active' AND work.stage = 3
             AND work.stage = ${effectiveProgressiveStageSql()} AND work.stage IN (2, 3) AND work.state = 'pending'
+            AND ${preciseTargetReady}
             AND ${progressiveCfdAdmissionSql("generation", sql`work.target_id`, true)}
             AND (${machPredicate})
             AND ${targetFilter}
@@ -446,6 +452,7 @@ export async function claimProgressiveCfdUnit(
         AND ${previousExecutionStopped}
         AND generation.plan_revision_id = (SELECT current_plan_revision_id FROM sim_campaigns WHERE id = ${campaign.id})
         AND generation.status = 'active' AND work.stage = ${effectiveProgressiveStageSql()} AND work.stage IN (2, 3) AND work.state = 'pending'
+        AND (work.stage <> 3 OR ${preciseTargetReady})
         AND ${progressiveCfdAdmissionSql("generation", sql`work.target_id`, true)}
         AND unit.state = 'pending' AND ${attemptAvailable} AND unit.active_seconds < ${effectiveBudget}
         AND (unit.retry_after IS NULL OR unit.retry_after <= clock_timestamp())

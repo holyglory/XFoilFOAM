@@ -1,7 +1,10 @@
 import { sql } from "drizzle-orm";
 import { PROGRESSIVE_COMPUTE_POLICY } from "@aerodb/core";
 import type { DB } from "./client";
-import { effectiveProgressiveStageSql } from "./progressive-execution-policy";
+import {
+  effectiveProgressiveStageSql,
+  progressiveFastTargetSettledSql,
+} from "./progressive-execution-policy";
 import {
   progressiveCfdOrdinaryAttemptCountSql,
   progressiveCfdCompletionRetryAvailableSql,
@@ -22,6 +25,8 @@ const RECOVERABLE_TERMINAL_GAP_REASONS = [
   "fast pass has no informative accepted evidence",
   "precise evidence remains unresolved",
   "Stale HZ remote execution released during disposable solver reset",
+  "obsolete execution physically stopped",
+  "unstarted submission retry budget exhausted or history incomplete",
 ] as const;
 const RECOVERABLE_TERMINAL_GAP_REASONS_SQL = sql`(${sql.join(
   RECOVERABLE_TERMINAL_GAP_REASONS.map((reason) => sql`${reason}`),
@@ -261,6 +266,7 @@ export async function recoverTerminalProgressiveNoEvidenceGaps(
         AND work.state IN ('pending', 'gap')
         AND campaign.status IN ('active', 'attention', 'paused')
         AND unit.state IN ('gap', 'pending')
+        AND (work.stage <> 3 OR ${progressiveFastTargetSettledSql()})
         AND (
           (unit.state = 'gap' AND unit.error IN ${RECOVERABLE_TERMINAL_GAP_REASONS_SQL})
           OR (
@@ -272,9 +278,20 @@ export async function recoverTerminalProgressiveNoEvidenceGaps(
         AND unit.lease_token IS NULL
         AND unit.lease_owner IS NULL
         AND unit.lease_until IS NULL
-        AND attempt.outcome = 'failed'
+        AND (
+          attempt.outcome = 'failed'
+          OR (
+            attempt.outcome = 'cancelled'
+            AND attempt.active_seconds = 0
+            AND stopped.proof->>'ownership_basis' = 'never_started_cancellation_fence'
+          )
+        )
         AND attempt.sim_job_id IS NOT NULL
         AND attempt.error IN ${RECOVERABLE_TERMINAL_GAP_REASONS_SQL}
+        AND NOT EXISTS (
+          SELECT 1 FROM progressive_cfd_evidence evidence
+          WHERE evidence.attempt_token = attempt.token
+        )
         AND NOT EXISTS (
           SELECT 1 FROM progressive_cfd_attempts newer
           WHERE newer.unit_id = unit.id

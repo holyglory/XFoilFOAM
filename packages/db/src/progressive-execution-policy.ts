@@ -46,9 +46,17 @@ export function effectiveProgressiveStageSql(
   targetId: SQL = sql`work.target_id`,
   workStage: SQL | null = sql`work.stage`,
 ) {
+  const preciseTargetStarted = sql`EXISTS (
+    SELECT 1 FROM progressive_cfd_units precise_unit
+    JOIN progressive_work precise_work ON precise_work.id = precise_unit.work_id
+    WHERE precise_work.generation_id = ${sql.raw(generation)}.id
+      AND precise_work.target_id = ${targetId}
+      AND precise_work.stage = 3
+  )`;
+  const preciseTargetReady = sql`(${progressiveFastTargetSettledSql(generation, targetId)} OR ${preciseTargetStarted})`;
   const preciseOverlap = workStage
-    ? sql`${workStage} = 3 AND ${progressiveFastTargetSettledSql(generation, targetId)}`
-    : progressiveFastTargetSettledSql(generation, targetId);
+    ? sql`${workStage} = 3 AND ${preciseTargetReady}`
+    : preciseTargetReady;
   return sql`CASE WHEN ${progressiveExecutionPolicySql(generation)} THEN (
     SELECT CASE
       WHEN cursor.stage = 2 AND ${preciseOverlap}
