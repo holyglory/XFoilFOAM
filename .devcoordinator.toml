@@ -4363,6 +4363,11 @@ name = "rendered-coverage"
 tier = "development"
 command = ["node", "scripts/dev/verify-production-campaign-coverage.mjs"]
 
+[[test.campaign-coverage-production.check]]
+name = "all-profile-audit"
+tier = "development"
+command = ["node", "scripts/dev/audit-production-campaign-completion.mjs"]
+
 [test.prediction-repair-production]
 timeout_seconds = 180
 
