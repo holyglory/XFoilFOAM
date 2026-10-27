@@ -12,6 +12,8 @@ import {
   type ProgressiveRemoteReport,
 } from "./progressive-remote-report";
 
+const STALE_REPORT_QUARANTINE_BATCH_SIZE = 128;
+
 async function projectRunningWorkerReport(
   db: DB,
   report: ProgressiveRemoteReport,
@@ -384,6 +386,20 @@ export async function quarantineProgressiveWorkerReportConflicts(
     await connection.execute(
       sql`SELECT id FROM sim_jobs WHERE id = ${input.executionId}::uuid FOR UPDATE`,
     );
+    const pending = await connection.execute(sql`
+      SELECT sequence
+      FROM progressive_worker_reports
+      WHERE sim_job_id = ${input.executionId}::uuid
+        AND report->>'solverId' = ${input.solverId}
+        AND acknowledged_at IS NULL
+      ORDER BY sequence
+      LIMIT ${STALE_REPORT_QUARANTINE_BATCH_SIZE}
+    `);
+    if (!pending.length) return 0;
+    const sequences = sql.join(
+      pending.map((row) => sql`${String(row.sequence)}::bigint`),
+      sql`, `,
+    );
     await connection.execute(sql`
       INSERT INTO progressive_worker_report_conflicts
         (sim_job_id, sequence, content_signature, report, reason)
@@ -391,6 +407,7 @@ export async function quarantineProgressiveWorkerReportConflicts(
       FROM progressive_worker_reports report
       WHERE report.sim_job_id = ${input.executionId}::uuid
         AND report.report->>'solverId' = ${input.solverId}
+        AND report.sequence IN (${sequences})
         AND report.acknowledged_at IS NULL
       ON CONFLICT (sim_job_id, sequence) DO NOTHING
     `);
@@ -399,6 +416,7 @@ export async function quarantineProgressiveWorkerReportConflicts(
       SET acknowledged_at = coalesce(acknowledged_at, clock_timestamp())
       WHERE sim_job_id = ${input.executionId}::uuid
         AND report->>'solverId' = ${input.solverId}
+        AND sequence IN (${sequences})
         AND acknowledged_at IS NULL
       RETURNING sequence
     `);
