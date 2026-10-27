@@ -19,7 +19,8 @@ it("prioritizes active exact-owned reports before stale pending backlog", async 
         'https://fixture.invalid'::text AS upstream_base_url,md5('solver')::uuid AS remote_solver_registered_id`);
     await transaction.execute(sql`CREATE TEMP TABLE sim_jobs ON COMMIT DROP AS
       SELECT id,jsonb_build_object('syncPromiseId',id::text,'remoteSolver',variant<>'not-remote',
-        'upstreamBaseUrl',CASE WHEN variant='wrong-job-upstream' THEN 'https://foreign.invalid' ELSE 'https://fixture.invalid' END) AS request_payload FROM fixture_jobs`);
+        'upstreamBaseUrl',CASE WHEN variant='wrong-job-upstream' THEN 'https://foreign.invalid' ELSE 'https://fixture.invalid' END) AS request_payload,
+        CASE WHEN variant='cancelled' THEN 'cancelled' ELSE 'running' END AS status FROM fixture_jobs`);
     await transaction.execute(
       sql`CREATE UNIQUE INDEX fixture_publication_jobs_idx ON sim_jobs(id)`,
     );
@@ -60,7 +61,8 @@ it("prioritizes active exact-owned reports before stale pending backlog", async 
         AND promise.source_base_url=settings.upstream_base_url
         AND job.request_payload->>'upstreamBaseUrl'=settings.upstream_base_url
         AND job.request_payload->>'remoteSolver'='true'
-      ORDER BY (promise.status = 'active' AND promise."expiresAt" > clock_timestamp()) DESC,
+      ORDER BY (promise.status = 'active' AND promise."expiresAt" > clock_timestamp()
+        AND job.status IN ('pending', 'submitted', 'running', 'ingesting')) DESC,
         report.created_at,report.sim_job_id,report.sequence LIMIT 1`);
     const selectedJobs = new Set();
     for (let ordinal = 0; ordinal < 6; ordinal += 1) {

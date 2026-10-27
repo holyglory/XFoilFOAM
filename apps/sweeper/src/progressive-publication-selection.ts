@@ -31,6 +31,7 @@ export function progressivePublicationSelectionSql(lane = 0, laneCount = 1) {
       WHERE promise.status = 'active' AND promise."expiresAt" > clock_timestamp()
         AND promise.registered_solver_id = settings.remote_solver_registered_id
         AND promise.source_base_url = settings.upstream_base_url
+        AND job.status IN ('pending', 'submitted', 'running', 'ingesting')
         AND job.request_payload->>'upstreamBaseUrl' = settings.upstream_base_url
         AND job.request_payload->>'remoteSolver' = 'true'
         AND ${laneCount === 1 ? sql`TRUE` : sql`mod((hashtext(report.sim_job_id::text)::bigint & 2147483647), ${laneCount}) = ${lane}`}
@@ -72,7 +73,8 @@ export function progressivePublicationBatchSelectionSql(limit = 32) {
       SELECT DISTINCT ON (report.sim_job_id)
         report.sim_job_id,
         report.created_at,
-        (promise.status = 'active' AND promise."expiresAt" > clock_timestamp()) AS active_lease
+        (promise.status = 'active' AND promise."expiresAt" > clock_timestamp()
+          AND job.status IN ('pending', 'submitted', 'running', 'ingesting')) AS active_lease
       FROM progressive_worker_reports report
       JOIN sim_jobs job ON job.id = report.sim_job_id
       JOIN sync_sweep_promises promise
