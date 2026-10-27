@@ -1,5 +1,92 @@
 import { sql } from "drizzle-orm";
 
+const PROGRESSIVE_BOUNDED_NO_EVIDENCE_RECOVERY_REASONS = [
+  "terminal execution has no measured case evidence",
+  "Stale HZ remote execution released during disposable solver reset",
+  "obsolete execution physically stopped",
+  "unstarted submission retry budget exhausted or history incomplete",
+] as const;
+const PROGRESSIVE_BOUNDED_NO_EVIDENCE_RECOVERY_REASONS_SQL = sql`(${sql.join(
+  PROGRESSIVE_BOUNDED_NO_EVIDENCE_RECOVERY_REASONS.map((reason) => sql`${reason}`),
+  sql`, `,
+)})`;
+
+export function progressiveCfdNoAcceptedHistoryAndSettledSql(alias = "unit") {
+  const unit = sql.identifier(alias);
+  return sql`(
+    NOT EXISTS (
+      SELECT 1
+      FROM progressive_cfd_attempts history
+      JOIN progressive_cfd_evidence evidence
+        ON evidence.attempt_token = history.token
+      JOIN result_attempts raw
+        ON raw.id = evidence.result_attempt_id
+      LEFT JOIN result_classifications accepted_attempt
+        ON accepted_attempt.result_attempt_id = raw.id
+      LEFT JOIN result_classifications accepted_result
+        ON accepted_result.result_id = raw.result_id
+      WHERE history.unit_id = ${unit}.id
+        AND (
+          accepted_attempt.state = 'accepted'
+          OR accepted_result.state = 'accepted'
+        )
+    )
+    AND NOT EXISTS (
+      SELECT 1
+      FROM progressive_cfd_attempts history
+      LEFT JOIN sim_jobs history_job
+        ON history_job.id = history.sim_job_id
+      LEFT JOIN progressive_cfd_execution_stops history_stop
+        ON history_stop.sim_job_id = history.sim_job_id
+        AND history_stop.engine_job_id = history_job.engine_job_id
+      WHERE history.unit_id = ${unit}.id
+        AND history.sim_job_id IS NOT NULL
+        AND (
+          history.outcome = 'running'
+          OR (
+            history_stop.sim_job_id IS NULL
+            AND NOT (
+              history.error = 'Stale HZ remote execution released during disposable solver reset'
+              AND history_job.status = 'cancelled'
+              AND history_job.engine_state = 'cancelled'
+              AND history_job.engine_job_id IS NULL
+              AND NOT EXISTS (
+                SELECT 1
+                FROM progressive_remote_dispatches dispatch
+                JOIN sync_sweep_promises promise
+                  ON promise.id = dispatch.promise_id
+                WHERE dispatch.sim_job_id = history.sim_job_id
+                  AND promise.status = 'active'
+              )
+            )
+          )
+        )
+    )
+    AND NOT EXISTS (
+      SELECT 1
+      FROM progressive_cfd_attempts history
+      JOIN progressive_remote_dispatches dispatch
+        ON dispatch.sim_job_id = history.sim_job_id
+      JOIN sync_sweep_promises promise
+        ON promise.id = dispatch.promise_id
+      WHERE history.unit_id = ${unit}.id
+        AND promise.status = 'active'
+    )
+  )`;
+}
+
+export function progressiveCfdBoundedNoEvidenceRecoveryAvailableSql(
+  alias = "unit",
+) {
+  const unit = sql.identifier(alias);
+  return sql`(
+    ${unit}.attempts = 3
+    AND ${unit}.active_seconds < ${unit}.active_budget_seconds
+    AND ${unit}.error IN ${PROGRESSIVE_BOUNDED_NO_EVIDENCE_RECOVERY_REASONS_SQL}
+    AND ${progressiveCfdNoAcceptedHistoryAndSettledSql(alias)}
+  )`;
+}
+
 export function progressiveCfdNeverStartedAttemptCountSql(alias = "unit") {
   const unit = sql.identifier(alias);
   return sql`(

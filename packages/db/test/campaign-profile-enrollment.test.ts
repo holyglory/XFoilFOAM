@@ -2687,20 +2687,21 @@ describe("progressive durable stage transitions", () => {
       UPDATE progressive_work SET state = 'gap', error = 'terminal execution has no measured case evidence'
       WHERE id = ${lease.workId}::uuid
     `);
-    expect(await recoverTerminalProgressiveNoEvidenceGaps(db)).toBe(0);
+    expect(await recoverTerminalProgressiveNoEvidenceGaps(db)).toBe(1);
     const [attemptLimitUnit] = await db.execute(sql`
-      SELECT state, attempts, active_seconds FROM progressive_cfd_units
+      SELECT state, attempts, active_seconds, error FROM progressive_cfd_units
       WHERE id = ${lease.id}::uuid
     `);
     expect(attemptLimitUnit).toMatchObject({
-      state: 'gap',
+      state: 'pending',
       attempts: 3,
       active_seconds: 0,
+      error: 'terminal execution has no measured case evidence',
     });
 
     await db.execute(sql`
       UPDATE progressive_cfd_units
-      SET attempts = 2, active_seconds = active_budget_seconds,
+      SET state = 'gap', attempts = 2, active_seconds = active_budget_seconds,
         error = 'terminal execution has no measured case evidence'
       WHERE id = ${lease.id}::uuid
     `);
@@ -2819,7 +2820,7 @@ describe("progressive durable stage transitions", () => {
     });
   });
 
-  it("reopens bounded stale-HZ gaps without reopening exhausted budgets", async () => {
+  it("reopens one bounded stale-HZ retry at the attempt ceiling", async () => {
     const fixture = await fitFixture(2, false, [0]);
     const lease = fixture.leases[0];
     await acknowledgeProgressiveCfdExecutionStop(db, {
@@ -2837,7 +2838,7 @@ describe("progressive durable stage transitions", () => {
     await db.execute(sql`
       UPDATE progressive_cfd_units
       SET state = 'gap', lease_token = NULL, lease_owner = NULL,
-        lease_until = NULL, attempts = 1, active_seconds = 0, error = ${reason}
+        lease_until = NULL, attempts = 3, active_seconds = 0, error = ${reason}
       WHERE id = ${lease.id}::uuid
     `);
     await db.execute(sql`
@@ -2851,9 +2852,101 @@ describe("progressive durable stage transitions", () => {
     `);
     expect(reopened).toMatchObject({
       state: 'pending',
-      attempts: 1,
-      error: 'Retrying after terminal execution without measurable case evidence',
+      attempts: 3,
+      error: reason,
     });
+    const replay = await claimProgressiveCfdUnit(db, {
+      owner: "stale-hz-ceiling-replay",
+      leaseSeconds: 120,
+      solverBudgetVersion: 2,
+      localTimeStepVersion: 1,
+      sameTarget: {
+        generationId: lease.generationId,
+        targetId: lease.targetId,
+        recipe: lease.recipe,
+        remainingActiveSeconds: lease.remainingActiveSeconds,
+        recoveryParentJobId: lease.recoveryParentJobId ?? null,
+      },
+    });
+    expect(replay).toMatchObject({ id: lease.id });
+    const [history] = await db.execute(sql`
+      SELECT count(*)::int AS count FROM progressive_cfd_attempts
+      WHERE unit_id = ${lease.id}::uuid
+    `);
+    expect(history.count).toBe(2);
+    const [claimed] = await db.execute(sql`
+      SELECT attempts, state FROM progressive_cfd_units WHERE id = ${lease.id}::uuid
+    `);
+    expect(claimed).toMatchObject({ attempts: 4, state: 'leased' });
+  });
+
+  it("does not reopen an attempt-ceiling gap with accepted history", async () => {
+    const fixture = await fitFixture(2, false, [0]);
+    const lease = fixture.leases[0];
+    const evidence = await fixture.save(20, "rans", 0);
+    await fixture.record([evidence]);
+    await db.execute(sql`
+      INSERT INTO result_classifications(result_attempt_id, airfoil_id,
+        simulation_preset_revision_id, aoa_deg, classifier_version, state, reasons)
+      SELECT id, airfoil_id, simulation_preset_revision_id, aoa_deg,
+        'bounded-recovery-accepted-history', 'accepted', '{}'
+      FROM result_attempts WHERE id = ${evidence}::uuid
+    `);
+    await acknowledgeProgressiveCfdExecutionStop(db, {
+      simJobId: fixture.composed.jobId,
+      proof: executionStopProof(fixture.engineJobId),
+    });
+    const reason =
+      "terminal execution has no measured case evidence";
+    await db.execute(sql`
+      UPDATE progressive_cfd_attempts
+      SET outcome = 'failed', error = ${reason}
+      WHERE token = ${lease.token}::uuid
+    `);
+    await db.execute(sql`
+      UPDATE progressive_cfd_units
+      SET state = 'gap', lease_token = NULL, lease_owner = NULL,
+        lease_until = NULL, attempts = 3, active_seconds = 0, error = ${reason}
+      WHERE id = ${lease.id}::uuid
+    `);
+    await db.execute(sql`
+      UPDATE progressive_work SET state = 'gap', error = ${reason}
+      WHERE id = ${lease.workId}::uuid
+    `);
+    expect(await recoverTerminalProgressiveNoEvidenceGaps(db)).toBe(0);
+    const [unit] = await db.execute(sql`
+      SELECT state, attempts, error FROM progressive_cfd_units
+      WHERE id = ${lease.id}::uuid
+    `);
+    expect(unit).toMatchObject({ state: 'gap', attempts: 3, error: reason });
+  });
+
+  it("does not reopen an attempt-ceiling gap with unsettled ownership", async () => {
+    const fixture = await fitFixture(2, false, [0]);
+    const lease = fixture.leases[0];
+    const reason =
+      "Stale HZ remote execution released during disposable solver reset";
+    await db.execute(sql`
+      UPDATE progressive_cfd_attempts
+      SET outcome = 'failed', error = ${reason}
+      WHERE token = ${lease.token}::uuid
+    `);
+    await db.execute(sql`
+      UPDATE progressive_cfd_units
+      SET state = 'gap', lease_token = NULL, lease_owner = NULL,
+        lease_until = NULL, attempts = 3, active_seconds = 0, error = ${reason}
+      WHERE id = ${lease.id}::uuid
+    `);
+    await db.execute(sql`
+      UPDATE progressive_work SET state = 'gap', error = ${reason}
+      WHERE id = ${lease.workId}::uuid
+    `);
+    expect(await recoverTerminalProgressiveNoEvidenceGaps(db)).toBe(0);
+    const [unit] = await db.execute(sql`
+      SELECT state, attempts, error FROM progressive_cfd_units
+      WHERE id = ${lease.id}::uuid
+    `);
+    expect(unit).toMatchObject({ state: 'gap', attempts: 3, error: reason });
   });
 
   it.each(["paused", "cancelled"])(

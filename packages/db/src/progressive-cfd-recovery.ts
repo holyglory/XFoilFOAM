@@ -6,11 +6,14 @@ import {
   progressiveFastTargetSettledSql,
 } from "./progressive-execution-policy";
 import {
+  progressiveCfdBoundedNoEvidenceRecoveryAvailableSql,
+  progressiveCfdNoAcceptedHistoryAndSettledSql,
   progressiveCfdOrdinaryAttemptCountSql,
   progressiveCfdCompletionRetryAvailableSql,
   progressiveCfdPreciseVerificationAvailableSql,
 } from "./progressive-attempt-budget";
 import { acquireProgressiveAdmissionLock } from "./progressive-admission-lock";
+import { STALE_HZ_RESET_REASON } from "./progressive-remote-stale-recovery";
 import {
   progressiveCfdBudgetExtensionPendingSql,
   progressiveCfdEffectiveBudgetSql,
@@ -256,9 +259,12 @@ export async function recoverTerminalProgressiveNoEvidenceGaps(
       JOIN progressive_generations generation ON generation.id = work.generation_id
       JOIN sim_campaigns campaign ON campaign.id = generation.campaign_id
       JOIN progressive_cfd_attempts attempt ON attempt.unit_id = unit.id
-      JOIN progressive_cfd_execution_stops stopped
-        ON stopped.sim_job_id = attempt.sim_job_id
-        AND stopped.engine_job_id = attempt.sim_job_id::text
+      JOIN sim_jobs attempt_job
+        ON attempt_job.id = attempt.sim_job_id
+        AND attempt_job.campaign_id = campaign.id
+      LEFT JOIN progressive_cfd_execution_stops stopped
+        ON stopped.sim_job_id = attempt_job.id
+        AND stopped.engine_job_id = attempt_job.engine_job_id
       WHERE generation.epoch_id = ${epoch.id}
         AND generation.status = 'active'
         AND generation.plan_revision_id = campaign.current_plan_revision_id
@@ -274,7 +280,10 @@ export async function recoverTerminalProgressiveNoEvidenceGaps(
             AND unit.error = ${TERMINAL_NO_EVIDENCE_RETRY_REASON}
           )
         )
-        AND unit.attempts < 3
+        AND (
+          unit.attempts < 3
+          OR ${progressiveCfdBoundedNoEvidenceRecoveryAvailableSql()}
+        )
         AND unit.lease_token IS NULL
         AND unit.lease_owner IS NULL
         AND unit.lease_until IS NULL
@@ -303,6 +312,24 @@ export async function recoverTerminalProgressiveNoEvidenceGaps(
         )
         AND attempt.sim_job_id IS NOT NULL
         AND attempt.error IN ${RECOVERABLE_TERMINAL_GAP_REASONS_SQL}
+        AND (
+          (unit.state = 'gap' AND attempt.error = unit.error)
+          OR (
+            unit.state = 'pending'
+            AND unit.error = ${TERMINAL_NO_EVIDENCE_RETRY_REASON}
+          )
+        )
+        AND (
+          stopped.sim_job_id IS NOT NULL
+          OR (
+            attempt.error = ${STALE_HZ_RESET_REASON}
+            AND attempt.outcome = 'failed'
+            AND attempt_job.status = 'cancelled'
+            AND attempt_job.engine_state = 'cancelled'
+            AND attempt_job.engine_job_id IS NULL
+          )
+        )
+        AND ${progressiveCfdNoAcceptedHistoryAndSettledSql()}
         AND NOT EXISTS (
           SELECT 1 FROM progressive_cfd_evidence evidence
           WHERE evidence.attempt_token = attempt.token
@@ -312,21 +339,9 @@ export async function recoverTerminalProgressiveNoEvidenceGaps(
           WHERE newer.unit_id = unit.id
             AND (newer.started_at, newer.token) > (attempt.started_at, attempt.token)
         )
-        AND NOT EXISTS (
-          SELECT 1 FROM progressive_cfd_attempts active
-          WHERE active.unit_id = unit.id AND active.outcome = 'running'
-        )
-        AND NOT EXISTS (
-          SELECT 1 FROM progressive_cfd_attempts unsettled
-          LEFT JOIN progressive_cfd_execution_stops unsettled_stop
-            ON unsettled_stop.sim_job_id = unsettled.sim_job_id
-          WHERE unsettled.unit_id = unit.id
-            AND unsettled.sim_job_id IS NOT NULL
-            AND unsettled_stop.sim_job_id IS NULL
-        )
       ORDER BY unit.attempts, unit.id
       LIMIT ${PROGRESSIVE_TERMINAL_RECOVERY_UNITS_PER_PASS}
-      FOR UPDATE OF work, unit, attempt SKIP LOCKED
+      FOR UPDATE OF work, unit, attempt, attempt_job SKIP LOCKED
     `);
     let recovered = 0;
     for (const unit of units) {
@@ -338,12 +353,14 @@ export async function recoverTerminalProgressiveNoEvidenceGaps(
             'obsolete execution physically stopped',
             'unstarted submission retry budget exhausted or history incomplete'
           ) THEN clock_timestamp() + interval '5 minutes' ELSE NULL END,
-          error = ${TERMINAL_NO_EVIDENCE_RETRY_REASON}
+          error = CASE WHEN unit.attempts = 3
+            THEN unit.error ELSE ${TERMINAL_NO_EVIDENCE_RETRY_REASON} END
         FROM progressive_work work
         WHERE unit.id = ${unit.id}::uuid
           AND work.id = unit.work_id
           AND unit.state = 'gap'
-          AND ${claimEligible}
+          AND unit.active_seconds < ${progressiveCfdEffectiveBudgetSql(sql`unit`)}
+          AND (unit.attempts = 3 OR ${attemptAvailable})
         RETURNING unit.id
       `);
       if (requeued) {
