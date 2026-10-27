@@ -9,7 +9,7 @@ import {
 const client = createClient({ max: 1 });
 afterAll(() => client.sql.end());
 
-it("selects the oldest exact owned report without re-reading the whole pending backlog", async () => {
+it("prioritizes active exact-owned reports before stale pending backlog", async () => {
   await client.db.transaction(async (transaction) => {
     await transaction.execute(sql`CREATE TEMP TABLE fixture_jobs ON COMMIT DROP AS
       SELECT md5(variant)::uuid AS id,variant FROM unnest(ARRAY['eligible','cancelled','expired',
@@ -47,7 +47,7 @@ it("selects the oldest exact owned report without re-reading the whole pending b
       transaction.execute(progressivePublicationSelectionSql());
     const selectBatch = () =>
       transaction.execute(progressivePublicationBatchSelectionSql(3));
-    const legacy = () =>
+    const expected = () =>
       transaction.execute(sql`
       SELECT report.sim_job_id FROM progressive_worker_reports report
       JOIN sim_jobs job ON job.id=report.sim_job_id
@@ -60,11 +60,12 @@ it("selects the oldest exact owned report without re-reading the whole pending b
         AND promise.source_base_url=settings.upstream_base_url
         AND job.request_payload->>'upstreamBaseUrl'=settings.upstream_base_url
         AND job.request_payload->>'remoteSolver'='true'
-      ORDER BY report.created_at,report.sim_job_id,report.sequence LIMIT 1`);
+      ORDER BY (promise.status = 'active' AND promise."expiresAt" > clock_timestamp()) DESC,
+        report.created_at,report.sim_job_id,report.sequence LIMIT 1`);
     const selectedJobs = new Set();
     for (let ordinal = 0; ordinal < 6; ordinal += 1) {
       const rows = await select();
-      expect(rows).toEqual(await legacy());
+      expect(rows).toEqual(await expected());
       expect(rows).toHaveLength(1);
       selectedJobs.add(rows[0].sim_job_id);
       await transaction.execute(sql`UPDATE progressive_worker_reports SET acknowledged_at=clock_timestamp()
@@ -152,7 +153,7 @@ it("selects the oldest exact owned report without re-reading the whole pending b
           node["Relation Name"] === "progressive_worker_reports",
       ),
     ).toBe(false);
-    expect(await select()).toEqual(await legacy());
+    expect(await select()).toEqual(await expected());
     console.info(
       JSON.stringify({
         reportSelectionMs: plan["Execution Time"],

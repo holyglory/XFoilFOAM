@@ -14,8 +14,31 @@ export function progressivePublicationSelectionSql(lane = 0, laneCount = 1) {
       SELECT remote_solver_registered_id,upstream_base_url FROM sync_api_settings
       WHERE id = 1 AND NOT remote_solver_transfer_paused
         AND remote_solver_auth_token <> '' AND upstream_base_url IS NOT NULL
-    )
-      SELECT report.sim_job_id FROM progressive_worker_reports report
+    ), active_candidate AS MATERIALIZED (
+      SELECT report.sim_job_id, report.created_at
+      FROM sync_sweep_promises promise
+      JOIN sim_jobs job ON job.request_payload->>'syncPromiseId' = promise.id::text
+      CROSS JOIN settings
+      JOIN LATERAL (
+        SELECT report.sim_job_id, report.created_at
+        FROM progressive_worker_reports report
+        WHERE report.sim_job_id = job.id
+          AND report.acknowledged_at IS NULL
+          AND report.report->>'solverId' = settings.remote_solver_registered_id::text
+        ORDER BY report.sequence
+        LIMIT 1
+      ) report ON TRUE
+      WHERE promise.status = 'active' AND promise."expiresAt" > clock_timestamp()
+        AND promise.registered_solver_id = settings.remote_solver_registered_id
+        AND promise.source_base_url = settings.upstream_base_url
+        AND job.request_payload->>'upstreamBaseUrl' = settings.upstream_base_url
+        AND job.request_payload->>'remoteSolver' = 'true'
+        AND ${laneCount === 1 ? sql`TRUE` : sql`mod((hashtext(report.sim_job_id::text)::bigint & 2147483647), ${laneCount}) = ${lane}`}
+      ORDER BY report.created_at, report.sim_job_id
+      LIMIT 1
+    ), fallback_candidate AS MATERIALIZED (
+      SELECT report.sim_job_id, report.created_at, report.sequence
+      FROM progressive_worker_reports report
       WHERE report.acknowledged_at IS NULL
         AND report.report->>'solverId' = (SELECT remote_solver_registered_id::text FROM settings)
         AND ${laneCount === 1 ? sql`TRUE` : sql`mod((hashtext(report.sim_job_id::text)::bigint & 2147483647), ${laneCount}) = ${lane}`}
@@ -28,6 +51,12 @@ export function progressivePublicationSelectionSql(lane = 0, laneCount = 1) {
             AND job.request_payload->>'remoteSolver' = 'true'
         ) IS TRUE
       ORDER BY report.created_at, report.sim_job_id, report.sequence LIMIT 1
+    )
+    SELECT sim_job_id FROM active_candidate
+    UNION ALL
+    SELECT sim_job_id FROM fallback_candidate
+    WHERE NOT EXISTS (SELECT 1 FROM active_candidate)
+    LIMIT 1
   `;
 }
 
