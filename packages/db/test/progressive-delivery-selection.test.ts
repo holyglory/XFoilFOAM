@@ -263,6 +263,60 @@ it("prioritizes active remote reports before terminal ingestion backlog", async 
   });
 });
 
+it("reserves a bounded terminal lane while active report jobs keep arriving", async () => {
+  await client.db.transaction(async (transaction) => {
+    await transaction.execute(sql`CREATE TEMP TABLE sim_jobs ON COMMIT DROP AS
+      SELECT md5('active-' || ordinal)::uuid AS id, md5('campaign')::uuid AS campaign_id,
+        md5('active-engine-' || ordinal)::text AS engine_job_id, 'running'::text AS status,
+        clock_timestamp() AS "updatedAt", clock_timestamp() AS "polledAt",
+        'running'::text AS engine_state
+      FROM generate_series(1, 12) ordinal
+      UNION ALL
+      SELECT md5('terminal-' || ordinal)::uuid, md5('campaign')::uuid,
+        md5('terminal-' || ordinal)::text, 'cancelled'::text,
+        clock_timestamp() - interval '1 hour', clock_timestamp() - interval '1 hour',
+        'cancelled'::text
+      FROM generate_series(1, 5) ordinal`);
+    await transaction.execute(sql`CREATE TEMP TABLE progressive_remote_dispatches ON COMMIT DROP AS
+      SELECT id AS sim_job_id FROM sim_jobs`);
+    await transaction.execute(sql`CREATE TEMP TABLE progressive_remote_reports ON COMMIT DROP AS
+      SELECT job.id AS sim_job_id, sequence, clock_timestamp() -
+        CASE WHEN job.status = 'cancelled' THEN interval '1 hour' ELSE interval '1 minute' END AS received_at
+      FROM sim_jobs job CROSS JOIN generate_series(1, 120) sequence`);
+    await transaction.execute(sql`CREATE TEMP TABLE progressive_remote_progress_receipts (
+      sim_job_id uuid, sequence bigint
+    ) ON COMMIT DROP`);
+    await transaction.execute(sql`CREATE TEMP TABLE progressive_remote_report_inventories (
+      sim_job_id uuid, sequence bigint
+    ) ON COMMIT DROP`);
+
+    const selected = await transaction.execute(progressiveReportJobsSql());
+    const activeIds = new Set(
+      (await transaction.execute(sql`SELECT id FROM sim_jobs WHERE status = 'running'`)).map(
+        (row) => row.id,
+      ),
+    );
+    const terminalIds = new Set(
+      (await transaction.execute(sql`SELECT id FROM sim_jobs WHERE status = 'cancelled'`)).map(
+        (row) => row.id,
+      ),
+    );
+
+    expect(selected).toHaveLength(17);
+    expect(selected.slice(0, 6).every((row) => activeIds.has(row.sim_job_id))).toBe(true);
+    expect(selected.slice(6, 8).every((row) => terminalIds.has(row.sim_job_id))).toBe(true);
+    expect(selected.slice(0, 8).some((row) => terminalIds.has(row.sim_job_id))).toBe(true);
+    expect(selected).toEqual(
+      expect.arrayContaining(
+        [...terminalIds].map((sim_job_id) => ({
+          sim_job_id,
+          campaign_id: selected[0].campaign_id,
+        })),
+      ),
+    );
+  });
+});
+
 it("selects closed terminal jobs with retained evidence for classification settlement", async () => {
   await client.db.transaction(async (transaction) => {
     await transaction.execute(sql`CREATE TEMP TABLE sim_campaigns ON COMMIT DROP AS

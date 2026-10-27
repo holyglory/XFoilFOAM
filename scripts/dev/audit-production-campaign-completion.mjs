@@ -24,6 +24,14 @@ try {
   const summaryResponse = await request.get(`/api/admin/campaigns/${campaignId}`);
   assert.equal(summaryResponse.status(), 200);
   const summary = await summaryResponse.json();
+  const [healthResponse, syncResponse] = await Promise.all([
+    request.get("/api/admin/health"),
+    request.get("/api/admin/sync"),
+  ]);
+  assert.equal(healthResponse.status(), 200);
+  assert.equal(syncResponse.status(), 200);
+  const health = await healthResponse.json();
+  const sync = await syncResponse.json();
   let cursor = null;
   const items = [];
   do {
@@ -73,6 +81,30 @@ try {
     firstMissing: missing.slice(0, 20),
     campaignTotals: summary.totals,
     completionSources: summary.completionSources,
+    fleet: {
+      healthKeys: Object.keys(health).sort(),
+      syncSettings: {
+        remoteSolverEnabled: sync.settings?.remoteSolverEnabled ?? null,
+        remoteSolverCpuBudget: sync.settings?.remoteSolverCpuBudget ?? null,
+        remoteSolverLastStatus: sync.settings?.remoteSolverLastStatus ?? null,
+        remoteSolverLastError: sync.settings?.remoteSolverLastError ?? null,
+      },
+      registeredSolvers: (sync.registeredSolvers ?? []).map((solver) => ({
+        instanceName: solver.instanceName,
+        cpuCapacity: solver.cpuCapacity,
+        cpuBudget: solver.cpuBudget,
+        maxActivePolarPromises: solver.maxActivePolarPromises,
+        activePromiseCount: solver.activePromiseCount,
+        status: solver.status,
+        lastHeartbeatAt: solver.lastHeartbeatAt,
+        activeAoaCount: solver.activeAoaCount,
+        solvedCount: solver.solvedCount,
+        pushedCount: solver.pushedCount,
+        health: solver.health,
+      })),
+      performance: health.performance ?? null,
+      fleet: health.fleet ?? null,
+    },
   }));
   assert.equal(items.length, Number(summary.airfoilCount ?? items.length));
   assert(conditions > 0, "No progressive condition cells were returned");

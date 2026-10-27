@@ -1167,6 +1167,12 @@ requires = ["schema", "types"]
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/progressive-publication-selection.test.ts"]
 
 [[test.staging-selection.check]]
+name = "progressive-delivery-selection"
+tier = "development"
+requires = ["schema", "types"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/progressive-delivery-selection.test.ts"]
+
+[[test.staging-selection.check]]
 name = "publication-services"
 tier = "development"
 requires = ["types"]
@@ -4367,6 +4373,11 @@ command = ["node", "scripts/dev/verify-production-campaign-coverage.mjs"]
 name = "all-profile-audit"
 tier = "development"
 command = ["node", "scripts/dev/audit-production-campaign-completion.mjs"]
+
+[[test.campaign-coverage-production.check]]
+name = "remote-backpressure"
+tier = "development"
+command = ["node", "scripts/dev/diagnose-production-remote-backpressure.mjs"]
 
 [test.prediction-repair-production]
 timeout_seconds = 180

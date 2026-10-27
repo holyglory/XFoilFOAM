@@ -1,6 +1,9 @@
 import { sql } from "drizzle-orm";
 
 const PROGRESSIVE_REPORT_JOB_LIMIT = 64;
+const PROGRESSIVE_REPORT_BACKPRESSURE_LIMIT = 2_000;
+const PROGRESSIVE_TERMINAL_REPORT_JOB_RESERVE = 2;
+const PROGRESSIVE_ACTIVE_REPORT_JOB_HEADROOM = 6;
 const PROGRESSIVE_SETTLEMENT_JOB_LIMIT = 128;
 
 const unappliedReports = sql`EXISTS (
@@ -36,22 +39,73 @@ export function progressiveReportJobsSql(jobIds?: string[]) {
       LEFT JOIN progressive_remote_report_inventories inventory
         ON inventory.sim_job_id = report.sim_job_id AND inventory.sequence = report.sequence
       GROUP BY report.sim_job_id
+    ), backlog AS MATERIALIZED (
+      SELECT count(*)::int AS pending_reports
+      FROM progressive_remote_reports report
+      LEFT JOIN progressive_remote_progress_receipts receipt
+        ON receipt.sim_job_id = report.sim_job_id AND receipt.sequence = report.sequence
+      LEFT JOIN progressive_remote_report_inventories inventory
+        ON inventory.sim_job_id = report.sim_job_id AND inventory.sequence = report.sequence
+      WHERE receipt.sim_job_id IS NULL OR inventory.sim_job_id IS NULL
+    ), eligible AS MATERIALIZED (
+      SELECT job.id AS sim_job_id, job.campaign_id,
+        state.has_unapplied, state.has_indexed, state.oldest_unapplied_report,
+        backlog.pending_reports,
+        CASE WHEN job.status NOT IN ('pending', 'submitted', 'running')
+          THEN true ELSE false END AS terminal_job,
+        CASE WHEN state.has_unapplied THEN 0 ELSE 1 END AS report_priority,
+        CASE WHEN job.status = 'pending' AND job.engine_job_id IS NOT NULL THEN 0
+          WHEN job.status = 'pending' AND job.engine_job_id IS NULL THEN 1
+          WHEN job.status IN ('submitted', 'running') THEN 2
+          ELSE 3 END AS lifecycle_priority,
+        coalesce(job."polledAt", job."updatedAt") AS last_polled_at
+      FROM report_state state
+      JOIN sim_jobs job ON job.id = state.sim_job_id
+      CROSS JOIN backlog
+      WHERE ${executionScope(jobIds)}
+        AND (state.has_unapplied OR (
+          job.engine_job_id IS NULL AND job.status = 'pending' AND state.has_indexed
+        ))
+        AND EXISTS (SELECT 1 FROM progressive_remote_dispatches dispatch WHERE dispatch.sim_job_id = job.id)
+    ), active_head AS MATERIALIZED (
+      SELECT eligible.*
+      FROM eligible
+      WHERE NOT eligible.terminal_job
+      ORDER BY eligible.report_priority, eligible.lifecycle_priority,
+        eligible.oldest_unapplied_report NULLS LAST, eligible.last_polled_at,
+        eligible.sim_job_id
+      LIMIT (SELECT CASE WHEN pending_reports >= ${PROGRESSIVE_REPORT_BACKPRESSURE_LIMIT}::int
+        THEN ${PROGRESSIVE_ACTIVE_REPORT_JOB_HEADROOM}::int ELSE ${PROGRESSIVE_REPORT_JOB_LIMIT}::int END
+        FROM backlog)
+    ), terminal_head AS MATERIALIZED (
+      SELECT eligible.*
+      FROM eligible
+      WHERE eligible.terminal_job
+        AND eligible.pending_reports >= ${PROGRESSIVE_REPORT_BACKPRESSURE_LIMIT}
+      ORDER BY eligible.report_priority, eligible.oldest_unapplied_report NULLS LAST,
+        eligible.last_polled_at, eligible.sim_job_id
+      LIMIT ${PROGRESSIVE_TERMINAL_REPORT_JOB_RESERVE}
+    ), ordered AS (
+      SELECT active_head.*, 0 AS lane FROM active_head
+      UNION ALL
+      SELECT terminal_head.*, 1 AS lane FROM terminal_head
+      UNION ALL
+      SELECT eligible.*, 2 AS lane
+      FROM eligible
+      WHERE NOT EXISTS (
+        SELECT 1 FROM active_head selected
+        WHERE selected.sim_job_id = eligible.sim_job_id
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM terminal_head selected
+        WHERE selected.sim_job_id = eligible.sim_job_id
+      )
     )
-    SELECT job.id AS sim_job_id, job.campaign_id
-    FROM report_state state
-    JOIN sim_jobs job ON job.id = state.sim_job_id
-    WHERE ${executionScope(jobIds)}
-      AND (state.has_unapplied OR (
-        job.engine_job_id IS NULL AND job.status = 'pending' AND state.has_indexed
-      ))
-      AND EXISTS (SELECT 1 FROM progressive_remote_dispatches dispatch WHERE dispatch.sim_job_id = job.id)
-      ORDER BY CASE WHEN state.has_unapplied THEN 0 ELSE 1 END,
-      CASE WHEN job.status = 'pending' AND job.engine_job_id = job.id::text THEN 0
-        WHEN job.status = 'pending' AND job.engine_job_id IS NULL THEN 1
-        WHEN job.status IN ('submitted', 'running') THEN 2
-        ELSE 3 END,
-      state.oldest_unapplied_report NULLS LAST,
-      coalesce(job."polledAt", job."updatedAt"), job.id LIMIT ${PROGRESSIVE_REPORT_JOB_LIMIT}`;
+    SELECT sim_job_id, campaign_id
+    FROM ordered
+    ORDER BY lane, report_priority, lifecycle_priority,
+      oldest_unapplied_report NULLS LAST, last_polled_at, sim_job_id
+    LIMIT ${PROGRESSIVE_REPORT_JOB_LIMIT}`;
 }
 
 export function progressiveSettlementJobsSql(jobIds?: string[]) {
