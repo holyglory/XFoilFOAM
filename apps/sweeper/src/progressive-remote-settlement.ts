@@ -905,6 +905,8 @@ export async function settleProgressiveRemoteJob(db: DB, executionId: string) {
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       if (
+        !(error instanceof ProgressiveCfdEvidenceScopeClosed) &&
+        message !== "Obsolete or settled progressive CFD execution scope" &&
         !message.includes(
           "Numerical recovery changed the exact original RANS promotion scope",
         )
