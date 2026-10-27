@@ -283,7 +283,10 @@ export async function recoverTerminalProgressiveNoEvidenceGaps(
           OR (
             attempt.outcome = 'cancelled'
             AND attempt.active_seconds = 0
-            AND stopped.proof->>'ownership_basis' = 'never_started_cancellation_fence'
+            AND stopped.proof->>'ownership_basis' IN (
+              'never_started_cancellation_fence',
+              'recorded_execution_namespace'
+            )
           )
         )
         AND attempt.sim_job_id IS NOT NULL
