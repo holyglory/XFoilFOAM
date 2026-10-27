@@ -255,7 +255,6 @@ export async function settleProgressiveCfdExecution(
       `);
       if (
         current?.value &&
-        job.status !== "cancelled" &&
         !(
           job.status === "ingesting" &&
           current.stopped_pending &&

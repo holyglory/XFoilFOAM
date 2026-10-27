@@ -205,15 +205,6 @@ export async function reconcileProgressiveExecutions(
         }
       }
       const settled = await settleProgressiveCfdExecution(db, jobId);
-      if (job.status === "cancelled" && settled.waiting === 0)
-        await db.execute(sql`
-          UPDATE sim_jobs
-          SET engine_state = 'cancelled',
-            "ingestedAt" = coalesce("ingestedAt", clock_timestamp()),
-            "finishedAt" = coalesce("finishedAt", clock_timestamp()),
-            "updatedAt" = clock_timestamp()
-          WHERE id = ${jobId}::uuid AND status = 'cancelled'
-        `);
       for (const key of [
         "complete",
         "retry",
