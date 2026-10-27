@@ -196,11 +196,11 @@ export async function settleProgressiveCfdExecution(
     });
     await connection.execute(sql`UPDATE progressive_cfd_units unit SET state = 'blocked',
         lease_token = NULL, lease_owner = NULL, lease_until = NULL,
-        error = 'Physical stop acknowledged after the execution lease expired'
+        error = 'Physical stop acknowledged after execution stopped'
       FROM progressive_cfd_attempts attempt
       WHERE attempt.unit_id = unit.id AND attempt.sim_job_id = ${simJobId}
         AND attempt.outcome = 'running' AND unit.state = 'leased'
-        AND unit.lease_token = attempt.token AND unit.lease_until <= clock_timestamp()`);
+        AND unit.lease_token = attempt.token`);
     const [job] = await connection.execute(
       sql`SELECT status, "ingestedAt" FROM sim_jobs WHERE id = ${simJobId}`,
     );
