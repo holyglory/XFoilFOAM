@@ -211,20 +211,12 @@ export async function claimSimJobCancellation(
           payload.uransRequestId,
         );
       }
-      const [remoteDispatch] = await tx.execute(sql`
-        SELECT EXISTS (
-          SELECT 1 FROM progressive_remote_dispatches
-          WHERE sim_job_id = ${claimed.id}::uuid
-        ) AS remote_progressive
-      `);
       return {
         claim: {
           kind: "cancelled" as const,
           jobId: claimed.id,
           engineJobId: claimed.engineJobId,
-          remoteProgressive:
-            Boolean(remoteDispatch?.remote_progressive) &&
-            isRemoteProgressiveRequest(claimed.requestPayload),
+          remoteProgressive: isRemoteProgressiveRequest(claimed.requestPayload),
         },
         campaignIds: settlement.campaignIds,
       };
