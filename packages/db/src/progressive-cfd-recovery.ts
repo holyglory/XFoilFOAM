@@ -280,6 +280,17 @@ export async function recoverTerminalProgressiveNoEvidenceGaps(
         AND unit.lease_until IS NULL
         AND (unit.retry_after IS NULL OR unit.retry_after <= clock_timestamp())
         AND (
+          unit.error NOT IN (
+            'obsolete execution physically stopped',
+            'unstarted submission retry budget exhausted or history incomplete'
+          )
+          OR NOT EXISTS (
+            SELECT 1 FROM registered_remote_solvers remote
+            WHERE remote.revoked_at IS NULL
+              AND NULLIF(remote.metadata#>>'{health,cpu,loadPct}', '')::double precision >= 90
+          )
+        )
+        AND (
           attempt.outcome = 'failed'
           OR (
             attempt.outcome = 'cancelled'
