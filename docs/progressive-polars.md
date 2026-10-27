@@ -961,6 +961,14 @@ informative-history gates. Flat, material-domain, numerical-recovery-exhausted,
 and no-case evidence never receives this extension. Bounded failures close the
 fast pass with explicit gaps, allowing precise work.
 
+A validated material-domain failure remains rejected evidence and never becomes
+a polar point. When the failed recipe is exactly `rhoSimpleFoam`, the controller
+may admit one targeted recovery for that same airfoil, condition and angle using
+`rhoPimpleFoam` (preliminary fidelity in stage 2, full fidelity in stage 3).
+The original failure and its checksum remain immutable; the retry is allowed
+only after the execution stop is proven and only real, independently valid
+evidence can settle the unit. A second material-domain failure stays a gap.
+
 The engine's `case_solver_budget_seconds` limits cumulative solver-command wall
 time for one chord/speed/angle within a job, including initialization and retries.
 Meshing, media and MPI decomposition/reconstruction do not consume that allowance.

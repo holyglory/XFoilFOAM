@@ -7624,7 +7624,7 @@ export const progressiveCfdRecoveryPlans = pgTable(
     ),
     reasonCheck: check(
       "progressive_cfd_recovery_plans_reason_check",
-      sql`${table.reason} IN ('hard_solver', 'needs_urans', 'accepted_precalc')`,
+      sql`${table.reason} IN ('hard_solver', 'needs_urans', 'material_domain', 'accepted_precalc')`,
     ),
     unitOrdinalUq: unique(
       "progressive_cfd_recovery_plans_unit_id_ordinal_key",

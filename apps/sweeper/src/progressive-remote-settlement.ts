@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { sql } from "drizzle-orm";
 import { effectiveProgressiveStageSql } from "@aerodb/db/progressive-execution-policy";
 import { polarEvidencePublicationRank } from "@aerodb/core";
@@ -15,11 +16,21 @@ import {
   type ProgressiveRansPromotion,
   progressiveCfdEffectiveBudgetSql,
   ProgressiveCfdEvidenceScopeClosed,
+  recordProgressiveCfdMaterialDomainRecoveryPlans,
 } from "@aerodb/db";
-import { readProgressiveRemoteRetention } from "@aerodb/db/progressive-remote-retention";
+import { EngineClient, type JobResult } from "@aerodb/engine-client";
+import {
+  readProgressiveRemoteRetention,
+  terminalReportHasNoPhysicalEvidence,
+} from "@aerodb/db/progressive-remote-retention";
 import { refreshPolarClassificationsForJob } from "@aerodb/db/polar-cache";
 import { releaseResultClaimsForJob } from "@aerodb/db/result-claim-lifecycle";
 import { retireSettledProgressivePromise } from "./progressive-remote-lease-retirement";
+import {
+  ingestResult,
+  type ConditionMapEntry,
+  type SpeedBc,
+} from "./ingest";
 
 async function settleInactiveUndeliveredExecution(
   db: DB,
@@ -461,6 +472,148 @@ type ProgressiveRemoteReceiptPrefix = {
   receipt_count?: unknown;
 };
 
+async function ingestTerminalRemoteFailureAttempts(
+  db: DB,
+  executionId: string,
+): Promise<boolean> {
+  const [latest] = await db.execute(sql`
+    SELECT report.report, report.sequence, report.content_signature,
+      dispatch.envelope
+    FROM progressive_remote_dispatches dispatch
+    JOIN LATERAL (
+      SELECT report, sequence, content_signature
+      FROM progressive_remote_reports
+      WHERE sim_job_id = dispatch.sim_job_id
+      ORDER BY sequence DESC LIMIT 1
+    ) report ON true
+    WHERE dispatch.sim_job_id = ${executionId}::uuid
+  `);
+  if (!latest) return false;
+  const envelope = latest.envelope as ProgressiveRemoteExecutionEnvelope;
+  const validated = validateProgressiveRemoteReport(
+    latest.report,
+    envelope,
+  );
+  if (
+    validated.contentSignature !== latest.content_signature ||
+    !terminalReportHasNoPhysicalEvidence(validated.report)
+  )
+    return false;
+  const [existing] = await db.execute(sql`
+    SELECT EXISTS (
+      SELECT 1 FROM result_attempts
+      WHERE sim_job_id = ${executionId}::uuid
+    ) AS present
+  `);
+  if (existing?.present === true) return false;
+  const [job] = await db.execute(sql`
+    SELECT airfoil_id, simulation_preset_revision_id, bc_ids, request_payload,
+      status
+    FROM sim_jobs
+    WHERE id = ${executionId}::uuid
+      AND (ingest_lease_expires_at IS NULL OR ingest_lease_expires_at <= clock_timestamp())
+    FOR UPDATE
+  `);
+  if (!job || !job.simulation_preset_revision_id)
+    throw new Error(
+      "Remote material-domain report has no immutable setup revision",
+    );
+  const sourceResult = validated.report.result as JobResult;
+  const attempts = sourceResult.polars.flatMap((polar) => polar.attempts ?? []);
+  if (
+    !attempts.length ||
+    !attempts.every(
+      (point) => point.failure_disposition === "material_domain",
+    )
+  )
+    return false;
+  const report = sourceResult;
+  const payload = (job.request_payload ?? {}) as Record<string, unknown>;
+  const engineRequest = (payload.engineRequest ?? {}) as Record<string, unknown>;
+  const solverRequest = (engineRequest.solver ?? {}) as Record<string, unknown>;
+  const selection = (solverRequest.selection ?? {}) as Record<string, unknown>;
+  const solverFamily =
+    selection.solver ?? solverRequest.flow_solver_family ?? solverRequest.solver;
+  if (solverFamily !== "rhoSimpleFoam") return false;
+  const rawConditionMap = payload.conditionMap;
+  const conditionMap = Array.isArray(rawConditionMap)
+    ? (rawConditionMap as ConditionMapEntry[])
+    : null;
+  const bcIds = Array.isArray(job.bc_ids)
+    ? job.bc_ids.filter((id): id is string => typeof id === "string")
+    : [];
+  if (!bcIds.length && !conditionMap?.length)
+    throw new Error(
+      "Remote material-domain report has no boundary-condition identity",
+    );
+  const speedForPolar = (speed: number) =>
+    report.polars.find((polar) => polar.speed === speed)?.mach ?? null;
+  const speedMap: SpeedBc[] = conditionMap?.length
+    ? conditionMap.map((entry) => ({
+        speed: entry.speed,
+        bcId: entry.bcId,
+        presetRevisionId: entry.revisionId,
+        mach: speedForPolar(entry.speed),
+      }))
+    : report.polars.map((polar) => ({
+        speed: polar.speed,
+        bcId: bcIds[0],
+        presetRevisionId: String(job.simulation_preset_revision_id),
+        mach: polar.mach ?? null,
+      }));
+  if (!speedMap.length)
+    throw new Error("Remote material-domain report has no physical polar");
+  const ingestLeaseToken = randomUUID();
+  const [claimed] = await db.execute(sql`
+    UPDATE sim_jobs
+    SET status = 'ingesting',
+      ingest_lease_previous_status = status,
+      ingest_lease_token = ${ingestLeaseToken},
+      ingest_lease_claimed_at = clock_timestamp(),
+      ingest_lease_expires_at = clock_timestamp() + 120000 * interval '1 millisecond'
+    WHERE id = ${executionId}::uuid
+      AND (ingest_lease_expires_at IS NULL OR ingest_lease_expires_at <= clock_timestamp())
+    RETURNING id, ingest_lease_previous_status
+  `);
+  if (!claimed) return false;
+  try {
+    await ingestResult({
+      db,
+      engine: new EngineClient("http://127.0.0.1:9"),
+      engineJobId: executionId,
+      simJobId: executionId,
+      airfoilId: String(job.airfoil_id),
+      speedMap,
+      conditionMap: conditionMap ?? undefined,
+      jobAoas: envelope.request.aoa?.angles ?? [],
+      uransFidelity:
+        envelope.request.solver?.urans_fidelity === "precalc" ||
+        envelope.request.solver?.urans_fidelity === "full"
+          ? envelope.request.solver.urans_fidelity
+          : undefined,
+      result: report,
+      remoteProgressiveReportSequence: Number(latest.sequence),
+      ingestLeaseToken,
+    });
+    await db.execute(sql`
+      UPDATE sim_jobs
+      SET ingest_lease_token = NULL, ingest_lease_claimed_at = NULL,
+        ingest_lease_expires_at = NULL, "updatedAt" = clock_timestamp()
+      WHERE id = ${executionId}::uuid AND ingest_lease_token = ${ingestLeaseToken}
+    `);
+    return true;
+  } catch (error) {
+    await db.execute(sql`
+      UPDATE sim_jobs
+      SET status = ingest_lease_previous_status,
+        ingest_lease_token = NULL, ingest_lease_claimed_at = NULL,
+        ingest_lease_expires_at = NULL
+      WHERE id = ${executionId}::uuid AND ingest_lease_token = ${ingestLeaseToken}
+    `);
+    throw error;
+  }
+}
+
 function contiguousReceiptPrefixEnd(
   receiptPrefix: ProgressiveRemoteReceiptPrefix | undefined,
 ) {
@@ -644,6 +797,13 @@ export async function settleProgressiveRemoteJob(db: DB, executionId: string) {
         if (inactive) return inactive;
       }
       return retained;
+    }
+    if (retained.sources.length === 0) {
+      await ingestTerminalRemoteFailureAttempts(connection, executionId);
+      await recordProgressiveCfdMaterialDomainRecoveryPlans(
+        connection,
+        executionId,
+      );
     }
     const result = retained.report.result;
     const finalPoints = new Set(

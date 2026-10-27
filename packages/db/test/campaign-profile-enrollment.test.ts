@@ -67,7 +67,9 @@ import {
   settleProgressiveCfdExecution,
 } from "../src/progressive-cfd-settlement";
 import {
+  progressiveMaterialDomainRecipe,
   progressiveUnsteadyRecipe,
+  recordProgressiveCfdMaterialDomainRecoveryPlans,
   recordProgressiveCfdRecoveryPlans,
   supersedeProgressivePriorEvidence,
   progressiveParentRevisionIds,
@@ -7620,6 +7622,83 @@ describe("bounded progressive numerical recovery", () => {
     },
     120_000,
   );
+
+  it("admits one exact rhoPimpleFoam fallback for a material-domain failure", async () => {
+    const fixture = await cfdEvidenceFixture(166, 2, [], [0]);
+    const evidence = await fixture.save(20, "rans", 0, {
+      failure_disposition: "material_domain",
+    });
+    await fixture.record([evidence]);
+    await stopped(fixture);
+    expect(
+      await recordProgressiveCfdRecoveryPlans(db, fixture.composed.jobId),
+    ).toBe(0);
+    expect(
+      await recordProgressiveCfdMaterialDomainRecoveryPlans(
+        db,
+        fixture.composed.jobId,
+      ),
+    ).toBe(1);
+    expect(
+      await recordProgressiveCfdMaterialDomainRecoveryPlans(
+        db,
+        fixture.composed.jobId,
+      ),
+    ).toBe(0);
+    const [plan] = await db.execute(sql`
+      SELECT plan.scope, plan.reason, plan.diagnostic_attempt_id, plan.recipe,
+        unit.aoa_deg
+      FROM progressive_cfd_recovery_plans plan
+      JOIN progressive_cfd_units unit ON unit.id = plan.unit_id
+      WHERE plan.parent_job_id = ${fixture.composed.jobId}
+    `);
+    expect(plan).toMatchObject({
+      scope: "targeted",
+      reason: "material_domain",
+      diagnostic_attempt_id: evidence,
+      aoa_deg: 0,
+      recipe: {
+        uransFidelity: "precalc",
+        selection: {
+          solver: "rhoPimpleFoam",
+          reason: "bounded_material_domain_recovery",
+        },
+      },
+    });
+    expect(
+      await settleProgressiveCfdExecution(db, fixture.composed.jobId),
+    ).toMatchObject({ retry: 1, complete: 0, gaps: 0 });
+    const [replacement] = await claimProgressiveCfdBatch(db, {
+      owner: "bounded-material-domain-recovery",
+      leaseSeconds: 120,
+      solverBudgetVersion: 2,
+      allowedSolverFamilies: ["rhoPimpleFoam"],
+    });
+    expect(replacement).toMatchObject({
+      alpha: 0,
+      recoveryParentJobId: fixture.composed.jobId,
+      recoveryPlanId: expect.any(String),
+      recipe: {
+        uransFidelity: "precalc",
+        selection: { solver: "rhoPimpleFoam" },
+      },
+    });
+  }, 120_000);
+
+  it("does not create a material fallback for another solver family", () => {
+    expect(
+      progressiveMaterialDomainRecipe(
+        { selection: { solver: "rhoCentralFoam" } },
+        2,
+      ),
+    ).toBeNull();
+    expect(
+      progressiveMaterialDomainRecipe(
+        { selection: { solver: "rhoPimpleFoam" } },
+        3,
+      ),
+    ).toBeNull();
+  });
 
   it("does not enlarge exhausted compute allocations for numerical recovery", async () => {
     const fixture = await cfdEvidenceFixture(33.019, 3, [], [0]);

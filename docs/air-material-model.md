@@ -75,7 +75,9 @@ repeatedly extending bounds or treating a clamped run as converged.
 Normal solver-result checks now reject JANAF clamps as a distinct material-domain
 failure, retaining the exact raw log and diagnostic. A timeout cannot make a
 clamped history eligible, and this failure cannot justify a whole-polar URANS
-promotion or an automatic conservative numerical retry.
+promotion. If the exact failed recipe was `rhoSimpleFoam`, the progressive
+controller may make one targeted `rhoPimpleFoam` recovery attempt after a
+verified stop; another clamp remains rejected and leaves the cell unresolved.
 
 The diagnostic parser also reports the minimum and maximum temperatures actually
 printed in clamp warnings and the declared ranges in those warnings. These are

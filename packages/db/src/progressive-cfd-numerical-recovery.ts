@@ -12,6 +12,23 @@ export interface ProgressiveRansPromotion {
   intentionallyOmittedAoas: number[];
 }
 
+export function progressiveMaterialDomainRecipe(
+  recipe: Record<string, unknown>,
+  stage: 2 | 3,
+): Record<string, unknown> | null {
+  const selection = recipe.selection as Record<string, unknown> | undefined;
+  if (selection?.solver !== "rhoSimpleFoam") return null;
+  return {
+    ...recipe,
+    uransFidelity: stage === 2 ? "precalc" : "full",
+    selection: {
+      ...selection,
+      solver: "rhoPimpleFoam",
+      reason: "bounded_material_domain_recovery",
+    },
+  };
+}
+
 interface RecoveryUnit {
   id: string;
   token: string;
@@ -280,6 +297,147 @@ export async function recordProgressiveCfdRecoveryPlans(
           (unit_id, ordinal, parent_attempt_token, parent_job_id, diagnostic_attempt_id, diagnostic_signature, scope, reason, recipe)
         VALUES (${unit.id}, ${ordinal}, ${unit.token}, ${simJobId}, ${diagnostic.id}, ${diagnostic.evidence_signature},
           ${scope}, ${reason}, ${canonicalAnalysisJson(recipe)}::jsonb)
+      `);
+      inserted += 1;
+    }
+    return inserted;
+  });
+}
+
+export async function recordProgressiveCfdMaterialDomainRecoveryPlans(
+  db: DB,
+  simJobId: string,
+): Promise<number> {
+  return db.transaction(async (transaction) => {
+    const connection = transaction as unknown as DB;
+    const [job] = await connection.execute(sql`
+      SELECT job.engine_job_id,
+        EXISTS (SELECT 1 FROM progressive_cfd_execution_stops stopped
+          WHERE stopped.sim_job_id = job.id AND stopped.engine_job_id = job.engine_job_id) AS stopped
+      FROM sim_jobs job WHERE job.id = ${simJobId}
+    `);
+    if (!job?.stopped || typeof job.engine_job_id !== "string")
+      throw new Error(
+        "Material-domain recovery requires a physically stopped parent execution",
+      );
+    if (
+      !(await assertProgressiveCfdEvidenceJob(
+        connection,
+        simJobId,
+        job.engine_job_id,
+      ))
+    )
+      throw new Error(
+        "Material-domain recovery requires a progressive parent execution",
+      );
+    const units = (await connection.execute(sql`
+      SELECT unit.id, attempt.token, work.stage, recipe.recipe,
+        EXISTS (SELECT 1 FROM progressive_cfd_recovery_plans existing
+          WHERE existing.unit_id = unit.id) AS has_recovery_plan
+      FROM progressive_cfd_attempts attempt
+      JOIN progressive_cfd_units unit ON unit.id = attempt.unit_id
+      JOIN progressive_work work ON work.id = unit.work_id
+      JOIN progressive_cfd_execution_recipes recipe ON recipe.id = attempt.execution_recipe_id
+      WHERE attempt.sim_job_id = ${simJobId}
+        AND work.stage IN (2, 3)
+      ORDER BY unit.ordinal, unit.id
+    `)) as unknown as Array<{
+      id: string;
+      token: string;
+      stage: 2 | 3;
+      recipe: Record<string, unknown>;
+      has_recovery_plan: boolean;
+    }>;
+    if (!units.length) return 0;
+    if (units.length > 512)
+      throw new Error(
+        "Material-domain recovery has no bounded parent unit scope",
+      );
+    const evidence = (await connection.execute(sql`
+      SELECT attempt.unit_id, raw.id, receipt.evidence_signature,
+        raw.evidence_payload, raw.status, raw.valid_for_polar, raw.regime
+      FROM progressive_cfd_attempts attempt
+      JOIN progressive_cfd_evidence receipt ON receipt.attempt_token = attempt.token
+      JOIN result_attempts raw ON raw.id = receipt.result_attempt_id
+      WHERE attempt.sim_job_id = ${simJobId}
+        AND raw.status = 'failed'
+        AND raw.valid_for_polar = false
+        AND raw.regime = 'rans'
+        AND raw.evidence_payload->>'failure_disposition' = 'material_domain'
+      ORDER BY raw."createdAt", raw.id
+      LIMIT 513
+    `)) as unknown as Array<{
+      unit_id: string;
+      id: string;
+      evidence_signature: string;
+      evidence_payload: Record<string, unknown> | null;
+      status: string;
+      valid_for_polar: boolean;
+      regime: string;
+    }>;
+    if (evidence.length > 512)
+      throw new Error(
+        "Material-domain recovery has unbounded diagnostic evidence",
+      );
+    const evidenceByUnit = new Map<string, (typeof evidence)[number]>();
+    for (const item of evidence) {
+      if (
+        !item.evidence_payload ||
+        analysisContentHash(item.evidence_payload) !== item.evidence_signature
+      )
+        throw new Error(
+          "Material-domain recovery has changed diagnostic evidence",
+        );
+      if (evidenceByUnit.has(item.unit_id))
+        throw new Error(
+          "Material-domain recovery has competing diagnostic attempts",
+        );
+      evidenceByUnit.set(item.unit_id, item);
+    }
+    let inserted = 0;
+    for (const unit of units) {
+      if (unit.has_recovery_plan) continue;
+      const diagnostic = evidenceByUnit.get(unit.id);
+      if (
+        !diagnostic ||
+        diagnostic.status !== "failed" ||
+        diagnostic.valid_for_polar ||
+        diagnostic.regime !== "rans"
+      )
+        continue;
+      const recipe = progressiveMaterialDomainRecipe(unit.recipe, unit.stage);
+      if (!recipe) continue;
+      const values = {
+        unit_id: unit.id,
+        ordinal: 1,
+        parent_attempt_token: unit.token,
+        parent_job_id: simJobId,
+        diagnostic_attempt_id: diagnostic.id,
+        diagnostic_signature: diagnostic.evidence_signature,
+        scope: "targeted",
+        reason: "material_domain",
+        recipe,
+      };
+      const [existing] = await connection.execute(sql`
+        SELECT unit_id, ordinal, parent_attempt_token, parent_job_id,
+          diagnostic_attempt_id, diagnostic_signature, scope, reason, recipe
+        FROM progressive_cfd_recovery_plans
+        WHERE unit_id = ${unit.id} AND ordinal = 1
+      `);
+      if (existing) {
+        if (canonicalAnalysisJson(existing) !== canonicalAnalysisJson(values))
+          throw new Error(
+            "Material-domain recovery conflicts with the immutable existing plan",
+          );
+        continue;
+      }
+      await connection.execute(sql`
+        INSERT INTO progressive_cfd_recovery_plans
+          (unit_id, ordinal, parent_attempt_token, parent_job_id,
+           diagnostic_attempt_id, diagnostic_signature, scope, reason, recipe)
+        VALUES (${unit.id}, 1, ${unit.token}, ${simJobId}, ${diagnostic.id},
+          ${diagnostic.evidence_signature}, 'targeted', 'material_domain',
+          ${canonicalAnalysisJson(recipe)}::jsonb)
       `);
       inserted += 1;
     }

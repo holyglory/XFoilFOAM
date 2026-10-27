@@ -68,3 +68,32 @@ export function progressiveCfdPreciseVerificationAvailableSql(
       )
   )`;
 }
+
+export function progressiveCfdMaterialDomainRecoveryAvailableSql(
+  alias = "unit",
+  settlingAttemptAlias?: string,
+) {
+  const unit = sql.identifier(alias);
+  const settlingToken = settlingAttemptAlias
+    ? sql`${sql.identifier(settlingAttemptAlias)}.token`
+    : sql`NULL::uuid`;
+  return sql`EXISTS (
+    SELECT 1 FROM progressive_cfd_recovery_plans recovery
+    WHERE recovery.unit_id = ${unit}.id
+      AND recovery.ordinal = 1
+      AND recovery.reason = 'material_domain'
+      AND NOT EXISTS (
+        SELECT 1 FROM progressive_cfd_recovery_claims claimed
+        JOIN progressive_cfd_attempts claimed_attempt ON claimed_attempt.token = claimed.attempt_token
+        WHERE claimed.recovery_plan_id = recovery.id AND NOT (
+          (claimed_attempt.outcome = 'cancelled' OR claimed_attempt.token IS NOT DISTINCT FROM ${settlingToken})
+          AND claimed_attempt.active_seconds = 0
+          AND EXISTS (SELECT 1 FROM progressive_cfd_execution_stops stopped
+            WHERE stopped.sim_job_id = claimed_attempt.sim_job_id
+              AND stopped.proof->>'ownership_basis' = 'never_started_cancellation_fence')
+          AND NOT EXISTS (SELECT 1 FROM progressive_cfd_evidence evidence
+            WHERE evidence.attempt_token = claimed_attempt.token)
+        )
+      )
+  )`;
+}

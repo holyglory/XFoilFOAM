@@ -121,6 +121,7 @@ import { reconcileProgressiveExecutions } from "./progressive-execution";
 import { recoverProgressiveSubmissions } from "./progressive-submission";
 import {
   recordProgressiveCfdRuntimeProgress,
+  recordProgressiveCfdMaterialDomainRecoveryPlans,
   recordProgressiveCfdRecoveryPlans,
 } from "@aerodb/db";
 import { composePhysicalPrecalcJob } from "./precalc-composition";
@@ -4273,6 +4274,8 @@ export async function reconcileProgressiveCfdJob(
           job.id,
           ingested.ransPrecalcPromotions,
         );
+      if (terminal && !requestPayload(job).remoteProgressiveExecution)
+        await recordProgressiveCfdMaterialDomainRecoveryPlans(db, job.id);
       await refreshPolarCachesForJob(db, job, () =>
         renewIngestAndHeartbeat(db, lease),
       );
