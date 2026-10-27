@@ -6204,6 +6204,10 @@ describe("progressive execution stop and settlement", () => {
 
   it("finalizes a cancelled progressive job when the engine has no result snapshot", async () => {
     const fixture = await fitFixture();
+    const diagnosticAttempt = await fixture.save(0, "rans", 0, {
+      failure_disposition: "hard_solver",
+    });
+    await fixture.record([diagnosticAttempt]);
     const engine = new EngineClient("http://unused.invalid");
     vi.spyOn(engine, "getJob").mockResolvedValue({
       job_id: fixture.engineJobId,
@@ -6237,6 +6241,16 @@ describe("progressive execution stop and settlement", () => {
       engineState: "cancelled",
     });
     expect(finished.ingestedAt).toBeInstanceOf(Date);
+    const [recoveryPlan] = await db.execute(sql`
+      SELECT reason, scope, ordinal
+      FROM progressive_cfd_recovery_plans
+      WHERE parent_job_id = ${fixture.composed.jobId}::uuid
+    `);
+    expect(recoveryPlan).toMatchObject({
+      reason: "hard_solver",
+      scope: "targeted",
+      ordinal: 1,
+    });
   });
 
   it("reconciles budget stops without releasing work before physical proof and terminal ingestion", async () => {

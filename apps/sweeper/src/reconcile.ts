@@ -4279,6 +4279,10 @@ export async function reconcileProgressiveCfdJob(
       await refreshPolarCachesForJob(db, job, () =>
         renewIngestAndHeartbeat(db, lease),
       );
+    } else if (terminal) {
+      await recordProgressiveCfdRecoveryPlans(db, job.id);
+      if (!requestPayload(job).remoteProgressiveExecution)
+        await recordProgressiveCfdMaterialDomainRecoveryPlans(db, job.id);
     }
     if (!terminal) {
       const [updated] = await db

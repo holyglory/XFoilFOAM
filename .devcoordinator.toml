@@ -52,7 +52,7 @@ command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vites
 name = "bounded-no-evidence-recovery"
 tier = "development"
 requires = ["types"]
-command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "reopens one bounded stale-HZ retry at the attempt ceiling|does not reopen an attempt-ceiling gap with accepted history|does not reopen an attempt-ceiling gap with unsettled ownership"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "reopens one bounded stale-HZ retry at the attempt ceiling|does not reopen an attempt-ceiling gap with accepted history|does not reopen an attempt-ceiling gap with unsettled ownership|finalizes a cancelled progressive job when the engine has no result snapshot"]
 
 [[test.precise-selection.check]]
 name = "informative-reuse"
