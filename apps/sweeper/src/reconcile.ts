@@ -555,27 +555,6 @@ function requestPayload(job: SimJobRow): Record<string, unknown> {
   return ((job.requestPayload ?? {}) as Record<string, unknown>) ?? {};
 }
 
-function reconcilableDirectLifecycleWhere() {
-  const localRequest = sql`(
-    (
-      ${simJobs.requestPayload}->>'remoteSolver' IS NULL
-      OR ${simJobs.requestPayload}->>'remoteSolver' = 'false'
-    )
-    AND NOT coalesce(
-      ${simJobs.requestPayload} ? 'remoteProgressiveExecution',
-      false
-    )
-  )`;
-  return or(
-    and(solverDirectLifecycleSql(), localRequest),
-    and(
-      eq(simJobs.status, "cancelled"),
-      sql`${simJobs.requestPayload}->'progressive' IS NOT NULL`,
-      localRequest,
-    ),
-  );
-}
-
 export function parsedExecutedMeshRecoveryVersion(
   value: unknown,
 ): number | null {
@@ -4184,7 +4163,7 @@ export async function reconcileProgressiveCfdJob(
   const [local] = await db
     .select({ id: simJobs.id })
     .from(simJobs)
-    .where(and(eq(simJobs.id, job.id), reconcilableDirectLifecycleWhere()))
+    .where(and(eq(simJobs.id, job.id), solverDirectLifecycleSql()))
     .limit(1);
   if (!local) return;
   assertProgressiveExecutionIdentity(
@@ -4196,7 +4175,7 @@ export async function reconcileProgressiveCfdJob(
     expectedEngine: expectedEngineForJob(job),
     expectedExecutionPool: await expectedExecutionPoolForJob(db, job),
   };
-  let status = await engine.getJob(job.engineJobId, route);
+  const status = await engine.getJob(job.engineJobId, route);
   if (status.job_id !== job.engineJobId)
     throw new Error("Progressive status belongs to another engine execution");
   if (status.solver_budget_progress)
@@ -4205,7 +4184,7 @@ export async function reconcileProgressiveCfdJob(
       engineJobId: job.engineJobId,
       progress: status.solver_budget_progress,
     });
-  let terminal = ["completed", "failed", "cancelled"].includes(status.state);
+  const terminal = ["completed", "failed", "cancelled"].includes(status.state);
   if (!terminal) {
     if (job.status === "cancelled") {
       const cancellation = await engine.cancelJob(job.engineJobId, route);
@@ -4213,41 +4192,17 @@ export async function reconcileProgressiveCfdJob(
         throw new Error(
           "Engine did not acknowledge the exact progressive cancellation",
         );
-      let proof = await durableProgressiveStopProof(
-        db,
-        job.id,
-        job.engineJobId,
-      );
-      if (!proof)
-        proof = await engine.getExecutionStopProof(job.engineJobId, route);
-      if (proof.job_id !== job.engineJobId)
-        throw new Error(
-          "Execution-stop proof belongs to another engine execution",
-        );
-      if (!proof.execution_stopped) return;
-      await acknowledgeProgressiveCfdExecutionStop(db, {
-        simJobId: job.id,
-        proof,
-      });
-      status = await engine.getJob(job.engineJobId, route);
-      if (status.job_id !== job.engineJobId)
-        throw new Error(
-          "Progressive status belongs to another engine execution",
-        );
-      terminal = ["completed", "failed", "cancelled"].includes(status.state);
-      if (!terminal) return;
+      return;
     }
-    if (!terminal) {
-      await updateJobFromEngineStatus(db, job, {
-        ...status,
-        completed_cases: job.completedCases,
-      });
-      if (
-        status.state !== "running" ||
-        status.completed_cases <= job.completedCases
-      )
-        return;
-    }
+    await updateJobFromEngineStatus(db, job, {
+      ...status,
+      completed_cases: job.completedCases,
+    });
+    if (
+      status.state !== "running" ||
+      status.completed_cases <= job.completedCases
+    )
+      return;
   } else {
     let proof = await durableProgressiveStopProof(
       db,
@@ -4424,7 +4379,7 @@ export async function reconcile(
   }
 
   const activeFilters = [
-    reconcilableDirectLifecycleWhere(),
+    solverDirectLifecycleSql(),
     or(
       inArray(simJobs.status, activeJobStatuses),
       and(

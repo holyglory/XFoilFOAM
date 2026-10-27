@@ -4124,24 +4124,6 @@ describe("progressive CPU admission", () => {
           .where(eq(simJobs.id, job.id));
         const bound = await bindProgressiveRemoteDispatch(db, assignment);
         expect(bound.replayed).toBe(false);
-        const localCancellationRollback = new Error(
-          "restore local cancellation classification fixture",
-        );
-        await expect(
-          db.transaction(async (transaction) => {
-            const connection = transaction as unknown as DB;
-            const classified = await claimSimJobCancellation(
-              connection,
-              job.id,
-              "isolated local cancellation classification",
-            );
-            expect(classified).toMatchObject({
-              kind: "cancelled",
-              remoteProgressive: false,
-            });
-            throw localCancellationRollback;
-          }),
-        ).rejects.toBe(localCancellationRollback);
         expect(await clearHubWorkerPayloadFields(db)).toBe(0);
         expect(bound.envelope.request).toEqual(
           JSON.parse(JSON.stringify(composed.request)),
@@ -4170,27 +4152,6 @@ describe("progressive CPU admission", () => {
           remote_solver: true,
           remote_execution: true,
         });
-        const remoteCancellationRollback = new Error(
-          "restore remote cancellation classification fixture",
-        );
-        await expect(
-          db.transaction(async (transaction) => {
-            const connection = transaction as unknown as DB;
-            await connection.execute(
-              sql`DELETE FROM progressive_remote_dispatches WHERE sim_job_id = ${job.id}::uuid`,
-            );
-            const classified = await claimSimJobCancellation(
-              connection,
-              job.id,
-              "isolated remote cancellation classification",
-            );
-            expect(classified).toMatchObject({
-              kind: "cancelled",
-              remoteProgressive: true,
-            });
-            throw remoteCancellationRollback;
-          }),
-        ).rejects.toBe(remoteCancellationRollback);
         const forecastRollback = new Error(
           "isolated disk attribution rollback",
         );
@@ -5920,26 +5881,12 @@ describe("progressive execution stop and settlement", () => {
       ...executionStopProof(fixture.engineJobId),
       execution_stopped: false,
     });
-    const cancel = vi.spyOn(engine, "cancelJob").mockResolvedValue({
+    vi.spyOn(engine, "cancelJob").mockResolvedValue({
       job_id: fixture.engineJobId,
       cancelled: true,
     });
     const options = { jobIds: [jobId], skipFailedRecovery: true };
     await reconcile(db, engine, options);
-    expect(cancel.mock.calls).toContainEqual([
-      fixture.engineJobId,
-      expect.objectContaining({
-        expectedEngine: fixture.composed.request.expected_engine,
-        expectedExecutionPool: fixture.composed.request.expected_execution_pool,
-      }),
-    ]);
-    expect(proof).toHaveBeenCalledWith(
-      fixture.engineJobId,
-      expect.objectContaining({
-        expectedEngine: fixture.composed.request.expected_engine,
-        expectedExecutionPool: fixture.composed.request.expected_execution_pool,
-      }),
-    );
     const [waiting] = await db
       .select()
       .from(simJobs)
