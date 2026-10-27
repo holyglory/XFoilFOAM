@@ -561,6 +561,10 @@ function reconcilableDirectLifecycleWhere() {
       ${simJobs.requestPayload}->>'remoteSolver' IS NULL
       OR ${simJobs.requestPayload}->>'remoteSolver' = 'false'
     )
+    AND NOT coalesce(
+      ${simJobs.requestPayload} ? 'remoteProgressiveExecution',
+      false
+    )
   )`;
   return or(
     and(solverDirectLifecycleSql(), localRequest),
