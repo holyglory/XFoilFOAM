@@ -695,14 +695,14 @@ export function CampaignDetail({
           data-ui-region="campaign-completion-sources"
           data-ui-verify-min-content-inset="10"
           className="campaign-completion-sources"
-          aria-label={`${fCount(summary.completionSources.remoteSolved)} completed by the remote solver, ${fCount(summary.completionSources.hubSolved)} completed by the hub solver${summary.completionSources.derived > 0 ? `, ${fCount(summary.completionSources.derived)} derived by symmetry` : ""}`}
+          aria-label={`${fCount(summary.completionSources.remoteSolved)} solved points attributed to remote execution, ${fCount(summary.completionSources.hubSolved)} solved points attributed to the hub${summary.completionSources.derived > 0 ? `, ${fCount(summary.completionSources.derived)} derived by symmetry` : ""}`}
         >
           <span className="campaign-completion-scope">
             Current campaign plan · all solver sources
           </span>
           <span className="is-remote">
             <strong>{fCount(summary.completionSources.remoteSolved)}</strong>
-            remote solver
+            remote solved points
           </span>
           {progressive.preliminaryPoints > 0 && (
             <span className="is-preliminary">
@@ -718,7 +718,7 @@ export function CampaignDetail({
           )}
           <span>
             <strong>{fCount(summary.completionSources.hubSolved)}</strong>
-            hub solver
+            hub solved points
           </span>
           {summary.completionSources.derived > 0 && (
             <span className="is-derived">
