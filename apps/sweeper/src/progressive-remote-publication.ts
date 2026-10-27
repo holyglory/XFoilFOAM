@@ -2,6 +2,7 @@ import { canonicalRemoteHubBaseUrl } from "@aerodb/core";
 import {
   acknowledgeProgressiveWorkerReport,
   quarantineProgressiveWorkerReportConflict,
+  quarantineProgressiveWorkerReportConflicts,
   readPendingProgressiveWorkerReport,
   validateProgressiveRemoteReport,
   verifyProgressiveRemoteExecution,
@@ -111,13 +112,11 @@ export async function publishProgressiveWorkerReport(
     } | null;
     if (
       body?.error === staleRemoteOwnerReason &&
-      (await quarantineProgressiveWorkerReportConflict(db, {
+      (await quarantineProgressiveWorkerReportConflicts(db, {
         executionId,
         solverId: String(owned.solver_id),
-        sequence: pending.sequence,
-        contentSignature: pending.contentSignature,
         reason: staleRemoteOwnerReason,
-      }))
+      })) > 0
     )
       return { kind: "quarantined", sequence: pending.sequence };
   }

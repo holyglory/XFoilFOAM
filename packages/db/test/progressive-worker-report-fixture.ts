@@ -496,52 +496,27 @@ export async function verifyProgressiveWorkerReportDelivery(
         ).toEqual({ kind: "quarantined", sequence: 1 });
         expect(
           await connection.execute(
-            sql`SELECT reason FROM progressive_worker_report_conflicts
-            WHERE sim_job_id=${executionId}::uuid AND sequence=1`,
+            sql`SELECT sequence, reason FROM progressive_worker_report_conflicts
+            WHERE sim_job_id=${executionId}::uuid ORDER BY sequence`,
           ),
-        ).toEqual([{ reason: "remote solver does not own this execution" }]);
+        ).toEqual([
+          { sequence: 1, reason: "remote solver does not own this execution" },
+          { sequence: 2, reason: "remote solver does not own this execution" },
+          { sequence: 3, reason: "remote solver does not own this execution" },
+        ]);
         expect(
           await connection.execute(
-            sql`SELECT acknowledged_at IS NOT NULL AS acknowledged
+            sql`SELECT count(*)::integer AS acknowledged
             FROM progressive_worker_reports
-            WHERE sim_job_id=${executionId}::uuid AND sequence=1`,
+            WHERE sim_job_id=${executionId}::uuid AND acknowledged_at IS NOT NULL`,
           ),
-        ).toEqual([{ acknowledged: true }]);
+        ).toEqual([{ acknowledged: 3 }]);
         expect(
-          (
-            await readPendingProgressiveWorkerReport(connection, {
-              executionId,
-              solverId: envelope.solverId,
-            })
-          )?.sequence,
-        ).toBe(2);
-        const publishNext: typeof fetch = async (_url, options) => {
-          const body = JSON.parse(String(options?.body));
-          return Response.json({
-            received: true,
-            receipt: await storeProgressiveRemoteReport(connection, {
-              solverId: envelope.solverId,
-              promiseId: body.promiseId,
-              executionId,
-              report: body.report,
-            }),
-          });
-        };
-        expect(
-          await publishProgressiveWorkerReport(
-            connection,
+          await readPendingProgressiveWorkerReport(connection, {
             executionId,
-            publishNext,
-          ),
-        ).toEqual({ kind: "published", sequence: 2 });
-        expect(
-          (
-            await readPendingProgressiveWorkerReport(connection, {
-              executionId,
-              solverId: envelope.solverId,
-            })
-          )?.sequence,
-        ).toBe(3);
+            solverId: envelope.solverId,
+          }),
+        ).toBeNull();
         throw staleOwnerRollback;
       }),
     ).rejects.toBe(staleOwnerRollback);

@@ -370,3 +370,42 @@ export async function quarantineProgressiveWorkerReportConflict(
     return true;
   });
 }
+
+export async function quarantineProgressiveWorkerReportConflicts(
+  db: DB,
+  input: {
+    executionId: string;
+    solverId: string;
+    reason: string;
+  },
+): Promise<number> {
+  return db.transaction(async (transaction) => {
+    const connection = transaction as unknown as DB;
+    await connection.execute(
+      sql`SELECT id FROM sim_jobs WHERE id = ${input.executionId}::uuid FOR UPDATE`,
+    );
+    await connection.execute(sql`
+      INSERT INTO progressive_worker_report_conflicts
+        (sim_job_id, sequence, content_signature, report, reason)
+      SELECT report.sim_job_id, report.sequence, report.content_signature, report.report, ${input.reason}
+      FROM progressive_worker_reports report
+      WHERE report.sim_job_id = ${input.executionId}::uuid
+        AND report.report->>'solverId' = ${input.solverId}
+        AND report.acknowledged_at IS NULL
+      ON CONFLICT (sim_job_id, sequence) DO NOTHING
+    `);
+    const acknowledged = await connection.execute(sql`
+      UPDATE progressive_worker_reports
+      SET acknowledged_at = coalesce(acknowledged_at, clock_timestamp())
+      WHERE sim_job_id = ${input.executionId}::uuid
+        AND report->>'solverId' = ${input.solverId}
+        AND acknowledged_at IS NULL
+      RETURNING sequence
+    `);
+    if (acknowledged.length)
+      await connection.execute(
+        sql`SELECT pg_notify('progressive_worker_evidence_changed', ${input.executionId})`,
+      );
+    return acknowledged.length;
+  });
+}
