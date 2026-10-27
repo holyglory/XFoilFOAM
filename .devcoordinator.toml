@@ -1191,6 +1191,12 @@ requires = ["seed", "types"]
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "progressive remote dispatch pins one exact request"]
 
 [[test.staging-selection.check]]
+name = "campaign-read-model"
+tier = "development"
+requires = ["seed", "types"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "keeps progressive coverage visible without legacy progress rows"]
+
+[[test.staging-selection.check]]
 name = "api-conflict-recovery"
 tier = "development"
 requires = ["exact-ingestion"]

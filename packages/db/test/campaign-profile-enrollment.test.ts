@@ -185,6 +185,7 @@ import {
   campaignAirfoilRows,
   campaignSummary,
   listCampaigns,
+  listCampaignsFast,
   materializeCampaignLaunch,
   reconcileCampaignProfileEnrollment,
 } from "../src/campaigns";
@@ -2034,9 +2035,45 @@ describe("progressive durable stage transitions", () => {
       fastComplete: 0,
       preciseComplete: 0,
     };
+    await db.execute(sql`
+      UPDATE sim_campaign_progress
+      SET requested = 99, solved = 17
+      WHERE campaign_id = ${fixture.campaignId}
+        AND condition_id = (
+          SELECT condition_id
+          FROM sim_campaign_progress
+          WHERE campaign_id = ${fixture.campaignId}
+          ORDER BY condition_id
+          LIMIT 1
+        )
+    `);
     const beforeDeletion = await campaignSummary(db, fixture.campaignId);
+    expect(beforeDeletion.totals).toMatchObject({
+      requested: 6,
+      solved: 0,
+      remaining: 6,
+    });
     expect(beforeDeletion.conditions.map((condition) => condition.progressive))
       .toEqual([expectedCoverage, expectedCoverage]);
+    expect(beforeDeletion.conditions[0]?.counters).toMatchObject({
+      requested: 3,
+      solved: 0,
+      remaining: 3,
+    });
+    const mixedListed = await listCampaigns(db, {
+      statuses: ["active"],
+      limit: 100,
+    });
+    expect(
+      mixedListed.items.find((item) => item.id === fixture.campaignId)?.totals,
+    ).toMatchObject({ requested: 6, solved: 0, remaining: 6 });
+    const mixedFastListed = await listCampaignsFast(db, {
+      statuses: ["active"],
+      limit: 100,
+    });
+    expect(
+      mixedFastListed.items.find((item) => item.id === fixture.campaignId)?.totals,
+    ).toMatchObject({ requested: 6, solved: 0, remaining: 6 });
     await db.execute(
       sql`DELETE FROM sim_campaign_progress WHERE campaign_id=${fixture.campaignId}`,
     );
