@@ -3,6 +3,7 @@ import { PROGRESSIVE_COMPUTE_POLICY } from "@aerodb/core";
 import { analysisContentHash, canonicalAnalysisJson } from "./analysis-target";
 import type { DB } from "./client";
 import { assertProgressiveCfdEvidenceJob } from "./progressive-cfd-evidence";
+import { assertProgressiveExecutionIdentity } from "./progressive-execution-identity";
 
 export interface ProgressiveRansPromotion {
   revisionId: string;
@@ -311,7 +312,7 @@ export async function recordProgressiveCfdMaterialDomainRecoveryPlans(
   return db.transaction(async (transaction) => {
     const connection = transaction as unknown as DB;
     const [job] = await connection.execute(sql`
-      SELECT job.engine_job_id,
+      SELECT job.engine_job_id, job.campaign_id, job.request_payload,
         EXISTS (SELECT 1 FROM progressive_cfd_execution_stops stopped
           WHERE stopped.sim_job_id = job.id AND stopped.engine_job_id = job.engine_job_id) AS stopped
       FROM sim_jobs job WHERE job.id = ${simJobId}
@@ -320,15 +321,44 @@ export async function recordProgressiveCfdMaterialDomainRecoveryPlans(
       throw new Error(
         "Material-domain recovery requires a physically stopped parent execution",
       );
-    if (
-      !(await assertProgressiveCfdEvidenceJob(
-        connection,
-        simJobId,
-        job.engine_job_id,
-      ))
-    )
+    const metadata = (job.request_payload as Record<string, unknown> | null)
+      ?.progressive as
+      | Record<string, unknown>
+      | undefined;
+    if (!metadata || job.engine_job_id !== simJobId)
       throw new Error(
         "Material-domain recovery requires a progressive parent execution",
+      );
+    assertProgressiveExecutionIdentity(
+      simJobId,
+      job.engine_job_id,
+      job.request_payload,
+    );
+    const [epoch] = await connection.execute(
+      sql`SELECT id FROM calculation_epochs WHERE current FOR SHARE`,
+    );
+    const [campaign] = await connection.execute(sql`
+      SELECT status, current_plan_revision_id
+      FROM sim_campaigns WHERE id = ${job.campaign_id} FOR UPDATE
+    `);
+    const [generation] = await connection.execute(sql`
+      SELECT id, epoch_id, plan_revision_id, status
+      FROM progressive_generations WHERE id = ${String(metadata.generationId)}::uuid
+    `);
+    if (
+      !epoch ||
+      !campaign ||
+      !generation ||
+      !["active", "attention", "paused"].includes(String(campaign.status)) ||
+      generation.status !== "active" ||
+      String(generation.epoch_id) !== String(epoch.id) ||
+      String(generation.plan_revision_id) !== String(campaign.current_plan_revision_id) ||
+      String(metadata.epochId) !== String(epoch.id) ||
+      (metadata.campaignId != null &&
+        String(metadata.campaignId) !== String(job.campaign_id))
+    )
+      throw new Error(
+        "Material-domain recovery requires the current campaign generation",
       );
     const units = (await connection.execute(sql`
       SELECT unit.id, attempt.token, work.stage, recipe.recipe,
