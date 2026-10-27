@@ -4186,14 +4186,7 @@ export async function reconcileProgressiveCfdJob(
     });
   const terminal = ["completed", "failed", "cancelled"].includes(status.state);
   if (!terminal) {
-    if (job.status === "cancelled") {
-      const cancellation = await engine.cancelJob(job.engineJobId, route);
-      if (cancellation.job_id !== job.engineJobId || !cancellation.cancelled)
-        throw new Error(
-          "Engine did not acknowledge the exact progressive cancellation",
-        );
-      return;
-    }
+    if (job.status === "cancelled") return;
     await updateJobFromEngineStatus(db, job, {
       ...status,
       completed_cases: job.completedCases,

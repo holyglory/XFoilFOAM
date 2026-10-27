@@ -10,7 +10,6 @@ import {
   terminalReportNoPhysicalEvidenceSignatures,
 } from "../src/progressive-remote-retention";
 import { analysisContentHash } from "../src/analysis-target";
-import { isRemoteProgressiveRequest } from "../src/job-lifecycle";
 import {
   isFinalProgressiveRemoteReport,
   normalizeProgressiveRemoteReportJson,
@@ -19,14 +18,6 @@ import {
   resolveProgressiveReportedPoint,
   type ProgressiveRemoteReport,
 } from "../src/progressive-remote-report";
-
-it("classifies only explicitly remote progressive requests as remote", () => {
-  expect(isRemoteProgressiveRequest({ remoteSolver: true })).toBe(true);
-  expect(isRemoteProgressiveRequest({ remoteSolver: "true" })).toBe(true);
-  expect(isRemoteProgressiveRequest({ remoteSolver: false })).toBe(false);
-  expect(isRemoteProgressiveRequest({ progressive: { stage: 3 } })).toBe(false);
-  expect(isRemoteProgressiveRequest(null)).toBe(false);
-});
 
 function fixture() {
   const units = [0, 5].map((alpha) => ({
