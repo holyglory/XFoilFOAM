@@ -23,7 +23,12 @@ async function releaseMissingCancelledExecution(db: DB, jobId: string) {
     const [job] = await connection.execute(sql`
       SELECT status, engine_state FROM sim_jobs WHERE id = ${jobId}::uuid FOR UPDATE
     `);
-    if (job?.status !== "cancelled" || job.engine_state !== "cancelled")
+    if (
+      job?.status !== "cancelled" ||
+      !["cancelled", "running", "missing", "cancel_pending"].includes(
+        String(job.engine_state),
+      )
+    )
       return 0;
     const [evidence] = await connection.execute(sql`
       SELECT EXISTS (SELECT 1 FROM result_attempts WHERE sim_job_id = ${jobId}::uuid)
