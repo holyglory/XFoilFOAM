@@ -361,7 +361,9 @@ export async function recordProgressiveCfdMaterialDomainRecoveryPlans(
         "Material-domain recovery requires the current campaign generation",
       );
     const units = (await connection.execute(sql`
-      SELECT unit.id, attempt.token, work.stage, recipe.recipe,
+      SELECT unit.id, attempt.token, unit.state, unit.active_seconds,
+        unit.active_budget_seconds, work.id AS work_id, work.state AS work_state,
+        work.stage, recipe.recipe,
         EXISTS (SELECT 1 FROM progressive_cfd_recovery_plans existing
           WHERE existing.unit_id = unit.id) AS has_recovery_plan
       FROM progressive_cfd_attempts attempt
@@ -374,6 +376,11 @@ export async function recordProgressiveCfdMaterialDomainRecoveryPlans(
     `)) as unknown as Array<{
       id: string;
       token: string;
+      state: string;
+      active_seconds: number;
+      active_budget_seconds: number;
+      work_id: string;
+      work_state: string;
       stage: 2 | 3;
       recipe: Record<string, unknown>;
       has_recovery_plan: boolean;
@@ -426,7 +433,33 @@ export async function recordProgressiveCfdMaterialDomainRecoveryPlans(
     }
     let inserted = 0;
     for (const unit of units) {
-      if (unit.has_recovery_plan) continue;
+      if (unit.has_recovery_plan) {
+        if (
+          unit.state === "gap" &&
+          Number(unit.active_seconds) < Number(unit.active_budget_seconds) &&
+          ["pending", "gap"].includes(unit.work_state)
+        ) {
+          await connection.execute(sql`
+            UPDATE progressive_cfd_units
+            SET state = 'pending', lease_token = NULL, lease_owner = NULL,
+              lease_until = NULL,
+              error = 'material-domain failure; bounded rhoPimpleFoam fallback admitted'
+            WHERE id = ${unit.id}::uuid AND state = 'gap'
+              AND active_seconds < active_budget_seconds
+              AND NOT EXISTS (
+                SELECT 1 FROM progressive_cfd_attempts running
+                WHERE running.unit_id = progressive_cfd_units.id
+                  AND running.outcome = 'running'
+              )
+          `);
+          await connection.execute(sql`
+            UPDATE progressive_work SET state = 'pending', error = NULL,
+              completed_at = NULL
+            WHERE id = ${unit.work_id}::uuid AND state = 'gap'
+          `);
+        }
+        continue;
+      }
       const diagnostic = evidenceByUnit.get(unit.id);
       if (
         !diagnostic ||
