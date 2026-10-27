@@ -1173,6 +1173,18 @@ requires = ["schema", "types"]
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/progressive-delivery-selection.test.ts"]
 
 [[test.staging-selection.check]]
+name = "remote-lease-retirement"
+tier = "development"
+requires = ["schema", "types"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/progressive-remote-lease-retirement.test.ts"]
+
+[[test.staging-selection.check]]
+name = "progressive-terminal-lane"
+tier = "development"
+requires = ["schema", "types"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/progressive-delivery-selection.test.ts", "-t", "reserves a bounded terminal lane"]
+
+[[test.staging-selection.check]]
 name = "publication-services"
 tier = "development"
 requires = ["types"]
