@@ -56,7 +56,7 @@ interface BoundUnit {
   };
 }
 
-type JobScopePolicy = "strict" | "runtime";
+type JobScopePolicy = "strict" | "runtime" | "late_runtime";
 
 function isRuntimeProgressActiveUnit(unit: BoundUnit): boolean {
   return (
@@ -72,6 +72,17 @@ function isRuntimeProgressObsoleteUnit(unit: BoundUnit): boolean {
     (!unit.latest_attempt ||
       ["complete", "failed", "expired", "cancelled"].includes(unit.outcome) ||
       ["complete", "gap", "cancelled"].includes(unit.state))
+  );
+}
+
+function isLateRuntimeUnit(unit: BoundUnit): boolean {
+  return (
+    unit.latest_attempt === true &&
+    unit.work_state === "pending" &&
+    ["leased", "blocked", "gap", "complete"].includes(unit.state) &&
+    ["running", "failed", "expired", "cancelled", "complete"].includes(
+      unit.outcome,
+    )
   );
 }
 
@@ -204,7 +215,9 @@ async function lockJobScope(
                 unit.lease_until == null ||
                 new Date(String(unit.lease_until)).getTime() > Date.now()
               : unit.lease_token != null || unit.lease_until != null)
-          : policy === "runtime"
+          : policy === "late_runtime"
+            ? !isLateRuntimeUnit(unit)
+            : policy === "runtime"
             ? !isRuntimeProgressActiveUnit(unit) &&
               !isRuntimeProgressObsoleteUnit(unit)
             : unit.outcome !== "running" ||
@@ -387,12 +400,14 @@ export async function assertProgressiveCfdEvidenceJob(
     chord: number;
     solverActiveSeconds?: number | null;
   }>,
+  options: { policy?: JobScopePolicy } = {},
 ) {
   return db.transaction(async (transaction) => {
     const scope = await lockJobScope(
       transaction as unknown as DB,
       simJobId,
       engineJobId,
+      { policy: options.policy },
     );
     if (scope && cases) {
       for (const item of cases) {
@@ -555,6 +570,7 @@ export async function recordProgressiveCfdEvidence(
     engineJobId: string;
     resultAttemptIds: string[];
     recoveryScope?: ProgressiveStorageEvidenceRecoveryScope;
+    policy?: JobScopePolicy;
   },
 ): Promise<{ progressive: boolean; linked: number; stopRequired: boolean }> {
   const ids = [...new Set(input.resultAttemptIds)];
@@ -569,7 +585,9 @@ export async function recordProgressiveCfdEvidence(
           input.recoveryScope,
           ids,
         )
-      : await lockJobScope(connection, input.simJobId, input.engineJobId);
+      : await lockJobScope(connection, input.simJobId, input.engineJobId, {
+          policy: input.policy,
+        });
     if (input.recoveryScope && input.engineJobId !== input.simJobId)
       throw new ProgressiveCfdEvidenceScopeClosed(
         "Historical progressive recovery requires exact engine ownership",

@@ -15,6 +15,8 @@ import {
 } from "./progressive-remote-point-projection";
 import { assertStoppedProgressiveStorage } from "./progressive-stopped-storage";
 
+type ProgressiveEvidencePolicy = "strict" | "runtime" | "late_runtime";
+
 export interface ProgressiveRemoteEvidenceDelivery {
   solverId: string;
   promiseId: string;
@@ -169,6 +171,7 @@ export async function recordProgressiveRemoteEvidenceReceipt(
     resultAttemptId: string;
     storageOnly?: boolean;
     recoveryScope?: ProgressiveStorageEvidenceRecoveryScope;
+    policy?: ProgressiveEvidencePolicy;
   },
 ) {
   if (input.recoveryScope) {
@@ -199,6 +202,7 @@ export async function recordProgressiveRemoteEvidenceReceipt(
         engineJobId: input.engineJobId,
         resultAttemptIds: [input.resultAttemptId],
         recoveryScope: input.recoveryScope,
+        policy: input.policy,
       });
     await connection.execute(sql`
       INSERT INTO progressive_remote_evidence_receipts
