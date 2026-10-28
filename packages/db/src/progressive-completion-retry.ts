@@ -1,6 +1,6 @@
 import { sql } from "drizzle-orm";
 import type { DB } from "./client";
-import { tryProgressiveAdmissionLock } from "./progressive-admission-lock";
+import { acquireProgressiveAdmissionLock } from "./progressive-admission-lock";
 
 const COMPLETION_RETRY_REASONS = [
   "terminal execution has no measured case evidence",
@@ -21,8 +21,7 @@ export async function requeueProgressiveCompletionRetries(
     throw new Error("Completion retry requires an exact campaign and bounded count");
   return db.transaction(async (transaction) => {
     const connection = transaction as unknown as DB;
-    if (!(await tryProgressiveAdmissionLock(connection)))
-      return { requeued: 0 };
+    await acquireProgressiveAdmissionLock(connection);
     const units = await connection.execute(sql`
       SELECT unit.id, unit.work_id
       FROM progressive_cfd_units unit

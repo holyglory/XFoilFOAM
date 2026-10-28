@@ -2495,6 +2495,12 @@ requires = ["dependencies", "types"]
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "requeues only stopped terminal executions with no measurable evidence"]
 
 [[test.progressive.check]]
+name = "terminal-evidence-inventory-guard"
+tier = "development"
+requires = ["workspace"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "terminal evidence inventory|requeues one ordinary retry|defers automatic recovery while progressive admission is held, then recovers after release|without letting an older attempt close the latest owner"]
+
+[[test.progressive.check]]
 name = "remote-stage-barrier"
 tier = "development"
 requires = ["dependencies", "types"]

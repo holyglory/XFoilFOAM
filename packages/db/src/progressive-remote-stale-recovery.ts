@@ -1,6 +1,6 @@
 import { sql } from "drizzle-orm";
 import type { DB } from "./client";
-import { tryProgressiveAdmissionLock } from "./progressive-admission-lock";
+import { acquireProgressiveAdmissionLock } from "./progressive-admission-lock";
 
 export const STALE_HZ_RESET_REASON =
   "Stale HZ remote execution released during disposable solver reset";
@@ -42,13 +42,7 @@ export async function recoverStaleProgressiveRemoteDispatches(
   const olderThanMinutes = input.olderThanMinutes ?? 360;
   return db.transaction(async (transaction) => {
     const connection = transaction as unknown as DB;
-    if (!(await tryProgressiveAdmissionLock(connection)))
-      return {
-        candidateJobs: 0,
-        releasedJobs: [],
-        releasedUnits: 0,
-        reopenedUnits: 0,
-      };
+    await acquireProgressiveAdmissionLock(connection);
     const candidates = await connection.execute(sql`
       SELECT job.id, promise.id AS promise_id
       FROM sim_jobs job
