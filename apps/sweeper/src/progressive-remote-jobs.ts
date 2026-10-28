@@ -1,6 +1,7 @@
 import {
   canonicalRemoteHubBaseUrl,
   progressiveSolverIsTransient,
+  type ProgressiveSolverFamily,
 } from "@aerodb/core";
 import {
   canonicalAnalysisJson,
@@ -20,6 +21,16 @@ import {
   solverImplementationIdForSetup,
 } from "./build-request";
 import { requireExecutionPoolForSetup } from "./engine-pool";
+
+export function progressiveRemoteExecutionSolverFamily(
+  stage: 2 | 3,
+  configuredFamily: ProgressiveSolverFamily,
+): ProgressiveSolverFamily {
+  if (stage === 3 && configuredFamily === "simpleFoam") return "pimpleFoam";
+  if (stage === 3 && configuredFamily === "rhoSimpleFoam")
+    return "rhoPimpleFoam";
+  return configuredFamily;
+}
 
 export async function assertProgressiveWorkerEvidenceJob(
   db: DB,
@@ -179,13 +190,17 @@ export async function mirrorProgressiveRemoteJob(
     const setup = revision.snapshot as unknown as SimulationSetupSnapshot;
     const pool = await requireExecutionPoolForSetup(connection, setup);
     const family = setup.solver.flowSolverFamily;
+    const executionFamily = progressiveRemoteExecutionSolverFamily(
+      envelope.scope.stage,
+      family,
+    );
     const boundaryId = setup.preset.legacyBoundaryConditionId;
     if (
       !boundaryId ||
       canonicalAnalysisJson(engineIdentityForSetup(setup)) !==
         canonicalAnalysisJson(envelope.request.expected_engine) ||
       !family ||
-      family !== envelope.request.solver?.flow_solver_family ||
+      executionFamily !== envelope.request.solver?.flow_solver_family ||
       pool.routingKey !== envelope.request.expected_execution_pool ||
       setup.referenceGeometry.referenceLengthM !== chord ||
       setup.flowState.speedMps !== speed
@@ -205,8 +220,8 @@ export async function mirrorProgressiveRemoteJob(
     )
       throw new Error("The mirrored promise changes the assigned angle list");
     const transient = progressiveSolverIsTransient(
-      family,
-      setup.solver.timeCoordinate,
+      executionFamily,
+      executionFamily === family ? setup.solver.timeCoordinate : undefined,
     );
     if (envelope.request.solver?.force_transient !== transient)
       throw new Error(

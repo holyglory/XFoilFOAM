@@ -258,6 +258,12 @@ requires = ["seed"]
 command = ["/bin/bash", "-euc", "/usr/bin/corepack pnpm --filter @aerodb/db typecheck && /usr/bin/corepack pnpm --filter @aerodb/engine-client typecheck && /usr/bin/corepack pnpm --filter @aerodb/sweeper typecheck"]
 
 [[test.cfd-source-geometry.check]]
+name = "progressive-remote-intake-contract"
+tier = "development"
+requires = ["seed"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/progressive-remote-jobs.test.ts"]
+
+[[test.cfd-source-geometry.check]]
 name = "progressive-fast-budget-recovery"
 tier = "development"
 requires = ["seed"]
