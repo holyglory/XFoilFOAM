@@ -13,7 +13,6 @@ MIGRATION_FILE="$APP_DIR/packages/db/migrations/0189_progressive_worker_report_j
 MIGRATION_CREATED_AT=1793187421071
 INDEXES=(
   progressive_worker_reports_staging_job_order_idx
-  progressive_worker_reports_terminal_staging_job_order_idx
 )
 
 if [[ ! -f "$ENV_FILE" || ! -f "$MIGRATION_FILE" ]]; then
@@ -81,11 +80,7 @@ for index_name in "${INDEXES[@]}"; do
     psql -c "DROP INDEX CONCURRENTLY IF EXISTS $index_name;"
   fi
   if [[ "$index_state" != "valid" ]]; then
-    if [[ "$index_name" == "${INDEXES[0]}" ]]; then
-      psql -c "CREATE INDEX CONCURRENTLY $index_name ON progressive_worker_reports (sim_job_id, created_at, sequence) WHERE acknowledged_at IS NOT NULL AND jsonb_typeof(report->'result') = 'object';"
-    else
-      psql -c "CREATE INDEX CONCURRENTLY $index_name ON progressive_worker_reports (sim_job_id, created_at, sequence) WHERE acknowledged_at IS NOT NULL AND jsonb_typeof(report->'result') = 'object' AND stopped_engine_job_id IS NOT NULL;"
-    fi
+    psql -c "CREATE INDEX CONCURRENTLY $index_name ON progressive_worker_reports (sim_job_id, created_at, sequence) WHERE acknowledged_at IS NOT NULL AND jsonb_typeof(report->'result') = 'object';"
   fi
   [[ "$(psql -Atc "SELECT CASE WHEN indisvalid AND indisready THEN 'valid' ELSE 'invalid' END FROM pg_class c JOIN pg_index i ON i.indexrelid=c.oid WHERE c.relname='$index_name';")" == "valid" ]] || {
     echo "Index $index_name did not become valid." >&2
