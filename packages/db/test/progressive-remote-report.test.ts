@@ -167,38 +167,6 @@ it("classifies only artifact-free failed points in a mixed terminal report", () 
   expect(terminalReportHasNoPhysicalEvidence(input.report)).toBe(false);
 });
 
-it("classifies artifact-free failed points in a completed final report", () => {
-  const input = fixture();
-  input.report.status.state = "completed";
-  input.report.result!.state = "completed";
-  input.report.result!.polars[0].attempts = [
-    {
-      ...input.report.result!.polars[0].attempts![0],
-      aoa_deg: 5,
-      cl: null,
-      cd: null,
-      cm: null,
-      error: "HardSolverError: SIGFPE",
-      failure_disposition: "hard_solver",
-      evidence_artifacts: [],
-    },
-  ];
-  input.report.stopProof = {
-    version: 1,
-    job_id: input.report.executionId,
-    execution_stopped: true,
-    producer_stopped: true,
-    namespace_verified: true,
-    remaining: [],
-    observed_at: "2026-09-07T09:01:00Z",
-    error: null,
-    fence: "terminal_result",
-    ownership_basis: "recorded_execution_namespace",
-  };
-  expect(terminalReportNoPhysicalEvidenceSignatures(input.report).size).toBe(1);
-  expect(terminalReportHasNoPhysicalEvidence(input.report)).toBe(false);
-});
-
 it("normalizes NUL diagnostics before validation and signs the persisted representation", () => {
   const { assignment, report } = fixture();
   report.status.message = "status\u0000diagnostic";
