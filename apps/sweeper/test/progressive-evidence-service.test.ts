@@ -227,11 +227,7 @@ it("continues delivery while all four staging slots wait", async () => {
     await imports.pending;
     return false;
   });
-  const deliver = vi
-    .fn()
-    .mockResolvedValueOnce(true)
-    .mockResolvedValueOnce(true)
-    .mockResolvedValue(false);
+  const deliver = vi.fn().mockResolvedValue(false);
   const running = runProgressiveEvidenceService(
     {} as DB,
     channel.connection,
@@ -242,13 +238,19 @@ it("continues delivery while all four staging slots wait", async () => {
   try {
     await vi.advanceTimersByTimeAsync(0);
     expect(stage).toHaveBeenCalledTimes(4);
-    expect(deliver).toHaveBeenCalledTimes(8);
-    expect(deliver.mock.calls.every(([preferActive]) => preferActive)).toBe(
-      true,
-    );
+    expect(deliver.mock.calls).toEqual([[true], [false], [true], [false]]);
     channel.notify("progressive_worker_evidence_changed");
     await vi.advanceTimersByTimeAsync(0);
-    expect(deliver).toHaveBeenCalledTimes(12);
+    expect(deliver.mock.calls).toEqual([
+      [true],
+      [false],
+      [true],
+      [false],
+      [false],
+      [true],
+      [false],
+      [true],
+    ]);
     expect(stage).toHaveBeenCalledTimes(4);
   } finally {
     owner.abort();

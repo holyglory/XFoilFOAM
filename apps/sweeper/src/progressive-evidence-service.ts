@@ -137,7 +137,7 @@ export async function runProgressiveEvidenceService(
               ? stage(preference)
               : drainProgressiveWorkerEvidencePass(
                   deliver,
-                  true,
+                  preference,
                   SERVICE_MAX_SEQUENTIAL_EVIDENCE_DELIVERIES,
                   childSignal,
                 );
