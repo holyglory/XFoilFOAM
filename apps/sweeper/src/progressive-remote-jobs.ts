@@ -190,6 +190,8 @@ export async function mirrorProgressiveRemoteJob(
     const setup = revision.snapshot as unknown as SimulationSetupSnapshot;
     const pool = await requireExecutionPoolForSetup(connection, setup);
     const family = setup.solver.flowSolverFamily;
+    if (!family)
+      throw new Error("The local setup has no solver family");
     const executionFamily = progressiveRemoteExecutionSolverFamily(
       envelope.scope.stage,
       family,
