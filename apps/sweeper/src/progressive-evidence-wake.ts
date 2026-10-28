@@ -6,6 +6,22 @@ export function progressiveEvidenceWakeSql(
   scope: ProgressiveEvidenceWakeScope,
   ready: boolean,
 ) {
+  const terminalScopeClosed = sql`SELECT association.sim_job_id, failure.retry_after,
+      NULL::timestamptz AS claim_until
+    FROM progressive_worker_delivery_failures failure
+    JOIN progressive_worker_evidence_attempts association
+      ON association.sim_job_id = failure.sim_job_id
+     AND association.point_content_signature = failure.point_content_signature
+    JOIN progressive_worker_reports report
+      ON report.sim_job_id = association.sim_job_id
+     AND report.sequence = association.sequence
+    WHERE failure.state = 'conflict'
+      AND failure.last_error ILIKE '%progressive_scope_closed%'
+      AND report.acknowledged_at IS NOT NULL
+      AND report.report#>>'{stopProof,execution_stopped}' = 'true'
+      AND report.report#>>'{status,state}' IN ('completed', 'failed', 'cancelled')
+    ORDER BY failure.updated_at, failure.sim_job_id, failure.point_content_signature
+    LIMIT 1`;
   const source =
     scope === "staging"
       ? sql`SELECT report.sim_job_id, failure.retry_after, NULL::timestamptz AS claim_until
@@ -19,7 +35,8 @@ export function progressiveEvidenceWakeSql(
             WHERE staged.sim_job_id = report.sim_job_id AND staged.sequence = report.sequence)
           ${ready ? sql`AND (failure.sim_job_id IS NULL OR failure.retry_after <= clock_timestamp())` : sql``}
         ORDER BY report.created_at, report.sim_job_id, report.sequence OFFSET 0`
-      : sql`SELECT association.sim_job_id, failure.retry_after,
+      : sql`WITH terminal_scope_closed AS MATERIALIZED (${terminalScopeClosed}),
+      normal_delivery AS MATERIALIZED (SELECT association.sim_job_id, failure.retry_after,
           CASE WHEN claim.claim_token IS NOT NULL THEN claim.claim_expires_at END AS claim_until
         FROM progressive_worker_evidence_attempts association
         JOIN progressive_worker_evidence_receipts staged
@@ -58,7 +75,10 @@ export function progressiveEvidenceWakeSql(
             AND (claim.claim_token IS NULL OR claim.claim_expires_at <= clock_timestamp())`
               : sql``
           }
-        ORDER BY report.created_at, association.sim_job_id, association.sequence, association.result_attempt_id OFFSET 0`;
+        ORDER BY report.created_at, association.sim_job_id, association.sequence, association.result_attempt_id OFFSET 0)
+      SELECT * FROM terminal_scope_closed
+      UNION ALL
+      SELECT * FROM normal_delivery WHERE NOT EXISTS (SELECT 1 FROM terminal_scope_closed)`;
   const ownership = sql`SELECT job.ingest_lease_token, job.ingest_lease_expires_at
     FROM sim_jobs job
     JOIN sync_sweep_promises promise ON promise.id::text = job.request_payload->>'syncPromiseId'
