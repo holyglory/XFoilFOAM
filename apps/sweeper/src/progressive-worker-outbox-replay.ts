@@ -286,10 +286,10 @@ export async function replayProgressiveWorkerOutbox(
               owner.simulation_preset_revision_id ||
             row.aoa_deg !== projection.aoaDeg,
         ) ||
-        Number(result.reynolds) !== projection.reynolds ||
+        Number(result.reynolds) !== Math.round(projection.reynolds) ||
         result.speed !== projection.speed ||
         result.chord !== projection.chord ||
-        result.mach !== projection.mach ||
+        (projection.mach !== null && result.mach !== projection.mach) ||
         attempt.cl !== projection.cl ||
         attempt.cd !== projection.cd ||
         attempt.cm !== projection.cm ||

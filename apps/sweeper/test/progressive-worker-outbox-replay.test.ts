@@ -262,8 +262,8 @@ async function withFixture(
           {
             chord: 1,
             speed: 30,
-            reynolds: 2_000_000,
-            mach: 0.09,
+            reynolds: 2_000_000.4,
+            mach: null,
             points: angles.map((alpha) => ({
               aoa_deg: alpha,
               case_slug: `fixture-${alpha}`,
