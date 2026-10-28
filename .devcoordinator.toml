@@ -1198,6 +1198,13 @@ requires = ["schema", "types"]
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/progressive-staging-selection.test.ts"]
 
 [[test.staging-selection.check]]
+name = "selector-contract"
+tier = "development"
+requires = ["schema", "types"]
+timeout_seconds = 180
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/progressive-staging-selection.test.ts", "-t", "serves fresh active reports|prioritizes active terminal reports"]
+
+[[test.staging-selection.check]]
 name = "publication-focused"
 tier = "development"
 requires = ["schema", "types"]
