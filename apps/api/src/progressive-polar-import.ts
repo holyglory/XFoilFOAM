@@ -39,7 +39,6 @@ export async function prepareProgressivePolarImport(
       receipt: Awaited<ReturnType<typeof readProgressiveRemoteEvidenceReceipt>>;
       projection: ReturnType<typeof progressiveRemotePointProjection>;
       storageOnly: boolean;
-      lateRuntime: boolean;
     }
   >();
   if (
@@ -97,7 +96,6 @@ export async function prepareProgressivePolarImport(
       receipt: await readProgressiveRemoteEvidenceReceipt(db, delivery),
       projection: progressiveRemotePointProjection(source),
       storageOnly: options.storageOnly === true,
-      lateRuntime: false,
     });
   }
   if (prepared.size && prepared.size !== payload.results.length)
@@ -112,8 +110,7 @@ export async function assertProgressivePolarImportScope(
   prepared: Awaited<ReturnType<typeof prepareProgressivePolarImport>>,
 ) {
   const publishable = new Set<number>();
-  for (const entry of prepared.values()) {
-    const { source, receipt, delivery, storageOnly } = entry;
+  for (const { source, receipt, delivery, storageOnly } of prepared.values()) {
     if (storageOnly || receipt?.storageOnly) {
       await assertStoppedProgressiveStorage(db, delivery);
       continue;
@@ -134,30 +131,9 @@ export async function assertProgressivePolarImportScope(
         ],
       );
     } catch (error) {
-      if (
-        error instanceof ProgressiveCfdEvidenceScopeClosed &&
-        !receipt &&
-        source.report.stopProof !== null &&
-        ["completed", "failed", "cancelled"].includes(source.report.status.state)
-      ) {
-        owned = await assertProgressiveCfdEvidenceJob(
-          db,
-          source.report.executionId,
-          source.report.executionId,
-          [
-            {
-              alpha: source.point.aoa_deg,
-              speed: source.polar.speed,
-              chord: source.polar.chord,
-              solverActiveSeconds: source.point.solver_active_seconds,
-            },
-          ],
-          { policy: "late_runtime" },
-        );
-        entry.lateRuntime = true;
-      } else if (receipt && error instanceof ProgressiveCfdEvidenceScopeClosed) {
+      if (receipt && error instanceof ProgressiveCfdEvidenceScopeClosed)
         continue;
-      } else throw error;
+      throw error;
     }
     if (!owned)
       throw new ProgressiveRemoteEvidenceConflict(
