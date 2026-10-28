@@ -348,10 +348,17 @@ export async function replayProgressiveWorkerOutbox(
         WHERE sim_job_id = ${input.executionId}::uuid AND point_content_signature = ${point.pointContentSignature}
         FOR UPDATE
       `);
+      const staleFailure =
+        failure &&
+        Number(failure.sequence) < point.sequence &&
+        failure.result_attempt_id !== point.resultAttemptId;
+      const exactFailure =
+        failure &&
+        Number(failure.sequence) === point.sequence &&
+        failure.result_attempt_id === point.resultAttemptId;
       if (
         !failure ||
-        Number(failure.sequence) !== point.sequence ||
-        failure.result_attempt_id !== point.resultAttemptId ||
+        (!exactFailure && !staleFailure) ||
         failure.state !== "conflict" ||
         failure.last_http_status !== 409 ||
         !SCOPE_CLOSED.test(String(failure.last_error)) ||
@@ -371,10 +378,14 @@ export async function replayProgressiveWorkerOutbox(
         (selected) => selected.outcome === "requeued",
       )) {
         const updated = await connection.execute(sql`
-          UPDATE progressive_worker_delivery_failures SET state = 'retry', retry_after = clock_timestamp()
-          WHERE sim_job_id = ${input.executionId}::uuid AND sequence = ${point.sequence}
-            AND result_attempt_id = ${point.resultAttemptId}::uuid
-            AND point_content_signature = ${point.pointContentSignature} AND state = 'conflict'
+          UPDATE progressive_worker_delivery_failures
+          SET sequence = ${point.sequence}, result_attempt_id = ${point.resultAttemptId}::uuid,
+            state = 'retry', retry_after = clock_timestamp()
+          WHERE sim_job_id = ${input.executionId}::uuid
+            AND point_content_signature = ${point.pointContentSignature}
+            AND state = 'conflict'
+            AND (sequence = ${point.sequence} AND result_attempt_id = ${point.resultAttemptId}::uuid
+              OR sequence < ${point.sequence})
           RETURNING point_content_signature
         `);
         if (updated.length !== 1)

@@ -484,6 +484,56 @@ it("dry-runs by default, then requeues exactly one selected source without alter
   });
 });
 
+it("retargets one stale closed-scope failure to the newer final report", async () => {
+  await withFixture(async ({ connection, input }) => {
+    input.points = input.points.slice(0, 1);
+    input.expectedCount = 1;
+    const point = input.points[0];
+    await connection.execute(sql`UPDATE progressive_worker_delivery_failures
+      SET sequence = 2, result_attempt_id = md5('stale-reported-attempt')::uuid
+      WHERE sim_job_id = ${input.executionId}::uuid
+        AND point_content_signature = ${point.pointContentSignature}`);
+    const beforeEvidence = await snapshot(
+      connection,
+      TABLES.filter(
+        (table) => table !== "progressive_worker_delivery_failures",
+      ),
+    );
+    const preview = await replayProgressiveWorkerOutbox(connection, input);
+    expect(preview.points[0].outcome).toBe("would_requeue");
+    const applied = await replayProgressiveWorkerOutbox(
+      connection,
+      {
+        ...input,
+        expectedCount: undefined,
+        manifestSignature: preview.manifestSignature,
+      },
+      { apply: true },
+    );
+    expect(applied.requeuedCount).toBe(1);
+    const [failure] = await connection.execute(sql`
+      SELECT sequence, result_attempt_id, state
+      FROM progressive_worker_delivery_failures
+      WHERE sim_job_id = ${input.executionId}::uuid
+        AND point_content_signature = ${point.pointContentSignature}`);
+    expect(failure).toEqual({
+      sequence: String(point.sequence),
+      result_attempt_id: point.resultAttemptId,
+      state: "retry",
+    });
+    expect(await snapshot(connection, Object.keys(beforeEvidence))).toEqual(
+      beforeEvidence,
+    );
+    await connection.execute(sql`UPDATE progressive_worker_delivery_failures
+      SET sequence = 999, result_attempt_id = md5('future-reported-attempt')::uuid, state = 'conflict'
+      WHERE sim_job_id = ${input.executionId}::uuid
+        AND point_content_signature = ${point.pointContentSignature}`);
+    await expect(
+      replayProgressiveWorkerOutbox(connection, input),
+    ).rejects.toThrow("exact 409");
+  });
+});
+
 it("uses the migrated sim_jobs boundary array and rejects a foreign boundary", async () => {
   await withFixture(async ({ connection, input }) => {
     const columns = await connection.execute(sql`SELECT column_name
