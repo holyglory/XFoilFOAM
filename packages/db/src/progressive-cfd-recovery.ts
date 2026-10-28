@@ -12,7 +12,7 @@ import {
   progressiveCfdCompletionRetryAvailableSql,
   progressiveCfdPreciseVerificationAvailableSql,
 } from "./progressive-attempt-budget";
-import { acquireProgressiveAdmissionLock } from "./progressive-admission-lock";
+import { tryProgressiveAdmissionLock } from "./progressive-admission-lock";
 import { STALE_HZ_RESET_REASON } from "./progressive-remote-stale-recovery";
 import {
   progressiveCfdBudgetExtensionPendingSql,
@@ -44,7 +44,7 @@ export async function recoverUnboundProgressiveCfdLeases(
   return db.transaction(async (transaction) => {
     const connection = transaction as unknown as DB;
     const receipt = { retried: 0, gaps: 0 };
-    await acquireProgressiveAdmissionLock(connection);
+    if (!(await tryProgressiveAdmissionLock(connection))) return receipt;
     const [epoch] = await connection.execute(
       sql`SELECT id FROM calculation_epochs WHERE current FOR SHARE`,
     );
@@ -102,7 +102,7 @@ export async function recoverInactiveProgressiveRemoteGaps(
 ): Promise<number> {
   return db.transaction(async (transaction) => {
     const connection = transaction as unknown as DB;
-    await acquireProgressiveAdmissionLock(connection);
+    if (!(await tryProgressiveAdmissionLock(connection))) return 0;
     const [epoch] = await connection.execute(
       sql`SELECT id FROM calculation_epochs WHERE current FOR SHARE`,
     );
@@ -166,7 +166,7 @@ export async function recoverTerminalProgressiveNoEvidenceGaps(
 ): Promise<number> {
   return db.transaction(async (transaction) => {
     const connection = transaction as unknown as DB;
-    await acquireProgressiveAdmissionLock(connection);
+    if (!(await tryProgressiveAdmissionLock(connection))) return 0;
     const [epoch] = await connection.execute(
       sql`SELECT id FROM calculation_epochs WHERE current FOR SHARE`,
     );
