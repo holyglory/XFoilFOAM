@@ -22,6 +22,8 @@ import { fetchProgressiveRemote } from "./progressive-remote-http";
 const REMOTE_EVIDENCE_DELIVERY_TIMEOUT_MS = Number(
   process.env.REMOTE_EVIDENCE_DELIVERY_TIMEOUT_MS ?? 120_000,
 );
+const STALE_REMOTE_OWNER_ERROR =
+  "remote solver does not own this exact promise payload";
 
 export async function recordProgressiveWorkerEvidenceReceipt(
   db: DB,
@@ -302,6 +304,8 @@ export async function deliverNextProgressiveWorkerEvidence(
         !retryStoppedStorage &&
         !transientTransportFailure &&
         !transientResponseFailure) ||
+      (responseStatus === 403 &&
+        rejected?.error === STALE_REMOTE_OWNER_ERROR) ||
       importConflictIds.length > 0;
     await db.execute(sql`
       INSERT INTO progressive_worker_delivery_failures

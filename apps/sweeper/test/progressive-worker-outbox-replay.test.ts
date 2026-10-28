@@ -849,6 +849,36 @@ it("leaves another scope-closed rejection terminal after one explicit replay", a
   });
 });
 
+it("quarantines an exact stale remote-owner rejection instead of retrying forever", async () => {
+  await withFixture(async ({ connection, input }) => {
+    input.points = input.points.slice(0, 1);
+    input.expectedCount = 1;
+    await replayProgressiveWorkerOutbox(connection, input, { apply: true });
+    const fetcher = vi.fn<typeof fetch>(async () =>
+      Response.json(
+        { error: "remote solver does not own this exact promise payload" },
+        { status: 403 },
+      ),
+    );
+    await expect(
+      deliverNextProgressiveWorkerEvidence(connection, fetcher),
+    ).rejects.toThrow("remote solver does not own this exact promise payload");
+    const [failure] = await connection.execute(sql`
+      SELECT state, attempt_count, retry_after
+      FROM progressive_worker_delivery_failures
+      WHERE result_attempt_id=${input.points[0].resultAttemptId}::uuid`);
+    expect(failure).toEqual({
+      state: "conflict",
+      attempt_count: 6,
+      retry_after: null,
+    });
+    expect(
+      await deliverNextProgressiveWorkerEvidence(connection, fetcher),
+    ).toBe(false);
+    expect(fetcher).toHaveBeenCalledOnce();
+  });
+});
+
 it("refuses selection/count/manifest drift and the hub role before any mutation", async () => {
   await withFixture(async ({ connection, input }) => {
     const before = await snapshot(connection);
