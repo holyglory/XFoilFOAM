@@ -54,7 +54,7 @@ export function progressiveEvidenceWakeSql(
           AND (claim.claim_token IS NULL OR claim.claim_expires_at IS NOT NULL)
           ${
             ready
-              ? sql`AND (failure.sim_job_id IS NULL OR failure.retry_after <= clock_timestamp())
+              ? sql`AND (failure.sim_job_id IS NULL OR failure.retry_after IS NULL OR failure.retry_after <= clock_timestamp())
             AND (claim.claim_token IS NULL OR claim.claim_expires_at <= clock_timestamp())`
               : sql``
           }
