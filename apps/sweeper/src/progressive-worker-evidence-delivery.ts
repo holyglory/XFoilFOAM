@@ -11,7 +11,10 @@ import {
 import { sql } from "drizzle-orm";
 import { randomUUID } from "node:crypto";
 import { assertProgressiveWorkerEvidenceJob } from "./progressive-remote-jobs";
-import { progressiveDeliverySelectionSql } from "./progressive-delivery-selection";
+import {
+  progressiveDeliverySelectionSql,
+  progressiveTerminalScopeClosedDeliverySelectionSql,
+} from "./progressive-delivery-selection";
 import { recordInactiveStoppedPromise } from "./progressive-inactive-promise";
 import {
   progressiveStoppedStorageEligible,
@@ -110,15 +113,21 @@ export async function deliverNextProgressiveWorkerEvidence(
   await requeueStoppedProgressiveStorage(db, { retryStoppedStorage: true });
   const claimToken = randomUUID();
   const [pending] = await db.execute(
-    progressiveDeliverySelectionSql(
-      selection.preferActive === true,
-      claimToken,
-    ),
+    progressiveTerminalScopeClosedDeliverySelectionSql(claimToken),
   );
-  if (!pending) return false;
-  const executionId = String(pending.sim_job_id);
-  const sequence = Number(pending.sequence);
-  const report = pending.report as unknown as ProgressiveRemoteReport;
+  const [fallback] = pending
+    ? []
+    : await db.execute(
+        progressiveDeliverySelectionSql(
+          selection.preferActive === true,
+          claimToken,
+        ),
+      );
+  const selected = pending ?? fallback;
+  if (!selected) return false;
+  const executionId = String(selected.sim_job_id);
+  const sequence = Number(selected.sequence);
+  const report = selected.report as unknown as ProgressiveRemoteReport;
   let responseStatus: number | null = null;
   let importConflictIds: string[] = [];
   let stoppedStorage = false;
@@ -132,21 +141,21 @@ export async function deliverNextProgressiveWorkerEvidence(
       result: report.result!,
     });
     const envelope = verifyProgressiveRemoteExecution(
-      (pending.request_payload as Record<string, unknown>)
+      (selected.request_payload as Record<string, unknown>)
         .remoteProgressiveExecution,
       {
-        solverId: String(pending.remote_solver_registered_id),
-        promiseId: String(pending.promise_id),
+        solverId: String(selected.remote_solver_registered_id),
+        promiseId: String(selected.promise_id),
         executionId,
         contentSignature: report.assignmentSignature,
       },
     );
     const source = resolveProgressiveReportedPoint(report.result!, {
-      alpha: Number(pending.aoa_deg),
+      alpha: Number(selected.aoa_deg),
       caseSlug:
-        pending.engine_case_slug == null
+        selected.engine_case_slug == null
           ? null
-          : String(pending.engine_case_slug),
+          : String(selected.engine_case_slug),
       speed: envelope.request.speeds![0],
       chord: envelope.request.chord_lengths![0],
     });
@@ -156,27 +165,27 @@ export async function deliverNextProgressiveWorkerEvidence(
       report,
     });
     if (
-      source.contentSignature !== pending.point_content_signature ||
+      source.contentSignature !== selected.point_content_signature ||
       analysisContentHash(projection.evidencePayload) !==
-        analysisContentHash(pending.evidence_payload)
+        analysisContentHash(selected.evidence_payload)
     )
       throw new Error(
         "Worker evidence delivery differs from its immutable reported source",
       );
     const requestBody = JSON.stringify({
-      promiseId: pending.promise_id,
-      sourceInstanceId: pending.instance_id,
-      sourceInstanceName: pending.instance_name,
+      promiseId: selected.promise_id,
+      sourceInstanceId: selected.instance_id,
+      sourceInstanceName: selected.instance_name,
       results: [
         {
           aoaDeg: source.point.aoa_deg,
           engineJobId: executionId,
           engineCaseSlug: source.point.case_slug ?? null,
-          remoteResultId: pending.result_id,
-          remoteResultAttemptId: pending.result_attempt_id,
+          remoteResultId: selected.result_id,
+          remoteResultAttemptId: selected.result_attempt_id,
           progressiveEvidence: {
             sequence,
-            reportContentSignature: pending.report_signature,
+            reportContentSignature: selected.report_signature,
             pointContentSignature: source.contentSignature,
           },
         },
@@ -185,13 +194,13 @@ export async function deliverNextProgressiveWorkerEvidence(
     const post = (route: "polars" | "retained-progressive-evidence") =>
       fetchProgressiveRemote(
         fetcher,
-        `${canonicalRemoteHubBaseUrl(String(pending.upstream_base_url))}/${route}`,
+        `${canonicalRemoteHubBaseUrl(String(selected.upstream_base_url))}/${route}`,
         {
           method: "POST",
           headers: {
             "content-type": "application/json",
             "x-xfoilfoam-solver-token": String(
-              pending.remote_solver_auth_token,
+              selected.remote_solver_auth_token,
             ),
           },
           redirect: "error",
@@ -238,10 +247,10 @@ export async function deliverNextProgressiveWorkerEvidence(
           db,
           {
             executionId,
-            promiseId: String(pending.promise_id),
-            solverId: String(pending.remote_solver_registered_id),
-            upstreamBaseUrl: String(pending.upstream_base_url),
-            token: String(pending.remote_solver_auth_token),
+            promiseId: String(selected.promise_id),
+            solverId: String(selected.remote_solver_registered_id),
+            upstreamBaseUrl: String(selected.upstream_base_url),
+            token: String(selected.remote_solver_auth_token),
           },
           { status: response.status, error: rejected?.error },
         );
@@ -281,8 +290,8 @@ export async function deliverNextProgressiveWorkerEvidence(
     await recordProgressiveWorkerEvidenceReceipt(db, receipt, {
       executionId,
       pointContentSignature: source.contentSignature,
-      resultId: String(pending.result_id),
-      resultAttemptId: String(pending.result_attempt_id),
+      resultId: String(selected.result_id),
+      resultAttemptId: String(selected.result_attempt_id),
     });
     return true;
   } catch (error) {
@@ -306,7 +315,7 @@ export async function deliverNextProgressiveWorkerEvidence(
     await db.execute(sql`
       INSERT INTO progressive_worker_delivery_failures
         (sim_job_id, sequence, result_attempt_id, point_content_signature, state, attempt_count, retry_after, last_http_status, last_error, remote_conflict_ids)
-      VALUES (${executionId}::uuid, ${sequence}, ${pending.result_attempt_id}::uuid, ${pending.point_content_signature},
+      VALUES (${executionId}::uuid, ${sequence}, ${selected.result_attempt_id}::uuid, ${selected.point_content_signature},
         ${conflict ? "conflict" : "retry"}, 1, ${conflict ? sql`NULL` : sql`clock_timestamp() + interval '2 seconds'`},
         ${responseStatus}, ${error instanceof Error ? error.message : String(error)}, ${JSON.stringify(importConflictIds)}::jsonb)
       ON CONFLICT (sim_job_id, point_content_signature) DO UPDATE SET
@@ -319,7 +328,7 @@ export async function deliverNextProgressiveWorkerEvidence(
     await db.execute(sql`
       DELETE FROM progressive_worker_evidence_delivery_claims
       WHERE sim_job_id=${executionId}::uuid
-        AND point_content_signature=${pending.point_content_signature}
+        AND point_content_signature=${selected.point_content_signature}
         AND claim_token=${claimToken}::uuid
     `);
     throw error;
