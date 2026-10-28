@@ -348,10 +348,7 @@ export async function replayProgressiveWorkerOutbox(
         WHERE sim_job_id = ${input.executionId}::uuid AND point_content_signature = ${point.pointContentSignature}
         FOR UPDATE
       `);
-      const staleFailure =
-        failure &&
-        Number(failure.sequence) < point.sequence &&
-        failure.result_attempt_id !== point.resultAttemptId;
+      const staleFailure = failure && Number(failure.sequence) < point.sequence;
       const exactFailure =
         failure &&
         Number(failure.sequence) === point.sequence &&

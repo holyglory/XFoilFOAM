@@ -490,7 +490,7 @@ it("retargets one stale closed-scope failure to the newer final report", async (
     input.expectedCount = 1;
     const point = input.points[0];
     await connection.execute(sql`UPDATE progressive_worker_delivery_failures
-      SET sequence = 2, result_attempt_id = md5('stale-reported-attempt')::uuid
+      SET sequence = 2
       WHERE sim_job_id = ${input.executionId}::uuid
         AND point_content_signature = ${point.pointContentSignature}`);
     const beforeEvidence = await snapshot(
@@ -693,7 +693,7 @@ it.each([
   ],
   [
     "wrong failure sequence",
-    sql`UPDATE progressive_worker_delivery_failures SET sequence=2`,
+    sql`UPDATE progressive_worker_delivery_failures SET sequence=999`,
   ],
   [
     "wrong failure attempt",
