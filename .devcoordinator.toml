@@ -2459,6 +2459,12 @@ requires = ["types"]
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/progressive-remote-admission.test.ts", "test/progressive-remote-admission-lock.test.ts", "test/progressive-parallel-admission.test.ts"]
 
 [[test.progressive.check]]
+name = "remote-progress-policy"
+tier = "development"
+requires = ["types"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/progressive-remote-progress-policy.test.ts"]
+
+[[test.progressive.check]]
 name = "remote-archive-broker"
 tier = "development"
 requires = ["dependencies", "types"]
