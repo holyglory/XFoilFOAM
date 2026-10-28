@@ -39,18 +39,7 @@ export function progressiveEvidenceWakeSql(
           AND NOT EXISTS (SELECT 1 FROM progressive_worker_hub_receipts delivered
             WHERE delivered.sim_job_id = association.sim_job_id
               AND delivered.point_content_signature = association.point_content_signature)
-          AND (failure.sim_job_id IS NULL OR failure.state = 'retry' OR (
-            failure.state = 'conflict'
-            AND failure.last_error ILIKE '%progressive_scope_closed%'
-            AND EXISTS (
-              SELECT 1
-              FROM progressive_worker_reports terminal_report
-              WHERE terminal_report.sim_job_id = association.sim_job_id
-                AND terminal_report.acknowledged_at IS NOT NULL
-                AND terminal_report.report#>>'{stopProof,execution_stopped}' = 'true'
-                AND terminal_report.report#>>'{status,state}' IN ('completed', 'failed', 'cancelled')
-            )
-          ))
+          AND (failure.sim_job_id IS NULL OR failure.state = 'retry')
           AND (claim.claim_token IS NULL OR claim.claim_expires_at IS NOT NULL)
           ${
             ready
