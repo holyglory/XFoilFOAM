@@ -1,5 +1,42 @@
 schema = 2
 
+[test.worker-outbox-replay]
+timeout_seconds = 900
+
+[test.worker-outbox-replay.postgres]
+image = "postgres:16-alpine"
+database = "aerodb"
+user = "aerodb"
+
+[[test.worker-outbox-replay.check]]
+name = "workspace"
+tier = "development"
+command = ["/usr/bin/corepack", "pnpm", "install", "--frozen-lockfile", "--ignore-scripts"]
+
+[[test.worker-outbox-replay.check]]
+name = "schema"
+tier = "development"
+requires = ["workspace"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "migrate"]
+
+[[test.worker-outbox-replay.check]]
+name = "seed"
+tier = "development"
+requires = ["schema"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "seed"]
+
+[[test.worker-outbox-replay.check]]
+name = "types"
+tier = "development"
+requires = ["workspace"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "typecheck"]
+
+[[test.worker-outbox-replay.check]]
+name = "database-replay"
+tier = "development"
+requires = ["seed", "types"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/progressive-worker-outbox-replay.test.ts"]
+
 [test.precise-steady-low-mach]
 timeout_seconds = 2100
 env = { PYTHONPATH = "src:.", PYTHONDONTWRITEBYTECODE = "1" }
