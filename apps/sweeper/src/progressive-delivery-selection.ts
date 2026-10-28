@@ -14,6 +14,18 @@ export function progressiveDeliverySelectionSql(
       ])
     )
   )`;
+  const terminalScopeClosedFailure = sql`(
+    failure.state = 'conflict'
+    AND failure.last_error ILIKE '%progressive_scope_closed%'
+    AND EXISTS (
+      SELECT 1
+      FROM progressive_worker_reports terminal_report
+      WHERE terminal_report.sim_job_id = source.sim_job_id
+        AND terminal_report.acknowledged_at IS NOT NULL
+        AND terminal_report.report#>>'{stopProof,execution_stopped}' = 'true'
+        AND terminal_report.report#>>'{status,state}' IN ('completed', 'failed', 'cancelled')
+    )
+  )`;
   const points = sql`WITH outstanding_sources AS MATERIALIZED (
     SELECT source.*
     FROM progressive_worker_evidence_attempts source
@@ -25,7 +37,7 @@ export function progressiveDeliverySelectionSql(
   )
     SELECT source.sim_job_id, source.sequence, source.result_attempt_id,
       source.point_content_signature, report.created_at, attempt.aoa_deg,
-      COALESCE(${retryableFailure}, false) AS is_retry
+      COALESCE(${retryableFailure} OR ${terminalScopeClosedFailure}, false) AS is_retry
     FROM progressive_worker_reports report
     JOIN outstanding_sources source ON source.sim_job_id = report.sim_job_id AND source.sequence = report.sequence
     JOIN result_attempts attempt ON attempt.id = source.result_attempt_id AND attempt.sim_job_id = source.sim_job_id
@@ -40,8 +52,9 @@ export function progressiveDeliverySelectionSql(
       AND NOT EXISTS (SELECT 1 FROM progressive_worker_report_conflicts conflict
         WHERE conflict.sim_job_id = report.sim_job_id AND conflict.sequence = report.sequence)
       AND (claim.claim_token IS NULL OR claim.claim_expires_at <= clock_timestamp())
-      AND (failure.sim_job_id IS NULL OR (${retryableFailure}
-        AND (failure.retry_after IS NULL OR failure.retry_after <= clock_timestamp())))`;
+      AND (failure.sim_job_id IS NULL OR
+        ((${retryableFailure} OR ${terminalScopeClosedFailure})
+          AND (failure.retry_after IS NULL OR failure.retry_after <= clock_timestamp())))`;
   const candidate = (
     active: boolean,
     excludeActive = false,
