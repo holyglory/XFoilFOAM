@@ -5657,6 +5657,7 @@ export async function importPolarPush(
           ...entry.delivery,
           resultAttemptId: committed.attemptId,
           storageOnly: entry.storageOnly,
+          policy: entry.lateRuntime ? "runtime" : undefined,
         }),
       );
       if (committed.brokeredUploadId)

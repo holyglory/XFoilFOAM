@@ -39,6 +39,7 @@ export async function prepareProgressivePolarImport(
       receipt: Awaited<ReturnType<typeof readProgressiveRemoteEvidenceReceipt>>;
       projection: ReturnType<typeof progressiveRemotePointProjection>;
       storageOnly: boolean;
+      lateRuntime: boolean;
     }
   >();
   if (
@@ -96,6 +97,7 @@ export async function prepareProgressivePolarImport(
       receipt: await readProgressiveRemoteEvidenceReceipt(db, delivery),
       projection: progressiveRemotePointProjection(source),
       storageOnly: options.storageOnly === true,
+      lateRuntime: false,
     });
   }
   if (prepared.size && prepared.size !== payload.results.length)
@@ -110,7 +112,8 @@ export async function assertProgressivePolarImportScope(
   prepared: Awaited<ReturnType<typeof prepareProgressivePolarImport>>,
 ) {
   const publishable = new Set<number>();
-  for (const { source, receipt, delivery, storageOnly } of prepared.values()) {
+  for (const entry of prepared.values()) {
+    const { source, receipt, delivery, storageOnly } = entry;
     if (storageOnly || receipt?.storageOnly) {
       await assertStoppedProgressiveStorage(db, delivery);
       continue;
@@ -131,9 +134,32 @@ export async function assertProgressivePolarImportScope(
         ],
       );
     } catch (error) {
-      if (receipt && error instanceof ProgressiveCfdEvidenceScopeClosed)
-        continue;
-      throw error;
+      if (error instanceof ProgressiveCfdEvidenceScopeClosed) {
+        if (
+          !receipt &&
+          source.report.stopProof !== null &&
+          ["completed", "failed", "cancelled"].includes(
+            source.report.status.state,
+          )
+        ) {
+          owned = await assertProgressiveCfdEvidenceJob(
+            db,
+            source.report.executionId,
+            source.report.executionId,
+            [
+              {
+                alpha: source.point.aoa_deg,
+                speed: source.polar.speed,
+                chord: source.polar.chord,
+                solverActiveSeconds: source.point.solver_active_seconds,
+              },
+            ],
+            { policy: "runtime" },
+          );
+          entry.lateRuntime = true;
+        } else if (receipt) continue;
+        else throw error;
+      } else throw error;
     }
     if (!owned)
       throw new ProgressiveRemoteEvidenceConflict(

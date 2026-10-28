@@ -387,12 +387,14 @@ export async function assertProgressiveCfdEvidenceJob(
     chord: number;
     solverActiveSeconds?: number | null;
   }>,
+  options: { policy?: JobScopePolicy } = {},
 ) {
   return db.transaction(async (transaction) => {
     const scope = await lockJobScope(
       transaction as unknown as DB,
       simJobId,
       engineJobId,
+      { policy: options.policy },
     );
     if (scope && cases) {
       for (const item of cases) {
@@ -555,6 +557,7 @@ export async function recordProgressiveCfdEvidence(
     engineJobId: string;
     resultAttemptIds: string[];
     recoveryScope?: ProgressiveStorageEvidenceRecoveryScope;
+    policy?: JobScopePolicy;
   },
 ): Promise<{ progressive: boolean; linked: number; stopRequired: boolean }> {
   const ids = [...new Set(input.resultAttemptIds)];
@@ -569,7 +572,9 @@ export async function recordProgressiveCfdEvidence(
           input.recoveryScope,
           ids,
         )
-      : await lockJobScope(connection, input.simJobId, input.engineJobId);
+      : await lockJobScope(connection, input.simJobId, input.engineJobId, {
+          policy: input.policy,
+        });
     if (input.recoveryScope && input.engineJobId !== input.simJobId)
       throw new ProgressiveCfdEvidenceScopeClosed(
         "Historical progressive recovery requires exact engine ownership",

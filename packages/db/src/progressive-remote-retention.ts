@@ -35,7 +35,11 @@ export function terminalReportHasNoPhysicalEvidence(
 export function terminalReportNoPhysicalEvidenceSignatures(
   report: ProgressiveRemoteReport,
 ) {
-  if (!report.result || !["failed", "cancelled"].includes(report.result.state))
+  if (
+    !report.result ||
+    (!["failed", "cancelled"].includes(report.result.state) &&
+      !isFinalProgressiveRemoteReport(report))
+  )
     return new Set<string>();
   return new Set(
     progressiveReportedPointSources(report.result)
