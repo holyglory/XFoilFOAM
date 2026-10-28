@@ -9,7 +9,7 @@ COMPOSE_FILE="${COMPOSE_FILE:-$APP_DIR/docker-compose.deploy.yml}"
 COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-}"
 COMPOSE_OVERRIDE_FILE="${COMPOSE_OVERRIDE_FILE:-}"
 LOCK_FILE="${LOCK_FILE:-/tmp/airfoils-pro-deploy.lock}"
-MIGRATION_FILE="$APP_DIR/packages/db/migrations/0189_progressive_worker_report_job_order.sql"
+MIGRATION_FILE="${MIGRATION_FILE:-$APP_DIR/packages/db/migrations/0189_progressive_worker_report_job_order.sql}"
 MIGRATION_CREATED_AT=1793187421071
 INDEXES=(
   progressive_worker_reports_staging_job_order_idx
