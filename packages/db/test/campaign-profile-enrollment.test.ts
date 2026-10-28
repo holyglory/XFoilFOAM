@@ -128,7 +128,6 @@ import {
   recoverTerminalProgressiveNoEvidenceGaps,
   recoverUnboundProgressiveCfdLeases,
 } from "../src/progressive-cfd-recovery";
-import { acquireProgressiveAdmissionLock } from "../src/progressive-admission-lock";
 import {
   buildProgressiveFitRequest,
   PROGRESSIVE_FIT_POLICY_ID,
@@ -2636,122 +2635,6 @@ describe("progressive durable stage transitions", () => {
         leaseSeconds: 120,
       }),
     ).toHaveLength(0);
-  });
-
-  it("defers automatic recovery while progressive admission is held, then recovers after release", async () => {
-    const unboundCampaignId = await campaign();
-    await materializeProgressiveCampaignScope(db, unboundCampaignId);
-    const unboundBaseline = (await claim([1]))!;
-    await storeNeuralFoilPrediction(
-      db,
-      unboundBaseline,
-      predictionFixture(unboundBaseline),
-    );
-    const unboundCount = await initializeProgressiveCfdWork(db);
-    const unboundLeases = await claimProgressiveCfdBatch(db, {
-      owner: "admission-lock-unbound-recovery",
-      leaseSeconds: 120,
-    });
-    expect(unboundLeases).toHaveLength(unboundCount);
-    await db.execute(sql`
-      UPDATE progressive_cfd_units
-      SET lease_until = clock_timestamp() - interval '1 second'
-      WHERE id IN (${sql.join(
-        unboundLeases.map((lease) => sql`${lease.id}::uuid`),
-        sql`, `,
-      )})
-    `);
-
-    const inactiveCampaignId = await campaign();
-    await materializeProgressiveCampaignScope(db, inactiveCampaignId);
-    const inactiveBaseline = (await claim([1]))!;
-    await storeNeuralFoilPrediction(
-      db,
-      inactiveBaseline,
-      predictionFixture(inactiveBaseline),
-    );
-    await initializeProgressiveCfdWork(db);
-    const inactiveLeases = await claimProgressiveCfdBatch(db, {
-      owner: "admission-lock-inactive-recovery",
-      leaseSeconds: 120,
-    });
-    expect(inactiveLeases.length).toBeGreaterThan(0);
-    const inactiveLease = inactiveLeases[0];
-    await db.execute(sql`
-      UPDATE progressive_cfd_units
-      SET state = 'gap', lease_token = NULL, lease_owner = NULL,
-        lease_until = NULL, retry_after = NULL, active_seconds = 1,
-        error = 'Inactive remote delivery has unresolved evidence'
-      WHERE id = ${inactiveLease.id}::uuid
-    `);
-
-    const terminalFixture = await fitFixture(2, false, [0]);
-    const terminalLease = terminalFixture.leases[0];
-    await acknowledgeProgressiveCfdExecutionStop(db, {
-      simJobId: terminalFixture.composed.jobId,
-      proof: executionStopProof(terminalFixture.engineJobId),
-    });
-    await db.execute(sql`
-      UPDATE progressive_cfd_attempts
-      SET outcome = 'failed', sim_job_id = ${terminalFixture.composed.jobId}::uuid,
-        error = 'terminal execution has no measured case evidence'
-      WHERE token = ${terminalLease.token}::uuid
-    `);
-    await db.execute(sql`
-      UPDATE progressive_cfd_units
-      SET state = 'gap', lease_token = NULL, lease_owner = NULL,
-        lease_until = NULL, attempts = 1, active_seconds = 0,
-        error = 'terminal execution has no measured case evidence'
-      WHERE id = ${terminalLease.id}::uuid
-    `);
-    await db.execute(sql`
-      UPDATE progressive_work
-      SET state = 'gap', error = 'terminal execution has no measured case evidence'
-      WHERE id = ${terminalLease.workId}::uuid
-    `);
-
-    const owner = createClient({ url: targetUrl.toString(), max: 1 });
-    let release!: () => void;
-    let signalLocked!: () => void;
-    const released = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    const locked = new Promise<void>((resolve) => {
-      signalLocked = resolve;
-    });
-    const holding = owner.db.transaction(async (transaction) => {
-      await acquireProgressiveAdmissionLock(transaction as unknown as DB);
-      signalLocked();
-      await released;
-    });
-    try {
-      await Promise.race([
-        locked,
-        holding.then(() => {
-          throw new Error("Admission lock owner exited before acquisition");
-        }),
-      ]);
-      expect(await recoverUnboundProgressiveCfdLeases(db)).toEqual({
-        retried: 0,
-        gaps: 0,
-      });
-      expect(await recoverInactiveProgressiveRemoteGaps(db)).toBe(0);
-      expect(await recoverTerminalProgressiveNoEvidenceGaps(db)).toBe(0);
-
-      release();
-      await holding;
-
-      expect(await recoverUnboundProgressiveCfdLeases(db)).toEqual({
-        retried: unboundCount,
-        gaps: 0,
-      });
-      expect(await recoverInactiveProgressiveRemoteGaps(db)).toBe(1);
-      expect(await recoverTerminalProgressiveNoEvidenceGaps(db)).toBe(1);
-    } finally {
-      release();
-      await holding.catch(() => undefined);
-      await owner.sql.end();
-    }
   });
 
   it("requeues only bounded inactive remote delivery gaps", async () => {

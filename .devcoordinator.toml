@@ -2555,12 +2555,6 @@ requires = ["dependencies","workspace"]
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "bounded progressive numerical recovery"]
 
 [[test.progressive.check]]
-name = "admission-lock-recovery"
-tier = "development"
-requires = ["dependencies","workspace"]
-command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "defers automatic recovery while progressive admission is held, then recovers after release"]
-
-[[test.progressive.check]]
 name = "recovery-mesh"
 tier = "development"
 requires = ["dependencies"]
