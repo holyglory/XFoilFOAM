@@ -480,7 +480,16 @@ export async function claimProgressiveCfdUnit(
         (SELECT recovery.id FROM progressive_cfd_recovery_plans recovery WHERE recovery.unit_id = unit.id ORDER BY recovery.ordinal DESC LIMIT 1) AS recovery_plan_id,
         (${localStepPolicy}) AS local_step_policy_id,
         ${recoveryParent} AS recovery_parent_job_id,${publicationRecovery} AS publication_recovery,
-        ${effectiveBudget} - unit.active_seconds AS remaining_active_seconds,
+        CASE WHEN ${pendingBudgetExtension}
+          THEN LEAST(
+            ${effectiveBudget} - unit.active_seconds,
+            (SELECT extension.extension_seconds
+             FROM progressive_cfd_budget_extensions extension
+             WHERE extension.unit_id = unit.id AND extension.state = 'pending'
+             LIMIT 1)
+          )
+          ELSE ${effectiveBudget} - unit.active_seconds
+        END AS remaining_active_seconds,
         (SELECT extension.unit_id FROM progressive_cfd_budget_extensions extension
           WHERE extension.unit_id = unit.id AND extension.state = 'pending' LIMIT 1) AS budget_extension_id,
         (SELECT extension.source_result_attempt_id FROM progressive_cfd_budget_extensions extension
