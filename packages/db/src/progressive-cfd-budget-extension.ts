@@ -7,6 +7,10 @@ export const PROGRESSIVE_FAST_BUDGET_EXTENSION_POLICY =
 
 export const PROGRESSIVE_FAST_BUDGET_EXTENSION_SECONDS =
   PROGRESSIVE_COMPUTE_POLICY.fastBudgetExtensionSeconds;
+export const PROGRESSIVE_PRECISE_BUDGET_EXTENSION_SECONDS =
+  PROGRESSIVE_COMPUTE_POLICY.preciseInitialActiveSeconds;
+export const PROGRESSIVE_URANS_CONTINUATION_MAX_SECONDS =
+  PROGRESSIVE_PRECISE_BUDGET_EXTENSION_SECONDS;
 
 const PROGRESSIVE_FAST_BUDGET_RECOVERY_MAX_UNITS = 512;
 const PROGRESSIVE_FAST_BUDGET_RECOVERY_REASON =
@@ -46,7 +50,7 @@ export async function admitProgressiveCfdBudgetExtension(
   input: { unitId: string; attemptToken: string },
 ): Promise<boolean> {
   const [candidate] = await db.execute(sql`
-    SELECT unit.id, receipt.result_attempt_id, receipt.evidence_signature,
+    SELECT unit.id, work.stage, receipt.result_attempt_id, receipt.evidence_signature,
       raw.engine_job_id, raw.engine_case_slug
     FROM progressive_cfd_units unit
     JOIN progressive_work work ON work.id = unit.work_id
@@ -59,13 +63,18 @@ export async function admitProgressiveCfdBudgetExtension(
     JOIN result_attempts raw ON raw.id = receipt.result_attempt_id
       AND raw.sim_job_id = source_attempt.sim_job_id
     WHERE unit.id = ${input.unitId}::uuid
-      AND work.stage = 2 AND unit.purpose = 'initial'
+      AND (
+        (work.stage = 2 AND unit.purpose = 'initial'
+          AND raw.evidence_payload->>'fidelity' = 'urans_precalc')
+        OR
+        (work.stage = 3 AND unit.purpose = 'precise'
+          AND raw.evidence_payload->>'fidelity' = 'urans_full')
+      )
       AND generation.status = 'active'
       AND source_attempt.outcome IN ('running', 'failed')
       AND source_attempt.active_seconds > 0
       AND unit.attempts = 2
       AND unit.active_seconds >= unit.active_budget_seconds
-      AND raw.evidence_payload->>'fidelity' = 'urans_precalc'
       AND raw.engine_job_id IS NOT NULL
       AND raw.engine_case_slug IS NOT NULL
       AND (
@@ -82,6 +91,14 @@ export async function admitProgressiveCfdBudgetExtension(
     FOR UPDATE OF unit, source_attempt
   `);
   if (!candidate) return false;
+  const extensionSeconds =
+    Number(candidate.stage) === 3
+      ? PROGRESSIVE_PRECISE_BUDGET_EXTENSION_SECONDS
+      : PROGRESSIVE_FAST_BUDGET_EXTENSION_SECONDS;
+  const policyVersion =
+    Number(candidate.stage) === 3
+      ? "progressive-precise-budget-extension-v1"
+      : PROGRESSIVE_FAST_BUDGET_EXTENSION_POLICY;
   const [inserted] = await db.execute(sql`
     INSERT INTO progressive_cfd_budget_extensions
       (unit_id, source_attempt_token, source_result_attempt_id, source_evidence_signature,
@@ -89,8 +106,7 @@ export async function admitProgressiveCfdBudgetExtension(
     VALUES (${candidate.id}::uuid, ${input.attemptToken}::uuid,
       ${candidate.result_attempt_id}::uuid, ${candidate.evidence_signature},
       ${candidate.engine_job_id}, ${candidate.engine_case_slug},
-      ${PROGRESSIVE_FAST_BUDGET_EXTENSION_SECONDS},
-      ${PROGRESSIVE_FAST_BUDGET_EXTENSION_POLICY})
+      ${extensionSeconds}, ${policyVersion})
     ON CONFLICT (unit_id) DO NOTHING
     RETURNING unit_id
   `);

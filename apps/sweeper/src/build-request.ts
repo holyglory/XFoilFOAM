@@ -1,6 +1,7 @@
 import {
   gasThermodynamicsForMaterial,
   progressiveSolverIsTransient,
+  type ProgressiveSolverFamily,
   type Point,
 } from "@aerodb/core";
 import {
@@ -89,6 +90,9 @@ export function buildPolarRequest(opts: {
   /** Logical numerical implementation selected by the immutable setup.
    * Defaults only to the historical OpenCFD-v2406 compatibility path. */
   engineIdentity?: EngineIdentity;
+  /** Progressive recovery recipes may deliberately promote a steady setup to
+   * a transient solver without mutating the immutable setup snapshot. */
+  solverFamilyOverride?: ProgressiveSolverFamily;
 }): { request: PolarRequest; speed: number; nu: number } {
   const {
     airfoil,
@@ -100,7 +104,12 @@ export function buildPolarRequest(opts: {
     cpuSlots,
     speeds,
     engineIdentity,
+    solverFamilyOverride,
   } = opts;
+  const solverFamily = solverFamilyOverride ?? setup.solver.flowSolverFamily;
+  const timeCoordinate = solverFamilyOverride
+    ? undefined
+    : setup.solver.timeCoordinate;
   const cpuBudget =
     cpuSlots == null
       ? (setup.scheduling.cpuBudget ?? undefined)
@@ -110,13 +119,13 @@ export function buildPolarRequest(opts: {
   const nu = setup.flowState.kinematicViscosity;
   const speed = setup.flowState.speedMps;
   const compressible =
-    setup.solver.flowSolverFamily?.startsWith("rho") ?? false;
+    solverFamily?.startsWith("rho") ?? false;
   if (
-    setup.solver.timeCoordinate !== undefined &&
-    (!setup.solver.flowSolverFamily ||
+    timeCoordinate !== undefined &&
+    (!solverFamily ||
       progressiveSolverIsTransient(
-        setup.solver.flowSolverFamily,
-        setup.solver.timeCoordinate,
+        solverFamily,
+        timeCoordinate,
       ) !==
         (wave === 2))
   )
@@ -139,8 +148,8 @@ export function buildPolarRequest(opts: {
     span_chords: mesh.spanChords,
   });
   const request: PolarRequest = {
-    ...(setup.solver.flowSolverFamily === "rhoCentralFoam" &&
-    setup.solver.timeCoordinate === "local_pseudo_time_iterations" &&
+    ...(solverFamily === "rhoCentralFoam" &&
+    timeCoordinate === "local_pseudo_time_iterations" &&
     setup.solver.localTimeStepSmoothing != null
       ? { expected_local_time_step_version: 1 }
       : {}),
@@ -192,8 +201,8 @@ export function buildPolarRequest(opts: {
       ? { urans_precalc_mesh: meshBlock(setup.uransPrecalcMesh) }
       : {}),
     solver: {
-      ...(setup.solver.flowSolverFamily
-        ? { flow_solver_family: setup.solver.flowSolverFamily }
+      ...(solverFamily
+        ? { flow_solver_family: solverFamily }
         : {}),
       ...(compressible
         ? {
@@ -212,8 +221,8 @@ export function buildPolarRequest(opts: {
         viscosity_ratio: setup.boundary.viscosityRatio,
       },
       n_iterations: setup.solver.nIterations,
-      ...(setup.solver.flowSolverFamily === "rhoCentralFoam" &&
-      setup.solver.timeCoordinate === "local_pseudo_time_iterations" &&
+      ...(solverFamily === "rhoCentralFoam" &&
+      timeCoordinate === "local_pseudo_time_iterations" &&
       setup.solver.localTimeStepSmoothing != null
         ? { local_time_step_smoothing: setup.solver.localTimeStepSmoothing }
         : {}),

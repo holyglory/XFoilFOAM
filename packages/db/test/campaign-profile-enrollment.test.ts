@@ -38,6 +38,7 @@ import {
   evaluateGasState,
   materialPhysicsValues,
   parseCoordinates,
+  PROGRESSIVE_COMPUTE_POLICY,
   PRECISE_SOLVER_SELECTION_POLICY,
 } from "@aerodb/core";
 import { sourceAirModel } from "../../core/test/fixtures/source-air-model";
@@ -1676,27 +1677,77 @@ async function cfdEvidenceFixture(
   retryWithAllocations = false,
   prepared?: { campaignId: string; leases: ProgressiveCfdLease[] },
   physical: { mediumId?: string; chordM?: number } = {},
+  maximumUnits?: number,
 ) {
   const campaignId = prepared?.campaignId ?? await campaign("active", [speed, ...extraSpeeds], angles, physical);
   let retriedUnitId: string | undefined;
+  let generationId: string | undefined;
   if (!prepared) {
-  await materializeProgressiveCampaignScope(db, campaignId);
-  const baseline = (await claim([1]))!;
-  await storeNeuralFoilPrediction(db, baseline, predictionFixture(baseline));
-  for (let remaining = extraSpeeds.length; remaining > 0; remaining -= 1) {
-    const nextBaseline = (await claim([1]))!;
-    await storeNeuralFoilPrediction(
-      db,
-      nextBaseline,
-      predictionFixture(nextBaseline),
-    );
-  }
+  const materialized = await materializeProgressiveCampaignScope(
+    db,
+    campaignId,
+    undefined,
+    `cfd-evidence-fixture-${sequence}-${stage}`,
+  );
+  const [existingGeneration] = await db.execute(sql`
+    SELECT id FROM progressive_generations
+    WHERE campaign_id = ${campaignId}::uuid AND status = 'active'
+    ORDER BY created_at DESC, id DESC LIMIT 1
+  `);
+  generationId = materialized?.id ?? String(existingGeneration?.id);
   if (stage === 3) {
+    await db.execute(sql`
+      INSERT INTO progressive_work (generation_id, target_id, stage)
+      SELECT scope.generation_id, scope.target_id, stages.stage
+      FROM progressive_generation_targets scope
+      CROSS JOIN generate_series(1, 3) AS stages(stage)
+      WHERE scope.generation_id = ${generationId}::uuid
+      ON CONFLICT (generation_id, target_id, stage) DO NOTHING
+    `);
+    const [target] = await db.execute(sql`
+      SELECT scope.generation_id, target.physical->'geometry' AS geometry,
+        scope.recipes->'neuralfoil' AS recipe
+      FROM progressive_generation_targets scope
+      JOIN polar_analysis_targets target ON target.id = scope.target_id
+      WHERE scope.generation_id = ${generationId}::uuid AND target.airfoil_id = ${originalId}
+      ORDER BY scope.target_id LIMIT 1
+    `);
+    const baseline = (await claimProgressiveWork(db, {
+      owner: "isolated-test",
+      stages: [1],
+      leaseSeconds: 120,
+      baselineGroup: {
+        generationId: String(target.generation_id),
+        airfoilId: originalId,
+        geometry: target.geometry,
+        recipe: target.recipe,
+        maximumAngles: 32768,
+      },
+    }))!;
+    await storeNeuralFoilPrediction(db, baseline, predictionFixture(baseline));
+    await db.execute(sql`UPDATE progressive_generations SET stage = 2 WHERE id = ${generationId}::uuid`);
+    await initializeProgressiveCfdWork(db);
     await db.execute(sql`UPDATE progressive_work SET state = 'complete', completed_at = clock_timestamp()
-      WHERE generation_id = ${baseline.generationId} AND stage = 2`);
-    await db.execute(
-      sql`UPDATE progressive_generations SET stage = 3 WHERE id = ${baseline.generationId}`,
-    );
+      WHERE generation_id = ${generationId}::uuid AND stage = 2`);
+    await db.execute(sql`UPDATE progressive_cfd_units SET state = 'gap', attempts = GREATEST(attempts, 1),
+      lease_token = NULL, lease_owner = NULL, lease_until = NULL
+      WHERE work_id IN (SELECT id FROM progressive_work WHERE generation_id = ${generationId}::uuid AND stage = 2)`);
+    await db.execute(sql`UPDATE progressive_generations SET stage = 3 WHERE id = ${generationId}::uuid`);
+    await db.execute(sql`UPDATE progressive_generation_cohorts
+      SET stage = 3, status = 'active', updated_at = clock_timestamp()
+      WHERE generation_id = ${generationId}::uuid`);
+  } else {
+    const baseline = (await claim([1]))!;
+    generationId = baseline.generationId;
+    await storeNeuralFoilPrediction(db, baseline, predictionFixture(baseline));
+    for (let remaining = extraSpeeds.length; remaining > 0; remaining -= 1) {
+      const nextBaseline = (await claim([1]))!;
+      await storeNeuralFoilPrediction(
+        db,
+        nextBaseline,
+        predictionFixture(nextBaseline),
+      );
+    }
   }
   await initializeProgressiveCfdWork(db);
   if (retryWithAllocations) {
@@ -1712,12 +1763,26 @@ async function cfdEvidenceFixture(
       lease_owner = NULL, lease_until = NULL WHERE id = ${previous.id}`);
   }
   }
-  const leases = prepared?.leases ?? await claimProgressiveCfdBatch(db, {
-    owner: "evidence-fixture",
-    leaseSeconds: 120,
-    solverBudgetVersion: 2,
-    localTimeStepVersion: 1,
-  });
+  let leases: ProgressiveCfdLease[];
+  try {
+    leases = prepared?.leases ?? await claimProgressiveCfdBatch(db, {
+      owner: "evidence-fixture",
+      leaseSeconds: 120,
+      ...(maximumUnits == null ? {} : { maximumUnits }),
+      solverBudgetVersion: 2,
+      localTimeStepVersion: 1,
+    });
+  } catch (error) {
+    console.error(
+      "precise fixture claim failed",
+      error,
+      await db.execute(sql`SELECT work.stage,work.state AS work_state,unit.state,
+        unit.lease_token,unit.lease_owner,unit.lease_until,unit.purpose
+        FROM progressive_work work LEFT JOIN progressive_cfd_units unit ON unit.work_id=work.id
+        WHERE work.generation_id=${generationId}::uuid ORDER BY work.stage,unit.ordinal`),
+    );
+    throw error;
+  }
   const execution = await materializeProgressiveCfdExecution(db, leases[0]);
   const [pool] = await db
     .select()
@@ -1817,12 +1882,17 @@ async function fitFixture(
   stage: 2 | 3 = 2,
   extraCondition = false,
   angles = [-2, 0, 2],
+  maximumUnits?: number,
 ) {
   const fixture = await cfdEvidenceFixture(
     32.173 + (sequence + 1) / 100,
     stage,
     extraCondition ? [42.173 + (sequence + 1) / 100] : [],
     angles,
+    false,
+    undefined,
+    {},
+    maximumUnits,
   );
   const [prediction] = await db.execute(sql`
     SELECT id FROM neuralfoil_predictions WHERE target_id = ${fixture.leases[0].targetId}
@@ -6104,6 +6174,146 @@ describe("progressive execution stop and settlement", () => {
       { state: "claimed", claim_attempt_token: claimed!.token },
     ]);
   });
+
+  it("continues one bounded precise full-URANS case from settled wall-clock evidence", async () => {
+    const fixture = await fitFixture(3, false, [-2, 0, 2], 1);
+    const lease = fixture.leases[0];
+    const resultAttemptId = await fixture.save(
+      PROGRESSIVE_COMPUTE_POLICY.preciseInitialActiveSeconds,
+      "urans",
+      lease.alpha,
+      {
+        fidelity: "urans_full",
+        force_history: {
+          t: [0, 1],
+          cl: [0, 0],
+          cd: [0.02, 0.02],
+          cm: [0, 0],
+        },
+      },
+    );
+    await db
+      .update(resultAttempts)
+      .set({
+        engineJobId: fixture.engineJobId,
+        engineCaseSlug: "c0p1_u30/a0",
+        error: "URANS integration stopped by the wall-clock budget guard",
+        qualityWarnings: ["stopped by the wall-clock budget guard"],
+      })
+      .where(eq(resultAttempts.id, resultAttemptId));
+    await fixture.record([resultAttemptId]);
+    await db.execute(sql`UPDATE progressive_cfd_attempts
+      SET outcome = 'running', active_seconds = ${PROGRESSIVE_COMPUTE_POLICY.preciseInitialActiveSeconds},
+        finished_at = NULL, error = 'active compute budget exhausted'
+      WHERE token = ${lease.token}`);
+    await db.execute(sql`UPDATE progressive_cfd_units
+      SET attempts = 2, active_seconds = ${PROGRESSIVE_COMPUTE_POLICY.preciseInitialActiveSeconds},
+        state = 'blocked', lease_token = NULL, lease_owner = NULL, lease_until = NULL
+      WHERE id = ${lease.id}`);
+    await acknowledgeProgressiveCfdExecutionStop(db, {
+      simJobId: fixture.composed.jobId,
+      proof: executionStopProof(fixture.engineJobId),
+    });
+    await db
+      .update(simJobs)
+      .set({ status: "failed", ingestedAt: new Date() })
+      .where(eq(simJobs.id, fixture.composed.jobId));
+
+    expect(await settleProgressiveCfdExecution(db, fixture.composed.jobId)).toMatchObject({
+      complete: 0,
+      retry: 1,
+      gaps: 0,
+    });
+    expect(
+      await db.execute(sql`SELECT source_attempt_token, source_result_attempt_id, extension_seconds, state
+        FROM progressive_cfd_budget_extensions WHERE unit_id = ${lease.id}`),
+    ).toEqual([
+      {
+        source_attempt_token: lease.token,
+        source_result_attempt_id: resultAttemptId,
+        extension_seconds: PROGRESSIVE_COMPUTE_POLICY.preciseInitialActiveSeconds,
+        state: "pending",
+      },
+    ]);
+
+    const continuationLease = await claimProgressiveCfdUnit(db, {
+      owner: "precise-continuation-test",
+      leaseSeconds: 120,
+      solverBudgetVersion: 2,
+      localTimeStepVersion: 1,
+    });
+    expect(continuationLease).toMatchObject({
+      id: lease.id,
+      stage: 3,
+      remainingActiveSeconds:
+        PROGRESSIVE_COMPUTE_POLICY.preciseInitialActiveSeconds,
+      budgetExtension: {
+        sourceResultAttemptId: resultAttemptId,
+        engineJobId: fixture.engineJobId,
+        engineCaseSlug: "c0p1_u30/a0",
+        extensionSeconds:
+          PROGRESSIVE_COMPUTE_POLICY.preciseInitialActiveSeconds,
+      },
+    });
+
+    const [pool] = await db
+      .select()
+      .from(solverExecutionPools)
+      .where(
+        eq(
+          solverExecutionPools.solverImplementationId,
+          fixture.execution.revision.solverImplementationId!,
+        ),
+      )
+      .limit(1);
+    const [priorAdmission] = await db
+      .select({ enabled: sweeperState.enabled })
+      .from(sweeperState)
+      .where(eq(sweeperState.id, 1));
+    await db
+      .update(sweeperState)
+      .set({ enabled: true })
+      .where(eq(sweeperState.id, 1));
+    await db
+      .update(solverExecutionPools)
+      .set({ enabled: true })
+      .where(eq(solverExecutionPools.id, pool.id));
+    let composed: Awaited<ReturnType<typeof composeProgressiveCfdJob>>;
+    try {
+      composed = await composeProgressiveCfdJob(db, [continuationLease!], {
+        cpuSlots: 1,
+        meshRecoveryVersion: 1,
+        uransRecoveryVersion: 2,
+        solverBudgetVersion: 2,
+        localTimeStepVersion: 1,
+      });
+    } finally {
+      await db
+        .update(solverExecutionPools)
+        .set({ enabled: pool.enabled })
+        .where(eq(solverExecutionPools.id, pool.id));
+      await db
+        .update(sweeperState)
+        .set({ enabled: priorAdmission?.enabled ?? false })
+        .where(eq(sweeperState.id, 1));
+    }
+    expect(composed.request.continue_from).toEqual({
+      engine_job_id: fixture.engineJobId,
+      case_slug: "c0p1_u30/a0",
+    });
+    expect(composed.request.budget_override_s).toBe(
+      PROGRESSIVE_COMPUTE_POLICY.preciseInitialActiveSeconds,
+    );
+    expect(composed.request.expected_urans_recovery_version).toBe(2);
+    const [storedJob] = await db
+      .select({ parentJobId: simJobs.parentJobId, totalCases: simJobs.totalCases })
+      .from(simJobs)
+      .where(eq(simJobs.id, composed.jobId));
+    expect(storedJob).toEqual({
+      parentJobId: fixture.engineJobId,
+      totalCases: 1,
+    });
+  }, 120_000);
 
   it("reopens only settled FAST budget gaps with matching immutable URANS evidence", async () => {
     const fixture = await fitFixture(2, false, [-1, 0, 1]);

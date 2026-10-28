@@ -297,7 +297,9 @@ export async function claimProgressiveCfdUnit(
     const attemptAvailable = sql`unit.attempts < 4 AND (${ordinaryAttempts} < 2 OR ${progressiveCfdBoundedNoEvidenceRecoveryAvailableSql()} OR ${progressiveCfdCompletionRetryAvailableSql()} OR ${publicationRecovery} OR ${progressiveCfdMaterialDomainRecoveryAvailableSql("unit")} OR (${ordinaryAttempts} = 2
       AND work.stage = 3 AND unit.policy_version = ${PROGRESSIVE_COMPUTE_POLICY.version}
       AND ${progressiveCfdPreciseVerificationAvailableSql()}) OR (${ordinaryAttempts} = 2
-      AND work.stage = 2 AND unit.purpose = 'initial' AND ${pendingBudgetExtension}))`;
+      AND ((work.stage = 2 AND unit.purpose = 'initial')
+        OR (work.stage = 3 AND unit.purpose = 'precise'))
+      AND ${pendingBudgetExtension}))`;
     const targetFilter = input.sameTarget
       ? sql`generation.id = ${input.sameTarget.generationId} AND work.target_id = ${input.sameTarget.targetId}
           AND ${effectiveRecipe} = ${JSON.stringify(input.sameTarget.recipe)}::jsonb

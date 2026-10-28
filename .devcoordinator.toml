@@ -240,6 +240,24 @@ requires = ["seed"]
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "admits one exact saved-case FAST continuation"]
 
 [[test.cfd-source-geometry.check]]
+name = "progressive-precise-budget-continuation"
+tier = "development"
+requires = ["seed"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "continues one bounded precise full-URANS case from settled wall-clock evidence"]
+
+[[test.cfd-source-geometry.check]]
+name = "progressive-precise-execution-contract"
+tier = "development"
+requires = ["seed"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/engine-client", "exec", "vitest", "run", "test/progressive-execution.test.ts"]
+
+[[test.cfd-source-geometry.check]]
+name = "progressive-precise-types"
+tier = "development"
+requires = ["seed"]
+command = ["/bin/bash", "-euc", "/usr/bin/corepack pnpm --filter @aerodb/db typecheck && /usr/bin/corepack pnpm --filter @aerodb/engine-client typecheck && /usr/bin/corepack pnpm --filter @aerodb/sweeper typecheck"]
+
+[[test.cfd-source-geometry.check]]
 name = "progressive-fast-budget-recovery"
 tier = "development"
 requires = ["seed"]

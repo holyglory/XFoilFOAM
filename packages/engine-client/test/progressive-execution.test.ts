@@ -109,6 +109,53 @@ describe("shared progressive execution ownership", () => {
     });
   });
 
+  it("accepts one exact saved full-URANS continuation allocation", () => {
+    const { request, scope } = fixture();
+    const sourceResultAttemptId = randomUUID();
+    const sourceJobId = randomUUID();
+    const extensionId = randomUUID();
+    const unit = scope.units[0];
+    scope.stage = 3;
+    unit.activeBudgetSeconds = 43_200;
+    scope.units = [unit];
+    scope.tokens = [unit.token];
+    scope.continuation = {
+      extensionId,
+      sourceResultAttemptId,
+      engineJobId: sourceJobId,
+      engineCaseSlug: "c0p1_u30/a0",
+      extensionSeconds: 43_200,
+    };
+    request.aoa = { angles: [unit.alpha] };
+    request.resources = {
+      ...request.resources,
+      case_solver_allocations: [
+        { chord: 0.1, speed: 30, aoa_deg: unit.alpha, limit_seconds: 43_200 },
+      ],
+    };
+    request.solver = {
+      ...request.solver,
+      flow_solver_family: "rhoPimpleFoam",
+      force_transient: true,
+      urans_fidelity: "full",
+    };
+    request.expected_urans_recovery_version = 14;
+    request.continue_from = {
+      engine_job_id: sourceJobId,
+      case_slug: "c0p1_u30/a0",
+    };
+    request.budget_override_s = 43_200;
+    expect(validateProgressiveExecutionScope(request, scope)).toMatchObject({
+      continuation: {
+        extensionId,
+        sourceResultAttemptId,
+        engineJobId: sourceJobId,
+        extensionSeconds: 43_200,
+      },
+      units: [{ activeBudgetSeconds: 43_200 }],
+    });
+  });
+
   it("rejects a continuation without the durable URANS recovery capability", () => {
     const { request, scope } = fixture();
     const sourceResultAttemptId = randomUUID();
