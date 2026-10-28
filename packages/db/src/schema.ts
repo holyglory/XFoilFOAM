@@ -7468,6 +7468,33 @@ export const progressiveCfdAttempts = pgTable(
   }),
 );
 
+export const progressiveIngestionOwnershipRecoveries = pgTable(
+  "progressive_ingestion_ownership_recoveries",
+  {
+    attemptToken: uuid("attempt_token").primaryKey()
+      .references(() => progressiveCfdAttempts.token, { onDelete: "cascade" }),
+    unitId: uuid("unit_id").notNull()
+      .references(() => progressiveCfdUnits.id, { onDelete: "cascade" }),
+    simJobId: uuid("sim_job_id").notNull()
+      .references(() => simJobs.id, { onDelete: "cascade" }),
+    manifestSignature: text("manifest_signature").notNull(),
+    manifest: jsonb("manifest").$type<Record<string, unknown>>().notNull(),
+    priorState: jsonb("prior_state").$type<Record<string, unknown>>().notNull(),
+    restoredLeaseUntil: timestamp("restored_lease_until", { withTimezone: true }).notNull(),
+    restoredAt: timestamp("restored_at", { withTimezone: true }).notNull().default(sql`clock_timestamp()`),
+    databaseActor: text("database_actor").notNull().default(sql`current_user`),
+  },
+  (table) => ({
+    jobIdx: index("progressive_ingestion_ownership_recoveries_job_idx").on(table.simJobId, table.unitId),
+    signatureCheck: check("progressive_ingestion_ownership_recoveries_manifest_signature_check",
+      sql`${table.manifestSignature} ~ '^[a-f0-9]{64}$'`),
+    manifestCheck: check("progressive_ingestion_ownership_recoveries_manifest_check",
+      sql`jsonb_typeof(${table.manifest}) = 'object'`),
+    priorCheck: check("progressive_ingestion_ownership_recoveries_prior_state_check",
+      sql`jsonb_typeof(${table.priorState}) = 'object'`),
+  }),
+);
+
 export const progressiveCfdBudgetExtensions = pgTable(
   "progressive_cfd_budget_extensions",
   {

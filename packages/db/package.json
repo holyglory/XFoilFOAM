@@ -23,6 +23,7 @@
     "recover:progressive-fast-budget": "tsx src/recover-progressive-fast-budget.ts",
     "recover:progressive-completion-retries": "tsx src/recover-progressive-completion-retries.ts",
     "recover:progressive-stale-hz": "tsx src/recover-progressive-stale-hz.ts",
+    "recover:progressive-ingestion-ownership": "tsx src/recover-progressive-ingestion-ownership.ts",
     "reset": "tsx src/reset.ts && corepack pnpm run migrate && corepack pnpm run seed",
     "studio": "drizzle-kit studio",
     "test": "vitest run",

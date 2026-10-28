@@ -131,6 +131,7 @@ import {
 import { acquireProgressiveAdmissionLock } from "../src/progressive-admission-lock";
 import { requeueProgressiveCompletionRetries } from "../src/progressive-completion-retry";
 import { recoverStaleProgressiveRemoteDispatches } from "../src/progressive-remote-stale-recovery";
+import { recoverProgressiveIngestionOwnership } from "../src/progressive-ingestion-ownership-recovery";
 import {
   buildProgressiveFitRequest,
   PROGRESSIVE_FIT_POLICY_ID,
@@ -2839,7 +2840,7 @@ describe("progressive durable stage transitions", () => {
     expect(fixture.leases).toHaveLength(8);
     const executionId = fixture.composed.jobId;
     const rollback = new Error("Restore isolated terminal inventory recovery fixture");
-    await db.transaction(async (transaction) => {
+    await expect(db.transaction(async (transaction) => {
       const connection = transaction as unknown as DB;
       const [job] = await connection.select().from(simJobs).where(eq(simJobs.id, executionId));
       const solverId = randomUUID();
@@ -2987,8 +2988,105 @@ describe("progressive durable stage transitions", () => {
       expect(await recoverTerminalProgressiveNoEvidenceGaps(connection)).toBe(0);
       if (sources === "physical") {
         expect(await readOwnership()).toEqual(ownershipBefore);
-        expect(await assertProgressiveCfdEvidenceJob(connection, executionId, executionId)).toBe(true);
-        await expect(assertProgressiveCfdEvidenceJob(connection, executionId, randomUUID())).rejects.toThrow("ownership");
+        const previousRole = process.env.AIRFOILFOAM_DEPLOYMENT_ROLE;
+        process.env.AIRFOILFOAM_DEPLOYMENT_ROLE = "hub";
+        try {
+        if (state === "cancelled") {
+          const late = fixture.leases.find((lease) => lease.alpha === 10)!;
+          await expect(recoverProgressiveIngestionOwnership(connection, {
+            jobId: executionId, solverId, promiseId, unitIds: [late.id], expectedUnitCount: 1,
+          })).rejects.toThrow("stopped ingestion");
+          throw rollback;
+        }
+        const late = fixture.leases.find((lease) => lease.alpha === 10)!;
+        await connection.execute(sql`UPDATE progressive_cfd_units unit
+          SET error = 'Another execution owns these result cells; preparation deferred',
+              retry_after = clock_timestamp() + interval '1 minute'
+          FROM progressive_work work
+          WHERE unit.work_id = work.id AND work.generation_id = ${fixture.leases[0].generationId}::uuid
+            AND unit.aoa_deg = 10`);
+        const selection = {
+            jobId: executionId,
+            solverId,
+            promiseId,
+            unitIds: [late.id],
+            expectedUnitCount: 1,
+          };
+        await expect(recoverProgressiveIngestionOwnership(connection, {
+            ...selection,
+            solverId: randomUUID(),
+        })).rejects.toThrow("stored assignment");
+        const foreignJobId = randomUUID();
+          await connection.execute(sql`INSERT INTO sim_jobs
+            (id, airfoil_id, bc_ids, simulation_preset_revision_id, campaign_id, reference_chord_m, status)
+            SELECT ${foreignJobId}::uuid, airfoil_id, bc_ids, simulation_preset_revision_id,
+              campaign_id, reference_chord_m, 'pending' FROM sim_jobs WHERE id = ${executionId}::uuid`);
+        await connection.execute(sql`UPDATE results SET sim_job_id = ${foreignJobId}::uuid
+            WHERE sim_job_id = ${executionId}::uuid AND aoa_deg = 10`);
+          await connection.execute(sql`UPDATE progressive_cfd_attempts SET outcome = 'failed',
+            error = 'terminal execution has no measured case evidence'
+            WHERE token = ${late.token}::uuid`);
+          await connection.execute(sql`UPDATE progressive_cfd_units SET state = 'pending',
+            lease_token = NULL, lease_owner = NULL, lease_until = NULL,
+            error = 'Another execution owns these result cells; preparation deferred'
+            WHERE id = ${late.id}::uuid`);
+        await expect(recoverProgressiveIngestionOwnership(connection, selection)).rejects.toThrow("canonical result cell");
+          await connection.execute(sql`UPDATE results SET sim_job_id = ${executionId}::uuid
+            WHERE sim_job_id = ${foreignJobId}::uuid AND aoa_deg = 10`);
+        await connection.execute(sql`DELETE FROM sim_jobs WHERE id = ${foreignJobId}::uuid`);
+        const dryRun = await recoverProgressiveIngestionOwnership(connection, selection);
+          expect(dryRun.mode).toBe("dry-run");
+          expect(dryRun.restoredUnitIds).toEqual([]);
+          const rejectedInSavepoint = async (
+            mutate: (transaction: DB) => Promise<void>,
+            message: string,
+          ) => {
+            const savepointRollback = new Error("rollback recovery rejection fixture");
+            await expect(connection.transaction(async (raw) => {
+              const transaction = raw as unknown as DB;
+              await mutate(transaction);
+              await expect(recoverProgressiveIngestionOwnership(transaction, selection)).rejects.toThrow(message);
+              throw savepointRollback;
+            })).rejects.toBe(savepointRollback);
+          };
+          await rejectedInSavepoint(async (transaction) => {
+            await transaction.execute(sql`INSERT INTO progressive_cfd_attempts
+              (token, unit_id, owner, lease_until, outcome, execution_recipe_id)
+              SELECT ${randomUUID()}::uuid, unit_id, 'newer-owner', clock_timestamp() + interval '10 minutes',
+                'running', execution_recipe_id FROM progressive_cfd_attempts WHERE token = ${late.token}::uuid`);
+          }, "latest unleased");
+          await rejectedInSavepoint(async (transaction) => {
+            await transaction.execute(sql`DELETE FROM progressive_cfd_execution_stops
+              WHERE sim_job_id = ${executionId}::uuid`);
+          }, "physical stop");
+          await rejectedInSavepoint(async (transaction) => {
+            await transaction.execute(sql`UPDATE progressive_cfd_units SET state = 'leased',
+              lease_token = ${late.token}::uuid, lease_owner = 'competing-owner',
+              lease_until = clock_timestamp() + interval '10 minutes' WHERE id = ${late.id}::uuid`);
+          }, "latest unleased");
+          await rejectedInSavepoint(async (transaction) => {
+            await transaction.execute(sql`UPDATE progressive_cfd_units SET active_seconds = active_budget_seconds
+              WHERE id = ${late.id}::uuid`);
+          }, "budget");
+          await connection.execute(sql`UPDATE sim_jobs SET "polledAt" = clock_timestamp()
+            WHERE id = ${executionId}::uuid`);
+          const applied = await recoverProgressiveIngestionOwnership(connection, selection, {
+            apply: true,
+            manifest: dryRun.manifest,
+          });
+          expect(applied.restoredUnitIds).toEqual([late.id]);
+          expect(await recoverProgressiveIngestionOwnership(connection, selection, {
+            apply: true,
+            manifest: dryRun.manifest,
+          })).toMatchObject({ replayed: true, restoredUnitIds: [] });
+          await expect(recoverProgressiveIngestionOwnership(connection, {
+            ...selection,
+            unitIds: [fixture.leases.find((lease) => lease.alpha === 8)!.id],
+          }, { apply: true, manifest: dryRun.manifest })).rejects.toThrow("manifest");
+        } finally {
+          if (previousRole === undefined) delete process.env.AIRFOILFOAM_DEPLOYMENT_ROLE;
+          else process.env.AIRFOILFOAM_DEPLOYMENT_ROLE = previousRole;
+        }
         expect(await deliver(10)).toMatchObject({ executionId, storageOnly: false });
         expect(await readEvidence()).toEqual([{ sources: 8, receipts: 8, attempts: 8, linked: 8, published: 0 }]);
       } else {
@@ -3002,9 +3100,7 @@ describe("progressive durable stage transitions", () => {
             .toEqual(ownershipBefore.filter((unit) => unit.aoa_deg !== 10));
       }
       throw rollback;
-    }).catch((error) => {
-      if (error !== rollback) throw error;
-    });
+    })).rejects.toBe(rollback);
   }, 120_000);
 
   it("requeues one ordinary retry for stopped terminal executions with no measurable evidence", async () => {
