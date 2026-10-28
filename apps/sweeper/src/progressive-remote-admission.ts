@@ -362,7 +362,7 @@ export async function prepareProgressiveRemoteDispatch(
     if (error instanceof RemoteProgressiveAdmissionWait)
       return { kind: "waiting", reason: error.message };
     if (
-      ["55P03", "57014"].includes(String((error as { code?: unknown }).code)) ||
+      ["40P01", "55P03", "57014"].includes(String((error as { code?: unknown }).code)) ||
       (error instanceof Error && /lock timeout/i.test(error.message))
     )
       return {
