@@ -1331,6 +1331,13 @@
       "when": 1793187421071,
       "tag": "0189_progressive_worker_report_job_order",
       "breakpoints": true
+    },
+    {
+      "idx": 190,
+      "version": "7",
+      "when": 1793214000000,
+      "tag": "0190_progressive_precise_legacy_continuation",
+      "breakpoints": true
     }
   ]
 }

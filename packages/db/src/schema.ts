@@ -7410,7 +7410,7 @@ export const progressiveCfdUnits = pgTable(
     ),
     attemptsCheck: check(
       "progressive_cfd_units_attempts_check",
-      sql`${table.attempts} BETWEEN 0 AND 4`,
+      sql`${table.attempts} BETWEEN 0 AND 5`,
     ),
     leaseCheck: check(
       "progressive_cfd_units_check",

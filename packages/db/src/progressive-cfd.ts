@@ -294,12 +294,16 @@ export async function claimProgressiveCfdUnit(
       WHERE recovery.unit_id=unit.id AND recovery.attempts_before=unit.attempts AND unit.active_seconds>=recovery.active_seconds
         AND NOT EXISTS(SELECT 1 FROM progressive_publication_recovery_claims claimed WHERE claimed.unit_id=recovery.unit_id))`;
     const ordinaryAttempts = progressiveCfdOrdinaryAttemptCountSql();
-    const attemptAvailable = sql`unit.attempts < 4 AND (${ordinaryAttempts} < 2 OR ${progressiveCfdBoundedNoEvidenceRecoveryAvailableSql()} OR ${progressiveCfdCompletionRetryAvailableSql()} OR ${publicationRecovery} OR ${progressiveCfdMaterialDomainRecoveryAvailableSql("unit")} OR (${ordinaryAttempts} = 2
+    const attemptAvailable = sql`(
+      unit.attempts < 4 AND (${ordinaryAttempts} < 2 OR ${progressiveCfdBoundedNoEvidenceRecoveryAvailableSql()} OR ${progressiveCfdCompletionRetryAvailableSql()} OR ${publicationRecovery} OR ${progressiveCfdMaterialDomainRecoveryAvailableSql("unit")} OR (${ordinaryAttempts} = 2
       AND work.stage = 3 AND unit.policy_version = ${PROGRESSIVE_COMPUTE_POLICY.version}
       AND ${progressiveCfdPreciseVerificationAvailableSql()}) OR (${ordinaryAttempts} = 2
       AND ((work.stage = 2 AND unit.purpose = 'initial')
         OR (work.stage = 3 AND unit.purpose = 'precise'))
-      AND ${pendingBudgetExtension}))`;
+      AND ${pendingBudgetExtension}))
+      OR (work.stage = 3 AND unit.purpose = 'precise' AND unit.attempts < 5
+        AND ${pendingBudgetExtension})
+    )`;
     const targetFilter = input.sameTarget
       ? sql`generation.id = ${input.sameTarget.generationId} AND work.target_id = ${input.sameTarget.targetId}
           AND ${effectiveRecipe} = ${JSON.stringify(input.sameTarget.recipe)}::jsonb
