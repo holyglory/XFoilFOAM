@@ -130,6 +130,10 @@ export async function sealProgressiveGeneration(
   if (!input.scopeKey || !input.targets.length)
     throw new Error("A generation requires finite target scope");
   const benchmarkOnly = input.benchmarkOnly === true;
+  const stageValues = sql.join(
+    progressiveGenerationStages(benchmarkOnly).map((stage) => sql`${stage}`),
+    sql`,`,
+  );
   if (
     benchmarkOnly &&
     input.targets.some(
@@ -287,7 +291,7 @@ export async function sealProgressiveGeneration(
       await connection.execute(sql`
         INSERT INTO progressive_work (generation_id, target_id, stage)
         SELECT ${generation.id}, source.id, stage FROM jsonb_to_recordset(${inputRows}::jsonb) AS source(id text)
-        CROSS JOIN UNNEST(${progressiveGenerationStages(benchmarkOnly)}::smallint[]) stage
+        CROSS JOIN UNNEST(ARRAY[${stageValues}]::smallint[]) stage
       `);
     }
     await initializeProgressiveGenerationCohorts(connection, generation.id);
