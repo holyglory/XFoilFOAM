@@ -6976,6 +6976,7 @@ export const progressiveGenerations = pgTable(
       .references(() => simCampaignPlanRevisions.id),
     scopeKey: text("scope_key").notNull(),
     scopeSignature: text("scope_signature").notNull(),
+    benchmarkOnly: boolean("benchmark_only").notNull().default(false),
     stage: smallint("stage").notNull().default(1),
     status: text("status").notNull().default("active"),
     createdAt: timestamp("created_at", { withTimezone: true })

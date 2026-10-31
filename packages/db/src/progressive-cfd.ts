@@ -129,6 +129,7 @@ export async function initializeProgressiveCfdWork(
           WHERE generation.campaign_id = campaign.id AND generation.epoch_id = ${epoch.id}
             AND generation.plan_revision_id = campaign.current_plan_revision_id AND generation.status = 'active'
             AND work.stage IN (2, 3) AND work.stage = ${effectiveProgressiveStageSql()} AND work.state = 'pending'
+            AND (generation.benchmark_only = false OR work.stage = 2)
             AND NOT EXISTS (SELECT 1 FROM progressive_cfd_units unit WHERE unit.work_id = work.id)
         ) ORDER BY campaign.priority DESC, campaign."createdAt", campaign.id LIMIT 1 FOR UPDATE SKIP LOCKED
     `);
@@ -145,6 +146,7 @@ export async function initializeProgressiveCfdWork(
       WHERE generation.campaign_id = ${campaign.id} AND generation.epoch_id = ${epoch.id}
         AND generation.plan_revision_id = (SELECT current_plan_revision_id FROM sim_campaigns WHERE id = ${campaign.id})
         AND generation.status = 'active' AND work.stage IN (2, 3) AND work.stage = ${effectiveProgressiveStageSql()} AND work.state = 'pending'
+        AND (generation.benchmark_only = false OR work.stage = 2)
         AND NOT EXISTS (SELECT 1 FROM progressive_cfd_units unit WHERE unit.work_id = work.id)
         ORDER BY generation.created_at, generation.id, work.target_id LIMIT 8192 FOR UPDATE OF generation, work SKIP LOCKED
     `)) as unknown as WorkScope[];
@@ -357,6 +359,7 @@ export async function claimProgressiveCfdUnit(
             AND ${previousExecutionStopped}
             AND generation.plan_revision_id = campaign.current_plan_revision_id AND generation.status = 'active'
             AND work.stage = 2 AND work.stage = ${effectiveProgressiveStageSql()} AND work.state = 'pending'
+            AND (generation.benchmark_only = false OR work.stage = 2)
             AND ${progressiveCfdAdmissionSql("generation", sql`work.target_id`, true)}
             AND unit.state = 'pending' AND ${attemptAvailable} AND unit.active_seconds < ${effectiveBudget}
             AND (unit.retry_after IS NULL OR unit.retry_after <= clock_timestamp())
@@ -372,6 +375,7 @@ export async function claimProgressiveCfdUnit(
           AND ${previousExecutionStopped}
           AND generation.plan_revision_id = campaign.current_plan_revision_id AND generation.status = 'active'
           AND work.stage = ${effectiveProgressiveStageSql()} AND work.stage IN (2, 3) AND work.state = 'pending'
+          AND (generation.benchmark_only = false OR work.stage = 2)
           AND ${progressiveCfdAdmissionSql("generation", sql`work.target_id`, true)}
           AND unit.state = 'pending' AND ${attemptAvailable} AND unit.active_seconds < ${effectiveBudget}
           AND (unit.retry_after IS NULL OR unit.retry_after <= clock_timestamp())
@@ -407,6 +411,7 @@ export async function claimProgressiveCfdUnit(
           WHERE generation.campaign_id = ${campaign.id} AND generation.epoch_id = ${epoch.id}
             AND generation.plan_revision_id = (SELECT current_plan_revision_id FROM sim_campaigns WHERE id = ${campaign.id})
             AND generation.status = 'active' AND work.stage = 3
+            AND (generation.benchmark_only = false OR work.stage = 2)
             AND work.stage = ${effectiveProgressiveStageSql()} AND work.stage IN (2, 3) AND work.state = 'pending'
             AND ${preciseTargetReady}
             AND ${progressiveCfdAdmissionSql("generation", sql`work.target_id`, true)}
@@ -454,6 +459,7 @@ export async function claimProgressiveCfdUnit(
         AND ${previousExecutionStopped}
         AND generation.plan_revision_id = (SELECT current_plan_revision_id FROM sim_campaigns WHERE id = ${campaign.id})
         AND generation.status = 'active' AND work.stage = ${effectiveProgressiveStageSql()} AND work.stage IN (2, 3) AND work.state = 'pending'
+        AND (generation.benchmark_only = false OR work.stage = 2)
         AND (work.stage <> 3 OR ${preciseTargetReady})
         AND ${progressiveCfdAdmissionSql("generation", sql`work.target_id`, true)}
         AND unit.state = 'pending' AND ${attemptAvailable} AND unit.active_seconds < ${effectiveBudget}
@@ -694,6 +700,7 @@ export async function heartbeatProgressiveCfdUnit(
         AND generation.id = ${lease.generationId} AND generation.epoch_id = ${lease.epochId}
         AND generation.campaign_id = ${lease.campaignId} AND generation.plan_revision_id = ${campaign.current_plan_revision_id}
         AND generation.status = 'active' AND ${effectiveProgressiveStageSql()} = work.stage AND work.stage = ${lease.stage}
+      AND (generation.benchmark_only = false OR work.stage = 2)
         AND work.target_id = ${lease.targetId}
       FOR UPDATE OF generation, work, unit, attempt
     `);

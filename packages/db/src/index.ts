@@ -8,6 +8,8 @@ export * from "./analysis-target";
 export * from "./progressive-campaigns";
 export * from "./progressive-execution-policy";
 export * from "./progressive-materialization";
+export * from "./progressive-recipe-policy";
+export * from "./progressive-fast-v2-benchmark";
 export * from "./progressive-recipe-adoption";
 export { reuseInformativeProgressiveCfdEvidence } from "./progressive-cfd-reuse";
 export * from "./progressive-numerics-transition";

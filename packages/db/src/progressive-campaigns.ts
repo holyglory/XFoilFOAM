@@ -14,8 +14,15 @@ import {
   canonicalAnalysisJson,
   type AnalysisPhysical,
 } from "./analysis-target";
+import { PROGRESSIVE_BENCHMARK_PUBLICATION } from "./progressive-recipe-policy";
 
 export type ProgressiveStage = 1 | 2 | 3;
+
+export function progressiveGenerationStages(
+  benchmarkOnly: boolean,
+): [1, 2] | [1, 2, 3] {
+  return benchmarkOnly ? [1, 2] : [1, 2, 3];
+}
 export interface SealedPolarTarget {
   airfoilId: string;
   targetId: string;
@@ -117,10 +124,22 @@ export async function sealProgressiveGeneration(
     planRevisionId: string;
     scopeKey: string;
     targets: SealedPolarTarget[];
+    benchmarkOnly?: boolean;
   },
 ) {
   if (!input.scopeKey || !input.targets.length)
     throw new Error("A generation requires finite target scope");
+  const benchmarkOnly = input.benchmarkOnly === true;
+  if (
+    benchmarkOnly &&
+    input.targets.some(
+      (target) =>
+        target.recipes.fast.publication !== PROGRESSIVE_BENCHMARK_PUBLICATION,
+    )
+  )
+    throw new Error(
+      "Benchmark-only generations require a benchmark-only fast recipe",
+    );
   const orderedTargets = [...input.targets].sort((left, right) =>
     left.targetId.localeCompare(right.targetId),
   );
@@ -170,23 +189,29 @@ export async function sealProgressiveGeneration(
       throw new Error(
         "Campaign plan revision is no longer current for this campaign",
       );
-    const [existing] = await rows<{ id: string; scope_signature: string }>(
+    const [existing] = await rows<{
+      id: string;
+      scope_signature: string;
+      benchmark_only: boolean;
+    }>(
       connection,
       sql`
-      SELECT id, scope_signature FROM progressive_generations
+      SELECT id, scope_signature, benchmark_only FROM progressive_generations
       WHERE epoch_id = ${epochId} AND campaign_id = ${input.campaignId} AND scope_key = ${input.scopeKey}
     `,
     );
     if (existing) {
       if (existing.scope_signature !== scopeSignature)
         throw new Error("Sealed generation scope cannot change");
+      if (existing.benchmark_only !== benchmarkOnly)
+        throw new Error("Sealed generation benchmark mode cannot change");
       return { id: existing.id, epochId, replayed: true };
     }
     const [generation] = await rows<{ id: string }>(
       connection,
       sql`
-      INSERT INTO progressive_generations (epoch_id, campaign_id, plan_revision_id, scope_key, scope_signature)
-      VALUES (${epochId}, ${input.campaignId}, ${input.planRevisionId}, ${input.scopeKey}, ${scopeSignature}) RETURNING id
+      INSERT INTO progressive_generations (epoch_id, campaign_id, plan_revision_id, scope_key, scope_signature, benchmark_only)
+      VALUES (${epochId}, ${input.campaignId}, ${input.planRevisionId}, ${input.scopeKey}, ${scopeSignature}, ${benchmarkOnly}) RETURNING id
     `,
     );
     const sources = await rows<{
@@ -262,7 +287,7 @@ export async function sealProgressiveGeneration(
       await connection.execute(sql`
         INSERT INTO progressive_work (generation_id, target_id, stage)
         SELECT ${generation.id}, source.id, stage FROM jsonb_to_recordset(${inputRows}::jsonb) AS source(id text)
-        CROSS JOIN generate_series(1, 3) stage
+        CROSS JOIN UNNEST(${progressiveGenerationStages(benchmarkOnly)}::smallint[]) stage
       `);
     }
     await initializeProgressiveGenerationCohorts(connection, generation.id);
@@ -276,10 +301,13 @@ export async function sealProgressiveGeneration(
 
 export async function advanceGeneration(db: DB, generationId: string) {
   if (await advanceProgressiveGenerationCohorts(db, generationId)) return;
-  const [generation] = await rows<{ stage: ProgressiveStage }>(
+  const [generation] = await rows<{
+    stage: ProgressiveStage;
+    benchmark_only: boolean;
+  }>(
     db,
     sql`
-    SELECT stage FROM progressive_generations WHERE id = ${generationId} FOR UPDATE
+    SELECT stage, benchmark_only FROM progressive_generations WHERE id = ${generationId} FOR UPDATE
   `,
   );
   const [counts] = await rows<{ pending: number; gaps: number }>(
@@ -291,6 +319,14 @@ export async function advanceGeneration(db: DB, generationId: string) {
   `,
   );
   if (counts.pending > 0) return;
+  if (generation.benchmark_only && generation.stage >= 2) {
+    await db.execute(sql`
+      UPDATE progressive_generations SET status = ${counts.gaps ? "attention" : "complete"},
+        completed_at = CASE WHEN ${counts.gaps} = 0 THEN coalesce(completed_at, clock_timestamp()) ELSE NULL END
+      WHERE id = ${generationId}
+    `);
+    return;
+  }
   if (generation.stage < 3)
     await db.execute(
       sql`UPDATE progressive_generations SET stage = stage + 1 WHERE id = ${generationId}`,

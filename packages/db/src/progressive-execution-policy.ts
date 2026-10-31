@@ -223,9 +223,11 @@ export async function initializeProgressiveGenerationCohorts(db: DB, generationI
 
 export async function advanceProgressiveGenerationCohorts(db: DB, generationId: string) {
   const [generation] = await db.execute(sql`
-    SELECT generation.id, ${progressiveExecutionPolicySql()} AS cohort_policy
+    SELECT generation.id, generation.benchmark_only,
+      ${progressiveExecutionPolicySql()} AS cohort_policy
     FROM progressive_generations generation WHERE generation.id = ${generationId}::uuid FOR UPDATE
   `);
+  if (generation?.benchmark_only === true) return false;
   if (!generation?.cohort_policy) return false;
   const [baseline] = await db.execute(sql`
     SELECT EXISTS (SELECT 1 FROM progressive_work WHERE generation_id = ${generationId}::uuid

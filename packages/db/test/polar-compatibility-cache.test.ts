@@ -16,7 +16,16 @@ import {
   physicsHashForSnapshot,
   type SimulationSetupSnapshot,
 } from "../src/simulation-setup";
-import { progressiveRecipes } from "../src/progressive-materialization";
+import {
+  progressiveFastV2BenchmarkRecipes,
+  progressiveRecipes,
+} from "../src/progressive-materialization";
+import {
+  PROGRESSIVE_BENCHMARK_PUBLICATION,
+  PROGRESSIVE_FAST_V2_BENCHMARK_RECIPE_ID,
+  progressiveRecipeIsPublicationEligible,
+} from "../src/progressive-recipe-policy";
+import { canonicalAnalysisJson } from "../src/analysis-target";
 
 function candidate(
   id: string,
@@ -274,6 +283,70 @@ const snapshot: SimulationSetupSnapshot = {
 };
 
 describe("physics compatibility hash contract", () => {
+  it("creates a cheaper opt-in fast-v2 recipe without changing precise", () => {
+    const current = progressiveRecipes(snapshot, 0.2);
+    const benchmark = progressiveFastV2BenchmarkRecipes(snapshot, 0.2);
+
+    expect(benchmark.precise).toEqual(current.precise);
+    expect(canonicalAnalysisJson(benchmark.precise)).toBe(
+      canonicalAnalysisJson(current.precise),
+    );
+    expect(benchmark.fast).toMatchObject({
+      recipe_id: PROGRESSIVE_FAST_V2_BENCHMARK_RECIPE_ID,
+      publication: PROGRESSIVE_BENCHMARK_PUBLICATION,
+      mesh: {
+        nSurface: 64,
+        nRadial: 39,
+        nWake: 32,
+        farfieldRadiusChords: 12,
+        wakeLengthChords: 9,
+      },
+      solver: {
+        nIterations: 900,
+        convergenceTolerance: 2e-4,
+        momentumScheme: "upwind",
+        transientCycles: 6,
+      },
+    });
+    expect(benchmark.fast.mesh.nSurface).toBeLessThan(
+      current.fast.mesh.nSurface,
+    );
+    expect(benchmark.fast.mesh.nRadial).toBeLessThan(current.fast.mesh.nRadial);
+    expect(benchmark.fast.mesh.nWake).toBeLessThan(current.fast.mesh.nWake);
+    expect(benchmark.fast.solver.nIterations).toBeLessThan(
+      current.fast.solver.nIterations,
+    );
+  });
+
+  it("requires an explicitly selected low-Mach cohort for fast-v2", () => {
+    const highMach = structuredClone(snapshot);
+    highMach.derived.mach = 1;
+    expect(() =>
+      progressiveRecipes(highMach, 0.2, {
+        fastRecipeVariant: "fast-v2-benchmark",
+        benchmarkCohort: "low-mach",
+      }),
+    ).toThrow("low-Mach cohort");
+    expect(() =>
+      progressiveRecipes(snapshot, 0.2, {
+        fastRecipeVariant: "fast-v2-benchmark",
+        benchmarkCohort: "low-mach",
+      }),
+    ).not.toThrow();
+  });
+
+  it("keeps benchmark evidence out of publication inputs", () => {
+    const current = progressiveRecipes(snapshot, 0.2);
+    const benchmark = progressiveFastV2BenchmarkRecipes(snapshot, 0.2);
+
+    expect(progressiveRecipeIsPublicationEligible(current.fast)).toBe(true);
+    expect(progressiveRecipeIsPublicationEligible(current.precise)).toBe(true);
+    expect(progressiveRecipeIsPublicationEligible(benchmark.fast)).toBe(false);
+    expect(progressiveRecipeIsPublicationEligible(benchmark.precise)).toBe(
+      true,
+    );
+  });
+
   it("selects a guarded fast wall mesh while preserving precise and physical setup", () => {
     const original = structuredClone(snapshot);
     const normal = progressiveRecipes(snapshot, 0.2);

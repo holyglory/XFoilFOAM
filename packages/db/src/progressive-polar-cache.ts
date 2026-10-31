@@ -16,6 +16,7 @@ import {
   progressiveEvidencePreservesGeometry,
   SOURCE_GEOMETRY_POLICY_VERSION,
 } from "./progressive-evidence-geometry";
+import { PROGRESSIVE_BENCHMARK_PUBLICATION } from "./progressive-recipe-policy";
 
 export interface ProgressiveFitEvidence {
   attemptToken: string;
@@ -83,6 +84,7 @@ async function sourceForPrediction(
     FROM progressive_cfd_evidence receipt JOIN progressive_cfd_attempts attempt ON attempt.token = receipt.attempt_token
     JOIN progressive_cfd_units unit ON unit.id = attempt.unit_id JOIN progressive_work work ON work.id = unit.work_id
     JOIN progressive_generations generation ON generation.id = work.generation_id
+    JOIN progressive_generation_targets scope ON scope.generation_id = generation.id AND scope.target_id = work.target_id
     JOIN result_attempts result_attempt ON result_attempt.id = receipt.result_attempt_id
     LEFT JOIN result_classifications classification ON classification.result_attempt_id = result_attempt.id
     LEFT JOIN LATERAL (SELECT jsonb_build_object('id', verdict.id, 'verdict', verdict.verdict) AS payload
@@ -94,6 +96,8 @@ async function sourceForPrediction(
       FROM result_interpretations interpretation WHERE interpretation.result_attempt_id = result_attempt.id
       ORDER BY interpretation."createdAt" DESC, interpretation.id DESC LIMIT 1) interpretation ON true
     WHERE work.target_id = ${prediction.target_id} AND generation.epoch_id = ${prediction.epoch_id}
+      AND generation.benchmark_only = false
+      AND NOT (work.stage = 2 AND scope.recipes->'fast'->>'publication' = ${PROGRESSIVE_BENCHMARK_PUBLICATION})
     ORDER BY receipt.result_attempt_id LIMIT 257
   `);
   if (records.length > 256)
@@ -207,6 +211,8 @@ export async function claimProgressivePolarFit(
         JOIN progressive_cfd_units unit ON unit.id=attempt.unit_id
         JOIN progressive_work source_work ON source_work.id=unit.work_id
         JOIN progressive_generations generation ON generation.id=source_work.generation_id
+        JOIN progressive_generation_targets source_scope
+          ON source_scope.generation_id=generation.id AND source_scope.target_id=source_work.target_id
         ${
           input.currentCampaignEvidenceOnly
             ? sql`JOIN sim_campaigns campaign ON campaign.id=generation.campaign_id
@@ -215,10 +221,18 @@ export async function claimProgressivePolarFit(
             : sql``
         }
         WHERE generation.epoch_id=${epoch.id}
+          AND generation.benchmark_only = false
+          AND NOT (source_work.stage=2 AND source_scope.recipes->'fast'->>'publication' = ${PROGRESSIVE_BENCHMARK_PUBLICATION})
           ${input.currentCampaignEvidenceOnly ? sql`AND generation.status<>'cancelled'` : sql``}
         UNION
         SELECT DISTINCT successor_work.target_id
         FROM progressive_cfd_evidence_reuses reuse
+        JOIN progressive_cfd_attempts source_attempt ON source_attempt.token=reuse.source_attempt_token
+        JOIN progressive_cfd_units source_unit ON source_unit.id=source_attempt.unit_id
+        JOIN progressive_work source_work ON source_work.id=source_unit.work_id
+        JOIN progressive_generations source_generation ON source_generation.id=source_work.generation_id
+        JOIN progressive_generation_targets source_scope
+          ON source_scope.generation_id=source_generation.id AND source_scope.target_id=source_work.target_id
         JOIN progressive_cfd_units successor ON successor.id=reuse.successor_unit_id
         JOIN progressive_work successor_work ON successor_work.id=successor.work_id
         JOIN progressive_generations successor_generation
@@ -227,6 +241,9 @@ export async function claimProgressivePolarFit(
           ON successor_campaign.id=successor_generation.campaign_id
         WHERE successor_generation.epoch_id=${epoch.id}
           AND successor_generation.status<>'cancelled'
+          AND successor_generation.benchmark_only = false
+          AND source_generation.benchmark_only = false
+          AND NOT (source_work.stage=2 AND source_scope.recipes->'fast'->>'publication' = ${PROGRESSIVE_BENCHMARK_PUBLICATION})
           ${
             input.currentCampaignEvidenceOnly
               ? sql`AND successor_campaign.current_plan_revision_id=successor_generation.plan_revision_id

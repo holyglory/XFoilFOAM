@@ -1317,6 +1317,13 @@
       "when": 1792383717716,
       "tag": "0187_progressive_material_domain_recovery",
       "breakpoints": true
+    },
+    {
+      "idx": 188,
+      "version": "7",
+      "when": 1792383717717,
+      "tag": "0188_progressive_benchmark_generations",
+      "breakpoints": true
     }
   ]
 }

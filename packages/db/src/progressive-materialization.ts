@@ -19,12 +19,27 @@ import {
   sealProgressiveGeneration,
   type SealedPolarTarget,
 } from "./progressive-campaigns";
+import {
+  isLowMachBenchmarkMach,
+  PROGRESSIVE_BENCHMARK_PUBLICATION,
+  PROGRESSIVE_FAST_V2_BENCHMARK_RECIPE_ID,
+  type ProgressiveRecipeOptions,
+} from "./progressive-recipe-policy";
 import type { SimulationSetupSnapshot } from "./simulation-setup";
 
 export function progressiveRecipes(
   snapshot: SimulationSetupSnapshot,
   maximumConcaveCurvature: number | null = null,
+  options: ProgressiveRecipeOptions = {},
 ): SealedPolarTarget["recipes"] {
+  if (
+    options.fastRecipeVariant === "fast-v2-benchmark" &&
+    (options.benchmarkCohort !== "low-mach" ||
+      !isLowMachBenchmarkMach(snapshot.derived.mach))
+  )
+    throw new Error(
+      "Fast-v2 benchmark recipes require the explicit low-Mach cohort (0 <= Mach < 1)",
+    );
   if (snapshot.solver.turbulenceModel !== "kOmegaSST")
     throw new Error(
       "Progressive recipe requires an explicit transition policy for this turbulence model",
@@ -57,6 +72,101 @@ export function progressiveRecipes(
     maximumConcaveCurvature,
   );
   const usesWallFunction = wallSpacing.selection === "wall_function";
+  const currentFast = {
+    ...common,
+    ...(densityFarfield
+      ? { compressibleFarfieldBoundary: "density_static_freestream" }
+      : {}),
+    recipe_id: localDensity
+      ? localTimeStepSmoothing != null && localTimeStepSmoothing !== 0.02
+        ? "openfoam-fast-density-local-v2"
+        : "openfoam-fast-density-local-v1"
+      : usesWallFunction
+        ? "openfoam-fast-wall-v2"
+        : "openfoam-fast-v1",
+    ...(!localDensity ? { wallSpacing } : {}),
+    ...(localDensity ? { timeCoordinate: "local_pseudo_time_iterations" } : {}),
+    mesh: {
+      ...mesh,
+      targetYPlus: localDensity ? 40 : wallSpacing.targetYPlus,
+      nSurface: Math.min(
+        mesh.nSurface,
+        Math.max(80, Math.floor(mesh.nSurface * 0.65)),
+      ),
+      nRadial: Math.min(
+        mesh.nRadial,
+        Math.max(40, Math.floor(mesh.nRadial * 0.65)),
+      ),
+      nWake: Math.min(mesh.nWake, Math.max(40, Math.floor(mesh.nWake * 0.65))),
+    },
+    solver: {
+      ...solver,
+      ...(localDensity && localTimeStepSmoothing != null
+        ? { localTimeStepSmoothing }
+        : {}),
+      nIterations: localDensity ? 5000 : Math.min(solver.nIterations, 1500),
+      ...(localDensity ? { momentumScheme: "upwind" } : {}),
+      convergenceTolerance: Math.max(solver.convergenceTolerance, 1e-4),
+    },
+  };
+  const precise = {
+    ...common,
+    selectionPolicy: PRECISE_SOLVER_SELECTION_POLICY,
+    ...(densityFarfield
+      ? { compressibleFarfieldBoundary: "density_static_freestream" }
+      : {}),
+    recipe_id:
+      !localDensity && usesWallFunction
+        ? "openfoam-precise-wall-v2"
+        : "openfoam-precise-v1",
+    ...(!localDensity ? { wallSpacing } : {}),
+    mesh: {
+      ...mesh,
+      ...(!localDensity ? { targetYPlus: wallSpacing.targetYPlus } : {}),
+    },
+    solver,
+  };
+  const fast =
+    options.fastRecipeVariant === "fast-v2-benchmark"
+      ? {
+          ...currentFast,
+          recipe_id: PROGRESSIVE_FAST_V2_BENCHMARK_RECIPE_ID,
+          publication: PROGRESSIVE_BENCHMARK_PUBLICATION,
+          mesh: {
+            ...currentFast.mesh,
+            farfieldRadiusChords: Math.min(
+              currentFast.mesh.farfieldRadiusChords,
+              Math.max(10, currentFast.mesh.farfieldRadiusChords * 0.8),
+            ),
+            wakeLengthChords: Math.min(
+              currentFast.mesh.wakeLengthChords,
+              Math.max(8, currentFast.mesh.wakeLengthChords * 0.75),
+            ),
+            nSurface: Math.min(
+              currentFast.mesh.nSurface,
+              Math.max(64, Math.floor(currentFast.mesh.nSurface * 0.75)),
+            ),
+            nRadial: Math.min(
+              currentFast.mesh.nRadial,
+              Math.max(32, Math.floor(currentFast.mesh.nRadial * 0.75)),
+            ),
+            nWake: Math.min(
+              currentFast.mesh.nWake,
+              Math.max(32, Math.floor(currentFast.mesh.nWake * 0.75)),
+            ),
+          },
+          solver: {
+            ...currentFast.solver,
+            nIterations: Math.min(currentFast.solver.nIterations, 900),
+            convergenceTolerance: Math.max(
+              currentFast.solver.convergenceTolerance,
+              2e-4,
+            ),
+            momentumScheme: "upwind",
+            transientCycles: Math.min(currentFast.solver.transientCycles, 6),
+          },
+        }
+      : currentFast;
   return {
     neuralfoil: {
       recipe_id: "neuralfoil-prior-v1",
@@ -64,66 +174,19 @@ export function progressiveRecipes(
       maximum_geometry_rms: 0.003,
       maximum_geometry_error: 0.012,
     },
-    fast: {
-      ...common,
-      ...(densityFarfield
-        ? { compressibleFarfieldBoundary: "density_static_freestream" }
-        : {}),
-      recipe_id: localDensity
-        ? localTimeStepSmoothing != null && localTimeStepSmoothing !== 0.02
-          ? "openfoam-fast-density-local-v2"
-          : "openfoam-fast-density-local-v1"
-        : usesWallFunction
-          ? "openfoam-fast-wall-v2"
-          : "openfoam-fast-v1",
-      ...(!localDensity ? { wallSpacing } : {}),
-      ...(localDensity
-        ? { timeCoordinate: "local_pseudo_time_iterations" }
-        : {}),
-      mesh: {
-        ...mesh,
-        targetYPlus: localDensity ? 40 : wallSpacing.targetYPlus,
-        nSurface: Math.min(
-          mesh.nSurface,
-          Math.max(80, Math.floor(mesh.nSurface * 0.65)),
-        ),
-        nRadial: Math.min(
-          mesh.nRadial,
-          Math.max(40, Math.floor(mesh.nRadial * 0.65)),
-        ),
-        nWake: Math.min(
-          mesh.nWake,
-          Math.max(40, Math.floor(mesh.nWake * 0.65)),
-        ),
-      },
-      solver: {
-        ...solver,
-        ...(localDensity && localTimeStepSmoothing != null
-          ? { localTimeStepSmoothing }
-          : {}),
-        nIterations: localDensity ? 5000 : Math.min(solver.nIterations, 1500),
-        ...(localDensity ? { momentumScheme: "upwind" } : {}),
-        convergenceTolerance: Math.max(solver.convergenceTolerance, 1e-4),
-      },
-    },
-    precise: {
-      ...common,
-      selectionPolicy: PRECISE_SOLVER_SELECTION_POLICY,
-      ...(densityFarfield
-        ? { compressibleFarfieldBoundary: "density_static_freestream" }
-        : {}),
-      recipe_id:
-        !localDensity && usesWallFunction
-          ? "openfoam-precise-wall-v2"
-          : "openfoam-precise-v1",
-      ...(!localDensity ? { wallSpacing } : {}),
-      mesh: {
-        ...mesh,
-        ...(!localDensity ? { targetYPlus: wallSpacing.targetYPlus } : {}),
-      },
-      solver,
-    },
+    fast,
+    precise,
   };
+}
+
+export function progressiveFastV2BenchmarkRecipes(
+  snapshot: SimulationSetupSnapshot,
+  maximumConcaveCurvature: number | null = null,
+): SealedPolarTarget["recipes"] {
+  return progressiveRecipes(snapshot, maximumConcaveCurvature, {
+    fastRecipeVariant: "fast-v2-benchmark",
+    benchmarkCohort: "low-mach",
+  });
 }
 
 export async function materializeProgressiveCampaignScope(

@@ -1213,6 +1213,59 @@ newly admitted jobs.
 accepted points per hour, solver seconds per accepted point, CPU utilization,
 and failure dispositions before adopting a higher value.
 
+The backend also exposes an opt-in `progressiveFastV2BenchmarkRecipes` helper
+from `@aerodb/db`. It accepts one immutable setup snapshot and an optional
+curvature value, and it only succeeds when the snapshot Mach number is in the
+existing low cohort (`0 <= Mach < 1`). It returns the current NeuralFoil and
+precise recipes unchanged while applying a smaller mesh, fewer fast iterations,
+looser fast tolerance, and upwind momentum to the benchmark fast recipe. The
+fast recipe carries `publication: "benchmark_only"`; evidence from that recipe
+is excluded from fitted public polar inputs, so it cannot silently replace a
+published curve. The normal `progressiveRecipes` and campaign materialization
+path continue to select the current fast recipe.
+
+An isolated benchmark runner can invoke it as follows:
+
+```ts
+import { progressiveFastV2BenchmarkRecipes } from "@aerodb/db";
+
+const recipes = progressiveFastV2BenchmarkRecipes(snapshot, curvature);
+```
+
+For a concrete isolated launch, select no more than 32 profiles and conditions
+from an existing campaign. The command creates a separate idempotent benchmark
+campaign with two benchmark-only generations: current fast and fast-v2. It
+requires reusable NeuralFoil baselines, creates stage 1 and stage 2 work only,
+and refuses any precise stage or precise job:
+
+```sh
+corepack pnpm --filter @aerodb/db benchmark:fast-v2 -- \
+  --launch \
+  --benchmark-id low-mach-fast-v2-2026-01 \
+  --source-campaign-id CAMPAIGN_UUID \
+  --profile-id PROFILE_UUID_1 --profile-id PROFILE_UUID_2 \
+  --condition-id CONDITION_UUID_1 --condition-id CONDITION_UUID_2 \
+  --output /tmp/low-mach-fast-v2-launch.json
+```
+
+It reads the source snapshots and angle intent, rejects Mach 1 or higher, and
+does not alter the source campaign or its precise jobs. The output includes the
+new benchmark campaign id and a live report. Poll the real stored active
+seconds, accepted evidence rate, and coefficient deltas later with:
+
+```sh
+corepack pnpm --filter @aerodb/db benchmark:fast-v2 -- \
+  --report \
+  --benchmark-campaign-id BENCHMARK_CAMPAIGN_UUID \
+  --output /tmp/low-mach-fast-v2-report.json
+```
+
+The report uses accumulated solver active seconds and accepted stored evidence
+for each angle, then compares matching current-fast and fast-v2 coefficients.
+Missing angles remain unavailable; no interpolation is used for the comparison.
+Both benchmark generations are excluded from public polar fitting, and report
+files are created with exclusive mode so an existing artifact is never overwritten.
+
 ## Catalog growth and lifecycle
 
 Database-owned enrollment detects public/admin uploads, bulk imports, sync and
@@ -1633,10 +1686,10 @@ observations, without changing their coefficients or accepted classifications.
 Its multipliers remain `[1, 1, 1]`, chosen before this transfer study. Each
 reference's entire job and unit lineage are excluded from its prediction.
 
-| Cohort | Mean absolute Cl error, baseline → candidate | Mean absolute Cd error, baseline → candidate | Mean absolute Cm error, baseline → candidate |
-| --- | --- | --- | --- |
-| Seven compressible profiles | 0.08711 → 0.08896 | 0.01897 → 0.00615 | 0.02477 → 0.02341 |
-| Twenty low-speed controls | 0.10328 → 0.09385 | 0.03174 → 0.00657 | 0.03156 → 0.02105 |
+| Cohort                      | Mean absolute Cl error, baseline → candidate | Mean absolute Cd error, baseline → candidate | Mean absolute Cm error, baseline → candidate |
+| --------------------------- | -------------------------------------------- | -------------------------------------------- | -------------------------------------------- |
+| Seven compressible profiles | 0.08711 → 0.08896                            | 0.01897 → 0.00615                            | 0.02477 → 0.02341                            |
+| Twenty low-speed controls   | 0.10328 → 0.09385                            | 0.03174 → 0.00657                            | 0.03156 → 0.02105                            |
 
 With the unchanged 1.96 interval multiplier, all seven compressible and twenty
 control profiles fall inside the candidate intervals, compared with six and
