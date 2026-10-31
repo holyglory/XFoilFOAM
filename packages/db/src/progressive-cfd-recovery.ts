@@ -12,7 +12,7 @@ import {
   progressiveCfdCompletionRetryAvailableSql,
   progressiveCfdPreciseVerificationAvailableSql,
 } from "./progressive-attempt-budget";
-import { acquireProgressiveAdmissionLock } from "./progressive-admission-lock";
+import { tryProgressiveAdmissionLock } from "./progressive-admission-lock";
 import { STALE_HZ_RESET_REASON } from "./progressive-remote-stale-recovery";
 import {
   progressiveCfdBudgetExtensionPendingSql,
@@ -44,7 +44,7 @@ export async function recoverUnboundProgressiveCfdLeases(
   return db.transaction(async (transaction) => {
     const connection = transaction as unknown as DB;
     const receipt = { retried: 0, gaps: 0 };
-    await acquireProgressiveAdmissionLock(connection);
+    if (!(await tryProgressiveAdmissionLock(connection))) return receipt;
     const [epoch] = await connection.execute(
       sql`SELECT id FROM calculation_epochs WHERE current FOR SHARE`,
     );
@@ -102,7 +102,7 @@ export async function recoverInactiveProgressiveRemoteGaps(
 ): Promise<number> {
   return db.transaction(async (transaction) => {
     const connection = transaction as unknown as DB;
-    await acquireProgressiveAdmissionLock(connection);
+    if (!(await tryProgressiveAdmissionLock(connection))) return 0;
     const [epoch] = await connection.execute(
       sql`SELECT id FROM calculation_epochs WHERE current FOR SHARE`,
     );
@@ -166,7 +166,7 @@ export async function recoverTerminalProgressiveNoEvidenceGaps(
 ): Promise<number> {
   return db.transaction(async (transaction) => {
     const connection = transaction as unknown as DB;
-    await acquireProgressiveAdmissionLock(connection);
+    if (!(await tryProgressiveAdmissionLock(connection))) return 0;
     const [epoch] = await connection.execute(
       sql`SELECT id FROM calculation_epochs WHERE current FOR SHARE`,
     );
@@ -196,6 +196,49 @@ export async function recoverTerminalProgressiveNoEvidenceGaps(
           AND NOT EXISTS (
             SELECT 1 FROM progressive_cfd_evidence evidence
             WHERE evidence.attempt_token = attempt.token
+          )
+          AND NOT EXISTS (
+            SELECT 1
+            FROM progressive_remote_dispatches dispatch
+            JOIN LATERAL (
+              SELECT report.sequence, report.content_signature, report.report
+              FROM progressive_remote_reports report
+              WHERE report.sim_job_id = dispatch.sim_job_id
+              ORDER BY report.sequence DESC LIMIT 1
+            ) latest ON true
+            JOIN progressive_remote_report_inventories inventory
+              ON inventory.sim_job_id = dispatch.sim_job_id
+              AND inventory.sequence = latest.sequence
+              AND inventory.report_content_signature = latest.content_signature
+            JOIN progressive_remote_report_sources source
+              ON source.sim_job_id = inventory.sim_job_id
+              AND source.sequence = inventory.sequence
+              AND source.aoa_deg = unit.aoa_deg
+            WHERE dispatch.sim_job_id = job.id
+              AND job.engine_job_id = dispatch.sim_job_id::text
+              AND latest.report->>'assignmentSignature' = dispatch.content_signature
+              AND latest.report#>>'{stopProof,execution_stopped}' = 'true'
+              AND latest.report#>>'{status,state}' IN ('completed', 'failed', 'cancelled')
+              AND latest.report#>>'{result,state}' IN ('completed', 'failed', 'cancelled')
+              AND EXISTS (
+                SELECT 1
+                FROM jsonb_array_elements(latest.report#>'{result,polars}') polar(value)
+                CROSS JOIN LATERAL jsonb_array_elements(
+                  coalesce(polar.value->'points', '[]'::jsonb)
+                  || coalesce(polar.value->'attempts', '[]'::jsonb)
+                ) physical_point(value)
+                WHERE (physical_point.value->>'aoa_deg')::double precision = source.aoa_deg
+                  AND physical_point.value->>'case_slug' IS NOT DISTINCT FROM source.case_slug
+                  AND (
+                    physical_point.value->>'cl' IS NOT NULL
+                    OR physical_point.value->>'cd' IS NOT NULL
+                    OR physical_point.value->>'cm' IS NOT NULL
+                    OR (
+                      jsonb_typeof(physical_point.value->'evidence_artifacts') = 'array'
+                      AND physical_point.value->'evidence_artifacts' <> '[]'::jsonb
+                    )
+                  )
+              )
           )
           AND NOT EXISTS (
             SELECT 1 FROM progressive_cfd_attempts newer

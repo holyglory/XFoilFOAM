@@ -6,6 +6,7 @@ import {
   canonicalAnalysisJson,
   lockProgressiveCfdExecution,
   materializeProgressiveCfdExecution,
+  PROGRESSIVE_URANS_CONTINUATION_MAX_SECONDS,
   progressiveCfdAttempts,
   simJobs,
   type DB,
@@ -235,9 +236,25 @@ export async function composeProgressiveCfdJob(
       .limit(1);
     if (!airfoil || airfoil.archivedAt || airfoil.deletedAt)
       throw new Error("CFD profile is missing or inactive");
+    const recipeSelection = first.recipe.selection as
+      | Record<string, unknown>
+      | undefined;
+    const configuredRecipeSolver = recipeSelection?.solver as
+      | "simpleFoam"
+      | "pimpleFoam"
+      | "rhoSimpleFoam"
+      | "rhoPimpleFoam"
+      | "rhoCentralFoam"
+      | undefined;
+    const recipeSolver =
+      first.stage === 3 && configuredRecipeSolver === "simpleFoam"
+        ? "pimpleFoam"
+        : first.stage === 3 && configuredRecipeSolver === "rhoSimpleFoam"
+          ? "rhoPimpleFoam"
+          : configuredRecipeSolver;
     const transient = progressiveSolverIsTransient(
-      execution.snapshot.solver.flowSolverFamily!,
-      execution.snapshot.solver.timeCoordinate,
+      recipeSolver ?? execution.snapshot.solver.flowSolverFamily!,
+      recipeSolver ? undefined : execution.snapshot.solver.timeCoordinate,
     );
     const angles = leases
       .map((lease) => lease.alpha)
@@ -261,6 +278,7 @@ export async function composeProgressiveCfdJob(
       ransFailurePolicy:
         !transient && angles.length > 1 ? "abort_for_precalc" : "continue",
       cpuSlots: input.cpuSlots,
+      solverFamilyOverride: recipeSolver,
     });
     request.expected_execution_pool = pool.routingKey;
     request.expected_mesh_recovery_version = input.meshRecoveryVersion;
@@ -284,8 +302,14 @@ export async function composeProgressiveCfdJob(
         )
       : 1;
     if (continuation) {
-      if (!transient || fidelity !== "precalc")
-        throw new Error("Progressive continuation requires preliminary URANS");
+      if (!transient || fidelity !== (first.stage === 2 ? "precalc" : "full"))
+        throw new Error("Progressive continuation requires matching URANS fidelity");
+      if (
+        !Number.isSafeInteger(continuation.extensionSeconds) ||
+        continuation.extensionSeconds <= 0 ||
+        continuation.extensionSeconds > PROGRESSIVE_URANS_CONTINUATION_MAX_SECONDS
+      )
+        throw new Error("Progressive continuation exceeds its bounded budget");
       request.continue_from = {
         engine_job_id: continuation.engineJobId,
         case_slug: continuation.engineCaseSlug,

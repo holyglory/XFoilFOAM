@@ -67,6 +67,7 @@ export * from "./progressive-cfd-execution";
 export * from "./solver-reservations";
 export * from "./progressive-execution-identity";
 export * from "./progressive-cfd-evidence";
+export * from "./progressive-ingestion-ownership-recovery";
 export * from "./sweeper-admission-breaker";
 export { createClient, type DB, type Sql } from "./client";
 export { databaseUrl, DEFAULT_DATABASE_URL } from "./env";

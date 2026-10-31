@@ -12,7 +12,7 @@ export function progressiveRetryClaimSql(
 ) {
   if (!unit) return sql`false`;
   return sql`(
-    results.status IN ('failed', 'pending', 'stale')
+    results.status IN ('queued', 'done', 'failed', 'pending', 'stale')
     AND NOT EXISTS (SELECT 1 FROM result_classifications classification
       WHERE classification.result_id = results.id AND classification.state = 'accepted')
     AND EXISTS (

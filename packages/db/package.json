@@ -24,6 +24,7 @@
     "recover:progressive-completion-retries": "tsx src/recover-progressive-completion-retries.ts",
     "recover:progressive-stale-hz": "tsx src/recover-progressive-stale-hz.ts",
     "benchmark:fast-v2": "tsx src/progressive-fast-v2-benchmark-cli.ts",
+    "recover:progressive-ingestion-ownership": "tsx src/recover-progressive-ingestion-ownership.ts",
     "reset": "tsx src/reset.ts && corepack pnpm run migrate && corepack pnpm run seed",
     "studio": "drizzle-kit studio",
     "test": "vitest run",

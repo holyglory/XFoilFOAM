@@ -9,6 +9,7 @@ import {
   progressiveRemoteActivePromiseCount,
   PROGRESSIVE_REMOTE_START_LEASE_SECONDS,
   type DB,
+  type ProgressiveCfdLease,
   type ProgressiveRemoteExecutionEnvelope,
 } from "@aerodb/db";
 import { isEngineIdentity, type EngineIdentity } from "@aerodb/engine-client";
@@ -18,6 +19,7 @@ import {
   ProgressiveEvidenceCellOwned,
 } from "./progressive-claim-deferral";
 import { REQUIRED_PRECALC_EVIDENCE_RECOVERY_VERSION } from "./build-request";
+import { retireSettledProgressivePromise } from "./progressive-remote-lease-retirement";
 
 const PROGRESSIVE_REPORT_BACKPRESSURE_LIMIT = 2_000;
 
@@ -74,6 +76,72 @@ export function parseProgressiveRemoteCapabilities(
 
 class RemoteProgressiveAdmissionWait extends Error {}
 
+function isActivePromisePointConflict(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const candidate = error as { code?: unknown; constraint?: unknown };
+  return (
+    candidate.code === "23505" &&
+    candidate.constraint === "sync_sweep_promise_points_active_uq"
+  );
+}
+
+function exactAdmissionAngles(leases: readonly ProgressiveCfdLease[]) {
+  return sql`ARRAY[${sql.join(
+    leases.map((lease) => sql`${lease.alpha}::double precision`),
+    sql`, `,
+  )}]::double precision[]`;
+}
+
+async function retireSettledAdmissionOwners(
+  db: DB,
+  input: {
+    airfoilId: string;
+    simulationPresetRevisionId: string;
+    leases: readonly ProgressiveCfdLease[];
+  },
+) {
+  const owners = await db.execute(sql`
+    SELECT DISTINCT dispatch.sim_job_id
+    FROM sync_sweep_promise_points point
+    JOIN sync_sweep_promises promise ON promise.id = point.promise_id
+    JOIN progressive_remote_dispatches dispatch ON dispatch.promise_id = promise.id
+    JOIN sim_jobs job ON job.id = dispatch.sim_job_id
+    JOIN progressive_cfd_execution_stops stopped ON stopped.sim_job_id = job.id
+      AND stopped.engine_job_id = job.engine_job_id
+    WHERE point.status = 'active'
+      AND promise.status IN ('active', 'expired', 'cancelled')
+      AND job.status IN ('done', 'failed', 'cancelled')
+      AND (job."ingestedAt" IS NOT NULL OR job.status = 'cancelled')
+      AND point.airfoil_id = ${input.airfoilId}::uuid
+      AND point.simulation_preset_revision_id = ${input.simulationPresetRevisionId}::uuid
+      AND point.aoa_deg = ANY(${exactAdmissionAngles(input.leases)})
+    ORDER BY dispatch.sim_job_id
+  `);
+  for (const owner of owners)
+    await retireSettledProgressivePromise(db, String(owner.sim_job_id));
+}
+
+async function findAdmissionCellConflicts(
+  db: DB,
+  input: {
+    airfoilId: string;
+    simulationPresetRevisionId: string;
+    leases: readonly ProgressiveCfdLease[];
+  },
+) {
+  return db.execute(sql`
+    SELECT point.aoa_deg
+    FROM sync_sweep_promise_points point
+    JOIN sync_sweep_promises promise ON promise.id = point.promise_id
+    WHERE point.status = 'active'
+      AND point.airfoil_id = ${input.airfoilId}::uuid
+      AND point.simulation_preset_revision_id = ${input.simulationPresetRevisionId}::uuid
+      AND point.aoa_deg = ANY(${exactAdmissionAngles(input.leases)})
+    ORDER BY point.aoa_deg
+    FOR UPDATE OF point, promise
+  `);
+}
+
 export async function prepareProgressiveRemoteDispatch(
   db: DB,
   solverId: string,
@@ -90,6 +158,7 @@ export async function prepareProgressiveRemoteDispatch(
       "Remote admission requires an exact registered solver identity",
     );
   let admissionPhase = "start";
+  let claimedLeases: ProgressiveCfdLease[] = [];
   try {
     return await db.transaction(async (transaction) => {
       const connection = transaction as unknown as DB;
@@ -208,6 +277,7 @@ export async function prepareProgressiveRemoteDispatch(
         throw new RemoteProgressiveAdmissionWait(
           "No eligible campaign cases are ready",
         );
+      claimedLeases = leases;
       admissionPhase = "compose";
       const composed = await composeProgressiveCfdJob(connection, leases, {
         cpuSlots: available,
@@ -229,6 +299,27 @@ export async function prepareProgressiveRemoteDispatch(
       const [job] = await connection.execute(sql`
         SELECT airfoil_id, simulation_preset_revision_id FROM sim_jobs WHERE id = ${composed.jobId}::uuid
       `);
+      await retireSettledAdmissionOwners(connection, {
+        airfoilId: String(job.airfoil_id),
+        simulationPresetRevisionId: String(job.simulation_preset_revision_id),
+        leases,
+      });
+      const conflicts = await findAdmissionCellConflicts(connection, {
+        airfoilId: String(job.airfoil_id),
+        simulationPresetRevisionId: String(job.simulation_preset_revision_id),
+        leases,
+      });
+      if (conflicts.length) {
+        const conflictingAngles = new Set(
+          conflicts.map((conflict) => Number(conflict.aoa_deg)),
+        );
+        const conflictingLeases = leases.filter((lease) =>
+          conflictingAngles.has(Number(lease.alpha)),
+        );
+        throw new ProgressiveEvidenceCellOwned(
+          conflictingLeases.length ? conflictingLeases : leases,
+        );
+      }
       const promiseId = randomUUID();
       await connection.execute(sql`
         INSERT INTO sync_sweep_promises (id, registered_solver_id, source_instance_id, source_instance_name, source_base_url,
@@ -258,10 +349,20 @@ export async function prepareProgressiveRemoteDispatch(
           "Owned result cells deferred for another preparation opportunity",
         deferredUnits: await deferProgressiveClaim(db, error),
       };
+    if (isActivePromisePointConflict(error) && claimedLeases.length)
+      return {
+        kind: "waiting" as const,
+        reason:
+          "Exact result cells became owned during remote promise binding",
+        deferredUnits: await deferProgressiveClaim(
+          db,
+          new ProgressiveEvidenceCellOwned(claimedLeases),
+        ),
+      };
     if (error instanceof RemoteProgressiveAdmissionWait)
       return { kind: "waiting", reason: error.message };
     if (
-      ["55P03", "57014"].includes(String((error as { code?: unknown }).code)) ||
+      ["40P01", "55P03", "57014"].includes(String((error as { code?: unknown }).code)) ||
       (error instanceof Error && /lock timeout/i.test(error.message))
     )
       return {

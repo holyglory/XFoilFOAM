@@ -1321,8 +1321,29 @@
     {
       "idx": 188,
       "version": "7",
+      "when": 1793160000000,
+      "tag": "0188_progressive_ingestion_ownership_recovery",
+      "breakpoints": true
+    },
+    {
+      "idx": 189,
+      "version": "7",
+      "when": 1793187421071,
+      "tag": "0189_progressive_worker_report_job_order",
+      "breakpoints": true
+    },
+    {
+      "idx": 190,
+      "version": "7",
+      "when": 1793214000000,
+      "tag": "0190_progressive_precise_legacy_continuation",
+      "breakpoints": true
+    },
+    {
+      "idx": 191,
+      "version": "7",
       "when": 1792383717717,
-      "tag": "0188_progressive_benchmark_generations",
+      "tag": "0191_progressive_benchmark_generations",
       "breakpoints": true
     }
   ]

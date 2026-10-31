@@ -1,5 +1,42 @@
 schema = 2
 
+[test.worker-outbox-replay]
+timeout_seconds = 900
+
+[test.worker-outbox-replay.postgres]
+image = "postgres:16-alpine"
+database = "aerodb"
+user = "aerodb"
+
+[[test.worker-outbox-replay.check]]
+name = "workspace"
+tier = "development"
+command = ["/usr/bin/corepack", "pnpm", "install", "--frozen-lockfile", "--ignore-scripts"]
+
+[[test.worker-outbox-replay.check]]
+name = "schema"
+tier = "development"
+requires = ["workspace"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "migrate"]
+
+[[test.worker-outbox-replay.check]]
+name = "seed"
+tier = "development"
+requires = ["schema"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "seed"]
+
+[[test.worker-outbox-replay.check]]
+name = "types"
+tier = "development"
+requires = ["workspace"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "typecheck"]
+
+[[test.worker-outbox-replay.check]]
+name = "database-replay"
+tier = "development"
+requires = ["seed", "types"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/progressive-worker-outbox-replay.test.ts"]
+
 [test.precise-steady-low-mach]
 timeout_seconds = 2100
 env = { PYTHONPATH = "src:.", PYTHONDONTWRITEBYTECODE = "1" }
@@ -201,6 +238,30 @@ name = "progressive-fast-budget-continuation"
 tier = "development"
 requires = ["seed"]
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "admits one exact saved-case FAST continuation"]
+
+[[test.cfd-source-geometry.check]]
+name = "progressive-precise-budget-continuation"
+tier = "development"
+requires = ["seed"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "continues one bounded precise full-URANS case from settled wall-clock evidence"]
+
+[[test.cfd-source-geometry.check]]
+name = "progressive-precise-execution-contract"
+tier = "development"
+requires = ["seed"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/engine-client", "exec", "vitest", "run", "test/progressive-execution.test.ts"]
+
+[[test.cfd-source-geometry.check]]
+name = "progressive-precise-types"
+tier = "development"
+requires = ["seed"]
+command = ["/bin/bash", "-euc", "/usr/bin/corepack pnpm --filter @aerodb/db typecheck && /usr/bin/corepack pnpm --filter @aerodb/engine-client typecheck && /usr/bin/corepack pnpm --filter @aerodb/sweeper typecheck"]
+
+[[test.cfd-source-geometry.check]]
+name = "progressive-remote-intake-contract"
+tier = "development"
+requires = ["seed"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/progressive-remote-jobs.test.ts"]
 
 [[test.cfd-source-geometry.check]]
 name = "progressive-fast-budget-recovery"
@@ -1161,10 +1222,35 @@ requires = ["schema", "types"]
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/progressive-staging-selection.test.ts"]
 
 [[test.staging-selection.check]]
+name = "selector-contract"
+tier = "development"
+requires = ["schema", "types"]
+timeout_seconds = 180
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/progressive-staging-selection.test.ts", "-t", "serves fresh active reports|prioritizes active terminal reports"]
+
+[[test.staging-selection.check]]
 name = "publication-focused"
 tier = "development"
 requires = ["schema", "types"]
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/progressive-publication-selection.test.ts"]
+
+[[test.staging-selection.check]]
+name = "progressive-delivery-selection"
+tier = "development"
+requires = ["schema", "types"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/progressive-delivery-selection.test.ts"]
+
+[[test.staging-selection.check]]
+name = "remote-lease-retirement"
+tier = "development"
+requires = ["schema", "types"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/progressive-remote-lease-retirement.test.ts"]
+
+[[test.staging-selection.check]]
+name = "progressive-terminal-lane"
+tier = "development"
+requires = ["schema", "types"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/progressive-delivery-selection.test.ts", "-t", "reserves a bounded terminal lane"]
 
 [[test.staging-selection.check]]
 name = "publication-services"
@@ -1189,6 +1275,12 @@ name = "exact-ingestion"
 tier = "development"
 requires = ["seed", "types"]
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "progressive remote dispatch pins one exact request"]
+
+[[test.staging-selection.check]]
+name = "campaign-read-model"
+tier = "development"
+requires = ["seed", "types"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "keeps progressive coverage visible without legacy progress rows"]
 
 [[test.staging-selection.check]]
 name = "api-conflict-recovery"
@@ -2435,6 +2527,12 @@ requires = ["types"]
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/progressive-remote-admission.test.ts", "test/progressive-remote-admission-lock.test.ts", "test/progressive-parallel-admission.test.ts"]
 
 [[test.progressive.check]]
+name = "remote-progress-policy"
+tier = "development"
+requires = ["types"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/progressive-remote-progress-policy.test.ts"]
+
+[[test.progressive.check]]
 name = "remote-archive-broker"
 tier = "development"
 requires = ["dependencies", "types"]
@@ -2463,6 +2561,18 @@ name = "terminal-no-evidence-recovery"
 tier = "development"
 requires = ["dependencies", "types"]
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "requeues only stopped terminal executions with no measurable evidence"]
+
+[[test.progressive.check]]
+name = "ingestion-ownership-recovery"
+tier = "development"
+requires = ["dependencies", "types"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "terminal evidence inventory"]
+
+[[test.progressive.check]]
+name = "terminal-evidence-inventory-guard"
+tier = "development"
+requires = ["workspace"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "terminal evidence inventory|requeues one ordinary retry|defers automatic recovery while progressive admission is held, then recovers after release|without letting an older attempt close the latest owner"]
 
 [[test.progressive.check]]
 name = "remote-stage-barrier"
@@ -4356,6 +4466,16 @@ command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vites
 name = "rendered-coverage"
 tier = "development"
 command = ["node", "scripts/dev/verify-production-campaign-coverage.mjs"]
+
+[[test.campaign-coverage-production.check]]
+name = "all-profile-audit"
+tier = "development"
+command = ["node", "scripts/dev/audit-production-campaign-completion.mjs"]
+
+[[test.campaign-coverage-production.check]]
+name = "remote-backpressure"
+tier = "development"
+command = ["node", "scripts/dev/diagnose-production-remote-backpressure.mjs"]
 
 [test.prediction-repair-production]
 timeout_seconds = 180

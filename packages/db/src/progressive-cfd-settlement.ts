@@ -423,7 +423,7 @@ export async function settleProgressiveCfdExecution(
       }
       const budgetExtensionAdmitted =
         !complete &&
-        unit.stage === 2 &&
+        (unit.stage === 2 || unit.stage === 3) &&
         unit.latest_attempt === true &&
         Number(unit.attempts) === 2 &&
         (await admitProgressiveCfdBudgetExtension(connection, {
@@ -442,7 +442,7 @@ export async function settleProgressiveCfdExecution(
       const budgetExtensionRetry =
         !complete &&
         budgetExtensionPending &&
-        unit.stage === 2 &&
+        (unit.stage === 2 || unit.stage === 3) &&
         ordinaryAttempts === 2 &&
         Number(unit.active_seconds) < effectiveBudget;
       const retry =

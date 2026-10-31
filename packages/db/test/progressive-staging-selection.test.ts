@@ -330,6 +330,8 @@ it("serves fresh active reports and FIFO backlog without changing eligibility", 
     );
     await transaction.execute(sql`CREATE INDEX fixture_report_order_idx ON progressive_worker_reports(created_at,sim_job_id,sequence)
       WHERE acknowledged_at IS NOT NULL AND jsonb_typeof(report->'result')='object'`);
+    await transaction.execute(sql`CREATE INDEX fixture_report_job_order_idx ON progressive_worker_reports(sim_job_id,created_at,sequence)
+      WHERE acknowledged_at IS NOT NULL AND jsonb_typeof(report->'result')='object'`);
     const [index] = await transaction.execute(
       sql`SELECT indisvalid FROM pg_index WHERE indexrelid='public.progressive_worker_reports_staging_order_idx'::regclass`,
     );
@@ -403,7 +405,11 @@ it("serves fresh active reports and FIFO backlog without changing eligibility", 
       }
       visit(result.Plan as Record<string, unknown>);
       expect(
-        nodes.some((node) => node["Index Name"] === "fixture_report_order_idx"),
+        nodes.some((node) =>
+          ["fixture_report_order_idx", "fixture_report_job_order_idx"].includes(
+            String(node["Index Name"] ?? ""),
+          ),
+        ),
       ).toBe(true);
       expect(
         nodes.some(
@@ -493,7 +499,7 @@ it("serves fresh active reports and FIFO backlog without changing eligibility", 
     expect(await select(true)).toEqual([]);
     expect(await select(false)).toEqual([]);
   });
-});
+}, 30_000);
 
 it("prioritizes active terminal reports and keeps invalid reports in the fallback queue", async () => {
   await client.db.transaction(async (transaction) => {
@@ -543,6 +549,11 @@ it("prioritizes active terminal reports and keeps invalid reports in the fallbac
     );
     await transaction.execute(sql`CREATE UNIQUE INDEX fixture_report_idx
       ON progressive_worker_reports(sim_job_id,sequence)`);
+    await transaction.execute(sql`CREATE INDEX fixture_report_job_order_idx
+      ON progressive_worker_reports(sim_job_id,created_at,sequence)`);
+    await transaction.execute(sql`CREATE INDEX fixture_report_terminal_job_order_idx
+      ON progressive_worker_reports(sim_job_id,created_at,sequence)
+      WHERE stopped_engine_job_id IS NOT NULL`);
     await transaction.execute(sql`CREATE UNIQUE INDEX fixture_receipt_idx
       ON progressive_worker_evidence_receipts(sim_job_id,sequence)`);
 

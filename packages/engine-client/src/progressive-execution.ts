@@ -120,14 +120,15 @@ export function validateProgressiveExecutionScope(
       !Number.isFinite(candidate.extensionSeconds) ||
       candidate.extensionSeconds <= 0 ||
       candidate.extensionSeconds > 43200 ||
-      value.stage !== 2 ||
+      ![2, 3].includes(value.stage as number) ||
       request.continue_from == null ||
       request.continue_from.engine_job_id !== candidate.engineJobId ||
       request.continue_from.case_slug !== candidate.engineCaseSlug ||
       request.budget_override_s !== candidate.extensionSeconds ||
       request.corrective_tail_periods != null ||
       request.solver?.force_transient !== true ||
-      request.solver?.urans_fidelity !== "precalc" ||
+      request.solver?.urans_fidelity !==
+        (value.stage === 2 ? "precalc" : "full") ||
       !Number.isSafeInteger(request.expected_urans_recovery_version) ||
       (request.expected_urans_recovery_version ?? -1) < 2
     )

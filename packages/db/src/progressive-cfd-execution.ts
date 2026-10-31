@@ -71,7 +71,13 @@ export async function lockProgressiveCfdExecution(
       THEN ${localStepRecipeSql(sql`unit.recipe`, sql`local_policy.smoothing`)} END, unit.recipe) AS recipe,
       local_policy.id AS local_step_policy_id, recovery.id AS recovery_plan_id,
       recovery.parent_job_id AS recovery_parent_job_id, target.physical, scope.revision_id, attempt.sim_job_id, attempt.execution_recipe_id,
-      ${progressiveCfdEffectiveBudgetSql(sql`unit`)} - unit.active_seconds AS remaining_active_seconds,
+      CASE WHEN extension.unit_id IS NOT NULL
+        THEN LEAST(
+          ${progressiveCfdEffectiveBudgetSql(sql`unit`)} - unit.active_seconds,
+          extension.extension_seconds
+        )
+        ELSE ${progressiveCfdEffectiveBudgetSql(sql`unit`)} - unit.active_seconds
+      END AS remaining_active_seconds,
       extension.unit_id AS budget_extension_id, extension.source_result_attempt_id AS budget_extension_result_attempt_id,
       extension.source_engine_job_id AS budget_extension_engine_job_id,
       extension.source_engine_case_slug AS budget_extension_case_slug,

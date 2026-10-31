@@ -96,6 +96,44 @@ import type { RansRetryScope } from "./retry-plan";
 const execFileAsync = promisify(execFile);
 export const DEFAULT_RENDER_PROFILE_KEY = "default:v1:zoom2";
 
+async function assertIngestEvidenceScope(
+  db: DB,
+  input: {
+    simJobId: string;
+    engineJobId: string;
+    result: JobResult;
+    remoteProgressiveReportSequence?: number;
+  },
+): Promise<boolean> {
+  if (input.remoteProgressiveReportSequence !== undefined)
+    return assertProgressiveWorkerEvidenceJob(db, {
+      simJobId: input.simJobId,
+      engineJobId: input.engineJobId,
+      result: input.result,
+      reportSequence: input.remoteProgressiveReportSequence,
+    });
+  return (
+    (await assertProgressiveCfdEvidenceJob(
+      db,
+      input.simJobId,
+      input.engineJobId,
+      input.result.polars.flatMap((polar) =>
+        [...polar.points, ...(polar.attempts ?? [])].map((point) => ({
+          alpha: point.aoa_deg,
+          speed: polar.speed,
+          chord: polar.chord,
+          solverActiveSeconds: point.solver_active_seconds,
+        })),
+      ),
+    )) ||
+    (await assertProgressiveWorkerEvidenceJob(db, {
+      simJobId: input.simJobId,
+      engineJobId: input.engineJobId,
+      result: input.result,
+    }))
+  );
+}
+
 const SHA256_PATTERN = /^[0-9a-f]{64}$/;
 const GCS_GENERATION_PATTERN = /^[1-9][0-9]{0,19}$/;
 const GCS_CRC32C_PATTERN = /^[A-Za-z0-9+/]{6}==$/;
@@ -5898,26 +5936,12 @@ export async function ingestResult(opts: {
     conditionMap,
     result,
   } = opts;
-  const progressive =
-    (await assertProgressiveCfdEvidenceJob(
-      db,
-      simJobId,
-      engineJobId,
-      result.polars.flatMap((polar) =>
-        [...polar.points, ...(polar.attempts ?? [])].map((point) => ({
-          alpha: point.aoa_deg,
-          speed: polar.speed,
-          chord: polar.chord,
-          solverActiveSeconds: point.solver_active_seconds,
-        })),
-      ),
-    )) ||
-    (await assertProgressiveWorkerEvidenceJob(db, {
-      simJobId,
-      engineJobId,
-      result,
-      reportSequence: opts.remoteProgressiveReportSequence,
-    }));
+  const progressive = await assertIngestEvidenceScope(db, {
+    simJobId,
+    engineJobId,
+    result,
+    remoteProgressiveReportSequence: opts.remoteProgressiveReportSequence,
+  });
   const jobRuntime = await persistEngineRuntimeForJob(
     db,
     simJobId,
@@ -6212,12 +6236,11 @@ export async function ingestResult(opts: {
   for (const [revisionId, candidates] of candidatesByRevision) {
     const finalized = await db.transaction(async (transaction) => {
       const connection = transaction as unknown as DB;
-      await assertProgressiveCfdEvidenceJob(connection, simJobId, engineJobId);
-      await assertProgressiveWorkerEvidenceJob(connection, {
+      await assertIngestEvidenceScope(connection, {
         simJobId,
         engineJobId,
         result,
-        reportSequence: opts.remoteProgressiveReportSequence,
+        remoteProgressiveReportSequence: opts.remoteProgressiveReportSequence,
       });
       return publishStagedPoints(connection, airfoilId, revisionId, candidates);
     });

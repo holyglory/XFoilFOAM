@@ -29,6 +29,13 @@ const HIGH_PROGRESSIVE_CAMPAIGN_JOBS_PER_RECONCILIATION = 64;
 const HIGH_PROGRESSIVE_REPORT_JOBS_PER_RECONCILIATION = 48;
 const HIGH_PROGRESSIVE_TERMINAL_JOBS_PER_RECONCILIATION = 32;
 const PROGRESSIVE_REPORTS_PER_TRANSACTION = 8;
+export const PROGRESSIVE_REPORT_BACKPRESSURE_LIMIT = 2_000;
+
+export function progressiveReportBackpressureIsActive(
+  pendingReports: number,
+): boolean {
+  return Number.isFinite(pendingReports) && pendingReports >= PROGRESSIVE_REPORT_BACKPRESSURE_LIMIT;
+}
 
 async function applyProgressiveRemoteProgressInTransaction(
   db: DB,
@@ -352,7 +359,18 @@ export async function reconcileProgressiveRemoteProgress(
   const terminalJobs = await db.execute(
     progressiveSettlementJobsSql(options.jobIds),
   );
-  const reportBacklogIsPressured = jobs.length >= 32;
+  const [backlog] = await db.execute(sql`
+    SELECT count(*)::int AS pending_reports
+    FROM progressive_remote_reports report
+    LEFT JOIN progressive_remote_progress_receipts receipt
+      ON receipt.sim_job_id = report.sim_job_id AND receipt.sequence = report.sequence
+    LEFT JOIN progressive_remote_report_inventories inventory
+      ON inventory.sim_job_id = report.sim_job_id AND inventory.sequence = report.sequence
+    WHERE receipt.sim_job_id IS NULL OR inventory.sim_job_id IS NULL
+  `);
+  const reportBacklogIsPressured = progressiveReportBackpressureIsActive(
+    Number(backlog?.pending_reports ?? 0),
+  );
   const reportLimit = reportBacklogIsPressured
     ? HIGH_PROGRESSIVE_REPORTS_PER_EXECUTION
     : MAX_PROGRESSIVE_REPORTS_PER_EXECUTION;

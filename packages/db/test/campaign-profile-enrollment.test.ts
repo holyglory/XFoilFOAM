@@ -38,6 +38,7 @@ import {
   evaluateGasState,
   materialPhysicsValues,
   parseCoordinates,
+  PROGRESSIVE_COMPUTE_POLICY,
   PRECISE_SOLVER_SELECTION_POLICY,
 } from "@aerodb/core";
 import { sourceAirModel } from "../../core/test/fixtures/source-air-model";
@@ -128,6 +129,10 @@ import {
   recoverTerminalProgressiveNoEvidenceGaps,
   recoverUnboundProgressiveCfdLeases,
 } from "../src/progressive-cfd-recovery";
+import { acquireProgressiveAdmissionLock } from "../src/progressive-admission-lock";
+import { requeueProgressiveCompletionRetries } from "../src/progressive-completion-retry";
+import { recoverStaleProgressiveRemoteDispatches } from "../src/progressive-remote-stale-recovery";
+import { recoverProgressiveIngestionOwnership } from "../src/progressive-ingestion-ownership-recovery";
 import {
   buildProgressiveFitRequest,
   PROGRESSIVE_FIT_POLICY_ID,
@@ -185,6 +190,7 @@ import {
   campaignAirfoilRows,
   campaignSummary,
   listCampaigns,
+  listCampaignsFast,
   materializeCampaignLaunch,
   reconcileCampaignProfileEnrollment,
 } from "../src/campaigns";
@@ -1671,27 +1677,77 @@ async function cfdEvidenceFixture(
   retryWithAllocations = false,
   prepared?: { campaignId: string; leases: ProgressiveCfdLease[] },
   physical: { mediumId?: string; chordM?: number } = {},
+  maximumUnits?: number,
 ) {
   const campaignId = prepared?.campaignId ?? await campaign("active", [speed, ...extraSpeeds], angles, physical);
   let retriedUnitId: string | undefined;
+  let generationId: string | undefined;
   if (!prepared) {
-  await materializeProgressiveCampaignScope(db, campaignId);
-  const baseline = (await claim([1]))!;
-  await storeNeuralFoilPrediction(db, baseline, predictionFixture(baseline));
-  for (let remaining = extraSpeeds.length; remaining > 0; remaining -= 1) {
-    const nextBaseline = (await claim([1]))!;
-    await storeNeuralFoilPrediction(
-      db,
-      nextBaseline,
-      predictionFixture(nextBaseline),
-    );
-  }
+  const materialized = await materializeProgressiveCampaignScope(
+    db,
+    campaignId,
+    undefined,
+    `cfd-evidence-fixture-${sequence}-${stage}`,
+  );
+  const [existingGeneration] = await db.execute(sql`
+    SELECT id FROM progressive_generations
+    WHERE campaign_id = ${campaignId}::uuid AND status = 'active'
+    ORDER BY created_at DESC, id DESC LIMIT 1
+  `);
+  generationId = materialized?.id ?? String(existingGeneration?.id);
   if (stage === 3) {
+    await db.execute(sql`
+      INSERT INTO progressive_work (generation_id, target_id, stage)
+      SELECT scope.generation_id, scope.target_id, stages.stage
+      FROM progressive_generation_targets scope
+      CROSS JOIN generate_series(1, 3) AS stages(stage)
+      WHERE scope.generation_id = ${generationId}::uuid
+      ON CONFLICT (generation_id, target_id, stage) DO NOTHING
+    `);
+    const [target] = await db.execute(sql`
+      SELECT scope.generation_id, target.physical->'geometry' AS geometry,
+        scope.recipes->'neuralfoil' AS recipe
+      FROM progressive_generation_targets scope
+      JOIN polar_analysis_targets target ON target.id = scope.target_id
+      WHERE scope.generation_id = ${generationId}::uuid AND target.airfoil_id = ${originalId}
+      ORDER BY scope.target_id LIMIT 1
+    `);
+    const baseline = (await claimProgressiveWork(db, {
+      owner: "isolated-test",
+      stages: [1],
+      leaseSeconds: 120,
+      baselineGroup: {
+        generationId: String(target.generation_id),
+        airfoilId: originalId,
+        geometry: target.geometry,
+        recipe: target.recipe,
+        maximumAngles: 32768,
+      },
+    }))!;
+    await storeNeuralFoilPrediction(db, baseline, predictionFixture(baseline));
+    await db.execute(sql`UPDATE progressive_generations SET stage = 2 WHERE id = ${generationId}::uuid`);
+    await initializeProgressiveCfdWork(db);
     await db.execute(sql`UPDATE progressive_work SET state = 'complete', completed_at = clock_timestamp()
-      WHERE generation_id = ${baseline.generationId} AND stage = 2`);
-    await db.execute(
-      sql`UPDATE progressive_generations SET stage = 3 WHERE id = ${baseline.generationId}`,
-    );
+      WHERE generation_id = ${generationId}::uuid AND stage = 2`);
+    await db.execute(sql`UPDATE progressive_cfd_units SET state = 'gap', attempts = GREATEST(attempts, 1),
+      lease_token = NULL, lease_owner = NULL, lease_until = NULL
+      WHERE work_id IN (SELECT id FROM progressive_work WHERE generation_id = ${generationId}::uuid AND stage = 2)`);
+    await db.execute(sql`UPDATE progressive_generations SET stage = 3 WHERE id = ${generationId}::uuid`);
+    await db.execute(sql`UPDATE progressive_generation_cohorts
+      SET stage = 3, status = 'active', updated_at = clock_timestamp()
+      WHERE generation_id = ${generationId}::uuid`);
+  } else {
+    const baseline = (await claim([1]))!;
+    generationId = baseline.generationId;
+    await storeNeuralFoilPrediction(db, baseline, predictionFixture(baseline));
+    for (let remaining = extraSpeeds.length; remaining > 0; remaining -= 1) {
+      const nextBaseline = (await claim([1]))!;
+      await storeNeuralFoilPrediction(
+        db,
+        nextBaseline,
+        predictionFixture(nextBaseline),
+      );
+    }
   }
   await initializeProgressiveCfdWork(db);
   if (retryWithAllocations) {
@@ -1707,12 +1763,26 @@ async function cfdEvidenceFixture(
       lease_owner = NULL, lease_until = NULL WHERE id = ${previous.id}`);
   }
   }
-  const leases = prepared?.leases ?? await claimProgressiveCfdBatch(db, {
-    owner: "evidence-fixture",
-    leaseSeconds: 120,
-    solverBudgetVersion: 2,
-    localTimeStepVersion: 1,
-  });
+  let leases: ProgressiveCfdLease[];
+  try {
+    leases = prepared?.leases ?? await claimProgressiveCfdBatch(db, {
+      owner: "evidence-fixture",
+      leaseSeconds: 120,
+      ...(maximumUnits == null ? {} : { maximumUnits }),
+      solverBudgetVersion: 2,
+      localTimeStepVersion: 1,
+    });
+  } catch (error) {
+    console.error(
+      "precise fixture claim failed",
+      error,
+      await db.execute(sql`SELECT work.stage,work.state AS work_state,unit.state,
+        unit.lease_token,unit.lease_owner,unit.lease_until,unit.purpose
+        FROM progressive_work work LEFT JOIN progressive_cfd_units unit ON unit.work_id=work.id
+        WHERE work.generation_id=${generationId}::uuid ORDER BY work.stage,unit.ordinal`),
+    );
+    throw error;
+  }
   const execution = await materializeProgressiveCfdExecution(db, leases[0]);
   const [pool] = await db
     .select()
@@ -1812,12 +1882,17 @@ async function fitFixture(
   stage: 2 | 3 = 2,
   extraCondition = false,
   angles = [-2, 0, 2],
+  maximumUnits?: number,
 ) {
   const fixture = await cfdEvidenceFixture(
     32.173 + (sequence + 1) / 100,
     stage,
     extraCondition ? [42.173 + (sequence + 1) / 100] : [],
     angles,
+    false,
+    undefined,
+    {},
+    maximumUnits,
   );
   const [prediction] = await db.execute(sql`
     SELECT id FROM neuralfoil_predictions WHERE target_id = ${fixture.leases[0].targetId}
@@ -2034,9 +2109,45 @@ describe("progressive durable stage transitions", () => {
       fastComplete: 0,
       preciseComplete: 0,
     };
+    await db.execute(sql`
+      UPDATE sim_campaign_progress
+      SET requested = 99, solved = 17
+      WHERE campaign_id = ${fixture.campaignId}
+        AND condition_id = (
+          SELECT condition_id
+          FROM sim_campaign_progress
+          WHERE campaign_id = ${fixture.campaignId}
+          ORDER BY condition_id
+          LIMIT 1
+        )
+    `);
     const beforeDeletion = await campaignSummary(db, fixture.campaignId);
+    expect(beforeDeletion.totals).toMatchObject({
+      requested: 6,
+      solved: 0,
+      remaining: 6,
+    });
     expect(beforeDeletion.conditions.map((condition) => condition.progressive))
       .toEqual([expectedCoverage, expectedCoverage]);
+    expect(beforeDeletion.conditions[0]?.counters).toMatchObject({
+      requested: 3,
+      solved: 0,
+      remaining: 3,
+    });
+    const mixedListed = await listCampaigns(db, {
+      statuses: ["active"],
+      limit: 100,
+    });
+    expect(
+      mixedListed.items.find((item) => item.id === fixture.campaignId)?.totals,
+    ).toMatchObject({ requested: 6, solved: 0, remaining: 6 });
+    const mixedFastListed = await listCampaignsFast(db, {
+      statuses: ["active"],
+      limit: 100,
+    });
+    expect(
+      mixedFastListed.items.find((item) => item.id === fixture.campaignId)?.totals,
+    ).toMatchObject({ requested: 6, solved: 0, remaining: 6 });
     await db.execute(
       sql`DELETE FROM sim_campaign_progress WHERE campaign_id=${fixture.campaignId}`,
     );
@@ -2600,6 +2711,137 @@ describe("progressive durable stage transitions", () => {
     ).toHaveLength(0);
   });
 
+  it("defers automatic recovery while progressive admission is held, then recovers after release", async () => {
+    const unboundCampaignId = await campaign();
+    await materializeProgressiveCampaignScope(db, unboundCampaignId);
+    const unboundBaseline = (await claim([1]))!;
+    await storeNeuralFoilPrediction(
+      db,
+      unboundBaseline,
+      predictionFixture(unboundBaseline),
+    );
+    const unboundCount = await initializeProgressiveCfdWork(db);
+    const unboundLeases = await claimProgressiveCfdBatch(db, {
+      owner: "admission-lock-unbound-recovery",
+      leaseSeconds: 120,
+    });
+    expect(unboundLeases).toHaveLength(unboundCount);
+    await db.execute(sql`
+      UPDATE progressive_cfd_units
+      SET lease_until = clock_timestamp() - interval '1 second'
+      WHERE id IN (${sql.join(
+        unboundLeases.map((lease) => sql`${lease.id}::uuid`),
+        sql`, `,
+      )})
+    `);
+
+    const inactiveCampaignId = await campaign();
+    await materializeProgressiveCampaignScope(db, inactiveCampaignId);
+    const inactiveBaseline = (await claim([1]))!;
+    await storeNeuralFoilPrediction(
+      db,
+      inactiveBaseline,
+      predictionFixture(inactiveBaseline),
+    );
+    await initializeProgressiveCfdWork(db);
+    const inactiveLeases = await claimProgressiveCfdBatch(db, {
+      owner: "admission-lock-inactive-recovery",
+      leaseSeconds: 120,
+    });
+    expect(inactiveLeases.length).toBeGreaterThan(0);
+    const inactiveLease = inactiveLeases[0];
+    await db.execute(sql`
+      UPDATE progressive_cfd_units
+      SET state = 'gap', lease_token = NULL, lease_owner = NULL,
+        lease_until = NULL, retry_after = NULL, active_seconds = 1,
+        error = 'Inactive remote delivery has unresolved evidence'
+      WHERE id = ${inactiveLease.id}::uuid
+    `);
+
+    const terminalFixture = await fitFixture(2, false, [0]);
+    const terminalLease = terminalFixture.leases[0];
+    await acknowledgeProgressiveCfdExecutionStop(db, {
+      simJobId: terminalFixture.composed.jobId,
+      proof: executionStopProof(terminalFixture.engineJobId),
+    });
+    await db.execute(sql`
+      UPDATE progressive_cfd_attempts
+      SET outcome = 'failed', sim_job_id = ${terminalFixture.composed.jobId}::uuid,
+        error = 'terminal execution has no measured case evidence'
+      WHERE token = ${terminalLease.token}::uuid
+    `);
+    await db.execute(sql`
+      UPDATE progressive_cfd_units
+      SET state = 'gap', lease_token = NULL, lease_owner = NULL,
+        lease_until = NULL, attempts = 1, active_seconds = 0,
+        error = 'terminal execution has no measured case evidence'
+      WHERE id = ${terminalLease.id}::uuid
+    `);
+    await db.execute(sql`
+      UPDATE progressive_work
+      SET state = 'gap', error = 'terminal execution has no measured case evidence'
+      WHERE id = ${terminalLease.workId}::uuid
+    `);
+
+    const owner = createClient({ url: targetUrl.toString(), max: 1 });
+    let release!: () => void;
+    let signalLocked!: () => void;
+    const released = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const locked = new Promise<void>((resolve) => {
+      signalLocked = resolve;
+    });
+    const holding = owner.db.transaction(async (transaction) => {
+      await acquireProgressiveAdmissionLock(transaction as unknown as DB);
+      signalLocked();
+      await released;
+    });
+    try {
+      await Promise.race([
+        locked,
+        holding.then(() => {
+          throw new Error("Admission lock owner exited before acquisition");
+        }),
+      ]);
+      expect(await recoverUnboundProgressiveCfdLeases(db)).toEqual({
+        retried: 0,
+        gaps: 0,
+      });
+      expect(await recoverInactiveProgressiveRemoteGaps(db)).toBe(0);
+      expect(await recoverTerminalProgressiveNoEvidenceGaps(db)).toBe(0);
+
+      for (const recover of [
+        (connection: DB) => requeueProgressiveCompletionRetries(connection, {
+          campaignId: unboundCampaignId, expectedCount: 1,
+        }),
+        (connection: DB) => recoverStaleProgressiveRemoteDispatches(connection, {
+          campaignId: unboundCampaignId, expectedJobs: 1,
+        }),
+      ]) {
+        await expect(db.transaction(async (transaction) => {
+          const connection = transaction as unknown as DB;
+          await connection.execute(sql`SET LOCAL lock_timeout = '100ms'`);
+          await recover(connection);
+        })).rejects.toMatchObject({ code: "55P03" });
+      }
+
+      release();
+      await holding;
+
+      expect(await recoverUnboundProgressiveCfdLeases(db)).toEqual({
+        retried: unboundCount,
+        gaps: 0,
+      });
+      expect(await recoverInactiveProgressiveRemoteGaps(db)).toBe(1);
+      expect(await recoverTerminalProgressiveNoEvidenceGaps(db)).toBe(1);
+    } finally {
+      release();
+      await holding.catch(() => undefined);
+      await owner.sql.end();
+    }
+  });
+
   it("requeues only bounded inactive remote delivery gaps", async () => {
     const campaignId = await campaign();
     await materializeProgressiveCampaignScope(db, campaignId);
@@ -2640,6 +2882,297 @@ describe("progressive durable stage transitions", () => {
     });
   });
 
+  it.each([
+    { state: "completed", sources: "physical" },
+    { state: "failed", sources: "physical" },
+    { state: "cancelled", sources: "physical" },
+    { state: "failed", sources: "metadata" },
+    { state: "failed", sources: "diagnostics" },
+    { state: "completed", sources: "other-angle" },
+  ] as const)("terminal evidence inventory preserves exact ownership only for physical sources ($state/$sources)", async ({ state, sources }) => {
+    const angles = [-4, -2, 0, 2, 4, 6, 8, 10];
+    const campaignId = await campaign("active", [32.173 + (sequence + 1) / 100], angles);
+    await materializeProgressiveCampaignScope(db, campaignId);
+    const baseline = (await claim([1]))!;
+    await storeNeuralFoilPrediction(db, baseline, predictionFixture(baseline));
+    await initializeProgressiveCfdWork(db);
+    await db.execute(sql`UPDATE progressive_cfd_units unit
+      SET state = 'gap', error = 'Isolated fast-stage gap fixture'
+      FROM progressive_work work
+      WHERE work.id = unit.work_id AND work.generation_id = ${baseline.generationId}::uuid AND work.stage = 2`);
+    await advanceProgressiveCfdStages(db);
+    await initializeProgressiveCfdWork(db);
+    const leases = await claimProgressiveCfdBatch(db, {
+      owner: "terminal-inventory-precise-fixture", leaseSeconds: 120,
+      solverBudgetVersion: 2, localTimeStepVersion: 1,
+    });
+    const fixture = await cfdEvidenceFixture(undefined, 3, [], angles, false, { campaignId, leases });
+    expect(fixture.leases).toHaveLength(8);
+    const executionId = fixture.composed.jobId;
+    const rollback = new Error("Restore isolated terminal inventory recovery fixture");
+    await expect(db.transaction(async (transaction) => {
+      const connection = transaction as unknown as DB;
+      const [job] = await connection.select().from(simJobs).where(eq(simJobs.id, executionId));
+      const solverId = randomUUID();
+      const promiseId = randomUUID();
+      await connection.execute(sql`UPDATE sweeper_state SET enabled = true,
+        admission_fence_active = false, disk_admission_blocked = false WHERE id = 1`);
+      await connection.execute(sql`UPDATE sync_api_settings SET remote_solver_enabled = false WHERE id = 1`);
+      await connection.execute(sql`UPDATE sim_jobs SET status = 'pending', engine_job_id = NULL,
+        engine_state = NULL WHERE id = ${executionId}::uuid`);
+      await connection.execute(sql`INSERT INTO registered_remote_solvers
+        (id, instance_id, instance_name, cpu_capacity, cpu_budget, max_active_polar_promises)
+        VALUES (${solverId}::uuid, ${randomUUID()}, 'terminal inventory recovery fixture', 96, 96, 96)`);
+      await connection.execute(sql`INSERT INTO sync_sweep_promises
+        (id, registered_solver_id, airfoil_id, simulation_preset_revision_id, aoa_count, "expiresAt")
+        VALUES (${promiseId}::uuid, ${solverId}::uuid, ${job.airfoilId}::uuid,
+          ${job.simulationPresetRevisionId}::uuid, 8, clock_timestamp() + interval '1 hour')`);
+      for (const lease of fixture.leases)
+        await connection.execute(sql`INSERT INTO sync_sweep_promise_points
+          (promise_id, airfoil_id, simulation_preset_revision_id, aoa_deg)
+          VALUES (${promiseId}::uuid, ${job.airfoilId}::uuid,
+            ${job.simulationPresetRevisionId}::uuid, ${lease.alpha})`);
+      const bound = await bindProgressiveRemoteDispatch(connection, { simJobId: executionId, solverId, promiseId });
+      const result = progressiveRemoteEvidenceResult(bound.envelope);
+      result.state = state;
+      const polar = result.polars[0];
+      const template = polar.attempts![0];
+      polar.reynolds = fixture.execution.snapshot.derived.reynolds;
+      polar.mach = fixture.execution.snapshot.derived.mach;
+      polar.attempts = fixture.leases.filter((lease) => sources !== "other-angle" || lease.alpha !== 10).map((lease) => ({
+        ...template,
+        aoa_deg: lease.alpha,
+        case_slug: `terminal-inventory-${lease.alpha}`,
+        cl: sources === "diagnostics" ? null : 0.4,
+        cd: sources === "diagnostics" ? null : 0.03,
+        cm: sources === "diagnostics" ? null : -0.02,
+        converged: sources !== "diagnostics",
+        solver_active_seconds: sources === "diagnostics" ? 0 : 1,
+        error: sources === "diagnostics" ? "Infrastructure failure before solver execution" : null,
+        failure_disposition: sources === "diagnostics" ? "infrastructure" : "none",
+        evidence_artifacts: sources === "diagnostics" ? [] : template.evidence_artifacts,
+      }));
+      if (sources === "metadata") result.polars = [];
+      const report: ProgressiveRemoteReport = {
+        version: 1,
+        solverId,
+        promiseId,
+        executionId,
+        assignmentSignature: bound.envelope.contentSignature,
+        sequence: 1,
+        status: { job_id: executionId, state, total_cases: 8, completed_cases: 8, engine: result.engine },
+        result,
+        stopProof: executionStopProof(executionId),
+      };
+      const stored = await storeProgressiveRemoteReport(connection, { solverId, promiseId, executionId, report });
+      expect(await applyProgressiveRemoteProgress(connection, executionId)).toMatchObject({ kind: "applied", stopped: true });
+      const deliver = async (alpha: number) => {
+        const source = resolveProgressiveReportedPoint(result, {
+          alpha, speed: polar.speed, chord: polar.chord, caseSlug: `terminal-inventory-${alpha}`,
+        });
+        const projection = progressiveRemotePointProjection({ ...source, envelope: bound.envelope, report });
+        const [cell] = await connection.select().from(results)
+          .where(and(eq(results.simJobId, executionId), eq(results.aoaDeg, alpha)));
+        const [attempt] = await connection.insert(resultAttempts).values({
+          resultId: cell.id,
+          airfoilId: job.airfoilId,
+          bcId: cell.bcId,
+          simulationPresetRevisionId: job.simulationPresetRevisionId,
+          simJobId: executionId,
+          engineJobId: executionId,
+          engineCaseSlug: projection.engineCaseSlug,
+          aoaDeg: alpha,
+          status: projection.status,
+          source: projection.source,
+          regime: projection.regime,
+          cl: projection.cl,
+          cd: projection.cd,
+          cm: projection.cm,
+          clCd: projection.clCd,
+          clStd: projection.clStd,
+          cdStd: projection.cdStd,
+          cmStd: projection.cmStd,
+          stalled: projection.stalled,
+          unsteady: projection.unsteady,
+          converged: projection.converged,
+          finalResidual: projection.finalResidual,
+          iterations: projection.iterations,
+          yPlusAvg: projection.yPlusAvg,
+          yPlusMax: projection.yPlusMax,
+          nCells: projection.nCells,
+          firstOrderFallback: projection.firstOrderFallback,
+          strouhal: projection.strouhal,
+          error: projection.error,
+          qualityWarnings: projection.qualityWarnings,
+          methodKey: projection.methodKey,
+          evidencePayload: projection.evidencePayload,
+          validForPolar: false,
+        }).returning();
+        return recordProgressiveRemoteEvidenceReceipt(connection, {
+          solverId, promiseId, engineJobId: executionId, aoaDeg: alpha,
+          engineCaseSlug: projection.engineCaseSlug,
+          remoteResultId: randomUUID(), remoteResultAttemptId: randomUUID(),
+          progressiveEvidence: {
+            sequence: stored.sequence,
+            reportContentSignature: stored.contentSignature,
+            pointContentSignature: source.contentSignature,
+          },
+          resultAttemptId: attempt.id,
+        });
+      };
+      if (sources === "physical" || sources === "other-angle")
+        for (const lease of fixture.leases.filter((lease) => lease.alpha !== 10))
+          await deliver(lease.alpha);
+      await connection.execute(sql`UPDATE sim_jobs SET "updatedAt" = clock_timestamp() - interval '20 minutes'
+        WHERE id = ${executionId}::uuid`);
+      await connection.execute(sql`UPDATE sync_sweep_promises SET status = 'expired',
+        "expiresAt" = clock_timestamp() - interval '1 minute' WHERE id = ${promiseId}::uuid`);
+      const readOwnership = () => connection.execute(sql`
+        SELECT unit.id, unit.aoa_deg, unit.state, unit.lease_token, unit.lease_owner, unit.lease_until,
+          unit.attempts, unit.active_seconds, unit.error, attempt.token, attempt.outcome
+        FROM progressive_cfd_attempts attempt JOIN progressive_cfd_units unit ON unit.id = attempt.unit_id
+        WHERE attempt.sim_job_id = ${executionId}::uuid ORDER BY unit.ordinal
+      `);
+      const readEvidence = () => connection.execute(sql`
+        SELECT (SELECT count(*)::int FROM progressive_remote_report_sources WHERE sim_job_id = ${executionId}::uuid) AS sources,
+          (SELECT count(*)::int FROM progressive_remote_evidence_receipts WHERE sim_job_id = ${executionId}::uuid) AS receipts,
+          (SELECT count(*)::int FROM result_attempts WHERE sim_job_id = ${executionId}::uuid) AS attempts,
+          (SELECT count(*)::int FROM progressive_cfd_evidence evidence JOIN progressive_cfd_attempts attempt
+            ON attempt.token = evidence.attempt_token WHERE attempt.sim_job_id = ${executionId}::uuid) AS linked,
+          (SELECT count(*)::int FROM results WHERE sim_job_id = ${executionId}::uuid
+            AND current_result_attempt_id IS NOT NULL) AS published
+      `);
+      const evidenceBefore = await readEvidence();
+      expect(evidenceBefore).toEqual([{
+        sources: sources === "metadata" ? 0 : sources === "other-angle" ? 7 : 8,
+        receipts: sources === "physical" || sources === "other-angle" ? 7 : 0,
+        attempts: sources === "physical" || sources === "other-angle" ? 7 : 0,
+        linked: sources === "physical" || sources === "other-angle" ? 7 : 0,
+        published: 0,
+      }]);
+      const ownershipBefore = await readOwnership();
+      expect(await recoverTerminalProgressiveNoEvidenceGaps(connection)).toBe(
+        sources === "physical" ? 0 : sources === "other-angle" ? 1 : 8,
+      );
+      expect(await readEvidence()).toEqual(evidenceBefore);
+      expect(await recoverTerminalProgressiveNoEvidenceGaps(connection)).toBe(0);
+      if (sources === "physical") {
+        expect(await readOwnership()).toEqual(ownershipBefore);
+        const previousRole = process.env.AIRFOILFOAM_DEPLOYMENT_ROLE;
+        process.env.AIRFOILFOAM_DEPLOYMENT_ROLE = "hub";
+        try {
+        if (state === "cancelled") {
+          const late = fixture.leases.find((lease) => lease.alpha === 10)!;
+          await expect(recoverProgressiveIngestionOwnership(connection, {
+            jobId: executionId, solverId, promiseId, unitIds: [late.id], expectedUnitCount: 1,
+          })).rejects.toThrow("stopped ingestion");
+          throw rollback;
+        }
+        const late = fixture.leases.find((lease) => lease.alpha === 10)!;
+        await connection.execute(sql`UPDATE progressive_cfd_units unit
+          SET error = 'Another execution owns these result cells; preparation deferred',
+              retry_after = clock_timestamp() + interval '1 minute'
+          FROM progressive_work work
+          WHERE unit.work_id = work.id AND work.generation_id = ${fixture.leases[0].generationId}::uuid
+            AND unit.aoa_deg = 10`);
+        const selection = {
+            jobId: executionId,
+            solverId,
+            promiseId,
+            unitIds: [late.id],
+            expectedUnitCount: 1,
+          };
+        await expect(recoverProgressiveIngestionOwnership(connection, {
+            ...selection,
+            solverId: randomUUID(),
+        })).rejects.toThrow("stored assignment");
+        const foreignJobId = randomUUID();
+          await connection.execute(sql`INSERT INTO sim_jobs
+            (id, airfoil_id, bc_ids, simulation_preset_revision_id, campaign_id, reference_chord_m, status)
+            SELECT ${foreignJobId}::uuid, airfoil_id, bc_ids, simulation_preset_revision_id,
+              campaign_id, reference_chord_m, 'pending' FROM sim_jobs WHERE id = ${executionId}::uuid`);
+        await connection.execute(sql`UPDATE results SET sim_job_id = ${foreignJobId}::uuid
+            WHERE sim_job_id = ${executionId}::uuid AND aoa_deg = 10`);
+          await connection.execute(sql`UPDATE progressive_cfd_attempts SET outcome = 'failed',
+            error = 'terminal execution has no measured case evidence'
+            WHERE token = ${late.token}::uuid`);
+          await connection.execute(sql`UPDATE progressive_cfd_units SET state = 'pending',
+            lease_token = NULL, lease_owner = NULL, lease_until = NULL,
+            error = 'Another execution owns these result cells; preparation deferred'
+            WHERE id = ${late.id}::uuid`);
+        await expect(recoverProgressiveIngestionOwnership(connection, selection)).rejects.toThrow("canonical result cell");
+          await connection.execute(sql`UPDATE results SET sim_job_id = ${executionId}::uuid
+            WHERE sim_job_id = ${foreignJobId}::uuid AND aoa_deg = 10`);
+        await connection.execute(sql`DELETE FROM sim_jobs WHERE id = ${foreignJobId}::uuid`);
+        const dryRun = await recoverProgressiveIngestionOwnership(connection, selection);
+          expect(dryRun.mode).toBe("dry-run");
+          expect(dryRun.restoredUnitIds).toEqual([]);
+          const rejectedInSavepoint = async (
+            mutate: (transaction: DB) => Promise<void>,
+            message: string,
+          ) => {
+            const savepointRollback = new Error("rollback recovery rejection fixture");
+            await expect(connection.transaction(async (raw) => {
+              const transaction = raw as unknown as DB;
+              await mutate(transaction);
+              await expect(recoverProgressiveIngestionOwnership(transaction, selection)).rejects.toThrow(message);
+              throw savepointRollback;
+            })).rejects.toBe(savepointRollback);
+          };
+          await rejectedInSavepoint(async (transaction) => {
+            await transaction.execute(sql`INSERT INTO progressive_cfd_attempts
+              (token, unit_id, owner, lease_until, outcome, execution_recipe_id)
+              SELECT ${randomUUID()}::uuid, unit_id, 'newer-owner', clock_timestamp() + interval '10 minutes',
+                'running', execution_recipe_id FROM progressive_cfd_attempts WHERE token = ${late.token}::uuid`);
+          }, "latest unleased");
+          await rejectedInSavepoint(async (transaction) => {
+            await transaction.execute(sql`DELETE FROM progressive_cfd_execution_stops
+              WHERE sim_job_id = ${executionId}::uuid`);
+          }, "physical stop");
+          await rejectedInSavepoint(async (transaction) => {
+            await transaction.execute(sql`UPDATE progressive_cfd_units SET state = 'leased',
+              lease_token = ${late.token}::uuid, lease_owner = 'competing-owner',
+              lease_until = clock_timestamp() + interval '10 minutes' WHERE id = ${late.id}::uuid`);
+          }, "latest unleased");
+          await rejectedInSavepoint(async (transaction) => {
+            await transaction.execute(sql`UPDATE progressive_cfd_units SET active_seconds = active_budget_seconds
+              WHERE id = ${late.id}::uuid`);
+          }, "budget");
+          await connection.execute(sql`UPDATE sim_jobs SET "polledAt" = clock_timestamp()
+            WHERE id = ${executionId}::uuid`);
+          const applied = await recoverProgressiveIngestionOwnership(connection, selection, {
+            apply: true,
+            manifest: dryRun.manifest,
+          });
+          expect(applied.restoredUnitIds).toEqual([late.id]);
+          expect(await recoverProgressiveIngestionOwnership(connection, selection, {
+            apply: true,
+            manifest: dryRun.manifest,
+          })).toMatchObject({ replayed: true, restoredUnitIds: [] });
+          await expect(recoverProgressiveIngestionOwnership(connection, {
+            ...selection,
+            unitIds: [fixture.leases.find((lease) => lease.alpha === 8)!.id],
+          }, { apply: true, manifest: dryRun.manifest })).rejects.toThrow("manifest");
+        } finally {
+          if (previousRole === undefined) delete process.env.AIRFOILFOAM_DEPLOYMENT_ROLE;
+          else process.env.AIRFOILFOAM_DEPLOYMENT_ROLE = previousRole;
+        }
+        expect(await deliver(10)).toMatchObject({ executionId, storageOnly: false });
+        expect(await readEvidence()).toEqual([{ sources: 8, receipts: 8, attempts: 8, linked: 8, published: 0 }]);
+      } else {
+        const ownershipAfter = await readOwnership();
+        expect(ownershipAfter.find((unit) => unit.aoa_deg === 10)).toMatchObject({
+          state: "pending", outcome: "failed", lease_token: null, lease_owner: null, lease_until: null,
+          error: "Retrying after terminal execution without measurable case evidence",
+        });
+        if (sources === "other-angle")
+          expect(ownershipAfter.filter((unit) => unit.aoa_deg !== 10))
+            .toEqual(ownershipBefore.filter((unit) => unit.aoa_deg !== 10));
+      }
+      throw rollback;
+    })).rejects.toBe(rollback);
+  }, 120_000);
+
   it("requeues one ordinary retry for stopped terminal executions with no measurable evidence", async () => {
     const fixture = await fitFixture(2, false, [0]);
     const lease = fixture.leases[0];
@@ -2647,6 +3180,14 @@ describe("progressive durable stage transitions", () => {
       simJobId: fixture.composed.jobId,
       proof: executionStopProof(fixture.engineJobId),
     });
+    await db.execute(sql`UPDATE sim_jobs SET status = 'ingesting', engine_state = 'completed',
+      "updatedAt" = clock_timestamp() - interval '20 minutes'
+      WHERE id = ${fixture.composed.jobId}::uuid`);
+    expect(await recoverTerminalProgressiveNoEvidenceGaps(db)).toBe(1);
+    expect(await db.execute(sql`SELECT state, lease_token FROM progressive_cfd_units WHERE id = ${lease.id}::uuid`))
+      .toEqual([{ state: "pending", lease_token: null }]);
+    expect(await db.execute(sql`SELECT outcome FROM progressive_cfd_attempts WHERE token = ${lease.token}::uuid`))
+      .toEqual([{ outcome: "failed" }]);
     await db.execute(sql`
       UPDATE progressive_cfd_attempts
       SET outcome = 'failed', sim_job_id = ${fixture.composed.jobId}::uuid,
@@ -5633,6 +6174,146 @@ describe("progressive execution stop and settlement", () => {
       { state: "claimed", claim_attempt_token: claimed!.token },
     ]);
   });
+
+  it("continues one bounded precise full-URANS case from settled wall-clock evidence", async () => {
+    const fixture = await fitFixture(3, false, [-2, 0, 2], 1);
+    const lease = fixture.leases[0];
+    const resultAttemptId = await fixture.save(
+      PROGRESSIVE_COMPUTE_POLICY.preciseInitialActiveSeconds,
+      "urans",
+      lease.alpha,
+      {
+        fidelity: "urans_full",
+        force_history: {
+          t: [0, 1],
+          cl: [0, 0],
+          cd: [0.02, 0.02],
+          cm: [0, 0],
+        },
+      },
+    );
+    await db
+      .update(resultAttempts)
+      .set({
+        engineJobId: fixture.engineJobId,
+        engineCaseSlug: "c0p1_u30/a0",
+        error: "URANS integration stopped by the wall-clock budget guard",
+        qualityWarnings: ["stopped by the wall-clock budget guard"],
+      })
+      .where(eq(resultAttempts.id, resultAttemptId));
+    await fixture.record([resultAttemptId]);
+    await db.execute(sql`UPDATE progressive_cfd_attempts
+      SET outcome = 'running', active_seconds = ${PROGRESSIVE_COMPUTE_POLICY.preciseInitialActiveSeconds},
+        finished_at = NULL, error = 'active compute budget exhausted'
+      WHERE token = ${lease.token}`);
+    await db.execute(sql`UPDATE progressive_cfd_units
+      SET attempts = 2, active_seconds = ${PROGRESSIVE_COMPUTE_POLICY.preciseInitialActiveSeconds},
+        state = 'blocked', lease_token = NULL, lease_owner = NULL, lease_until = NULL
+      WHERE id = ${lease.id}`);
+    await acknowledgeProgressiveCfdExecutionStop(db, {
+      simJobId: fixture.composed.jobId,
+      proof: executionStopProof(fixture.engineJobId),
+    });
+    await db
+      .update(simJobs)
+      .set({ status: "failed", ingestedAt: new Date() })
+      .where(eq(simJobs.id, fixture.composed.jobId));
+
+    expect(await settleProgressiveCfdExecution(db, fixture.composed.jobId)).toMatchObject({
+      complete: 0,
+      retry: 1,
+      gaps: 0,
+    });
+    expect(
+      await db.execute(sql`SELECT source_attempt_token, source_result_attempt_id, extension_seconds, state
+        FROM progressive_cfd_budget_extensions WHERE unit_id = ${lease.id}`),
+    ).toEqual([
+      {
+        source_attempt_token: lease.token,
+        source_result_attempt_id: resultAttemptId,
+        extension_seconds: PROGRESSIVE_COMPUTE_POLICY.preciseInitialActiveSeconds,
+        state: "pending",
+      },
+    ]);
+
+    const continuationLease = await claimProgressiveCfdUnit(db, {
+      owner: "precise-continuation-test",
+      leaseSeconds: 120,
+      solverBudgetVersion: 2,
+      localTimeStepVersion: 1,
+    });
+    expect(continuationLease).toMatchObject({
+      id: lease.id,
+      stage: 3,
+      remainingActiveSeconds:
+        PROGRESSIVE_COMPUTE_POLICY.preciseInitialActiveSeconds,
+      budgetExtension: {
+        sourceResultAttemptId: resultAttemptId,
+        engineJobId: fixture.engineJobId,
+        engineCaseSlug: "c0p1_u30/a0",
+        extensionSeconds:
+          PROGRESSIVE_COMPUTE_POLICY.preciseInitialActiveSeconds,
+      },
+    });
+
+    const [pool] = await db
+      .select()
+      .from(solverExecutionPools)
+      .where(
+        eq(
+          solverExecutionPools.solverImplementationId,
+          fixture.execution.revision.solverImplementationId!,
+        ),
+      )
+      .limit(1);
+    const [priorAdmission] = await db
+      .select({ enabled: sweeperState.enabled })
+      .from(sweeperState)
+      .where(eq(sweeperState.id, 1));
+    await db
+      .update(sweeperState)
+      .set({ enabled: true })
+      .where(eq(sweeperState.id, 1));
+    await db
+      .update(solverExecutionPools)
+      .set({ enabled: true })
+      .where(eq(solverExecutionPools.id, pool.id));
+    let composed: Awaited<ReturnType<typeof composeProgressiveCfdJob>>;
+    try {
+      composed = await composeProgressiveCfdJob(db, [continuationLease!], {
+        cpuSlots: 1,
+        meshRecoveryVersion: 1,
+        uransRecoveryVersion: 2,
+        solverBudgetVersion: 2,
+        localTimeStepVersion: 1,
+      });
+    } finally {
+      await db
+        .update(solverExecutionPools)
+        .set({ enabled: pool.enabled })
+        .where(eq(solverExecutionPools.id, pool.id));
+      await db
+        .update(sweeperState)
+        .set({ enabled: priorAdmission?.enabled ?? false })
+        .where(eq(sweeperState.id, 1));
+    }
+    expect(composed.request.continue_from).toEqual({
+      engine_job_id: fixture.engineJobId,
+      case_slug: "c0p1_u30/a0",
+    });
+    expect(composed.request.budget_override_s).toBe(
+      PROGRESSIVE_COMPUTE_POLICY.preciseInitialActiveSeconds,
+    );
+    expect(composed.request.expected_urans_recovery_version).toBe(2);
+    const [storedJob] = await db
+      .select({ parentJobId: simJobs.parentJobId, totalCases: simJobs.totalCases })
+      .from(simJobs)
+      .where(eq(simJobs.id, composed.jobId));
+    expect(storedJob).toEqual({
+      parentJobId: fixture.engineJobId,
+      totalCases: 1,
+    });
+  }, 120_000);
 
   it("reopens only settled FAST budget gaps with matching immutable URANS evidence", async () => {
     const fixture = await fitFixture(2, false, [-1, 0, 1]);

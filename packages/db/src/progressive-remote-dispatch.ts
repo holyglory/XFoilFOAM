@@ -280,7 +280,20 @@ export async function bindProgressiveRemoteDispatch(
       );
     const current = await connection.execute(sql`
       SELECT attempt.token, unit.id AS unit_id, unit.aoa_deg,
-        ${progressiveCfdEffectiveBudgetSql(sql`unit`)} - unit.active_seconds AS remaining_seconds
+        CASE WHEN EXISTS (
+          SELECT 1 FROM progressive_cfd_budget_extensions extension
+          WHERE extension.unit_id = unit.id
+            AND extension.state = 'claimed'
+            AND extension.claim_attempt_token = attempt.token
+        ) THEN LEAST(
+          ${progressiveCfdEffectiveBudgetSql(sql`unit`)} - unit.active_seconds,
+          (SELECT extension.extension_seconds
+           FROM progressive_cfd_budget_extensions extension
+           WHERE extension.unit_id = unit.id
+             AND extension.state = 'claimed'
+             AND extension.claim_attempt_token = attempt.token
+           LIMIT 1)
+        ) ELSE ${progressiveCfdEffectiveBudgetSql(sql`unit`)} - unit.active_seconds END AS remaining_seconds
       FROM progressive_cfd_attempts attempt
       JOIN progressive_cfd_units unit ON unit.id = attempt.unit_id AND unit.lease_token = attempt.token
       JOIN progressive_work work ON work.id = unit.work_id

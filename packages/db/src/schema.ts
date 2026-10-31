@@ -7411,7 +7411,7 @@ export const progressiveCfdUnits = pgTable(
     ),
     attemptsCheck: check(
       "progressive_cfd_units_attempts_check",
-      sql`${table.attempts} BETWEEN 0 AND 4`,
+      sql`${table.attempts} BETWEEN 0 AND 5`,
     ),
     leaseCheck: check(
       "progressive_cfd_units_check",
@@ -7466,6 +7466,33 @@ export const progressiveCfdAttempts = pgTable(
       "progressive_cfd_attempts_active_seconds_check",
       sql`${table.activeSeconds} >= 0 AND ${table.activeSeconds} < 'Infinity'::double precision`,
     ),
+  }),
+);
+
+export const progressiveIngestionOwnershipRecoveries = pgTable(
+  "progressive_ingestion_ownership_recoveries",
+  {
+    attemptToken: uuid("attempt_token").primaryKey()
+      .references(() => progressiveCfdAttempts.token, { onDelete: "cascade" }),
+    unitId: uuid("unit_id").notNull()
+      .references(() => progressiveCfdUnits.id, { onDelete: "cascade" }),
+    simJobId: uuid("sim_job_id").notNull()
+      .references(() => simJobs.id, { onDelete: "cascade" }),
+    manifestSignature: text("manifest_signature").notNull(),
+    manifest: jsonb("manifest").$type<Record<string, unknown>>().notNull(),
+    priorState: jsonb("prior_state").$type<Record<string, unknown>>().notNull(),
+    restoredLeaseUntil: timestamp("restored_lease_until", { withTimezone: true }).notNull(),
+    restoredAt: timestamp("restored_at", { withTimezone: true }).notNull().default(sql`clock_timestamp()`),
+    databaseActor: text("database_actor").notNull().default(sql`current_user`),
+  },
+  (table) => ({
+    jobIdx: index("progressive_ingestion_ownership_recoveries_job_idx").on(table.simJobId, table.unitId),
+    signatureCheck: check("progressive_ingestion_ownership_recoveries_manifest_signature_check",
+      sql`${table.manifestSignature} ~ '^[a-f0-9]{64}$'`),
+    manifestCheck: check("progressive_ingestion_ownership_recoveries_manifest_check",
+      sql`jsonb_typeof(${table.manifest}) = 'object'`),
+    priorCheck: check("progressive_ingestion_ownership_recoveries_prior_state_check",
+      sql`jsonb_typeof(${table.priorState}) = 'object'`),
   }),
 );
 
@@ -8128,6 +8155,9 @@ export const progressiveWorkerReports = pgTable(
       .where(sql`${table.acknowledgedAt} IS NOT NULL AND jsonb_typeof(${table.report}->'result')='object' AND ${table.stoppedEngineJobId} IS NOT NULL`),
     stagingCandidateIdx: index("progressive_worker_reports_staging_candidate_idx")
       .on(table.simJobId, table.sequence, table.createdAt)
+      .where(sql`${table.acknowledgedAt} IS NOT NULL AND jsonb_typeof(${table.report}->'result')='object'`),
+    stagingJobOrderIdx: index("progressive_worker_reports_staging_job_order_idx")
+      .on(table.simJobId, table.createdAt, table.sequence)
       .where(sql`${table.acknowledgedAt} IS NOT NULL AND jsonb_typeof(${table.report}->'result')='object'`),
     primary: primaryKey({ columns: [table.simJobId, table.sequence] }),
     pendingIdx: index("progressive_worker_reports_pending_idx")
