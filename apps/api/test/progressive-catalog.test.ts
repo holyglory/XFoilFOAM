@@ -80,10 +80,13 @@ it("excludes selected benchmark attempts from public CFD points and cached fits 
         isolated.connection = connection;
         const prefix = `benchmark-public-${randomUUID()}`;
         const fixture = await createMinimalSolverFixture(connection, prefix, "air");
+        await connection.execute(
+          sql`UPDATE simulation_preset_revisions SET snapshot=jsonb_set(snapshot,'{flowState,mediumSlug}','"air"') WHERE id=${fixture.revisionId}`,
+        );
         const [category] = await connection.execute(sql`SELECT id FROM categories LIMIT 1`);
         const [airfoil] = await connection.insert(airfoils).values({
           slug: prefix, name: prefix, categoryId: String(category.id),
-          points: [{ x: 1, y: 0 }, { x: 0, y: 0.1 }, { x: 1, y: 0 }],
+          points: [{ x: 1, y: 0 }, { x: 0.5, y: 0.06 }, { x: 0, y: 0 }, { x: 0.5, y: -0.04 }, { x: 1, y: 0 }],
         }).returning();
         const [job] = await connection.insert(simJobs).values({
           airfoilId: airfoil.id, bcIds: [fixture.bcId],
@@ -113,7 +116,7 @@ it("excludes selected benchmark attempts from public CFD points and cached fits 
           const [result] = await connection.insert(results).values(values).returning();
           const [attempt] = await connection.insert(resultAttempts).values({
             ...values, resultId: result.id, validForPolar: true,
-            evidencePayload: { fidelity: "rans" },
+            evidencePayload: { fidelity: "rans", mesh_recovery_version: 3 },
           }).returning();
           await connection.insert(solverEvidenceArtifacts).values({
             resultId: result.id, resultAttemptId: attempt.id, airfoilId: airfoil.id,
@@ -820,6 +823,12 @@ async function verifyPublicCatalog(fullScale: boolean) {
         expect(baselineMetrics.ldmax).toBe(
           baseline.curves[0].metrics.liftToDragMaximum,
         );
+        await connection.execute(sql`UPDATE progressive_polar_fit_work
+          SET state='pending',model_id=NULL,policy_refresh_model_id=NULL,policy_refresh_policy_id=NULL
+          WHERE prediction_id=${second.predictionId}`);
+        expect(await connection.execute(sql`SELECT prediction_id FROM progressive_polar_fit_work
+          WHERE prediction_id IN (${first.predictionId},${second.predictionId})
+            AND state='ready' AND model_id IS NOT NULL`)).toEqual([{ prediction_id: first.predictionId }]);
         expect(
           await invalidateProgressiveFitPolicy(
             connection,

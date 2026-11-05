@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { eq, sql } from "drizzle-orm";
+import { eq, inArray, sql } from "drizzle-orm";
 import { expect } from "vitest";
 import { resultAttempts, resultClassifications, type DB } from "@aerodb/db";
 import {
@@ -157,6 +157,11 @@ export async function verifyProgressivePublicationPrecedence(
         });
         await connection.execute(sql`UPDATE results SET current_result_attempt_id = ${selectedId}::uuid
         WHERE id = ${attempt.resultId}::uuid`);
+        const evidenceBefore = await connection.select().from(resultAttempts)
+          .where(inArray(resultAttempts.id,[resultAttemptId,selectedId])).orderBy(resultAttempts.id);
+        const acceptedBefore = (await connection.select().from(resultClassifications)
+          .where(inArray(resultClassifications.resultAttemptId,[resultAttemptId,selectedId]))
+          .orderBy(resultClassifications.id)).filter(row => row.state === "accepted");
         const settlement = await settleProgressiveRemoteJob(
           connection,
           executionId,
@@ -169,14 +174,18 @@ export async function verifyProgressivePublicationPrecedence(
           LEFT JOIN result_classifications selected ON selected.result_attempt_id=result.current_result_attempt_id
           WHERE result.id=${attempt.resultId}::uuid`);
         expect(settlement, JSON.stringify({ scenario, incomingAttemptId: resultAttemptId, selectedAttemptId: selectedId, publication })).toMatchObject(
-          scenario === "higher-accepted"
-            ? { kind: "settled", counts: { complete: 1, waiting: 0 } }
-            : { kind: "waiting", reason: "accepted_point_publication" },
+          { kind: "settled", counts: { complete: 1, waiting: 0 } },
         );
         const [selected] = await connection.execute(
           sql`SELECT current_result_attempt_id FROM results WHERE id = ${attempt.resultId}::uuid`,
         );
-        expect(selected.current_result_attempt_id).toBe(selectedId);
+        expect(selected.current_result_attempt_id).toBe(scenario === "higher-accepted" ? selectedId : resultAttemptId);
+        expect(publication.incoming_state).toBe("accepted");
+        expect(await connection.select().from(resultAttempts)
+          .where(inArray(resultAttempts.id,[resultAttemptId,selectedId])).orderBy(resultAttempts.id)).toEqual(evidenceBefore);
+        expect(await connection.select().from(resultClassifications)
+          .where(inArray(resultClassifications.id,acceptedBefore.map(row => row.id)))
+          .orderBy(resultClassifications.id)).toEqual(acceptedBefore);
         throw rollback;
       }).catch(error => {
       if (error !== rollback) throw error;
@@ -209,11 +218,13 @@ export async function verifyProgressivePublicationPrecedence(
         WHERE id = ${attempt.resultId}::uuid`);
       await connection.execute(sql`DELETE FROM result_classifications
         WHERE result_attempt_id = ${resultAttemptId}::uuid`);
+      const evidenceBefore = await connection.select().from(resultAttempts)
+        .where(inArray(resultAttempts.id,[resultAttemptId,selectedId])).orderBy(resultAttempts.id);
       expect(
         await settleProgressiveRemoteJob(connection, executionId),
       ).toMatchObject({
-        kind: "waiting",
-        reason: "accepted_point_publication",
+        kind: "settled",
+        counts: { complete: 1, waiting: 0 },
       });
       const [published] = await connection.execute(sql`
         SELECT result.current_result_attempt_id, classification.state
@@ -223,9 +234,11 @@ export async function verifyProgressivePublicationPrecedence(
         WHERE result.id = ${attempt.resultId}::uuid
       `);
       expect(published).toEqual({
-        current_result_attempt_id: selectedId,
+        current_result_attempt_id: resultAttemptId,
         state: "accepted",
       });
+      expect(await connection.select().from(resultAttempts)
+        .where(inArray(resultAttempts.id,[resultAttemptId,selectedId])).orderBy(resultAttempts.id)).toEqual(evidenceBefore);
       throw unclassifiedRollback;
     }),
   ).rejects.toBe(unclassifiedRollback);
