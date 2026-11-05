@@ -4646,3 +4646,18 @@ command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/api", "typecheck"]
 name = "sweeper-types"
 tier = "development"
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "typecheck"]
+
+[test.fast-v2-report-artifact]
+timeout_seconds = 180
+
+[[test.fast-v2-report-artifact.check]]
+name = "artifact-contracts"
+tier = "development"
+command = ["node", "--test", "scripts/dev/package-fast-v2-report.test.mjs"]
+
+[[test.fast-v2-report-artifact.check]]
+name = "package-and-verify"
+tier = "development"
+requires = ["artifact-contracts"]
+command = ["node", "scripts/dev/package-fast-v2-report.mjs"]
+retained_artifacts = [{ name = "measured-benchmark-report", path = "scripts/dev/.codex-artifacts/fast-v2-report-20261105-v2", max_bytes = 8388608 }]
