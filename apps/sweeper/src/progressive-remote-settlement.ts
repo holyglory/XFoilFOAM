@@ -730,8 +730,13 @@ export async function settleProgressiveRemoteJob(db: DB, executionId: string) {
       return { kind: "waiting" as const, reason: "campaign_lock" };
     const [job] =
       await connection.execute(sql`SELECT engine_job_id, request_payload, status, "ingestedAt",
-        ingest_lease_expires_at > clock_timestamp() AS ingestion_owned
-      FROM sim_jobs WHERE id = ${executionId}::uuid FOR UPDATE`);
+        ingest_lease_expires_at > clock_timestamp() AS ingestion_owned,
+        EXISTS (
+          SELECT 1 FROM progressive_generations generation
+          WHERE generation.id::text = job.request_payload->'progressive'->>'generationId'
+            AND generation.benchmark_only
+        ) AS benchmark_only
+      FROM sim_jobs job WHERE id = ${executionId}::uuid FOR UPDATE`);
     if (
       !job ||
       job.engine_job_id !== executionId ||
@@ -857,6 +862,7 @@ export async function settleProgressiveRemoteJob(db: DB, executionId: string) {
             AND review."revokedAt" IS NULL ORDER BY review."createdAt" DESC, review.id DESC LIMIT 1), '') NOT IN ('exclude', 'defer')
           AND result.current_result_attempt_id IS DISTINCT FROM raw.id`);
       if (
+        job.benchmark_only !== true &&
         unpublished.some(
           (source) =>
             source.selected_accepted !== true ||
