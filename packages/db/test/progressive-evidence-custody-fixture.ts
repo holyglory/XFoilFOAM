@@ -491,7 +491,7 @@ async function exerciseProgressiveArchiveCustody(
       SELECT status FROM sync_sweep_promises WHERE id = ${source.promiseId}::uuid
     `);
     expect(retiredPromise.status).toBe(
-      status === "active" ? "cancelled" : status,
+      status === "active" || status === "expired" ? "cancelled" : status,
     );
     const [retiredPoint] = await db.execute(sql`
       SELECT status, result_id, result_attempt_id FROM sync_sweep_promise_points WHERE id = ${point.id}::uuid

@@ -133,17 +133,23 @@ async function verifyParallelStagingClaims(
     const interruption = new Error(
       "Finish isolated parallel claim observation",
     );
+    let claiming = true;
     const stages = Promise.allSettled(
-      Array.from({ length: 4 }, () =>
-        stageNextProgressiveWorkerEvidence(db, engine, {
+      Array.from({ length: 4 }, async () => {
+        while (claiming) {
+          const staged = await stageNextProgressiveWorkerEvidence(db, engine, {
           afterEvidenceClaimed: async (executionId) => {
             claimed.add(executionId);
             if (claimed.size === 4) allClaimed();
             await gate;
             throw interruption;
           },
-        }),
-      ),
+          });
+          if (staged) return staged;
+          await new Promise(resolve => setTimeout(resolve, 10));
+        }
+        return false;
+      }),
     );
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
@@ -170,6 +176,7 @@ async function verifyParallelStagingClaims(
       expect(leased.every((row) => row.token !== null)).toBe(true);
     } finally {
       clearTimeout(timer);
+      claiming = false;
       release();
       const completed = await stages;
       expect(
@@ -177,6 +184,12 @@ async function verifyParallelStagingClaims(
           (result) =>
             result.status === "rejected" && result.reason === interruption,
         ),
+        JSON.stringify({
+          claimed: [...claimed],
+          completed: completed.map(result => result.status === "rejected"
+            ? { status: result.status, reason: String(result.reason) }
+            : result),
+        }),
       ).toBe(true);
     }
     const released = await db

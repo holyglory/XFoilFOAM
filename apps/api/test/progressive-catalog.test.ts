@@ -23,6 +23,7 @@ import {
   results,
   simJobs,
   solverEvidenceArtifacts,
+  solverGeometryCompatibility,
 } from "@aerodb/db";
 import {
   refreshPolarCacheForRevision,
@@ -30,6 +31,7 @@ import {
   refreshPolarCompatibilityCache,
 } from "@aerodb/db/polar-cache";
 import { resolveRevisionMethodCompatibilityHash } from "@aerodb/db/polar-compatibility-cache";
+import { ensureSimulationPresetRevision } from "@aerodb/db/simulation-setup";
 import { promoteRetainedProgressiveAttempts } from "../../sweeper/src/progressive-remote-settlement";
 
 const isolated = vi.hoisted(() => ({
@@ -80,9 +82,11 @@ it("excludes selected benchmark attempts from public CFD points and cached fits 
         isolated.connection = connection;
         const prefix = `benchmark-public-${randomUUID()}`;
         const fixture = await createMinimalSolverFixture(connection, prefix, "air");
-        await connection.execute(
-          sql`UPDATE simulation_preset_revisions SET snapshot=jsonb_set(snapshot,'{flowState,mediumSlug}','"air"') WHERE id=${fixture.revisionId}`,
-        );
+        const [sourceRevision] = await connection.execute(sql`SELECT preset_id FROM simulation_preset_revisions WHERE id=${fixture.revisionId}::uuid`);
+        const resolved = await ensureSimulationPresetRevision(connection,String(sourceRevision.preset_id));
+        expect(resolved).not.toBeNull();
+        fixture.revisionId = resolved!.revision.id;
+        expect(resolved!.revision.methodCompatibilityHash).toMatch(/^[a-f0-9]{64}$/);
         const [category] = await connection.execute(sql`SELECT id FROM categories LIMIT 1`);
         const [airfoil] = await connection.insert(airfoils).values({
           slug: prefix, name: prefix, categoryId: String(category.id),
@@ -120,6 +124,7 @@ it("excludes selected benchmark attempts from public CFD points and cached fits 
           }).returning();
           await connection.insert(solverEvidenceArtifacts).values({
             resultId: result.id, resultAttemptId: attempt.id, airfoilId: airfoil.id,
+            simJobId: job.id,
             aoaDeg: alpha, kind: "manifest", storageKey: `${prefix}/${alpha}/manifest.json`,
             mimeType: "application/json", sha256: signature(), byteSize: 128,
           });
@@ -140,8 +145,24 @@ it("excludes selected benchmark attempts from public CFD points and cached fits 
         expect(before).toHaveLength(5);
         expect(before.every(row => row.classification_state === "accepted")).toBe(true);
         const publicDetail = await assembleDetail(prefix);
-        expect(publicDetail!.polars.flatMap(polar => polar.points), "ordinary CFD control before benchmark exclusion").toHaveLength(5);
-        expect((await assembleDetail(prefix, { revisionId: fixture.revisionId }))!.polars[0].fit?.points.length).toBeGreaterThan(0);
+        const pinnedControl = await assembleDetail(prefix, { revisionId: fixture.revisionId });
+        const geometry = await solverGeometryCompatibility(connection,airfoil.id,airfoil.points,
+          before.map(row => ({ attemptId: String(row.id), source: String(row.source),
+            meshRecoveryVersion: (row.evidence_payload as Record<string,unknown>).mesh_recovery_version })));
+        const [eligibility] = await connection.execute(sql`SELECT medium.slug AS medium,preset.enabled,
+          revision.method_compatibility_hash,revision.method_compatibility_hash_version,
+          revision.snapshot->'flowState'->>'mediumSlug' AS snapshot_medium,
+          (SELECT jsonb_agg(jsonb_build_object('hash',fit.compatibility_hash,'accepted',fit.accepted_point_count,
+            'members',(SELECT count(*) FROM polar_compatibility_fit_members member WHERE member.fit_set_id=fit.id)))
+            FROM polar_compatibility_fit_sets fit WHERE fit.airfoil_id=${airfoil.id}::uuid AND fit.is_current) AS caches
+          FROM simulation_preset_revisions revision JOIN simulation_presets preset ON preset.id=revision.preset_id
+          JOIN flow_conditions flow ON flow.id=preset.flow_condition_id JOIN mediums medium ON medium.id=flow.medium_id
+          WHERE revision.id=${fixture.revisionId}::uuid`);
+        expect(publicDetail!.polars.flatMap(polar => polar.points), JSON.stringify({
+          control: "ordinary CFD before benchmark exclusion", pinnedPoints: pinnedControl?.polars[0]?.points.length ?? null,
+          geometry: Object.fromEntries(geometry), eligibility: eligibility ?? null,
+        })).toHaveLength(5);
+        expect(pinnedControl!.polars[0].fit?.points.length).toBeGreaterThan(0);
         expect((await listAirfoils({ q: prefix }))[0].ldmax).not.toBeNull();
         for (const mode of ["generation", "recipe", "precise"] as const) {
           await connection.execute(sql`UPDATE progressive_generations SET benchmark_only=${mode === "generation"}`);
@@ -177,6 +198,7 @@ it("excludes selected benchmark attempts from public CFD points and cached fits 
         }))).returning();
         await connection.insert(solverEvidenceArtifacts).values(replacements.map(attempt => ({
           resultId: attempt.resultId, resultAttemptId: attempt.id, airfoilId: airfoil.id,
+          simJobId: replacementJob.id,
           aoaDeg: attempt.aoaDeg, kind: "manifest" as const, storageKey: `${prefix}/replacement/${attempt.aoaDeg}/manifest.json`,
           mimeType: "application/json", sha256: signature(), byteSize: 128,
         })));

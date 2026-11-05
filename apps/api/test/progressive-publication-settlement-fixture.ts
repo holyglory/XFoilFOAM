@@ -161,7 +161,8 @@ export async function verifyProgressivePublicationPrecedence(
           .where(inArray(resultAttempts.id,[resultAttemptId,selectedId])).orderBy(resultAttempts.id);
         const acceptedBefore = (await connection.select().from(resultClassifications)
           .where(inArray(resultClassifications.resultAttemptId,[resultAttemptId,selectedId]))
-          .orderBy(resultClassifications.id)).filter(row => row.state === "accepted");
+          .orderBy(resultClassifications.id)).filter(row => row.state === "accepted")
+          .map(({ updatedAt: _updatedAt, ...facts }) => facts);
         const settlement = await settleProgressiveRemoteJob(
           connection,
           executionId,
@@ -185,7 +186,7 @@ export async function verifyProgressivePublicationPrecedence(
           .where(inArray(resultAttempts.id,[resultAttemptId,selectedId])).orderBy(resultAttempts.id)).toEqual(evidenceBefore);
         expect(await connection.select().from(resultClassifications)
           .where(inArray(resultClassifications.id,acceptedBefore.map(row => row.id)))
-          .orderBy(resultClassifications.id)).toEqual(acceptedBefore);
+          .orderBy(resultClassifications.id).then(rows => rows.map(({ updatedAt: _updatedAt, ...facts }) => facts))).toEqual(acceptedBefore);
         throw rollback;
       }).catch(error => {
       if (error !== rollback) throw error;
@@ -244,11 +245,10 @@ export async function verifyProgressivePublicationPrecedence(
   ).rejects.toBe(unclassifiedRollback);
   for (const ingested of [false, true]) {
     const rollback = new Error("Rollback exact accepted publication");
-    await expect(
-      db.transaction(async (raw) => {
+    const restored = await db.transaction(async (raw) => {
         const connection = raw as unknown as DB;
         await connection.execute(sql`UPDATE results
-        SET current_result_attempt_id = NULL
+        SET current_result_attempt_id = ${ingested ? resultAttemptId : null}::uuid
         WHERE id = ${attempt.resultId}::uuid`);
         if (ingested) {
           await connection.execute(sql`UPDATE sim_jobs
@@ -264,7 +264,7 @@ export async function verifyProgressivePublicationPrecedence(
           attempt.airfoilId,
           attempt.simulationPresetRevisionId!,
         );
-        await expectedCache(connection, 0);
+        await expectedCache(connection, ingested ? 1 : 0);
         const original = await connection
           .select()
           .from(resultAttempts)
@@ -276,6 +276,7 @@ export async function verifyProgressivePublicationPrecedence(
           await connection.execute(
             sql`SELECT current_result_attempt_id FROM results WHERE id = ${attempt.resultId}::uuid`,
           ),
+          `exact accepted publication after ingested=${ingested}`,
         ).toEqual([{ current_result_attempt_id: resultAttemptId }]);
         await expectedCache(connection, 1);
         expect(
@@ -288,9 +289,23 @@ export async function verifyProgressivePublicationPrecedence(
             .from(resultAttempts)
             .where(eq(resultAttempts.id, resultAttemptId)),
         ).toEqual(original);
+        if (ingested) {
+          await connection.execute(sql`UPDATE results SET current_result_attempt_id=NULL
+            WHERE id=${attempt.resultId}::uuid`);
+          await refreshPolarCacheForRevision(connection,attempt.airfoilId,attempt.simulationPresetRevisionId!);
+          await expectedCache(connection,0);
+          expect(await settleProgressiveRemoteJob(connection,executionId)).toMatchObject({ kind: "settled" });
+          expect(await connection.execute(sql`SELECT current_result_attempt_id FROM results
+            WHERE id=${attempt.resultId}::uuid`)).toEqual([{ current_result_attempt_id: null }]);
+          await expectedCache(connection,0);
+          expect(await connection.select().from(resultAttempts).where(eq(resultAttempts.id,resultAttemptId))).toEqual(original);
+        }
         throw rollback;
-      }),
-    ).rejects.toBe(rollback);
+      }).catch(error => {
+        if (error !== rollback) throw error;
+        return rollback;
+      });
+    expect(restored).toBe(rollback);
   }
   for (const unavailable of ["archive", "excluded", "deferred"] as const) {
     const rollback = new Error(
@@ -341,6 +356,9 @@ export async function verifyProgressivePublicationPrecedence(
         SET status = 'cancelled', response_payload = jsonb_build_object('authoritativeLeaseLoss', true)
         WHERE id = (SELECT promise_id FROM progressive_remote_dispatches
           WHERE sim_job_id = ${executionId}::uuid)`);
+      await connection.execute(sql`UPDATE sim_jobs SET status='cancelled' WHERE id=${executionId}::uuid`);
+      const evidenceBefore = await connection.select().from(resultAttempts)
+        .where(inArray(resultAttempts.id,[resultAttemptId,selectedId])).orderBy(resultAttempts.id);
       expect(
         await settleProgressiveRemoteJob(connection, executionId),
       ).toMatchObject({ kind: "settled" });
@@ -349,6 +367,8 @@ export async function verifyProgressivePublicationPrecedence(
           sql`SELECT current_result_attempt_id FROM results WHERE id = ${attempt.resultId}::uuid`,
         ),
       ).toEqual([{ current_result_attempt_id: selectedId }]);
+      expect(await connection.select().from(resultAttempts)
+        .where(inArray(resultAttempts.id,[resultAttemptId,selectedId])).orderBy(resultAttempts.id)).toEqual(evidenceBefore);
       throw rollback;
     }),
   ).rejects.toBe(rollback);

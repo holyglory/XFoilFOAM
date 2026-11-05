@@ -22,7 +22,10 @@ import {
 import type { importPolarPush } from "../src/sync-routes";
 import { env } from "../src/env";
 import { applyProgressiveRemoteProgress } from "../../sweeper/src/progressive-remote-progress";
-import { settleProgressiveRemoteJob } from "../../sweeper/src/progressive-remote-settlement";
+import {
+  promoteRetainedProgressiveAttempts,
+  settleProgressiveRemoteJob,
+} from "../../sweeper/src/progressive-remote-settlement";
 import { verifyProgressivePublicationPrecedence } from "./progressive-publication-settlement-fixture";
 
 export async function verifyProgressivePolarArchiveImport(input: {
@@ -254,6 +257,18 @@ export async function verifyProgressivePolarArchiveImport(input: {
               input.delivery.engineJobId,
               input.retained.resultAttemptId,
             );
+            const [beforePromotion] = await connection.execute(sql`SELECT current_result_attempt_id,
+              airfoil_id,simulation_preset_revision_id
+              FROM results WHERE id=${input.retained.resultId}::uuid`);
+            expect(beforePromotion.current_result_attempt_id).toBeNull();
+            expect(
+              await promoteRetainedProgressiveAttempts(connection, {
+                executionId: input.delivery.engineJobId,
+                airfoilId: String(beforePromotion.airfoil_id),
+                simulationPresetRevisionId: String(beforePromotion.simulation_preset_revision_id),
+                attemptIds: [input.retained.resultAttemptId],
+              }),
+            ).toBe(true);
           }
           const accepted = await post();
           expect(accepted.statusCode, accepted.body).toBe(200);
