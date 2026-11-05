@@ -227,8 +227,8 @@ export async function advanceProgressiveGenerationCohorts(db: DB, generationId: 
       ${progressiveExecutionPolicySql()} AS cohort_policy
     FROM progressive_generations generation WHERE generation.id = ${generationId}::uuid FOR UPDATE
   `);
-  if (generation?.benchmark_only === true) return false;
   if (!generation?.cohort_policy) return false;
+  const benchmarkOnly = generation.benchmark_only === true;
   const [baseline] = await db.execute(sql`
     SELECT EXISTS (SELECT 1 FROM progressive_work WHERE generation_id = ${generationId}::uuid
       AND stage = 1 AND state NOT IN ('complete', 'gap')) AS pending
@@ -240,14 +240,17 @@ export async function advanceProgressiveGenerationCohorts(db: DB, generationId: 
   for (const cursor of cursors) {
     const [counts] = await db.execute(sql`
       SELECT count(*) FILTER (WHERE work.stage = 2 AND work.state NOT IN ('complete', 'gap'))::int AS fast_open,
+        count(*) FILTER (WHERE work.stage = 2 AND work.state = 'gap')::int AS fast_gaps,
         count(*) FILTER (WHERE work.stage = 3 AND work.state NOT IN ('complete', 'gap'))::int AS precise_open,
         count(*) FILTER (WHERE work.stage = 3 AND work.state = 'gap')::int AS precise_gaps
       FROM progressive_generation_cohort_targets member
       JOIN progressive_work work ON work.generation_id = member.generation_id AND work.target_id = member.target_id
       WHERE member.generation_id = ${generationId}::uuid AND member.cohort = ${cursor.cohort}
     `);
-    const stage = Number(counts.fast_open) ? 2 : 3;
-    const status = stage === 2 || Number(counts.precise_open) ? "active" : Number(counts.precise_gaps) ? "attention" : "complete";
+    const stage = benchmarkOnly || Number(counts.fast_open) ? 2 : 3;
+    const open = stage === 2 ? Number(counts.fast_open) : Number(counts.precise_open);
+    const gaps = stage === 2 ? Number(counts.fast_gaps) : Number(counts.precise_gaps);
+    const status = open ? "active" : gaps ? "attention" : "complete";
     await db.execute(sql`
       UPDATE progressive_generation_cohorts SET stage = ${stage}, status = ${status}, updated_at = clock_timestamp()
       WHERE generation_id = ${generationId}::uuid AND cohort = ${cursor.cohort}
@@ -289,11 +292,11 @@ export async function adoptProgressiveSubsonicPriority(db: DB, campaignId: strin
       SELECT policy, adopted_at FROM campaign_progressive_execution_policies WHERE campaign_id = ${campaignId}::uuid
     `);
     const generations = await connection.execute(sql`
-      SELECT id FROM progressive_generations WHERE campaign_id = ${campaignId}::uuid AND epoch_id = ${epoch.id}
+      SELECT id, benchmark_only FROM progressive_generations WHERE campaign_id = ${campaignId}::uuid AND epoch_id = ${epoch.id}
         AND plan_revision_id = ${campaign.current_plan_revision_id} AND status <> 'cancelled' ORDER BY id FOR UPDATE
     `);
-    if (inserted.length) {
-      for (const generation of generations) {
+    for (const generation of generations) {
+      if (inserted.length || generation.benchmark_only === true) {
         await initializeProgressiveGenerationCohorts(connection, String(generation.id));
         await advanceProgressiveGenerationCohorts(connection, String(generation.id));
       }

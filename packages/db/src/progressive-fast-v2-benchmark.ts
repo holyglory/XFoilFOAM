@@ -17,6 +17,7 @@ import {
   type SealedPolarTarget,
 } from "./progressive-campaigns";
 import { initializeProgressiveCfdWork } from "./progressive-cfd";
+import { adoptProgressiveSubsonicPriority } from "./progressive-execution-policy";
 import { reusePreviousBaselines } from "./progressive-recipe-adoption";
 import {
   isLowMachBenchmarkMach,
@@ -581,6 +582,7 @@ export async function launchFastV2Benchmark(
         connection,
         existing.id,
       );
+      await adoptProgressiveSubsonicPriority(connection, existing.id);
       const initialized = await initializeProgressiveCfdWork(
         connection,
         existing.id,
@@ -721,6 +723,7 @@ export async function launchFastV2Benchmark(
       throw new Error(
         "Fast-v2 benchmark requires complete reusable NeuralFoil baselines",
       );
+    await adoptProgressiveSubsonicPriority(connection, String(campaign.id));
     const initialized = await initializeProgressiveCfdWork(
       connection,
       String(campaign.id),
