@@ -97,7 +97,7 @@ async function sourceForPrediction(
       ORDER BY interpretation."createdAt" DESC, interpretation.id DESC LIMIT 1) interpretation ON true
     WHERE work.target_id = ${prediction.target_id} AND generation.epoch_id = ${prediction.epoch_id}
       AND generation.benchmark_only = false
-      AND NOT (work.stage = 2 AND scope.recipes->'fast'->>'publication' = ${PROGRESSIVE_BENCHMARK_PUBLICATION})
+      AND (work.stage = 2 AND scope.recipes->'fast'->>'publication' = ${PROGRESSIVE_BENCHMARK_PUBLICATION}) IS NOT TRUE
     ORDER BY receipt.result_attempt_id LIMIT 257
   `);
   if (records.length > 256)
@@ -222,7 +222,7 @@ export async function claimProgressivePolarFit(
         }
         WHERE generation.epoch_id=${epoch.id}
           AND generation.benchmark_only = false
-          AND NOT (source_work.stage=2 AND source_scope.recipes->'fast'->>'publication' = ${PROGRESSIVE_BENCHMARK_PUBLICATION})
+          AND (source_work.stage=2 AND source_scope.recipes->'fast'->>'publication' = ${PROGRESSIVE_BENCHMARK_PUBLICATION}) IS NOT TRUE
           ${input.currentCampaignEvidenceOnly ? sql`AND generation.status<>'cancelled'` : sql``}
         UNION
         SELECT DISTINCT successor_work.target_id
@@ -243,7 +243,7 @@ export async function claimProgressivePolarFit(
           AND successor_generation.status<>'cancelled'
           AND successor_generation.benchmark_only = false
           AND source_generation.benchmark_only = false
-          AND NOT (source_work.stage=2 AND source_scope.recipes->'fast'->>'publication' = ${PROGRESSIVE_BENCHMARK_PUBLICATION})
+          AND (source_work.stage=2 AND source_scope.recipes->'fast'->>'publication' = ${PROGRESSIVE_BENCHMARK_PUBLICATION}) IS NOT TRUE
           ${
             input.currentCampaignEvidenceOnly
               ? sql`AND successor_campaign.current_plan_revision_id=successor_generation.plan_revision_id

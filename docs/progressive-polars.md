@@ -1260,9 +1260,20 @@ corepack pnpm --filter @aerodb/db benchmark:fast-v2 -- \
   --output /tmp/low-mach-fast-v2-report.json
 ```
 
-The report uses accumulated solver active seconds and accepted stored evidence
-for each angle, then compares matching current-fast and fast-v2 coefficients.
-Missing angles remain unavailable; no interpolation is used for the comparison.
+The report separates cumulative active-time cost, including failed retries, from
+paired first-pass cost at the exact same physical target, angle, purpose and solver
+regime. Initial and adaptive points are reported separately. First-pass timing
+uses each unit's earliest attempt and requires terminal retained evidence; failed
+attempts remain included, and its cost ratio is not an equal-accuracy speedup or
+wall-clock throughput.
+The subset with eligible evidence on both sides has a separate paired cost ratio.
+Coefficient differences use only eligible retained evidence at the exact same
+target and angle, with stable result/attempt ids; convergence or agreement between
+recipes does not certify physical accuracy. Failed, unfinished, missing and
+uninitialized work remains explicit. Partial pairs may be inspected, but a final
+comparison stays unavailable or inconclusive until both variants finish with
+matching coverage and eligible evidence; no interpolation or fabricated aggregate
+fills a gap. Imported scalar elapsed totals cannot establish paired timing.
 Both benchmark generations are excluded from public polar fitting, and report
 files are created with exclusive mode so an existing artifact is never overwritten.
 

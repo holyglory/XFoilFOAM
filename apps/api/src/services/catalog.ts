@@ -10,6 +10,7 @@ import {
   polarFitSets,
   publicProgressiveCatalog,
 } from "@aerodb/db";
+import { progressiveRevisionHasBenchmarkSql } from "@aerodb/db/progressive-recipe-policy";
 import {
   and,
   asc,
@@ -282,6 +283,7 @@ export async function listAirfoils(opts: ListOpts): Promise<AirfoilSummary[]> {
           and(
             inArray(polarFitSets.airfoilId, candidateIds),
             eq(polarFitSets.isCurrent, true),
+            sql`NOT ${progressiveRevisionHasBenchmarkSql(sql`${polarFitSets.airfoilId}`, sql`${polarFitSets.simulationPresetRevisionId}`)}`,
             eq(polarFitSets.fitVersion, POLAR_FIT_VERSION),
             inArray(polarFitSets.status, ["final", "provisional"]),
             sql`${polarFitSets.ldmax} IS NOT NULL`,

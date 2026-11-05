@@ -4589,3 +4589,60 @@ name = "layout"
 tier = "development"
 requires = ["verifier-self-test", "preview-origin", "preview-ready"]
 command = ["node", "scripts/dev/verify-progressive-layout.mjs"]
+
+[test.benchmark-isolation]
+timeout_seconds = 7200
+
+[test.benchmark-isolation.postgres]
+image = "postgres:16-alpine"
+database = "aerodb"
+user = "aerodb"
+
+[[test.benchmark-isolation.check]]
+name = "schema"
+tier = "development"
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "migrate"]
+
+[[test.benchmark-isolation.check]]
+name = "seed"
+tier = "development"
+requires = ["schema"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "seed"]
+
+[[test.benchmark-isolation.check]]
+name = "public-benchmark-containment"
+tier = "development"
+requires = ["seed"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/api", "exec", "vitest", "run", "test/progressive-catalog.test.ts", "test/detail-polar-compatibility.test.ts", "test/exact-generation-public.test.ts"]
+
+[[test.benchmark-isolation.check]]
+name = "publication-and-fit-reuse"
+tier = "development"
+requires = ["seed"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "progressive remote dispatch pins one exact request"]
+
+[[test.benchmark-isolation.check]]
+name = "ordinary-cfd-caches"
+tier = "development"
+requires = ["seed"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/polar-cache-atomicity.test.ts", "test/polar-compatibility-cache.test.ts", "test/progressive-cfd-reuse.test.ts"]
+
+[[test.benchmark-isolation.check]]
+name = "benchmark-report-contracts"
+tier = "development"
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/progressive-fast-v2"]
+
+[[test.benchmark-isolation.check]]
+name = "database-types"
+tier = "development"
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "typecheck"]
+
+[[test.benchmark-isolation.check]]
+name = "api-types"
+tier = "development"
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/api", "typecheck"]
+
+[[test.benchmark-isolation.check]]
+name = "sweeper-types"
+tier = "development"
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "typecheck"]

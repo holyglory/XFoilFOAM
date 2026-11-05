@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { afterAll, expect, it, vi } from "vitest";
-import { sql } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { progressiveCurveMetrics } from "@aerodb/core";
 import { createClient, type DB } from "@aerodb/db/client";
 import {
@@ -16,10 +16,21 @@ import {
 } from "@aerodb/db/progressive-polar-cache";
 import { createMinimalSolverFixture } from "../../../packages/db/test/solver-fixture";
 import {
+  airfoils,
   geometryRequiresPreservation,
   progressiveEvidencePreservesGeometry,
+  resultAttempts,
+  results,
   simJobs,
+  solverEvidenceArtifacts,
 } from "@aerodb/db";
+import {
+  refreshPolarCacheForRevision,
+  refreshPolarClassificationsForJob,
+  refreshPolarCompatibilityCache,
+} from "@aerodb/db/polar-cache";
+import { resolveRevisionMethodCompatibilityHash } from "@aerodb/db/polar-compatibility-cache";
+import { promoteRetainedProgressiveAttempts } from "../../sweeper/src/progressive-remote-settlement";
 
 const isolated = vi.hoisted(() => ({
   connection: null as DB | null,
@@ -60,6 +71,138 @@ import { assembleDetail } from "../src/services/detail";
 const { db, sql: client } = createClient({ max: 1 });
 afterAll(() => client.end({ timeout: 5 }));
 const signature = () => createHash("sha256").update(randomUUID()).digest("hex");
+
+it("excludes selected benchmark attempts from public CFD points and cached fits without changing evidence", async () => {
+  const rollback = new Error("Restore isolated public benchmark containment");
+  try {
+    await expect(
+      db.transaction(async (transaction) => {
+        const connection = transaction as unknown as DB;
+        isolated.connection = connection;
+        const prefix = `benchmark-public-${randomUUID()}`;
+        const fixture = await createMinimalSolverFixture(connection, prefix);
+        const [category] = await connection.execute(sql`SELECT id FROM categories LIMIT 1`);
+        const [airfoil] = await connection.insert(airfoils).values({
+          slug: prefix, name: prefix, categoryId: String(category.id),
+          points: [{ x: 1, y: 0 }, { x: 0, y: 0.1 }, { x: 1, y: 0 }],
+        }).returning();
+        const [job] = await connection.insert(simJobs).values({
+          airfoilId: airfoil.id, bcIds: [fixture.bcId],
+          simulationPresetRevisionId: fixture.revisionId,
+          referenceChordM: 0.987654, status: "done",
+        }).returning();
+        for (const table of ["progressive_generations", "progressive_generation_targets",
+          "progressive_work", "progressive_cfd_units", "progressive_cfd_attempts"])
+          await connection.execute(sql.raw(`CREATE TEMP TABLE ${table} ON COMMIT DROP AS SELECT * FROM public.${table} WITH NO DATA`));
+        const generationId = randomUUID();
+        const workId = randomUUID();
+        const targetId = signature();
+        await connection.execute(sql`INSERT INTO progressive_generations(id,benchmark_only) VALUES(${generationId}::uuid,false)`);
+        await connection.execute(sql`INSERT INTO progressive_generation_targets(generation_id,target_id,recipes)
+          VALUES(${generationId}::uuid,${targetId},'{"fast":{}}')`);
+        await connection.execute(sql`INSERT INTO progressive_work(id,generation_id,target_id,stage)
+          VALUES(${workId}::uuid,${generationId}::uuid,${targetId},2)`);
+        for (const alpha of [-4, -2, 0, 2, 4]) {
+          const values = {
+            airfoilId: airfoil.id, bcId: fixture.bcId,
+            simulationPresetRevisionId: fixture.revisionId, aoaDeg: alpha,
+            status: "done" as const, source: "solved" as const, regime: "rans" as const,
+            cl: alpha * 0.1, cd: 0.012 + Math.abs(alpha) * 0.001,
+            clCd: alpha * 0.1 / (0.012 + Math.abs(alpha) * 0.001),
+            cm: -0.01, converged: true, simJobId: job.id, solvedAt: new Date(),
+          };
+          const [result] = await connection.insert(results).values(values).returning();
+          const [attempt] = await connection.insert(resultAttempts).values({
+            ...values, resultId: result.id, validForPolar: true,
+            evidencePayload: { fidelity: "rans" },
+          }).returning();
+          await connection.insert(solverEvidenceArtifacts).values({
+            resultId: result.id, resultAttemptId: attempt.id, airfoilId: airfoil.id,
+            aoaDeg: alpha, kind: "manifest", storageKey: `${prefix}/${alpha}/manifest.json`,
+            mimeType: "application/json", sha256: signature(), byteSize: 128,
+          });
+          await connection.execute(sql`UPDATE results SET current_result_attempt_id=${attempt.id}::uuid WHERE id=${result.id}::uuid`);
+          const unitId = randomUUID();
+          await connection.execute(sql`INSERT INTO progressive_cfd_units(id,work_id,aoa_deg)
+            VALUES(${unitId}::uuid,${workId}::uuid,${alpha})`);
+          await connection.execute(sql`INSERT INTO progressive_cfd_attempts(token,unit_id,sim_job_id)
+            VALUES(${randomUUID()}::uuid,${unitId}::uuid,${job.id}::uuid)`);
+        }
+        await refreshPolarCacheForRevision(connection, airfoil.id, fixture.revisionId);
+        const hash = (await resolveRevisionMethodCompatibilityHash(connection, fixture.revisionId))!;
+        const before = await connection.execute(sql`SELECT raw.*,classification.state AS classification_state,
+          result.current_result_attempt_id FROM result_attempts raw
+          JOIN results result ON result.id=raw.result_id
+          JOIN result_classifications classification ON classification.result_attempt_id=raw.id
+          WHERE raw.sim_job_id=${job.id}::uuid ORDER BY raw.id`);
+        expect(before).toHaveLength(5);
+        expect(before.every(row => row.classification_state === "accepted")).toBe(true);
+        const publicDetail = await assembleDetail(prefix);
+        expect(publicDetail!.polars.flatMap(polar => polar.points)).toHaveLength(5);
+        expect((await assembleDetail(prefix, { revisionId: fixture.revisionId }))!.polars[0].fit?.points.length).toBeGreaterThan(0);
+        expect((await listAirfoils({ q: prefix }))[0].ldmax).not.toBeNull();
+        for (const mode of ["generation", "recipe", "precise"] as const) {
+          await connection.execute(sql`UPDATE progressive_generations SET benchmark_only=${mode === "generation"}`);
+          await connection.execute(sql`UPDATE progressive_generation_targets
+            SET recipes=${JSON.stringify({ fast: mode === "generation" ? {} : { publication: "benchmark_only" } })}::jsonb`);
+          await connection.execute(sql`UPDATE progressive_work SET stage=${mode === "precise" ? 3 : 2}`);
+          const expectedCount = mode === "precise" ? 5 : 0;
+          if (mode === "precise")
+            await refreshPolarCompatibilityCache(connection, airfoil.id, hash);
+          expect((await assembleDetail(prefix))!.polars.flatMap(polar => polar.points)).toHaveLength(expectedCount);
+          const pinned = (await assembleDetail(prefix, { revisionId: fixture.revisionId }))!.polars[0];
+          expect(pinned.points).toHaveLength(expectedCount);
+          expect(Boolean(pinned.fit?.points.length)).toBe(mode === "precise");
+          expect((await listAirfoils({ q: prefix }))[0].ldmax == null).toBe(mode !== "precise");
+          const compatibility = await refreshPolarCompatibilityCache(connection, airfoil.id, hash);
+          expect(compatibility.selectedResultIds).toHaveLength(expectedCount);
+          expect(await connection.execute(sql`SELECT raw.*,classification.state AS classification_state,
+            result.current_result_attempt_id FROM result_attempts raw
+            JOIN results result ON result.id=raw.result_id
+            JOIN result_classifications classification ON classification.result_attempt_id=raw.id
+            WHERE raw.sim_job_id=${job.id}::uuid ORDER BY raw.id`)).toEqual(before);
+        }
+        await connection.execute(sql`UPDATE progressive_generations SET benchmark_only=true`);
+        await connection.execute(sql`UPDATE progressive_work SET stage=2`);
+        const retained = await connection.select().from(resultAttempts).where(eq(resultAttempts.simJobId,job.id));
+        const [replacementJob] = await connection.insert(simJobs).values({
+          airfoilId: airfoil.id, bcIds: [fixture.bcId],
+          simulationPresetRevisionId: fixture.revisionId,
+          referenceChordM: 0.987654, status: "done",
+        }).returning();
+        const replacements = await connection.insert(resultAttempts).values(retained.map(attempt => ({
+          ...attempt, id: randomUUID(), simJobId: replacementJob.id,
+        }))).returning();
+        await connection.insert(solverEvidenceArtifacts).values(replacements.map(attempt => ({
+          resultId: attempt.resultId, resultAttemptId: attempt.id, airfoilId: airfoil.id,
+          aoaDeg: attempt.aoaDeg, kind: "manifest" as const, storageKey: `${prefix}/replacement/${attempt.aoaDeg}/manifest.json`,
+          mimeType: "application/json", sha256: signature(), byteSize: 128,
+        })));
+        await refreshPolarClassificationsForJob(connection,airfoil.id,fixture.revisionId,replacementJob.id);
+        const [priorFit] = await connection.execute(sql`SELECT id FROM polar_fit_sets
+          WHERE airfoil_id=${airfoil.id}::uuid AND simulation_preset_revision_id=${fixture.revisionId}::uuid AND is_current`);
+        expect(await promoteRetainedProgressiveAttempts(connection, {
+          executionId: replacementJob.id, airfoilId: airfoil.id,
+          simulationPresetRevisionId: fixture.revisionId, attemptIds: replacements.map(attempt => attempt.id),
+        })).toBe(true);
+        const [newFit] = await connection.execute(sql`SELECT id FROM polar_fit_sets
+          WHERE airfoil_id=${airfoil.id}::uuid AND simulation_preset_revision_id=${fixture.revisionId}::uuid AND is_current`);
+        expect(newFit.id).not.toBe(priorFit.id);
+        expect((await assembleDetail(prefix))!.polars.flatMap(polar => polar.points).map(point => point.resultId).sort())
+          .toEqual(replacements.map(attempt => attempt.resultId).sort());
+        expect((await connection.execute(sql`SELECT current_result_attempt_id FROM results
+          WHERE airfoil_id=${airfoil.id}::uuid AND simulation_preset_revision_id=${fixture.revisionId}::uuid`))
+          .map(row => String(row.current_result_attempt_id)).sort()).toEqual(replacements.map(attempt => attempt.id).sort());
+        expect((await assembleDetail(prefix, { revisionId: fixture.revisionId }))!.polars[0].fit?.points.length).toBeGreaterThan(0);
+        expect((await listAirfoils({ q: prefix }))[0].ldmax).not.toBeNull();
+        expect(await connection.select().from(resultAttempts).where(eq(resultAttempts.simJobId,job.id))).toEqual(retained);
+        throw rollback;
+      }),
+    ).rejects.toBe(rollback);
+  } finally {
+    isolated.connection = null;
+  }
+});
 
 it("backfills the source geometry publication guard without trusting old writers or excluded evidence", async () => {
   const rollback = new Error("isolated source geometry migration proof");

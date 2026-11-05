@@ -13,6 +13,7 @@ import { and, eq, isNull, ne, or, sql } from "drizzle-orm";
 import { createHash } from "node:crypto";
 
 import type { DB } from "./client";
+import { progressiveBenchmarkAttemptSql } from "./progressive-recipe-policy";
 import { activeReviewVerdicts } from "./review-verdicts";
 import { solverGeometryCompatibility } from "./solver-evidence-geometry";
 import {
@@ -703,6 +704,7 @@ export async function refreshPolarCompatibilityCache(
       .where(
         and(
           eq(results.airfoilId, airfoilId),
+          sql`NOT ${progressiveBenchmarkAttemptSql(sql`${resultAttempts.id}`)}`,
           eq(
             simulationPresetRevisions.methodCompatibilityHashVersion,
             METHOD_COMPATIBILITY_HASH_VERSION,

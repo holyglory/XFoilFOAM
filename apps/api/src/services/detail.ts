@@ -46,6 +46,10 @@ import {
   type SimulationSetupSnapshot,
 } from "@aerodb/db/simulation-setup";
 import { and, desc, eq, inArray, isNotNull, isNull, sql } from "drizzle-orm";
+import {
+  progressiveBenchmarkAttemptSql,
+  progressiveRevisionHasBenchmarkSql,
+} from "@aerodb/db/progressive-recipe-policy";
 
 import { db } from "../db";
 import { geometryFor } from "./geometry";
@@ -520,6 +524,7 @@ async function loadSolvedRows(
         isNotNull(resultAttempts.cd),
         isNull(resultReviewVerdicts.id),
         inArray(resultClassifications.state, ["accepted", "needs_urans"]),
+        sql`NOT ${progressiveBenchmarkAttemptSql(sql`${resultAttempts.id}`)}`,
       ),
     );
   const geometryCompatibility = await solverGeometryCompatibility(
@@ -675,6 +680,7 @@ async function loadRevisionFits(
         eq(polarFitSets.airfoilId, airfoilId),
         eq(polarFitSets.fitVersion, POLAR_FIT_VERSION),
         eq(polarFitSets.isCurrent, true),
+        sql`NOT ${progressiveRevisionHasBenchmarkSql(sql`${polarFitSets.airfoilId}`, sql`${polarFitSets.simulationPresetRevisionId}`)}`,
       ),
     );
   const fitIds = fitRows.map((row) => row.id);

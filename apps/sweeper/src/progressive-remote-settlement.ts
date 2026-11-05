@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { sql } from "drizzle-orm";
 import { effectiveProgressiveStageSql } from "@aerodb/db/progressive-execution-policy";
+import { progressiveBenchmarkAttemptSql } from "@aerodb/db/progressive-recipe-policy";
 import { polarEvidencePublicationRank } from "@aerodb/core";
 import {
   acknowledgeProgressiveCfdExecutionStop,
@@ -23,7 +24,10 @@ import {
   readProgressiveRemoteRetention,
   terminalReportHasNoPhysicalEvidence,
 } from "@aerodb/db/progressive-remote-retention";
-import { refreshPolarClassificationsForJob } from "@aerodb/db/polar-cache";
+import {
+  refreshPolarCacheForRevision,
+  refreshPolarClassificationsForJob,
+} from "@aerodb/db/polar-cache";
 import { releaseResultClaimsForJob } from "@aerodb/db/result-claim-lifecycle";
 import { retireSettledProgressivePromise } from "./progressive-remote-lease-retirement";
 import {
@@ -123,7 +127,7 @@ export async function promoteRetainedProgressiveAttempts(
   },
 ) {
   if (!input.attemptIds.length) return false;
-  const promoted = await db.execute(sql`
+  const promotion = sql`
     WITH candidates AS (
       SELECT DISTINCT ON (raw.result_id)
         raw.id AS attempt_id,
@@ -154,6 +158,7 @@ export async function promoteRetainedProgressiveAttempts(
         AND raw.simulation_preset_revision_id = ${input.simulationPresetRevisionId}::uuid
         AND raw.status = 'done'
         AND raw.valid_for_polar
+        AND NOT ${progressiveBenchmarkAttemptSql(sql`raw.id`)}
         AND result.current_result_attempt_id IS DISTINCT FROM raw.id
         AND coalesce((SELECT review.verdict::text
           FROM result_review_verdicts review
@@ -230,21 +235,25 @@ export async function promoteRetainedProgressiveAttempts(
       AND eligible.incoming_rank >= eligible.current_rank
       AND result.current_result_attempt_id IS NOT DISTINCT FROM eligible.observed_current_attempt_id
     RETURNING result.id
-  `);
-  if (!promoted.length) return false;
-  await db.execute(sql`
-    UPDATE polar_compatibility_fit_sets fit
-    SET is_current = false, "updatedAt" = now()
-    WHERE fit.is_current = true
-      AND fit.airfoil_id = ${input.airfoilId}::uuid
-      AND EXISTS (
-        SELECT 1
-        FROM polar_compatibility_fit_members member
-        WHERE member.fit_set_id = fit.id
-          AND member.simulation_preset_revision_id = ${input.simulationPresetRevisionId}::uuid
-      )
-  `);
-  return true;
+  `;
+  const noPromotion = new Error("No eligible retained progressive attempt");
+  try {
+    await refreshPolarCacheForRevision(
+      db,
+      input.airfoilId,
+      input.simulationPresetRevisionId,
+      {
+        beforeEvidenceLoad: async (transaction) => {
+          const promoted = await transaction.execute(promotion);
+          if (!promoted.length) throw noPromotion;
+        },
+      },
+    );
+    return true;
+  } catch (error) {
+    if (error === noPromotion) return false;
+    throw error;
+  }
 }
 
 async function publishAcceptedProgressiveAttempts(db: DB, executionId: string) {
@@ -264,6 +273,7 @@ async function publishAcceptedProgressiveAttempts(db: DB, executionId: string) {
         LEFT JOIN result_classifications classification
           ON classification.result_attempt_id = raw.id
         WHERE raw.sim_job_id = job.id AND raw.status = 'done' AND raw.valid_for_polar
+          AND NOT ${progressiveBenchmarkAttemptSql(sql`raw.id`)}
           AND (
             classification.id IS NULL
             OR (
@@ -858,6 +868,7 @@ export async function settleProgressiveRemoteJob(db: DB, executionId: string) {
           sql`, `,
         )})
           AND raw.status = 'done' AND raw.valid_for_polar AND classification.state = 'accepted'
+          AND NOT ${progressiveBenchmarkAttemptSql(sql`raw.id`)}
           AND coalesce((SELECT review.verdict FROM result_review_verdicts review WHERE review.result_id = result.id
             AND review."revokedAt" IS NULL ORDER BY review."createdAt" DESC, review.id DESC LIMIT 1), '') NOT IN ('exclude', 'defer')
           AND result.current_result_attempt_id IS DISTINCT FROM raw.id`);
