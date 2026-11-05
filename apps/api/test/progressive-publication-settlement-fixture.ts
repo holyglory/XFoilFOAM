@@ -131,8 +131,7 @@ export async function verifyProgressivePublicationPrecedence(
     const rollback = new Error(
       `Rollback isolated publication precedence ${scenario}`,
     );
-    await expect(
-      db.transaction(async (raw) => {
+    const restored = await db.transaction(async (raw) => {
         const connection = raw as unknown as DB;
         const selectedId = randomUUID();
         const regime = scenario === "same-rank" ? "rans" : "urans";
@@ -162,7 +161,14 @@ export async function verifyProgressivePublicationPrecedence(
           connection,
           executionId,
         );
-        expect(settlement).toMatchObject(
+        const [publication] = await connection.execute(sql`SELECT result.current_result_attempt_id,
+          incoming.state AS incoming_state,selected.state AS selected_state,job."ingestedAt"
+          FROM results result
+          JOIN sim_jobs job ON job.id=${executionId}::uuid
+          LEFT JOIN result_classifications incoming ON incoming.result_attempt_id=${resultAttemptId}::uuid
+          LEFT JOIN result_classifications selected ON selected.result_attempt_id=result.current_result_attempt_id
+          WHERE result.id=${attempt.resultId}::uuid`);
+        expect(settlement, JSON.stringify({ scenario, incomingAttemptId: resultAttemptId, selectedAttemptId: selectedId, publication })).toMatchObject(
           scenario === "higher-accepted"
             ? { kind: "settled", counts: { complete: 1, waiting: 0 } }
             : { kind: "waiting", reason: "accepted_point_publication" },
@@ -172,8 +178,11 @@ export async function verifyProgressivePublicationPrecedence(
         );
         expect(selected.current_result_attempt_id).toBe(selectedId);
         throw rollback;
-      }),
-    ).rejects.toBe(rollback);
+      }).catch(error => {
+      if (error !== rollback) throw error;
+      return rollback;
+    });
+    expect(restored).toBe(rollback);
   }
   const unclassifiedRollback = new Error(
     "Rollback unclassified progressive publication",

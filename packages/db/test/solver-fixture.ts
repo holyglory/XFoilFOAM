@@ -28,8 +28,12 @@ export interface MinimalSolverFixture {
 export async function createMinimalSolverFixture(
   db: DB,
   prefix: string,
+  mediumSlug?: string,
 ): Promise<MinimalSolverFixture> {
-  const [medium] = await db.select({ id: mediums.id }).from(mediums).limit(1);
+  const mediumQuery = db.select({ id: mediums.id }).from(mediums);
+  const [medium] = await (mediumSlug
+    ? mediumQuery.where(eq(mediums.slug, mediumSlug))
+    : mediumQuery).limit(1);
   const [boundary] = await db
     .select({ id: boundaryProfiles.id })
     .from(boundaryProfiles)

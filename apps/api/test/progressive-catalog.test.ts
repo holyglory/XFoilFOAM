@@ -75,12 +75,11 @@ const signature = () => createHash("sha256").update(randomUUID()).digest("hex");
 it("excludes selected benchmark attempts from public CFD points and cached fits without changing evidence", async () => {
   const rollback = new Error("Restore isolated public benchmark containment");
   try {
-    await expect(
-      db.transaction(async (transaction) => {
+    const restored = await db.transaction(async (transaction) => {
         const connection = transaction as unknown as DB;
         isolated.connection = connection;
         const prefix = `benchmark-public-${randomUUID()}`;
-        const fixture = await createMinimalSolverFixture(connection, prefix);
+        const fixture = await createMinimalSolverFixture(connection, prefix, "air");
         const [category] = await connection.execute(sql`SELECT id FROM categories LIMIT 1`);
         const [airfoil] = await connection.insert(airfoils).values({
           slug: prefix, name: prefix, categoryId: String(category.id),
@@ -138,7 +137,7 @@ it("excludes selected benchmark attempts from public CFD points and cached fits 
         expect(before).toHaveLength(5);
         expect(before.every(row => row.classification_state === "accepted")).toBe(true);
         const publicDetail = await assembleDetail(prefix);
-        expect(publicDetail!.polars.flatMap(polar => polar.points)).toHaveLength(5);
+        expect(publicDetail!.polars.flatMap(polar => polar.points), "ordinary CFD control before benchmark exclusion").toHaveLength(5);
         expect((await assembleDetail(prefix, { revisionId: fixture.revisionId }))!.polars[0].fit?.points.length).toBeGreaterThan(0);
         expect((await listAirfoils({ q: prefix }))[0].ldmax).not.toBeNull();
         for (const mode of ["generation", "recipe", "precise"] as const) {
@@ -149,7 +148,7 @@ it("excludes selected benchmark attempts from public CFD points and cached fits 
           const expectedCount = mode === "precise" ? 5 : 0;
           if (mode === "precise")
             await refreshPolarCompatibilityCache(connection, airfoil.id, hash);
-          expect((await assembleDetail(prefix))!.polars.flatMap(polar => polar.points)).toHaveLength(expectedCount);
+          expect((await assembleDetail(prefix))!.polars.flatMap(polar => polar.points), `${mode} public CFD points`).toHaveLength(expectedCount);
           const pinned = (await assembleDetail(prefix, { revisionId: fixture.revisionId }))!.polars[0];
           expect(pinned.points).toHaveLength(expectedCount);
           expect(Boolean(pinned.fit?.points.length)).toBe(mode === "precise");
@@ -197,8 +196,11 @@ it("excludes selected benchmark attempts from public CFD points and cached fits 
         expect((await listAirfoils({ q: prefix }))[0].ldmax).not.toBeNull();
         expect(await connection.select().from(resultAttempts).where(eq(resultAttempts.simJobId,job.id))).toEqual(retained);
         throw rollback;
-      }),
-    ).rejects.toBe(rollback);
+      }).catch(error => {
+        if (error !== rollback) throw error;
+        return rollback;
+      });
+    expect(restored).toBe(rollback);
   } finally {
     isolated.connection = null;
   }
@@ -508,7 +510,7 @@ async function verifyPublicCatalog(fullScale: boolean) {
         const connection = transaction as unknown as DB;
         isolated.connection = connection;
         const prefix = `public-metrics-${randomUUID()}`;
-        const fixture = await createMinimalSolverFixture(connection, prefix);
+        const fixture = await createMinimalSolverFixture(connection, prefix, "air");
         await connection.execute(
           sql`UPDATE simulation_preset_revisions SET snapshot=jsonb_set(snapshot,'{flowState,mediumSlug}','"air"') WHERE id=${fixture.revisionId}`,
         );
@@ -755,7 +757,8 @@ async function verifyPublicCatalog(fullScale: boolean) {
           sql`INSERT INTO progressive_polar_geometry_verifications(model_id,source_geometry_compatible) VALUES(${fallbackModelId},true)`,
         );
         await connection.execute(
-          sql`INSERT INTO progressive_polar_fit_work(prediction_id,state,model_id) VALUES(${second.predictionId},'ready',${fallbackModelId})`,
+          sql`INSERT INTO progressive_polar_fit_work(prediction_id,state,model_id) VALUES(${second.predictionId},'ready',${fallbackModelId})
+            ON CONFLICT(prediction_id) DO UPDATE SET state='ready',model_id=EXCLUDED.model_id`,
         );
         const fallbackPublished = (
           await publicProgressivePolars(connection, profiles[1])
