@@ -1932,113 +1932,6 @@ def _numeric_time_dirs(case_dir: Path) -> list[float]:
     return sorted(times)
 
 
-def _stopping_frame_fields(time_dir: Path, frame_time: float) -> dict[str, str] | None:
-    fields: dict[str, str] = {}
-    try:
-        for path in time_dir.iterdir():
-            if not path.is_file():
-                continue
-            name = path.stem if path.suffix == ".gz" else path.name
-            before = path.stat()
-            with (gzip.open(path, "rb") if path.suffix == ".gz" else path.open("rb")) as stream:
-                header = stream.read(2048).decode(errors="replace")
-                stream.seek(0, os.SEEK_END)
-                stream.seek(max(0, stream.tell() - 128))
-                footer = stream.read(128)
-            after = path.stat()
-            field_class = re.search(r"\bclass\s+([^;\s]+)\s*;", header)
-            field_object = re.search(r"\bobject\s+([^;\s]+)\s*;", header)
-            location = re.search(r'\blocation\s+"([^"]+)"\s*;', header)
-            if (
-                before.st_size <= 0
-                or (before.st_ino, before.st_size, before.st_mtime_ns)
-                != (after.st_ino, after.st_size, after.st_mtime_ns)
-                or "FoamFile" not in header
-                or field_class is None
-                or not re.fullmatch(
-                    r"(?:vol|surface|point)(?:Scalar|Vector|Tensor|SymmTensor|SphericalTensor)Field",
-                    field_class.group(1),
-                )
-                or field_object is None
-                or field_object.group(1) != name
-                or location is None
-                or float(PurePosixPath(location.group(1)).name) != frame_time
-                or not re.search(rb"// \*+ //\s*$", footer)
-                or name in fields
-            ):
-                return None
-            fields[name] = field_class.group(1)
-    except (OSError, EOFError, ValueError):
-        return None
-    return fields or None
-
-
-def _stopping_field_times(
-    case_dir: Path, n_proc: int, since: float | None = None
-) -> list[float]:
-    if n_proc <= 1:
-        return _numeric_time_dirs(case_dir)
-    if since is None:
-        since = read_transient_start_marker(case_dir)
-    if since is None or not math.isfinite(since):
-        return []
-    expected = {f"processor{rank}" for rank in range(n_proc)}
-    try:
-        actual = {
-            path.name
-            for path in case_dir.iterdir()
-            if path.is_dir() and re.fullmatch(r"processor[0-9]+", path.name)
-        }
-        if actual != expected:
-            return []
-        rank_times: list[dict[float, Path]] = []
-        required_fields: dict[str, str] | None = None
-        for rank_name in sorted(expected):
-            times: dict[float, Path] = {}
-            duplicate_times: set[float] = set()
-            for path in (case_dir / rank_name).iterdir():
-                if not path.is_dir():
-                    continue
-                try:
-                    physical_time = float(path.name)
-                except ValueError:
-                    continue
-                if not math.isfinite(physical_time) or physical_time < since:
-                    continue
-                if physical_time in times:
-                    duplicate_times.add(physical_time)
-                times[physical_time] = path
-            for physical_time in duplicate_times:
-                times.pop(physical_time, None)
-            initial = times.get(since)
-            fields = _stopping_frame_fields(initial, since) if initial else None
-            if fields is None or not {"U", "p"}.issubset(fields):
-                return []
-            if required_fields is None:
-                required_fields = fields
-            elif fields != required_fields:
-                return []
-            rank_times.append(times)
-        common = set.intersection(*(set(times) for times in rank_times))
-        complete_times: list[float] = []
-        for physical_time in sorted(common):
-            if physical_time <= since:
-                continue
-            frame_fields = [
-                _stopping_frame_fields(times[physical_time], physical_time)
-                for times in rank_times
-            ]
-            if (
-                frame_fields[0] is not None
-                and required_fields.items() <= frame_fields[0].items()
-                and all(fields == frame_fields[0] for fields in frame_fields[1:])
-            ):
-                complete_times.append(physical_time)
-        return complete_times
-    except OSError:
-        return []
-
-
 def _field_frame_count(case_dir: Path, start_time: float, end_time: float) -> int:
     return sum(1 for t in _numeric_time_dirs(case_dir) if start_time <= t <= end_time)
 
@@ -3720,7 +3613,6 @@ def _make_urans_monitor(
     settled_max_courant: Optional[float] = None,
     startup_max_delta_t: Optional[float] = None,
     allow_quiet_startup_release: bool = False,
-    n_proc: int = 1,
 ) -> Callable[[], None]:
     configured_max_courant = (
         solver_params.transient_max_courant
@@ -3844,7 +3736,6 @@ def _make_urans_monitor(
             state["impulse_recovery_armed"] = True
             state["courant_released"] = False
             state["stable_since"] = None
-            state["stopping_stable_since"] = None
         if result.ok and result.stable and period is not None and period > 0:
             # Every physical chunk starts conservatively.  Only a measured,
             # repeatable tail may release the configured production Courant
@@ -3881,13 +3772,12 @@ def _make_urans_monitor(
                 )
                 latest = _latest_time(tcase)
                 if result.ok and latest + 1e-9 >= required_end and not state.get("stop_requested"):
-                    if n_proc <= 1:
-                        _write_early_stop_marker(tcase, result, retain_from=float(stable_since))
-                        _set_control_dict_entries(
-                            tcase / "system" / "controlDict",
-                            {"stopAt": "writeNow", "runTimeModifiable": True},
-                        )
-                        state["stop_requested"] = True
+                    _write_early_stop_marker(tcase, result, retain_from=float(stable_since))
+                    _set_control_dict_entries(
+                        tcase / "system" / "controlDict",
+                        {"stopAt": "writeNow", "runTimeModifiable": True},
+                    )
+                    state["stop_requested"] = True
                 else:
                     target_period = state.get("target_period")
                     if target_period is None or abs(float(target_period) - period) / max(period, 1e-12) > 0.15:
@@ -3905,45 +3795,6 @@ def _make_urans_monitor(
             # Stability lost (or never established): restart the certification
             # clock so a transient wobble cannot count toward retention.
             state["stable_since"] = None
-
-        if n_proc > 1:
-            stopping_times = _stopping_field_times(tcase, n_proc, coeff_start_time)
-            stopping_result = stable_two_period_window(
-                coeff_files,
-                speed=spec.speed,
-                chord=spec.chord,
-                alpha_deg=spec.aoa_deg,
-                section_thickness_ratio=spec.section_thickness_ratio,
-                frame_times=stopping_times,
-                discard_fraction=0.0,
-                min_frames_per_cycle=URANS_MIN_FRAMES_PER_CYCLE,
-            )
-            stopping_period = stopping_result.period_s
-            if (
-                stopping_result.ok
-                and stopping_result.stable
-                and stopping_period is not None
-                and stopping_period > 0
-            ):
-                stopping_since = state.get("stopping_stable_since")
-                if stopping_since is None and stopping_result.window_start is not None:
-                    stopping_since = float(stopping_result.window_start)
-                    state["stopping_stable_since"] = stopping_since
-                if stopping_since is not None and stopping_times:
-                    stopping_end = float(stopping_since) + (
-                        _early_stop_certification_cycles(solver_params) * stopping_period
-                    )
-                    if stopping_times[-1] + 1e-9 >= stopping_end and not state.get("stop_requested"):
-                        _write_early_stop_marker(
-                            tcase, stopping_result, retain_from=float(stopping_since)
-                        )
-                        _set_control_dict_entries(
-                            tcase / "system" / "controlDict",
-                            {"stopAt": "writeNow", "runTimeModifiable": True},
-                        )
-                        state["stop_requested"] = True
-            else:
-                state["stopping_stable_since"] = None
 
     return monitor
 
@@ -5695,7 +5546,6 @@ def _run_transient_attempt(
                 solver_params=pass_params,
                 settled_max_courant=settled_max_courant,
                 startup_max_delta_t=pass_max_delta_t,
-                n_proc=n_proc,
             ),
         )
         wall_seconds += max(0.0, time.monotonic() - solve_started)

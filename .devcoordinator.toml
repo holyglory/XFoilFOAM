@@ -4714,17 +4714,3 @@ command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "typecheck"]
 name = "sweeper-types"
 tier = "development"
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "typecheck"]
-
-[test.solver-mpi-stopping]
-timeout_seconds = 900
-
-[[test.solver-mpi-stopping.check]]
-name = "retained-production-replay"
-tier = "development"
-command = ["/usr/bin/env", "PYTHONPATH=src", ".venv/bin/python", "-B", ".codex-artifacts/slow-job-recovery-20261106/replay-mpi-stopping.py", "--input", ".codex-artifacts/slow-job-recovery-20261106/mpi-stopping-real-capture.tar.gz", "--output", ".codex-artifacts/slow-job-recovery-20261106/mpi-stop-finished-replay/report.json"]
-retained_artifacts = [{ name = "mpi-stop-finished-replay", path = ".codex-artifacts/slow-job-recovery-20261106/mpi-stop-finished-replay", max_bytes = 4194304 }]
-
-[[test.solver-mpi-stopping.check]]
-name = "monitor-regressions"
-tier = "development"
-command = ["/usr/bin/env", "PYTHONPATH=src", ".venv/bin/python", "-B", "-m", "pytest", "tests/test_frame_track.py", "tests/test_unsteady.py", "tests/test_no_shedding_urans.py", "tests/test_compressible_execution.py", "tests/test_targeted_urans_warmstart.py", "-q"]
