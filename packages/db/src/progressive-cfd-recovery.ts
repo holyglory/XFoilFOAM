@@ -293,6 +293,8 @@ export async function recoverTerminalProgressiveNoEvidenceGaps(
         AND ${pendingBudgetExtension}
       )
     )`;
+    const requeueEligible = sql`unit.active_seconds < ${progressiveCfdEffectiveBudgetSql(sql`unit`)}
+      AND (unit.attempts = 3 OR ${attemptAvailable})`;
     const claimEligible = sql`${attemptAvailable}
       AND unit.active_seconds < ${progressiveCfdEffectiveBudgetSql(sql`unit`)}`;
     const units = await connection.execute(sql`
@@ -382,6 +384,10 @@ export async function recoverTerminalProgressiveNoEvidenceGaps(
           WHERE newer.unit_id = unit.id
             AND (newer.started_at, newer.token) > (attempt.started_at, attempt.token)
         )
+        AND (
+          (unit.state = 'gap' AND ${requeueEligible})
+          OR (unit.state = 'pending' AND NOT (${claimEligible}))
+        )
       ORDER BY unit.attempts, unit.id
       LIMIT ${PROGRESSIVE_TERMINAL_RECOVERY_UNITS_PER_PASS}
       FOR UPDATE OF work, unit, attempt, attempt_job SKIP LOCKED
@@ -402,8 +408,7 @@ export async function recoverTerminalProgressiveNoEvidenceGaps(
         WHERE unit.id = ${unit.id}::uuid
           AND work.id = unit.work_id
           AND unit.state = 'gap'
-          AND unit.active_seconds < ${progressiveCfdEffectiveBudgetSql(sql`unit`)}
-          AND (unit.attempts = 3 OR ${attemptAvailable})
+          AND ${requeueEligible}
         RETURNING unit.id
       `);
       if (requeued) {
