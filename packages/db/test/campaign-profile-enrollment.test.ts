@@ -4681,6 +4681,70 @@ describe("progressive CPU admission", () => {
     });
   });
 
+  it("recovers terminal remote material failure ingestion without publishing CFD", async () => {
+    await ready(async () => {
+      const leases = await claimProgressiveCfdBatch(db, {
+        owner: "terminal-material-ingest-fixture",
+        leaseSeconds: 120,
+        solverBudgetVersion: 2,
+      });
+      const composed = await composeProgressiveCfdJob(db, leases, {
+        cpuSlots: 1,
+        meshRecoveryVersion: 1,
+        solverBudgetVersion: 2,
+      });
+      const [job] = await db
+        .select()
+        .from(simJobs)
+        .where(eq(simJobs.id, composed.jobId));
+      const solverId = randomUUID();
+      const promiseId = randomUUID();
+      try {
+        await db.execute(sql`INSERT INTO registered_remote_solvers
+          (id, instance_id, instance_name, cpu_capacity, cpu_budget, max_active_polar_promises)
+          VALUES (${solverId}::uuid, ${randomUUID()}, 'isolated terminal material worker', 96, 96, 96)`);
+        await db.execute(sql`INSERT INTO sync_sweep_promises
+          (id, registered_solver_id, airfoil_id, simulation_preset_revision_id, aoa_count, "expiresAt")
+          VALUES (${promiseId}::uuid, ${solverId}::uuid, ${job.airfoilId}::uuid,
+            ${job.simulationPresetRevisionId}::uuid, ${leases.length}, clock_timestamp() + interval '1 hour')`);
+        for (const lease of leases)
+          await db.execute(sql`INSERT INTO sync_sweep_promise_points
+            (promise_id, airfoil_id, simulation_preset_revision_id, aoa_deg)
+            VALUES (${promiseId}::uuid, ${job.airfoilId}::uuid,
+              ${job.simulationPresetRevisionId}::uuid, ${lease.alpha})`);
+        const { envelope } = await bindProgressiveRemoteDispatch(db, {
+          simJobId: job.id,
+          solverId,
+          promiseId,
+        });
+        const report: ProgressiveRemoteReport = {
+          version: 1,
+          solverId,
+          promiseId,
+          executionId: job.id,
+          assignmentSignature: envelope.contentSignature,
+          sequence: 1,
+          status: {
+            job_id: job.id,
+            state: "running",
+            total_cases: leases.length,
+            completed_cases: 1,
+          },
+          result: progressiveRemoteEvidenceResult(envelope),
+          stopProof: null,
+        };
+        const { verifyTerminalRemoteMaterialFailureIngest } = await import(
+          "./progressive-remote-inventory-fixture"
+        );
+        await verifyTerminalRemoteMaterialFailureIngest(db, report);
+      } finally {
+        await db.execute(sql`DELETE FROM progressive_remote_dispatches WHERE sim_job_id=${job.id}::uuid`);
+        await db.execute(sql`DELETE FROM sync_sweep_promises WHERE id=${promiseId}::uuid`);
+        await db.execute(sql`DELETE FROM registered_remote_solvers WHERE id=${solverId}::uuid`);
+      }
+    }, [32.1797]);
+  }, 120_000);
+
   it("progressive remote dispatch pins one exact request and holds CPU through promise expiry until physical stop", async () => {
     await ready(async () => {
       const leases = await claimProgressiveCfdBatch(db, {

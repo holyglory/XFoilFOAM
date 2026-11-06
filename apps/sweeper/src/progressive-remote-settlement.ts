@@ -577,7 +577,10 @@ async function ingestTerminalRemoteFailureAttempts(
   const [claimed] = await db.execute(sql`
     UPDATE sim_jobs
     SET status = 'ingesting',
-      ingest_lease_previous_status = status,
+      ingest_lease_previous_status = CASE WHEN status = 'ingesting' THEN
+        coalesce(ingest_lease_previous_status,
+          ${validated.report.status.state === "cancelled" ? "cancelled" : "failed"}::sim_job_status)
+        ELSE status END,
       ingest_lease_token = ${ingestLeaseToken},
       ingest_lease_claimed_at = clock_timestamp(),
       ingest_lease_expires_at = clock_timestamp() + 120000 * interval '1 millisecond'
@@ -602,12 +605,12 @@ async function ingestTerminalRemoteFailureAttempts(
           ? envelope.request.solver.urans_fidelity
           : undefined,
       result: report,
-      remoteProgressiveReportSequence: Number(latest.sequence),
       ingestLeaseToken,
     });
     await db.execute(sql`
       UPDATE sim_jobs
-      SET ingest_lease_token = NULL, ingest_lease_claimed_at = NULL,
+      SET status = ingest_lease_previous_status, ingest_lease_previous_status = NULL,
+        ingest_lease_token = NULL, ingest_lease_claimed_at = NULL,
         ingest_lease_expires_at = NULL, "updatedAt" = clock_timestamp()
       WHERE id = ${executionId}::uuid AND ingest_lease_token = ${ingestLeaseToken}
     `);
@@ -616,6 +619,7 @@ async function ingestTerminalRemoteFailureAttempts(
     await db.execute(sql`
       UPDATE sim_jobs
       SET status = ingest_lease_previous_status,
+        ingest_lease_previous_status = NULL,
         ingest_lease_token = NULL, ingest_lease_claimed_at = NULL,
         ingest_lease_expires_at = NULL
       WHERE id = ${executionId}::uuid AND ingest_lease_token = ${ingestLeaseToken}

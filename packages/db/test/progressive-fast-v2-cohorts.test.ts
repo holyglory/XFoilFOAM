@@ -3,6 +3,7 @@ import { sql } from "drizzle-orm";
 import { describe, expect, it } from "vitest";
 import { createClient, type DB } from "../src/client";
 import { advanceGeneration } from "../src/progressive-campaigns";
+import { advanceProgressiveCfdStages } from "../src/progressive-cfd-stages";
 import {
   adoptProgressiveSubsonicPriority,
   effectiveProgressiveStageSql,
@@ -247,6 +248,82 @@ describe.skipIf(!process.env.DATABASE_URL)(
           ),
         ).toEqual([{ stage: 3, status: "active" }]);
         expect(await sealedState(db)).toEqual(immutable);
+      });
+    });
+
+    it.each([2, 3])("appends immutable stage-%s closure history after the same units are reopened", async (stage) => {
+      await withCohortFixture(async ({ db, generations, preciseGenerationId }) => {
+        await db.execute(sql`ALTER TABLE sim_campaigns
+          ADD COLUMN "createdAt" timestamptz NOT NULL DEFAULT clock_timestamp(),
+          ADD COLUMN "updatedAt" timestamptz,
+          ADD COLUMN "completedAt" timestamptz`);
+        await db.execute(sql`ALTER TABLE progressive_generations
+          ADD COLUMN created_at timestamptz NOT NULL DEFAULT clock_timestamp()`);
+        await db.execute(sql`ALTER TABLE progressive_work
+          ADD COLUMN error text, ADD COLUMN completed_at timestamptz`);
+        await db.execute(sql`ALTER TABLE progressive_generation_cohorts
+          ADD COLUMN adaptive_fast_deferred boolean NOT NULL DEFAULT false`);
+        await db.execute(sql`DROP TABLE progressive_cfd_units`);
+        for (const table of [
+          "progressive_cfd_units",
+          "progressive_cfd_attempts",
+          "progressive_cfd_execution_stops",
+          "progressive_cfd_evidence",
+          "progressive_cfd_evidence_reuses",
+          "progressive_prediction_links",
+          "neuralfoil_predictions",
+          "progressive_polar_fit_work",
+          "progressive_polar_geometry_verifications",
+          "progressive_polar_models",
+          "progressive_cfd_stage_decisions",
+          "progressive_scope_requests",
+        ]) {
+          await db.execute(sql`CREATE TEMP TABLE ${sql.identifier(table)}
+            (LIKE public.${sql.identifier(table)} INCLUDING DEFAULTS INCLUDING CONSTRAINTS INCLUDING INDEXES)
+            ON COMMIT DROP`);
+        }
+        const generationId = stage === 2 ? generations[0] : preciseGenerationId;
+        await db.execute(sql`UPDATE progressive_work SET state='complete'
+          WHERE generation_id=${generationId}::uuid AND stage < ${stage}`);
+        await db.execute(sql`UPDATE progressive_generations SET stage=${stage}
+          WHERE id=${generationId}::uuid`);
+        const [work] = await db.execute(sql`UPDATE progressive_work SET state='pending'
+          WHERE generation_id=${generationId}::uuid AND stage=${stage}
+          RETURNING id, target_id`);
+        const [target] = await db.execute(sql`SELECT recipes FROM progressive_generation_targets
+          WHERE generation_id=${generationId}::uuid AND target_id=${work.target_id}`);
+        const recipe = (target.recipes as Record<string, unknown>)[stage === 2 ? "fast" : "precise"];
+        for (const [ordinal, alpha] of [-4, 7].entries()) {
+          await db.execute(sql`INSERT INTO progressive_cfd_units
+            (work_id,aoa_deg,ordinal,purpose,recipe,reason,policy_version,active_budget_seconds,state)
+            VALUES (${work.id}::uuid,${alpha},${ordinal},${stage === 2 ? "initial" : "precise"},
+              ${JSON.stringify(recipe)}::jsonb,'sealed fixture','stage-decision-fixture',${stage === 2 ? 900 : 43200},
+              ${ordinal === 0 ? "gap" : "complete"})`);
+        }
+        const immutable = await sealedState(db);
+        const units = await db.execute(sql`SELECT * FROM progressive_cfd_units ORDER BY ordinal`);
+        const kind = stage === 2 ? "close_fast" : "close_precise";
+        expect(await advanceProgressiveCfdStages(db)).toMatchObject({ admitted: 0, closed: 1 });
+        let history = await db.execute(sql`SELECT * FROM progressive_cfd_stage_decisions
+          WHERE work_id=${work.id}::uuid ORDER BY ordinal`);
+        expect(history).toHaveLength(1);
+        expect(history[0]).toMatchObject({ ordinal: 2, kind });
+
+        for (const ordinal of [3, 4]) {
+          await db.execute(sql`UPDATE progressive_work SET state='pending', error=NULL, completed_at=NULL
+            WHERE id=${work.id}::uuid`);
+          await db.execute(sql`UPDATE progressive_generations SET status='active', completed_at=NULL
+            WHERE id=${generationId}::uuid`);
+          expect(await advanceProgressiveCfdStages(db)).toMatchObject({ admitted: 0, closed: 1 });
+          const decisions = await db.execute(sql`SELECT * FROM progressive_cfd_stage_decisions
+            WHERE work_id=${work.id}::uuid ORDER BY ordinal`);
+          expect(decisions.slice(0, -1)).toEqual(history);
+          expect(decisions.at(-1)).toMatchObject({ ordinal, kind });
+          history = decisions;
+          expect(await advanceProgressiveCfdStages(db)).toMatchObject({ admitted: 0, closed: 0 });
+          expect(await db.execute(sql`SELECT * FROM progressive_cfd_units ORDER BY ordinal`)).toEqual(units);
+          expect(await sealedState(db)).toEqual(immutable);
+        }
       });
     });
   },

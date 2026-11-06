@@ -4661,3 +4661,56 @@ tier = "development"
 requires = ["artifact-contracts"]
 command = ["node", "scripts/dev/package-fast-v2-report.mjs"]
 retained_artifacts = [{ name = "measured-benchmark-report", path = "scripts/dev/.codex-artifacts/fast-v2-report-20261105-v2", max_bytes = 8388608 }]
+
+[test.solver-throughput-recovery]
+timeout_seconds = 3600
+
+[test.solver-throughput-recovery.postgres]
+image = "postgres:16-alpine"
+database = "aerodb"
+user = "aerodb"
+
+[[test.solver-throughput-recovery.check]]
+name = "schema"
+tier = "development"
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "migrate"]
+
+[[test.solver-throughput-recovery.check]]
+name = "seed"
+tier = "development"
+requires = ["schema"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "seed"]
+
+[[test.solver-throughput-recovery.check]]
+name = "terminal-ingestion"
+tier = "development"
+requires = ["seed"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "recovers terminal remote material failure ingestion without publishing CFD"]
+
+[[test.solver-throughput-recovery.check]]
+name = "stage-progress"
+tier = "development"
+requires = ["schema"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/progressive-fast-v2-cohorts.test.ts"]
+
+[[test.solver-throughput-recovery.check]]
+name = "outbox-replay"
+tier = "development"
+requires = ["seed"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/progressive-worker-outbox-replay.test.ts"]
+
+[[test.solver-throughput-recovery.check]]
+name = "admission-and-leases"
+tier = "development"
+requires = ["seed"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/ingest-lease.test.ts", "test/progressive-remote-admission.test.ts", "test/progressive-remote-admission-lock.test.ts", "test/admission-predicate-transitions.test.ts"]
+
+[[test.solver-throughput-recovery.check]]
+name = "database-types"
+tier = "development"
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "typecheck"]
+
+[[test.solver-throughput-recovery.check]]
+name = "sweeper-types"
+tier = "development"
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "typecheck"]

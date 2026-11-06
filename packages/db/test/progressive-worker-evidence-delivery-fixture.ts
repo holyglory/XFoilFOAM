@@ -138,6 +138,10 @@ export async function verifyProgressiveWorkerEvidenceDelivery(
     expect(unused).not.toHaveBeenCalled();
     for (const conflicts of [
       [{ id: remoteConflictId, status: "pending" }],
+      [{ id: remoteConflictId, status: "pending", retryable: false }],
+      [{ id: remoteConflictId, status: "pending", retryable: "true" }],
+      [{ id: randomUUID(), status: "pending", retryable: true }],
+      [{ id: remoteConflictId, status: "archived", retryable: true }],
       [{ id: remoteConflictId, status: "archived" }],
       [
         {

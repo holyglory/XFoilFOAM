@@ -481,8 +481,15 @@ export async function advanceProgressiveCfdStages(db: DB) {
         receipt.waiting += 1;
         continue;
       }
+      const [previousDecision] = await connection.execute(sql`
+        SELECT ordinal FROM progressive_cfd_stage_decisions
+        WHERE work_id = ${scope.id} ORDER BY ordinal DESC LIMIT 1
+      `);
       const ordinal =
-        Math.max(...units.map((unit) => Number(unit.ordinal))) + 1;
+        Math.max(
+          Number(previousDecision?.ordinal ?? -1),
+          ...units.map((unit) => Number(unit.ordinal)),
+        ) + 1;
       const summary = {
         policyVersion: PROGRESSIVE_COMPUTE_POLICY.version,
         modelId,

@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { sql } from "drizzle-orm";
-import { expect } from "vitest";
+import { expect, vi } from "vitest";
 import type { DB } from "../src/client";
+import { analysisContentHash } from "../src/analysis-target";
 import type { ProgressiveRemoteReport } from "../src/progressive-remote-report";
 import { resultAttempts, results } from "../src/schema";
 import { resolveProgressiveRemoteEvidence } from "../src/progressive-remote-evidence";
@@ -20,6 +21,177 @@ import {
 import { settleProgressiveRemoteJob } from "../../../apps/sweeper/src/progressive-remote-settlement";
 import { verifyPublicationRecovery } from "./progressive-publication-recovery-fixture";
 import { verifyRetainedReports } from "./retained-report-fixture";
+import * as ingestion from "../../../apps/sweeper/src/ingest";
+
+export async function verifyTerminalRemoteMaterialFailureIngest(
+  db: DB,
+  terminal: ProgressiveRemoteReport,
+) {
+  const restore = new Error("Restore terminal remote material-failure fixture");
+  await expect(db.transaction(async (raw) => {
+    const connection = raw as unknown as DB;
+    const executionId = terminal.executionId;
+    const failure = structuredClone(terminal);
+    failure.sequence = 1;
+    failure.status.state = "failed";
+    failure.result!.state = "failed";
+    failure.stopProof = {
+      version: 1,
+      job_id: executionId,
+      execution_stopped: true,
+      producer_stopped: true,
+      namespace_verified: true,
+      remaining: [],
+      observed_at: new Date().toISOString(),
+      error: null,
+      fence: "terminal_result",
+      ownership_basis: "recorded_execution_namespace",
+    };
+    failure.result!.polars = failure.result!.polars.map((polar) => ({
+      ...polar,
+      points: [],
+      attempts: polar.attempts!.map((attempt) => ({
+        ...attempt,
+        cl: null,
+        cd: null,
+        cm: null,
+        failure_disposition: "material_domain" as const,
+        evidence_artifacts: [],
+      })),
+    }));
+    for (const progress of failure.status.solver_budget_progress?.cases ?? [])
+      progress.solver_running = false;
+    await connection.execute(sql`UPDATE sim_campaigns SET status='active'
+      WHERE id=(SELECT campaign_id FROM sim_jobs WHERE id=${executionId}::uuid)`);
+    await connection.execute(sql`UPDATE sim_jobs SET request_payload=request_payload
+      - 'remoteSolver' - 'remoteProgressiveExecution' - 'syncPromiseId' - 'upstreamBaseUrl',
+      status='running',ingest_lease_token=NULL,ingest_lease_previous_status=NULL,
+      ingest_lease_claimed_at=NULL,ingest_lease_expires_at=NULL
+      WHERE id=${executionId}::uuid`);
+    const [setup] = await connection.execute(sql`SELECT
+      coalesce(request_payload#>>'{engineRequest,solver,selection,solver}',
+        request_payload#>>'{engineRequest,solver,flow_solver_family}',
+        request_payload#>>'{engineRequest,solver,solver}') AS solver
+      FROM sim_jobs WHERE id=${executionId}::uuid`);
+    expect(setup.solver).toBe("rhoSimpleFoam");
+    await connection.execute(sql`DELETE FROM progressive_remote_reports WHERE sim_job_id=${executionId}::uuid`);
+    await storeProgressiveRemoteReport(connection, {
+      executionId,
+      solverId: failure.solverId,
+      promiseId: failure.promiseId,
+      report: failure,
+    });
+    expect(await applyProgressiveRemoteProgress(connection, executionId)).toMatchObject({
+      kind: "applied", sequence: 1, stopped: true,
+    });
+    expect(await readProgressiveRemoteRetention(connection, executionId)).toMatchObject({
+      kind: "retained", sources: [],
+    });
+    const reports = await connection.execute(sql`SELECT * FROM progressive_remote_reports
+      WHERE sim_job_id=${executionId}::uuid ORDER BY sequence`);
+    const readJob = async () => [...await connection.execute(sql`SELECT status,request_payload,
+      ingest_lease_token,ingest_lease_previous_status,ingest_lease_claimed_at,ingest_lease_expires_at,"ingestedAt"
+      FROM sim_jobs WHERE id=${executionId}::uuid`)];
+    for (const previous of ["failed", "cancelled", "done", null] as const) {
+      await connection.execute(sql`UPDATE sim_jobs SET status='ingesting',
+        ingest_lease_previous_status=${previous}::sim_job_status,ingest_lease_token='expired-material-owner',
+        ingest_lease_claimed_at=clock_timestamp()-interval '3 minutes',
+        ingest_lease_expires_at=clock_timestamp()-interval '1 minute'
+        WHERE id=${executionId}::uuid`);
+      const before = await readJob();
+      if (previous === "failed")
+        await expect(connection.transaction(async (legacy) => {
+          await legacy.execute(sql`UPDATE sim_jobs SET ingest_lease_previous_status=status
+            WHERE id=${executionId}::uuid`);
+        })).rejects.toThrow("sim_jobs_ingest_lease_previous_status_check");
+      const failureAfterClaim = new Error("Isolated failure after material ingest claim");
+      const failedIngest = vi.spyOn(ingestion, "ingestResult").mockImplementationOnce(async () => {
+        const [claimed] = await connection.execute(sql`SELECT status,ingest_lease_previous_status,
+          ingest_lease_token,ingest_lease_expires_at>clock_timestamp() AS owned
+          FROM sim_jobs WHERE id=${executionId}::uuid`);
+        expect(claimed).toMatchObject({
+          status: "ingesting", ingest_lease_previous_status: previous ?? "failed", owned: true,
+        });
+        expect(claimed.ingest_lease_token).not.toBe("expired-material-owner");
+        throw failureAfterClaim;
+      });
+      try {
+        await expect(settleProgressiveRemoteJob(connection, executionId)).rejects.toBe(failureAfterClaim);
+        expect(failedIngest).toHaveBeenCalledOnce();
+        expect(await readJob()).toEqual(before);
+      } finally {
+        failedIngest.mockRestore();
+      }
+      if (previous === "done") continue;
+      const restoreSuccess = new Error("Restore material ingest success");
+      await expect(connection.transaction(async (nested) => {
+        const scoped = nested as unknown as DB;
+        expect(await settleProgressiveRemoteJob(scoped, executionId)).toMatchObject({
+          kind: "settled", counts: { complete: 0 },
+        });
+        const attempts = await scoped.execute(sql`SELECT id,status,valid_for_polar,evidence_payload
+          FROM result_attempts WHERE sim_job_id=${executionId}::uuid ORDER BY id`);
+        expect(attempts).toHaveLength(1);
+        expect(attempts[0]).toMatchObject({
+          status: "failed", valid_for_polar: false,
+          evidence_payload: { failure_disposition: "material_domain", cl: null, cd: null, cm: null },
+        });
+        const source = progressiveRemoteReportInventory(failure).sources[0];
+        const resolved = await resolveProgressiveRemoteEvidence(scoped, {
+          solverId: failure.solverId,
+          promiseId: failure.promiseId,
+          engineJobId: executionId,
+          aoaDeg: Number(source.aoa_deg),
+          engineCaseSlug: source.case_slug,
+          progressiveEvidence: {
+            sequence: failure.sequence,
+            reportContentSignature: String(reports[0].content_signature),
+            pointContentSignature: source.point_content_signature,
+          },
+        });
+        expect(resolved).not.toBeNull();
+        expect(attempts[0].evidence_payload).toEqual(progressiveRemotePointProjection(resolved!).evidencePayload);
+        const receipts = await scoped.execute(sql`SELECT receipt.evidence_signature,attempt.sim_job_id,
+          unit.aoa_deg FROM progressive_cfd_evidence receipt
+          JOIN progressive_cfd_attempts attempt ON attempt.token=receipt.attempt_token
+          JOIN progressive_cfd_units unit ON unit.id=attempt.unit_id
+          WHERE receipt.result_attempt_id=${attempts[0].id}::uuid`);
+        expect([...receipts]).toEqual([{
+          evidence_signature: analysisContentHash(attempts[0].evidence_payload),
+          sim_job_id: executionId,
+          aoa_deg: Number(source.aoa_deg),
+        }]);
+        const [published] = await scoped.execute(sql`SELECT count(*)::integer AS count FROM results result
+          JOIN result_attempts attempt ON attempt.id=result.current_result_attempt_id
+          JOIN result_classifications classification ON classification.result_attempt_id=attempt.id
+          WHERE attempt.sim_job_id=${executionId}::uuid AND attempt.status='done'
+            AND attempt.valid_for_polar AND classification.state='accepted'`);
+        expect(published.count).toBe(0);
+        const [finished] = await scoped.execute(sql`SELECT status,"ingestedAt",ingest_lease_token,
+          ingest_lease_previous_status FROM sim_jobs WHERE id=${executionId}::uuid`);
+        expect(finished.status).toBe(previous === "cancelled" ? "cancelled" : "failed");
+        expect(finished.ingestedAt).not.toBeNull();
+        expect(finished.ingest_lease_token).toBeNull();
+        expect(finished.ingest_lease_previous_status).toBeNull();
+        expect(await settleProgressiveRemoteJob(scoped, executionId)).toMatchObject({ kind: "settled" });
+        expect(await scoped.execute(sql`SELECT id FROM result_attempts
+          WHERE sim_job_id=${executionId}::uuid ORDER BY id`)).toEqual(attempts.map(({ id }) => ({ id })));
+        expect(await scoped.execute(sql`SELECT * FROM progressive_remote_reports
+          WHERE sim_job_id=${executionId}::uuid ORDER BY sequence`)).toEqual(reports);
+        throw restoreSuccess;
+      })).rejects.toBe(restoreSuccess);
+    }
+    await connection.execute(sql`UPDATE sim_jobs SET ingest_lease_token='live-material-owner',
+      ingest_lease_expires_at=clock_timestamp()+interval '10 minutes' WHERE id=${executionId}::uuid`);
+    const owned = await readJob();
+    expect(await settleProgressiveRemoteJob(connection, executionId)).toEqual({
+      kind: "waiting", reason: "ingestion_owner",
+    });
+    expect(await readJob()).toEqual(owned);
+    expect(await connection.execute(sql`SELECT id FROM result_attempts WHERE sim_job_id=${executionId}::uuid`)).toHaveLength(0);
+    throw restore;
+  })).rejects.toBe(restore);
+}
 
 export async function verifyProgressiveRemoteReportInventory(
   db: DB,

@@ -80,7 +80,8 @@ export async function reopenResolvedProgressiveConflicts(
     if (
       conflict.status === "promoted" ||
       (conflict.status === "archived" &&
-        conflict.exactGenerationAccepted === true)
+        conflict.exactGenerationAccepted === true) ||
+      (conflict.status === "pending" && conflict.retryable === true)
     ) {
       replayable.add(conflict.id);
     }
@@ -89,8 +90,7 @@ export async function reopenResolvedProgressiveConflicts(
     if (
       !(row.remote_conflict_ids as string[]).every(
         (id) => replayable.has(id),
-      ) &&
-      !row.retryable
+      )
     )
       continue;
     const changed =
