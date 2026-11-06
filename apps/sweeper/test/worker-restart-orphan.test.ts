@@ -22,40 +22,54 @@
 // cleanup in afterAll).
 
 import "./enabled-engine-pool-fixture";
+import { randomUUID } from "node:crypto";
 
 import {
   airfoils,
   boundaryProfiles,
   campaignFailures,
   categories,
+  claimProgressiveCfdUnit,
+  claimProgressiveWork,
   createClient,
+  failProgressiveWork,
   findCampaignGapBatch,
+  initializeProgressiveCfdWork,
   materializeCampaignLaunch,
+  materializeProgressiveCampaignScope,
   mediums,
   meshProfiles,
   outputProfiles,
+  resultAttempts,
   results,
   simCampaignPoints,
   simCampaignProgress,
   simJobs,
   solverIncidentSummary,
   solverProfiles,
+  solverCpuReservationSql,
   sweeperState,
 } from "@aerodb/db";
 import { cleanupCampaignFixtures } from "@aerodb/db/test-cleanup";
 import {
+  EngineError,
   WORKER_RESTART_ORPHAN_MESSAGE,
   type EngineClient,
+  type EngineExecutionStopProof,
+  type EngineQueueState,
+  type JobRuntimeSummary,
   type JobResult,
   type JobStatus,
   type PolarRequest,
 } from "@aerodb/engine-client";
-import { and, asc, eq } from "drizzle-orm";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { and, asc, desc, eq, sql as query } from "drizzle-orm";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 
 import type { ConditionMapEntry } from "../src/ingest";
 import { submitCampaignBatch } from "../src/loop";
 import { reconcile } from "../src/reconcile";
+import { composeProgressiveCfdJob } from "../src/progressive-cfd-jobs";
+import { claimAoas } from "../src/claim";
 import { withExactManifestEvidence } from "./exact-result-fixture";
 
 const { db, sql } = createClient({ max: 2 });
@@ -72,6 +86,7 @@ const NU = 1.789e-5 / 1.225;
 
 let orphanCampaignId = "";
 let genuineCampaignId = "";
+const progressiveCampaignIds: string[] = [];
 let airfoilId = "";
 let categoryId = "";
 let mediumId = "";
@@ -129,33 +144,73 @@ async function composeAndSubmit(
   campaignId: string,
   engineJobId: string,
 ): Promise<{ jobId: string; entry: ConditionMapEntry }> {
+  const [campaign] = await db.execute(query`SELECT status FROM sim_campaigns
+    WHERE id=${campaignId}::uuid`);
+  expect(campaign.status).toBe("active");
+  const existingJobs = await db
+    .select({ id: simJobs.id })
+    .from(simJobs)
+    .where(eq(simJobs.campaignId, campaignId));
+  const existingIds = new Set(existingJobs.map((job) => job.id));
   const batch = (await findCampaignGapBatch(db, {
     limit: 500,
     campaignIds: [campaignId],
   }))!;
   expect(batch).not.toBeNull();
-  const composeEngine = {
-    submitPolar: async (request: PolarRequest): Promise<JobStatus> => ({
+  const submit = vi.fn(
+    async (request: PolarRequest): Promise<JobStatus> => ({
       job_id: engineJobId,
       state: "pending",
       total_cases: request.aoa?.angles?.length ?? ANGLES.length,
       completed_cases: 0,
     }),
-  } as unknown as EngineClient;
+  );
+  const composeEngine = { submitPolar: submit } as unknown as EngineClient;
   const submitted = await submitCampaignBatch(db, composeEngine, batch, 0, 0);
-  expect(submitted).toBe(true);
-  const [job] = await db
+  expect(submitted).toBe(false);
+  expect(submit).not.toHaveBeenCalled();
+  const composedJobs = await db
     .select()
     .from(simJobs)
-    .where(
-      and(
-        eq(simJobs.campaignId, campaignId),
-        eq(simJobs.engineJobId, engineJobId),
-      ),
-    );
-  expect(job).toBeTruthy();
+    .where(eq(simJobs.campaignId, campaignId));
+  const newJobs = composedJobs.filter((job) => !existingIds.has(job.id));
+  expect(newJobs).toHaveLength(1);
+  const [job] = newJobs;
+  expect(job).toMatchObject({
+    campaignId,
+    status: "cancelled",
+    engineState: "cancelled",
+    engineJobId: null,
+    error: "campaign paused or cancelled before engine submission",
+  });
+  expect(job.finishedAt).toBeInstanceOf(Date);
+  expect(job.requestPayload).not.toHaveProperty("progressive");
+  expect(
+    await db
+      .select({ id: results.id })
+      .from(results)
+      .where(eq(results.simJobId, job.id)),
+  ).toEqual([]);
   const entries = conditionMapOf(job.requestPayload);
   expect(entries.length).toBe(1);
+  await db
+    .update(simJobs)
+    .set({
+      status: "running",
+      engineJobId,
+      engineState: "running",
+      finishedAt: null,
+    })
+    .where(eq(simJobs.id, job.id));
+  const claimed = await claimAoas(
+    db,
+    job.airfoilId,
+    entries[0].bcId,
+    entries[0].revisionId,
+    ANGLES,
+    job.id,
+  );
+  expect(claimed).toEqual(ANGLES);
   return { jobId: job.id, entry: entries[0] };
 }
 
@@ -235,7 +290,11 @@ afterAll(async () => {
   // registry rows are canonical-key deduped and can be referenced by parallel
   // suites, so hand-rolled unconditional deletes flake (DecisionHistory F9).
   await cleanupCampaignFixtures(db, {
-    campaignIds: [orphanCampaignId, genuineCampaignId],
+    campaignIds: [
+      orphanCampaignId,
+      genuineCampaignId,
+      ...progressiveCampaignIds,
+    ],
     presetSlugPrefix: `campaign-${PREFIX.toLowerCase()}`,
   });
   if (profileIds.boundary)
@@ -266,6 +325,443 @@ afterAll(async () => {
       });
   }
   await sql.end();
+});
+
+async function progressiveLostJobFixture(stage: 2 | 3 = 2) {
+  const identity = randomUUID();
+  const campaignId = await launchCampaign(
+    `${PREFIX} progressive ${identity}`,
+    21.43 + progressiveCampaignIds.length / 100,
+    identity,
+  );
+  progressiveCampaignIds.push(campaignId);
+  await materializeProgressiveCampaignScope(db, campaignId);
+  const [target] = await db.execute(query`SELECT scope.*, target.physical
+    FROM progressive_generation_targets scope
+    JOIN progressive_generations generation ON generation.id=scope.generation_id
+    JOIN polar_analysis_targets target ON target.id=scope.target_id
+    WHERE generation.campaign_id=${campaignId}::uuid AND generation.status='active'
+    ORDER BY generation.created_at DESC LIMIT 1`);
+  const baseline = await claimProgressiveWork(db, {
+    owner: identity,
+    stages: [1],
+    leaseSeconds: 120,
+    baselineGroup: {
+      generationId: String(target.generation_id),
+      airfoilId,
+      geometry: (target.physical as { geometry: number[][] }).geometry,
+      recipe: (target.recipes as Record<string, Record<string, unknown>>)
+        .neuralfoil,
+      maximumAngles: 32768,
+    },
+  });
+  expect(baseline).not.toBeNull();
+  await failProgressiveWork(
+    db,
+    baseline!,
+    "isolated unavailable prediction",
+    false,
+  );
+  await initializeProgressiveCfdWork(db, campaignId);
+  if (stage === 3) {
+    await db.execute(query`UPDATE progressive_cfd_units unit SET state='gap'
+      FROM progressive_work work WHERE unit.work_id=work.id
+        AND work.generation_id=${target.generation_id}::uuid AND work.stage=2`);
+    await db.execute(query`UPDATE progressive_work SET state='complete'
+      WHERE generation_id=${target.generation_id}::uuid AND stage=2`);
+    await db.execute(query`UPDATE progressive_generations SET stage=3
+      WHERE id=${target.generation_id}::uuid`);
+    await db.execute(query`UPDATE progressive_generation_cohorts SET stage=3
+      WHERE generation_id=${target.generation_id}::uuid`);
+    await initializeProgressiveCfdWork(db, campaignId);
+  }
+  const [pending] =
+    await db.execute(query`SELECT unit.recipe, unit.active_budget_seconds
+    FROM progressive_cfd_units unit JOIN progressive_work work ON work.id=unit.work_id
+    WHERE work.generation_id=${target.generation_id}::uuid AND work.stage=${stage}
+    ORDER BY unit.ordinal LIMIT 1`);
+  const lease = await claimProgressiveCfdUnit(db, {
+    owner: identity,
+    leaseSeconds: 120,
+    solverBudgetVersion: 2,
+    localTimeStepVersion: 1,
+    sameTarget: {
+      generationId: String(target.generation_id),
+      targetId: String(target.target_id),
+      recipe: pending.recipe as Record<string, unknown>,
+      remainingActiveSeconds: Number(pending.active_budget_seconds),
+    },
+  });
+  expect(lease).not.toBeNull();
+  const composed = await composeProgressiveCfdJob(db, [lease!], {
+    cpuSlots: 1,
+    meshRecoveryVersion: 1,
+    solverBudgetVersion: 2,
+    localTimeStepVersion: 1,
+  });
+  await db
+    .update(simJobs)
+    .set({
+      status: "running",
+      engineJobId: composed.jobId,
+      engineState: "running",
+      submittedAt: new Date(Date.now() - 3 * 60 * 60 * 1000),
+    })
+    .where(eq(simJobs.id, composed.jobId));
+  const inspect = async () => {
+    const [row] =
+      await db.execute(query`SELECT unit.state, unit.lease_token, unit.attempts,
+      attempt.outcome, ${solverCpuReservationSql("job")} AS cpu_reserved,
+      (SELECT count(*)::int FROM progressive_cfd_execution_stops WHERE sim_job_id=job.id) AS stop_count
+      FROM progressive_cfd_units unit JOIN progressive_cfd_attempts attempt ON attempt.unit_id=unit.id
+      JOIN sim_jobs job ON job.id=attempt.sim_job_id WHERE attempt.token=${lease!.token}::uuid`);
+    return row;
+  };
+  const invariant = () =>
+    db.execute(query`SELECT scope.recipes, unit.recipe,
+    unit.active_budget_seconds, unit.active_seconds
+    FROM progressive_generation_targets scope JOIN progressive_work work
+      ON work.generation_id=scope.generation_id AND work.target_id=scope.target_id
+    JOIN progressive_cfd_units unit ON unit.work_id=work.id
+    WHERE unit.id=${lease!.id}::uuid`);
+  const evidence = () =>
+    db
+      .select()
+      .from(resultAttempts)
+      .where(eq(resultAttempts.simJobId, composed.jobId))
+      .orderBy(asc(resultAttempts.id));
+  const [placeholder] = await db
+    .select()
+    .from(results)
+    .where(eq(results.simJobId, composed.jobId));
+  return {
+    ...composed,
+    lease: lease!,
+    inspect,
+    invariant,
+    evidence,
+    placeholder,
+  };
+}
+
+function progressiveLostJobEngine(
+  fixtures: Array<Awaited<ReturnType<typeof progressiveLostJobFixture>>>,
+) {
+  const quiet = new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString();
+  const statuses = new Map<string, JobStatus>(
+    fixtures.map((fixture) => [
+      fixture.jobId,
+      {
+        job_id: fixture.jobId,
+        state: "running",
+        phase: "waiting_cpu",
+        total_cases: 1,
+        completed_cases: 0,
+        started_at: quiet,
+        updated_at: quiet,
+        last_progress_at: quiet,
+      } satisfies JobStatus,
+    ]),
+  );
+  const runtimes = new Map<string, JobRuntimeSummary>(
+    fixtures.map((fixture) => [
+      fixture.jobId,
+      {
+        job_id: fixture.jobId,
+        exists: true,
+        cancelled: false,
+        process_count: 0,
+        runtime_heartbeat_age_sec: 10800,
+        status_readable: true,
+        result_readable: false,
+        has_result: false,
+      } satisfies JobRuntimeSummary,
+    ]),
+  );
+  const queue: EngineQueueState = {
+    queue_depth: 0,
+    active: [],
+    reserved: [],
+    scheduled: [],
+    active_count: 0,
+    reserved_count: 0,
+    scheduled_count: 0,
+    job_ids: [],
+    duplicates: {},
+    redelivered: [],
+    worker_queues: [
+      {
+        worker: "fixture-worker",
+        queues: [fixtures[0].request.expected_execution_pool!],
+        execution_pool: fixtures[0].request.expected_execution_pool!,
+        engine: {
+          ...fixtures[0].request.expected_engine!,
+          build_id: "progressive-lost-fixture",
+          application_source_sha256: "a".repeat(64),
+        },
+      },
+    ],
+    inspection_errors: {},
+    inspection_workers: {
+      active: ["fixture-worker"],
+      reserved: ["fixture-worker"],
+      scheduled: ["fixture-worker"],
+    },
+  };
+  const proof = (jobId: string): EngineExecutionStopProof => ({
+    version: 1,
+    job_id: jobId,
+    execution_stopped: true,
+    producer_stopped: true,
+    namespace_verified: true,
+    remaining: [],
+    error: null,
+    fence: "cancel_marker",
+    ownership_basis: "recorded_execution_namespace",
+    observed_at: new Date().toISOString(),
+  });
+  const calls = {
+    getQueue: vi.fn(async () => queue),
+    getJobRuntimes: vi.fn(async (ids: string[]) => ({
+      jobs: ids.flatMap((id) => (runtimes.has(id) ? [runtimes.get(id)!] : [])),
+    })),
+    getJob: vi.fn(async (id: string) => ({ ...statuses.get(id)! })),
+    cancelJob: vi.fn(async (id: string) => {
+      statuses.set(id, {
+        ...statuses.get(id)!,
+        state: "cancelled",
+        phase: "cancelled",
+      });
+      return { job_id: id, cancelled: true, execution_stopped: true };
+    }),
+    getExecutionStopProof: vi.fn(async (id: string) => proof(id)),
+    getResult: vi.fn(async () => {
+      throw new EngineError("Result not ready (state=cancelled)", 409);
+    }),
+    submitPolar: vi.fn(),
+  };
+  return {
+    engine: calls as unknown as EngineClient,
+    calls,
+    queue,
+    statuses,
+    runtimes,
+    proof,
+  };
+}
+
+describe("progressive background lost-job liveness", () => {
+  it("settles only the lost job after exact stop proof and preserves a live precise job", async () => {
+    const lost = await progressiveLostJobFixture();
+    const precise = await progressiveLostJobFixture(3);
+    const state = progressiveLostJobEngine([lost, precise]);
+    state.runtimes.get(precise.jobId)!.process_count = 2;
+    state.runtimes.get(precise.jobId)!.runtime_heartbeat_age_sec = 5;
+    state.statuses.set(precise.jobId, {
+      ...state.statuses.get(precise.jobId)!,
+      phase: "solving_urans",
+    });
+    state.queue.job_ids = [precise.jobId];
+    state.queue.active = [
+      {
+        worker: "fixture-worker",
+        task_id: precise.jobId,
+        name: "airfoilfoam.run_polar",
+        job_id: precise.jobId,
+        redelivered: false,
+      },
+    ];
+    state.queue.active_count = 1;
+    const retained = await lost.invariant();
+    const retainedEvidence = await lost.evidence();
+    expect(retainedEvidence).toEqual([]);
+    const preciseBefore = await precise.inspect();
+    const preciseInvariant = await precise.invariant();
+    const preciseEvidence = await precise.evidence();
+    const preciseCanonical = await db
+      .select()
+      .from(results)
+      .where(eq(results.id, precise.placeholder.id));
+    state.calls.getExecutionStopProof.mockImplementationOnce(async (id) => ({
+      ...state.proof(id),
+      execution_stopped: false,
+      producer_stopped: false,
+    }));
+    const options = {
+      jobIds: [lost.jobId, precise.jobId],
+      skipFailedRecovery: true,
+    };
+    await reconcile(db, state.engine, options);
+    expect(await lost.inspect()).toMatchObject({
+      state: "leased",
+      outcome: "running",
+      cpu_reserved: true,
+      stop_count: 0,
+    });
+    expect(state.calls.getResult).not.toHaveBeenCalled();
+    await reconcile(db, state.engine, options);
+    expect(await lost.inspect()).toMatchObject({
+      state: "gap",
+      lease_token: null,
+      outcome: "failed",
+      cpu_reserved: false,
+      stop_count: 1,
+    });
+    expect(state.calls.cancelJob.mock.calls.map(([id]) => id)).toEqual([
+      lost.jobId,
+    ]);
+    expect(
+      state.calls.getExecutionStopProof.mock.calls.every(
+        ([id]) => id === lost.jobId,
+      ),
+    ).toBe(true);
+    expect(state.calls.submitPolar).not.toHaveBeenCalled();
+    expect(await lost.invariant()).toEqual(retained);
+    expect(await lost.evidence()).toEqual(retainedEvidence);
+    const [released] = await db
+      .select()
+      .from(results)
+      .where(eq(results.id, lost.placeholder.id));
+    expect(released).toMatchObject({
+      status: "pending",
+      simJobId: null,
+      cl: null,
+      cd: null,
+      cm: null,
+    });
+    expect(await precise.inspect()).toEqual(preciseBefore);
+    expect(await precise.invariant()).toEqual(preciseInvariant);
+    expect(await precise.evidence()).toEqual(preciseEvidence);
+    expect(
+      await db
+        .select()
+        .from(results)
+        .where(eq(results.id, precise.placeholder.id)),
+    ).toEqual(preciseCanonical);
+  }, 120_000);
+
+  it.each([
+    "live mesh child",
+    "live CPU waiter",
+    "active task",
+    "reserved task",
+    "scheduled task",
+    "recent progress",
+    "fresh physical progress with stale coarse status",
+    "queue unavailable",
+    "runtime unavailable",
+    "partial worker coverage",
+    "inspection error",
+    "runtime error",
+    "missing heartbeat",
+    "missing worker inventory",
+    "foreign runtime",
+  ])(
+    "does not cancel %s",
+    async (scenario) => {
+      const fixture = await progressiveLostJobFixture();
+      const state = progressiveLostJobEngine([fixture]);
+      const runtime = state.runtimes.get(fixture.jobId)!;
+      if (scenario === "live mesh child") {
+        runtime.process_count = 1;
+        runtime.active_pids = [1234];
+        runtime.processes = [{ pid: 1234, command: "cartesian2DMesh" }];
+        state.statuses.set(fixture.jobId, {
+          ...state.statuses.get(fixture.jobId)!,
+          phase: "meshing",
+        });
+      }
+      if (scenario === "live CPU waiter") runtime.runtime_heartbeat_age_sec = 5;
+      if (
+        ["active task", "reserved task", "scheduled task"].includes(scenario)
+      ) {
+        const kind = scenario.split(" ")[0] as
+          | "active"
+          | "reserved"
+          | "scheduled";
+        state.queue[kind] = [
+          {
+            worker: "fixture-worker",
+            task_id: fixture.jobId,
+            name: "airfoilfoam.run_polar",
+            job_id: fixture.jobId,
+            redelivered: false,
+          },
+        ];
+        if (kind === "active") state.queue.active_count = 1;
+        if (kind === "reserved") state.queue.reserved_count = 1;
+        if (kind === "scheduled") state.queue.scheduled_count = 1;
+      }
+      if (scenario === "recent progress")
+        state.statuses.get(fixture.jobId)!.last_progress_at =
+          new Date().toISOString();
+      if (scenario === "fresh physical progress with stale coarse status")
+        Object.assign(runtime, {
+          runtime_last_progress_at: new Date().toISOString(),
+          active_pids: [],
+          processes: [],
+        });
+      if (scenario === "queue unavailable")
+        state.calls.getQueue.mockRejectedValue(new Error("queue unreachable"));
+      if (scenario === "runtime unavailable")
+        state.calls.getJobRuntimes.mockRejectedValue(
+          new Error("runtime unreachable"),
+        );
+      if (scenario === "partial worker coverage")
+        state.queue.inspection_workers!.active = [];
+      if (scenario === "inspection error")
+        state.queue.inspection_errors = { reserved: "worker timed out" };
+      if (scenario === "runtime error")
+        Object.assign(runtime, { runtime_error: "unreadable runtime" });
+      if (scenario === "missing heartbeat")
+        runtime.runtime_heartbeat_age_sec = undefined;
+      if (scenario === "missing worker inventory")
+        state.queue.worker_queues = null;
+      if (scenario === "foreign runtime") runtime.job_id = randomUUID();
+      const before = await fixture.inspect();
+      const invariant = await fixture.invariant();
+      await reconcile(db, state.engine, {
+        jobIds: [fixture.jobId],
+        skipFailedRecovery: true,
+      });
+      expect(state.calls.cancelJob).not.toHaveBeenCalled();
+      expect(state.calls.getExecutionStopProof).not.toHaveBeenCalled();
+      expect(state.calls.submitPolar).not.toHaveBeenCalled();
+      expect(await fixture.inspect()).toEqual(before);
+      expect(await fixture.invariant()).toEqual(invariant);
+    },
+    120_000,
+  );
+
+  it("keeps a competing live ingest owner ahead of lost-job cancellation", async () => {
+    const fixture = await progressiveLostJobFixture();
+    const state = progressiveLostJobEngine([fixture]);
+    const token = randomUUID();
+    state.calls.getJob.mockImplementationOnce(async () => {
+      await db
+        .update(simJobs)
+        .set({
+          status: "ingesting",
+          ingestLeaseToken: token,
+          ingestLeaseClaimedAt: new Date(),
+          ingestLeaseExpiresAt: new Date(Date.now() + 60000),
+        })
+        .where(eq(simJobs.id, fixture.jobId));
+      return { ...state.statuses.get(fixture.jobId)! };
+    });
+    const before = await fixture.inspect();
+    await reconcile(db, state.engine, {
+      jobIds: [fixture.jobId],
+      skipFailedRecovery: true,
+    });
+    expect(state.calls.cancelJob).not.toHaveBeenCalled();
+    expect(await fixture.inspect()).toEqual(before);
+    const [job] = await db
+      .select()
+      .from(simJobs)
+      .where(eq(simJobs.id, fixture.jobId));
+    expect(job.ingestLeaseToken).toBe(token);
+  }, 120_000);
 });
 
 describe("worker-restart orphan: interrupted campaign points release, never fail", () => {

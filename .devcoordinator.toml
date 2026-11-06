@@ -4688,6 +4688,12 @@ requires = ["seed"]
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "recovers terminal remote material failure ingestion without publishing CFD"]
 
 [[test.solver-throughput-recovery.check]]
+name = "mixed-delivery"
+tier = "development"
+requires = ["terminal-ingestion"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "delivers an exact physical case beside a retained terminal material diagnostic"]
+
+[[test.solver-throughput-recovery.check]]
 name = "stage-progress"
 tier = "development"
 requires = ["schema"]
@@ -4706,6 +4712,12 @@ requires = ["seed"]
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/ingest-lease.test.ts", "test/progressive-remote-admission.test.ts", "test/progressive-remote-admission-lock.test.ts", "test/admission-predicate-transitions.test.ts"]
 
 [[test.solver-throughput-recovery.check]]
+name = "progressive-orphans"
+tier = "development"
+requires = ["seed"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/worker-restart-orphan.test.ts"]
+
+[[test.solver-throughput-recovery.check]]
 name = "database-types"
 tier = "development"
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "typecheck"]
@@ -4714,3 +4726,8 @@ command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "typecheck"]
 name = "sweeper-types"
 tier = "development"
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "typecheck"]
+
+[[test.solver-throughput-recovery.check]]
+name = "api-types"
+tier = "development"
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/api", "typecheck"]

@@ -75,6 +75,7 @@ import {
   enqueuePrecalcVerifications,
   hasExactVerifiedRestartableEvidenceArchive,
 } from "@aerodb/db";
+import { recordProgressiveRemoteDiagnosticReceipt } from "@aerodb/db/progressive-remote-diagnostic-receipts";
 import {
   canonicalRemoteHubBaseUrl,
   parseGasThermodynamicModel,
@@ -7243,7 +7244,14 @@ export async function registerSyncRoutes(app: FastifyInstance): Promise<void> {
         .object({ executionId: z.string().uuid() })
         .safeParse(req.params);
       const body = z
-        .object({ promiseId: z.string().uuid(), report: z.record(z.unknown()) })
+        .object({
+          promiseId: z.string().uuid(), report: z.record(z.unknown()),
+          diagnostic: z.object({
+            pointContentSignature: z.string().regex(/^[a-f0-9]{64}$/),
+            remoteResultId: z.string().uuid(), remoteResultAttemptId: z.string().uuid(),
+            aoaDeg: z.number().finite(), engineCaseSlug: z.string().nullable(),
+          }).strict().optional(),
+        })
         .strict()
         .safeParse(req.body);
       if (!params.success || !body.success)
@@ -7272,10 +7280,22 @@ export async function registerSyncRoutes(app: FastifyInstance): Promise<void> {
           executionId: params.data.executionId,
           report: body.data.report,
         });
-        return { received: true, receipt };
+        const diagnosticReceipt = body.data.diagnostic ? await recordProgressiveRemoteDiagnosticReceipt(db, {
+          solverId: solver.id, promiseId: body.data.promiseId, engineJobId: params.data.executionId,
+          aoaDeg: body.data.diagnostic.aoaDeg, engineCaseSlug: body.data.diagnostic.engineCaseSlug,
+          progressiveEvidence: {
+            sequence: receipt.sequence, reportContentSignature: receipt.contentSignature,
+            pointContentSignature: body.data.diagnostic.pointContentSignature,
+          },
+        }) : undefined;
+        return { received: true, receipt, ...(diagnosticReceipt ? { diagnosticReceipt } : {}) };
       } catch (error) {
         if (error instanceof ProgressiveRemoteReportConflict)
           return reply.code(409).send({ error: error.message });
+        if (error instanceof ProgressiveRemoteEvidenceConflict)
+          return reply.code(409).send({ code: "progressive_diagnostic_scope_closed", error: error.message });
+        if (error instanceof ProgressiveCfdEvidenceScopePending)
+          return reply.code(503).send({ code: "progressive_diagnostic_scope_pending", error: error.message });
         throw error;
       }
     },

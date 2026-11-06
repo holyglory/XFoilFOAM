@@ -4681,6 +4681,45 @@ describe("progressive CPU admission", () => {
     });
   });
 
+  it("delivers an exact physical case beside a retained terminal material diagnostic", async () => {
+    await ready(async () => {
+      const leases = await claimProgressiveCfdBatch(db, {
+        owner: "mixed-terminal-delivery-fixture",
+        leaseSeconds: 120,
+        maximumUnits: 2,
+        solverBudgetVersion: 2,
+      });
+      const composed = await composeProgressiveCfdJob(db, leases, {
+        cpuSlots: 1,
+        meshRecoveryVersion: 1,
+        solverBudgetVersion: 2,
+      });
+      const [job] = await db.select().from(simJobs).where(eq(simJobs.id, composed.jobId));
+      const solverId = randomUUID();
+      const promiseId = randomUUID();
+      try {
+        await db.execute(sql`INSERT INTO registered_remote_solvers
+          (id,instance_id,instance_name,cpu_capacity,cpu_budget,max_active_polar_promises)
+          VALUES (${solverId}::uuid,${randomUUID()},'isolated mixed terminal worker',96,96,96)`);
+        await db.execute(sql`INSERT INTO sync_sweep_promises
+          (id,registered_solver_id,airfoil_id,simulation_preset_revision_id,aoa_count,"expiresAt")
+          VALUES (${promiseId}::uuid,${solverId}::uuid,${job.airfoilId}::uuid,
+            ${job.simulationPresetRevisionId}::uuid,${leases.length},clock_timestamp()+interval '1 hour')`);
+        for (const lease of leases)
+          await db.execute(sql`INSERT INTO sync_sweep_promise_points
+            (promise_id,airfoil_id,simulation_preset_revision_id,aoa_deg)
+            VALUES (${promiseId}::uuid,${job.airfoilId}::uuid,${job.simulationPresetRevisionId}::uuid,${lease.alpha})`);
+        const { envelope } = await bindProgressiveRemoteDispatch(db, { simJobId: job.id, solverId, promiseId });
+        const { verifyMixedProgressiveRemoteDelivery } = await import("./progressive-remote-mixed-delivery-fixture");
+        await verifyMixedProgressiveRemoteDelivery(db, envelope);
+      } finally {
+        await db.execute(sql`DELETE FROM progressive_remote_dispatches WHERE sim_job_id=${job.id}::uuid`);
+        await db.execute(sql`DELETE FROM sync_sweep_promises WHERE id=${promiseId}::uuid`);
+        await db.execute(sql`DELETE FROM registered_remote_solvers WHERE id=${solverId}::uuid`);
+      }
+    }, [32.1799]);
+  }, 120_000);
+
   it("recovers terminal remote material failure ingestion without publishing CFD", async () => {
     await ready(async () => {
       const leases = await claimProgressiveCfdBatch(db, {

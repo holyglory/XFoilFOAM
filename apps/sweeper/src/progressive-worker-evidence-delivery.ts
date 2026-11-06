@@ -2,6 +2,7 @@ import { canonicalRemoteHubBaseUrl } from "@aerodb/core";
 import {
   analysisContentHash,
   progressiveRemotePointProjection,
+  progressiveReportedPointSources,
   resolveProgressiveReportedPoint,
   verifyProgressiveRemoteExecution,
   type DB,
@@ -38,20 +39,22 @@ export async function recordProgressiveWorkerEvidenceReceipt(
   const receipt = supplied as Record<string, unknown> | null;
   const uuid =
     /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i;
+  const diagnostic = receipt?.kind === "retained-progressive-diagnostic";
   if (
     !receipt ||
     receipt.version !== 1 ||
-    receipt.kind !== "retained-progressive-attempt" ||
+    (!diagnostic && receipt.kind !== "retained-progressive-attempt") ||
     receipt.executionId !== expected.executionId ||
     !Number.isSafeInteger(receipt.sequence) ||
     Number(receipt.sequence) < 1 ||
     receipt.pointContentSignature !== expected.pointContentSignature ||
-    receipt.remoteResultId !== expected.resultId ||
-    receipt.remoteResultAttemptId !== expected.resultAttemptId ||
-    typeof receipt.resultId !== "string" ||
-    !uuid.test(receipt.resultId) ||
-    typeof receipt.resultAttemptId !== "string" ||
-    !uuid.test(receipt.resultAttemptId) ||
+    (!diagnostic && (receipt.remoteResultId !== expected.resultId ||
+      receipt.remoteResultAttemptId !== expected.resultAttemptId)) ||
+    (diagnostic ? typeof receipt.reportContentSignature !== "string" ||
+      !/^[a-f0-9]{64}$/.test(receipt.reportContentSignature) ||
+      "resultId" in receipt || "resultAttemptId" in receipt
+      : typeof receipt.resultId !== "string" || !uuid.test(receipt.resultId) ||
+        typeof receipt.resultAttemptId !== "string" || !uuid.test(receipt.resultAttemptId)) ||
     typeof receipt.receivedAt !== "string" ||
     !Number.isFinite(Date.parse(receipt.receivedAt))
   )
@@ -60,14 +63,20 @@ export async function recordProgressiveWorkerEvidenceReceipt(
   await db.transaction(async (transaction) => {
     const connection = transaction as unknown as DB;
     const [source] = await connection.execute(sql`
-      SELECT report.report FROM progressive_worker_evidence_attempts association
+      SELECT association.sequence,report.report,report.content_signature,attempt.evidence_payload,job.request_payload,
+        EXISTS (SELECT 1 FROM progressive_worker_reports stopped
+          WHERE stopped.sim_job_id=job.id AND stopped.stopped_engine_job_id=job.id::text
+            AND stopped.assignment_signature=report.assignment_signature AND stopped.acknowledged_at IS NOT NULL) AS stopped
+      FROM progressive_worker_evidence_attempts association
       JOIN progressive_worker_reports report ON report.sim_job_id=association.sim_job_id AND report.sequence=association.sequence
       JOIN result_attempts attempt ON attempt.id=association.result_attempt_id
         AND attempt.sim_job_id=association.sim_job_id AND attempt.engine_job_id=association.sim_job_id::text
-      WHERE association.sim_job_id=${expected.executionId}::uuid AND association.sequence=${sequence}
+      JOIN sim_jobs job ON job.id=association.sim_job_id
+      WHERE association.sim_job_id=${expected.executionId}::uuid AND (${diagnostic} OR association.sequence=${sequence})
         AND association.result_attempt_id=${expected.resultAttemptId}::uuid
         AND association.point_content_signature=${expected.pointContentSignature}
         AND attempt.result_id=${expected.resultId}::uuid AND report.acknowledged_at IS NOT NULL
+      ORDER BY CASE WHEN association.sequence=${sequence} THEN 0 ELSE 1 END,association.sequence LIMIT 1
     `);
     if (!source)
       throw new Error(
@@ -76,12 +85,36 @@ export async function recordProgressiveWorkerEvidenceReceipt(
     await assertProgressiveWorkerEvidenceJob(connection, {
       simJobId: expected.executionId,
       engineJobId: expected.executionId,
-      reportSequence: sequence,
+      reportSequence: Number(source.sequence),
       result: (source.report as unknown as ProgressiveRemoteReport).result!,
     });
+    if (diagnostic) {
+      const report = source.report as unknown as ProgressiveRemoteReport;
+      const envelope = verifyProgressiveRemoteExecution((source.request_payload as Record<string, unknown>).remoteProgressiveExecution, {
+        executionId: expected.executionId, solverId: report.solverId, promiseId: report.promiseId,
+        contentSignature: report.assignmentSignature,
+      });
+      const point = progressiveReportedPointSources(report.result!).find((entry) => entry.contentSignature === expected.pointContentSignature);
+      const [anchor] = await connection.execute(sql`SELECT report,content_signature FROM progressive_worker_reports
+        WHERE sim_job_id=${expected.executionId}::uuid AND sequence=${sequence} AND acknowledged_at IS NOT NULL`);
+      if (!anchor) throw new Error("Hub diagnostic receipt has no acknowledged source report");
+      await assertProgressiveWorkerEvidenceJob(connection, {
+        simJobId: expected.executionId, engineJobId: expected.executionId, reportSequence: sequence,
+        result: (anchor.report as unknown as ProgressiveRemoteReport).result!,
+      });
+      if (!source.stopped || anchor.content_signature !== receipt.reportContentSignature ||
+        !progressiveReportedPointSources((anchor.report as unknown as ProgressiveRemoteReport).result!)
+          .some((entry) => entry.contentSignature === expected.pointContentSignature) || !point ||
+        point.point.failure_disposition !== "material_domain" || point.point.converged !== false ||
+        [point.point.cl,point.point.cd,point.point.cm].some((value) => value != null) ||
+        (point.point.evidence_artifacts?.length ?? 0) > 0 ||
+        analysisContentHash(progressiveRemotePointProjection({ ...point, envelope, report }).evidencePayload) !==
+          analysisContentHash(source.evidence_payload))
+        throw new Error("Hub diagnostic receipt differs from the exact stopped metadata-only source");
+    }
     await connection.execute(sql`
       INSERT INTO progressive_worker_hub_receipts (sim_job_id, sequence, result_attempt_id, point_content_signature, receipt)
-      VALUES (${expected.executionId}::uuid, ${sequence}, ${expected.resultAttemptId}::uuid,
+      VALUES (${expected.executionId}::uuid, ${Number(source.sequence)}, ${expected.resultAttemptId}::uuid,
         ${expected.pointContentSignature}, ${JSON.stringify(receipt)}::jsonb)
       ON CONFLICT (sim_job_id, point_content_signature) DO NOTHING
     `);
@@ -201,7 +234,20 @@ export async function deliverNextProgressiveWorkerEvidence(
           body: requestBody,
         },
       );
-    let response = await post("polars");
+    const diagnostic = source.point.failure_disposition === "material_domain" && source.point.converged === false &&
+      [source.point.cl,source.point.cd,source.point.cm].every((value) => value == null) &&
+      (source.point.evidence_artifacts?.length ?? 0) === 0;
+    let response = diagnostic ? await fetchProgressiveRemote(fetcher,
+      `${canonicalRemoteHubBaseUrl(String(pending.upstream_base_url))}/progressive-executions/${executionId}/reports`, {
+        method: "POST", headers: {
+          "content-type": "application/json", "x-xfoilfoam-solver-token": String(pending.remote_solver_auth_token),
+        }, redirect: "error", signal: AbortSignal.timeout(REMOTE_EVIDENCE_DELIVERY_TIMEOUT_MS),
+        body: JSON.stringify({ promiseId: pending.promise_id, report, diagnostic: {
+          aoaDeg: source.point.aoa_deg, engineCaseSlug: source.point.case_slug ?? null,
+          remoteResultId: pending.result_id, remoteResultAttemptId: pending.result_attempt_id,
+          pointContentSignature: source.contentSignature,
+        } }),
+      }) : await post("polars");
     responseStatus = response.status;
     if (!response.ok) {
       rejected = (await response.json().catch(() => null)) as {
@@ -211,7 +257,7 @@ export async function deliverNextProgressiveWorkerEvidence(
       const closedScope =
         rejected?.code === "promise_inactive" ||
         rejected?.code === "progressive_scope_closed";
-      if (response.status === 409 && closedScope) {
+      if (!diagnostic && response.status === 409 && closedScope) {
         stoppedStorage = await progressiveStoppedStorageEligible(
           db,
           executionId,
@@ -254,6 +300,9 @@ export async function deliverNextProgressiveWorkerEvidence(
     }
     const responseBody = (await response.json()) as {
       progressiveEvidenceReceipts?: unknown;
+      diagnosticReceipt?: unknown;
+      received?: unknown;
+      receipt?: { executionId?: unknown; sequence?: unknown; contentSignature?: unknown };
       conflictIds?: unknown;
     } | null;
     if (responseBody?.conflictIds !== undefined) {
@@ -276,10 +325,14 @@ export async function deliverNextProgressiveWorkerEvidence(
         );
     }
     const receipts = responseBody?.progressiveEvidenceReceipts;
-    const receipt =
+    const receipt = diagnostic ? responseBody?.diagnosticReceipt :
       Array.isArray(receipts) && receipts.length === 1
         ? (receipts[0] as Record<string, unknown> | null)
         : null;
+    if (diagnostic && (responseBody?.received !== true || responseBody.receipt?.executionId !== executionId ||
+      responseBody.receipt.sequence !== sequence || responseBody.receipt.contentSignature !== pending.report_signature ||
+      (receipt as Record<string, unknown> | null)?.kind !== "retained-progressive-diagnostic"))
+      throw new Error("Hub did not acknowledge the exact retained diagnostic report and source");
     await recordProgressiveWorkerEvidenceReceipt(db, receipt, {
       executionId,
       pointContentSignature: source.contentSignature,

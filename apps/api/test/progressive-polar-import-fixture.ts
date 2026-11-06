@@ -50,6 +50,20 @@ vi.mock("../src/db", () => ({
   },
 }));
 
+export async function withProgressiveSyncApi<T>(db: DB, run: (app: ReturnType<typeof Fastify>) => Promise<T>) {
+  if (isolated.connection) throw new Error("Isolated API fixture is already active");
+  isolated.connection = db;
+  const app = Fastify({ logger: false });
+  try {
+    await app.register(multipart);
+    await registerSyncRoutes(app);
+    return await run(app);
+  } finally {
+    await app.close();
+    isolated.connection = null;
+  }
+}
+
 export async function verifyProgressivePolarImport(
   db: DB,
   delivery: ProgressiveRemoteEvidenceDelivery,

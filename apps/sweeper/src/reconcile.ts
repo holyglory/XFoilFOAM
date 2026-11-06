@@ -71,6 +71,7 @@ import {
   WORKER_RESTART_ORPHAN_MESSAGE,
   classifyQueueLifecycle,
   engineQueueListsJob,
+  liveWorkerConsumesExecutionPool,
   type EngineClient,
   type EngineExecutionStopProof,
   type EngineQueueState,
@@ -1552,12 +1553,21 @@ function classifyLostRunning(
     Number(runtime.runtime_heartbeat_age_sec) <= 120;
   if (heartbeatAlive) return null;
   if (!queue || engineQueueListsJob(queue, job.engineJobId)) return null;
-  const lastProgress =
-    parseEngineDate(status.last_progress_at) ??
-    parseEngineDate(status.started_at) ??
-    parseEngineDate(status.queued_at);
-  if (!lastProgress) return null;
-  const quietMs = now - lastProgress.getTime();
+  const progressTimes = [
+    status.last_progress_at,
+    status.updated_at,
+    status.phase_started_at,
+    status.started_at,
+    status.queued_at,
+    runtime.runtime_last_progress_at,
+    runtime.status_last_progress_at,
+    runtime.status_updated_at,
+  ].flatMap((value) => {
+    const observed = parseEngineDate(value);
+    return observed ? [observed.getTime()] : [];
+  });
+  if (!progressTimes.length) return null;
+  const quietMs = now - Math.max(...progressTimes);
   if (quietMs < LOST_RUNNING_GRACE_MS) return null;
   return (
     `engine reports running but no OpenFOAM process exists, the worker heartbeat is stale, Celery does not list the task, ` +
@@ -1565,8 +1575,58 @@ function classifyLostRunning(
     // time-limit kill (task_time_limit, 2026-07-07), where the pool child is
     // SIGKILLed without any worker restart — so the message must not assert a
     // restart it cannot prove.
-    `and last progress was ${Math.round(quietMs / 60000)} min ago — task lost (worker process died, was hard-killed, or restarted mid-solve); cancelled and requeued`
+    `and last progress was ${Math.round(quietMs / 60000)} min ago — task lost (worker process died, was hard-killed, or restarted mid-solve)`
   );
+}
+
+type ProgressiveExecutionObservation = {
+  runtime: JobRuntimeSummary | null;
+  queue: EngineQueueState | null;
+};
+
+function completeProgressiveObservation(
+  observation: ProgressiveExecutionObservation | undefined,
+  engineJobId: string,
+): observation is { runtime: JobRuntimeSummary; queue: EngineQueueState } {
+  const runtime = observation?.runtime;
+  const queue = observation?.queue;
+  if (
+    !runtime ||
+    runtime.job_id !== engineJobId ||
+    !runtime.exists ||
+    runtime.runtime_error != null ||
+    runtime.status_error != null ||
+    runtime.result_error != null ||
+    !runtime.status_readable ||
+    runtime.has_result ||
+    runtime.result_readable ||
+    !Number.isSafeInteger(runtime.process_count) ||
+    runtime.process_count < 0 ||
+    runtime.runtime_heartbeat_age_sec == null ||
+    !Number.isFinite(runtime.runtime_heartbeat_age_sec) ||
+    !queue ||
+    queue.worker_queues_error != null ||
+    queue.worker_runtime_error != null ||
+    Object.keys(queue.inspection_errors ?? {}).length > 0 ||
+    !Array.isArray(queue.worker_queues) ||
+    queue.worker_queues.length === 0
+  )
+    return false;
+  const workers = new Set(queue.worker_queues.map((binding) => binding.worker));
+  if (
+    workers.size !== queue.worker_queues.length ||
+    [...workers].some((worker) => typeof worker !== "string" || !worker)
+  )
+    return false;
+  return ["active", "reserved", "scheduled"].every((kind) => {
+    const inspected = queue.inspection_workers?.[kind];
+    return (
+      Array.isArray(inspected) &&
+      inspected.length === workers.size &&
+      new Set(inspected).size === workers.size &&
+      inspected.every((worker) => workers.has(worker))
+    );
+  });
 }
 
 /** Grace before declaring an engine-"running" job lost. The engine bumps
@@ -4159,6 +4219,7 @@ export async function reconcileProgressiveCfdJob(
   db: DB,
   engine: EngineClient,
   job: SimJobRow,
+  observation?: ProgressiveExecutionObservation,
 ): Promise<void> {
   if (!job.engineJobId || !requestPayload(job).progressive) return;
   const [local] = await db
@@ -4176,9 +4237,63 @@ export async function reconcileProgressiveCfdJob(
     expectedEngine: expectedEngineForJob(job),
     expectedExecutionPool: await expectedExecutionPoolForJob(db, job),
   };
-  const status = await engine.getJob(job.engineJobId, route);
+  let status = await engine.getJob(job.engineJobId, route);
   if (status.job_id !== job.engineJobId)
     throw new Error("Progressive status belongs to another engine execution");
+  if (
+    status.state === "running" &&
+    completeProgressiveObservation(observation, job.engineJobId) &&
+    liveWorkerConsumesExecutionPool(
+      observation.queue,
+      route.expectedExecutionPool,
+      route.expectedEngine,
+    )
+  ) {
+    const lostReason = classifyLostRunning(
+      job,
+      status,
+      observation.runtime,
+      observation.queue,
+    );
+    if (lostReason) {
+      const lease = await claimJobForIngest(db, job.id);
+      if (!lease) return;
+      try {
+        console.error(
+          `[sweeper] LOST progressive engine job ${job.engineJobId}: ${lostReason}`,
+        );
+        const cancellation = await engine.cancelJob(job.engineJobId, route);
+        if (cancellation.job_id !== job.engineJobId || !cancellation.cancelled)
+          throw new Error(
+            "Engine did not acknowledge the exact lost progressive execution",
+          );
+        const proof = await engine.getExecutionStopProof(
+          job.engineJobId,
+          route,
+        );
+        if (proof.job_id !== job.engineJobId)
+          throw new Error("Execution-stop proof belongs to another engine job");
+        validateProgressiveExecutionStopProof(proof);
+        status = await engine.getJob(job.engineJobId, route);
+        if (
+          status.job_id !== job.engineJobId ||
+          !["completed", "failed", "cancelled"].includes(status.state)
+        )
+          throw new Error(
+            "Stopped progressive execution has no exact terminal status",
+          );
+        await acknowledgeProgressiveCfdExecutionStop(db, {
+          simJobId: job.id,
+          proof,
+        });
+        if (!(await releaseIngestLeaseToRunning(db, lease)))
+          throw new IngestLeaseLostError(job.id);
+      } catch (error) {
+        await markIngestRetry(db, job.id, error, lease, status.state);
+        throw error;
+      }
+    }
+  }
   if (status.solver_budget_progress)
     await recordProgressiveCfdRuntimeProgress(db, {
       simJobId: job.id,
@@ -4198,19 +4313,11 @@ export async function reconcileProgressiveCfdJob(
     )
       return;
   } else {
-    let proof = await durableProgressiveStopProof(
-      db,
-      job.id,
-      job.engineJobId,
-    );
+    let proof = await durableProgressiveStopProof(db, job.id, job.engineJobId);
     if (!proof) {
       proof = await engine.getExecutionStopProof(job.engineJobId, route);
       if (!proof.execution_stopped) {
-        proof = await durableProgressiveStopProof(
-          db,
-          job.id,
-          job.engineJobId,
-        );
+        proof = await durableProgressiveStopProof(db, job.id, job.engineJobId);
         if (!proof) return;
       }
     }
@@ -4338,10 +4445,11 @@ async function pollProgressiveCfdJob(
   db: DB,
   engine: EngineClient,
   job: SimJobRow,
+  observation: ProgressiveExecutionObservation,
 ): Promise<void> {
   await touchHeartbeat(db);
   try {
-    await reconcileProgressiveCfdJob(db, engine, job);
+    await reconcileProgressiveCfdJob(db, engine, job, observation);
   } catch (error) {
     await db
       .update(simJobs)
@@ -4449,7 +4557,12 @@ export async function reconcile(
 
   await runWithConcurrency(jobs, activeReconcileConcurrency(), async (job) => {
     if (requestPayload(job).progressive) {
-      await pollProgressiveCfdJob(db, engine, job);
+      await pollProgressiveCfdJob(db, engine, job, {
+        runtime: job.engineJobId
+          ? (runtimeByJobId.get(job.engineJobId) ?? null)
+          : null,
+        queue,
+      });
       return;
     }
     await reconcileRunningPrecalcHandoff(db, job);

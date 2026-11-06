@@ -2,6 +2,8 @@ import { randomUUID } from "node:crypto";
 import { sql } from "drizzle-orm";
 import { effectiveProgressiveStageSql } from "@aerodb/db/progressive-execution-policy";
 import { progressiveBenchmarkAttemptSql } from "@aerodb/db/progressive-recipe-policy";
+import { assertProgressiveCfdTerminalDiagnostics } from "@aerodb/db/progressive-cfd-evidence";
+import { issueProgressiveRemoteDiagnosticReceipts } from "@aerodb/db/progressive-remote-diagnostic-receipts";
 import { polarEvidencePublicationRank } from "@aerodb/core";
 import {
   acknowledgeProgressiveCfdExecutionStop,
@@ -303,15 +305,12 @@ async function publishAcceptedProgressiveAttempts(db: DB, executionId: string) {
   const retained = await readProgressiveRemoteRetention(db, executionId);
   if (retained.kind !== "retained") return;
   const result = retained.report.result;
-  const finalPoints = new Set(
-    result
-      ? progressiveReportedPointSources({
-          ...result,
-          polars: result.polars.map((polar) => ({ ...polar, attempts: [] })),
-        }).map((source) => source.contentSignature)
-      : [],
-  );
-  const attemptIds = retained.sources
+  const finalSources = result ? progressiveReportedPointSources({
+    ...result,
+    polars: result.polars.map((polar) => ({ ...polar, attempts: [] })),
+  }) : [];
+  const finalPoints = new Set(finalSources.map((source) => source.contentSignature));
+  const publicationSources = retained.sources
     .filter(
       (source) =>
         source.archived &&
@@ -319,8 +318,8 @@ async function publishAcceptedProgressiveAttempts(db: DB, executionId: string) {
         finalPoints.has(
           source.delivery.progressiveEvidence.pointContentSignature,
         ),
-    )
-    .map((source) => source.resultAttemptId);
+    );
+  const attemptIds = publicationSources.map((source) => source.resultAttemptId);
   if (!attemptIds.length) return;
   const [current] = await db.execute(sql`
     SELECT job."ingestedAt", job.ingest_lease_expires_at > clock_timestamp() AS ingestion_owned
@@ -337,8 +336,17 @@ async function publishAcceptedProgressiveAttempts(db: DB, executionId: string) {
     FOR SHARE OF epoch FOR UPDATE OF campaign, job
   `);
   if (!current || current.ingestion_owned) return;
-  if (!current.ingestedAt)
-    await assertProgressiveCfdEvidenceJob(db, executionId, executionId);
+  if (!current.ingestedAt) {
+    const signatures = new Set(publicationSources.map((source) => source.delivery.progressiveEvidence.pointContentSignature));
+    await assertProgressiveCfdEvidenceJob(db, executionId, executionId,
+      finalSources.filter((source) => signatures.has(source.contentSignature)).map((source) => ({
+        alpha: source.point.aoa_deg,
+        speed: source.polar.speed,
+        chord: source.polar.chord,
+        solverActiveSeconds: source.point.solver_active_seconds,
+      })),
+    );
+  }
   await refreshPolarClassificationsForJob(
     db,
     String(candidate.airfoil_id),
@@ -516,6 +524,7 @@ async function ingestTerminalRemoteFailureAttempts(
     ) AS present
   `);
   if (existing?.present === true) return false;
+  if (await assertProgressiveCfdTerminalDiagnostics(db, executionId, executionId)) return true;
   const [job] = await db.execute(sql`
     SELECT airfoil_id, simulation_preset_revision_id, bc_ids, request_payload,
       status
@@ -798,6 +807,7 @@ export async function settleProgressiveRemoteJob(db: DB, executionId: string) {
         counts: await settleObsoleteProgressiveRemoteJob(connection, executionId),
       };
     }
+    await issueProgressiveRemoteDiagnosticReceipts(connection,executionId);
     const [materialFailure] = await connection.execute(sql`
       SELECT EXISTS (
         SELECT 1
@@ -936,12 +946,13 @@ export async function settleProgressiveRemoteJob(db: DB, executionId: string) {
       recoveryWarning = message;
     }
     const status = retained.report.status;
-    await connection.execute(sql`UPDATE sim_jobs SET status = CASE WHEN status = 'cancelled' THEN status
+    await connection.execute(sql`UPDATE sim_jobs SET status = CASE WHEN status = 'cancelled'
+        OR (status = 'ingesting' AND ingest_lease_previous_status = 'cancelled') THEN 'cancelled'::sim_job_status
         ELSE ${status.state === "completed" ? "done" : status.state === "cancelled" ? "cancelled" : "failed"}::sim_job_status END,
       engine_state = ${status.state}, completed_cases = ${status.completed_cases}, total_cases = ${status.total_cases},
       "ingestedAt" = clock_timestamp(), "finishedAt" = clock_timestamp(), "updatedAt" = clock_timestamp(),
       error = ${recoveryWarning ?? (status.state === "completed" ? null : (status.message ?? "Remote execution stopped"))},
-      ingest_lease_token = NULL, ingest_lease_claimed_at = NULL, ingest_lease_expires_at = NULL
+      ingest_lease_token = NULL, ingest_lease_previous_status = NULL, ingest_lease_claimed_at = NULL, ingest_lease_expires_at = NULL
       WHERE id = ${executionId}::uuid`);
     await releaseResultClaimsForJob(connection, executionId, [
       "queued",

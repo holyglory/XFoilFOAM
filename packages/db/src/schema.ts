@@ -8249,6 +8249,29 @@ export const progressiveRemoteProgressReceipts = pgTable(
   }),
 );
 
+export const progressiveRemoteDiagnosticReceipts = pgTable(
+  "progressive_remote_diagnostic_receipts",
+  {
+    simJobId: uuid("sim_job_id").notNull(),
+    sequence: bigint("sequence", { mode: "number" }).notNull(),
+    pointContentSignature: text("point_content_signature").notNull(),
+    receipt: jsonb("receipt").$type<Record<string, unknown>>().notNull(),
+    receivedAt: timestamp("received_at", { withTimezone: true }).notNull().default(sql`clock_timestamp()`),
+  },
+  (table) => ({
+    primary: primaryKey({ columns: [table.simJobId, table.pointContentSignature] }),
+    source: foreignKey({
+      columns: [table.simJobId, table.sequence, table.pointContentSignature],
+      foreignColumns: [progressiveRemoteReportSources.simJobId, progressiveRemoteReportSources.sequence,
+        progressiveRemoteReportSources.pointContentSignature],
+    }).onDelete("cascade"),
+    signatureCheck: check("progressive_remote_diagnostic_receipts_point_content_signature_check",
+      sql`${table.pointContentSignature} ~ '^[a-f0-9]{64}$'`),
+    receiptCheck: check("progressive_remote_diagnostic_receipts_receipt_check",
+      sql`jsonb_typeof(${table.receipt}) = 'object' AND ${table.receipt}->>'kind' = 'retained-progressive-diagnostic'`),
+  }),
+);
+
 export const progressiveRemoteEvidenceReceipts = pgTable(
   "progressive_remote_evidence_receipts",
   {

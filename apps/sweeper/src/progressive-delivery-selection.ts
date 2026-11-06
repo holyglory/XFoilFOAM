@@ -1,11 +1,28 @@
 import { sql } from "drizzle-orm";
 
+export function progressiveMaterialDiagnosticSql(alias: string) {
+  const attempt = sql.identifier(alias);
+  return sql`(${attempt}.evidence_payload->>'failure_disposition'='material_domain'
+    AND ${attempt}.evidence_payload->>'converged'='false'
+    AND coalesce(${attempt}.evidence_payload->>'cl',${attempt}.evidence_payload->>'cd',${attempt}.evidence_payload->>'cm') IS NULL
+    AND coalesce(${attempt}.evidence_payload->'evidence_artifacts','[]'::jsonb)='[]'::jsonb)`;
+}
+
+export function progressiveDiagnosticRetrySql(failureAlias: string, attemptAlias: string) {
+  const failure = sql.identifier(failureAlias);
+  return sql`(${failure}.state='conflict' AND ${failure}.last_http_status=409
+    AND ${failure}.remote_conflict_ids='[]'::jsonb
+    AND ${failure}.last_error ~ '^Progressive evidence delivery failed [(]409[)]: progressive_scope_closed( |$)'
+    AND ${progressiveMaterialDiagnosticSql(attemptAlias)})`;
+}
+
 export function progressiveDeliverySelectionSql(
   preferActive: boolean,
   claimToken?: string,
 ) {
   const retryableFailure = sql`(
     failure.state = 'retry'
+    OR ${progressiveDiagnosticRetrySql("failure", "attempt")}
     OR (
       failure.state = 'conflict'
       AND failure.last_error ILIKE ANY (ARRAY[

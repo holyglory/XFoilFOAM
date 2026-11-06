@@ -32,6 +32,10 @@ export async function verifyTerminalRemoteMaterialFailureIngest(
     const connection = raw as unknown as DB;
     const executionId = terminal.executionId;
     const failure = structuredClone(terminal);
+    const [physical] = await connection.execute(sql`SELECT revision.snapshot#>>'{derived,reynolds}' AS reynolds
+      FROM sim_jobs job JOIN simulation_preset_revisions revision ON revision.id=job.simulation_preset_revision_id
+      WHERE job.id=${executionId}::uuid`);
+    for (const polar of failure.result!.polars) polar.reynolds = Number(physical.reynolds);
     failure.sequence = 1;
     failure.status.state = "failed";
     failure.result!.state = "failed";

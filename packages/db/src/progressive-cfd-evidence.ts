@@ -9,7 +9,7 @@ import {
   solverBudgetCaseKey,
 } from "../../engine-client/src/solver-budget";
 import { assertProgressiveExecutionIdentity } from "./progressive-execution-identity";
-import { readProgressiveRemoteRetention } from "./progressive-remote-retention";
+import { readProgressiveRemoteRetention, readProgressiveRemoteSourceClassifications } from "./progressive-remote-retention";
 import { assertStoppedProgressiveStorage } from "./progressive-stopped-storage";
 import { verifyProgressiveRemoteExecution } from "./progressive-remote-execution";
 import {
@@ -82,10 +82,16 @@ async function lockJobScope(
   options: {
     recoveryScope?: ProgressiveStorageEvidenceRecoveryScope;
     policy?: JobScopePolicy;
+    evidenceAoas?: readonly number[];
+    terminalDiagnostics?: boolean;
   } = {},
 ) {
   const recoveryScope = options.recoveryScope;
   const policy = options.policy ?? "strict";
+  const selectedAoas = options.evidenceAoas ? new Set(options.evidenceAoas) : null;
+  if (selectedAoas && (policy !== "strict" || recoveryScope || !selectedAoas.size ||
+    selectedAoas.size > 2048 || [...selectedAoas].some((alpha) => !Number.isFinite(alpha))))
+    throw new Error("Invalid exact CFD evidence case selection");
   if (recoveryScope) await assertProgressiveStorageEvidenceRecoveryHost(db);
   const [job] = await db.execute(sql`
     SELECT job.airfoil_id, job.engine_job_id, job.campaign_id, job.status, job."ingestedAt", job.ingest_lease_expires_at,
@@ -186,6 +192,21 @@ async function lockJobScope(
   const [count] = await db.execute(
     sql`SELECT count(*)::integer AS count FROM progressive_cfd_attempts WHERE sim_job_id = ${simJobId}`,
   );
+  if (selectedAoas && [...selectedAoas].some((alpha) => !units.some((unit) => unit.aoa_deg === alpha)))
+    throw new Error("Progressive CFD delivery changed its exact physical scope");
+  const diagnosticCandidates = selectedAoas || options.terminalDiagnostics ? units.filter((unit) =>
+    (options.terminalDiagnostics || !selectedAoas?.has(unit.aoa_deg)) && unit.latest_attempt && unit.outcome === "failed" &&
+    ["gap", "pending"].includes(unit.state) && unit.lease_token == null && unit.lease_until == null,
+  ) : [];
+  const diagnostics = diagnosticCandidates.length ? await readProgressiveRemoteSourceClassifications(
+    db, simJobId, diagnosticCandidates.map((unit) => unit.aoa_deg),
+  ) : [];
+  const retainedDiagnostics = new Set(diagnosticCandidates.filter((unit) => {
+    const sources = diagnostics.filter((source) => source.aoaDeg === unit.aoa_deg);
+    return sources.length > 0 && sources.every((source) => source.kind === "material_diagnostic");
+  }).map((unit) => unit.token));
+  if (options.terminalDiagnostics && retainedDiagnostics.size !== units.length)
+    throw new ProgressiveCfdEvidenceScopeClosed("Terminal diagnostics require exact stopped, unowned material failures for every original unit");
   if (
     !units.length ||
     units.length !== Number(count.count) ||
@@ -207,8 +228,10 @@ async function lockJobScope(
           : policy === "runtime"
             ? !isRuntimeProgressActiveUnit(unit) &&
               !isRuntimeProgressObsoleteUnit(unit)
-            : unit.outcome !== "running" ||
-              !["leased", "blocked"].includes(unit.state)),
+            : !retainedDiagnostics.has(unit.token) &&
+              (unit.outcome !== "running" || !["leased", "blocked"].includes(unit.state) ||
+                (selectedAoas !== null && (!unit.latest_attempt ||
+                  (unit.state === "leased" && unit.lease_token !== unit.token))))),
     )
   )
     throw new ProgressiveCfdEvidenceScopeClosed(
@@ -377,6 +400,23 @@ export async function assertProgressiveStorageEvidenceRecoveryJob(
   return scope;
 }
 
+export async function assertProgressiveCfdTerminalDiagnostics(
+  db: DB,
+  simJobId: string,
+  engineJobId: string,
+) {
+  return db.transaction(async (transaction) => {
+    const connection = transaction as unknown as DB;
+    const [terminal] = await connection.execute(sql`SELECT count(*)>0 AND bool_and(
+      attempt.outcome='failed' AND unit.state IN ('gap','pending')
+        AND unit.lease_token IS NULL AND unit.lease_until IS NULL) AS ready
+      FROM progressive_cfd_attempts attempt JOIN progressive_cfd_units unit ON unit.id=attempt.unit_id
+      WHERE attempt.sim_job_id=${simJobId}`);
+    if (terminal?.ready !== true) return false;
+    return await lockJobScope(connection, simJobId, engineJobId, { terminalDiagnostics: true }) !== null;
+  });
+}
+
 export async function assertProgressiveCfdEvidenceJob(
   db: DB,
   simJobId: string,
@@ -393,6 +433,7 @@ export async function assertProgressiveCfdEvidenceJob(
       transaction as unknown as DB,
       simJobId,
       engineJobId,
+      { evidenceAoas: cases?.length ? cases.map((item) => item.alpha) : undefined },
     );
     if (scope && cases) {
       for (const item of cases) {
@@ -562,6 +603,11 @@ export async function recordProgressiveCfdEvidence(
     throw new Error("CFD evidence batch exceeds its bounded case scope");
   return db.transaction(async (transaction) => {
     const connection = transaction as unknown as DB;
+    const selectedEvidence = ids.length && !input.recoveryScope ? await connection.execute(sql`
+      SELECT id,aoa_deg FROM result_attempts WHERE id IN (${sql.join(ids.map((id) => sql`${id}::uuid`), sql`, `)})
+        AND sim_job_id=${input.simJobId} AND engine_job_id=${input.engineJobId}
+    `) : [];
+    const evidenceAoas = [...new Set(selectedEvidence.map((row) => Number(row.aoa_deg)))];
     const scope = input.recoveryScope
       ? await assertProgressiveStorageEvidenceRecoveryJob(
           connection,
@@ -569,7 +615,9 @@ export async function recordProgressiveCfdEvidence(
           input.recoveryScope,
           ids,
         )
-      : await lockJobScope(connection, input.simJobId, input.engineJobId);
+      : await lockJobScope(connection, input.simJobId, input.engineJobId, {
+          evidenceAoas: evidenceAoas.length ? evidenceAoas : undefined,
+        });
     if (input.recoveryScope && input.engineJobId !== input.simJobId)
       throw new ProgressiveCfdEvidenceScopeClosed(
         "Historical progressive recovery requires exact engine ownership",
@@ -597,6 +645,9 @@ export async function recordProgressiveCfdEvidence(
       : [];
     if (evidence.length !== ids.length)
       throw new Error("CFD receipt must reference exact stored job evidence");
+    if (!input.recoveryScope && evidence.some((row) => !selectedEvidence.some((selected) =>
+      selected.id === row.id && Number(selected.aoa_deg) === Number(row.aoa_deg))))
+      throw new Error("CFD evidence changed its exact stored case selection");
     for (const row of evidence) {
       const unit = scope.units.find(
         (item) => item.aoa_deg === Number(row.aoa_deg),

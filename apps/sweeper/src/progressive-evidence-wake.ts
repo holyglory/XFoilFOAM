@@ -1,4 +1,5 @@
 import { sql } from "drizzle-orm";
+import { progressiveDiagnosticRetrySql } from "./progressive-delivery-selection";
 
 export type ProgressiveEvidenceWakeScope = "staging" | "delivery";
 
@@ -39,7 +40,7 @@ export function progressiveEvidenceWakeSql(
           AND NOT EXISTS (SELECT 1 FROM progressive_worker_hub_receipts delivered
             WHERE delivered.sim_job_id = association.sim_job_id
               AND delivered.point_content_signature = association.point_content_signature)
-          AND (failure.sim_job_id IS NULL OR failure.state = 'retry')
+          AND (failure.sim_job_id IS NULL OR failure.state = 'retry' OR ${progressiveDiagnosticRetrySql("failure", "attempt")})
           AND (claim.claim_token IS NULL OR claim.claim_expires_at IS NOT NULL)
           ${
             ready

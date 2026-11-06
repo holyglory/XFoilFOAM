@@ -14,6 +14,7 @@ import { releaseResultClaimsForJob } from "@aerodb/db/result-claim-lifecycle";
 import { indexProgressiveRemoteReport } from "@aerodb/db/progressive-remote-inventory";
 import { persistEngineRuntimeForJob } from "./engine-provenance";
 import { settleProgressiveRemoteJob } from "./progressive-remote-settlement";
+import { issueProgressiveRemoteDiagnosticReceipts } from "@aerodb/db/progressive-remote-diagnostic-receipts";
 import { activeReconcileConcurrency, runWithConcurrency } from "./reconcile";
 import {
   progressiveReportJobsSql,
@@ -154,6 +155,7 @@ async function applyProgressiveRemoteProgressInTransaction(
         simJobId: executionId,
         proof: report.stopProof,
       });
+    if (report.stopProof) await issueProgressiveRemoteDiagnosticReceipts(connection, executionId);
     let settled: Awaited<
       ReturnType<typeof settleProgressiveCfdExecution>
     > | null = null;

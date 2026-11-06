@@ -1,6 +1,6 @@
 import { sql } from "drizzle-orm";
 import type { DB } from "./client";
-import { analysisContentHash } from "./analysis-target";
+import { analysisContentHash, canonicalAnalysisJson } from "./analysis-target";
 import { readProgressiveEvidenceCustodyReceipt } from "./progressive-evidence-custody";
 import { resolveProgressiveRemoteEvidence } from "./progressive-remote-evidence";
 import type { ProgressiveRemoteEvidenceDelivery } from "./progressive-remote-evidence-receipts";
@@ -9,8 +9,119 @@ import {
   progressiveReportedPointSources,
   validateProgressiveRemoteReport,
 } from "./progressive-remote-report";
-import type { ProgressiveRemoteExecutionEnvelope } from "./progressive-remote-execution";
+import { verifyProgressiveRemoteExecution, type ProgressiveRemoteExecutionEnvelope } from "./progressive-remote-execution";
 import type { ProgressiveRemoteReport } from "./progressive-remote-report";
+import { progressiveRemoteReportInventory } from "./progressive-remote-inventory";
+import { validateProgressiveExecutionStopProof } from "./progressive-cfd-settlement";
+
+function materialDiagnosticSignatures(report: ProgressiveRemoteReport) {
+  if (!report.result) return new Set<string>();
+  return new Set(progressiveReportedPointSources({
+    ...report.result,
+    polars: report.result.polars.map((polar) => ({ ...polar, points: [] })),
+  }).filter(({ point }) =>
+    point.failure_disposition === "material_domain" && point.converged === false &&
+    [point.cl, point.cd, point.cm].every((value) => value == null) &&
+    (!point.evidence_artifacts || point.evidence_artifacts.length === 0),
+  ).map((source) => source.contentSignature));
+}
+
+export async function readProgressiveRemoteSourceClassifications(
+  db: DB,
+  executionId: string,
+  aoas?: readonly number[],
+) {
+  const [stored] = await db.execute(sql`SELECT dispatch.envelope,dispatch.solver_id,dispatch.promise_id,
+    dispatch.content_signature AS assignment_signature,job.request_payload,
+    latest.report,latest.content_signature,latest.sequence,
+    stopped.proof,stopped.proof_signature,stopped.engine_job_id AS stopped_engine_job_id
+    FROM progressive_remote_dispatches dispatch JOIN sim_jobs job ON job.id=dispatch.sim_job_id
+    JOIN LATERAL (SELECT report,content_signature,sequence FROM progressive_remote_reports
+      WHERE sim_job_id=dispatch.sim_job_id ORDER BY sequence DESC LIMIT 1) latest ON true
+    LEFT JOIN progressive_cfd_execution_stops stopped ON stopped.sim_job_id=dispatch.sim_job_id
+    WHERE dispatch.sim_job_id=${executionId}::uuid`);
+  if (!stored) return [];
+  const envelope = verifyProgressiveRemoteExecution(stored.envelope, {
+    executionId,
+    solverId: String(stored.solver_id),
+    promiseId: String(stored.promise_id),
+    contentSignature: String(stored.assignment_signature),
+  });
+  const payload = stored.request_payload as Record<string, unknown>;
+  if (canonicalAnalysisJson(payload.engineRequest) !== canonicalAnalysisJson(envelope.request) ||
+    canonicalAnalysisJson(payload.progressive) !== canonicalAnalysisJson(envelope.scope))
+    throw new Error("Remote diagnostic history differs from immutable execution ownership");
+  const latest = validateProgressiveRemoteReport(stored.report, envelope);
+  if (latest.contentSignature !== stored.content_signature)
+    throw new Error("Remote diagnostic history changed its final report bytes");
+  if (!isFinalProgressiveRemoteReport(latest.report) || !stored.proof) return [];
+  if (stored.stopped_engine_job_id !== executionId ||
+    analysisContentHash(stored.proof) !== stored.proof_signature ||
+    (stored.proof as { job_id?: unknown }).job_id !== executionId)
+    throw new Error("Remote diagnostic history has no exact stop acknowledgement");
+  validateProgressiveExecutionStopProof(stored.proof as Parameters<typeof validateProgressiveExecutionStopProof>[0]);
+  validateProgressiveExecutionStopProof(latest.report.stopProof!);
+  const [missing] = await db.execute(sql`SELECT report.sequence FROM progressive_remote_reports report
+    LEFT JOIN progressive_remote_report_inventories inventory USING (sim_job_id,sequence)
+    WHERE report.sim_job_id=${executionId}::uuid AND report.sequence<=${latest.report.sequence}
+      AND (inventory.sequence IS NULL OR inventory.report_content_signature<>report.content_signature
+        OR inventory.source_count<>(SELECT count(*) FROM progressive_remote_report_sources source
+          WHERE source.sim_job_id=inventory.sim_job_id AND source.sequence=inventory.sequence)) LIMIT 1`);
+  if (missing) throw new Error("Remote diagnostic history has an incomplete authenticated inventory");
+  const selected = aoas?.length
+    ? sql`AND source.aoa_deg IN (${sql.join(aoas.map((alpha) => sql`${alpha}`), sql`, `)})`
+    : sql``;
+  const sources = await db.execute(sql`SELECT DISTINCT ON (source.point_content_signature)
+    source.point_content_signature,source.aoa_deg,source.case_slug,source.sequence
+    FROM progressive_remote_report_sources source
+    WHERE source.sim_job_id=${executionId}::uuid AND source.sequence<=${latest.report.sequence}
+      ${selected}
+    ORDER BY source.point_content_signature,source.sequence LIMIT 2049`);
+  if (sources.length > 2048) throw new Error("Remote diagnostic history exceeds its bounded source inventory");
+  if (!sources.length) return [];
+  const sequences = [...new Set(sources.map((source) => Number(source.sequence)))];
+  const reports = await db.execute(sql`SELECT report.sequence,report.report,report.content_signature,
+    inventory.inventory_signature,inventory.source_count
+    FROM progressive_remote_reports report JOIN progressive_remote_report_inventories inventory USING (sim_job_id,sequence)
+    WHERE report.sim_job_id=${executionId}::uuid AND report.sequence IN (
+      ${sql.join(sequences.map((sequence) => sql`${sequence}`), sql`, `)})`);
+  const verified = new Map<number, {
+    signature: string;
+    inventory: ReturnType<typeof progressiveRemoteReportInventory>;
+    diagnostics: Set<string>;
+  }>();
+  for (const entry of reports) {
+    const validated = validateProgressiveRemoteReport(entry.report, envelope);
+    const inventory = progressiveRemoteReportInventory(validated.report);
+    if (validated.contentSignature !== entry.content_signature ||
+      inventory.inventorySignature !== entry.inventory_signature ||
+      inventory.sources.length !== Number(entry.source_count) ||
+      validated.report.sequence !== Number(entry.sequence))
+      throw new Error("Remote diagnostic history changed its authenticated report inventory");
+    verified.set(validated.report.sequence, {
+      signature: validated.contentSignature,
+      inventory,
+      diagnostics: materialDiagnosticSignatures(validated.report),
+    });
+  }
+  return sources.map((source) => {
+    const report = verified.get(Number(source.sequence));
+    const signature = String(source.point_content_signature);
+    if (!report || !report.inventory.sources.some((entry) =>
+      entry.point_content_signature === signature && entry.aoa_deg === Number(source.aoa_deg) &&
+      entry.case_slug === source.case_slug))
+      throw new Error("Remote diagnostic history has no exact authenticated point source");
+    return {
+      kind: report.diagnostics.has(signature) ? "material_diagnostic" as const : "requires_evidence" as const,
+      executionId,
+      sequence: Number(source.sequence),
+      reportContentSignature: report.signature,
+      pointContentSignature: signature,
+      aoaDeg: Number(source.aoa_deg),
+      engineCaseSlug: source.case_slug == null ? null : String(source.case_slug),
+    };
+  });
+}
 
 export function terminalReportHasNoPhysicalEvidence(
   report: ProgressiveRemoteReport,
@@ -35,6 +146,8 @@ export function terminalReportHasNoPhysicalEvidence(
 export function terminalReportNoPhysicalEvidenceSignatures(
   report: ProgressiveRemoteReport,
 ) {
+  if (report.result?.state === "completed" && isFinalProgressiveRemoteReport(report))
+    return materialDiagnosticSignatures(report);
   if (!report.result || !["failed", "cancelled"].includes(report.result.state))
     return new Set<string>();
   return new Set(
@@ -102,7 +215,16 @@ export async function readProgressiveRemoteRetention(
     throw new Error(
       "Remote retention exceeds the bounded source-attempt inventory",
     );
-  const terminalNoEvidence = terminalReportNoPhysicalEvidenceSignatures(report);
+  const missingAoas = [...new Set(sources.filter((source) => source.result_attempt_id == null)
+    .map((source) => Number(source.aoa_deg)))];
+  const classifications = missingAoas.length
+    ? await readProgressiveRemoteSourceClassifications(db, executionId, missingAoas)
+    : [];
+  const terminalNoEvidence = new Set([
+    ...terminalReportNoPhysicalEvidenceSignatures(report),
+    ...classifications.filter((source) => source.kind === "material_diagnostic")
+      .map((source) => source.pointContentSignature),
+  ]);
   const missingEvidence = sources.filter(
     (source) =>
       source.result_attempt_id == null &&
