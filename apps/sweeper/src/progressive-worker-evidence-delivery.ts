@@ -19,6 +19,7 @@ import {
   requeueStoppedProgressiveStorage,
 } from "./progressive-stopped-storage";
 import { fetchProgressiveRemote } from "./progressive-remote-http";
+import { progressiveReportedDiagnosticFailureKind } from "@aerodb/db/progressive-remote-retention";
 
 const REMOTE_EVIDENCE_DELIVERY_TIMEOUT_MS = Number(
   process.env.REMOTE_EVIDENCE_DELIVERY_TIMEOUT_MS ?? 120_000,
@@ -42,7 +43,8 @@ export async function recordProgressiveWorkerEvidenceReceipt(
   const diagnostic = receipt?.kind === "retained-progressive-diagnostic";
   if (
     !receipt ||
-    receipt.version !== 1 ||
+    (receipt.version !== 1 && !(diagnostic && receipt.version === 2)) ||
+    (diagnostic && receipt.version === 2 && !["infrastructure", "hard_solver"].includes(String(receipt.failureKind))) ||
     (!diagnostic && receipt.kind !== "retained-progressive-attempt") ||
     receipt.executionId !== expected.executionId ||
     !Number.isSafeInteger(receipt.sequence) ||
@@ -105,9 +107,10 @@ export async function recordProgressiveWorkerEvidenceReceipt(
       if (!source.stopped || anchor.content_signature !== receipt.reportContentSignature ||
         !progressiveReportedPointSources((anchor.report as unknown as ProgressiveRemoteReport).result!)
           .some((entry) => entry.contentSignature === expected.pointContentSignature) || !point ||
-        point.point.failure_disposition !== "material_domain" || point.point.converged !== false ||
-        [point.point.cl,point.point.cd,point.point.cm].some((value) => value != null) ||
-        (point.point.evidence_artifacts?.length ?? 0) > 0 ||
+        (receipt.version === 1 ? point.point.failure_disposition !== "material_domain" || point.point.converged !== false ||
+          [point.point.cl,point.point.cd,point.point.cm].some((value) => value != null) ||
+          (point.point.evidence_artifacts?.length ?? 0) > 0
+          : progressiveReportedDiagnosticFailureKind(point.point) !== receipt.failureKind) ||
         analysisContentHash(progressiveRemotePointProjection({ ...point, envelope, report }).evidencePayload) !==
           analysisContentHash(source.evidence_payload))
         throw new Error("Hub diagnostic receipt differs from the exact stopped metadata-only source");
@@ -234,9 +237,7 @@ export async function deliverNextProgressiveWorkerEvidence(
           body: requestBody,
         },
       );
-    const diagnostic = source.point.failure_disposition === "material_domain" && source.point.converged === false &&
-      [source.point.cl,source.point.cd,source.point.cm].every((value) => value == null) &&
-      (source.point.evidence_artifacts?.length ?? 0) === 0;
+    const diagnostic = progressiveReportedDiagnosticFailureKind(source.point) !== null;
     let response = diagnostic ? await fetchProgressiveRemote(fetcher,
       `${canonicalRemoteHubBaseUrl(String(pending.upstream_base_url))}/progressive-executions/${executionId}/reports`, {
         method: "POST", headers: {
@@ -261,6 +262,7 @@ export async function deliverNextProgressiveWorkerEvidence(
         stoppedStorage = await progressiveStoppedStorageEligible(
           db,
           executionId,
+          { resultAttemptId: String(pending.result_attempt_id), pointContentSignature: source.contentSignature, sequence },
         );
         if (stoppedStorage) {
           response = await post("retained-progressive-evidence");
@@ -325,13 +327,12 @@ export async function deliverNextProgressiveWorkerEvidence(
         );
     }
     const receipts = responseBody?.progressiveEvidenceReceipts;
-    const receipt = diagnostic ? responseBody?.diagnosticReceipt :
-      Array.isArray(receipts) && receipts.length === 1
-        ? (receipts[0] as Record<string, unknown> | null)
-        : null;
+    const retainedAttempt = Array.isArray(receipts) && receipts.length === 1
+      ? (receipts[0] as Record<string, unknown> | null) : null;
+    const receipt = diagnostic ? responseBody?.diagnosticReceipt ?? retainedAttempt : retainedAttempt;
     if (diagnostic && (responseBody?.received !== true || responseBody.receipt?.executionId !== executionId ||
       responseBody.receipt.sequence !== sequence || responseBody.receipt.contentSignature !== pending.report_signature ||
-      (receipt as Record<string, unknown> | null)?.kind !== "retained-progressive-diagnostic"))
+      !["retained-progressive-diagnostic", "retained-progressive-attempt"].includes(String((receipt as Record<string, unknown> | null)?.kind))))
       throw new Error("Hub did not acknowledge the exact retained diagnostic report and source");
     await recordProgressiveWorkerEvidenceReceipt(db, receipt, {
       executionId,

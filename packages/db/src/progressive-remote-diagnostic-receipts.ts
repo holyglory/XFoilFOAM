@@ -3,12 +3,11 @@ import type { DB } from "./client";
 import { analysisContentHash } from "./analysis-target";
 import { resolveProgressiveRemoteEvidence, ProgressiveRemoteEvidenceConflict } from "./progressive-remote-evidence";
 import type { ProgressiveRemoteEvidenceDelivery } from "./progressive-remote-evidence-receipts";
-import { readProgressiveRemoteSourceClassifications } from "./progressive-remote-retention";
+import { readProgressiveRemoteSourceClassifications, progressiveReportedDiagnosticFailureKind } from "./progressive-remote-retention";
 import { assertProgressiveRemotePhysicalCase } from "./progressive-remote-point-projection";
 import { ProgressiveCfdEvidenceScopePending } from "./progressive-storage-recovery-scope";
 
-export interface ProgressiveRemoteDiagnosticReceipt {
-  version: 1;
+interface ProgressiveRemoteDiagnosticReceiptIdentity {
   kind: "retained-progressive-diagnostic";
   executionId: string;
   sequence: number;
@@ -16,6 +15,11 @@ export interface ProgressiveRemoteDiagnosticReceipt {
   pointContentSignature: string;
   receivedAt: string;
 }
+
+export type ProgressiveRemoteDiagnosticReceipt = ProgressiveRemoteDiagnosticReceiptIdentity & (
+  { version: 1; failureKind?: never } |
+  { version: 2; failureKind: "infrastructure" | "hard_solver" }
+);
 
 export async function recordProgressiveRemoteDiagnosticReceipt(
   db: DB,
@@ -35,18 +39,25 @@ export async function recordProgressiveRemoteDiagnosticReceipt(
           pointContentSignature: receipt.pointContentSignature,
         },
       });
-      if (!anchor || receipt.version !== 1 || receipt.kind !== "retained-progressive-diagnostic" ||
+      if (!anchor || (receipt.version !== 1 && receipt.version !== 2) ||
+        (receipt.version === 2 && !["infrastructure", "hard_solver"].includes(receipt.failureKind)) ||
+        receipt.kind !== "retained-progressive-diagnostic" ||
         receipt.executionId !== delivery.engineJobId || receipt.pointContentSignature !== source.contentSignature)
         throw new ProgressiveRemoteEvidenceConflict("Diagnostic receipt replay changed its exact retained source identity");
       return receipt;
     }
+    const [physical] = await connection.execute(sql`SELECT result_attempt_id FROM progressive_remote_evidence_receipts
+      WHERE sim_job_id=${delivery.engineJobId}::uuid AND point_content_signature=${source.contentSignature}`);
+    if (physical) throw new ProgressiveRemoteEvidenceConflict("Diagnostic source already has an immutable retained-attempt receipt");
     const [stopped] = await connection.execute(sql`SELECT sim_job_id FROM progressive_cfd_execution_stops
       WHERE sim_job_id=${delivery.engineJobId}::uuid AND engine_job_id=${delivery.engineJobId}`);
     if (!stopped) throw new ProgressiveCfdEvidenceScopePending("Diagnostic receipt awaits the exact terminal stop acknowledgement");
     const classifications = await readProgressiveRemoteSourceClassifications(connection, delivery.engineJobId, [delivery.aoaDeg]);
-    if (!classifications.some((entry) => entry.kind === "material_diagnostic" &&
+    const failureKind = progressiveReportedDiagnosticFailureKind(source.point);
+    if (failureKind === null || !classifications.some((entry) =>
+      (entry.kind === "material_diagnostic" || entry.kind === "failure_diagnostic") &&
       entry.pointContentSignature === delivery.progressiveEvidence.pointContentSignature))
-      throw new ProgressiveRemoteEvidenceConflict("Diagnostic receipt requires authenticated material-domain history without physical evidence");
+      throw new ProgressiveRemoteEvidenceConflict("Diagnostic receipt requires authenticated reported failure history without physical evidence");
     const [job] = await connection.execute(sql`SELECT job.request_payload,job.airfoil_id,campaign.current_plan_revision_id
       FROM sim_jobs job JOIN sim_campaigns campaign ON campaign.id=job.campaign_id
       JOIN progressive_remote_dispatches dispatch ON dispatch.sim_job_id=job.id
@@ -91,7 +102,9 @@ export async function recordProgressiveRemoteDiagnosticReceipt(
     assertProgressiveRemotePhysicalCase(source, selected[0].snapshot as Parameters<typeof assertProgressiveRemotePhysicalCase>[1]);
     const [clock] = await connection.execute(sql`SELECT clock_timestamp() AS at`);
     const receipt: ProgressiveRemoteDiagnosticReceipt = {
-      version: 1, kind: "retained-progressive-diagnostic", executionId: delivery.engineJobId,
+      ...(failureKind === "material_domain" ? { version: 1 as const }
+        : { version: 2 as const, failureKind }),
+      kind: "retained-progressive-diagnostic", executionId: delivery.engineJobId,
       sequence: delivery.progressiveEvidence.sequence,
       reportContentSignature: delivery.progressiveEvidence.reportContentSignature,
       pointContentSignature: delivery.progressiveEvidence.pointContentSignature,
@@ -115,8 +128,12 @@ export async function issueProgressiveRemoteDiagnosticReceipts(db: DB, execution
   const [dispatch] = await db.execute(sql`SELECT solver_id,promise_id FROM progressive_remote_dispatches
     WHERE sim_job_id=${executionId}::uuid`);
   if (!dispatch) return [];
+  const physical = await db.execute(sql`SELECT point_content_signature FROM progressive_remote_evidence_receipts
+    WHERE sim_job_id=${executionId}::uuid`);
+  const retainedAttempts = new Set(physical.map((entry) => String(entry.point_content_signature)));
   const receipts: ProgressiveRemoteDiagnosticReceipt[] = [];
-  for (const source of sources.filter((entry) => entry.kind === "material_diagnostic"))
+  for (const source of sources.filter((entry) => !retainedAttempts.has(entry.pointContentSignature) &&
+    (entry.kind === "material_diagnostic" || entry.kind === "failure_diagnostic")))
     receipts.push(await recordProgressiveRemoteDiagnosticReceipt(db, {
       solverId: String(dispatch.solver_id), promiseId: String(dispatch.promise_id),
       engineJobId: executionId, aoaDeg: source.aoaDeg, engineCaseSlug: source.engineCaseSlug,

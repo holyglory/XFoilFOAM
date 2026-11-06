@@ -213,13 +213,15 @@ async function exerciseMixedProgressiveRemoteDelivery(
     const source = inventory.sources.find((entry) => entry.case_slug === physical.case_slug)!;
     const diagnosticSource = inventory.sources.find((entry) => entry.case_slug === diagnostic.case_slug)!;
     expect([...terminalReportNoPhysicalEvidenceSignatures(completedWithDiagnostic)]).toEqual(
-      sibling === "material" || sibling === "same-angle" ? [diagnosticSource.point_content_signature] : [],
+      sibling !== "physical" ? [diagnosticSource.point_content_signature] : [],
     );
     if (sibling === "material") for (const changed of [
       { ...diagnostic, cl: 0.1 },
       { ...diagnostic, evidence_artifacts: physical.evidence_artifacts },
-      { ...diagnostic, failure_disposition: "infrastructure" as const },
+      { ...diagnostic, failure_disposition: "deterministic_mesh" as const },
       { ...diagnostic, converged: true },
+      { ...diagnostic, force_history: { t: [0, 1], cl: [0.1, 0.2], cd: [0.01, 0.02], cm: [0, 0] } },
+      { ...diagnostic, images: { pressure: "/retained-pressure.png" } },
     ]) {
       const altered = structuredClone(completedWithDiagnostic);
       altered.result!.polars[0].attempts![0] = changed;
@@ -227,7 +229,7 @@ async function exerciseMixedProgressiveRemoteDelivery(
     }
     expect(await readProgressiveRemoteRetention(connection, executionId)).toMatchObject({
       kind: "waiting", reason: "raw_evidence", sourceCount: 2,
-      pendingCount: sibling === "material" || sibling === "same-angle" ? 1 : 2,
+      pendingCount: sibling !== "physical" ? 1 : 2,
     });
     const delivery = {
       solverId: envelope.solverId,

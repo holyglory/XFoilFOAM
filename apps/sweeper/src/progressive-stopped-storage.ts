@@ -24,7 +24,42 @@ const stoppedOwner = sql`
 export async function progressiveStoppedStorageEligible(
   db: DB,
   executionId: string,
+  failedSource?: { resultAttemptId: string; pointContentSignature: string; sequence: number },
 ): Promise<boolean> {
+  if (failedSource) {
+    const rows = await db.execute(sql`SELECT job.id FROM sim_jobs job
+      JOIN sync_sweep_promises promise ON promise.id::text=job.request_payload->>'syncPromiseId'
+      JOIN sync_api_settings settings ON settings.id=1
+      JOIN progressive_worker_evidence_attempts source ON source.sim_job_id=job.id
+        AND source.sequence=${failedSource.sequence} AND source.result_attempt_id=${failedSource.resultAttemptId}::uuid
+        AND source.point_content_signature=${failedSource.pointContentSignature}
+      JOIN progressive_worker_reports report ON report.sim_job_id=source.sim_job_id AND report.sequence=source.sequence
+        AND report.acknowledged_at IS NOT NULL
+      JOIN result_attempts attempt ON attempt.id=source.result_attempt_id AND attempt.sim_job_id=job.id
+        AND attempt.engine_job_id=job.id::text AND attempt.status='failed' AND NOT attempt.valid_for_polar
+        AND NOT attempt.converged
+      WHERE job.id=${executionId}::uuid AND job.engine_job_id=job.id::text
+        AND job.status IN('done','failed','cancelled') AND job.request_payload->>'remoteSolver'='true'
+        AND job.request_payload ? 'remoteProgressiveExecution'
+        AND (job.ingest_lease_token IS NULL OR job.ingest_lease_expires_at<=clock_timestamp())
+        AND promise.registered_solver_id=settings.remote_solver_registered_id
+        AND promise.source_base_url=settings.upstream_base_url
+        AND job.request_payload->>'upstreamBaseUrl'=settings.upstream_base_url
+        AND NOT settings.remote_solver_transfer_paused AND settings.remote_solver_auth_token<>''
+        AND attempt.evidence_payload->>'failure_disposition' IN('material_domain','infrastructure','hard_solver')
+        AND EXISTS(SELECT 1 FROM jsonb_array_elements(attempt.evidence_payload->'evidence_artifacts') artifact
+          WHERE artifact->>'kind'='manifest' AND artifact->>'sha256' ~ '^[a-fA-F0-9]{64}$'
+            AND (artifact->>'byte_size')::bigint>0)
+        AND EXISTS(SELECT 1 FROM progressive_worker_reports stopped
+          JOIN progressive_worker_submission_intents intent ON intent.sim_job_id=stopped.sim_job_id
+            AND intent.assignment_signature=stopped.assignment_signature
+          WHERE stopped.sim_job_id=job.id AND stopped.assignment_signature=report.assignment_signature
+            AND stopped.sequence>=source.sequence AND stopped.stopped_engine_job_id=job.id::text
+            AND stopped.acknowledged_at IS NOT NULL
+            AND stopped.report#>>'{status,state}' IN('completed','failed','cancelled')
+            AND stopped.report#>>'{result,state}' IN('completed','failed','cancelled'))`);
+    return rows.length === 1;
+  }
   const rows = await db.execute(
     sql`SELECT job.id ${stoppedOwner} AND job.id=${executionId}::uuid`,
   );

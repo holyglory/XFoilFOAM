@@ -7280,7 +7280,14 @@ export async function registerSyncRoutes(app: FastifyInstance): Promise<void> {
           executionId: params.data.executionId,
           report: body.data.report,
         });
-        const diagnosticReceipt = body.data.diagnostic ? await recordProgressiveRemoteDiagnosticReceipt(db, {
+        const retainedAttempt = body.data.diagnostic ? await readProgressiveRemoteEvidenceReceipt(db, {
+          solverId: solver.id, promiseId: body.data.promiseId, engineJobId: params.data.executionId,
+          aoaDeg: body.data.diagnostic.aoaDeg, engineCaseSlug: body.data.diagnostic.engineCaseSlug,
+          remoteResultId: body.data.diagnostic.remoteResultId, remoteResultAttemptId: body.data.diagnostic.remoteResultAttemptId,
+          progressiveEvidence: { sequence: receipt.sequence, reportContentSignature: receipt.contentSignature,
+            pointContentSignature: body.data.diagnostic.pointContentSignature },
+        }) : null;
+        const diagnosticReceipt = body.data.diagnostic && !retainedAttempt ? await recordProgressiveRemoteDiagnosticReceipt(db, {
           solverId: solver.id, promiseId: body.data.promiseId, engineJobId: params.data.executionId,
           aoaDeg: body.data.diagnostic.aoaDeg, engineCaseSlug: body.data.diagnostic.engineCaseSlug,
           progressiveEvidence: {
@@ -7288,7 +7295,8 @@ export async function registerSyncRoutes(app: FastifyInstance): Promise<void> {
             pointContentSignature: body.data.diagnostic.pointContentSignature,
           },
         }) : undefined;
-        return { received: true, receipt, ...(diagnosticReceipt ? { diagnosticReceipt } : {}) };
+        return { received: true, receipt, ...(diagnosticReceipt ? { diagnosticReceipt } : {}),
+          ...(retainedAttempt ? { progressiveEvidenceReceipts: [retainedAttempt] } : {}) };
       } catch (error) {
         if (error instanceof ProgressiveRemoteReportConflict)
           return reply.code(409).send({ error: error.message });

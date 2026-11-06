@@ -11,6 +11,10 @@ import {
 import { assertProgressiveExecutionIdentity } from "./progressive-execution-identity";
 import { readProgressiveRemoteRetention, readProgressiveRemoteSourceClassifications } from "./progressive-remote-retention";
 import { assertStoppedProgressiveStorage } from "./progressive-stopped-storage";
+import { resolveProgressiveRemoteEvidence, assertProgressiveReportedManifest, ProgressiveRemoteEvidenceConflict } from "./progressive-remote-evidence";
+import { progressiveRemotePointProjection, assertProgressiveRemotePhysicalCase } from "./progressive-remote-point-projection";
+import { progressiveReportedPointSources } from "./progressive-remote-report";
+import type { ProgressiveRemoteEvidenceDelivery } from "./progressive-remote-evidence-receipts";
 import { verifyProgressiveRemoteExecution } from "./progressive-remote-execution";
 import {
   assertProgressiveStorageEvidenceRecoveryHost,
@@ -56,7 +60,7 @@ interface BoundUnit {
   };
 }
 
-type JobScopePolicy = "strict" | "runtime";
+type JobScopePolicy = "strict" | "runtime" | "stopped-failed-storage";
 
 function isRuntimeProgressActiveUnit(unit: BoundUnit): boolean {
   return (
@@ -89,9 +93,11 @@ async function lockJobScope(
   const recoveryScope = options.recoveryScope;
   const policy = options.policy ?? "strict";
   const selectedAoas = options.evidenceAoas ? new Set(options.evidenceAoas) : null;
-  if (selectedAoas && (policy !== "strict" || recoveryScope || !selectedAoas.size ||
+  if (selectedAoas && ((policy !== "strict" && policy !== "stopped-failed-storage") || recoveryScope || !selectedAoas.size ||
     selectedAoas.size > 2048 || [...selectedAoas].some((alpha) => !Number.isFinite(alpha))))
     throw new Error("Invalid exact CFD evidence case selection");
+  if (policy === "stopped-failed-storage" && (!selectedAoas || selectedAoas.size !== 1))
+    throw new Error("Stopped failure storage requires one exact selected case");
   if (recoveryScope) await assertProgressiveStorageEvidenceRecoveryHost(db);
   const [job] = await db.execute(sql`
     SELECT job.airfoil_id, job.engine_job_id, job.campaign_id, job.status, job."ingestedAt", job.ingest_lease_expires_at,
@@ -194,7 +200,7 @@ async function lockJobScope(
   );
   if (selectedAoas && [...selectedAoas].some((alpha) => !units.some((unit) => unit.aoa_deg === alpha)))
     throw new Error("Progressive CFD delivery changed its exact physical scope");
-  const diagnosticCandidates = selectedAoas || options.terminalDiagnostics ? units.filter((unit) =>
+  const diagnosticCandidates = policy === "strict" && (selectedAoas || options.terminalDiagnostics) ? units.filter((unit) =>
     (options.terminalDiagnostics || !selectedAoas?.has(unit.aoa_deg)) && unit.latest_attempt && unit.outcome === "failed" &&
     ["gap", "pending"].includes(unit.state) && unit.lease_token == null && unit.lease_until == null,
   ) : [];
@@ -225,6 +231,9 @@ async function lockJobScope(
                 unit.lease_until == null ||
                 new Date(String(unit.lease_until)).getTime() > Date.now()
               : unit.lease_token != null || unit.lease_until != null)
+          : policy === "stopped-failed-storage"
+            ? selectedAoas!.has(unit.aoa_deg) && (!unit.latest_attempt || unit.outcome !== "failed" ||
+              !["gap", "pending"].includes(unit.state) || unit.lease_token != null || unit.lease_until != null)
           : policy === "runtime"
             ? !isRuntimeProgressActiveUnit(unit) &&
               !isRuntimeProgressObsoleteUnit(unit)
@@ -284,6 +293,43 @@ async function lockJobScope(
     airfoilId: String(job.airfoil_id),
     units,
   };
+}
+
+export async function assertProgressiveStoppedFailedEvidenceJob(
+  db: DB,
+  delivery: ProgressiveRemoteEvidenceDelivery,
+) {
+  const source = await resolveProgressiveRemoteEvidence(db, delivery);
+  if (!source || progressiveRemotePointProjection(source).status !== "failed" || source.point.converged !== false ||
+    !["material_domain", "infrastructure", "hard_solver"].includes(String(source.point.failure_disposition)) ||
+    !progressiveReportedPointSources({ ...source.report.result!,
+      polars: source.report.result!.polars.map((polar) => ({ ...polar, points: [] })),
+    }).some((entry) => entry.contentSignature === source.contentSignature))
+    throw new ProgressiveRemoteEvidenceConflict("Stopped failure storage requires an authentic reported failed attempt");
+  const manifests = source.point.evidence_artifacts?.filter((artifact) => artifact.kind === "manifest") ?? [];
+  if (manifests.length !== 1 || typeof manifests[0].sha256 !== "string" ||
+    !/^[a-f0-9]{64}$/i.test(manifests[0].sha256) || typeof manifests[0].byte_size !== "number" ||
+    !Number.isSafeInteger(manifests[0].byte_size) || manifests[0].byte_size <= 0 ||
+    typeof manifests[0].path !== "string" || !manifests[0].path.trim())
+    throw new ProgressiveRemoteEvidenceConflict("Stopped physical failure storage requires its exact reported manifest");
+  assertProgressiveReportedManifest(source, { manifestSha256: manifests[0].sha256, manifestByteSize: manifests[0].byte_size });
+  const classifications = await readProgressiveRemoteSourceClassifications(db, delivery.engineJobId, [delivery.aoaDeg]);
+  if (!classifications.some((entry) => entry.pointContentSignature === source.contentSignature && entry.kind === "requires_evidence"))
+    throw new ProgressiveCfdEvidenceScopePending("Stopped failure storage awaits the authenticated final report, inventory and stop acknowledgement");
+  const scope = await lockJobScope(db, delivery.engineJobId, delivery.engineJobId, {
+    policy: "stopped-failed-storage", evidenceAoas: [delivery.aoaDeg],
+  });
+  const selected = scope?.units.filter((unit) => unit.aoa_deg === delivery.aoaDeg) ?? [];
+  if (!scope || selected.length !== 1)
+    throw new ProgressiveCfdEvidenceScopeClosed("Stopped failure storage has no unique original selected owner");
+  const [owner] = await db.execute(sql`SELECT unit.lease_owner,job.ingest_lease_token,job.ingest_lease_expires_at
+    FROM progressive_cfd_units unit JOIN sim_jobs job ON job.id=${delivery.engineJobId}::uuid
+    WHERE unit.id=${selected[0].unit_id}::uuid FOR UPDATE OF job`);
+  if (!owner || owner.lease_owner != null || (owner.ingest_lease_token != null &&
+    (owner.ingest_lease_expires_at == null || new Date(String(owner.ingest_lease_expires_at)).getTime() > Date.now())))
+    throw new ProgressiveCfdEvidenceScopeClosed("Stopped failure storage conflicts with a live ingestion or selected unit owner");
+  assertProgressiveRemotePhysicalCase(source, selected[0].snapshot);
+  return { source, scope: { ...scope, units: selected } };
 }
 
 export async function assertProgressiveStorageEvidenceRecoveryJob(
@@ -596,6 +642,7 @@ export async function recordProgressiveCfdEvidence(
     engineJobId: string;
     resultAttemptIds: string[];
     recoveryScope?: ProgressiveStorageEvidenceRecoveryScope;
+    stoppedFailedStorage?: ProgressiveRemoteEvidenceDelivery;
   },
 ): Promise<{ progressive: boolean; linked: number; stopRequired: boolean }> {
   const ids = [...new Set(input.resultAttemptIds)];
@@ -603,12 +650,17 @@ export async function recordProgressiveCfdEvidence(
     throw new Error("CFD evidence batch exceeds its bounded case scope");
   return db.transaction(async (transaction) => {
     const connection = transaction as unknown as DB;
+    if (input.stoppedFailedStorage && (input.recoveryScope || ids.length !== 1 ||
+      input.stoppedFailedStorage.engineJobId !== input.simJobId || input.engineJobId !== input.simJobId))
+      throw new Error("Stopped failed evidence requires its one exact authenticated delivery");
     const selectedEvidence = ids.length && !input.recoveryScope ? await connection.execute(sql`
       SELECT id,aoa_deg FROM result_attempts WHERE id IN (${sql.join(ids.map((id) => sql`${id}::uuid`), sql`, `)})
         AND sim_job_id=${input.simJobId} AND engine_job_id=${input.engineJobId}
     `) : [];
     const evidenceAoas = [...new Set(selectedEvidence.map((row) => Number(row.aoa_deg)))];
-    const scope = input.recoveryScope
+    const scope = input.stoppedFailedStorage
+      ? (await assertProgressiveStoppedFailedEvidenceJob(connection, input.stoppedFailedStorage)).scope
+      : input.recoveryScope
       ? await assertProgressiveStorageEvidenceRecoveryJob(
           connection,
           input.simJobId,
@@ -623,6 +675,13 @@ export async function recordProgressiveCfdEvidence(
         "Historical progressive recovery requires exact engine ownership",
       );
     if (!scope) return { progressive: false, linked: 0, stopRequired: false };
+    if (input.stoppedFailedStorage) {
+      const { assertProgressiveRemoteEvidenceAttempt } = await import("./progressive-remote-evidence-receipts");
+      await assertProgressiveRemoteEvidenceAttempt(connection, { ...input.stoppedFailedStorage, resultAttemptId: ids[0] });
+      const [raw] = await connection.execute(sql`SELECT status,converged,valid_for_polar FROM result_attempts WHERE id=${ids[0]}::uuid`);
+      if (!raw || raw.status !== "failed" || raw.converged !== false || raw.valid_for_polar !== false)
+        throw new ProgressiveRemoteEvidenceConflict("Stopped failed storage cannot link accepted or solved CFD");
+    }
     let linked = 0;
     let stopRequired = scope.units.some(
       (unit) =>
@@ -725,7 +784,10 @@ export async function recordProgressiveCfdEvidence(
       await connection.execute(
         sql`UPDATE progressive_cfd_attempts SET active_seconds = ${measured} WHERE token = ${unit.token}`,
       );
-      await connection.execute(sql`
+      if (input.stoppedFailedStorage) await connection.execute(sql`
+        UPDATE progressive_cfd_units SET active_seconds = ${total} WHERE id = ${unit.unit_id}
+      `);
+      else await connection.execute(sql`
         UPDATE progressive_cfd_units SET active_seconds = ${total},
           state = CASE WHEN ${exhausted} THEN 'blocked' ELSE state END,
           lease_token = CASE WHEN ${exhausted} THEN NULL ELSE lease_token END,
@@ -743,6 +805,6 @@ export async function recordProgressiveCfdEvidence(
         Number(unit.unit_seconds) >= Number(unit.effective_budget_seconds) &&
         !unit.budget_guard_confirmed,
     );
-    return { progressive: true, linked, stopRequired };
+    return { progressive: true, linked, stopRequired: input.stoppedFailedStorage ? false : stopRequired };
   });
 }

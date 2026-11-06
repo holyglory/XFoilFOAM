@@ -12,6 +12,7 @@ import {
 } from "./progressive-remote-report";
 import { validateProgressiveExecutionStopProof } from "./progressive-cfd-settlement";
 import type { EngineExecutionStopProof } from "../../engine-client/src/types";
+import { progressiveRemotePointProjection } from "./progressive-remote-point-projection";
 
 const stoppedAttemptOwner = sql`(
   (unit.state='blocked' AND unit.lease_token IS NULL AND unit.lease_until IS NULL)
@@ -27,6 +28,14 @@ export async function assertStoppedProgressiveStorage(
     throw new ProgressiveRemoteEvidenceConflict(
       "Stopped storage requires an exact progressive source",
     );
+  const [existing] = await db.execute(sql`SELECT storage_only FROM progressive_remote_evidence_receipts
+    WHERE sim_job_id=${delivery.engineJobId}::uuid AND point_content_signature=${source.contentSignature}`);
+  if (existing?.storage_only === true) return source;
+  if (progressiveRemotePointProjection(source).status === "failed") {
+    const { assertProgressiveStoppedFailedEvidenceJob } = await import("./progressive-cfd-evidence");
+    await assertProgressiveStoppedFailedEvidenceJob(db, delivery);
+    return source;
+  }
   const [stopped] = await db.execute(sql`
     SELECT job.status,job.engine_job_id,promise.status AS promise_status,
       stop.proof,stop.proof_signature,latest.report,latest.content_signature

@@ -5,7 +5,17 @@ export function progressiveMaterialDiagnosticSql(alias: string) {
   return sql`(${attempt}.evidence_payload->>'failure_disposition'='material_domain'
     AND ${attempt}.evidence_payload->>'converged'='false'
     AND coalesce(${attempt}.evidence_payload->>'cl',${attempt}.evidence_payload->>'cd',${attempt}.evidence_payload->>'cm') IS NULL
-    AND coalesce(${attempt}.evidence_payload->'evidence_artifacts','[]'::jsonb)='[]'::jsonb)`;
+    AND coalesce(${attempt}.evidence_payload->'evidence_artifacts','[]'::jsonb)='[]'::jsonb
+    AND coalesce(${attempt}.evidence_payload->'force_history','null'::jsonb)='null'::jsonb
+    AND coalesce(${attempt}.evidence_payload->'steady_history','null'::jsonb)='null'::jsonb
+    AND coalesce(${attempt}.evidence_payload->'frame_track','null'::jsonb)='null'::jsonb
+    AND coalesce(${attempt}.evidence_payload->'urans_cycle_certificate','null'::jsonb)='null'::jsonb
+    AND coalesce(${attempt}.evidence_payload->'aperiodic_mean_certificate','null'::jsonb)='null'::jsonb
+    AND coalesce(${attempt}.evidence_payload->'no_shedding_certificate','null'::jsonb)='null'::jsonb
+    AND coalesce(${attempt}.evidence_payload->'rans_hold_certificate','null'::jsonb)='null'::jsonb
+    AND coalesce(nullif(${attempt}.evidence_payload->'images','null'::jsonb),'{}'::jsonb)='{}'::jsonb
+    AND coalesce(nullif(${attempt}.evidence_payload->'video','null'::jsonb),'{}'::jsonb)='{}'::jsonb
+    AND coalesce(nullif(${attempt}.evidence_payload->'mean_images','null'::jsonb),'{}'::jsonb)='{}'::jsonb)`;
 }
 
 export function progressiveDiagnosticRetrySql(failureAlias: string, attemptAlias: string) {

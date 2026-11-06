@@ -191,9 +191,14 @@ export async function recordProgressiveRemoteEvidenceReceipt(
         "Historical recovery requires an existing immutable storage-only receipt",
       );
     await assertProgressiveRemoteEvidenceAttempt(connection, input);
-    if (input.storageOnly)
+    if (input.storageOnly) {
       await assertStoppedProgressiveStorage(connection, input);
-    else
+      if (progressiveRemotePointProjection(source).status === "failed")
+        await recordProgressiveCfdEvidence(connection, {
+          simJobId: input.engineJobId, engineJobId: input.engineJobId,
+          resultAttemptIds: [input.resultAttemptId], stoppedFailedStorage: input,
+        });
+    } else
       await recordProgressiveCfdEvidence(connection, {
         simJobId: input.engineJobId,
         engineJobId: input.engineJobId,

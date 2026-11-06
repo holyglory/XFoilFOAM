@@ -4730,6 +4730,18 @@ requires = ["retry-selection"]
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "recovers later terminal gaps through canonical admission after a saturated recovery prefix"]
 
 [[test.solver-throughput-recovery.check]]
+name = "stopped-failure-storage"
+tier = "development"
+requires = ["retry-recovery-integration"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "retains exact stopped failed attempts without canonical publication"]
+
+[[test.solver-throughput-recovery.check]]
+name = "artifact-metadata-replay"
+tier = "development"
+requires = ["stopped-failure-storage"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/evidence-object-storage-ingest.test.ts"]
+
+[[test.solver-throughput-recovery.check]]
 name = "database-types"
 tier = "development"
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "typecheck"]
@@ -4743,3 +4755,33 @@ command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "typechec
 name = "api-types"
 tier = "development"
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/api", "typecheck"]
+
+[test.artifact-metadata-replay]
+timeout_seconds = 3600
+
+[test.artifact-metadata-replay.postgres]
+image = "postgres:16-alpine"
+database = "aerodb"
+user = "aerodb"
+
+[[test.artifact-metadata-replay.check]]
+name = "schema"
+tier = "development"
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "migrate"]
+
+[[test.artifact-metadata-replay.check]]
+name = "seed"
+tier = "development"
+requires = ["schema"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "seed"]
+
+[[test.artifact-metadata-replay.check]]
+name = "replay"
+tier = "development"
+requires = ["seed"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/evidence-object-storage-ingest.test.ts"]
+
+[[test.artifact-metadata-replay.check]]
+name = "types"
+tier = "development"
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "typecheck"]

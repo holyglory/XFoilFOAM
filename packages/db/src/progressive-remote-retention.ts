@@ -14,16 +14,32 @@ import type { ProgressiveRemoteReport } from "./progressive-remote-report";
 import { progressiveRemoteReportInventory } from "./progressive-remote-inventory";
 import { validateProgressiveExecutionStopProof } from "./progressive-cfd-settlement";
 
-function materialDiagnosticSignatures(report: ProgressiveRemoteReport) {
+export type ProgressiveDiagnosticFailureKind = "material_domain" | "infrastructure" | "hard_solver";
+
+export function progressivePointHasRetainedHistory(point: ReturnType<typeof progressiveReportedPointSources>[number]["point"]) {
+  return [point.force_history, point.steady_history, point.frame_track,
+    point.urans_cycle_certificate, point.aperiodic_mean_certificate,
+    point.no_shedding_certificate, point.rans_hold_certificate].some((history) => history != null) ||
+    [point.images, point.video, point.mean_images].some((media) => media != null && Object.keys(media).length > 0);
+}
+
+export function progressiveReportedDiagnosticFailureKind(
+  point: ReturnType<typeof progressiveReportedPointSources>[number]["point"],
+): ProgressiveDiagnosticFailureKind | null {
+  if (!["material_domain", "infrastructure", "hard_solver"].includes(String(point.failure_disposition)) ||
+    point.converged !== false || [point.cl, point.cd, point.cm].some((value) => value != null) ||
+    (point.evidence_artifacts?.length ?? 0) > 0 || progressivePointHasRetainedHistory(point))
+    return null;
+  return point.failure_disposition as ProgressiveDiagnosticFailureKind;
+}
+
+function diagnosticSignatures(report: ProgressiveRemoteReport) {
   if (!report.result) return new Set<string>();
   return new Set(progressiveReportedPointSources({
     ...report.result,
     polars: report.result.polars.map((polar) => ({ ...polar, points: [] })),
-  }).filter(({ point }) =>
-    point.failure_disposition === "material_domain" && point.converged === false &&
-    [point.cl, point.cd, point.cm].every((value) => value == null) &&
-    (!point.evidence_artifacts || point.evidence_artifacts.length === 0),
-  ).map((source) => source.contentSignature));
+  }).filter(({ point }) => progressiveReportedDiagnosticFailureKind(point) !== null)
+    .map((source) => source.contentSignature));
 }
 
 export async function readProgressiveRemoteSourceClassifications(
@@ -89,6 +105,7 @@ export async function readProgressiveRemoteSourceClassifications(
     signature: string;
     inventory: ReturnType<typeof progressiveRemoteReportInventory>;
     diagnostics: Set<string>;
+    failureKinds: Map<string, ProgressiveDiagnosticFailureKind | null>;
   }>();
   for (const entry of reports) {
     const validated = validateProgressiveRemoteReport(entry.report, envelope);
@@ -101,7 +118,9 @@ export async function readProgressiveRemoteSourceClassifications(
     verified.set(validated.report.sequence, {
       signature: validated.contentSignature,
       inventory,
-      diagnostics: materialDiagnosticSignatures(validated.report),
+      diagnostics: diagnosticSignatures(validated.report),
+      failureKinds: new Map(validated.report.result ? progressiveReportedPointSources(validated.report.result)
+        .map((source) => [source.contentSignature, progressiveReportedDiagnosticFailureKind(source.point)]) : []),
     });
   }
   return sources.map((source) => {
@@ -111,8 +130,11 @@ export async function readProgressiveRemoteSourceClassifications(
       entry.point_content_signature === signature && entry.aoa_deg === Number(source.aoa_deg) &&
       entry.case_slug === source.case_slug))
       throw new Error("Remote diagnostic history has no exact authenticated point source");
+    const failureKind = report.diagnostics.has(signature) ? report.failureKinds.get(signature) ?? null : null;
     return {
-      kind: report.diagnostics.has(signature) ? "material_diagnostic" as const : "requires_evidence" as const,
+      kind: failureKind === "material_domain" ? "material_diagnostic" as const
+        : failureKind !== null ? "failure_diagnostic" as const : "requires_evidence" as const,
+      failureKind,
       executionId,
       sequence: Number(source.sequence),
       reportContentSignature: report.signature,
@@ -138,7 +160,9 @@ export function terminalReportHasNoPhysicalEvidence(
       (attempt) =>
         (!attempt.evidence_artifacts ||
           attempt.evidence_artifacts.length === 0) &&
-        (attempt.failure_disposition != null || attempt.error != null),
+        (attempt.failure_disposition != null || attempt.error != null) &&
+        [attempt.cl, attempt.cd, attempt.cm].every((value) => value == null) &&
+        !progressivePointHasRetainedHistory(attempt),
     )
   );
 }
@@ -147,7 +171,7 @@ export function terminalReportNoPhysicalEvidenceSignatures(
   report: ProgressiveRemoteReport,
 ) {
   if (report.result?.state === "completed" && isFinalProgressiveRemoteReport(report))
-    return materialDiagnosticSignatures(report);
+    return diagnosticSignatures(report);
   if (!report.result || !["failed", "cancelled"].includes(report.result.state))
     return new Set<string>();
   return new Set(
@@ -158,7 +182,8 @@ export function terminalReportNoPhysicalEvidenceSignatures(
           coefficients.every((value) => value == null) &&
           (!point.evidence_artifacts ||
             point.evidence_artifacts.length === 0) &&
-          (point.failure_disposition != null || point.error != null)
+          (point.failure_disposition != null || point.error != null) &&
+          !progressivePointHasRetainedHistory(point)
         );
       })
       .map((source) => source.contentSignature),
@@ -222,7 +247,7 @@ export async function readProgressiveRemoteRetention(
     : [];
   const terminalNoEvidence = new Set([
     ...terminalReportNoPhysicalEvidenceSignatures(report),
-    ...classifications.filter((source) => source.kind === "material_diagnostic")
+    ...classifications.filter((source) => source.kind === "material_diagnostic" || source.kind === "failure_diagnostic")
       .map((source) => source.pointContentSignature),
   ]);
   const missingEvidence = sources.filter(
