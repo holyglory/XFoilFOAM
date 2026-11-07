@@ -381,7 +381,9 @@ async function exerciseMixedProgressiveRemoteDelivery(
     };
     for (const changed of [
       { cl: 99, validForPolar: false },
-      { status: "failed" as const, source: "queued" as const, converged: false, validForPolar: false },
+      projection.status === "failed"
+        ? { status: "done" as const, source: "solved" as const, converged: true, validForPolar: true }
+        : { status: "failed" as const, source: "queued" as const, converged: false, validForPolar: false },
     ]) {
       const [changedRaw] = await connection.insert(resultAttempts).values({ ...values, ...changed }).returning();
       await expect(recordProgressiveRemoteEvidenceReceipt(connection, {
