@@ -4,6 +4,8 @@ const PROGRESSIVE_REPORT_JOB_LIMIT = 64;
 const PROGRESSIVE_TERMINAL_REPORT_JOB_RESERVE = 2;
 const PROGRESSIVE_ACTIVE_REPORT_JOB_HEADROOM = 6;
 const PROGRESSIVE_SETTLEMENT_JOB_LIMIT = 128;
+const PROGRESSIVE_NORMAL_SETTLEMENT_JOB_HEADROOM = 6;
+const PROGRESSIVE_CLOSED_SETTLEMENT_JOB_RESERVE = 2;
 
 const unappliedReports = sql`EXISTS (
   SELECT 1 FROM progressive_remote_reports report
@@ -95,7 +97,13 @@ export function progressiveReportJobsSql(jobIds?: string[]) {
 }
 
 export function progressiveSettlementJobsSql(jobIds?: string[]) {
-  return sql`SELECT job.id AS sim_job_id, job.campaign_id
+  return sql`WITH eligible AS MATERIALIZED (
+    SELECT job.id AS sim_job_id, job.campaign_id, retained.ready_closed,
+      coalesce(cohort_priority.priority, 1) AS cohort_priority,
+      CASE WHEN campaign.status IN ('active', 'attention', 'paused') THEN 0 ELSE 1 END AS campaign_priority,
+      CASE WHEN job.status = 'ingesting' AND job.engine_state IN ('completed', 'failed', 'cancelled')
+        THEN 0 ELSE 1 END AS lifecycle_priority,
+      coalesce(job."polledAt", job."updatedAt") AS last_polled_at
     FROM sim_jobs job
     LEFT JOIN sim_campaigns campaign ON campaign.id = job.campaign_id
     JOIN progressive_remote_dispatches dispatch ON dispatch.sim_job_id = job.id
@@ -109,30 +117,10 @@ export function progressiveSettlementJobsSql(jobIds?: string[]) {
         ON member.generation_id = work.generation_id AND member.target_id = work.target_id
       WHERE attempt.sim_job_id = job.id
     ) cohort_priority ON true
-    WHERE ${executionScope(jobIds)} AND NOT ${unappliedReports}
-      AND (
-        (job.status = 'ingesting' AND job.engine_state IN ('completed', 'failed', 'cancelled'))
-        OR (EXISTS (SELECT 1 FROM progressive_cfd_execution_stops stopped WHERE stopped.sim_job_id = job.id)
-          AND EXISTS (SELECT 1 FROM progressive_cfd_attempts attempt
-            WHERE attempt.sim_job_id = job.id AND attempt.outcome = 'running'))
-        OR (job.status IN ('done', 'failed', 'cancelled')
-          AND EXISTS (SELECT 1 FROM progressive_cfd_execution_stops stopped
-            WHERE stopped.sim_job_id = job.id)
-          AND EXISTS (SELECT 1
-            FROM progressive_cfd_attempts attempt
-            JOIN progressive_cfd_units unit ON unit.id = attempt.unit_id
-            WHERE attempt.sim_job_id = job.id
-              AND NOT EXISTS (SELECT 1 FROM progressive_cfd_attempts newer
-                WHERE newer.unit_id = unit.id
-                  AND (newer.started_at, newer.token) > (attempt.started_at, attempt.token))
-              AND ((unit.state = 'leased' AND unit.lease_token = attempt.token
-                AND unit.lease_until <= clock_timestamp())
-                OR (unit.state = 'blocked' AND unit.lease_token IS NULL
-                  AND unit.lease_until IS NULL))))
-        OR (job.status IN ('done', 'failed', 'cancelled') AND EXISTS (
-          SELECT 1 FROM progressive_remote_dispatches dispatch JOIN sync_sweep_promises promise ON promise.id = dispatch.promise_id
-          WHERE dispatch.sim_job_id = job.id AND promise.status = 'active'))
-        OR (job.status IN ('done', 'failed', 'cancelled') AND job."ingestedAt" IS NULL
+    CROSS JOIN LATERAL (
+      SELECT coalesce((job.status IN ('done', 'failed', 'cancelled') AND job."ingestedAt" IS NULL
+          AND (job.ingest_lease_expires_at <= clock_timestamp()
+            OR (job.ingest_lease_token IS NULL AND job.ingest_lease_expires_at IS NULL))
           AND promise.status IN ('expired', 'cancelled', 'fulfilled')
           AND job.engine_job_id = job.id::text
           AND dispatch.envelope->>'solverId' = dispatch.solver_id::text
@@ -158,7 +146,32 @@ export function progressiveSettlementJobsSql(jobIds?: string[]) {
               AND NOT EXISTS (SELECT 1 FROM progressive_remote_evidence_receipts evidence
                 JOIN solver_evidence_archives archive ON archive.result_attempt_id = evidence.result_attempt_id AND archive.state = 'current'
                 WHERE evidence.sim_job_id = source.sim_job_id
-                  AND evidence.point_content_signature = source.point_content_signature)))
+                  AND evidence.point_content_signature = source.point_content_signature))), false) AS ready_closed
+    ) retained
+    WHERE ${executionScope(jobIds)} AND NOT ${unappliedReports}
+      AND (
+        (job.status = 'ingesting' AND job.engine_state IN ('completed', 'failed', 'cancelled'))
+        OR (EXISTS (SELECT 1 FROM progressive_cfd_execution_stops stopped WHERE stopped.sim_job_id = job.id)
+          AND EXISTS (SELECT 1 FROM progressive_cfd_attempts attempt
+            WHERE attempt.sim_job_id = job.id AND attempt.outcome = 'running'))
+        OR (job.status IN ('done', 'failed', 'cancelled')
+          AND EXISTS (SELECT 1 FROM progressive_cfd_execution_stops stopped
+            WHERE stopped.sim_job_id = job.id)
+          AND EXISTS (SELECT 1
+            FROM progressive_cfd_attempts attempt
+            JOIN progressive_cfd_units unit ON unit.id = attempt.unit_id
+            WHERE attempt.sim_job_id = job.id
+              AND NOT EXISTS (SELECT 1 FROM progressive_cfd_attempts newer
+                WHERE newer.unit_id = unit.id
+                  AND (newer.started_at, newer.token) > (attempt.started_at, attempt.token))
+              AND ((unit.state = 'leased' AND unit.lease_token = attempt.token
+                AND unit.lease_until <= clock_timestamp())
+                OR (unit.state = 'blocked' AND unit.lease_token IS NULL
+                  AND unit.lease_until IS NULL))))
+        OR (job.status IN ('done', 'failed', 'cancelled') AND EXISTS (
+          SELECT 1 FROM progressive_remote_dispatches dispatch JOIN sync_sweep_promises promise ON promise.id = dispatch.promise_id
+          WHERE dispatch.sim_job_id = job.id AND promise.status = 'active'))
+        OR retained.ready_closed
         OR (job.status IN ('done', 'failed', 'cancelled')
           AND EXISTS (SELECT 1 FROM progressive_cfd_execution_stops stopped
             WHERE stopped.sim_job_id = job.id)
@@ -184,10 +197,24 @@ export function progressiveSettlementJobsSql(jobIds?: string[]) {
                 WHERE review.result_id = result.id AND review."revokedAt" IS NULL
                 ORDER BY review."createdAt" DESC, review.id DESC LIMIT 1), '')
                 NOT IN ('exclude', 'defer'))))
-    ORDER BY coalesce(cohort_priority.priority, 1),
-      CASE WHEN campaign.status IN ('active', 'attention', 'paused') THEN 0 ELSE 1 END,
-      CASE WHEN job.status = 'ingesting'
-      AND job.engine_state IN ('completed', 'failed', 'cancelled')
-      THEN 0 ELSE 1 END,
-      coalesce(job."polledAt", job."updatedAt"), job.id LIMIT ${PROGRESSIVE_SETTLEMENT_JOB_LIMIT}`;
+    ), normal_head AS MATERIALIZED (
+      SELECT eligible.* FROM eligible WHERE NOT ready_closed
+      ORDER BY cohort_priority, campaign_priority, lifecycle_priority, last_polled_at, sim_job_id
+      LIMIT ${PROGRESSIVE_NORMAL_SETTLEMENT_JOB_HEADROOM}
+    ), closed_head AS MATERIALIZED (
+      SELECT eligible.* FROM eligible WHERE ready_closed
+      ORDER BY cohort_priority, campaign_priority, lifecycle_priority, last_polled_at, sim_job_id
+      LIMIT ${PROGRESSIVE_CLOSED_SETTLEMENT_JOB_RESERVE}
+    ), ordered AS (
+      SELECT normal_head.*, 0 AS lane FROM normal_head
+      UNION ALL
+      SELECT closed_head.*, 1 AS lane FROM closed_head
+      UNION ALL
+      SELECT eligible.*, 2 AS lane FROM eligible
+      WHERE NOT EXISTS (SELECT 1 FROM normal_head selected WHERE selected.sim_job_id = eligible.sim_job_id)
+        AND NOT EXISTS (SELECT 1 FROM closed_head selected WHERE selected.sim_job_id = eligible.sim_job_id)
+    )
+    SELECT sim_job_id, campaign_id FROM ordered
+    ORDER BY cohort_priority, campaign_priority, lane, lifecycle_priority, last_polled_at, sim_job_id
+    LIMIT ${PROGRESSIVE_SETTLEMENT_JOB_LIMIT}`;
 }

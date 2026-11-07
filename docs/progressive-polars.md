@@ -1183,6 +1183,11 @@ reported source must have either its diagnostic receipt or physical archive.
 Normal settlement still checks retention and preserves newer owners. After the
 job receives its ingestion stamp, this recovery branch no longer selects it;
 retained failed evidence never becomes accepted CFD through queue settlement.
+Within the existing cohort and campaign precedence, the settlement selector
+reserves two positions for these fully retained, unowned closed jobs after six
+ordinary candidates. Unused positions return to the ordinary ordered backlog.
+The 128-candidate bound and actual per-pass limits remain unchanged, so unfinished
+imports cannot consume every settlement turn while archived jobs wait indefinitely.
 Progressive workers publish through their dedicated compact-evidence and archive
 services, never the legacy accepted-result publisher. A terminal worker report
 may precede local point staging; that temporary absence is not an empty solve and

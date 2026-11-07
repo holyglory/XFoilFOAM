@@ -16,6 +16,13 @@ import { reconcileCompletedProgressiveArchiveReclaims } from "../../../apps/swee
 const client = createClient({ max: 1 });
 afterAll(() => client.sql.end());
 
+async function analyzeSelectionFixture(connection: Pick<DB, "execute">) {
+  const tables = await connection.execute(sql`SELECT relname FROM pg_class
+    WHERE relnamespace=pg_my_temp_schema() AND relkind='r'`);
+  for (const table of tables)
+    await connection.execute(sql`ANALYZE ${sql.identifier("pg_temp")}.${sql.identifier(String(table.relname))}`);
+}
+
 it("recognizes exact completed canonical cleanup without deleting again or double-counting bytes", async () => {
   await client.db.transaction(async (transaction) => {
     await transaction.execute(sql`CREATE TEMP TABLE reclaim_cases ON COMMIT DROP AS
@@ -336,6 +343,7 @@ it("selects closed terminal jobs with retained evidence for classification settl
   await client.db.transaction(async (transaction) => {
     await transaction.execute(sql`CREATE TEMP TABLE fixture_storage_jobs ON COMMIT DROP AS
       SELECT md5(variant)::uuid AS id,variant FROM unnest(ARRAY['retained','unretained','stored-closed',
+        'stored-closed-2','stored-high','stored-inactive','stored-live-ingest','stored-indefinite-ingest',
         'stored-ingested','stored-pending','stored-running','stored-no-stop','stored-wrong-stop','stored-live-proof',
         'stored-unretained','stored-no-archive','stored-unapplied','stored-wrong-dispatch','stored-foreign-request']) variant`);
     await transaction.execute(sql`CREATE TEMP TABLE sim_campaigns ON COMMIT DROP AS
@@ -345,6 +353,8 @@ it("selects closed terminal jobs with retained evidence for classification settl
         CASE WHEN variant='stored-pending' THEN 'pending' WHEN variant='stored-running' THEN 'running'
           WHEN variant LIKE 'stored-%' THEN 'cancelled' ELSE 'done' END AS status,'completed'::text AS engine_state,
         CASE WHEN variant='stored-ingested' THEN clock_timestamp() END AS "ingestedAt",
+        CASE WHEN variant IN ('stored-live-ingest','stored-indefinite-ingest') THEN 'current-ingestion-owner' END AS ingest_lease_token,
+        CASE WHEN variant='stored-live-ingest' THEN clock_timestamp()+interval '1 hour' END AS ingest_lease_expires_at,
         jsonb_build_object('progressive',jsonb_build_object('executionId',id),'engineRequest','{}'::jsonb) AS request_payload,
         clock_timestamp()-interval '1 hour' AS "updatedAt",
         clock_timestamp()-interval '1 hour' AS "polledAt"
@@ -420,6 +430,13 @@ it("selects closed terminal jobs with retained evidence for classification settl
     await transaction.execute(sql`CREATE TEMP TABLE result_review_verdicts (
       id uuid,result_id uuid,verdict text,"revokedAt" timestamptz,"createdAt" timestamptz
     ) ON COMMIT DROP`);
+    const beforePlan = await transaction.execute(sql`EXPLAIN (FORMAT JSON) ${progressiveSettlementJobsSql()}`);
+    await analyzeSelectionFixture(transaction);
+    const afterPlan = await transaction.execute(sql`EXPLAIN (FORMAT JSON) ${progressiveSettlementJobsSql()}`);
+    console.info("settlement-fixture-plans", JSON.stringify([beforePlan,afterPlan].map((rows) => {
+      const [plan] = rows[0]["QUERY PLAN"] as Array<{ Plan: { "Total Cost": number }; JIT?: unknown }>;
+      return { cost: plan.Plan["Total Cost"], jit: plan.JIT ?? null };
+    })));
     const selected = await transaction.execute(progressiveSettlementJobsSql());
     const [{ id: retainedId }, { id: unretainedId }] =
       await transaction.execute(
@@ -433,10 +450,60 @@ it("selects closed terminal jobs with retained evidence for classification settl
     );
     const variants = await transaction.execute(sql`SELECT variant FROM fixture_storage_jobs
       WHERE id IN (${sql.join(selected.map((row) => sql`${row.sim_job_id}::uuid`), sql`, `)}) ORDER BY variant`);
-    expect(variants.map((row) => row.variant)).toEqual(["retained", "stored-closed"]);
+    expect(variants.map((row) => row.variant)).toEqual(["retained", "stored-closed", "stored-closed-2", "stored-high", "stored-inactive"]);
     await transaction.execute(sql`UPDATE sim_jobs SET "ingestedAt"=clock_timestamp() WHERE id=md5('stored-closed')::uuid`);
     const [closed] = await transaction.execute(sql`SELECT id FROM fixture_storage_jobs WHERE variant='stored-closed'`);
     expect(await transaction.execute(progressiveSettlementJobsSql([String(closed.id)]))).toEqual([]);
+    await transaction.execute(sql`UPDATE sim_jobs SET "ingestedAt"=NULL WHERE id=md5('stored-closed')::uuid`);
+    await transaction.execute(sql`INSERT INTO sim_jobs(id,campaign_id,engine_job_id,status,engine_state,"updatedAt","polledAt",request_payload)
+      SELECT md5('unfinished-'||ordinal)::uuid,md5('campaign')::uuid,md5('unfinished-'||ordinal),
+        'ingesting','failed',timestamptz '2020-01-01',timestamptz '2020-01-01','{}'::jsonb
+      FROM generate_series(1,160) ordinal`);
+    await transaction.execute(sql`INSERT INTO progressive_remote_dispatches(sim_job_id,promise_id,solver_id,envelope)
+      SELECT id,id,id,'{}'::jsonb FROM sim_jobs WHERE status='ingesting'`);
+    await transaction.execute(sql`INSERT INTO sync_sweep_promises SELECT id,'active' FROM sim_jobs WHERE status='ingesting'`);
+    await transaction.execute(sql`INSERT INTO sim_campaigns VALUES (md5('inactive-campaign')::uuid,'complete')`);
+    await transaction.execute(sql`UPDATE sim_jobs SET campaign_id=md5('inactive-campaign')::uuid WHERE id=md5('stored-inactive')::uuid`);
+    await transaction.execute(sql`INSERT INTO progressive_cfd_units(id,work_id) SELECT id,id FROM sim_jobs`);
+    await transaction.execute(sql`INSERT INTO progressive_work SELECT id,md5('generation')::uuid,id FROM sim_jobs`);
+    await transaction.execute(sql`INSERT INTO progressive_generation_cohort_targets
+      SELECT md5('generation')::uuid,id,CASE WHEN id=md5('stored-high')::uuid THEN 'high' ELSE 'low' END FROM sim_jobs`);
+    await transaction.execute(sql`INSERT INTO progressive_cfd_attempts(token,sim_job_id,outcome,unit_id,started_at)
+      SELECT id,id,'failed',id,timestamptz '2020-01-01' FROM sim_jobs`);
+    await analyzeSelectionFixture(transaction);
+    const readyRows = await transaction.execute(sql`SELECT id FROM fixture_storage_jobs WHERE variant IN ('stored-closed','stored-closed-2')`);
+    const readyIds = readyRows.map((row) => String(row.id));
+    const unfinishedRows = await transaction.execute(sql`SELECT id FROM sim_jobs WHERE status='ingesting' ORDER BY id`);
+    const unfinishedIds = new Set(unfinishedRows.map((row) => String(row.id)));
+    for (let pass = 0; pass < 2; pass += 1) {
+      const selected = await transaction.execute(progressiveSettlementJobsSql());
+      const selectedIds = selected.map((row) => String(row.sim_job_id));
+      expect(selected).toHaveLength(128);
+      expect(new Set(selectedIds).size).toBe(128);
+      expect(selectedIds.slice(0,6).every((id) => unfinishedIds.has(id))).toBe(true);
+      expect(selectedIds.slice(6,8).sort()).toEqual([...readyIds].sort());
+      expect(selectedIds.every((id) => unfinishedIds.has(id) || readyIds.includes(id))).toBe(true);
+      expect(selectedIds.slice(0,32).filter((id) => readyIds.includes(id))).toHaveLength(2);
+      await transaction.execute(sql`UPDATE sim_jobs SET "polledAt"=clock_timestamp()
+        WHERE id IN (${sql.join(selectedIds.slice(0,8).map((id) => sql`${id}::uuid`),sql`,`)})`);
+    }
+    const [high] = await transaction.execute(sql`SELECT id FROM fixture_storage_jobs WHERE variant='stored-high'`);
+    const lowerCohortIds = [...unfinishedIds].slice(0,9);
+    const mixedCohorts = await transaction.execute(progressiveSettlementJobsSql([...lowerCohortIds,String(high.id)]));
+    expect(mixedCohorts.slice(0,9).every((row) => lowerCohortIds.includes(String(row.sim_job_id)))).toBe(true);
+    expect(mixedCohorts[9].sim_job_id).toBe(high.id);
+    const [inactive] = await transaction.execute(sql`SELECT id FROM fixture_storage_jobs WHERE variant='stored-inactive'`);
+    const mixedCampaigns = await transaction.execute(progressiveSettlementJobsSql([...lowerCohortIds,String(inactive.id)]));
+    expect(mixedCampaigns.slice(0,9).every((row) => lowerCohortIds.includes(String(row.sim_job_id)))).toBe(true);
+    expect(mixedCampaigns[9].sim_job_id).toBe(inactive.id);
+    const oneReady = await transaction.execute(progressiveSettlementJobsSql([...unfinishedIds,readyIds[0]]));
+    expect(oneReady.slice(0,8).filter((row) => row.sim_job_id===readyIds[0])).toHaveLength(1);
+    expect(oneReady.slice(0,8).filter((row) => unfinishedIds.has(String(row.sim_job_id)))).toHaveLength(7);
+    await transaction.execute(sql`UPDATE sim_jobs SET "ingestedAt"=clock_timestamp()
+      WHERE id IN (${sql.join(readyIds.map((id) => sql`${id}::uuid`),sql`,`)})`);
+    const noneReady = await transaction.execute(progressiveSettlementJobsSql([...unfinishedIds,...readyIds]));
+    expect(noneReady).toHaveLength(128);
+    expect(noneReady.every((row) => unfinishedIds.has(String(row.sim_job_id)))).toBe(true);
   });
 });
 
@@ -453,6 +520,7 @@ it("settles fulfilled and active jobs fairly while expired work keeps arriving",
     await transaction.execute(sql`CREATE TEMP TABLE sim_jobs ON COMMIT DROP AS
       SELECT id,md5('campaign')::uuid AS campaign_id,
         NULL::text AS engine_job_id,NULL::timestamptz AS "ingestedAt",'{}'::jsonb AS request_payload,
+        NULL::text AS ingest_lease_token,NULL::timestamptz AS ingest_lease_expires_at,
         CASE WHEN variant IN ('executing','stopped-running') THEN 'running'
           WHEN variant IN ('stopped-terminal','done-active','done-closed','done-closed-pointer-gap','done-closed-evidence') THEN 'done' ELSE 'ingesting' END AS status,
         CASE WHEN variant IN ('executing','stopped-running') THEN 'running' ELSE 'completed' END AS engine_state,
@@ -579,6 +647,7 @@ it("settles fulfilled and active jobs fairly while expired work keeps arriving",
     const [fulfilled] = await transaction.execute(
       sql`SELECT id FROM fixture_settlement_jobs WHERE variant='fulfilled'`,
     );
+    await analyzeSelectionFixture(transaction);
     const allReports = await expectedReports();
     const allSettlements = await expectedSettlements();
     expect(allReports).toHaveLength(50);

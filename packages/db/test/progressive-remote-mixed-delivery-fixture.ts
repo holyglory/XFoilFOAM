@@ -3,12 +3,12 @@ import { eq, sql } from "drizzle-orm";
 import { expect } from "vitest";
 import type { DB } from "../src/client";
 import { analysisContentHash } from "../src/analysis-target";
-import { resultAttempts, solverEvidenceArtifacts, syncBrokeredEvidenceUploads } from "../src/schema";
+import { progressiveCfdAttempts, progressiveRemoteDispatches, resultAttempts, simJobs, solverEvidenceArtifacts, syncBrokeredEvidenceUploads, syncSweepPromises } from "../src/schema";
 import { registerVerifiedBrokeredEvidenceArchive } from "../src/brokered-evidence-archive";
 import { readProgressiveEvidenceCustodyReceipt } from "../src/progressive-evidence-custody";
 import { progressiveArchiveManifestBytes, progressiveArchiveManifestSha256, progressiveArchiveMembers } from "./progressive-archive-data";
 import { assertProgressiveCfdEvidenceJob } from "../src/progressive-cfd-evidence";
-import type { ProgressiveRemoteExecutionEnvelope } from "../src/progressive-remote-execution";
+import { sealProgressiveRemoteExecution, type ProgressiveRemoteExecutionEnvelope } from "../src/progressive-remote-execution";
 import type { ProgressiveRemoteReport } from "../src/progressive-remote-report";
 import { progressiveRemoteReportInventory } from "../src/progressive-remote-inventory";
 import { progressiveRemotePointProjection } from "../src/progressive-remote-point-projection";
@@ -501,6 +501,10 @@ async function exerciseMixedProgressiveRemoteDelivery(
         sql`DELETE FROM progressive_cfd_execution_stops WHERE sim_job_id=${executionId}::uuid`,
         sql`DELETE FROM progressive_remote_progress_receipts WHERE sim_job_id=${executionId}::uuid AND sequence=2`,
         sql`DELETE FROM progressive_remote_diagnostic_receipts WHERE sim_job_id=${executionId}::uuid`,
+        sql`UPDATE sim_jobs SET ingest_lease_token='live-storage-owner',ingest_lease_expires_at=clock_timestamp()+interval '1 hour'
+          WHERE id=${executionId}::uuid`,
+        sql`UPDATE sim_jobs SET ingest_lease_token='indefinite-storage-owner',ingest_lease_expires_at=NULL
+          WHERE id=${executionId}::uuid`,
       ]) {
         const restore = new Error("Restore closed storage selector guard");
         await connection.transaction(async (nested) => {
@@ -512,6 +516,43 @@ async function exerciseMixedProgressiveRemoteDelivery(
           throw restore;
         }).catch((error) => { if (error !== restore) throw error; });
       }
+      const [sourceJob] = await connection.select().from(simJobs).where(eq(simJobs.id, executionId));
+      const [sourcePromise] = await connection.select().from(syncSweepPromises).where(eq(syncSweepPromises.id, envelope.promiseId));
+      const backlog = Array.from({ length: 129 }, () => {
+        const unfinishedId = randomUUID();
+        const units = envelope.scope.units.map((unit) => ({ ...unit, token: randomUUID() }));
+        return sealProgressiveRemoteExecution({
+          solverId: envelope.solverId, promiseId: randomUUID(),
+          scope: { ...envelope.scope, executionId: unfinishedId, units, tokens: units.map((unit) => unit.token) },
+          request: { ...envelope.request, execution_id: unfinishedId },
+        });
+      });
+      const oldestPoll = new Date("2000-01-01T00:00:00Z");
+      const liveLease = new Date(Date.now() + 3_600_000);
+      await connection.insert(simJobs).values(backlog.map((unfinished) => ({
+        ...sourceJob, id: unfinished.scope.executionId, engineJobId: unfinished.scope.executionId,
+        status: "ingesting" as const, engineState: "failed", ingestedAt: null, finishedAt: null,
+        polledAt: oldestPoll, ingestLeaseToken: unfinished.scope.executionId, ingestLeaseExpiresAt: liveLease,
+        requestPayload: { ...sourceJob.requestPayload as Record<string, unknown>, progressive: unfinished.scope, engineRequest: unfinished.request },
+      })));
+      await connection.insert(syncSweepPromises).values(backlog.map((unfinished) => ({
+        ...sourcePromise, id: unfinished.promiseId, status: "active" as const, expiresAt: liveLease,
+        expiredAt: null, cancelledAt: null, fulfilledAt: null,
+      })));
+      await connection.insert(progressiveRemoteDispatches).values(backlog.map((unfinished) => ({
+        simJobId: unfinished.scope.executionId, promiseId: unfinished.promiseId, solverId: unfinished.solverId,
+        cpuSlots: 1, contentSignature: unfinished.contentSignature, envelope: { ...unfinished },
+      })));
+      await connection.insert(progressiveCfdAttempts).values(backlog.flatMap((unfinished) => unfinished.scope.units.map((unit) => ({
+        token: unit.token, unitId: unit.unitId, owner: "unfinished historic ingestion", executionRecipeId: unfinished.scope.recipeId,
+        simJobId: unfinished.scope.executionId, startedAt: oldestPoll, leaseUntil: oldestPoll, outcome: "expired",
+      }))));
+      const candidates = await connection.execute(progressiveSettlementJobsSql());
+      expect(candidates).toHaveLength(128);
+      expect(new Set(candidates.map((candidate) => candidate.sim_job_id)).size).toBe(128);
+      expect(candidates[6].sim_job_id).toBe(executionId);
+      const unfinishedIds = new Set(backlog.map((unfinished) => unfinished.scope.executionId));
+      expect(candidates.filter((candidate) => unfinishedIds.has(String(candidate.sim_job_id)))).toHaveLength(127);
       for (const staleEpoch of [false, true]) {
         const replacementToken = randomUUID();
         const restore = new Error("Restore newer closed storage owner");
@@ -526,13 +567,20 @@ async function exerciseMixedProgressiveRemoteDelivery(
             lease_owner='newer unrelated solver owner',lease_until=clock_timestamp()+interval '1 hour'
             WHERE id=${envelope.scope.units[0].unitId}::uuid`);
           const ownerBefore = await scoped.execute(sql`SELECT * FROM progressive_cfd_units WHERE id=${envelope.scope.units[0].unitId}::uuid`);
-          expect(await reconcileProgressiveRemoteProgress(scoped, { jobIds: [executionId] })).toMatchObject({ settled: 1, errors: [] });
+          const pointersBefore = await scoped.execute(sql`SELECT id,current_result_attempt_id FROM results WHERE id=${raw.resultId}::uuid`);
+          expect(await reconcileProgressiveRemoteProgress(scoped, staleEpoch ? { jobIds: [executionId] } : {})).toMatchObject({ settled: 1, errors: [] });
           expect(await scoped.execute(sql`SELECT * FROM progressive_cfd_units WHERE id=${envelope.scope.units[0].unitId}::uuid`)).toEqual(ownerBefore);
           expect(await scoped.execute(sql`SELECT outcome FROM progressive_cfd_attempts WHERE token=${replacementToken}::uuid`)).toEqual([{ outcome: "running" }]);
+          expect(await scoped.execute(sql`SELECT id,current_result_attempt_id FROM results WHERE id=${raw.resultId}::uuid`)).toEqual(pointersBefore);
           throw restore;
         }).catch((error) => { if (error !== restore) throw error; });
       }
-      expect(await reconcileProgressiveRemoteProgress(connection, { jobIds: [executionId] })).toMatchObject({ settled: 1, waiting: 0, errors: [] });
+      expect(await reconcileProgressiveRemoteProgress(connection)).toMatchObject({ settled: 1, waiting: 7, errors: [] });
+      const unfinished = await connection.execute(sql`SELECT id,status,"ingestedAt","polledAt",ingest_lease_token
+        FROM sim_jobs WHERE id IN (${sql.join([...unfinishedIds].map((id) => sql`${id}::uuid`),sql`,`)})`);
+      expect(unfinished).toHaveLength(129);
+      expect(unfinished.filter((candidate) => new Date(String(candidate.polledAt)).getTime() > oldestPoll.getTime())).toHaveLength(7);
+      expect(unfinished.every((candidate) => candidate.status === "ingesting" && candidate.ingestedAt === null && candidate.ingest_lease_token === candidate.id)).toBe(true);
       const [finished] = await connection.execute(sql`SELECT status,"ingestedAt" FROM sim_jobs WHERE id=${executionId}::uuid`);
       expect(finished.status).toBe("cancelled");
       expect(finished.ingestedAt).not.toBeNull();
