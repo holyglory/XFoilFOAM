@@ -10,7 +10,10 @@
 import { sql } from "drizzle-orm";
 
 import type { DB } from "./client";
-import { acquireResultEvidenceLock } from "./result-evidence-lock";
+import { acquireResultEvidenceLock, acquireResultEvidenceLocks } from "./result-evidence-lock";
+import { analysisContentHash } from "./analysis-target";
+import { exactValidSolverManifestSql } from "./evidence-manifest";
+import type { SimulationSetupSnapshot } from "./simulation-setup";
 import {
   recordSolverIncidentInTransaction,
   solverIncidentReason,
@@ -65,6 +68,111 @@ export async function requeueLegacyResultMediaRenderTimeouts(
     RETURNING repair.id
   `)) as unknown as Array<{ id: string }>;
   return rows.length;
+}
+
+export interface LegacyResultMediaPhysicalRecoveryTarget {
+  resultId: string;
+  resultAttemptId: string;
+  repairId: string;
+  revisionId: string;
+  archiveId: string;
+  evidenceSignature: string;
+}
+
+export async function requeueLegacyResultMediaPhysicalContext(
+  db: DB,
+  opts: {
+    mode: "dry-run" | "apply";
+    targets: readonly LegacyResultMediaPhysicalRecoveryTarget[];
+    expectedCount: number;
+    expectedSignature: string;
+  },
+) {
+  const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+  if (!opts || !["dry-run", "apply"].includes(opts.mode) || !Array.isArray(opts.targets)
+    || opts.targets.length < 1 || opts.targets.length > 3 || opts.expectedCount !== opts.targets.length
+    || new Set(opts.targets.map((target) => target?.resultId)).size !== opts.targets.length
+    || opts.targets.some((target) => !target
+      || ![target.resultId, target.resultAttemptId, target.repairId, target.revisionId, target.archiveId].every((id) => typeof id === "string" && uuid.test(id))
+      || typeof target.evidenceSignature !== "string" || target.evidenceSignature.length < 1 || target.evidenceSignature.length > 2048)
+    || !/^[a-f0-9]{64}$/.test(opts.expectedSignature)
+    || analysisContentHash({ version: 1, kind: "legacy-media-physical-context", targets: opts.targets, expectedCount: opts.expectedCount }) !== opts.expectedSignature)
+    throw new Error("Invalid pinned legacy media recovery scope");
+  return db.transaction(async (rawTransaction) => {
+    const transaction = rawTransaction as unknown as DB;
+    await transaction.execute(sql`SET LOCAL lock_timeout='2s'`);
+    await transaction.execute(sql`SET LOCAL statement_timeout='15s'`);
+    await acquireResultEvidenceLocks(transaction, opts.targets.map((target) => target.resultId));
+    await transaction.execute(sql`SELECT id FROM results WHERE id IN (
+      ${sql.join(opts.targets.map((target) => sql`${target.resultId}::uuid`), sql`,`)}) ORDER BY id FOR UPDATE`);
+    const rows = await transaction.execute(sql`
+      WITH wanted AS (SELECT * FROM jsonb_to_recordset(${JSON.stringify(opts.targets)}::jsonb)
+        AS target("resultId" uuid,"resultAttemptId" uuid,"repairId" uuid,"revisionId" uuid,"archiveId" uuid,"evidenceSignature" text))
+      SELECT repair.id,repair.result_id,revision.snapshot,result.chord,result.speed
+      FROM wanted JOIN result_media_repairs repair ON repair.id=wanted."repairId" AND repair.result_id=wanted."resultId"
+        AND repair.result_attempt_id=wanted."resultAttemptId" AND repair.evidence_signature=wanted."evidenceSignature"
+      JOIN results result ON result.id=repair.result_id AND result.simulation_preset_revision_id=wanted."revisionId"
+      JOIN result_attempts attempt ON attempt.id=repair.result_attempt_id AND attempt.result_id=result.id
+        AND attempt.airfoil_id=result.airfoil_id AND attempt.simulation_preset_revision_id=result.simulation_preset_revision_id
+      JOIN simulation_preset_revisions revision ON revision.id=result.simulation_preset_revision_id
+      JOIN result_classifications classification ON classification.result_attempt_id=attempt.id
+        AND classification.airfoil_id=attempt.airfoil_id AND classification.simulation_preset_revision_id=attempt.simulation_preset_revision_id
+        AND classification.aoa_deg IS NOT DISTINCT FROM attempt.aoa_deg
+      JOIN solver_evidence_archives archive ON archive.id=wanted."archiveId" AND archive.result_id=result.id
+        AND archive.result_attempt_id=attempt.id AND archive.state='current'
+      JOIN solver_evidence_blobs blob ON blob.id=archive.blob_id AND blob.backend='gcs' AND blob.compression='zstd'
+        AND blob.mime_type='application/zstd' AND blob."verifiedAt" IS NOT NULL
+      LEFT JOIN sim_jobs job ON job.id=attempt.sim_job_id
+      WHERE repair.state='blocked' AND repair.attempt_count=repair.max_attempts
+        AND repair.claim_token IS NULL AND repair.claim_expires_at IS NULL
+        AND repair.last_error IN ('media-repair result '||result.id::text||' has no valid reference chord',
+          'media-repair result '||result.id::text||' has no valid flow speed')
+        AND (result.status IN ('done','failed') OR (result.status='pending'
+          AND result.current_result_attempt_id IS NULL AND job.id IS NOT NULL))
+        AND (result.sim_job_id IS NULL OR result.sim_job_id=attempt.sim_job_id)
+        AND (result.current_result_attempt_id IS NULL OR result.current_result_attempt_id=attempt.id)
+        AND attempt.status='done' AND attempt.source='solved' AND attempt.unsteady AND attempt.valid_for_polar AND attempt.converged
+        AND classification.state='rejected' AND classification.reasons=ARRAY['missing-urans-video']::text[]
+        AND (job.id IS NULL OR (job.status IN ('done','failed','cancelled')
+          AND (job.ingest_lease_expires_at<=clock_timestamp() OR (job.ingest_lease_token IS NULL AND job.ingest_lease_expires_at IS NULL))))
+        AND ${exactValidSolverManifestSql(sql`result.id`, sql`attempt.id`)}
+        AND EXISTS (SELECT 1 FROM solver_evidence_artifacts manifest
+          JOIN solver_evidence_artifact_members member ON member.artifact_id=manifest.id AND member.archive_id=archive.id AND member.member_path='evidence_manifest.json'
+          WHERE manifest.result_id=result.id AND manifest.result_attempt_id=attempt.id AND manifest.kind='manifest'
+            AND repair.evidence_signature=concat_ws(':',attempt.engine_job_id,attempt.engine_case_slug,manifest.sha256))
+        AND NOT EXISTS (SELECT 1 FROM solver_evidence_orphan_quarantines quarantine
+          WHERE quarantine.engine_job_id=attempt.engine_job_id AND quarantine.engine_case_slug=attempt.engine_case_slug)
+        AND NOT EXISTS (SELECT 1 FROM solver_evidence_incomplete_quarantines quarantine
+          WHERE quarantine.engine_job_id=attempt.engine_job_id AND quarantine.engine_case_slug=attempt.engine_case_slug)
+        AND NOT EXISTS (SELECT 1 FROM sync_remote_result_deliveries delivered
+          WHERE delivered.result_id=result.id AND delivered.result_attempt_id=attempt.id AND delivered.state IN ('delivered','superseded'))
+        AND NOT EXISTS (SELECT 1 FROM result_media_repairs active JOIN results owner ON owner.id=active.result_id
+          WHERE active.state='running' AND owner.airfoil_id=result.airfoil_id AND owner.simulation_preset_revision_id=result.simulation_preset_revision_id)
+      ORDER BY result.id FOR UPDATE OF repair
+    `);
+    if (rows.length !== opts.expectedCount)
+      throw new Error("Pinned legacy media repair scope refused; no repairs changed");
+    for (const row of rows) {
+      const snapshot = row.snapshot as Partial<SimulationSetupSnapshot> | null;
+      const chord = snapshot?.referenceGeometry?.referenceLengthM;
+      const speed = snapshot?.flowState?.speedMps;
+      if (snapshot?.referenceGeometry?.referenceLengthKind !== "chord"
+        || typeof chord !== "number" || !Number.isFinite(chord) || chord <= 0
+        || typeof speed !== "number" || !Number.isFinite(speed) || speed <= 0
+        || (row.chord != null && row.chord !== chord) || (row.speed != null && row.speed !== speed))
+        throw new Error("Pinned legacy media repair immutable physical setup refused");
+    }
+    if (opts.mode === "apply") {
+      const updated = await transaction.execute(sql`UPDATE result_media_repairs SET state='pending',attempt_count=0,
+        claim_token=NULL,claimed_at=NULL,claim_expires_at=NULL,next_attempt_at=clock_timestamp(),last_error=NULL,
+        completed_at=NULL,downstream_finalized_at=NULL,"updatedAt"=clock_timestamp()
+        WHERE id IN (${sql.join(rows.map((row) => sql`${row.id}::uuid`), sql`,`)}) AND state='blocked'
+        RETURNING id`);
+      if (updated.length !== opts.expectedCount) throw new Error("Pinned legacy media repair changed during recovery");
+    }
+    return { mode: opts.mode, eligible: rows.length, requeued: opts.mode === "apply" ? rows.length : 0,
+      resultIds: rows.map((row) => String(row.result_id)), scopeSignature: opts.expectedSignature };
+  });
 }
 
 export interface SatisfiedResultMediaRepair extends ResultMediaRepair {

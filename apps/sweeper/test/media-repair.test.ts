@@ -1,5 +1,6 @@
 import {
   acquireResultEvidenceLock,
+  analysisContentHash,
   airfoils,
   boundaryProfiles,
   boundaryConditions,
@@ -45,11 +46,14 @@ import {
   polarFitSets,
   solverProfiles,
   solverEvidenceArtifacts,
+  solverEvidenceArchives,
   solverEvidenceBlobs,
   sweepDefinitions,
   type DB,
+  type LegacyResultMediaPhysicalRecoveryTarget,
   refreshPolarCacheForRevision,
   requeueLegacyResultMediaRenderTimeouts,
+  requeueLegacyResultMediaPhysicalContext,
   satisfyPrecalcObligationFromAcceptedResult,
   withEvidenceArtifactWriteLocks,
 } from "@aerodb/db";
@@ -66,8 +70,8 @@ import {
   type RenderDefaultMediaRequest,
   type RenderDefaultMediaResponse,
 } from "@aerodb/engine-client";
-import { and, eq, inArray } from "drizzle-orm";
-import { createHash } from "node:crypto";
+import { and, eq, inArray, sql as querySql } from "drizzle-orm";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -2513,7 +2517,111 @@ describe("durable result media repair", () => {
     expect(blocked.lastError).toContain("raw evidence unavailable");
   });
 
-  it("reopens only repairs exhausted by the retired two-minute render deadline", async () => {
+  it.each(["render-timeout", "physical-context"])("reopens only repairs exhausted by superseded media failures (%s)", async (failureKind) => {
+    if (failureKind === "physical-context") {
+      const fixtures: Fixture[] = [];
+      const targets: LegacyResultMediaPhysicalRecoveryTarget[] = [];
+      for (const ordinal of [1, 2, 3]) {
+        const label = `legacy-physical-${ordinal}`;
+        const airfoilId = await createAirfoil(label);
+        const [job] = await db.insert(simJobs).values({ airfoilId, bcIds: [bcId], simulationPresetRevisionId: revisionId,
+          referenceChordM: 0.15, status: "done", engineJobId: `${PREFIX}-${label}-job` }).returning();
+        const fixture = await createSolvedResult(label, { airfoilId, simJobId: job.id, fidelity: "urans_full" });
+        const archived = await createVerifiedRestartArchiveFixture(db, { resultId: fixture.resultId, resultAttemptId: fixture.resultAttemptId });
+        evidenceBlobIds.push(archived.blobId);
+        fixtures.push(fixture);
+        await db.update(results).set({ status: "pending", source: "queued", simJobId: ordinal === 2 ? null : job.id,
+          engineJobId: null, engineCaseSlug: null, chord: null, speed: null, currentResultAttemptId: null })
+          .where(eq(results.id, fixture.resultId));
+        await discoverMissingResultMediaRepairs(db, { resultId: fixture.resultId });
+        const [repair] = await db.update(resultMediaRepairs).set({ state: "blocked", attemptCount: 3,
+          lastError: `media-repair result ${fixture.resultId} has no valid ${ordinal === 2 ? "flow speed" : "reference chord"}` })
+          .where(eq(resultMediaRepairs.resultId, fixture.resultId)).returning();
+        const [archive] = await db.select().from(solverEvidenceArchives)
+          .where(and(eq(solverEvidenceArchives.resultAttemptId, fixture.resultAttemptId), eq(solverEvidenceArchives.state, "current")));
+        targets.push({ resultId: fixture.resultId, resultAttemptId: fixture.resultAttemptId, repairId: repair.id,
+          revisionId, archiveId: archive.id, evidenceSignature: repair.evidenceSignature });
+      }
+      const scope = { targets, expectedCount: 3, expectedSignature: analysisContentHash({
+        version: 1, kind: "legacy-media-physical-context", targets, expectedCount: 3,
+      }) };
+      const repairIds = targets.map((target) => target.repairId);
+      const resultIds = targets.map((target) => target.resultId);
+      const attemptIds = targets.map((target) => target.resultAttemptId);
+      const before = await db.select().from(resultMediaRepairs).where(inArray(resultMediaRepairs.id, repairIds)).orderBy(resultMediaRepairs.id);
+      const rawBefore = await db.select().from(resultAttempts).where(inArray(resultAttempts.id, attemptIds)).orderBy(resultAttempts.id);
+      const resultsBefore = await db.select().from(results).where(inArray(results.id, resultIds)).orderBy(results.id);
+      for (const malformed of [{ ...scope, expectedSignature: "0".repeat(64) }, { ...scope, expectedCount: 2 }, { ...scope, targets: [] }])
+        await expect(requeueLegacyResultMediaPhysicalContext(db, { ...malformed, mode: "apply" })).rejects.toThrow("Invalid pinned");
+      expect(await requeueLegacyResultMediaPhysicalContext(db, { ...scope, mode: "dry-run" })).toMatchObject({ eligible: 3, requeued: 0 });
+      expect(await db.select().from(resultMediaRepairs).where(inArray(resultMediaRepairs.id, repairIds)).orderBy(resultMediaRepairs.id)).toEqual(before);
+      for (const scenario of ["invalid-snapshot", "quarantine-invalid-state", "new-owner", "competing-job", "queued-cell", "running-cell", "active-ingest", "signature-drift", "already-queued", "live-claim", "other-rejection", "superseded-archive", "new-reader-error"]) {
+        const restore = new Error(`Restore recovery refusal ${scenario}`);
+        await db.transaction(async (rawTransaction) => {
+          const transaction = rawTransaction as unknown as DB;
+          const target = targets[0];
+          if (scenario === "invalid-snapshot") {
+            await transaction.update(simulationPresetRevisions).set({ snapshot: {} }).where(eq(simulationPresetRevisions.id, revisionId));
+          } else if (scenario === "quarantine-invalid-state") {
+            await transaction.execute(querySql`CREATE TEMP TABLE solver_evidence_orphan_quarantines
+              (engine_job_id text,engine_case_slug text) ON COMMIT DROP`);
+            await transaction.execute(querySql`INSERT INTO solver_evidence_orphan_quarantines
+              VALUES (${fixtures[0].engineJobId},${fixtures[0].caseSlug})`);
+          } else if (scenario === "competing-job") {
+            const [owner] = await transaction.insert(simJobs).values({ airfoilId: fixtures[0].airfoilId, bcIds: [bcId],
+              simulationPresetRevisionId: revisionId, referenceChordM: 0.15, status: "running", engineJobId: randomUUID() }).returning();
+            await transaction.update(results).set({ simJobId: owner.id }).where(eq(results.id, target.resultId));
+          } else if (scenario === "queued-cell" || scenario === "running-cell") {
+            await transaction.update(results).set({ status: scenario === "queued-cell" ? "queued" : "running" })
+              .where(eq(results.id, target.resultId));
+          } else if (scenario === "active-ingest") {
+            const original = rawBefore.find((attempt) => attempt.id === target.resultAttemptId)!;
+            await transaction.update(simJobs).set({ ingestLeaseToken: "competing-ingestion", ingestLeaseExpiresAt: new Date(Date.now() + 60_000) })
+              .where(eq(simJobs.id, original.simJobId!));
+          } else if (scenario === "new-owner") {
+            const original = rawBefore.find((attempt) => attempt.id === target.resultAttemptId)!;
+            const [owner] = await transaction.insert(simJobs).values({ airfoilId: original.airfoilId, bcIds: [bcId],
+              simulationPresetRevisionId: revisionId, referenceChordM: 0.15, status: "done", engineJobId: randomUUID() }).returning();
+            const [replacement] = await transaction.insert(resultAttempts).values({ ...original, id: randomUUID(),
+              simJobId: owner.id, engineJobId: owner.engineJobId }).returning();
+            await transaction.update(results).set({ currentResultAttemptId: replacement.id }).where(eq(results.id, target.resultId));
+          } else if (scenario === "other-rejection") {
+            await transaction.update(resultClassifications).set({ reasons: ["missing-urans-video", "solver-error"] })
+              .where(eq(resultClassifications.resultAttemptId, target.resultAttemptId));
+          } else if (scenario === "superseded-archive") {
+            await transaction.update(solverEvidenceArchives).set({ state: "superseded", supersededAt: new Date() })
+              .where(eq(solverEvidenceArchives.id, target.archiveId));
+          } else {
+            await transaction.update(resultMediaRepairs).set(scenario === "new-reader-error" ? { lastError: `media-repair immutable setup ${revisionId} has invalid reference chord or flow speed` }
+              : scenario === "signature-drift" ? { evidenceSignature: "changed-source" }
+              : scenario === "already-queued" ? { state: "pending", attemptCount: 0 }
+                : { state: "running", claimToken: randomUUID(), claimExpiresAt: new Date(Date.now() + 60_000) })
+              .where(eq(resultMediaRepairs.id, target.repairId));
+          }
+          const unchanged = await transaction.select().from(resultMediaRepairs).where(inArray(resultMediaRepairs.id, repairIds)).orderBy(resultMediaRepairs.id);
+          await expect(requeueLegacyResultMediaPhysicalContext(transaction, { ...scope, mode: "apply" })).rejects.toThrow("Pinned legacy media repair");
+          expect(await transaction.select().from(resultMediaRepairs).where(inArray(resultMediaRepairs.id, repairIds)).orderBy(resultMediaRepairs.id)).toEqual(unchanged);
+          throw restore;
+        }).catch((error) => { if (error !== restore) throw error; });
+      }
+      expect(await requeueLegacyResultMediaPhysicalContext(db, { ...scope, mode: "apply" })).toMatchObject({ eligible: 3, requeued: 3 });
+      expect(await db.select().from(resultAttempts).where(inArray(resultAttempts.id, attemptIds)).orderBy(resultAttempts.id)).toEqual(rawBefore);
+      expect(await db.select().from(results).where(inArray(results.id, resultIds)).orderBy(results.id)).toEqual(resultsBefore);
+      expect((await db.select().from(resultMediaRepairs).where(inArray(resultMediaRepairs.id, repairIds))).every(repair =>
+        repair.state === "pending" && repair.attemptCount === 0 && repair.maxAttempts === 3 && repair.lastError === null)).toBe(true);
+      await expect(requeueLegacyResultMediaPhysicalContext(db, { ...scope, mode: "apply" })).rejects.toThrow("Pinned legacy media repair");
+      for (const fixture of fixtures) {
+        expect(await resultMediaRepairTick(db, engineWith(), { resultId: fixture.resultId })).toMatchObject({ finalized: 1 });
+        const [published] = await db.select().from(results).where(eq(results.id, fixture.resultId));
+        expect(published).toMatchObject({ status: "pending", chord: null, speed: null, currentResultAttemptId: null });
+        const [classification] = await db.select().from(resultClassifications)
+          .where(eq(resultClassifications.resultAttemptId, fixture.resultAttemptId));
+        expect(classification.state).toBe("accepted");
+        expect((await db.select().from(resultMedia).where(eq(resultMedia.resultAttemptId, fixture.resultAttemptId)))
+          .some(media => media.kind === "video")).toBe(true);
+      }
+      return;
+    }
     const timedOut = await createSolvedResult("legacy-render-timeout");
     const genuineFailure = await createSolvedResult("genuine-render-failure");
     for (const fixture of [timedOut, genuineFailure]) {
