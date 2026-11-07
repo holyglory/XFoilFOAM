@@ -132,6 +132,33 @@ export function progressiveSettlementJobsSql(jobIds?: string[]) {
         OR (job.status IN ('done', 'failed', 'cancelled') AND EXISTS (
           SELECT 1 FROM progressive_remote_dispatches dispatch JOIN sync_sweep_promises promise ON promise.id = dispatch.promise_id
           WHERE dispatch.sim_job_id = job.id AND promise.status = 'active'))
+        OR (job.status IN ('done', 'failed', 'cancelled') AND job."ingestedAt" IS NULL
+          AND promise.status IN ('expired', 'cancelled', 'fulfilled')
+          AND job.engine_job_id = job.id::text
+          AND dispatch.envelope->>'solverId' = dispatch.solver_id::text
+          AND dispatch.envelope->>'promiseId' = dispatch.promise_id::text
+          AND dispatch.envelope#>>'{scope,executionId}' = job.id::text
+          AND dispatch.envelope->'scope' = job.request_payload->'progressive'
+          AND dispatch.envelope->'request' = job.request_payload->'engineRequest'
+          AND EXISTS (SELECT 1 FROM progressive_cfd_execution_stops stopped
+            WHERE stopped.sim_job_id = job.id AND stopped.engine_job_id = job.engine_job_id
+              AND stopped.proof->>'job_id' = job.engine_job_id
+              AND stopped.proof->>'execution_stopped' = 'true'
+              AND stopped.proof->>'producer_stopped' = 'true'
+              AND stopped.proof->>'namespace_verified' = 'true'
+              AND stopped.proof->'remaining' = '[]'::jsonb)
+          AND EXISTS (SELECT 1 FROM progressive_remote_evidence_receipts evidence
+            WHERE evidence.sim_job_id = job.id AND evidence.storage_only)
+          AND EXISTS (SELECT 1 FROM progressive_remote_report_sources source WHERE source.sim_job_id = job.id)
+          AND NOT EXISTS (SELECT 1 FROM progressive_remote_report_sources source
+            WHERE source.sim_job_id = job.id
+              AND NOT EXISTS (SELECT 1 FROM progressive_remote_diagnostic_receipts diagnostic
+                WHERE diagnostic.sim_job_id = source.sim_job_id
+                  AND diagnostic.point_content_signature = source.point_content_signature)
+              AND NOT EXISTS (SELECT 1 FROM progressive_remote_evidence_receipts evidence
+                JOIN solver_evidence_archives archive ON archive.result_attempt_id = evidence.result_attempt_id AND archive.state = 'current'
+                WHERE evidence.sim_job_id = source.sim_job_id
+                  AND evidence.point_content_signature = source.point_content_signature)))
         OR (job.status IN ('done', 'failed', 'cancelled')
           AND EXISTS (SELECT 1 FROM progressive_cfd_execution_stops stopped
             WHERE stopped.sim_job_id = job.id)

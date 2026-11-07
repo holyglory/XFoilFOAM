@@ -589,6 +589,11 @@ warning remains unchanged. Missing, new or ambiguous sources use normal ingestio
 Reuse records only the new report receipt and associations under the same ingest
 lease. It never modifies solver coefficients, accepted status, artifacts or existing
 receipts, and a lost lease cannot publish the new receipt.
+Artifact replay acquires the same transaction-scoped artifact locks in batches of
+at most 64 with one database request per batch. The existing JavaScript key order
+is carried into SQL as explicit ordinals; artifact locks still precede result
+locks. Metadata, manifest-member, ownership and archive checks remain unchanged.
+This reduces repeated database requests, not the evidence required for completion.
 An older worker's late failure cannot recreate a retry after a replacement has
 already staged that report. Archive references prefer the source report already
 acknowledged by the hub, even if an earlier report is staged later.
@@ -1171,6 +1176,13 @@ paused. Progressive jobs use a separate ingestion path: cancelled final historie
 are retained after a physical-stop proof, omitted angles stay absent, and the legacy
 RANS-to-URANS handoff cannot launch replacement work from that ingestion. A terminal
 job status without a completed ingestion stamp cannot complete current-scope units.
+The terminal selector also revisits closed-promise, un-ingested executions with
+retained storage-only evidence. Their dispatch must match the original request,
+their exact execution must have stopped, all reports must be applied, and every
+reported source must have either its diagnostic receipt or physical archive.
+Normal settlement still checks retention and preserves newer owners. After the
+job receives its ingestion stamp, this recovery branch no longer selects it;
+retained failed evidence never becomes accepted CFD through queue settlement.
 Progressive workers publish through their dedicated compact-evidence and archive
 services, never the legacy accepted-result publisher. A terminal worker report
 may precede local point staging; that temporary absence is not an empty solve and

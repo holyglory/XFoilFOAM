@@ -67,9 +67,12 @@ import {
 
 const { db, sql } = createClient({ max: 2 });
 let replayQueries: Record<string, number> | null = null;
-sql.options.debug = (_connection, query) => {
+sql.options.debug = (_connection, query, parameters) => {
   if (!replayQueries) return;
   replayQueries.total = (replayQueries.total ?? 0) + 1;
+  if (query.includes("pg_advisory_xact_lock") && parameters.some((value) =>
+    typeof value === "string" && value.startsWith("evidence-artifact:")))
+    replayQueries.artifactLockCommands = (replayQueries.artifactLockCommands ?? 0) + 1;
   const operation = query.trim().split(/\s+/, 1)[0].toLowerCase();
   for (const table of ["solver_evidence_artifacts", "solver_evidence_artifact_members"])
     if (query.includes(`"${table}"`)) {
@@ -460,7 +463,12 @@ afterAll(async () => {
 });
 
 describe("GCS Zstandard evidence ingestion", () => {
-  it.each([false, true])("replays bounded artifact metadata through real ingestion with archive=%s", async (archived) => {
+  it.each([
+    { archived: false, artifactCount: 64 },
+    { archived: true, artifactCount: 64 },
+    { archived: false, artifactCount: 1024 },
+    { archived: true, artifactCount: 1024 },
+  ])("replays bounded artifact metadata through real ingestion with archive=$archived artifacts=$artifactCount", async ({ archived, artifactCount }) => {
     const owner = fixture!;
     const { revision, snapshot } = await createReplayRevision(owner);
     expect(snapshot.preset.legacyBoundaryConditionId).toBe(owner.bcId);
@@ -471,7 +479,7 @@ describe("GCS Zstandard evidence ingestion", () => {
     const points = [false, true].map((rejected): PolarPoint => {
       const alpha = rejected ? 9 : 0;
       const caseOwner = { ...owner, caseSlug: `${owner.caseSlug}-${alpha}`, evidenceBase: `${owner.evidenceBase}/${alpha}` };
-      const artifacts = Array.from({ length: 64 }, (_, index) => {
+      const artifacts = Array.from({ length: artifactCount }, (_, index) => {
         const artifact = logicalArtifact(caseOwner, index === 0 ? "mesh_evidence" : "time_directory", `raw/${index}.dat`);
         delete artifact.role;
         return { ...artifact,
@@ -539,7 +547,7 @@ describe("GCS Zstandard evidence ingestion", () => {
       return { artifacts, members, archives, histories, attempts, classifications, pointers };
     };
     const before = await exactSnapshot();
-    expect(before.artifacts).toHaveLength(archived ? 132 : 130);
+    expect(before.artifacts).toHaveLength(2 * (artifactCount + (archived ? 2 : 1)));
     expect(before.archives).toHaveLength(archived ? 2 : 0);
     expect(before.histories).toHaveLength(2);
     expect(before.attempts.find((attempt) => attempt.aoaDeg === 9)?.validForPolar).toBe(false);
@@ -562,15 +570,17 @@ describe("GCS Zstandard evidence ingestion", () => {
     const measurements = [];
     for (let repetition = 0; repetition < 3; repetition++) measurements.push(await measure(false));
     measurements.push(await measure(true));
-    console.log("artifact-metadata-replay-measurement", JSON.stringify({ version: 1, archived,
+    console.log("artifact-metadata-replay-measurement", JSON.stringify({ version: 1, archived, artifactCount,
       inputHash: analysisContentHash(report),
       fixtureShapeHash: analysisContentHash(JSON.parse(JSON.stringify(report)
         .replaceAll(owner.engineJobId, "fixture-engine").replaceAll(owner.caseSlug, "fixture-case")
         .replaceAll(owner.evidenceBase, "fixture-evidence").replaceAll(PREFIX, "fixture-prefix"))),
       fixtureSourceHash: createHash("sha256").update(await readFile(new URL(import.meta.url))).digest("hex"),
       helperSourceHash: createHash("sha256").update(await readFile(new URL("../src/ingest.ts", import.meta.url))).digest("hex"),
+      lockHelperSourceHash: createHash("sha256").update(await readFile(new URL("../../../packages/db/src/result-evidence-lock.ts", import.meta.url))).digest("hex"),
       hashes: Object.fromEntries(Object.entries(before).map(([name, rows]) => [name, analysisContentHash(JSON.parse(JSON.stringify(rows)))])),
       measurements }));
+    if (artifactCount > 64) return;
     const bulk = before.artifacts.find((artifact) => artifact.kind === "time_directory")!;
     const nullable = before.artifacts.find((artifact) => artifact.kind === "time_directory" && artifact.field === null && artifact.role === null)!;
     expect(nullable).toBeDefined();

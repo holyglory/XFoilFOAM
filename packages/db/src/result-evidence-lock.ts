@@ -55,6 +55,37 @@ export async function acquireEvidenceArtifactKeyLock(
   );
 }
 
+export async function acquireEvidenceArtifactKeyLocks(
+  db: DB,
+  keys: ReadonlyArray<{ storageKey: string; sha256: string }>,
+): Promise<void> {
+  const ordered = [
+    ...new Map(
+      keys.map((key) => [`${key.storageKey}\0${key.sha256}`, key]),
+    ).values(),
+  ].sort((left, right) =>
+    `${left.storageKey}\0${left.sha256}`.localeCompare(
+      `${right.storageKey}\0${right.sha256}`,
+    ),
+  );
+  for (let offset = 0; offset < ordered.length; offset += 64) {
+    const batch = ordered.slice(offset, offset + 64);
+    await db.execute(sql`
+      SELECT pg_advisory_xact_lock(hashtextextended(requested.lock_identity, 0))
+      FROM (VALUES ${sql.join(
+        batch.map(
+          (key, ordinal) => sql`(
+        ${offset + ordinal}::integer,
+        ${`evidence-artifact:${key.storageKey.length}:${key.storageKey}:${key.sha256.toLowerCase()}`}::text
+      )`,
+        ),
+        sql`, `,
+      )}) AS requested(ordinal, lock_identity)
+      ORDER BY requested.ordinal
+    `);
+  }
+}
+
 /** Acquire all affected result locks in one deterministic global order. */
 export async function acquireResultEvidenceLocks(
   db: DB,

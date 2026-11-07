@@ -4754,6 +4754,12 @@ requires = ["stopped-failure-storage"]
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/evidence-object-storage-ingest.test.ts"]
 
 [[test.solver-throughput-recovery.check]]
+name = "artifact-locking"
+tier = "development"
+requires = ["artifact-metadata-replay"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/solver-evidence-object-storage-migration.test.ts"]
+
+[[test.solver-throughput-recovery.check]]
 name = "database-types"
 tier = "development"
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "typecheck"]
@@ -4792,6 +4798,12 @@ name = "replay"
 tier = "development"
 requires = ["seed"]
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/evidence-object-storage-ingest.test.ts"]
+
+[[test.artifact-metadata-replay.check]]
+name = "artifact-locking"
+tier = "development"
+requires = ["replay"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/solver-evidence-object-storage-migration.test.ts"]
 
 [[test.artifact-metadata-replay.check]]
 name = "types"

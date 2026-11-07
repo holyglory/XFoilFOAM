@@ -1,4 +1,5 @@
 import { drizzle } from "drizzle-orm/postgres-js";
+import { sql as drizzleSql } from "drizzle-orm";
 import { migrate } from "drizzle-orm/postgres-js/migrator";
 import {
   cpSync,
@@ -12,9 +13,15 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import postgres from "postgres";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 
 import { databaseUrl } from "../src/env";
+import type { DB } from "../src/client";
+import {
+  acquireEvidenceArtifactKeyLock,
+  acquireEvidenceArtifactKeyLocks,
+  acquireResultEvidenceLocks,
+} from "../src/result-evidence-lock";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const migrations = resolve(here, "../migrations");
@@ -192,6 +199,247 @@ afterAll(async () => {
   }
   if (through66) rmSync(through66, { recursive: true, force: true });
   if (through67) rmSync(through67, { recursive: true, force: true });
+});
+
+describe("artifact advisory lock transactions", () => {
+  it("acquires reversed contenders in the same backend order before result locks and releases on rollback", async () => {
+    if (!client) throw new Error("migration test database is unavailable");
+    const inspector = client;
+    const blockerClient = postgres(targetUrl.toString(), { max: 1 });
+    const batchClient = postgres(targetUrl.toString(), { max: 1 });
+    const contenderClient = postgres(targetUrl.toString(), { max: 1 });
+    const first = { storageKey: `${dbName}/ä`, sha256: "a".repeat(64) };
+    const last = { storageKey: `${dbName}/Z:🚀`, sha256: "BC".repeat(32) };
+    expect(
+      `${first.storageKey}\0${first.sha256}`.localeCompare(
+        `${last.storageKey}\0${last.sha256}`,
+      ),
+    ).toBeLessThan(0);
+    const identity = (key: typeof first) =>
+      `evidence-artifact:${key.storageKey.length}:${key.storageKey}:${key.sha256.toLowerCase()}`;
+    const locks = async (backendPid: number) => inspector`
+      WITH expected(name, key) AS (VALUES
+        ('first', hashtextextended(${identity(first)}, 0)),
+        ('last', hashtextextended(${identity(last)}, 0)),
+        ('result', hashtextextended(${`result-evidence:${IDS.resultA}`}, 0))
+      )
+      SELECT expected.name, observed.granted
+      FROM expected JOIN pg_locks observed ON observed.locktype = 'advisory'
+        AND observed.objsubid = 1 AND observed.pid = ${backendPid}
+        AND observed.classid::bigint = ((expected.key >> 32) & 4294967295)
+        AND observed.objid::bigint = (expected.key & 4294967295)
+      ORDER BY expected.name
+    `;
+    let releaseBlocker!: () => void;
+    let signalBlocker!: () => void;
+    let releaseBatch!: () => void;
+    let signalBatch!: (backendPid: number) => void;
+    let signalContender!: (backendPid: number) => void;
+    let signalAcquired!: () => void;
+    const holdBlocker = new Promise<void>((resolve) => {
+      releaseBlocker = resolve;
+    });
+    const blockerReady = new Promise<void>((resolve) => {
+      signalBlocker = resolve;
+    });
+    const holdBatch = new Promise<void>((resolve) => {
+      releaseBatch = resolve;
+    });
+    const batchReady = new Promise<number>((resolve) => {
+      signalBatch = resolve;
+    });
+    const contenderReady = new Promise<number>((resolve) => {
+      signalContender = resolve;
+    });
+    const batchAcquired = new Promise<void>((resolve) => {
+      signalAcquired = resolve;
+    });
+    const rollback = new Error("Rollback ordered artifact locks");
+    let blocker: Promise<unknown> | undefined;
+    let batch: Promise<unknown> | undefined;
+    let contender: Promise<unknown> | undefined;
+    try {
+      blocker = drizzle(blockerClient)
+        .transaction(async (transaction) => {
+          await acquireEvidenceArtifactKeyLock(
+            transaction as unknown as DB,
+            last.storageKey,
+            last.sha256.toLowerCase(),
+          );
+          signalBlocker();
+          await holdBlocker;
+        })
+        .catch((error: unknown) => error);
+      const blockerOutcome = await Promise.race([blockerReady, blocker]);
+      if (blockerOutcome instanceof Error) throw blockerOutcome;
+      batch = drizzle(batchClient)
+        .transaction(async (transaction) => {
+          await transaction.execute(drizzleSql`SET LOCAL lock_timeout = '10s'`);
+          const [backend] = await transaction.execute(
+            drizzleSql`SELECT pg_backend_pid() AS pid`,
+          );
+          signalBatch(Number(backend.pid));
+          const connection = transaction as unknown as DB;
+          await acquireEvidenceArtifactKeyLocks(connection, [last, first]);
+          await acquireResultEvidenceLocks(connection, [IDS.resultA]);
+          signalAcquired();
+          await holdBatch;
+          throw rollback;
+        })
+        .catch((error: unknown) => error);
+      const batchPid = await Promise.race([batchReady, batch]);
+      if (typeof batchPid !== "number") throw batchPid;
+      await vi.waitFor(
+        async () => {
+          expect(await locks(batchPid)).toEqual([
+            { name: "first", granted: true },
+            { name: "last", granted: false },
+          ]);
+        },
+        { timeout: 3000, interval: 20 },
+      );
+      contender = drizzle(contenderClient)
+        .transaction(async (transaction) => {
+          await transaction.execute(drizzleSql`SET LOCAL lock_timeout = '10s'`);
+          const [backend] = await transaction.execute(
+            drizzleSql`SELECT pg_backend_pid() AS pid`,
+          );
+          signalContender(Number(backend.pid));
+          const connection = transaction as unknown as DB;
+          await acquireEvidenceArtifactKeyLocks(connection, [first, last]);
+          await acquireResultEvidenceLocks(connection, [IDS.resultA]);
+          expect(await locks(Number(backend.pid))).toEqual([
+            { name: "first", granted: true },
+            { name: "last", granted: true },
+            { name: "result", granted: true },
+          ]);
+        })
+        .catch((error: unknown) => error);
+      const contenderPid = await Promise.race([contenderReady, contender]);
+      if (typeof contenderPid !== "number") throw contenderPid;
+      await vi.waitFor(
+        async () => {
+          expect(await locks(contenderPid)).toEqual([
+            { name: "first", granted: false },
+          ]);
+        },
+        { timeout: 3000, interval: 20 },
+      );
+      releaseBlocker();
+      expect(await blocker).toBeUndefined();
+      const acquiredOutcome = await Promise.race([batchAcquired, batch]);
+      if (acquiredOutcome instanceof Error) throw acquiredOutcome;
+      expect(await locks(batchPid)).toEqual([
+        { name: "first", granted: true },
+        { name: "last", granted: true },
+        { name: "result", granted: true },
+      ]);
+      expect(await locks(contenderPid)).toEqual([
+        { name: "first", granted: false },
+      ]);
+      releaseBatch();
+      expect(await batch).toBe(rollback);
+      expect(await contender).toBeUndefined();
+      expect(await locks(batchPid)).toEqual([]);
+      expect(await locks(contenderPid)).toEqual([]);
+    } finally {
+      releaseBlocker();
+      releaseBatch();
+      await Promise.allSettled([blocker, batch, contender]);
+      await Promise.all([
+        blockerClient.end(),
+        batchClient.end(),
+        contenderClient.end(),
+      ]);
+    }
+  }, 15_000);
+
+  it("preserves length-prefixed identities, case collisions, deduplication and empty bounded batches", async () => {
+    if (!client) throw new Error("migration test database is unavailable");
+    const inspector = client;
+    const holderClient = postgres(targetUrl.toString(), { max: 1 });
+    const keys = [
+      { storageKey: `${dbName}:left:right`, sha256: "tail" },
+      { storageKey: `${dbName}:left`, sha256: "right:tail" },
+      { storageKey: `${dbName}/🛩`, sha256: "AB".repeat(32) },
+      ...Array.from({ length: 62 }, (_, index) => ({
+        storageKey: `${dbName}/batch/${String(index).padStart(2, "0")}`,
+        sha256: "c".repeat(64),
+      })),
+    ];
+    const identities = keys.map(
+      (key) =>
+        `evidence-artifact:${key.storageKey.length}:${key.storageKey}:${key.sha256.toLowerCase()}`,
+    );
+    expect(`${keys[0].storageKey}:${keys[0].sha256}`).toBe(
+      `${keys[1].storageKey}:${keys[1].sha256}`,
+    );
+    expect(identities[0]).not.toBe(identities[1]);
+    const batches: number[] = [];
+    holderClient.options.debug = (_connection, query, parameters) => {
+      if (query.includes("pg_advisory_xact_lock"))
+        batches.push(
+          parameters.filter(
+            (value) =>
+              typeof value === "string" &&
+              value.startsWith("evidence-artifact:"),
+          ).length,
+        );
+    };
+    let release!: () => void;
+    let signalHeld!: (backendPid: number) => void;
+    const hold = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const held = new Promise<number>((resolve) => {
+      signalHeld = resolve;
+    });
+    let holder: Promise<unknown> | undefined;
+    try {
+      holder = drizzle(holderClient)
+        .transaction(async (transaction) => {
+          const connection = transaction as unknown as DB;
+          await acquireEvidenceArtifactKeyLocks(connection, []);
+          expect(batches).toEqual([]);
+          await acquireEvidenceArtifactKeyLocks(connection, [
+            ...[...keys].reverse(),
+            keys[0],
+            { ...keys[2], sha256: keys[2].sha256.toLowerCase() },
+          ]);
+          expect(batches).toEqual([64, 2]);
+          const [backend] = await transaction.execute(
+            drizzleSql`SELECT pg_backend_pid() AS pid`,
+          );
+          signalHeld(Number(backend.pid));
+          await hold;
+        })
+        .catch((error: unknown) => error);
+      const backendPid = await Promise.race([held, holder]);
+      if (typeof backendPid !== "number") throw backendPid;
+      const [count] =
+        await inspector`SELECT count(*)::integer AS count FROM pg_locks
+        WHERE pid=${backendPid} AND locktype='advisory' AND objsubid=1 AND granted`;
+      expect(count.count).toBe(65);
+      await inspector.begin(async (transaction) => {
+        const [probe] =
+          await transaction`SELECT bool_and(NOT pg_try_advisory_xact_lock(hashtextextended(identity.value, 0))) AS blocked
+          FROM jsonb_array_elements_text(${JSON.stringify(identities)}::jsonb) identity(value)`;
+        expect(probe.blocked).toBe(true);
+      });
+      release();
+      expect(await holder).toBeUndefined();
+      await inspector.begin(async (transaction) => {
+        const [probe] =
+          await transaction`SELECT bool_and(pg_try_advisory_xact_lock(hashtextextended(identity.value, 0))) AS released
+          FROM jsonb_array_elements_text(${JSON.stringify(identities)}::jsonb) identity(value)`;
+        expect(probe.released).toBe(true);
+      });
+    } finally {
+      release();
+      await Promise.allSettled([holder]);
+      await holderClient.end();
+    }
+  }, 15_000);
 });
 
 describe("0067 solver evidence object storage migration", () => {

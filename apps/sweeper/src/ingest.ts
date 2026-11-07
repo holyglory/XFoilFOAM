@@ -1,5 +1,5 @@
 import {
-  acquireEvidenceArtifactKeyLock,
+  acquireEvidenceArtifactKeyLocks,
   acquireResultEvidenceLock,
   acquireResultEvidenceLocks,
   assertProgressiveCfdEvidenceJob,
@@ -2301,12 +2301,7 @@ async function registerEvidenceArtifactsBatch(
           `${right.storageKey}\0${right.sha256}`,
         ),
       );
-      for (const key of lockKeys)
-        await acquireEvidenceArtifactKeyLock(
-          transaction,
-          key.storageKey,
-          key.sha256,
-        );
+      await acquireEvidenceArtifactKeyLocks(transaction, lockKeys);
       if (lockKeys.length) {
         const existing = await transaction
           .select({ resultId: solverEvidenceArtifacts.resultId })
