@@ -36,8 +36,9 @@ export async function progressiveStoppedStorageEligible(
       JOIN progressive_worker_reports report ON report.sim_job_id=source.sim_job_id AND report.sequence=source.sequence
         AND report.acknowledged_at IS NOT NULL
       JOIN result_attempts attempt ON attempt.id=source.result_attempt_id AND attempt.sim_job_id=job.id
-        AND attempt.engine_job_id=job.id::text AND attempt.status='failed' AND NOT attempt.valid_for_polar
+        AND attempt.engine_job_id=job.id::text AND NOT attempt.valid_for_polar
         AND NOT attempt.converged
+      JOIN results result ON result.id=attempt.result_id AND result.status='failed'
       WHERE job.id=${executionId}::uuid AND job.engine_job_id=job.id::text
         AND job.status IN('done','failed','cancelled') AND job.request_payload->>'remoteSolver'='true'
         AND job.request_payload ? 'remoteProgressiveExecution'
