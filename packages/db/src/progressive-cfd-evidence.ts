@@ -210,7 +210,7 @@ async function lockJobScope(
     sql`SELECT count(*)::integer AS count FROM progressive_cfd_attempts WHERE sim_job_id = ${simJobId}`,
   );
   if (selectedAoas && [...selectedAoas].some((alpha) => !units.some((unit) => unit.aoa_deg === alpha)))
-    throw new Error("Progressive CFD delivery changed its exact physical scope");
+    throw new ProgressiveCfdEvidenceScopeClosed("Progressive CFD delivery changed its exact physical scope");
   const diagnosticCandidates = policy === "strict" && (selectedAoas || options.terminalDiagnostics) ? units.filter((unit) =>
     (options.terminalDiagnostics || !selectedAoas?.has(unit.aoa_deg)) && unit.latest_attempt && unit.outcome === "failed" &&
     ["gap", "pending"].includes(unit.state) && unit.lease_token == null && unit.lease_until == null,

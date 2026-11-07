@@ -1679,6 +1679,7 @@ async function cfdEvidenceFixture(
   prepared?: { campaignId: string; leases: ProgressiveCfdLease[] },
   physical: { mediumId?: string; chordM?: number } = {},
   maximumUnits?: number,
+  deferSubmission = false,
 ) {
   const campaignId = prepared?.campaignId ?? await campaign("active", [speed, ...extraSpeeds], angles, physical);
   let retriedUnitId: string | undefined;
@@ -1823,10 +1824,11 @@ async function cfdEvidenceFixture(
       .where(eq(sweeperState.id, 1));
   }
   const engineJobId = composed.request.execution_id!;
-  await db
-    .update(simJobs)
-    .set({ engineJobId, status: "running" })
-    .where(eq(simJobs.id, composed.jobId));
+  if (!deferSubmission)
+    await db
+      .update(simJobs)
+      .set({ engineJobId, status: "running" })
+      .where(eq(simJobs.id, composed.jobId));
   const cells = await db
     .select()
     .from(results)
@@ -3314,9 +3316,13 @@ describe("progressive durable stage transitions", () => {
             const solverId = randomUUID();
             const promiseId = randomUUID();
             const [job] = await connection.select().from(simJobs).where(eq(simJobs.id, fixture.composed.jobId));
+            const payload = job.requestPayload as {
+              engineRequest: typeof fixture.composed.request;
+              progressive: unknown;
+            };
             const envelope = sealProgressiveRemoteExecution({
-              solverId, promiseId, request: fixture.composed.request,
-              scope: (job.requestPayload as { progressive: unknown }).progressive,
+              solverId, promiseId, request: payload.engineRequest,
+              scope: payload.progressive,
             });
             await connection.execute(sql`INSERT INTO registered_remote_solvers
               (id, instance_id, instance_name, cpu_capacity, cpu_budget, max_active_polar_promises)
@@ -5233,42 +5239,28 @@ describe("progressive CPU admission", () => {
     }, [32.1799]);
   }, 120_000);
 
-  it("retains exact stopped failed attempts without canonical publication", async () => {
+  it.each([false, true])("retains exact stopped failed attempts without canonical publication (prior raw: %s)", async (priorRaw) => {
     const verify = async (priorRaw: boolean) => {
-      let leases = await claimProgressiveCfdBatch(db, {
+      const prepared = priorRaw ? await cfdEvidenceFixture(
+        32.1803, 3, [], [-4, -3, -2, -1, 0, 1, 2], false, undefined, {}, 7, true,
+      ) : null;
+      const leases = prepared?.leases ?? await claimProgressiveCfdBatch(db, {
         owner: "stopped-failed-storage-fixture", leaseSeconds: 120,
-        maximumUnits: priorRaw ? 1 : 2, solverBudgetVersion: 2,
+        maximumUnits: priorRaw ? 7 : 2, solverBudgetVersion: 2, localTimeStepVersion: 1,
       });
-      if (priorRaw) {
-        const first = leases[0];
-        await db.execute(sql`INSERT INTO progressive_cfd_units
-          (work_id,aoa_deg,ordinal,purpose,recipe,reason,policy_version,active_budget_seconds)
-          SELECT source.work_id,angle.alpha,maximum.ordinal+row_number() OVER(ORDER BY angle.alpha),'adaptive',
-            source.recipe,'Isolated original seven-case execution',source.policy_version,source.active_budget_seconds
-          FROM progressive_cfd_units source JOIN progressive_work work ON work.id=source.work_id
-          JOIN progressive_generation_targets scope ON scope.generation_id=work.generation_id AND scope.target_id=work.target_id
-          CROSS JOIN LATERAL(SELECT max(ordinal) AS ordinal FROM progressive_cfd_units sibling WHERE sibling.work_id=source.work_id) maximum
-          CROSS JOIN LATERAL(SELECT alpha FROM unnest(scope.angles) alpha
-            WHERE NOT EXISTS(SELECT 1 FROM progressive_cfd_units sibling WHERE sibling.work_id=source.work_id AND sibling.aoa_deg=alpha)
-            ORDER BY alpha LIMIT 5) angle
-          WHERE source.id=${first.id}::uuid`);
-        leases = [...leases, ...await claimProgressiveCfdBatch(db, {
-          owner: "stopped-failed-storage-fixture", leaseSeconds: 120, maximumUnits: 6, solverBudgetVersion: 2,
-          sameTarget: { generationId: first.generationId, targetId: first.targetId, recipe: first.recipe,
-            remainingActiveSeconds: first.remainingActiveSeconds, recoveryParentJobId: first.recoveryParentJobId },
-        })].sort((left, right) => left.alpha - right.alpha);
-        expect(leases).toHaveLength(7);
-      }
-      const composed = await composeProgressiveCfdJob(db, leases, {
+      expect(leases).toHaveLength(priorRaw ? 7 : 2);
+      const composed = prepared?.composed ?? await composeProgressiveCfdJob(db, leases, {
         cpuSlots: 1, meshRecoveryVersion: 3, solverBudgetVersion: 2,
       });
       const [job] = await db.select().from(simJobs).where(eq(simJobs.id, composed.jobId));
+      const [admission] = await db.select({ enabled: sweeperState.enabled }).from(sweeperState).where(eq(sweeperState.id, 1));
       const solverId = randomUUID();
       const promiseId = randomUUID();
       try {
         await db.execute(sql`INSERT INTO registered_remote_solvers
           (id,instance_id,instance_name,cpu_capacity,cpu_budget,max_active_polar_promises)
           VALUES (${solverId}::uuid,${randomUUID()},'isolated stopped failed worker',96,96,96)`);
+        await db.update(sweeperState).set({ enabled: true }).where(eq(sweeperState.id, 1));
         await db.execute(sql`INSERT INTO sync_sweep_promises
           (id,registered_solver_id,airfoil_id,simulation_preset_revision_id,aoa_count,"expiresAt")
           VALUES (${promiseId}::uuid,${solverId}::uuid,${job.airfoilId}::uuid,
@@ -5281,13 +5273,14 @@ describe("progressive CPU admission", () => {
         const { verifyStoppedFailedProgressiveDelivery, verifyPriorRawStoppedProgressiveSettlement } = await import("./progressive-stopped-failed-delivery-fixture");
         await (priorRaw ? verifyPriorRawStoppedProgressiveSettlement : verifyStoppedFailedProgressiveDelivery)(db, envelope);
       } finally {
+        await db.update(sweeperState).set({ enabled: admission.enabled }).where(eq(sweeperState.id, 1));
         await db.execute(sql`DELETE FROM progressive_remote_dispatches WHERE sim_job_id=${job.id}::uuid`);
         await db.execute(sql`DELETE FROM sync_sweep_promises WHERE id=${promiseId}::uuid`);
         await db.execute(sql`DELETE FROM registered_remote_solvers WHERE id=${solverId}::uuid`);
       }
     };
-    await ready(() => verify(false), [32.1801]);
-    await ready(() => verify(true), [32.1803]);
+    if (priorRaw) await verify(true);
+    else await ready(() => verify(false), [32.1801]);
   }, 240_000);
 
   it("recovers terminal remote material failure ingestion without publishing CFD", async () => {

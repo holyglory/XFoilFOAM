@@ -460,6 +460,9 @@ point signature; material-domain acknowledgements retain their version-1 identit
 while infrastructure and hard-solver diagnostics carry a version-2 failure kind.
 An already-issued raw-attempt receipt remains the original receipt on replay.
 Unattempted angles receive neither diagnostic acknowledgements nor solver rows.
+Existing parked nonmaterial scope conflicts still require the exact-source,
+manifest-pinned replay operation; recognizing a diagnostic is not permission to
+clear arbitrary conflicts or retry physical evidence automatically.
 An explicit import-conflict response is not a successful retained-attempt receipt
 or a transient transport failure. The compact worker records valid remote conflict
 IDs and the original HTTP status, including HTTP 200 conflict responses, then stops

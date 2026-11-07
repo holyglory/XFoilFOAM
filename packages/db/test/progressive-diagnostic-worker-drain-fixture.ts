@@ -12,6 +12,7 @@ import { solverCpuReservationSql } from "../src/solver-reservations";
 import { deliverNextProgressiveWorkerEvidence, recordProgressiveWorkerEvidenceReceipt } from "../../../apps/sweeper/src/progressive-worker-evidence-delivery";
 import { nextProgressiveEvidenceWakeAt } from "../../../apps/sweeper/src/progressive-evidence-service";
 import { progressiveArchiveSelectionSql } from "../../../apps/sweeper/src/progressive-worker-archive-delivery";
+import { replayProgressiveWorkerOutbox } from "../../../apps/sweeper/src/progressive-worker-outbox-replay";
 import { withProgressiveSyncApi } from "../../../apps/api/test/progressive-polar-import-fixture";
 
 export async function verifyDiagnosticWorkerDrain(
@@ -21,7 +22,9 @@ export async function verifyDiagnosticWorkerDrain(
 ) {
   const executionId = envelope.scope.executionId;
   const baseUrl = "https://isolated-diagnostic-hub.invalid/api/sync/v1";
+  const [solver] = await db.execute(sql`SELECT instance_id FROM registered_remote_solvers WHERE id=${envelope.solverId}::uuid`);
   await db.execute(sql`UPDATE sync_api_settings SET remote_solver_registered_id=${envelope.solverId}::uuid,
+    instance_id=${solver.instance_id}::uuid,remote_solver_enabled=true,
     remote_solver_auth_token='isolated-diagnostic-credential',upstream_base_url=${baseUrl},
     remote_solver_transfer_paused=false,enabled=true WHERE id=1`);
   await db.execute(sql`UPDATE sync_api_permissions SET can_push=true WHERE data_type='polars'`);
@@ -59,6 +62,9 @@ export async function verifyDiagnosticWorkerDrain(
     const projection = progressiveRemotePointProjection({ ...source,envelope,report });
     const [cell] = await db.execute(sql`SELECT id FROM results WHERE airfoil_id=${job.airfoil_id}::uuid
       AND simulation_preset_revision_id=${job.simulation_preset_revision_id}::uuid AND aoa_deg=${source.point.aoa_deg}`);
+    expect(await db.execute(sql`UPDATE results SET reynolds=${Math.round(projection.reynolds)},
+      speed=${projection.speed},chord=${projection.chord},mach=${projection.mach}
+      WHERE id=${cell.id}::uuid AND current_result_attempt_id IS NULL RETURNING id`)).toHaveLength(1);
     const [attempt] = await db.insert(resultAttempts).values({
       resultId: String(cell.id),airfoilId: String(job.airfoil_id),bcId: (job.bc_ids as string[])[0],
       simulationPresetRevisionId: String(job.simulation_preset_revision_id),simJobId: executionId,
@@ -80,6 +86,31 @@ export async function verifyDiagnosticWorkerDrain(
       progressiveEvidence: { sequence: queued.sequence,reportContentSignature: queued.contentSignature,
         pointContentSignature: source.contentSignature },
     } });
+  }
+  const explicitReplays = references.filter((reference) => reference.source.point.failure_disposition !== "material_domain");
+  if (explicitReplays.length) {
+    expect(await nextProgressiveEvidenceWakeAt(db, "delivery")).toBeNull();
+    const previousRole = process.env.AIRFOILFOAM_DEPLOYMENT_ROLE;
+    try {
+      process.env.AIRFOILFOAM_DEPLOYMENT_ROLE = "remote-solver";
+      const selection = {
+        executionId,
+        expectedCount: explicitReplays.length,
+        points: explicitReplays.map((reference) => ({
+          pointContentSignature: reference.source.contentSignature,
+          resultAttemptId: reference.attempt.id,
+          sequence: queued.sequence,
+        })),
+      };
+      const preview = await replayProgressiveWorkerOutbox(db, selection);
+      expect(preview.requeuedCount).toBe(0);
+      expect(await replayProgressiveWorkerOutbox(db, {
+        ...selection, manifestSignature: preview.manifestSignature,
+      }, { apply: true })).toMatchObject({ requeuedCount: explicitReplays.length });
+    } finally {
+      if (previousRole === undefined) delete process.env.AIRFOILFOAM_DEPLOYMENT_ROLE;
+      else process.env.AIRFOILFOAM_DEPLOYMENT_ROLE = previousRole;
+    }
   }
   const first = references[0];
   const issued = await recordProgressiveRemoteDiagnosticReceipt(db, first.delivery);

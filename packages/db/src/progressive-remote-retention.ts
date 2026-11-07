@@ -2,7 +2,7 @@ import { sql } from "drizzle-orm";
 import type { DB } from "./client";
 import { analysisContentHash, canonicalAnalysisJson } from "./analysis-target";
 import { readProgressiveEvidenceCustodyReceipt } from "./progressive-evidence-custody";
-import { resolveProgressiveRemoteEvidence } from "./progressive-remote-evidence";
+import { resolveProgressiveRemoteEvidence, ProgressiveRemoteEvidenceConflict } from "./progressive-remote-evidence";
 import type { ProgressiveRemoteEvidenceDelivery } from "./progressive-remote-evidence-receipts";
 import {
   isFinalProgressiveRemoteReport,
@@ -66,7 +66,7 @@ export async function readProgressiveRemoteSourceClassifications(
   const payload = stored.request_payload as Record<string, unknown>;
   if (canonicalAnalysisJson(payload.engineRequest) !== canonicalAnalysisJson(envelope.request) ||
     canonicalAnalysisJson(payload.progressive) !== canonicalAnalysisJson(envelope.scope))
-    throw new Error("Remote diagnostic history differs from immutable execution ownership");
+    throw new ProgressiveRemoteEvidenceConflict("Remote diagnostic history differs from immutable execution ownership");
   const latest = validateProgressiveRemoteReport(stored.report, envelope);
   if (latest.contentSignature !== stored.content_signature)
     throw new Error("Remote diagnostic history changed its final report bytes");

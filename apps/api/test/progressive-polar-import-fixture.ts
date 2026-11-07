@@ -54,6 +54,9 @@ export async function withProgressiveSyncApi<T>(db: DB, run: (app: ReturnType<ty
   if (isolated.connection) throw new Error("Isolated API fixture is already active");
   isolated.connection = db;
   const app = Fastify({ logger: false });
+  app.setErrorHandler((error, _request, reply) => {
+    reply.code(error.statusCode ?? 500).send({ code: error.code, error: error.message });
+  });
   try {
     await app.register(multipart);
     await registerSyncRoutes(app);
