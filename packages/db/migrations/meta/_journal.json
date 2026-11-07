@@ -1352,6 +1352,13 @@
       "when": 1793995800000,
       "tag": "0192_progressive_remote_diagnostic_receipts",
       "breakpoints": true
+    },
+    {
+      "idx": 193,
+      "version": "7",
+      "when": 1794094800000,
+      "tag": "0193_restore_quarantine_schema",
+      "breakpoints": true
     }
   ]
 }

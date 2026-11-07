@@ -29,6 +29,9 @@ import {
   incompleteMemberSetSha256,
   registerIncompleteEvidenceQuarantine,
 } from "../src/evidence-incomplete-quarantine";
+import { rehearseQuarantineSchemaRepair } from "./quarantine-schema-repair-fixture";
+import { createVerifiedRestartArchiveFixture } from "@aerodb/db/test-fixtures";
+import { LEGACY_UNKNOWN_SOLVER_IMPLEMENTATION_ID } from "@aerodb/db/solver-implementations";
 
 const { db, sql } = createClient({ max: 2 });
 const PREFIX = `incomplete-evidence-${process.pid}-${Date.now().toString(36)}`;
@@ -528,10 +531,28 @@ afterAll(async () => {
 });
 
 describe("terminal incomplete evidence quarantine", () => {
-  it("registers only an immutable physical blob and preservation row", async () => {
+  it.each([false, true])("registers only an immutable physical blob and preservation row (schema restored: %s)", async (restore) => {
     await withRollback(async (testDb) => {
       process.env.AIRFOILFOAM_EVIDENCE_BUCKET = BUCKET;
       const fixture = await createFixture(testDb);
+      const [preservedAttempt] = await testDb.insert(resultAttempts).values({
+        resultId: fixture.siblingResultId, airfoilId: fixture.airfoilId, bcId: fixture.bcId,
+        aoaDeg: 13, simJobId: fixture.simJobId, engineJobId: fixture.engineJobId, engineCaseSlug: fixture.engineCaseSlug,
+        status: "failed", source: "solved", regime: "rans", validForPolar: false, converged: false,
+        solverImplementationId: LEGACY_UNKNOWN_SOLVER_IMPLEMENTATION_ID,
+        evidencePayload: { error: "preserved pre-repair rejected evidence" },
+      }).returning();
+      await testDb.insert(solverEvidenceArtifacts).values({
+        resultId: fixture.siblingResultId, resultAttemptId: preservedAttempt.id, airfoilId: fixture.airfoilId,
+        simJobId: fixture.simJobId, engineJobId: fixture.engineJobId, engineCaseSlug: fixture.engineCaseSlug, aoaDeg: 13,
+        solverImplementationId: LEGACY_UNKNOWN_SOLVER_IMPLEMENTATION_ID, kind: "manifest",
+        storageKey: `jobs/${fixture.engineJobId}/cases/${fixture.engineCaseSlug}/a13/evidence/evidence_manifest.json`,
+        mimeType: "application/json", sha256: sha256("preserved rejected evidence manifest"), byteSize: 128,
+      });
+      await createVerifiedRestartArchiveFixture(testDb, { resultId: fixture.siblingResultId, resultAttemptId: preservedAttempt.id });
+      const preservedArtifacts = await testDb.select({ id: solverEvidenceArtifacts.id }).from(solverEvidenceArtifacts)
+        .where(eq(solverEvidenceArtifacts.engineJobId, fixture.engineJobId));
+      await rehearseQuarantineSchemaRepair(testDb, restore);
       const before = await ownershipCounts(testDb);
       const ack = await registerIncompleteEvidenceQuarantine({
         db: testDb,
@@ -586,7 +607,10 @@ describe("terminal incomplete evidence quarantine", () => {
           .select({ id: solverEvidenceArtifacts.id })
           .from(solverEvidenceArtifacts)
           .where(eq(solverEvidenceArtifacts.engineJobId, fixture.engineJobId)),
-      ).toEqual([{ id: siblingArtifact.id }]);
+      ).toEqual(expect.arrayContaining([...preservedArtifacts, { id: siblingArtifact.id }]));
+      expect(await testDb.select({ id: solverEvidenceArtifacts.id }).from(solverEvidenceArtifacts)
+        .where(eq(solverEvidenceArtifacts.engineJobId, fixture.engineJobId))).toHaveLength(preservedArtifacts.length + 1);
+      expect(await testDb.select().from(resultAttempts).where(eq(resultAttempts.id, preservedAttempt.id))).toEqual([preservedAttempt]);
       expect(
         JSON.parse(
           await readFile(

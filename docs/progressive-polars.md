@@ -662,6 +662,13 @@ conflicting present display values fail before rendering. Repair never fills a
 canonical row just to bypass this check, and generated media does not turn invalid
 CFD into an accepted polar point.
 
+Migration 0193 repairs the exact recorded-history state in which both quarantine
+tables and their dedicated guards are missing. It validates an intact schema
+without replacing it and refuses unexpected partial or altered definitions.
+Restoring schema objects does not recover lost incident history or establish
+historical clearance; recovery still requires independently authenticated current
+archive bytes and the normal exact-evidence checks.
+
 Every received report now records a sealed source inventory, including an explicit
 empty inventory when nothing was calculated. Exact duplicates listed as both points
 and attempts share a source hash; different raw generations remain distinct, even

@@ -24,6 +24,7 @@ import {
   evidenceMigrationExecutionLog,
   registerEvidenceMigrationReceipt,
 } from "../src/evidence-storage-backfill";
+import { rehearseQuarantineSchemaRepair, refusePartialQuarantineSchemaRepair } from "./quarantine-schema-repair-fixture";
 
 const { db, sql } = createClient({ max: 2 });
 const PREFIX = `orphan-evidence-${process.pid}-${Date.now().toString(36)}`;
@@ -253,11 +254,13 @@ afterAll(async () => {
 });
 
 describe("exact un-ingested solver evidence quarantine", () => {
-  it("preserves the sole exact job/path without inventing a result or AoA", async () => {
+  it.each([false, true])("preserves the sole exact job/path without inventing a result or AoA (schema restored: %s)", async (restore) => {
     await withRollback(async (db) => {
       const fixture = await createFixture(db, {
         unrelatedSameAoaResult: true,
       });
+      if (!restore) await refusePartialQuarantineSchemaRepair(db);
+      await rehearseQuarantineSchemaRepair(db, restore);
       const beforeResults = await db
         .select({ id: results.id })
         .from(results)
@@ -345,6 +348,7 @@ describe("exact un-ingested solver evidence quarantine", () => {
         mediaRoot: fixture.mediaRoot,
       });
       expect(replay).toEqual(ack);
+      await rehearseQuarantineSchemaRepair(db, false);
       expect(
         await db
           .select()
