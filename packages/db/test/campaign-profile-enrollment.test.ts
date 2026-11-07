@@ -8,6 +8,7 @@ import { authorizeProgressiveRemoteStart } from "../src/progressive-remote-start
 import { readProgressiveRemoteContinuation } from "../src/progressive-remote-continuation";
 import { solverGeometryCompatibility } from "../src/solver-evidence-geometry";
 import { claimSimJobCancellation } from "../src/job-lifecycle";
+import { releaseResultClaimsForJob } from "../src/result-claim-lifecycle";
 import { loadDiskAdmissionExposure } from "../../../apps/sweeper/src/disk-admission";
 import {
   localPredictionRepairEngines,
@@ -3180,7 +3181,7 @@ describe("progressive durable stage transitions", () => {
       const evidence = await first.save(20, stage === 3 ? "urans" : "rans", 0);
       await first.record([evidence]);
       await db.update(resultAttempts).set({
-        status: "done", validForPolar: true, converged: true,
+        status: "done", source: "solved", validForPolar: true, converged: true,
         cl: 0.1, cd: 0.02, cm: -0.01,
       }).where(eq(resultAttempts.id, evidence));
       await db.execute(sql`INSERT INTO result_classifications(result_attempt_id, airfoil_id,
@@ -3188,6 +3189,10 @@ describe("progressive durable stage transitions", () => {
         SELECT id, airfoil_id, simulation_preset_revision_id, aoa_deg,
           'completion-retry-accepted-history', 'accepted', '{}'
         FROM result_attempts WHERE id = ${evidence}::uuid`);
+      await db.execute(sql`UPDATE results cell SET status = 'done', source = 'solved',
+        current_result_attempt_id = raw.id, regime = raw.regime, converged = raw.converged,
+        cl = raw.cl, cd = raw.cd, cm = raw.cm
+        FROM result_attempts raw WHERE raw.id = ${evidence}::uuid AND cell.id = raw.result_id`);
       const stop = async (
         fixture: Awaited<ReturnType<typeof cfdEvidenceFixture>>,
         seconds: number,
@@ -3200,9 +3205,13 @@ describe("progressive durable stage transitions", () => {
           simJobId: fixture.composed.jobId,
           proof: executionStopProof(fixture.engineJobId),
         });
-        await db.execute(sql`UPDATE sim_jobs SET status = 'failed', engine_state = 'failed',
-          "updatedAt" = clock_timestamp() - interval '20 minutes'
-          WHERE id = ${fixture.composed.jobId}::uuid`);
+        await db.transaction(async (transaction) => {
+          const connection = transaction as unknown as DB;
+          await connection.execute(sql`UPDATE sim_jobs SET status = 'failed', engine_state = 'failed',
+            "updatedAt" = clock_timestamp() - interval '20 minutes'
+            WHERE id = ${fixture.composed.jobId}::uuid`);
+          await releaseResultClaimsForJob(connection, fixture.composed.jobId, ["queued", "running"]);
+        });
         await db.execute(sql`UPDATE progressive_cfd_attempts
           SET outcome = 'failed', finished_at = clock_timestamp(), error = ${reason}
           WHERE sim_job_id = ${fixture.composed.jobId}::uuid`);
@@ -3250,9 +3259,10 @@ describe("progressive durable stage transitions", () => {
         SELECT * FROM progressive_cfd_attempts WHERE unit_id = ${lease.id}::uuid
         ORDER BY started_at, token`);
       const readEvidence = () => observer.db.execute(sql`
-        SELECT raw.*, classification.state AS classification
+        SELECT raw.*, classification.state AS classification, to_jsonb(cell) AS canonical
         FROM result_attempts raw JOIN result_classifications classification
           ON classification.result_attempt_id = raw.id
+        JOIN results cell ON cell.id = raw.result_id
         WHERE raw.id = ${evidence}::uuid`);
       try {
         const [before] = await readUnit();
@@ -3269,7 +3279,10 @@ describe("progressive durable stage transitions", () => {
         expect(stopped).toHaveLength(2);
         const protectedBefore = await readProtected();
         const evidenceBefore = await readEvidence();
-        expect(evidenceBefore[0]).toMatchObject({ aoa_deg: 0, classification: "accepted" });
+        expect(evidenceBefore[0]).toMatchObject({
+          aoa_deg: 0, classification: "accepted", status: "done", valid_for_polar: true,
+          canonical: { status: "done", source: "solved", current_result_attempt_id: evidence },
+        });
 
         if (path === "terminal" && stage === 2) {
           const reject = async (mutate: (connection: DB) => Promise<void>) => {
@@ -3646,14 +3659,16 @@ describe("progressive durable stage transitions", () => {
   });
 
   it("reconciles a stranded terminal retry before normal admission", async () => {
-    const fixture = await fitFixture(2, false, [-1, 0, 8]);
+    const fixture = await fitFixture(3, false, [-1, 0, 8], 3);
+    expect(fixture.leases.map((lease) => lease.alpha).sort((left, right) => left - right))
+      .toEqual([-1, 0, 8]);
     const retryable = fixture.leases.find((lease) => lease.alpha === -1)!;
     const accepted = fixture.leases.find((lease) => lease.alpha === 0)!;
     const stranded = fixture.leases.find((lease) => lease.alpha === 8)!;
-    const evidence = await fixture.save(20, "rans", 0);
+    const evidence = await fixture.save(20, "urans", 0);
     await fixture.record([evidence]);
     await db.update(resultAttempts).set({
-      status: "done", validForPolar: true, converged: true,
+      status: "done", source: "solved", validForPolar: true, converged: true,
       cl: 0.1, cd: 0.02, cm: -0.01,
     }).where(eq(resultAttempts.id, evidence));
     await db.execute(sql`INSERT INTO result_classifications(result_attempt_id, airfoil_id,
@@ -3661,6 +3676,10 @@ describe("progressive durable stage transitions", () => {
       SELECT id, airfoil_id, simulation_preset_revision_id, aoa_deg,
         'stranded-retry-accepted-history', 'accepted', '{}'
       FROM result_attempts WHERE id = ${evidence}::uuid`);
+    await db.execute(sql`UPDATE results cell SET status = 'done', source = 'solved',
+      current_result_attempt_id = raw.id, regime = raw.regime, converged = raw.converged,
+      cl = raw.cl, cd = raw.cd, cm = raw.cm
+      FROM result_attempts raw WHERE raw.id = ${evidence}::uuid AND cell.id = raw.result_id`);
     await heartbeatProgressiveCfdUnit(db, stranded, {
       attemptActiveSeconds: 50, leaseSeconds: 120,
     });
@@ -3668,8 +3687,12 @@ describe("progressive durable stage transitions", () => {
       simJobId: fixture.composed.jobId,
       proof: executionStopProof(fixture.engineJobId),
     });
-    await db.update(simJobs).set({ status: "failed", engineState: "failed" })
-      .where(eq(simJobs.id, fixture.composed.jobId));
+    await db.transaction(async (transaction) => {
+      const connection = transaction as unknown as DB;
+      await connection.update(simJobs).set({ status: "failed", engineState: "failed" })
+        .where(eq(simJobs.id, fixture.composed.jobId));
+      await releaseResultClaimsForJob(connection, fixture.composed.jobId, ["queued", "running"]);
+    });
     await db.execute(sql`
       UPDATE progressive_cfd_attempts
       SET outcome = 'failed', sim_job_id = ${fixture.composed.jobId}::uuid,
@@ -3698,7 +3721,7 @@ describe("progressive durable stage transitions", () => {
     };
     const second = await claimProgressiveCfdUnit(db, input);
     expect(second).toMatchObject({ id: stranded.id });
-    const secondFixture = await cfdEvidenceFixture(undefined, 2, [], [8], false, {
+    const secondFixture = await cfdEvidenceFixture(undefined, 3, [], [8], false, {
       campaignId: fixture.campaignId, leases: [second!],
     });
     await heartbeatProgressiveCfdUnit(db, second!, {
@@ -3708,8 +3731,12 @@ describe("progressive durable stage transitions", () => {
       simJobId: secondFixture.composed.jobId,
       proof: executionStopProof(secondFixture.engineJobId),
     });
-    await db.update(simJobs).set({ status: "failed", engineState: "failed" })
-      .where(eq(simJobs.id, secondFixture.composed.jobId));
+    await db.transaction(async (transaction) => {
+      const connection = transaction as unknown as DB;
+      await connection.update(simJobs).set({ status: "failed", engineState: "failed" })
+        .where(eq(simJobs.id, secondFixture.composed.jobId));
+      await releaseResultClaimsForJob(connection, secondFixture.composed.jobId, ["queued", "running"]);
+    });
     await db.execute(sql`
       UPDATE progressive_cfd_attempts SET outcome = 'failed', finished_at = clock_timestamp(),
         error = 'terminal execution has no measured case evidence'
@@ -3749,10 +3776,15 @@ describe("progressive durable stage transitions", () => {
     const readProtected = async () => ({
       unit: await db.execute(sql`SELECT * FROM progressive_cfd_units WHERE id = ${accepted.id}::uuid`),
       attempt: await db.execute(sql`SELECT * FROM result_attempts WHERE id = ${evidence}::uuid`),
+      canonical: await db.execute(sql`SELECT * FROM results
+        WHERE id = (SELECT result_id FROM result_attempts WHERE id = ${evidence}::uuid)`),
       classification: await db.execute(sql`SELECT * FROM result_classifications WHERE result_attempt_id = ${evidence}::uuid`),
       evidence: await db.execute(sql`SELECT * FROM progressive_cfd_evidence WHERE attempt_token = ${accepted.token}::uuid`),
     });
     const protectedBefore = await readProtected();
+    expect(protectedBefore.canonical[0]).toMatchObject({
+      status: "done", source: "solved", current_result_attempt_id: evidence,
+    });
 
     expect(await recoverTerminalProgressiveNoEvidenceGaps(db)).toBe(1);
     const rows = await db.execute(sql`

@@ -148,10 +148,11 @@ export async function verifyPriorRawStoppedProgressiveSettlement(db: DB, envelop
           progressiveEvidence: { sequence: 282, reportContentSignature: analysisContentHash(early), pointContentSignature: source.contentSignature },
         };
         const resolved = await resolveProgressiveRemoteEvidence(connection, delivery);
+        expect(resolved).not.toBeNull();
         const response = await app.inject({ method: "POST", url: "/api/sync/v1/polars",
           headers: { "x-xfoilfoam-solver-token": token },
           payload: { promiseId: envelope.promiseId, sourceInstanceId: String(solver.instance_id), fieldColorScales: [],
-            results: [{ ...progressiveRemotePointProjection(resolved!), ...delivery, fieldExtents: [], evidenceArtifacts: [], media: [] }] } });
+            results: [{ ...delivery, fieldExtents: [], evidenceArtifacts: [], media: [] }] } });
         expect(response.statusCode, response.body).toBe(200);
         const receipt = response.json().progressiveEvidenceReceipts[0];
         expect(receipt.storageOnly).toBe(false);
@@ -298,7 +299,7 @@ export async function verifyStoppedFailedProgressiveDelivery(
         const headers = { "x-xfoilfoam-solver-token": token };
         const payload = {
           promiseId: envelope.promiseId, sourceInstanceId: String(solver.instance_id), fieldColorScales: [],
-          results: [{ ...projection, ...delivery, progressiveEvidence: reference,
+          results: [{ ...delivery, progressiveEvidence: reference,
             fieldExtents: [], evidenceArtifacts: [], media: [] }],
         };
         const strict = await app.inject({ method: "POST", url: "/api/sync/v1/polars", headers, payload });
@@ -538,7 +539,7 @@ async function verifyLegacyClosedProgressiveStorage(db: DB, envelope: Progressiv
       await withProgressiveSyncApi(connection, async (app) => {
         const headers = { "x-xfoilfoam-solver-token": token };
         const payload = { promiseId: envelope.promiseId, sourceInstanceId: String(solver.instance_id), fieldColorScales: [],
-          results: [{ ...projection, ...delivery, fieldExtents: [], evidenceArtifacts: [], media: [] }] };
+          results: [{ ...delivery, fieldExtents: [], evidenceArtifacts: [], media: [] }] };
         const paths: string[] = [];
         const fetcher: typeof fetch = async (url, options) => {
           const route = new URL(String(url)).pathname;
