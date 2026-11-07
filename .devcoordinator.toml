@@ -4702,7 +4702,7 @@ command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vites
 [[test.solver-throughput-recovery.check]]
 name = "report-selection"
 tier = "development"
-requires = ["schema"]
+requires = ["mixed-delivery", "stage-progress", "outbox-replay", "admission-and-leases", "progressive-orphans"]
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/progressive-delivery-selection.test.ts"]
 
 [[test.solver-throughput-recovery.check]]
