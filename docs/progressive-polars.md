@@ -661,6 +661,13 @@ needed for publication. Missing or invalid setup values, foreign revisions and
 conflicting present display values fail before rendering. Repair never fills a
 canonical row just to bypass this check, and generated media does not turn invalid
 CFD into an accepted polar point.
+After verified media makes a stopped precise attempt acceptable, an exact
+post-repair transaction may publish its unowned pending cell and complete the
+matching current stage-3 gap. It rechecks the source, manifest, recipe, current
+epoch and plan, latest attempt, physical stop and absence of newer ownership.
+A durable evidence-reuse receipt records the recovery; the failed attempt history
+and accumulated compute budget remain unchanged. Blocked or interrupted
+publication leaves downstream repair finalization open for a later retry.
 
 Migration 0193 repairs the exact recorded-history state in which both quarantine
 tables and their dedicated guards are missing. It validates an intact schema

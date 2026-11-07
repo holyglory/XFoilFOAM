@@ -2,6 +2,7 @@ import {
   acquireEvidenceArtifactKeyLocks,
   acquireResultEvidenceLock,
   acquireResultEvidenceLocks,
+  completeSatisfiedResultMediaRepair,
   assertProgressiveCfdEvidenceJob,
   recordProgressiveCfdEvidence,
   airfoils,
@@ -31,6 +32,10 @@ import {
   withEvidenceArtifactWriteLocks,
 } from "@aerodb/db";
 import type { SimulationSetupSnapshot } from "@aerodb/db/simulation-setup";
+import {
+  withRepairedProgressiveCfdEvidence,
+  type RepairedResultPublication,
+} from "@aerodb/db/progressive-cfd-settlement";
 import { assertProgressiveWorkerEvidenceJob } from "./progressive-remote-jobs";
 import {
   baseRejectionReasons,
@@ -5688,7 +5693,7 @@ export async function publishRepairedResultAttempt(opts: {
   resultAttemptId: string;
   repairId: string;
   evidenceSignature: string;
-}): Promise<boolean> {
+}): Promise<RepairedResultPublication> {
   const [scope] = await opts.db
     .select({
       airfoilId: results.airfoilId,
@@ -5697,42 +5702,59 @@ export async function publishRepairedResultAttempt(opts: {
     .from(results)
     .where(eq(results.id, opts.resultId))
     .limit(1);
-  if (!scope?.revisionId) return false;
+  if (!scope?.revisionId) return "waiting";
+  const revisionId = scope.revisionId;
 
-  let published = false;
-  await refreshPolarCacheForRevision(
+  return withRepairedProgressiveCfdEvidence(
     opts.db,
-    scope.airfoilId,
-    scope.revisionId,
-    {
-      afterAttemptClassifications: async (tx) => {
-        // The polar advisory is already held by refreshPolarCacheForRevision.
-        // Observe the pointer first, lock any exact FINAL queue authorization,
-        // then lock/revalidate the result row. This matches every ladder
-        // projection's polar -> queue -> result order and removes the former
-        // result -> queue inversion.
-        const [observedCell] = await tx
-          .select({
-            currentAttemptId: results.currentResultAttemptId,
-            status: results.status,
-          })
-          .from(results)
-          .where(eq(results.id, opts.resultId))
-          .limit(1);
-        if (
-          !observedCell ||
-          ["pending", "queued", "running", "stale"].includes(
-            observedCell.status,
-          )
-        ) {
-          return;
-        }
-        let exactFinalRepairReplacement = false;
-        if (
-          observedCell.currentAttemptId !== null &&
-          observedCell.currentAttemptId !== opts.resultAttemptId
-        ) {
-          const [authorization] = (await tx.execute(sql`
+    opts,
+    async (connection, progressive) => {
+      let outcome: RepairedResultPublication = "waiting";
+      await refreshPolarCacheForRevision(
+        connection,
+        scope.airfoilId,
+        revisionId,
+        {
+          afterAttemptClassifications: async (tx) => {
+            await acquireResultEvidenceLock(tx, opts.resultId);
+            // The polar advisory is already held by refreshPolarCacheForRevision.
+            // Observe the pointer first, lock any exact FINAL queue authorization,
+            // then lock/revalidate the result row. This matches every ladder
+            // projection's polar -> queue -> result order and removes the former
+            // result -> queue inversion.
+            const [observedCell] = await tx
+              .select({
+                currentAttemptId: results.currentResultAttemptId,
+                status: results.status,
+                simJobId: results.simJobId,
+              })
+              .from(results)
+              .where(eq(results.id, opts.resultId))
+              .limit(1);
+            const unownedPending =
+              progressive &&
+              observedCell?.status === "pending" &&
+              observedCell.currentAttemptId === null &&
+              observedCell.simJobId === null;
+            if (
+              !observedCell ||
+              (!unownedPending &&
+                ["pending", "queued", "running", "stale"].includes(
+                  observedCell.status,
+                )) ||
+              (progressive &&
+                !unownedPending &&
+                (observedCell.status !== "done" ||
+                  observedCell.currentAttemptId !== opts.resultAttemptId))
+            ) {
+              return;
+            }
+            let exactFinalRepairReplacement = false;
+            if (
+              observedCell.currentAttemptId !== null &&
+              observedCell.currentAttemptId !== opts.resultAttemptId
+            ) {
+              const [authorization] = (await tx.execute(sql`
             SELECT verify_item.id
             FROM sim_urans_verify_queue verify_item
             JOIN result_attempts repaired_attempt
@@ -5778,135 +5800,157 @@ export async function publishRepairedResultAttempt(opts: {
             LIMIT 1
             FOR UPDATE OF verify_item
           `)) as unknown as Array<{ id: string }>;
-          if (!authorization) return;
-          exactFinalRepairReplacement = true;
-        }
-        const [cell] = await tx
-          .select({
-            currentAttemptId: results.currentResultAttemptId,
-            status: results.status,
-          })
-          .from(results)
-          .where(eq(results.id, opts.resultId))
-          .for("update")
-          .limit(1);
-        if (
-          !cell ||
-          cell.currentAttemptId !== observedCell.currentAttemptId ||
-          cell.status !== observedCell.status
-        ) {
-          return;
-        }
-        const [repair] = await tx
-          .select({
-            resultAttemptId: resultMediaRepairs.resultAttemptId,
-            state: resultMediaRepairs.state,
-            evidenceSignature: resultMediaRepairs.evidenceSignature,
-          })
-          .from(resultMediaRepairs)
-          .where(eq(resultMediaRepairs.id, opts.repairId))
-          .for("update")
-          .limit(1);
-        if (
-          !repair ||
-          repair.resultAttemptId !== opts.resultAttemptId ||
-          repair.state !== "done" ||
-          repair.evidenceSignature !== opts.evidenceSignature
-        ) {
-          return;
-        }
-        const [attempt] = await tx
-          .select()
-          .from(resultAttempts)
-          .where(
-            and(
-              eq(resultAttempts.id, opts.resultAttemptId),
-              eq(resultAttempts.resultId, opts.resultId),
-            ),
-          )
-          .limit(1);
-        const [classification] = await tx
-          .select({ state: resultClassifications.state })
-          .from(resultClassifications)
-          .where(
-            eq(resultClassifications.resultAttemptId, opts.resultAttemptId),
-          )
-          .limit(1);
-        const manifest = await manifestForAttempt(
-          tx,
-          opts.resultId,
-          opts.resultAttemptId,
-        );
-        if (
-          !attempt ||
-          !manifest ||
-          !(
-            classification?.state === "accepted" ||
-            (!exactFinalRepairReplacement &&
-              classification?.state === "needs_urans")
-          ) ||
-          `${attempt.engineJobId ?? ""}:${attempt.engineCaseSlug ?? ""}:${manifest.sha256}` !==
-            opts.evidenceSignature
-        ) {
-          return;
-        }
-        const payload = attempt.evidencePayload;
-        const [updated] = await tx
-          .update(results)
-          .set({
-            currentResultAttemptId: attempt.id,
-            bcId: attempt.bcId,
-            status: attempt.status,
-            source: attempt.source,
-            regime: attempt.regime,
-            methodKey: attempt.methodKey,
-            solverImplementationId: attempt.solverImplementationId,
-            solverRuntimeBuildId: attempt.solverRuntimeBuildId,
-            cl: attempt.cl,
-            cd: attempt.cd,
-            cm: attempt.cm,
-            clCd: attempt.clCd,
-            clStd: attempt.clStd,
-            cdStd: attempt.cdStd,
-            cmStd: attempt.cmStd,
-            stalled: attempt.stalled,
-            unsteady: attempt.unsteady,
-            converged: attempt.converged,
-            finalResidual: attempt.finalResidual,
-            iterations: attempt.iterations,
-            yPlusAvg: attempt.yPlusAvg,
-            yPlusMax: attempt.yPlusMax,
-            nCells: attempt.nCells,
-            firstOrderFallback: attempt.firstOrderFallback,
-            strouhal: attempt.strouhal,
-            error: attempt.error,
-            qualityWarnings: attempt.qualityWarnings,
-            frameTrack: payloadField(payload, "frame_track", "frameTrack"),
-            fidelity: payloadField(payload, "fidelity", "fidelity"),
-            steadyHistory: payloadField(
-              payload,
-              "steady_history",
-              "steadyHistory",
-            ),
-            engineJobId: attempt.engineJobId,
-            engineCaseSlug: attempt.engineCaseSlug,
-            simJobId: attempt.simJobId,
-            solvedAt: attempt.solvedAt,
-            priority: 0,
-            updatedAt: new Date(),
-          })
-          .where(
-            and(
-              eq(results.id, opts.resultId),
-              sql`${results.currentResultAttemptId} IS NOT DISTINCT FROM ${cell.currentAttemptId}::uuid`,
-            ),
-          )
-          .returning({ id: results.id });
-        published = Boolean(updated);
-      },
+              if (!authorization) return;
+              exactFinalRepairReplacement = true;
+            }
+            const [cell] = await tx
+              .select({
+                currentAttemptId: results.currentResultAttemptId,
+                status: results.status,
+                simJobId: results.simJobId,
+              })
+              .from(results)
+              .where(eq(results.id, opts.resultId))
+              .for("update")
+              .limit(1);
+            if (
+              !cell ||
+              cell.currentAttemptId !== observedCell.currentAttemptId ||
+              cell.status !== observedCell.status ||
+              cell.simJobId !== observedCell.simJobId
+            ) {
+              return;
+            }
+            const [repair] = await tx
+              .select({
+                resultAttemptId: resultMediaRepairs.resultAttemptId,
+                state: resultMediaRepairs.state,
+                evidenceSignature: resultMediaRepairs.evidenceSignature,
+              })
+              .from(resultMediaRepairs)
+              .where(eq(resultMediaRepairs.id, opts.repairId))
+              .for("update")
+              .limit(1);
+            if (
+              !repair ||
+              repair.resultAttemptId !== opts.resultAttemptId ||
+              repair.state !== "done" ||
+              repair.evidenceSignature !== opts.evidenceSignature
+            ) {
+              return;
+            }
+            const [attempt] = await tx
+              .select()
+              .from(resultAttempts)
+              .where(
+                and(
+                  eq(resultAttempts.id, opts.resultAttemptId),
+                  eq(resultAttempts.resultId, opts.resultId),
+                ),
+              )
+              .limit(1);
+            const [classification] = await tx
+              .select({ state: resultClassifications.state })
+              .from(resultClassifications)
+              .where(
+                eq(resultClassifications.resultAttemptId, opts.resultAttemptId),
+              )
+              .limit(1);
+            const manifest = await manifestForAttempt(
+              tx,
+              opts.resultId,
+              opts.resultAttemptId,
+            );
+            if (
+              !attempt ||
+              !manifest ||
+              (progressive &&
+                !unownedPending &&
+                cell.simJobId !== attempt.simJobId) ||
+              `${attempt.engineJobId ?? ""}:${attempt.engineCaseSlug ?? ""}:${manifest.sha256}` !==
+                opts.evidenceSignature
+            ) {
+              return;
+            }
+            if (
+              !(await completeSatisfiedResultMediaRepair(
+                tx,
+                opts.repairId,
+                opts.resultAttemptId,
+                opts.evidenceSignature,
+              ))
+            )
+              return;
+            if (
+              !(
+                classification?.state === "accepted" ||
+                (!progressive &&
+                  !exactFinalRepairReplacement &&
+                  classification?.state === "needs_urans")
+              )
+            ) {
+              outcome = "rejected";
+              return;
+            }
+            const payload = attempt.evidencePayload;
+            const [updated] = await tx
+              .update(results)
+              .set({
+                currentResultAttemptId: attempt.id,
+                bcId: attempt.bcId,
+                status: attempt.status,
+                source: attempt.source,
+                regime: attempt.regime,
+                methodKey: attempt.methodKey,
+                solverImplementationId: attempt.solverImplementationId,
+                solverRuntimeBuildId: attempt.solverRuntimeBuildId,
+                cl: attempt.cl,
+                cd: attempt.cd,
+                cm: attempt.cm,
+                clCd: attempt.clCd,
+                clStd: attempt.clStd,
+                cdStd: attempt.cdStd,
+                cmStd: attempt.cmStd,
+                stalled: attempt.stalled,
+                unsteady: attempt.unsteady,
+                converged: attempt.converged,
+                finalResidual: attempt.finalResidual,
+                iterations: attempt.iterations,
+                yPlusAvg: attempt.yPlusAvg,
+                yPlusMax: attempt.yPlusMax,
+                nCells: attempt.nCells,
+                firstOrderFallback: attempt.firstOrderFallback,
+                strouhal: attempt.strouhal,
+                error: attempt.error,
+                qualityWarnings: attempt.qualityWarnings,
+                frameTrack: payloadField(payload, "frame_track", "frameTrack"),
+                fidelity: payloadField(payload, "fidelity", "fidelity"),
+                steadyHistory: payloadField(
+                  payload,
+                  "steady_history",
+                  "steadyHistory",
+                ),
+                engineJobId: attempt.engineJobId,
+                engineCaseSlug: attempt.engineCaseSlug,
+                simJobId: attempt.simJobId,
+                solvedAt: attempt.solvedAt,
+                priority: 0,
+                updatedAt: new Date(),
+              })
+              .where(
+                and(
+                  eq(results.id, opts.resultId),
+                  sql`${results.currentResultAttemptId} IS NOT DISTINCT FROM ${cell.currentAttemptId}::uuid`,
+                ),
+              )
+              .returning({ id: results.id });
+            if (updated) outcome = "published";
+          },
+        },
+      );
+      return outcome;
     },
   );
-  return published;
 }
 
 /** Ingest a completed JobResult through immutable attempt staging followed by

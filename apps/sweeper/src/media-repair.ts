@@ -148,14 +148,15 @@ export async function finalizeSatisfiedResultMediaRepairs(
     }
     // Reclassify the exact repaired attempt and advance the public pointer only
     // if it is now accepted/provisional. Rejected evidence remains history.
-    const published = await publishRepairedResultAttempt({
+    const publication = await publishRepairedResultAttempt({
       db,
       resultId: repair.resultId,
       resultAttemptId: repair.resultAttemptId,
       repairId: repair.id,
       evidenceSignature: repair.evidenceSignature,
     });
-    if (!published) {
+    if (publication === "waiting") continue;
+    if (publication === "rejected") {
       if (
         await completeResultMediaRepairFinalization(
           db,
@@ -211,6 +212,7 @@ export async function finalizeSatisfiedResultMediaRepairs(
       revisionId: repair.revisionId,
       aoaDeg: Number(repair.aoaDeg),
       resultId: repair.resultId,
+      resultAttemptId: repair.resultAttemptId,
       status: repair.status as "done" | "failed",
       regime: repair.regime,
     });

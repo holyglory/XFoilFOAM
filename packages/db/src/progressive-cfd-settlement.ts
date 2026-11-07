@@ -6,6 +6,7 @@ import { assertProgressiveExecutionIdentity } from "./progressive-execution-iden
 import type { EngineExecutionStopProof } from "../../engine-client/src/types";
 import { analysisContentHash, canonicalAnalysisJson } from "./analysis-target";
 import type { DB } from "./client";
+import { tryProgressiveAdmissionLock } from "./progressive-admission-lock";
 import { SOURCE_GEOMETRY_POLICY_VERSION } from "./progressive-evidence-geometry";
 import {
   progressiveCfdNeverStartedAttemptCountSql,
@@ -17,6 +18,268 @@ import {
   PROGRESSIVE_FAST_BUDGET_EXTENSION_SECONDS,
   progressiveCfdEffectiveBudgetSql,
 } from "./progressive-cfd-budget-extension";
+
+export type RepairedResultPublication = "published" | "rejected" | "waiting";
+
+export interface RepairedProgressiveCfdEvidence {
+  repairId: string;
+  resultId: string;
+  resultAttemptId: string;
+  evidenceSignature: string;
+}
+
+export async function withRepairedProgressiveCfdEvidence(
+  db: DB,
+  input: RepairedProgressiveCfdEvidence,
+  publish: (
+    connection: DB,
+    progressive: boolean,
+  ) => Promise<RepairedResultPublication>,
+): Promise<RepairedResultPublication> {
+  const uuid = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i;
+  if (
+    ![input.repairId, input.resultId, input.resultAttemptId].every((id) =>
+      uuid.test(id),
+    ) ||
+    !input.evidenceSignature
+  )
+    throw new Error(
+      "Repaired progressive evidence requires exact repair identities",
+    );
+  const lost = new Error(
+    "Repaired progressive evidence changed during publication",
+  );
+  try {
+    return await db.transaction(async (transaction) => {
+      const connection = transaction as unknown as DB;
+      const [source] = await connection.execute(sql`
+        SELECT job.id, job.request_payload->'progressive' AS progressive,
+          evidence.attempt_token AS progressive_attempt_token,
+          generation.epoch_id, generation.campaign_id
+        FROM result_attempts raw
+        LEFT JOIN sim_jobs job ON job.id = raw.sim_job_id
+        LEFT JOIN progressive_cfd_evidence evidence ON evidence.result_attempt_id = raw.id
+        LEFT JOIN progressive_cfd_attempts attempt ON attempt.token = evidence.attempt_token
+        LEFT JOIN progressive_cfd_units unit ON unit.id = attempt.unit_id
+        LEFT JOIN progressive_work work ON work.id = unit.work_id
+        LEFT JOIN progressive_generations generation ON generation.id = work.generation_id
+        WHERE raw.id = ${input.resultAttemptId}::uuid AND raw.result_id = ${input.resultId}::uuid
+      `);
+      if (!source) return "waiting";
+      if (!source.progressive) {
+        if (
+          source.progressive_attempt_token ||
+          source.epoch_id ||
+          source.campaign_id
+        )
+          return "waiting";
+        return publish(connection, false);
+      }
+      if (!source.epoch_id || !source.campaign_id) return "waiting";
+      if (!(await tryProgressiveAdmissionLock(connection))) return "waiting";
+      const [epoch] = await connection.execute(sql`
+        SELECT id, current FROM calculation_epochs WHERE id = ${source.epoch_id}::uuid FOR SHARE
+      `);
+      if (!epoch?.current) return "waiting";
+      const [campaign] = await connection.execute(sql`
+        SELECT id, status, current_plan_revision_id FROM sim_campaigns
+        WHERE id = ${source.campaign_id}::uuid FOR UPDATE SKIP LOCKED
+      `);
+      if (!campaign) return "waiting";
+      const [scope] = await connection.execute(sql`
+        SELECT generation.id AS generation_id, generation.epoch_id, generation.plan_revision_id,
+          generation.status AS generation_status, generation.benchmark_only, work.id AS work_id, work.target_id, target.physical,
+          work.stage, work.state AS work_state, ${effectiveProgressiveStageSql()} AS effective_stage,
+          unit.id AS unit_id, unit.state AS unit_state, unit.recipe, unit.lease_token,
+          unit.lease_owner, unit.lease_until, attempt.token, attempt.outcome,
+          attempt.sim_job_id, attempt.execution_recipe_id,
+          recipe.source_revision_id, recipe.execution_revision_id, recipe.recipe AS execution_recipe,
+          generation_scope.revision_id AS scope_revision_id,
+          raw.airfoil_id, raw.engine_job_id, raw.engine_case_slug, raw.evidence_payload,
+          evidence.evidence_signature AS payload_signature,
+          raw.status AS raw_status, raw.source AS raw_source, raw.valid_for_polar,
+          raw.regime, raw.evidence_payload->>'fidelity' AS fidelity,
+          raw.airfoil_id = target.airfoil_id AND raw.aoa_deg = unit.aoa_deg AND raw.aoa_deg = ANY(generation_scope.angles)
+            AND raw.simulation_preset_revision_id = recipe.execution_revision_id AS exact_cell,
+          NOT EXISTS (SELECT 1 FROM progressive_cfd_attempts newer
+            WHERE newer.unit_id = unit.id
+              AND (newer.started_at, newer.token) > (attempt.started_at, attempt.token)) AS latest,
+          NOT EXISTS (SELECT 1 FROM result_attempts newer_raw
+            WHERE newer_raw.result_id = raw.result_id
+              AND (newer_raw."createdAt", newer_raw.id) > (raw."createdAt", raw.id)) AS latest_raw,
+          NOT EXISTS (SELECT 1 FROM progressive_cfd_attempts live
+            JOIN progressive_cfd_units live_unit ON live_unit.id = live.unit_id
+            JOIN progressive_work live_work ON live_work.id = live_unit.work_id
+            WHERE live_work.generation_id = generation.id AND live_work.target_id = work.target_id
+              AND live_unit.aoa_deg = unit.aoa_deg AND live.outcome = 'running') AS unowned,
+          EXISTS (SELECT 1 FROM solver_evidence_archives archive
+            WHERE archive.result_id = raw.result_id AND archive.result_attempt_id = raw.id
+              AND archive.state = 'current') AS archived,
+          NOT EXISTS (SELECT 1 FROM progressive_cfd_recovery_plans recovery
+            WHERE recovery.unit_id = unit.id AND recovery.parent_attempt_token = attempt.token) AS final_recipe,
+          NOT EXISTS (SELECT 1 FROM result_review_verdicts review
+            WHERE review.result_id = raw.result_id AND review."revokedAt" IS NULL
+              AND review.verdict IN ('exclude', 'defer')) AS review_allowed
+        FROM progressive_cfd_evidence evidence
+        JOIN result_attempts raw ON raw.id = evidence.result_attempt_id
+        JOIN progressive_cfd_attempts attempt ON attempt.token = evidence.attempt_token
+          AND attempt.sim_job_id = raw.sim_job_id
+        JOIN progressive_cfd_units unit ON unit.id = attempt.unit_id
+        JOIN progressive_work work ON work.id = unit.work_id
+        JOIN progressive_generations generation ON generation.id = work.generation_id
+          AND generation.campaign_id = ${campaign.id}::uuid
+        JOIN progressive_generation_targets generation_scope
+          ON generation_scope.generation_id = generation.id AND generation_scope.target_id = work.target_id
+        JOIN polar_analysis_targets target ON target.id = work.target_id
+        JOIN progressive_cfd_execution_recipes recipe ON recipe.id = attempt.execution_recipe_id
+        WHERE raw.id = ${input.resultAttemptId}::uuid AND raw.result_id = ${input.resultId}::uuid
+        FOR UPDATE OF generation, work, unit, attempt SKIP LOCKED
+      `);
+      if (!scope) return "waiting";
+      const [reuse] = await connection.execute(sql`
+        SELECT source_attempt_token, source_result_attempt_id, source_evidence_signature,
+          source_generation_id, source_execution_recipe_id
+        FROM progressive_cfd_evidence_reuses WHERE successor_unit_id = ${scope.unit_id}::uuid
+      `);
+      const replay = scope.unit_state === "complete" && reuse != null;
+      if (
+        scope.epoch_id !== epoch.id ||
+        scope.plan_revision_id !== campaign.current_plan_revision_id ||
+        scope.stage !== 3 ||
+        scope.benchmark_only !== false ||
+        analysisContentHash(scope.physical) !== scope.target_id ||
+        !scope.latest ||
+        !scope.latest_raw ||
+        !scope.unowned ||
+        !scope.archived ||
+        !scope.exact_cell ||
+        !scope.review_allowed ||
+        !scope.final_recipe ||
+        scope.raw_status !== "done" ||
+        scope.raw_source !== "solved" ||
+        !scope.valid_for_polar ||
+        scope.fidelity !== "urans_full" ||
+        scope.regime !== "urans" ||
+        scope.outcome !== "failed" ||
+        scope.lease_token != null ||
+        scope.lease_owner != null ||
+        scope.lease_until != null ||
+        (!replay &&
+          (scope.unit_state !== "gap" ||
+            !["pending", "gap"].includes(String(scope.work_state)) ||
+            scope.generation_status !== "active" ||
+            scope.effective_stage !== 3 ||
+            !["active", "attention", "paused"].includes(
+              String(campaign.status),
+            ))) ||
+        (replay &&
+          (!["active", "complete"].includes(String(scope.generation_status)) ||
+            !["active", "attention", "paused", "completed"].includes(
+              String(campaign.status),
+            ))) ||
+        (reuse &&
+          (reuse.source_attempt_token !== scope.token ||
+            reuse.source_result_attempt_id !== input.resultAttemptId ||
+            reuse.source_evidence_signature !== scope.payload_signature ||
+            reuse.source_generation_id !== scope.generation_id ||
+            reuse.source_execution_recipe_id !== scope.execution_recipe_id)) ||
+        scope.source_revision_id !== scope.scope_revision_id ||
+        analysisContentHash({
+          sourceRevisionId: scope.source_revision_id,
+          recipe: scope.execution_recipe,
+        }) !== scope.execution_recipe_id ||
+        analysisContentHash(scope.execution_recipe) !==
+          analysisContentHash(scope.recipe) ||
+        analysisContentHash(scope.evidence_payload) !== scope.payload_signature
+      )
+        return "waiting";
+      const [job] = await connection.execute(sql`
+        SELECT id, campaign_id, airfoil_id, simulation_preset_revision_id, engine_job_id, request_payload, status, "ingestedAt",
+          (ingest_lease_expires_at <= clock_timestamp()
+            OR (ingest_lease_token IS NULL AND ingest_lease_expires_at IS NULL)) AS ingestion_released
+        FROM sim_jobs WHERE id = ${scope.sim_job_id}::uuid FOR UPDATE
+      `);
+      if (
+        !job ||
+        !["done", "failed", "cancelled"].includes(String(job.status)) ||
+        !job.ingestedAt ||
+        job.campaign_id !== campaign.id ||
+        job.airfoil_id !== scope.airfoil_id ||
+        job.simulation_preset_revision_id !== scope.execution_revision_id ||
+        job.ingestion_released !== true
+      )
+        return "waiting";
+      assertProgressiveExecutionIdentity(
+        String(job.id),
+        job.engine_job_id as string | null,
+        job.request_payload,
+      );
+      const metadata = (
+        job.request_payload as { progressive: Record<string, unknown> }
+      ).progressive;
+      if (
+        metadata.epochId !== epoch.id ||
+        metadata.generationId !== scope.generation_id ||
+        metadata.targetId !== scope.target_id ||
+        metadata.stage !== 3 ||
+        metadata.recipeId !== scope.execution_recipe_id ||
+        !Array.isArray(metadata.tokens) ||
+        !metadata.tokens.includes(scope.token) ||
+        scope.engine_job_id !== job.engine_job_id
+      )
+        return "waiting";
+      const [stop] = await connection.execute(sql`
+        SELECT proof, proof_signature FROM progressive_cfd_execution_stops
+        WHERE sim_job_id = ${job.id}::uuid AND engine_job_id = ${job.engine_job_id}
+          AND epoch_id = ${epoch.id}::uuid FOR SHARE
+      `);
+      if (!stop || analysisContentHash(stop.proof) !== stop.proof_signature)
+        return "waiting";
+      validateProgressiveExecutionStopProof(
+        stop.proof as EngineExecutionStopProof,
+      );
+      if ((stop.proof as EngineExecutionStopProof).job_id !== job.engine_job_id)
+        return "waiting";
+      const publication = await publish(connection, true);
+      if (publication !== "published") return publication;
+      const [accepted] = await connection.execute(sql`
+        SELECT raw.id FROM result_attempts raw
+        JOIN results cell ON cell.id = raw.result_id AND cell.current_result_attempt_id = raw.id
+          AND cell.sim_job_id = raw.sim_job_id AND cell.status = 'done'
+        JOIN result_classifications classification ON classification.result_attempt_id = raw.id
+          AND classification.state = 'accepted'
+        JOIN result_media_repairs repair ON repair.id = ${input.repairId}::uuid
+          AND repair.result_id = cell.id AND repair.result_attempt_id = raw.id
+          AND repair.state = 'done' AND repair.evidence_signature = ${input.evidenceSignature}
+        WHERE raw.id = ${input.resultAttemptId}::uuid AND raw.result_id = ${input.resultId}::uuid
+      `);
+      if (!accepted) throw lost;
+      await connection.execute(sql`
+        INSERT INTO progressive_cfd_evidence_reuses (successor_unit_id, source_attempt_token,
+          source_result_attempt_id, source_evidence_signature, source_generation_id, source_execution_recipe_id)
+        VALUES (${scope.unit_id}::uuid, ${scope.token}::uuid, ${input.resultAttemptId}::uuid,
+          ${scope.payload_signature}, ${scope.generation_id}::uuid, ${scope.execution_recipe_id})
+        ON CONFLICT (successor_unit_id) DO NOTHING
+      `);
+      if (!replay) {
+        const updated = await connection.execute(sql`
+          UPDATE progressive_cfd_units SET state = 'complete', error = NULL
+          WHERE id = ${scope.unit_id}::uuid AND state = 'gap'
+            AND lease_token IS NULL AND lease_owner IS NULL AND lease_until IS NULL RETURNING id
+        `);
+        if (updated.length !== 1) throw lost;
+        await connection.execute(sql`
+          UPDATE progressive_work SET state = 'pending', error = NULL, completed_at = NULL
+          WHERE id = ${scope.work_id}::uuid AND state = 'gap'
+        `);
+      }
+      return "published";
+    });
+  } catch (error) {
+    if (error === lost) return "waiting";
+    throw error;
+  }
+}
 
 export function validateProgressiveExecutionStopProof(
   proof: EngineExecutionStopProof,

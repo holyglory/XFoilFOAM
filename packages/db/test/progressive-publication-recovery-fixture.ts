@@ -2,6 +2,8 @@ import { randomUUID } from "node:crypto";
 import { sql } from "drizzle-orm";
 import { expect } from "vitest";
 import type { DB } from "../src/client";
+import { analysisContentHash, createAnalysisTarget } from "../src/analysis-target";
+import type { SimulationSetupSnapshot } from "../src/simulation-setup";
 import { recoverProgressivePublicationLosses } from "../src/progressive-publication-recovery";
 import { claimProgressiveCfdUnit } from "../src/progressive-cfd";
 import { composeProgressiveCfdJob } from "../../../apps/sweeper/src/progressive-cfd-jobs";
@@ -11,6 +13,206 @@ import {
   acknowledgeProgressiveCfdExecutionStop,
   settleProgressiveCfdExecution,
 } from "../src/progressive-cfd-settlement";
+
+export async function withRepairedPreciseMediaFixture(
+  db: DB,
+  resultAttemptIds: string[],
+  verify: (
+    connection: DB,
+    scope: {
+      campaignId: string;
+      planRevisionId: string;
+      generationId: string;
+      epochId: string;
+      units: Array<{
+        id: string;
+        token: string;
+        resultAttemptId: string;
+        workId: string;
+      }>;
+    },
+  ) => Promise<void>,
+) {
+  const restore = new Error("Restore repaired precise media fixture");
+  try {
+    await db.transaction(async (transaction) => {
+      const connection = transaction as unknown as DB;
+      const campaignId = randomUUID();
+      const planRevisionId = randomUUID();
+      const generationId = randomUUID();
+      const [epoch] = await connection.execute(
+        sql`SELECT id FROM calculation_epochs WHERE current FOR SHARE`,
+      );
+      if (!epoch)
+        throw new Error("Media recovery fixture requires a current epoch");
+      await connection.execute(sql`INSERT INTO sim_campaigns(id,slug,name,idempotency_key,status)
+        VALUES (${campaignId}::uuid,${campaignId},'Exact repaired precise media',${campaignId},'active')`);
+      await connection.execute(sql`INSERT INTO sim_campaign_plan_revisions(id,campaign_id,revision_number,kind,plan,summary)
+        VALUES (${planRevisionId}::uuid,${campaignId}::uuid,1,'initial','{}','{}')`);
+      await connection.execute(
+        sql`UPDATE sim_campaigns SET current_plan_revision_id=${planRevisionId}::uuid WHERE id=${campaignId}::uuid`,
+      );
+      await connection.execute(sql`INSERT INTO progressive_generations(id,epoch_id,campaign_id,plan_revision_id,scope_key,scope_signature,stage,status)
+        VALUES (${generationId}::uuid,${epoch.id}::uuid,${campaignId}::uuid,${planRevisionId}::uuid,${generationId},${"a".repeat(64)},3,'active')`);
+      const rawRows =
+        await connection.execute(sql`SELECT id,result_id,airfoil_id,aoa_deg,simulation_preset_revision_id,
+        sim_job_id,engine_job_id,evidence_payload FROM result_attempts
+        WHERE id IN (${sql.join(
+          resultAttemptIds.map((id) => sql`${id}::uuid`),
+          sql`, `,
+        )}) ORDER BY aoa_deg,id`);
+      expect(rawRows).toHaveLength(resultAttemptIds.length);
+      const works = new Map<
+        string,
+        { workId: string; targetId: string; recipeId: string }
+      >();
+      const jobs = new Map<
+        string,
+        { tokens: string[]; targetId: string; recipeId: string }
+      >();
+      const units: Array<{
+        id: string;
+        token: string;
+        resultAttemptId: string;
+        workId: string;
+      }> = [];
+      const recipe = {
+        selection: { solver: "pimpleFoam", regime: "urans" },
+        fidelity: "urans_full",
+      };
+      for (const raw of rawRows) {
+        expect(raw.sim_job_id).toBe(raw.engine_job_id);
+        const key = `${raw.airfoil_id}:${raw.simulation_preset_revision_id}`;
+        let work = works.get(key);
+        if (!work) {
+          const [geometry] = await connection.execute(
+            sql`SELECT points FROM airfoils WHERE id=${raw.airfoil_id}::uuid`,
+          );
+          const [revision] =
+            await connection.execute(sql`SELECT snapshot FROM simulation_preset_revisions
+            WHERE id=${raw.simulation_preset_revision_id}::uuid`);
+          const snapshot = revision.snapshot as SimulationSetupSnapshot;
+          if (!snapshot.material)
+            throw new Error(
+              "Precise media fixture requires the immutable material",
+            );
+          const target = createAnalysisTarget({
+            airfoilId: String(raw.airfoil_id),
+            points: geometry.points as Array<{ x: number; y: number }>,
+            snapshot,
+            material: {
+              ...snapshot.material,
+              speedOfSound: snapshot.material.speedOfSound ?? null,
+            },
+            transition: {
+              model: "fully_turbulent",
+              nCrit: 9,
+              upper: 0,
+              lower: 0,
+            },
+            branch: "increasing",
+          });
+          const physical = target.physical;
+          const targetId = target.signature;
+          const recipeId = analysisContentHash({
+            sourceRevisionId: raw.simulation_preset_revision_id,
+            recipe,
+          });
+          const workId = randomUUID();
+          work = { workId, targetId, recipeId };
+          works.set(key, work);
+          await connection.execute(sql`INSERT INTO polar_analysis_targets(id,airfoil_id,physical)
+            VALUES (${targetId},${raw.airfoil_id}::uuid,${JSON.stringify(physical)}::jsonb)`);
+          await connection.execute(sql`INSERT INTO progressive_generation_targets(generation_id,target_id,revision_id,angles,recipes)
+          VALUES (${generationId}::uuid,${targetId},${raw.simulation_preset_revision_id}::uuid,
+            ARRAY[${sql.join(
+              rawRows
+                .filter(
+                  (entry) =>
+                    entry.airfoil_id === raw.airfoil_id &&
+                    entry.simulation_preset_revision_id ===
+                      raw.simulation_preset_revision_id,
+                )
+                .map((entry) => sql`${entry.aoa_deg}`),
+              sql`, `,
+            )}]::double precision[],
+            ${JSON.stringify({ precise: recipe })}::jsonb)`);
+          await connection.execute(sql`INSERT INTO progressive_work(id,generation_id,target_id,stage,state)
+            VALUES (${workId}::uuid,${generationId}::uuid,${targetId},3,'pending')`);
+          await connection.execute(sql`INSERT INTO progressive_cfd_execution_recipes(id,source_revision_id,recipe,execution_revision_id)
+            VALUES (${recipeId},${raw.simulation_preset_revision_id}::uuid,${JSON.stringify(recipe)}::jsonb,${raw.simulation_preset_revision_id}::uuid)
+            ON CONFLICT (id) DO NOTHING`);
+        }
+        const unitId = randomUUID();
+        const token = randomUUID();
+        await connection.execute(sql`INSERT INTO progressive_cfd_units(id,work_id,aoa_deg,ordinal,purpose,recipe,reason,policy_version,
+          active_budget_seconds,active_seconds,state,attempts,error)
+          VALUES (${unitId}::uuid,${work.workId}::uuid,${raw.aoa_deg},${units.length},'precise',${JSON.stringify(recipe)}::jsonb,
+          'original precise calculation','media-repair-fixture',32400,25200,'gap',1,'precise evidence remains unresolved')`);
+        await connection.execute(sql`INSERT INTO progressive_cfd_attempts(token,unit_id,owner,execution_recipe_id,sim_job_id,
+          started_at,lease_until,outcome,active_seconds,finished_at,error)
+          VALUES (${token}::uuid,${unitId}::uuid,'original precise owner',${work.recipeId},${raw.sim_job_id}::uuid,
+          clock_timestamp()-interval '9 hours',clock_timestamp()-interval '1 hour','failed',25200,
+          clock_timestamp()-interval '30 minutes','precise evidence remains unresolved')`);
+        await connection.execute(sql`INSERT INTO progressive_cfd_evidence(attempt_token,result_attempt_id,evidence_signature,solver_active_seconds)
+          VALUES (${token}::uuid,${raw.id}::uuid,${analysisContentHash(raw.evidence_payload)},25200)`);
+        units.push({
+          id: unitId,
+          token,
+          resultAttemptId: String(raw.id),
+          workId: work.workId,
+        });
+        const jobId = String(raw.sim_job_id);
+        const job = jobs.get(jobId) ?? {
+          tokens: [],
+          targetId: work.targetId,
+          recipeId: work.recipeId,
+        };
+        job.tokens.push(token);
+        jobs.set(jobId, job);
+      }
+      for (const [jobId, job] of jobs) {
+        const request = {
+          progressive: {
+            executionId: jobId,
+            epochId: epoch.id,
+            generationId,
+            targetId: job.targetId,
+            stage: 3,
+            recipeId: job.recipeId,
+            tokens: job.tokens,
+          },
+          engineRequest: { execution_id: jobId },
+        };
+        await connection.execute(sql`UPDATE sim_jobs SET campaign_id=${campaignId}::uuid,status='done',"ingestedAt"=clock_timestamp(),
+          request_payload=${JSON.stringify(request)}::jsonb WHERE id=${jobId}::uuid`);
+        const proof = {
+          version: 1,
+          job_id: jobId,
+          execution_stopped: true,
+          producer_stopped: true,
+          namespace_verified: true,
+          remaining: [],
+          error: null,
+          fence: "terminal_result",
+          observed_at: new Date().toISOString(),
+        };
+        await connection.execute(sql`INSERT INTO progressive_cfd_execution_stops(sim_job_id,engine_job_id,epoch_id,proof,proof_signature,observed_at)
+          VALUES (${jobId}::uuid,${jobId},${epoch.id}::uuid,${JSON.stringify(proof)}::jsonb,${analysisContentHash(proof)},clock_timestamp())`);
+      }
+      await verify(connection, {
+        campaignId,
+        planRevisionId,
+        generationId,
+        epochId: String(epoch.id),
+        units,
+      });
+      throw restore;
+    });
+  } catch (error) {
+    if (error !== restore) throw error;
+  }
+}
 
 export async function verifyPublicationRecovery(db: DB, executionId: string) {
   const restore = new Error("Restore isolated publication recovery fixture");
