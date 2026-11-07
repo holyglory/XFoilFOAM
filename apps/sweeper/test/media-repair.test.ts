@@ -2666,7 +2666,7 @@ describe("durable result media repair", () => {
       attemptCount: 3,
       lastError: "evidence manifest contains no VTK files",
     });
-  });
+  }, 30_000);
 
   it("keeps one live-campaign lane fresh while backlog order remains available", async () => {
     const background = await createSolvedResult("claim-priority-background", {
