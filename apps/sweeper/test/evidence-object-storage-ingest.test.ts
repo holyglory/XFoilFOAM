@@ -1,25 +1,40 @@
 import {
   airfoils,
   boundaryConditions,
+  boundaryProfiles,
   categories,
   createClient,
+  analysisContentHash,
+  forceHistory,
+  flowConditions,
+  referenceGeometryProfiles,
+  meshProfiles,
+  solverProfiles,
+  schedulingProfiles,
+  outputProfiles,
+  sweepDefinitions,
+  simulationPresets,
   mediums,
   resultAttempts,
+  resultClassifications,
   results,
   simJobs,
+  simulationPresetRevisions,
   solverEvidenceArchives,
   solverEvidenceArtifactMembers,
   solverEvidenceArtifacts,
   solverEvidenceBlobs,
 } from "@aerodb/db";
+import { ensureSimulationPresetRevision } from "@aerodb/db/simulation-setup";
 import type {
   EngineClient,
   EngineEvidenceArtifact,
+  JobResult,
   PolarPoint,
   VerifyRemoteEvidenceManifestRequest,
   VerifyRemoteEvidenceManifestResponse,
 } from "@aerodb/engine-client";
-import { and, eq, like } from "drizzle-orm";
+import { and, eq, inArray, like } from "drizzle-orm";
 import { createHash, randomUUID } from "node:crypto";
 import {
   mkdir,
@@ -42,7 +57,8 @@ import {
   vi,
 } from "vitest";
 
-import { registerEvidenceArtifacts } from "../src/ingest";
+import { ingestResult, registerEvidenceArtifacts } from "../src/ingest";
+import { claimJobForIngest } from "../src/ingest-lease";
 import {
   parseEvidenceMigrationReceipt,
   planEvidenceMigrationReceipt,
@@ -50,6 +66,17 @@ import {
 } from "../src/evidence-storage-backfill";
 
 const { db, sql } = createClient({ max: 2 });
+let replayQueries: Record<string, number> | null = null;
+sql.options.debug = (_connection, query) => {
+  if (!replayQueries) return;
+  replayQueries.total = (replayQueries.total ?? 0) + 1;
+  const operation = query.trim().split(/\s+/, 1)[0].toLowerCase();
+  for (const table of ["solver_evidence_artifacts", "solver_evidence_artifact_members"])
+    if (query.includes(`"${table}"`)) {
+      const key = `${table}:${operation}`;
+      replayQueries[key] = (replayQueries[key] ?? 0) + 1;
+    }
+};
 const PREFIX = `evidence-gcs-ingest-${process.pid}-${Date.now().toString(36)}`;
 const BUCKET = "airfoils-pro-storage-bucket";
 const EXACT_GCS_GENERATION = "18446744073709551615";
@@ -82,6 +109,49 @@ interface OwnerFixture {
 
 let fixture: OwnerFixture | null = null;
 let mediumId = "";
+let replayPresetId: string | null = null;
+const replayProfiles: Array<{ id: string; table: typeof flowConditions | typeof referenceGeometryProfiles |
+  typeof boundaryProfiles | typeof meshProfiles | typeof solverProfiles | typeof schedulingProfiles |
+  typeof outputProfiles | typeof sweepDefinitions }> = [];
+
+async function createReplayRevision(owner: OwnerFixture) {
+  const [medium] = await db.select().from(mediums).where(eq(mediums.id, mediumId));
+  const [condition] = await db.select().from(boundaryConditions).where(eq(boundaryConditions.id, owner.bcId));
+  const [flow] = await db.insert(flowConditions).values({
+    slug: `${owner.engineJobId}-flow`, name: "Metadata replay flow", mediumId,
+    temperatureK: medium.refTemperatureK, pressurePa: medium.refPressurePa, speedMps: condition.speedMps!,
+    density: medium.density, dynamicViscosity: medium.dynamicViscosity,
+    kinematicViscosity: medium.kinematicViscosity, mach: condition.speedMps! / medium.speedOfSound!,
+  }).returning();
+  replayProfiles.push({ id: flow.id, table: flowConditions });
+  const [geometry] = await db.insert(referenceGeometryProfiles).values({
+    slug: `${owner.engineJobId}-geometry`, name: "Metadata replay geometry", geometryType: "airfoil_2d",
+    referenceLengthKind: "chord", referenceLengthM: condition.referenceChordM!,
+  }).returning();
+  replayProfiles.push({ id: geometry.id, table: referenceGeometryProfiles });
+  const [boundary] = await db.insert(boundaryProfiles).values({ slug: `${owner.engineJobId}-boundary`, name: "Metadata replay boundary" }).returning();
+  replayProfiles.push({ id: boundary.id, table: boundaryProfiles });
+  const [mesh] = await db.insert(meshProfiles).values({ slug: `${owner.engineJobId}-mesh`, name: "Metadata replay mesh" }).returning();
+  replayProfiles.push({ id: mesh.id, table: meshProfiles });
+  const [solver] = await db.insert(solverProfiles).values({ slug: `${owner.engineJobId}-solver`, name: "Metadata replay solver" }).returning();
+  replayProfiles.push({ id: solver.id, table: solverProfiles });
+  const [scheduling] = await db.insert(schedulingProfiles).values({ slug: `${owner.engineJobId}-scheduling`, name: "Metadata replay scheduling" }).returning();
+  replayProfiles.push({ id: scheduling.id, table: schedulingProfiles });
+  const [output] = await db.insert(outputProfiles).values({ slug: `${owner.engineJobId}-output`, name: "Metadata replay output" }).returning();
+  replayProfiles.push({ id: output.id, table: outputProfiles });
+  const [sweep] = await db.insert(sweepDefinitions).values({ slug: `${owner.engineJobId}-sweep`, name: "Metadata replay sweep", aoaList: [0, 9] }).returning();
+  replayProfiles.push({ id: sweep.id, table: sweepDefinitions });
+  const [preset] = await db.insert(simulationPresets).values({
+    slug: `${owner.engineJobId}-preset`, name: "Metadata replay preset", enabled: false, targetScope: "airfoils",
+    flowConditionId: flow.id, referenceGeometryProfileId: geometry.id, boundaryProfileId: boundary.id,
+    meshProfileId: mesh.id, solverProfileId: solver.id, schedulingProfileId: scheduling.id,
+    outputProfileId: output.id, sweepDefinitionId: sweep.id, legacyBoundaryConditionId: owner.bcId,
+  }).returning();
+  replayPresetId = preset.id;
+  const resolved = await ensureSimulationPresetRevision(db, preset.id);
+  if (!resolved) throw new Error("Exact metadata replay setup revision is missing");
+  return resolved;
+}
 
 async function createAttempt(
   owner: Pick<
@@ -358,6 +428,22 @@ afterEach(async () => {
   fixture = null;
   if (owner) {
     await db.delete(airfoils).where(eq(airfoils.id, owner.airfoilId));
+    if (replayPresetId) {
+      await db.delete(simulationPresetRevisions).where(eq(simulationPresetRevisions.presetId, replayPresetId));
+      await db.delete(simulationPresets).where(eq(simulationPresets.id, replayPresetId));
+      replayPresetId = null;
+    }
+    for (const profile of replayProfiles.splice(0).reverse()) {
+      if (profile.table === flowConditions)
+        await sql`DELETE FROM flow_conditions WHERE id=${profile.id}::uuid
+          AND NOT EXISTS(SELECT 1 FROM simulation_presets WHERE flow_condition_id=${profile.id}::uuid)
+          AND NOT EXISTS(SELECT 1 FROM sim_campaign_conditions WHERE flow_condition_id=${profile.id}::uuid)`;
+      else if (profile.table === referenceGeometryProfiles)
+        await sql`DELETE FROM reference_geometry_profiles WHERE id=${profile.id}::uuid
+          AND NOT EXISTS(SELECT 1 FROM simulation_presets WHERE reference_geometry_profile_id=${profile.id}::uuid)
+          AND NOT EXISTS(SELECT 1 FROM sim_campaign_conditions WHERE reference_geometry_profile_id=${profile.id}::uuid)`;
+      else await db.delete(profile.table).where(eq(profile.table.id, profile.id));
+    }
     await db
       .delete(solverEvidenceBlobs)
       .where(like(solverEvidenceBlobs.objectKey, `${PREFIX}/%`));
@@ -374,6 +460,169 @@ afterAll(async () => {
 });
 
 describe("GCS Zstandard evidence ingestion", () => {
+  it.each([false, true])("replays bounded artifact metadata through real ingestion with archive=%s", async (archived) => {
+    const owner = fixture!;
+    const { revision, snapshot } = await createReplayRevision(owner);
+    expect(snapshot.preset.legacyBoundaryConditionId).toBe(owner.bcId);
+    await db.update(simJobs).set({ simulationPresetRevisionId: revision.id, status: "running", engineState: "completed" })
+      .where(eq(simJobs.id, owner.simJobId));
+    const lease = await claimJobForIngest(db, owner.simJobId);
+    if (!lease) throw new Error("Metadata replay fixture could not claim its exact ingest lease");
+    const points = [false, true].map((rejected): PolarPoint => {
+      const alpha = rejected ? 9 : 0;
+      const caseOwner = { ...owner, caseSlug: `${owner.caseSlug}-${alpha}`, evidenceBase: `${owner.evidenceBase}/${alpha}` };
+      const artifacts = Array.from({ length: 64 }, (_, index) => {
+        const artifact = logicalArtifact(caseOwner, index === 0 ? "mesh_evidence" : "time_directory", `raw/${index}.dat`);
+        delete artifact.role;
+        return { ...artifact,
+          sha256: createHash("sha256").update(`artifact-metadata-replay-v1/${alpha}/${index}`).digest("hex"),
+          ...(index % 3 === 0 ? { field: "p" } : {}),
+          ...(index % 2 === 0 ? { role: "raw" } : {}),
+          metadata: { evidenceBase: caseOwner.evidenceBase, index, nested: { exact: true } },
+        };
+      });
+      const manifest = logicalArtifact(caseOwner, "manifest", "evidence_manifest.json");
+      manifest.sha256 = createHash("sha256").update(`artifact-metadata-replay-manifest-v1/${alpha}`).digest("hex");
+      const bundleSha = createHash("sha256").update(`artifact-metadata-replay-bundle-v1/${alpha}`).digest("hex");
+      const bundle = gcsBundle(caseOwner, { artifact: { sha256: bundleSha }, metadata: {
+        objectKey: `${PREFIX}/sha256/${bundleSha.slice(0, 2)}/${bundleSha}.tar.zst`,
+        uncompressedTarSha256: createHash("sha256").update(`artifact-metadata-replay-tar-v1/${alpha}`).digest("hex"),
+      } });
+      return {
+        aoa_deg: alpha, case_slug: caseOwner.caseSlug, cl: rejected ? null : 0.4,
+        cd: rejected ? null : 0.03, cm: rejected ? null : 0, converged: !rejected,
+        unsteady: false, first_order_fallback: false, images: {},
+        error: rejected ? "Isolated rejected physical evidence" : null,
+        ...(rejected ? { failure_disposition: "hard_solver" as const } : {}),
+        solver_active_seconds: 1,
+        force_history: { t: [0, 0.1, 0.2], cl: [0.4, 0.4, 0.4], cd: [0.03, 0.03, 0.03], cm: [0, 0, 0], samples: 3 },
+        evidence_artifacts: [manifest, ...(archived ? [bundle] : []), ...artifacts],
+      };
+    });
+    const report: JobResult = { job_id: owner.engineJobId, state: "completed", polars: [{
+      speed: snapshot.flowState.speedMps, chord: snapshot.referenceGeometry.referenceLengthM,
+      reynolds: snapshot.derived.reynolds, mach: snapshot.derived.mach,
+      points: [points[0]], attempts: [points[1]],
+    }] };
+    const input = { db, engine: ENGINE, engineJobId: owner.engineJobId, simJobId: owner.simJobId,
+      airfoilId: owner.airfoilId,
+      speedMap: [{ speed: snapshot.flowState.speedMps, bcId: owner.bcId,
+        presetRevisionId: revision.id, mach: snapshot.derived.mach }],
+      result: report, ingestLeaseToken: lease.token, heartbeat: async () => {},
+    };
+    const first = await ingestResult(input);
+    expect(first.resultAttemptIds).toHaveLength(2);
+    const exactSnapshot = async () => {
+      const artifacts = await db.select().from(solverEvidenceArtifacts)
+        .where(inArray(solverEvidenceArtifacts.resultAttemptId, first.resultAttemptIds)).orderBy(solverEvidenceArtifacts.id);
+      const members = await db.select({ archiveId: solverEvidenceArtifactMembers.archiveId,
+        artifactId: solverEvidenceArtifactMembers.artifactId, memberPath: solverEvidenceArtifactMembers.memberPath })
+        .from(solverEvidenceArtifactMembers).innerJoin(solverEvidenceArtifacts,
+          eq(solverEvidenceArtifacts.id, solverEvidenceArtifactMembers.artifactId))
+        .where(inArray(solverEvidenceArtifacts.resultAttemptId, first.resultAttemptIds))
+        .orderBy(solverEvidenceArtifactMembers.archiveId, solverEvidenceArtifactMembers.artifactId);
+      const archives = await db.select().from(solverEvidenceArchives)
+        .where(inArray(solverEvidenceArchives.resultAttemptId, first.resultAttemptIds)).orderBy(solverEvidenceArchives.id);
+      const histories = await db.select().from(forceHistory)
+        .where(inArray(forceHistory.resultAttemptId, first.resultAttemptIds)).orderBy(forceHistory.resultAttemptId);
+      const attempts = await db.select().from(resultAttempts)
+        .where(inArray(resultAttempts.id, first.resultAttemptIds)).orderBy(resultAttempts.id);
+      const classifications = await db.select({ resultId: resultClassifications.resultId,
+        resultAttemptId: resultClassifications.resultAttemptId, state: resultClassifications.state,
+        reasons: resultClassifications.reasons, classifierVersion: resultClassifications.classifierVersion })
+        .from(resultClassifications).where(inArray(resultClassifications.resultAttemptId, first.resultAttemptIds))
+        .orderBy(resultClassifications.resultAttemptId);
+      const pointers = await db.select({ id: results.id, attempt: results.currentResultAttemptId,
+        status: results.status, cl: results.cl, cd: results.cd, cm: results.cm, converged: results.converged })
+        .from(results).where(and(eq(results.airfoilId, owner.airfoilId), eq(results.simulationPresetRevisionId, revision.id)))
+        .orderBy(results.id);
+      return { artifacts, members, archives, histories, attempts, classifications, pointers };
+    };
+    const before = await exactSnapshot();
+    expect(before.artifacts).toHaveLength(archived ? 132 : 130);
+    expect(before.archives).toHaveLength(archived ? 2 : 0);
+    expect(before.histories).toHaveLength(2);
+    expect(before.attempts.find((attempt) => attempt.aoaDeg === 9)?.validForPolar).toBe(false);
+    expect(before.classifications.some((classification) => classification.state === "accepted"), JSON.stringify(before.classifications)).toBe(true);
+    const measure = async (concurrent: boolean) => {
+      const queries: Record<string, number> = {};
+      replayQueries = queries;
+      const cpuStart = process.cpuUsage();
+      const wallStart = performance.now();
+      try {
+        const receipts = concurrent ? await Promise.all([ingestResult(input), ingestResult(input)]) : [await ingestResult(input)];
+        const wallMs = performance.now() - wallStart;
+        const cpu = process.cpuUsage(cpuStart);
+        replayQueries = null;
+        for (const receipt of receipts) expect(receipt).toEqual(first);
+        expect(await exactSnapshot()).toEqual(before);
+        return { concurrent, queries, wallMs, cpuUserMicros: cpu.user, cpuSystemMicros: cpu.system };
+      } finally { replayQueries = null; }
+    };
+    const measurements = [];
+    for (let repetition = 0; repetition < 3; repetition++) measurements.push(await measure(false));
+    measurements.push(await measure(true));
+    console.log("artifact-metadata-replay-measurement", JSON.stringify({ version: 1, archived,
+      inputHash: analysisContentHash(report),
+      fixtureShapeHash: analysisContentHash(JSON.parse(JSON.stringify(report)
+        .replaceAll(owner.engineJobId, "fixture-engine").replaceAll(owner.caseSlug, "fixture-case")
+        .replaceAll(owner.evidenceBase, "fixture-evidence").replaceAll(PREFIX, "fixture-prefix"))),
+      fixtureSourceHash: createHash("sha256").update(await readFile(new URL(import.meta.url))).digest("hex"),
+      helperSourceHash: createHash("sha256").update(await readFile(new URL("../src/ingest.ts", import.meta.url))).digest("hex"),
+      hashes: Object.fromEntries(Object.entries(before).map(([name, rows]) => [name, analysisContentHash(JSON.parse(JSON.stringify(rows)))])),
+      measurements }));
+    const bulk = before.artifacts.find((artifact) => artifact.kind === "time_directory")!;
+    const nullable = before.artifacts.find((artifact) => artifact.kind === "time_directory" && artifact.field === null && artifact.role === null)!;
+    expect(nullable).toBeDefined();
+    const changes: Array<{ artifact: typeof bulk; values: Partial<typeof bulk> }> = [{ mimeType: "changed/type" }, { byteSize: bulk.byteSize + 1 },
+      { engineUrl: "https://foreign.invalid/evidence" }, { metadata: { ...bulk.metadata, changed: true } },
+      { engineCaseSlug: "foreign-case" }, { methodKey: "urans" }, { simJobId: null }, { engineJobId: "foreign-job" }]
+      .map((values) => ({ artifact: bulk, values }));
+    changes.push({ artifact: nullable, values: { field: "" } }, { artifact: nullable, values: { role: "" } });
+    if (revision.solverImplementationId && revision.solverImplementationId !== bulk.solverImplementationId)
+      changes.push({ artifact: bulk, values: { solverImplementationId: revision.solverImplementationId } });
+    for (const changed of changes) {
+      const rollback = new Error("Restore immutable metadata refusal fixture");
+      await db.transaction(async (transaction) => {
+        await transaction.delete(solverEvidenceArtifacts).where(eq(solverEvidenceArtifacts.id, changed.artifact.id));
+        await transaction.insert(solverEvidenceArtifacts).values({ ...changed.artifact, ...changed.values });
+        await expect(ingestResult({ ...input, db: transaction as unknown as typeof db })).rejects.toThrow("immutable association metadata");
+        throw rollback;
+      }).catch((error) => { if (error !== rollback) throw error; });
+      expect(await exactSnapshot()).toEqual(before);
+    }
+    const changedReport = structuredClone(report);
+    changedReport.polars[0].points[0].evidence_artifacts!.find((artifact) => artifact.kind === "time_directory")!.sha256 = "0".repeat(64);
+    await expect(ingestResult({ ...input, result: changedReport })).rejects.toThrow("result attempt replay changed immutable evidence");
+    expect(await exactSnapshot()).toEqual(before);
+    if (archived) {
+      const member = before.members.find((entry) => entry.artifactId === bulk.id)!;
+      const rollback = new Error("Restore conflicting archive member fixture");
+      await db.transaction(async (transaction) => {
+        await transaction.delete(solverEvidenceArtifactMembers).where(and(eq(solverEvidenceArtifactMembers.archiveId, member.archiveId),
+          eq(solverEvidenceArtifactMembers.artifactId, member.artifactId)));
+        await transaction.insert(solverEvidenceArtifactMembers).values({ ...member, memberPath: "wrong/immutable-member.dat" });
+        await expect(ingestResult({ ...input, db: transaction as unknown as typeof db })).rejects.toThrow("conflicts with immutable evidence");
+        throw rollback;
+      }).catch((error) => { if (error !== rollback) throw error; });
+      expect(await exactSnapshot()).toEqual(before);
+    }
+    await db.delete(solverEvidenceArtifacts).where(eq(solverEvidenceArtifacts.id, bulk.id));
+    expect((await ingestResult(input)).resultAttemptIds).toEqual(first.resultAttemptIds);
+    const restored = await exactSnapshot();
+    expect(restored.artifacts).toHaveLength(before.artifacts.length);
+    expect(restored.classifications).toEqual(before.classifications);
+    expect(restored.pointers).toEqual(before.pointers);
+    if (archived) {
+      const restoredBulk = restored.artifacts.find((artifact) => artifact.kind === "time_directory")!;
+      const member = restored.members.find((entry) => entry.artifactId === restoredBulk.id)!;
+      await db.delete(solverEvidenceArtifactMembers).where(and(eq(solverEvidenceArtifactMembers.archiveId, member.archiveId),
+        eq(solverEvidenceArtifactMembers.artifactId, member.artifactId)));
+      await ingestResult(input);
+      expect((await exactSnapshot()).members).toEqual(restored.members);
+    }
+  }, 120_000);
+
   it("MUST-CATCH: registers a rejected URANS checkpoint without rewriting the canonical result's older RANS provenance", async () => {
     const canonical = fixture!;
     const engineJobId = `${PREFIX}-continuation-engine`;

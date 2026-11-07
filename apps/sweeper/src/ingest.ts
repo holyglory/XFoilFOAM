@@ -1896,6 +1896,70 @@ async function currentRemoteRenderPointer(
   };
 }
 
+type EvidenceArtifactAssociation = Omit<StoredEvidenceArtifact, "id" | "createdAt">;
+
+function evidenceArtifactAssociation(
+  opts: Parameters<typeof registerEvidenceArtifacts>[0],
+): EvidenceArtifactAssociation | null {
+  const { engine, artifact, point, runtime } = opts;
+  const urlPath = artifact.url ?? artifact.path;
+  if (!urlPath) return null;
+  const knownKinds = ["manifest", "engine_bundle", "openfoam_bundle", "vtk_window", "time_directory",
+    "log", "force_coefficients", "mesh", "dictionary", "field_data", "frame_image"] as const;
+  const normalizedKind = artifact.kind === "mesh_evidence" ? "mesh" : artifact.kind;
+  const kind = knownKinds.find((knownKind) => knownKind === normalizedKind);
+  if (!kind) return null;
+  return {
+    resultId: opts.resultId ?? null,
+    resultAttemptId: opts.resultAttemptId ?? null,
+    airfoilId: opts.airfoilId,
+    simJobId: opts.simJobId,
+    engineJobId: opts.engineJobId,
+    engineCaseSlug: point.case_slug ?? null,
+    methodKey: point.method_key ?? null,
+    solverImplementationId: runtime?.solverImplementationId ?? null,
+    solverRuntimeBuildId: runtime?.solverRuntimeBuildId ?? null,
+    aoaDeg: point.aoa_deg,
+    kind,
+    field: artifact.field ?? null,
+    role: artifact.role ?? null,
+    storageKey: storageKeyOf(urlPath),
+    mimeType: artifact.mime_type,
+    sha256: artifact.sha256,
+    byteSize: artifact.byte_size,
+    engineUrl: `${engine.baseUrl}${urlPath.startsWith("/") ? "" : "/"}${urlPath}`,
+    metadata: artifact.kind === normalizedKind ? (artifact.metadata ?? {})
+      : { ...(artifact.metadata ?? {}), engineArtifactKind: artifact.kind },
+  };
+}
+
+function sameEvidenceArtifactAssociation(
+  stored: StoredEvidenceArtifact,
+  association: EvidenceArtifactAssociation,
+): boolean {
+  return (["resultId", "resultAttemptId", "airfoilId", "simJobId", "engineJobId", "engineCaseSlug",
+    "methodKey", "solverImplementationId", "solverRuntimeBuildId", "aoaDeg", "kind", "field", "role",
+    "storageKey", "mimeType", "sha256", "byteSize", "engineUrl"] as const)
+    .every((field) => stored[field] === association[field]) &&
+    stableHash(stored.metadata ?? {}) === stableHash(association.metadata);
+}
+
+function evidenceArtifactAssociationIdentity(association: EvidenceArtifactAssociation) {
+  return and(
+    sql`${solverEvidenceArtifacts.resultAttemptId} IS NOT DISTINCT FROM ${association.resultAttemptId}::uuid`,
+    eq(solverEvidenceArtifacts.kind, association.kind),
+    sql`${solverEvidenceArtifacts.field} IS NOT DISTINCT FROM ${association.field}`,
+    sql`${solverEvidenceArtifacts.role} IS NOT DISTINCT FROM ${association.role}`,
+    eq(solverEvidenceArtifacts.storageKey, association.storageKey),
+    eq(solverEvidenceArtifacts.sha256, association.sha256),
+  );
+}
+
+function evidenceArtifactAssociationKey(association: EvidenceArtifactAssociation): string {
+  return JSON.stringify([association.resultAttemptId, association.kind, association.field,
+    association.role, association.storageKey, association.sha256]);
+}
+
 export async function registerEvidenceArtifacts(opts: {
   db: DB;
   engine: EngineClient;
@@ -1918,41 +1982,16 @@ export async function registerEvidenceArtifacts(opts: {
     engine,
     resultId,
     resultAttemptId,
-    airfoilId,
-    simJobId,
     engineJobId,
     point,
     artifact,
-    runtime,
     transaction,
     archiveContext,
   } = opts;
   const urlPath = artifact.url ?? artifact.path;
   if (!urlPath) return null;
-  const storageKey = storageKeyOf(urlPath);
-  const knownKinds = [
-    "manifest",
-    "engine_bundle",
-    "openfoam_bundle",
-    "vtk_window",
-    "time_directory",
-    "log",
-    "force_coefficients",
-    "mesh",
-    "dictionary",
-    "field_data",
-    // Per-frame URANS PNGs (frame-track contract, FRAME_IMAGE_ARTIFACT_KIND).
-    "frame_image",
-  ] as const;
-  // The engine's shared-mesh bundle is genuine, immutable mesh evidence. The
-  // database currently has the broader `mesh` enum rather than a separate
-  // `mesh_evidence` enum, so retain it under that truthful parent kind and
-  // preserve the engine's exact label in metadata for provenance.
-  const originalKind = artifact.kind;
-  const normalizedKind =
-    originalKind === "mesh_evidence" ? "mesh" : originalKind;
-  const kind = knownKinds.find((k) => k === normalizedKind);
-  if (!kind) {
+  const association = evidenceArtifactAssociation(opts);
+  if (!association) {
     // Loud skip instead of a pg enum error that would abort the WHOLE ingest:
     // one unknown artifact kind from a newer engine must not cost the point's
     // coefficients, media, and every other artifact.
@@ -1961,6 +2000,7 @@ export async function registerEvidenceArtifacts(opts: {
     );
     return null;
   }
+  const { storageKey, kind } = association;
   const gcsBundle = parseVerifiedGcsEvidenceBundle(kind, artifact);
   if (gcsBundle && (!resultId || !resultAttemptId)) {
     throw new Error(
@@ -1987,30 +2027,6 @@ export async function registerEvidenceArtifacts(opts: {
         );
       }
     }
-    const association = {
-      resultId: resultId ?? null,
-      resultAttemptId: resultAttemptId ?? null,
-      airfoilId,
-      simJobId,
-      engineJobId,
-      engineCaseSlug: point.case_slug ?? null,
-      methodKey: point.method_key ?? null,
-      solverImplementationId: runtime?.solverImplementationId ?? null,
-      solverRuntimeBuildId: runtime?.solverRuntimeBuildId ?? null,
-      aoaDeg: point.aoa_deg,
-      kind,
-      field: artifact.field ?? null,
-      role: artifact.role ?? null,
-      storageKey,
-      mimeType: artifact.mime_type,
-      sha256: artifact.sha256,
-      byteSize: artifact.byte_size,
-      engineUrl: `${engine.baseUrl}${urlPath.startsWith("/") ? "" : "/"}${urlPath}`,
-      metadata:
-        originalKind === normalizedKind
-          ? (artifact.metadata ?? {})
-          : { ...(artifact.metadata ?? {}), engineArtifactKind: originalKind },
-    };
     if (kind === "manifest" && resultAttemptId) {
       const existingManifests = await writeDb
         .select()
@@ -2029,29 +2045,7 @@ export async function registerEvidenceArtifacts(opts: {
       }
       const existingManifest = existingManifests[0];
       if (existingManifest) {
-        const exactReplay =
-          existingManifest.resultId === association.resultId &&
-          existingManifest.resultAttemptId === association.resultAttemptId &&
-          existingManifest.airfoilId === association.airfoilId &&
-          existingManifest.simJobId === association.simJobId &&
-          existingManifest.engineJobId === association.engineJobId &&
-          existingManifest.engineCaseSlug === association.engineCaseSlug &&
-          existingManifest.methodKey === association.methodKey &&
-          existingManifest.solverImplementationId ===
-            association.solverImplementationId &&
-          existingManifest.solverRuntimeBuildId ===
-            association.solverRuntimeBuildId &&
-          existingManifest.aoaDeg === association.aoaDeg &&
-          existingManifest.field === association.field &&
-          existingManifest.role === association.role &&
-          existingManifest.storageKey === association.storageKey &&
-          existingManifest.mimeType === association.mimeType &&
-          existingManifest.sha256 === association.sha256 &&
-          existingManifest.byteSize === association.byteSize &&
-          existingManifest.engineUrl === association.engineUrl &&
-          stableHash(existingManifest.metadata ?? {}) ===
-            stableHash(association.metadata);
-        if (!exactReplay) {
+        if (!sameEvidenceArtifactAssociation(existingManifest, association)) {
           throw new Error(
             `manifest replay changed immutable association metadata for attempt ${resultAttemptId}`,
           );
@@ -2092,37 +2086,11 @@ export async function registerEvidenceArtifacts(opts: {
       [storedArtifact] = await writeDb
         .select()
         .from(solverEvidenceArtifacts)
-        .where(
-          and(
-            resultAttemptId
-              ? eq(solverEvidenceArtifacts.resultAttemptId, resultAttemptId)
-              : sql`${solverEvidenceArtifacts.resultAttemptId} IS NULL`,
-            eq(solverEvidenceArtifacts.kind, kind),
-            sql`${solverEvidenceArtifacts.field} IS NOT DISTINCT FROM ${association.field}`,
-            sql`${solverEvidenceArtifacts.role} IS NOT DISTINCT FROM ${association.role}`,
-            eq(solverEvidenceArtifacts.storageKey, storageKey),
-            eq(solverEvidenceArtifacts.sha256, artifact.sha256),
-          ),
-        )
+        .where(evidenceArtifactAssociationIdentity(association))
         .limit(1);
       if (
         !storedArtifact ||
-        storedArtifact.resultId !== association.resultId ||
-        storedArtifact.airfoilId !== association.airfoilId ||
-        storedArtifact.simJobId !== association.simJobId ||
-        storedArtifact.engineJobId !== association.engineJobId ||
-        storedArtifact.engineCaseSlug !== association.engineCaseSlug ||
-        storedArtifact.methodKey !== association.methodKey ||
-        storedArtifact.solverImplementationId !==
-          association.solverImplementationId ||
-        storedArtifact.solverRuntimeBuildId !==
-          association.solverRuntimeBuildId ||
-        storedArtifact.aoaDeg !== association.aoaDeg ||
-        storedArtifact.mimeType !== association.mimeType ||
-        storedArtifact.byteSize !== association.byteSize ||
-        storedArtifact.engineUrl !== association.engineUrl ||
-        stableHash(storedArtifact.metadata ?? {}) !==
-          stableHash(association.metadata)
+        !sameEvidenceArtifactAssociation(storedArtifact, association)
       ) {
         throw new Error(
           `evidence artifact replay changed immutable association metadata for attempt ${resultAttemptId ?? "unbound"} (${kind}/${artifact.field ?? ""}/${artifact.role ?? ""})`,
@@ -2226,6 +2194,53 @@ export async function registerEvidenceArtifacts(opts: {
 
 const EVIDENCE_ARTIFACT_TRANSACTION_BATCH_SIZE = 64;
 
+async function exactExistingEvidenceArtifacts(
+  transaction: DB,
+  base: Omit<Parameters<typeof registerEvidenceArtifacts>[0], "artifact" | "transaction">,
+  artifacts: readonly EngineEvidenceArtifact[],
+  archiveContext: Exclude<Parameters<typeof registerEvidenceArtifacts>[0]["archiveContext"], undefined>,
+): Promise<Set<EngineEvidenceArtifact>> {
+  const exact = new Set<EngineEvidenceArtifact>();
+  if (artifacts.length > EVIDENCE_ARTIFACT_TRANSACTION_BATCH_SIZE) return exact;
+  const candidates = artifacts.flatMap((artifact) => {
+    const association = evidenceArtifactAssociation({ ...base, artifact });
+    return association ? [{ artifact, association }] : [];
+  });
+  if (!candidates.length) return exact;
+  const existing = await transaction.select({ artifact: solverEvidenceArtifacts,
+    memberPath: solverEvidenceArtifactMembers.memberPath })
+    .from(solverEvidenceArtifacts)
+    .leftJoin(solverEvidenceArtifactMembers, and(
+      eq(solverEvidenceArtifactMembers.artifactId, solverEvidenceArtifacts.id),
+      sql`${solverEvidenceArtifactMembers.archiveId} = ${archiveContext?.archive.id ?? null}::uuid`,
+    ))
+    .where(or(...candidates.map(({ association }) => evidenceArtifactAssociationIdentity(association))))
+    .limit(EVIDENCE_ARTIFACT_TRANSACTION_BATCH_SIZE + 1);
+  if (existing.length > EVIDENCE_ARTIFACT_TRANSACTION_BATCH_SIZE) return exact;
+  const byIdentity = new Map<string, typeof existing>();
+  for (const row of existing) {
+    const key = evidenceArtifactAssociationKey(row.artifact);
+    const matches = byIdentity.get(key) ?? [];
+    matches.push(row);
+    byIdentity.set(key, matches);
+  }
+  for (const { artifact, association } of candidates) {
+    const matches = byIdentity.get(evidenceArtifactAssociationKey(association));
+    if (matches?.length !== 1 || !sameEvidenceArtifactAssociation(matches[0].artifact, association)) continue;
+    if (archiveContext && ARCHIVED_EVIDENCE_MEMBER_KINDS.has(association.kind)) {
+      if (association.resultId !== archiveContext.archive.resultId ||
+        association.resultAttemptId !== archiveContext.archive.resultAttemptId) continue;
+      artifactEvidenceBase(matches[0].artifact, archiveContext.evidenceBase);
+      const memberPath = artifact.path
+        ? archiveMemberPathFromArtifactPath(archiveContext.evidenceBase, artifact.path)
+        : archiveMemberPathFromStoredArtifact(archiveContext.evidenceBase, association.storageKey);
+      if (matches[0].memberPath !== memberPath) continue;
+    }
+    exact.add(artifact);
+  }
+  return exact;
+}
+
 async function registerEvidenceArtifactsBatch(
   base: Omit<
     Parameters<typeof registerEvidenceArtifacts>[0],
@@ -2322,8 +2337,11 @@ async function registerEvidenceArtifactsBatch(
               base.resultAttemptId,
             )
           : null;
+      const exactExisting = archiveContext === undefined ? new Set<EngineEvidenceArtifact>()
+        : await exactExistingEvidenceArtifacts(transaction, base, batch, archiveContext);
       const registered: PendingRemoteEvidenceCleanup[] = [];
       for (const artifact of batch) {
+        if (exactExisting.has(artifact)) continue;
         const cleanup = await registerEvidenceArtifacts({
           ...base,
           artifact,

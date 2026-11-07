@@ -488,6 +488,16 @@ reports to be staged. The selected sequence is passed through the claim boundary
 the stager must not rediscover an earlier deferred report. Successful staging
 clears only its own retry record.
 
+Replaying artifact metadata keeps the existing 64-item transaction boundary and
+deterministic artifact/result locks. Nonstructural artifacts already present may
+reuse a bounded exact association lookup instead of repeating individual no-op
+inserts and reads. The same full ownership, provenance, hash, size, MIME, URL and
+metadata comparison applies to both paths. Missing or changed associations still
+take the normal registration or refusal path. Current archives additionally
+require the exact member path; a metadata match without an archive is not proof of
+custody. Manifests and bundles retain their structural validation and cleanup
+obligations, and report staging is acknowledged only after all required work.
+
 ### Operator recovery of storage-only campaign evidence
 
 Recovery is an explicit hub operator action. Set
