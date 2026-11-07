@@ -154,6 +154,30 @@ it("releases admission CPU after the producer stops while retaining remote custo
     `);
     expect(await readReservations()).toEqual([4, 0]);
 
+    for (const promiseStatus of ["expired", "cancelled", "fulfilled"]) {
+      await transaction.execute(sql`UPDATE sync_sweep_promises SET status=${promiseStatus},
+        "expiresAt"=clock_timestamp()-interval '1 second' WHERE id=${promiseId}::uuid`);
+      for (const status of ["running", "done", "failed", "cancelled"]) {
+        await transaction.execute(sql`UPDATE sim_jobs SET status=${status},
+          engine_state=${status === "done" ? "completed" : status} WHERE id=${jobId}::uuid`);
+        expect(await readReservations()).toEqual([4, 0]);
+      }
+    }
+    await transaction.execute(sql`INSERT INTO progressive_cfd_execution_stops(sim_job_id,engine_job_id)
+      VALUES(${jobId}::uuid,'unrelated-engine')`);
+    expect(await readReservations()).toEqual([4, 0]);
+    await transaction.execute(sql`DELETE FROM progressive_cfd_execution_stops`);
+    await transaction.execute(sql`INSERT INTO progressive_cfd_execution_stops(sim_job_id,engine_job_id)
+      VALUES(${foreign}::uuid,${jobId})`);
+    expect(await readReservations()).toEqual([4, 0]);
+    await transaction.execute(sql`DELETE FROM progressive_cfd_execution_stops`);
+    await transaction.execute(sql`INSERT INTO progressive_cfd_execution_stops(sim_job_id,engine_job_id)
+      VALUES(${jobId}::uuid,${jobId})`);
+    expect(await readReservations()).toEqual([0, 0]);
+    await transaction.execute(sql`DELETE FROM progressive_cfd_execution_stops`);
+    await transaction.execute(sql`UPDATE sync_sweep_promises SET status='active',
+      "expiresAt"=clock_timestamp()+interval '1 hour' WHERE id=${promiseId}::uuid`);
+
     await transaction.execute(sql`
       UPDATE sim_jobs SET status = 'cancelled', engine_state = 'cancel_pending'
       WHERE id = ${jobId}::uuid

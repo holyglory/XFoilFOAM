@@ -589,11 +589,6 @@ warning remains unchanged. Missing, new or ambiguous sources use normal ingestio
 Reuse records only the new report receipt and associations under the same ingest
 lease. It never modifies solver coefficients, accepted status, artifacts or existing
 receipts, and a lost lease cannot publish the new receipt.
-Within one staging operation, source lookup uses a private immutable snapshot of
-the complete report instead of hashing every source again for each lookup.
-Previously staged reports are authenticated once per exact sequence and signature
-within that operation. The index is never shared across calls; changed inputs,
-competing source generations and lost ownership still require fresh validation.
 Artifact replay acquires the same transaction-scoped artifact locks in batches of
 at most 64 with one database request per batch. The existing JavaScript key order
 is carried into SQL as explicit ordinals; artifact locks still precede result

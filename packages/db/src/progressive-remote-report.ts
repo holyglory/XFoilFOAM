@@ -77,15 +77,14 @@ export function progressiveReportedPointSources(result: JobResult) {
   ];
 }
 
-interface ProgressiveReportedPointCell {
-  alpha: number;
-  speed: number;
-  chord: number;
-  caseSlug: string | null;
-}
-
-function assertProgressiveReportedPointCell(
-  input: ProgressiveReportedPointCell,
+export function resolveProgressiveReportedPoint(
+  result: JobResult,
+  input: {
+    alpha: number;
+    speed: number;
+    chord: number;
+    caseSlug: string | null;
+  },
 ) {
   if (
     ![input.alpha, input.speed, input.chord].every(Number.isFinite) ||
@@ -93,15 +92,7 @@ function assertProgressiveReportedPointCell(
     input.speed < 0
   )
     throw new Error("Reported point requires an exact finite physical cell");
-}
-
-function resolveProgressiveReportedPointSources(
-  sources: ReadonlyArray<
-    ReturnType<typeof progressiveReportedPointSources>[number]
-  >,
-  input: ProgressiveReportedPointCell,
-) {
-  const candidates = sources.filter(
+  const candidates = progressiveReportedPointSources(result).filter(
     ({ polar, point }) =>
       polar.chord === input.chord &&
       polar.speed === input.speed &&
@@ -116,37 +107,6 @@ function resolveProgressiveReportedPointSources(
       "Reported point is missing or has competing source generations",
     );
   return [...unique.values()][0];
-}
-
-export function createProgressiveReportedPointIndex(result: JobResult) {
-  const snapshot = structuredClone(result);
-  const sources = progressiveReportedPointSources(snapshot);
-  const freeze = (value: unknown): void => {
-    if (value === null || typeof value !== "object" || Object.isFrozen(value))
-      return;
-    for (const child of Object.values(value)) freeze(child);
-    Object.freeze(value);
-  };
-  freeze(snapshot);
-  freeze(sources);
-  return Object.freeze({
-    sources: sources as ReadonlyArray<(typeof sources)[number]>,
-    resolve(input: ProgressiveReportedPointCell) {
-      assertProgressiveReportedPointCell(input);
-      return resolveProgressiveReportedPointSources(sources, input);
-    },
-  });
-}
-
-export function resolveProgressiveReportedPoint(
-  result: JobResult,
-  input: ProgressiveReportedPointCell,
-) {
-  assertProgressiveReportedPointCell(input);
-  return resolveProgressiveReportedPointSources(
-    progressiveReportedPointSources(result),
-    input,
-  );
 }
 
 export function isFinalProgressiveRemoteReport(

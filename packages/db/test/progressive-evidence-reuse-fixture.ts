@@ -386,23 +386,7 @@ export async function verifyProgressiveEvidenceReuse(
           replay.sequence += 1;
           replay.result!.polars[0].points.push(...replay.result!.polars[0].attempts!.map(point => structuredClone(point)));
           await append(replay);
-          let previousReportReads = 0;
-          const measured = new Proxy(scoped, {
-            get(target, property, receiver) {
-              if (property === "execute") return async (query: Parameters<DB["execute"]>[0]) => {
-                const rows = await target.execute(query);
-                return rows.map(row => new Proxy(row, {
-                  get(value, field, receiver) {
-                    if (field === "report") previousReportReads += 1;
-                    return Reflect.get(value, field, receiver);
-                  },
-                }));
-              };
-              return Reflect.get(target, property, receiver);
-            },
-          });
-          expect(await existingProgressiveReportAttempts(measured, replay, envelope)).toEqual(staged.resultAttemptIds);
-          expect(previousReportReads).toBe(1);
+          expect(await existingProgressiveReportAttempts(scoped, replay, envelope)).toEqual(staged.resultAttemptIds);
           const changedSource = structuredClone(replay);
           changedSource.result!.polars[0].points[1].cl = 0.75;
           expect(await existingProgressiveReportAttempts(scoped, changedSource, envelope)).toBeNull();
@@ -439,7 +423,7 @@ export async function verifyProgressiveEvidenceReuse(
           expect(associated.map(row => row.point_content_signature).sort()).toEqual(
             progressiveReportedPointSources(replay.result!).map(source => source.contentSignature).sort(),
           );
-          console.info(JSON.stringify({ cumulativeSources: 2, previousReportValidations: previousReportReads,
+          console.info(JSON.stringify({ cumulativeSources: 2,
             duplicateListingsConserved: true, changedSourceRejected: true, leaseLossUnpublished: true, exactRowsConserved: true }));
           throw rollbackCumulative;
         }),

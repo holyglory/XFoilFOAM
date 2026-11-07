@@ -279,6 +279,15 @@ export async function verifyProgressiveWorkerArchiveDelivery(
           brokerVerified = true;
           return Response.json({ id: uploadId, state: "verified", remote });
         }
+        if (new URL(url).pathname === `/api/sync/v1/evidence-uploads/${uploadId}/custody`) {
+          expect(init?.method).toBe("POST");
+          expect(JSON.parse(String(init?.body))).toEqual({});
+          expect(rejectReceipt).toBe(true);
+          return Response.json(
+            { error: "exact bound progressive custody is unavailable" },
+            { status: 409 },
+          );
+        }
         expect(url.endsWith("/polars")).toBe(true);
         const bytes = await consume(init?.body);
         expect(bytes.byteLength).toBe(

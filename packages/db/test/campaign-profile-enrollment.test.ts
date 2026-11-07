@@ -5853,6 +5853,34 @@ describe("progressive CPU admission", () => {
         expect(await progressiveRemoteAdmissionReservedSlots(db, solverId)).toBe(
           0,
         );
+        const restoreBound = new Error("Restore physical reservation stop fixture");
+        await expect(db.transaction(async transaction => {
+          const connection = transaction as unknown as DB;
+          await connection.execute(sql`UPDATE sim_jobs SET engine_job_id=${job.id},engine_state='running'
+            WHERE id=${job.id}::uuid`);
+          for (const promiseStatus of ["expired", "cancelled"]) {
+            await connection.execute(sql`UPDATE sync_sweep_promises SET status=${promiseStatus}
+              WHERE id=${promiseId}::uuid`);
+            for (const status of ["running", "done", "failed", "cancelled"]) {
+              await connection.execute(sql`UPDATE sim_jobs SET status=${status},
+                engine_state=${status === "done" ? "completed" : status} WHERE id=${job.id}::uuid`);
+              expect(await progressiveRemoteReservedSlots(connection, solverId)).toBe(1);
+              expect(await progressiveRemoteAdmissionReservedSlots(connection, solverId)).toBe(0);
+            }
+          }
+          await expect(acknowledgeProgressiveCfdExecutionStop(connection, {
+            simJobId: job.id,
+            proof: executionStopProof(randomUUID()),
+          })).rejects.toThrow("does not belong");
+          expect(await progressiveRemoteReservedSlots(connection, solverId)).toBe(1);
+          await acknowledgeProgressiveCfdExecutionStop(connection, {
+            simJobId: job.id,
+            proof: executionStopProof(job.id),
+          });
+          expect(await progressiveRemoteReservedSlots(connection, solverId)).toBe(0);
+          expect(await progressiveRemoteAdmissionReservedSlots(connection, solverId)).toBe(0);
+          throw restoreBound;
+        })).rejects.toBe(restoreBound);
         await db.execute(sql`
           UPDATE progressive_cfd_units
           SET lease_until = clock_timestamp() - interval '1 second'

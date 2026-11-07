@@ -4760,7 +4760,7 @@ requires = ["artifact-metadata-replay"]
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/solver-evidence-object-storage-migration.test.ts"]
 
 [[test.solver-throughput-recovery.check]]
-name = "report-source-index"
+name = "report-contracts"
 tier = "development"
 requires = ["artifact-locking"]
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/progressive-remote-report.test.ts"]
@@ -4768,7 +4768,7 @@ command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vites
 [[test.solver-throughput-recovery.check]]
 name = "cumulative-evidence-reuse"
 tier = "development"
-requires = ["report-source-index"]
+requires = ["report-contracts"]
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "progressive remote dispatch pins one exact request"]
 
 [[test.solver-throughput-recovery.check]]

@@ -287,11 +287,18 @@ export async function verifyProgressiveWorkerReportDelivery(
       getExecutionStopProof: vi.fn(),
     };
     const reconcile = (jobIds = [executionId]) =>
-      reconcileProgressiveRemoteWorker(
-        db,
-        observedEngine as unknown as EngineClient,
-        { jobIds },
-      );
+      db.transaction(async transaction => {
+        const connection = transaction as unknown as DB;
+        await connection.execute(sql`CREATE TEMP TABLE progressive_remote_dispatches
+          (LIKE public.progressive_remote_dispatches INCLUDING DEFAULTS) ON COMMIT DROP`);
+        await connection.execute(sql`INSERT INTO progressive_remote_dispatches
+          SELECT * FROM public.progressive_remote_dispatches WHERE sim_job_id<>${executionId}::uuid`);
+        return reconcileProgressiveRemoteWorker(
+          connection,
+          observedEngine as unknown as EngineClient,
+          { jobIds },
+        );
+      });
     for (const [status, engineState] of [
       ["pending", "pending"],
       ["submitted", "pending"],
@@ -304,6 +311,11 @@ export async function verifyProgressiveWorkerReportDelivery(
         UPDATE sim_jobs SET status = ${status}, engine_state = ${engineState}
         WHERE id = ${executionId}::uuid
       `);
+      expect(await reconcileProgressiveRemoteWorker(
+        db,
+        observedEngine as unknown as EngineClient,
+        { jobIds: [executionId] },
+      )).toMatchObject({ inspected: 0, reported: 0, stopped: 0, errors: [] });
       expect(await reconcile([randomUUID()])).toMatchObject({
         inspected: 0,
         reported: 0,
@@ -496,7 +508,7 @@ export async function verifyProgressiveWorkerReportDelivery(
         ).toEqual({ kind: "quarantined", sequence: 1 });
         expect(
           await connection.execute(
-            sql`SELECT sequence, reason FROM progressive_worker_report_conflicts
+            sql`SELECT sequence::integer AS sequence, reason FROM progressive_worker_report_conflicts
             WHERE sim_job_id=${executionId}::uuid ORDER BY sequence`,
           ),
         ).toEqual([
