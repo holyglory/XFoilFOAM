@@ -263,14 +263,19 @@ it("prioritizes active remote reports before terminal ingestion backlog", async 
   });
 });
 
-it("reserves a bounded terminal lane while active report jobs keep arriving", async () => {
+it.each([
+  { reportCount: 1, activeCount: 12 },
+  { reportCount: 120, activeCount: 12 },
+  { reportCount: 1, activeCount: 80 },
+  { reportCount: 120, activeCount: 80 },
+])("reserves a bounded terminal lane with $activeCount active jobs and $reportCount reports each", async ({ reportCount, activeCount }) => {
   await client.db.transaction(async (transaction) => {
     await transaction.execute(sql`CREATE TEMP TABLE sim_jobs ON COMMIT DROP AS
       SELECT md5('active-' || ordinal)::uuid AS id, md5('campaign')::uuid AS campaign_id,
         md5('active-engine-' || ordinal)::text AS engine_job_id, 'running'::text AS status,
         clock_timestamp() AS "updatedAt", clock_timestamp() AS "polledAt",
         'running'::text AS engine_state
-      FROM generate_series(1, 12) ordinal
+      FROM generate_series(1, ${activeCount}) ordinal
       UNION ALL
       SELECT md5('terminal-' || ordinal)::uuid, md5('campaign')::uuid,
         md5('terminal-' || ordinal)::text, 'cancelled'::text,
@@ -282,7 +287,7 @@ it("reserves a bounded terminal lane while active report jobs keep arriving", as
     await transaction.execute(sql`CREATE TEMP TABLE progressive_remote_reports ON COMMIT DROP AS
       SELECT job.id AS sim_job_id, sequence, clock_timestamp() -
         CASE WHEN job.status = 'cancelled' THEN interval '1 hour' ELSE interval '1 minute' END AS received_at
-      FROM sim_jobs job CROSS JOIN generate_series(1, 120) sequence`);
+      FROM sim_jobs job CROSS JOIN generate_series(1, ${reportCount}) sequence`);
     await transaction.execute(sql`CREATE TEMP TABLE progressive_remote_progress_receipts (
       sim_job_id uuid, sequence bigint
     ) ON COMMIT DROP`);
@@ -302,11 +307,11 @@ it("reserves a bounded terminal lane while active report jobs keep arriving", as
       ),
     );
 
-    expect(selected).toHaveLength(17);
+    expect(selected).toHaveLength(Math.min(activeCount + 5, 64));
     expect(selected.slice(0, 6).every((row) => activeIds.has(row.sim_job_id))).toBe(true);
     expect(selected.slice(6, 8).every((row) => terminalIds.has(row.sim_job_id))).toBe(true);
     expect(selected.slice(0, 8).some((row) => terminalIds.has(row.sim_job_id))).toBe(true);
-    expect(selected).toEqual(
+    if (activeCount + 5 <= 64) expect(selected).toEqual(
       expect.arrayContaining(
         [...terminalIds].map((sim_job_id) => ({
           sim_job_id,
@@ -314,6 +319,16 @@ it("reserves a bounded terminal lane while active report jobs keep arriving", as
         })),
       ),
     );
+    await transaction.execute(sql`INSERT INTO progressive_remote_progress_receipts
+      SELECT report.sim_job_id,report.sequence FROM progressive_remote_reports report
+      JOIN sim_jobs job ON job.id=report.sim_job_id WHERE job.status='cancelled'`);
+    await transaction.execute(sql`INSERT INTO progressive_remote_report_inventories
+      SELECT report.sim_job_id,report.sequence FROM progressive_remote_reports report
+      JOIN sim_jobs job ON job.id=report.sim_job_id WHERE job.status='cancelled'`);
+    const activeOnly = await transaction.execute(progressiveReportJobsSql());
+    expect(activeOnly).toHaveLength(Math.min(activeCount, 64));
+    expect(activeOnly.slice(0, 8).every((row) => activeIds.has(row.sim_job_id))).toBe(true);
+    expect(activeOnly.some((row) => terminalIds.has(row.sim_job_id))).toBe(false);
   });
 });
 
@@ -601,11 +616,24 @@ it("settles fulfilled and active jobs fairly while expired work keeps arriving",
     const visited = new Set([...first, ...second].map((row) => row.sim_job_id));
     const terminalRows =
       await transaction.execute(sql`SELECT id FROM fixture_settlement_jobs
-      WHERE variant IN ('fulfilled','active','done-closed-evidence') OR variant LIKE 'expired-%'`);
+      WHERE variant IN ('fulfilled','active') OR variant LIKE 'expired-%'`);
     expect([...visited].sort()).toEqual(
       terminalRows.map((row) => row.id).sort(),
     );
-    expect(visited.size).toBe(163);
+    expect(visited.size).toBe(162);
+    const drained = new Error("Restore completed high-priority ingestion fixture");
+    await transaction.transaction(async (nested) => {
+      await nested.execute(sql`UPDATE sim_jobs job SET status='done'
+        FROM fixture_settlement_jobs fixture WHERE fixture.id=job.id
+          AND (fixture.variant IN ('fulfilled','active') OR fixture.variant LIKE 'expired-%')`);
+      await nested.execute(sql`UPDATE sync_sweep_promises SET status='fulfilled' WHERE id=md5('active')::uuid`);
+      const remaining = await nested.execute(progressiveSettlementJobsSql());
+      const expectedRemaining = await nested.execute(sql`SELECT id AS sim_job_id FROM fixture_settlement_jobs
+        WHERE variant IN ('stopped-running','done-active','done-closed-pointer-gap','done-closed-evidence','unapplied','unindexed')
+          OR variant LIKE 'report-%' ORDER BY id`);
+      expect(remaining.map((row) => row.sim_job_id).sort()).toEqual(expectedRemaining.map((row) => row.sim_job_id));
+      throw drained;
+    }).catch((error) => { if (error !== drained) throw error; });
     const nextReports = await transaction.execute(progressiveReportJobsSql());
     expect(nextReports).toHaveLength(allReports.length - reports.length);
     expect(nextReports).toEqual(await expectedReports());
@@ -698,6 +726,7 @@ it("resumes due archive retries and expired claims before untouched work while p
       "due-retry",
       "ordinary",
       "unselected-accepted",
+      "selected-accepted",
       "storage-only-accepted-current",
       "reconcilable-accepted-current",
     ]) {
@@ -797,6 +826,7 @@ it("preserves exact eligible deliveries, active priority, fallback and cumulativ
     await transaction.execute(sql`CREATE TEMP TABLE progressive_worker_delivery_failures ON COMMIT DROP AS
       SELECT source.sim_job_id,source.point_content_signature,CASE WHEN variant='conflict' THEN 'conflict' ELSE 'retry' END AS state,
         CASE WHEN variant='conflict' THEN 'requires conflict review' ELSE 'transient timeout' END AS last_error,
+        CASE WHEN variant='conflict' THEN 409 ELSE 503 END AS last_http_status,'[]'::jsonb AS remote_conflict_ids,
         CASE WHEN variant='future-retry' THEN clock_timestamp()+interval '1 day'
           WHEN variant='due-retry' THEN clock_timestamp()-interval '1 day' END AS retry_after
       FROM progressive_worker_evidence_attempts source JOIN fixture_jobs fixture ON fixture.id=source.sim_job_id

@@ -415,6 +415,7 @@ export async function reconcileProgressiveRemoteProgress(
         receipt.applied += batch.applied;
         receipt.indexed += batch.indexed;
         receipt.stopped += batch.stopped;
+        receipt.settled += batch.settled;
         receipt.errors.push(...batch.errors);
         receipt.waiting += batch.waiting;
       } catch (error) {

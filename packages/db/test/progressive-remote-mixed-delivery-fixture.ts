@@ -26,7 +26,8 @@ import {
   assertProgressivePolarImportScope,
   prepareProgressivePolarImport,
 } from "../../../apps/api/src/progressive-polar-import";
-import { applyProgressiveRemoteProgress } from "../../../apps/sweeper/src/progressive-remote-progress";
+import { applyProgressiveRemoteProgress, reconcileProgressiveRemoteProgress } from "../../../apps/sweeper/src/progressive-remote-progress";
+import { refreshPolarClassificationsForJob } from "../src/polar-cache";
 import { settleProgressiveRemoteJob } from "../../../apps/sweeper/src/progressive-remote-settlement";
 import { progressiveRemoteEvidenceResult } from "./progressive-remote-evidence-fixture";
 import { verifyDiagnosticWorkerDrain } from "./progressive-diagnostic-worker-drain-fixture";
@@ -36,7 +37,7 @@ export async function verifyMixedProgressiveRemoteDelivery(
   db: DB,
   envelope: ProgressiveRemoteExecutionEnvelope,
 ) {
-  for (const sibling of ["material", "physical", "infrastructure", "same-angle"] as const)
+  for (const sibling of ["material", "physical", "infrastructure", "hard_solver", "history", "omitted", "same-angle"] as const)
     await exerciseMixedProgressiveRemoteDelivery(db, envelope, sibling);
   await verifySettledRemoteMaterialDiagnostics(db, envelope);
 }
@@ -118,10 +119,10 @@ async function verifySettledRemoteMaterialDiagnostics(
 async function exerciseMixedProgressiveRemoteDelivery(
   db: DB,
   envelope: ProgressiveRemoteExecutionEnvelope,
-  sibling: "material" | "physical" | "infrastructure" | "same-angle",
+  sibling: "material" | "physical" | "infrastructure" | "hard_solver" | "history" | "omitted" | "same-angle",
 ) {
   const rollback = new Error("Restore isolated mixed remote delivery");
-  await expect(db.transaction(async (transaction) => {
+  await db.transaction(async (transaction) => {
     const connection = transaction as unknown as DB;
     const executionId = envelope.scope.executionId;
     expect(envelope.scope.units).toHaveLength(2);
@@ -143,12 +144,14 @@ async function exerciseMixedProgressiveRemoteDelivery(
       cd: null,
       cm: null,
       converged: false,
-      failure_disposition: sibling === "infrastructure" ? "infrastructure" as const : "material_domain" as const,
+      failure_disposition: sibling === "infrastructure" || sibling === "history" ? "infrastructure" as const
+        : sibling === "hard_solver" ? "hard_solver" as const : "material_domain" as const,
       error: "MaterialDomainError: isolated native temperature clamp",
       evidence_artifacts: [],
+      ...(sibling === "history" ? { force_history: { t: [0, 1], cl: [0.1, 0.2], cd: [0.01, 0.02], cm: [0, 0] } } : {}),
     };
     polar.points = [physical];
-    polar.attempts = [diagnostic];
+    polar.attempts = sibling === "omitted" ? [] : [diagnostic];
     result.state = "completed";
     const report: ProgressiveRemoteReport = {
       version: 1,
@@ -161,7 +164,7 @@ async function exerciseMixedProgressiveRemoteDelivery(
         job_id: executionId,
         state: "completed",
         total_cases: 2,
-        completed_cases: 2,
+        completed_cases: sibling === "omitted" ? 1 : 2,
       },
       result,
       stopProof: {
@@ -210,10 +213,18 @@ async function exerciseMixedProgressiveRemoteDelivery(
       FROM progressive_cfd_attempts attempt JOIN progressive_cfd_units unit ON unit.id=attempt.unit_id
       WHERE attempt.sim_job_id=${executionId}::uuid ORDER BY unit.aoa_deg`);
     const inventory = progressiveRemoteReportInventory(historyReport);
+    if (sibling === "omitted") {
+      expect(inventory.sources).toHaveLength(1);
+      await expect(assertProgressiveCfdEvidenceJob(connection, executionId, executionId, [{
+        alpha: physical.aoa_deg, speed: polar.speed, chord: polar.chord, solverActiveSeconds: physical.solver_active_seconds,
+      }])).rejects.toThrow("Obsolete or settled progressive CFD execution scope");
+      expect(await connection.execute(sql`SELECT id FROM result_attempts WHERE sim_job_id=${executionId}::uuid`)).toHaveLength(0);
+      throw rollback;
+    }
     const source = inventory.sources.find((entry) => entry.case_slug === physical.case_slug)!;
     const diagnosticSource = inventory.sources.find((entry) => entry.case_slug === diagnostic.case_slug)!;
     expect([...terminalReportNoPhysicalEvidenceSignatures(completedWithDiagnostic)]).toEqual(
-      sibling !== "physical" ? [diagnosticSource.point_content_signature] : [],
+      sibling !== "physical" && sibling !== "history" ? [diagnosticSource.point_content_signature] : [],
     );
     if (sibling === "material") for (const changed of [
       { ...diagnostic, cl: 0.1 },
@@ -229,7 +240,7 @@ async function exerciseMixedProgressiveRemoteDelivery(
     }
     expect(await readProgressiveRemoteRetention(connection, executionId)).toMatchObject({
       kind: "waiting", reason: "raw_evidence", sourceCount: 2,
-      pendingCount: sibling !== "physical" ? 1 : 2,
+      pendingCount: sibling !== "physical" && sibling !== "history" ? 1 : 2,
     });
     const delivery = {
       solverId: envelope.solverId,
@@ -264,7 +275,7 @@ async function exerciseMixedProgressiveRemoteDelivery(
       });
       throw rollback;
     }
-    if (sibling !== "material") {
+    if (sibling === "physical" || sibling === "history") {
       await expect(assertProgressivePolarImportScope(connection, prepared)).rejects.toThrow();
       expect(await connection.execute(sql`SELECT result_attempt_id FROM progressive_remote_evidence_receipts
         WHERE sim_job_id=${executionId}::uuid`)).toHaveLength(0);
@@ -304,14 +315,24 @@ async function exerciseMixedProgressiveRemoteDelivery(
         WHERE sim_job_id=${executionId}::uuid AND sequence=1`,
       sql`UPDATE sim_jobs SET request_payload=jsonb_set(request_payload,'{progressive,tokens}',${JSON.stringify([randomUUID(), randomUUID()])}::jsonb)
         WHERE id=${executionId}::uuid`,
+      sql`DELETE FROM progressive_cfd_execution_stops WHERE sim_job_id=${executionId}::uuid`,
+      sql`INSERT INTO progressive_cfd_attempts
+        (token,unit_id,owner,execution_recipe_id,started_at,lease_until,outcome)
+        SELECT ${randomUUID()}::uuid,attempt.unit_id,'newer diagnostic owner',attempt.execution_recipe_id,
+          attempt.started_at+interval '1 second',clock_timestamp(),'failed'
+        FROM progressive_cfd_attempts attempt JOIN progressive_cfd_units unit ON unit.id=attempt.unit_id
+        WHERE attempt.sim_job_id=${executionId}::uuid AND unit.aoa_deg=${diagnostic.aoa_deg}`,
+      ...(sibling === "material" ? [] : [sql`UPDATE progressive_cfd_units SET lease_owner='foreign diagnostic owner'
+        WHERE id IN(SELECT unit_id FROM progressive_cfd_attempts WHERE sim_job_id=${executionId}::uuid)
+          AND aoa_deg=${diagnostic.aoa_deg}`]),
     ]) {
       const restore = new Error("Restore rejected mixed delivery owner");
-      await expect(connection.transaction(async (nested) => {
+      await connection.transaction(async (nested) => {
         const scoped = nested as unknown as DB;
         await scoped.execute(mutation);
         await expect(assertProgressiveCfdEvidenceJob(scoped, executionId, executionId, [physicalCase])).rejects.toThrow();
         throw restore;
-      })).rejects.toBe(restore);
+      }).catch((error) => { if (error !== restore) throw error; });
     }
     const entry = prepared.get(physical.aoa_deg)!;
     const projection = progressiveRemotePointProjection(entry.source);
@@ -355,11 +376,16 @@ async function exerciseMixedProgressiveRemoteDelivery(
       evidencePayload: projection.evidencePayload,
       validForPolar: true,
     };
-    const [changedRaw] = await connection.insert(resultAttempts).values({ ...values, cl: 99, validForPolar: false }).returning();
-    await expect(recordProgressiveRemoteEvidenceReceipt(connection, {
-      ...delivery, resultAttemptId: changedRaw.id,
-    })).rejects.toThrow("reported source values");
-    await connection.delete(resultAttempts).where(eq(resultAttempts.id,changedRaw.id));
+    for (const changed of [
+      { cl: 99, validForPolar: false },
+      { status: "failed" as const, source: "queued" as const, converged: false, validForPolar: false },
+    ]) {
+      const [changedRaw] = await connection.insert(resultAttempts).values({ ...values, ...changed }).returning();
+      await expect(recordProgressiveRemoteEvidenceReceipt(connection, {
+        ...delivery, resultAttemptId: changedRaw.id,
+      })).rejects.toThrow("reported source values");
+      await connection.delete(resultAttempts).where(eq(resultAttempts.id,changedRaw.id));
+    }
     const [raw] = await connection.insert(resultAttempts).values(values).returning();
     if (!raw.resultId) throw new Error("Mixed delivery requires its exact stored result");
     const receipt = await recordProgressiveRemoteEvidenceReceipt(connection, { ...delivery, resultAttemptId: raw.id });
@@ -444,8 +470,28 @@ async function exerciseMixedProgressiveRemoteDelivery(
     expect(await readProgressiveRemoteRetention(connection, executionId)).toMatchObject({
       kind: "retained", sources: [{ resultAttemptId: raw.id, archived: true, storageOnly: false }],
     });
-    expect(await settleProgressiveRemoteJob(connection, executionId)).toMatchObject({
-      kind: "settled", counts: { complete: 1 },
+    await refreshPolarClassificationsForJob(connection, String(job.airfoil_id), String(job.simulation_preset_revision_id), executionId);
+    const [beforePublication] = await connection.execute(sql`SELECT result.current_result_attempt_id,classification.state
+      FROM result_attempts attempt JOIN results result ON result.id=attempt.result_id
+      JOIN result_classifications classification ON classification.result_attempt_id=attempt.id WHERE attempt.id=${raw.id}::uuid`);
+    expect(beforePublication).toMatchObject({ current_result_attempt_id: null, state: "accepted" });
+    if (sibling === "infrastructure") for (const verdict of ["exclude", "defer"] as const) {
+      const restore = new Error(`Restore ${verdict} review publication guard`);
+      await connection.transaction(async (nested) => {
+        const scoped = nested as unknown as DB;
+        await scoped.execute(sql`INSERT INTO result_review_verdicts(result_id,verdict,reviewer)
+          VALUES(${raw.resultId}::uuid,${verdict},'isolated mixed diagnostic review')`);
+        const reviewed = await reconcileProgressiveRemoteProgress(scoped, { jobIds: [executionId] });
+        expect(reviewed.errors).toEqual([]);
+        const [protectedResult] = await scoped.execute(sql`SELECT current_result_attempt_id FROM results WHERE id=${raw.resultId}::uuid`);
+        expect(protectedResult.current_result_attempt_id).toBeNull();
+        const [retainedRaw] = await scoped.execute(sql`SELECT evidence_payload FROM result_attempts WHERE id=${raw.id}::uuid`);
+        expect(analysisContentHash(retainedRaw.evidence_payload)).toBe(analysisContentHash(raw.evidencePayload));
+        throw restore;
+      }).catch((error) => { if (error !== restore) throw error; });
+    }
+    expect(await reconcileProgressiveRemoteProgress(connection, { jobIds: [executionId] })).toMatchObject({
+      settled: 1, waiting: 0, errors: [],
     });
     const [finished] = await connection.execute(sql`SELECT status,"ingestedAt" FROM sim_jobs WHERE id=${executionId}::uuid`);
     expect(finished.status).toBe("done");
@@ -460,5 +506,5 @@ async function exerciseMixedProgressiveRemoteDelivery(
       WHERE sim_job_id=${executionId}::uuid AND aoa_deg=${diagnostic.aoa_deg} AND valid_for_polar`);
     expect(accepted.count).toBe(0);
     throw rollback;
-  })).rejects.toBe(rollback);
+  }).catch((error) => { if (error !== rollback) throw error; });
 }

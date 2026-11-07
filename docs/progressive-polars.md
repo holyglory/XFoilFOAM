@@ -336,6 +336,13 @@ Workers persist ordered immutable reports before delivery. A lost response retri
 the same sequence and bytes; only the hub's matching execution, sequence and content
 signature acknowledge that local outbox row.
 
+Hub report selection reserves room for terminal reports even below the high-backlog
+threshold. That reserve must fit inside the report and per-campaign work budgets,
+so continuous live reports cannot indefinitely hide a completed execution. Unused
+reserved capacity remains available to other eligible work. Reconciliation counts
+include only settlements actually returned by the normal controller, independently
+of reports applied or indexed.
+
 Worker-control publication uses the connection already held by its control call.
 It must not borrow a second connection through the task producer pool: concurrent
 control calls can otherwise hold every connection while waiting for another.
@@ -458,6 +465,11 @@ artifacts use a distinct immutable diagnostic acknowledgement rather than an
 invented CFD result. The acknowledgement binds the authenticated report and exact
 point signature; material-domain acknowledgements retain their version-1 identity,
 while infrastructure and hard-solver diagnostics carry a version-2 failure kind.
+When every source for a settled sibling is an authenticated metadata-only failure,
+that sibling must not block a different, exactly selected accepted point from its
+normal publication checks. This exception never covers an omitted angle or a
+sibling with coefficients, histories or artifacts, and never accepts the diagnostic
+itself. Changed ownership, recipe, plan or physical target still closes the scope.
 An already-issued raw-attempt receipt remains the original receipt on replay.
 Unattempted angles receive neither diagnostic acknowledgements nor solver rows.
 Existing parked nonmaterial scope conflicts still require the exact-source,

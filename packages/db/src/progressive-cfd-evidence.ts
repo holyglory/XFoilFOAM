@@ -220,7 +220,9 @@ async function lockJobScope(
   ) : [];
   const retainedDiagnostics = new Set(diagnosticCandidates.filter((unit) => {
     const sources = diagnostics.filter((source) => source.aoaDeg === unit.aoa_deg);
-    return sources.length > 0 && sources.every((source) => source.kind === "material_diagnostic");
+    return sources.length > 0 && sources.every((source) => source.kind === "material_diagnostic" ||
+      (!options.terminalDiagnostics && selectedAoas !== null && unit.lease_owner == null &&
+        source.kind === "failure_diagnostic"));
   }).map((unit) => unit.token));
   if (options.terminalDiagnostics && retainedDiagnostics.size !== units.length)
     throw new ProgressiveCfdEvidenceScopeClosed("Terminal diagnostics require exact stopped, unowned material failures for every original unit");
