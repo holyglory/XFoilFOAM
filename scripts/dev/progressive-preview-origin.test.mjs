@@ -3,6 +3,11 @@ import test from "node:test";
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import {
+  assertEngineHealth,
+  engineUrlFromDeployment,
+  progressiveEngineUrl,
+} from "./progressive-preview-engine.mjs";
+import {
   originFromDeployment,
   progressivePreviewDeployment,
   progressivePreviewOrigin,
@@ -31,6 +36,116 @@ function lookupFixture(response = snapshot()) {
     },
   };
 }
+
+function engineSnapshot(port = 24000) {
+  return {
+    ok: true,
+    data: {
+      name: "progressive-engine",
+      public: false,
+      state: "running",
+      components: [
+        {
+          name: "engine",
+          owned: true,
+          state: "running",
+          health: "healthy",
+          port,
+        },
+      ],
+    },
+  };
+}
+
+test("resolves the private engine through the v3 read-only operation", () => {
+  const lookup = lookupFixture(engineSnapshot());
+  assert.equal(
+    progressiveEngineUrl({ execute: lookup.execute }),
+    "http://127.0.0.1:24000",
+  );
+  assert.deepEqual(lookup.calls, [
+    {
+      executable: "/usr/local/bin/devcoordinator2",
+      args: [
+        "--client",
+        "codex",
+        "call",
+        "deployment.status",
+        "--params",
+        JSON.stringify({
+          path: fileURLToPath(new URL("../../", import.meta.url)),
+          name: "progressive-engine",
+        }),
+      ],
+      options: { encoding: "utf8", timeout: 30000, maxBuffer: 256 * 1024 },
+    },
+  ]);
+  assert.equal(
+    engineUrlFromDeployment(engineSnapshot(24500)),
+    "http://127.0.0.1:24500",
+  );
+});
+
+test("rejects the wrong, public, stopped, unhealthy or unowned engine", () => {
+  for (const invalid of [null, {}, { ok: false }, { ok: true, data: {} }])
+    assert.throws(() => engineUrlFromDeployment(invalid));
+  for (const change of [
+    { name: "progressive-preview" },
+    { public: true },
+    { public: undefined },
+    { state: "stopped" },
+    { components: [] },
+  ]) {
+    const response = engineSnapshot();
+    Object.assign(response.data, change);
+    assert.throws(() => engineUrlFromDeployment(response));
+  }
+  for (const change of [
+    { name: "api" },
+    { owned: false },
+    { state: "stopped" },
+    { health: "unhealthy" },
+    { port: null },
+    { port: "24000" },
+    { port: 24000.5 },
+  ]) {
+    const response = engineSnapshot();
+    Object.assign(response.data.components[0], change);
+    assert.throws(() => engineUrlFromDeployment(response));
+  }
+});
+
+test("keeps the exact OpenCFD version and validation build requirement", () => {
+  const health = {
+    default_engine: { distribution: "opencfd", version: "2606" },
+    build_id: "progressive-local-validation",
+  };
+  assert.doesNotThrow(() => assertEngineHealth(health));
+  for (const invalid of [
+    null,
+    {},
+    { ...health, build_id: "other-build" },
+    { ...health, default_engine: { distribution: "foundation", version: "2606" } },
+    { ...health, default_engine: { distribution: "opencfd", version: "2512" } },
+  ])
+    assert.throws(() => assertEngineHealth(invalid));
+});
+
+test("propagates an engine lookup failure without a fallback or retry", () => {
+  const failure = new Error("Coordinator unavailable");
+  let calls = 0;
+  assert.throws(
+    () =>
+      progressiveEngineUrl({
+        execute() {
+          calls += 1;
+          throw failure;
+        },
+      }),
+    failure,
+  );
+  assert.equal(calls, 1);
+});
 
 test("queries the current worktree through the v3 read-only operation", () => {
   const lookup = lookupFixture();
