@@ -337,6 +337,113 @@ export async function verifyProgressiveEvidenceReuse(
           throw rollbackOrder;
         }),
       ).rejects.toBe(rollbackOrder);
+      const rollbackCumulative = new Error("Restore cumulative repeated-source staging");
+      await expect(
+        connection.transaction(async (nested) => {
+          const scoped = nested as unknown as DB;
+          const cumulative = structuredClone(repeated);
+          cumulative.sequence += 1;
+          const firstPoint = progressiveReportedPointSources(cumulative.result!)[0].point;
+          const nextUnit = envelope.scope.units.find(unit => unit.alpha !== firstPoint.aoa_deg);
+          expect(nextUnit).toBeDefined();
+          const secondPoint = {
+            ...structuredClone(firstPoint),
+            aoa_deg: nextUnit!.alpha,
+            case_slug: "isolated-cumulative-second-case",
+            evidence_artifacts: [],
+          };
+          cumulative.result!.polars[0].attempts!.push(secondPoint);
+          cumulative.status.completed_cases = 2;
+          const append = async (report: ProgressiveRemoteReport) => {
+            const sealed = validateProgressiveRemoteReport(report, envelope);
+            await scoped.execute(sql`INSERT INTO progressive_worker_reports(sim_job_id,sequence,content_signature,report,acknowledged_at)
+              VALUES(${executionId}::uuid,${report.sequence},${sealed.contentSignature},${JSON.stringify(sealed.report)}::jsonb,clock_timestamp())`);
+          };
+          expect(await existingProgressiveReportAttempts(scoped, cumulative, envelope)).toBeNull();
+          await append(cumulative);
+          const stagingEngine = new Proxy({ baseUrl: "http://isolated-progressive-engine.invalid" }, {
+            get(target, property, receiver) {
+              if (property === "baseUrl") return Reflect.get(target, property, receiver);
+              throw new Error("Cumulative report staging must not call the physical engine");
+            },
+          }) as EngineClient;
+          const staged = await stageProgressiveWorkerEvidence(scoped, stagingEngine, executionId, {
+            reportSequence: cumulative.sequence,
+          });
+          expect(staged).toMatchObject({ kind: "staged", sequence: cumulative.sequence });
+          expect(staged).not.toHaveProperty("reusedEvidence");
+          if (staged.kind !== "staged") throw new Error("Cumulative fixture did not stage");
+          expect(staged.resultAttemptIds).toHaveLength(2);
+          const snapshot = async () => ({
+            raw: await scoped.execute(sql`SELECT * FROM result_attempts WHERE sim_job_id=${executionId}::uuid ORDER BY id`),
+            artifacts: await scoped.execute(sql`SELECT * FROM solver_evidence_artifacts WHERE sim_job_id=${executionId}::uuid ORDER BY id`),
+            results: await scoped.execute(sql`SELECT * FROM results WHERE id IN (SELECT result_id FROM result_attempts WHERE sim_job_id=${executionId}::uuid) ORDER BY id`),
+          });
+          const stored = await snapshot();
+          expect(stored.raw).toHaveLength(2);
+          expect(stored.raw.every(row => row.status === "failed" && row.valid_for_polar === false)).toBe(true);
+          const replay = structuredClone(cumulative);
+          replay.sequence += 1;
+          replay.result!.polars[0].points.push(...replay.result!.polars[0].attempts!.map(point => structuredClone(point)));
+          await append(replay);
+          let previousReportReads = 0;
+          const measured = new Proxy(scoped, {
+            get(target, property, receiver) {
+              if (property === "execute") return async (query: Parameters<DB["execute"]>[0]) => {
+                const rows = await target.execute(query);
+                return rows.map(row => new Proxy(row, {
+                  get(value, field, receiver) {
+                    if (field === "report") previousReportReads += 1;
+                    return Reflect.get(value, field, receiver);
+                  },
+                }));
+              };
+              return Reflect.get(target, property, receiver);
+            },
+          });
+          expect(await existingProgressiveReportAttempts(measured, replay, envelope)).toEqual(staged.resultAttemptIds);
+          expect(previousReportReads).toBe(1);
+          const changedSource = structuredClone(replay);
+          changedSource.result!.polars[0].points[1].cl = 0.75;
+          expect(await existingProgressiveReportAttempts(scoped, changedSource, envelope)).toBeNull();
+          const rollbackTampered = new Error("Restore authenticated cumulative report");
+          await expect(nested.transaction(async transaction => {
+            await transaction.execute(sql`CREATE TEMP TABLE progressive_worker_reports ON COMMIT DROP AS
+              SELECT * FROM public.progressive_worker_reports WHERE sim_job_id=${executionId}::uuid`);
+            await transaction.execute(sql`UPDATE progressive_worker_reports SET report=jsonb_set(report,'{result,polars,0,attempts,1,cl}','0.75'::jsonb)
+              WHERE sim_job_id=${executionId}::uuid AND sequence=${cumulative.sequence}`);
+            expect(await existingProgressiveReportAttempts(transaction as unknown as DB, replay, envelope)).toBeNull();
+            throw rollbackTampered;
+          })).rejects.toBe(rollbackTampered);
+          const rollbackLease = new Error("Restore cumulative replay lease");
+          await expect(nested.transaction(async transaction => {
+            await expect(stageProgressiveWorkerEvidence(transaction as unknown as DB, stagingEngine, executionId, {
+              reportSequence: replay.sequence,
+              afterEvidenceStaged: async () => {
+                await transaction.execute(sql`UPDATE sim_jobs SET ingest_lease_expires_at=clock_timestamp()-interval '1 second' WHERE id=${executionId}::uuid`);
+              },
+            })).rejects.toThrow();
+            const [unpublished] = await transaction.execute(sql`SELECT count(*)::integer AS count FROM progressive_worker_evidence_receipts
+              WHERE sim_job_id=${executionId}::uuid AND sequence=${replay.sequence}`);
+            expect(unpublished.count).toBe(0);
+            expect(await snapshot()).toEqual(stored);
+            throw rollbackLease;
+          })).rejects.toBe(rollbackLease);
+          expect(await stageProgressiveWorkerEvidence(scoped, stagingEngine, executionId, {
+            reportSequence: replay.sequence,
+          })).toMatchObject({ kind: "staged", reusedEvidence: true, resultAttemptIds: staged.resultAttemptIds });
+          expect(await snapshot()).toEqual(stored);
+          const associated = await scoped.execute(sql`SELECT result_attempt_id,point_content_signature FROM progressive_worker_evidence_attempts
+            WHERE sim_job_id=${executionId}::uuid AND sequence=${replay.sequence} ORDER BY result_attempt_id`);
+          expect(associated.map(row => row.result_attempt_id)).toEqual([...staged.resultAttemptIds].sort());
+          expect(associated.map(row => row.point_content_signature).sort()).toEqual(
+            progressiveReportedPointSources(replay.result!).map(source => source.contentSignature).sort(),
+          );
+          console.info(JSON.stringify({ cumulativeSources: 2, previousReportValidations: previousReportReads,
+            duplicateListingsConserved: true, changedSourceRejected: true, leaseLossUnpublished: true, exactRowsConserved: true }));
+          throw rollbackCumulative;
+        }),
+      ).rejects.toBe(rollbackCumulative);
       throw rollback;
     }),
   ).rejects.toBe(rollback);

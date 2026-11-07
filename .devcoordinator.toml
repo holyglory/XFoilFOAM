@@ -4760,6 +4760,18 @@ requires = ["artifact-metadata-replay"]
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/solver-evidence-object-storage-migration.test.ts"]
 
 [[test.solver-throughput-recovery.check]]
+name = "report-source-index"
+tier = "development"
+requires = ["artifact-locking"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/progressive-remote-report.test.ts"]
+
+[[test.solver-throughput-recovery.check]]
+name = "cumulative-evidence-reuse"
+tier = "development"
+requires = ["report-source-index"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "progressive remote dispatch pins one exact request"]
+
+[[test.solver-throughput-recovery.check]]
 name = "database-types"
 tier = "development"
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "typecheck"]

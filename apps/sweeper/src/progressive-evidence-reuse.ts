@@ -1,8 +1,8 @@
 import {
   analysisContentHash,
+  createProgressiveReportedPointIndex,
   progressiveReportedPointSources,
   progressiveRemotePointProjection,
-  resolveProgressiveReportedPoint,
   validateProgressiveRemoteReport,
   type DB,
   type ProgressiveRemoteExecutionEnvelope,
@@ -75,7 +75,7 @@ export async function existingProgressiveReportAttempts(
             AND other.result_attempt_id<>candidate.result_attempt_id)
       ORDER BY candidate.point_content_signature,candidate.sequence DESC
     )
-    SELECT chosen.point_content_signature,chosen.result_attempt_id,
+    SELECT chosen.sequence,chosen.point_content_signature,chosen.result_attempt_id,
       original.report,chosen.content_signature,to_jsonb(attempt) AS attempt
     FROM chosen
     JOIN progressive_worker_reports original ON original.sim_job_id=chosen.sim_job_id
@@ -84,6 +84,13 @@ export async function existingProgressiveReportAttempts(
     JOIN result_attempts attempt ON attempt.id=chosen.result_attempt_id AND attempt.sim_job_id=chosen.sim_job_id
       AND attempt.engine_job_id=chosen.sim_job_id::text`);
   if (rows.length > 2048) return null;
+  const previousReports = new Map<
+    string,
+    {
+      report: ProgressiveRemoteReport;
+      sources: ReturnType<typeof createProgressiveReportedPointIndex>;
+    }
+  >();
   const attempts: string[] = [];
   for (const source of sources) {
     const candidates = rows.filter(
@@ -95,16 +102,28 @@ export async function existingProgressiveReportAttempts(
     )
       return null;
     const candidate = candidates[0];
-    const previous = validateProgressiveRemoteReport(
-      candidate.report,
-      envelope,
-    );
-    if (
-      previous.contentSignature !== candidate.content_signature ||
-      !previous.report.result
-    )
-      return null;
-    const original = resolveProgressiveReportedPoint(previous.report.result, {
+    const previousKey = JSON.stringify([
+      String(candidate.sequence),
+      candidate.content_signature,
+    ]);
+    let previous = previousReports.get(previousKey);
+    if (!previous) {
+      const validated = validateProgressiveRemoteReport(
+        candidate.report,
+        envelope,
+      );
+      if (
+        validated.contentSignature !== candidate.content_signature ||
+        !validated.report.result
+      )
+        return null;
+      previous = {
+        report: validated.report,
+        sources: createProgressiveReportedPointIndex(validated.report.result),
+      };
+      previousReports.set(previousKey, previous);
+    }
+    const original = previous.sources.resolve({
       alpha: source.point.aoa_deg,
       caseSlug: source.point.case_slug ?? null,
       speed: source.polar.speed,

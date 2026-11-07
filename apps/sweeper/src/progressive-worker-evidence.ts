@@ -3,7 +3,7 @@ import { eq, sql } from "drizzle-orm";
 import {
   simJobs,
   simulationPresetRevisions,
-  resolveProgressiveReportedPoint,
+  createProgressiveReportedPointIndex,
   type DB,
   type ProgressiveRemoteReport,
   type ProgressiveRemoteExecutionEnvelope,
@@ -225,6 +225,7 @@ async function stageClaimedProgressiveWorkerEvidence(
         result: claimed.result,
         reportSequence: claimed.sequence,
       });
+      const sources = createProgressiveReportedPointIndex(claimed.result);
       await connection.execute(sql`
         INSERT INTO progressive_worker_evidence_receipts (sim_job_id, sequence, content_signature)
         VALUES (${executionId}::uuid, ${claimed.sequence}, ${claimed.signature})
@@ -237,7 +238,7 @@ async function stageClaimedProgressiveWorkerEvidence(
           throw new Error(
             "Worker evidence attempt belongs to another execution",
           );
-        const source = resolveProgressiveReportedPoint(claimed.result, {
+        const source = sources.resolve({
           alpha: Number(attempt.aoa_deg),
           caseSlug:
             attempt.engine_case_slug === null

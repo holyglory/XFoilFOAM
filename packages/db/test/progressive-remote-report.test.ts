@@ -16,6 +16,7 @@ import {
   validateProgressiveRemoteReportOrder,
   validateProgressiveRemoteReport,
   resolveProgressiveReportedPoint,
+  createProgressiveReportedPointIndex,
   type ProgressiveRemoteReport,
 } from "../src/progressive-remote-report";
 
@@ -252,6 +253,49 @@ describe("remote progressive incremental report validation", () => {
     expect(
       resolveProgressiveReportedPoint(report.result!, input).contentSignature,
     ).not.toBe(original.contentSignature);
+  });
+
+  it("reuses a complete immutable source index without retaining mutable input or output proofs", () => {
+    const { assignment, report } = fixture();
+    const first = report.result!.polars[0].attempts![0];
+    const second = { ...structuredClone(first), aoa_deg: 5, case_slug: "second-case" };
+    report.result!.polars[0].attempts!.push(second);
+    report.result!.polars[0].points.push(structuredClone(first));
+    const validated = validateProgressiveRemoteReport(report, assignment);
+    const index = createProgressiveReportedPointIndex(validated.report.result!);
+    expect(index.sources).toHaveLength(2);
+    const firstCell = { alpha: 0, speed: 30, chord: 1, caseSlug: null };
+    const secondCell = { alpha: 5, speed: 30, chord: 1, caseSlug: "second-case" };
+    for (const cell of [firstCell, secondCell])
+      expect(index.resolve(cell)).toEqual(
+        resolveProgressiveReportedPoint(validated.report.result!, cell),
+      );
+    const original = index.resolve(firstCell);
+    validated.report.result!.polars[0].attempts![0].cl = 0.75;
+    expect(index.resolve(firstCell)).toEqual(original);
+    expect(() => createProgressiveReportedPointIndex(
+      validated.report.result!,
+    ).resolve(firstCell)).toThrow("competing source generations");
+    expect(() => { original.point.cl = 0.85; }).toThrow();
+    expect(() => { original.polar.points.push(structuredClone(first)); }).toThrow();
+    expect(index.resolve(firstCell).contentSignature).toBe(original.contentSignature);
+    expect(() => index.resolve({ ...secondCell, caseSlug: "foreign-case" })).toThrow("missing");
+    expect(() => index.resolve({ ...firstCell, speed: Number.NaN })).toThrow("finite physical cell");
+    expect(() => index.resolve({ ...firstCell, chord: 0 })).toThrow("finite physical cell");
+  });
+
+  it("authenticates unrelated point fields before indexed resolution and rebuilds changed inputs per invocation", () => {
+    const { report } = fixture();
+    const input = { alpha: 0, speed: 30, chord: 1, caseSlug: null };
+    const initial = createProgressiveReportedPointIndex(report.result!);
+    report.result!.polars[0].attempts![0].cl = 0.6;
+    const changed = createProgressiveReportedPointIndex(report.result!);
+    expect(changed.resolve(input).contentSignature).not.toBe(initial.resolve(input).contentSignature);
+    const invalid = { ...structuredClone(report.result!.polars[0].attempts![0]), aoa_deg: 5 };
+    Object.defineProperty(invalid, "unrelatedInvalidEvidence", { value: undefined, enumerable: true });
+    report.result!.polars[0].attempts!.push(invalid);
+    expect(() => createProgressiveReportedPointIndex(report.result!)).toThrow("finite, explicit JSON");
+    expect(() => resolveProgressiveReportedPoint(report.result!, input)).toThrow("finite, explicit JSON");
   });
   it("preserves a measured zero-case never-started cancellation without fabricating the requested case count", () => {
     const { assignment, report } = fixture();
