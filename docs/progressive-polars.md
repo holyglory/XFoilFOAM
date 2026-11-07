@@ -659,6 +659,14 @@ for that mode; a later ordinary accepted publication can reuse the bound archive
 Disabling new remote computation does not strand retained-source archives; the
 separate transfer-maintenance pause still prevents new archive claims.
 
+Stored-media repair resolves chord and speed from the exact immutable setup
+revision shared by the result and its source attempt. An unpublished display row
+may still have empty physical fields; that must not prevent rendering the evidence
+needed for publication. Missing or invalid setup values, foreign revisions and
+conflicting present display values fail before rendering. Repair never fills a
+canonical row just to bypass this check, and generated media does not turn invalid
+CFD into an accepted polar point.
+
 Every received report now records a sealed source inventory, including an explicit
 empty inventory when nothing was calculated. Exact duplicates listed as both points
 and attempts share a source hash; different raw generations remain distinct, even

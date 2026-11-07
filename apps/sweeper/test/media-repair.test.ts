@@ -28,6 +28,7 @@ import {
   results,
   schedulingProfiles,
   simulationPresets,
+  simulationPresetRevisions,
   simCampaignAirfoils,
   simCampaignConditions,
   simCampaignPlanRevisions,
@@ -992,38 +993,59 @@ describe("durable result media repair", () => {
   });
 
   it("refuses default-media repair when stored physical scale is missing or zero", async () => {
-    const missingChord = await createSolvedResult("missing-render-chord");
-    const zeroSpeed = await createSolvedResult("zero-render-speed");
-    await db
-      .update(results)
-      .set({ chord: null })
-      .where(eq(results.id, missingChord.resultId));
-    await db
-      .update(results)
-      .set({ speed: 0 })
-      .where(eq(results.id, zeroSpeed.resultId));
+    const fixture = await createSolvedResult("invalid-render-setup");
+    const [revision] = await db.select().from(simulationPresetRevisions)
+      .where(eq(simulationPresetRevisions.id, revisionId));
+    const referenceGeometry = revision.snapshot.referenceGeometry as Record<string, unknown>;
+    const flowState = revision.snapshot.flowState as Record<string, unknown>;
     let renderCalls = 0;
     const engine = engineWith({
+      extents: async () => {
+        renderCalls += 1;
+        throw new Error("Invalid physical setup must not reach the engine");
+      },
       render: async (jobId, request) => {
         renderCalls += 1;
         return completeMediaResponse(jobId, request);
       },
     });
 
-    for (const [fixture, expectedError] of [
-      [missingChord, "no valid reference chord"],
-      [zeroSpeed, "no valid flow speed"],
-    ] as const) {
-      const outcome = await resultMediaRepairTick(db, engine, {
-        resultId: fixture.resultId,
-      });
-      expect(outcome.retrying).toBe(1);
-      const [repair] = await db
-        .select()
-        .from(resultMediaRepairs)
-        .where(eq(resultMediaRepairs.resultId, fixture.resultId));
-      expect(repair.state).toBe("retry_wait");
-      expect(repair.lastError).toContain(expectedError);
+    for (const scenario of ["missing", "zero-chord", "zero-speed", "string-speed", "chord-conflict", "speed-conflict", "foreign-revision"]) {
+      const restore = new Error(`Restore ${scenario} physical context`);
+      await db.transaction(async (rawTransaction) => {
+        const transaction = rawTransaction as unknown as DB;
+        await transaction.update(results).set({ chord: null, speed: null, currentResultAttemptId: null })
+          .where(eq(results.id, fixture.resultId));
+        if (scenario === "foreign-revision") {
+          const [foreign] = await transaction.insert(simulationPresetRevisions).values({
+            ...revision, id: undefined, revisionNumber: revision.revisionNumber + 1,
+            signatureHash: createHash("sha256").update(`${PREFIX}:foreign-render-revision`).digest("hex"),
+            isCanonicalPhysics: false, isCanonicalMethod: false,
+          }).returning();
+          await transaction.update(resultAttempts).set({ simulationPresetRevisionId: foreign.id })
+            .where(eq(resultAttempts.id, fixture.resultAttemptId));
+        } else if (scenario.endsWith("conflict")) {
+          await transaction.update(results).set(scenario === "chord-conflict" ? { chord: 1 } : { speed: 0 })
+            .where(eq(results.id, fixture.resultId));
+        } else {
+          await transaction.update(simulationPresetRevisions).set({ snapshot: scenario === "missing" ? {} : {
+            ...revision.snapshot,
+            referenceGeometry: { ...referenceGeometry, referenceLengthM: scenario === "zero-chord" ? 0 : referenceGeometry.referenceLengthM },
+            flowState: { ...flowState, speedMps: scenario === "zero-speed" ? 0 : scenario === "string-speed" ? "25" : flowState.speedMps },
+          } }).where(eq(simulationPresetRevisions.id, revisionId));
+        }
+        const before = await transaction.select().from(results).where(eq(results.id, fixture.resultId));
+        const attemptsBefore = await transaction.select().from(resultAttempts).where(eq(resultAttempts.id, fixture.resultAttemptId));
+        await expect(repairDefaultMediaForStoredResult({ db: transaction, engine, resultId: fixture.resultId,
+          resultAttemptId: fixture.resultAttemptId, heartbeat: async () => undefined })).rejects.toThrow(
+          scenario === "foreign-revision" ? "does not own the result's immutable setup"
+            : scenario.endsWith("conflict") ? "physical scale conflicts with immutable setup"
+            : "has invalid reference chord or flow speed",
+        );
+        expect(await transaction.select().from(results).where(eq(results.id, fixture.resultId))).toEqual(before);
+        expect(await transaction.select().from(resultAttempts).where(eq(resultAttempts.id, fixture.resultAttemptId))).toEqual(attemptsBefore);
+        throw restore;
+      }).catch((error) => { if (error !== restore) throw error; });
     }
     expect(renderCalls).toBe(0);
   });
@@ -1585,14 +1607,20 @@ describe("durable result media repair", () => {
     expect(custom).toHaveLength(3);
   });
 
-  it("MUST-CATCH: renders a brokered result from its exact GCS generation", async () => {
-    const fixture = await createSolvedResult("brokered-gcs-render");
+  it.each([true, false])("MUST-CATCH: renders a brokered result from its exact GCS generation (valid CFD: %s)", async (validForPolar) => {
+    const fixture = await createSolvedResult(`brokered-gcs-render-${validForPolar}`);
+    await db.update(results).set({ chord: null, speed: null, currentResultAttemptId: null })
+      .where(eq(results.id, fixture.resultId));
+    await db.update(resultAttempts).set({ validForPolar, converged: validForPolar }).where(eq(resultAttempts.id, fixture.resultAttemptId));
+    const [rawBefore] = await db.select().from(resultAttempts).where(eq(resultAttempts.id, fixture.resultAttemptId));
     const pointers: Array<RemoteEvidencePointerPayload | undefined> = [];
+    const contexts: Array<{ chord: number; speed: number }> = [];
     const outcome = await resultMediaRepairTick(
       db,
       engineWith({
         extents: async (_jobId, request) => {
           pointers.push(request.remote);
+          contexts.push({ chord: request.chord, speed: request.speed });
           return {
             fields: {
               pressure: { min: -3, max: 2, finite_count: 500 },
@@ -1603,6 +1631,9 @@ describe("durable result media repair", () => {
         },
         render: async (jobId, request) => {
           pointers.push(request.remote);
+          contexts.push({ chord: request.chord, speed: request.speed });
+          const [unpublished] = await db.select().from(results).where(eq(results.id, fixture.resultId));
+          expect(unpublished).toMatchObject({ chord: null, speed: null, currentResultAttemptId: null });
           return completeMediaResponse(jobId, request);
         },
       }),
@@ -1610,6 +1641,17 @@ describe("durable result media repair", () => {
     );
 
     expect(outcome.finalized).toBe(1);
+    expect(contexts.length).toBeGreaterThan(1);
+    expect(contexts.every((context) => context.chord === 0.15 && context.speed === 25)).toBe(true);
+    const [published] = await db.select().from(results).where(eq(results.id, fixture.resultId));
+    expect(published).toMatchObject({ chord: null, speed: null,
+      currentResultAttemptId: validForPolar ? fixture.resultAttemptId : null });
+    expect(await db.select().from(resultAttempts).where(eq(resultAttempts.id, fixture.resultAttemptId))).toEqual([rawBefore]);
+    const [classified] = await db.select().from(resultClassifications)
+      .where(eq(resultClassifications.resultAttemptId, fixture.resultAttemptId));
+    expect(classified.state).toBe(validForPolar ? "accepted" : "rejected");
+    const media = await db.select().from(resultMedia).where(eq(resultMedia.resultAttemptId, fixture.resultAttemptId));
+    expect(media.some((row) => row.kind === "video" && row.evidenceSha256 === fixture.manifestSha)).toBe(true);
     expect(pointers.length).toBeGreaterThan(1);
     expect(pointers.every(Boolean)).toBe(true);
     expect(

@@ -25,10 +25,12 @@ import {
   refreshPolarCacheForRevision,
   results,
   resultMedia,
+  simulationPresetRevisions,
   solverEvidenceArtifacts,
   solverEvidenceBlobs,
   withEvidenceArtifactWriteLocks,
 } from "@aerodb/db";
+import type { SimulationSetupSnapshot } from "@aerodb/db/simulation-setup";
 import { assertProgressiveWorkerEvidenceJob } from "./progressive-remote-jobs";
 import {
   baseRejectionReasons,
@@ -3884,18 +3886,35 @@ export async function repairDefaultMediaForStoredResult(opts: {
       `media-repair attempt ${opts.resultAttemptId} has no saved engine job/case address`,
     );
   }
-  if (!Number.isFinite(result.chord) || !result.chord || result.chord <= 0) {
+  const [revision] = await opts.db
+    .select({ snapshot: simulationPresetRevisions.snapshot })
+    .from(simulationPresetRevisions)
+    .where(eq(simulationPresetRevisions.id, presetRevisionId))
+    .limit(1);
+  const snapshot = revision?.snapshot as
+    | Partial<SimulationSetupSnapshot>
+    | undefined;
+  const chord = snapshot?.referenceGeometry?.referenceLengthM;
+  const speed = snapshot?.flowState?.speedMps;
+  if (
+    snapshot?.referenceGeometry?.referenceLengthKind !== "chord" ||
+    typeof chord !== "number" ||
+    !Number.isFinite(chord) ||
+    chord <= 0 ||
+    typeof speed !== "number" ||
+    !Number.isFinite(speed) ||
+    speed <= 0
+  ) {
     throw new Error(
-      `media-repair result ${opts.resultId} has no valid reference chord`,
+      `media-repair immutable setup ${presetRevisionId} has invalid reference chord or flow speed`,
     );
   }
   if (
-    !Number.isFinite(result.speed) ||
-    result.speed == null ||
-    result.speed <= 0
+    (result.chord != null && result.chord !== chord) ||
+    (result.speed != null && result.speed !== speed)
   ) {
     throw new Error(
-      `media-repair result ${opts.resultId} has no valid flow speed`,
+      `media-repair result ${opts.resultId} physical scale conflicts with immutable setup ${presetRevisionId}`,
     );
   }
   const contour = await airfoilContourPoints(opts.db, result.airfoilId);
@@ -3988,8 +4007,8 @@ export async function repairDefaultMediaForStoredResult(opts: {
               case_slug: attempt.engineCaseSlug!,
               evidence_base: manifest.evidenceBase,
               airfoil_points: contour,
-              chord: result.chord!,
-              speed: result.speed!,
+              chord,
+              speed,
               fields: ALL_IMAGE_FIELDS,
               zoom_chords: 2,
               max_frames: 220,
@@ -4124,6 +4143,8 @@ export async function repairDefaultMediaForStoredResult(opts: {
       : {};
   const repairSource: typeof results.$inferSelect = {
     ...result,
+    chord,
+    speed,
     currentResultAttemptId: currentAttemptId,
     status: attempt.status,
     source: attempt.source,
