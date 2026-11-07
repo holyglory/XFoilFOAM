@@ -18,6 +18,7 @@ import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 import { afterAll, afterEach, beforeEach, expect, it, vi } from "vitest";
 import { progressiveDeliverySelectionSql } from "../src/progressive-delivery-selection";
+import { progressiveStoppedStorageEligible } from "../src/progressive-stopped-storage";
 import { deliverNextProgressiveWorkerEvidence } from "../src/progressive-worker-evidence-delivery";
 import {
   replayProgressiveWorkerOutbox,
@@ -68,7 +69,10 @@ async function withFixture(
       point: ProgressiveWorkerOutboxReplayInput["points"][number],
     ) => Record<string, unknown>;
   }) => Promise<void>,
-  pendingCount = 2,
+  {
+    pendingCount = 2,
+    failedPoints = false,
+  }: { pendingCount?: number; failedPoints?: boolean } = {},
 ) {
   await client.db.transaction(async (transaction) => {
     const connection = transaction as unknown as DB;
@@ -99,13 +103,10 @@ async function withFixture(
     await connection.execute(sql`CREATE TEMP TABLE progressive_worker_evidence_attempts (
       sim_job_id uuid, sequence bigint, result_attempt_id uuid, point_content_signature text,
       PRIMARY KEY(sim_job_id,sequence,result_attempt_id)) ON COMMIT DROP`);
-    await connection.execute(sql`CREATE TEMP TABLE result_attempts (
-      id uuid PRIMARY KEY, sim_job_id uuid, engine_job_id text, result_id uuid, airfoil_id uuid, bc_id uuid,
-      simulation_preset_revision_id uuid, aoa_deg double precision, engine_case_slug text, evidence_payload jsonb,
-      cl double precision, cd double precision, cm double precision, converged boolean, unsteady boolean) ON COMMIT DROP`);
-    await connection.execute(sql`CREATE TEMP TABLE results (
-      id uuid PRIMARY KEY, airfoil_id uuid, bc_id uuid, simulation_preset_revision_id uuid, aoa_deg double precision,
-      reynolds bigint, speed double precision, chord double precision, mach double precision) ON COMMIT DROP`);
+    await connection.execute(sql`CREATE TEMP TABLE result_attempts
+      (LIKE public.result_attempts INCLUDING DEFAULTS) ON COMMIT DROP`);
+    await connection.execute(sql`CREATE TEMP TABLE results
+      (LIKE public.results INCLUDING DEFAULTS) ON COMMIT DROP`);
     await connection.execute(sql`CREATE TEMP TABLE progressive_worker_evidence_delivery_claims (
       sim_job_id uuid, sequence bigint, result_attempt_id uuid, point_content_signature text, claim_token uuid,
       claim_expires_at timestamptz, PRIMARY KEY(sim_job_id,point_content_signature),
@@ -270,9 +271,15 @@ async function withFixture(
               cl: alpha / 10,
               cd: 0.03,
               cm: -0.01,
-              converged: true,
+              converged: !(failedPoints && alpha >= 7),
               unsteady: false,
               first_order_fallback: false,
+              error:
+                failedPoints && alpha >= 7
+                  ? "Fixture solver failed after retaining evidence"
+                  : undefined,
+              failure_disposition:
+                failedPoints && alpha >= 7 ? "hard_solver" : undefined,
               images: {},
               engine: runtime,
               solver_active_seconds: 48,
@@ -284,6 +291,17 @@ async function withFixture(
                   sha256: "d".repeat(64),
                   byte_size: 24,
                 },
+                ...(failedPoints && alpha >= 7
+                  ? [
+                      {
+                        kind: "manifest" as const,
+                        path: "fixture/evidence-manifest.json",
+                        mime_type: "application/json",
+                        sha256: "e".repeat(64),
+                        byte_size: 128,
+                      },
+                    ]
+                  : []),
               ],
             })),
           },
@@ -365,12 +383,18 @@ async function withFixture(
         resultAttemptId,
         sequence: report.sequence,
       };
-      await connection.execute(sql`INSERT INTO result_attempts VALUES (${resultAttemptId}::uuid,${executionId}::uuid,
+      await connection.execute(sql`INSERT INTO result_attempts
+        (id,sim_job_id,engine_job_id,result_id,airfoil_id,bc_id,simulation_preset_revision_id,aoa_deg,
+         engine_case_slug,evidence_payload,cl,cd,cm,converged,unsteady,status,source,valid_for_polar)
+        VALUES (${resultAttemptId}::uuid,${executionId}::uuid,
         ${executionId},${resultId}::uuid,${airfoilId}::uuid,${bcId}::uuid,${revisionId}::uuid,${alpha},
         ${reported.point.case_slug!},${JSON.stringify(projection.evidencePayload)}::jsonb,
-        ${projection.cl},${projection.cd},${projection.cm},${projection.converged},${projection.unsteady})`);
-      await connection.execute(sql`INSERT INTO results VALUES (${resultId}::uuid,${airfoilId}::uuid,${bcId}::uuid,
-        ${revisionId}::uuid,${alpha},2000000,30,1,0.09)`);
+        ${projection.cl},${projection.cd},${projection.cm},${projection.converged},${projection.unsteady},
+        ${projection.status},${projection.source},${projection.status === "done"})`);
+      await connection.execute(sql`INSERT INTO results
+        (id,airfoil_id,bc_id,simulation_preset_revision_id,aoa_deg,reynolds,speed,chord,mach,status,source,converged)
+        VALUES (${resultId}::uuid,${airfoilId}::uuid,${bcId}::uuid,
+        ${revisionId}::uuid,${alpha},2000000,30,1,0.09,${projection.status},${projection.source},${projection.converged})`);
       await connection.execute(sql`INSERT INTO progressive_worker_evidence_attempts VALUES
         (${executionId}::uuid,${point.sequence},${resultAttemptId}::uuid,${point.pointContentSignature})`);
       if (alpha < 7) {
@@ -849,6 +873,99 @@ it("leaves another scope-closed rejection terminal after one explicit replay", a
   });
 });
 
+it("keeps a failed attempt eligible for stopped storage beneath an accepted canonical cell", async () => {
+  await withFixture(
+    async ({ connection, input }) => {
+      const point = input.points[0];
+      const [accepted] =
+        await connection.execute(sql`INSERT INTO result_attempts
+      (result_id,airfoil_id,bc_id,simulation_preset_revision_id,aoa_deg,status,source,
+       valid_for_polar,converged,cl,cd,cm)
+      SELECT result_id,airfoil_id,bc_id,simulation_preset_revision_id,aoa_deg,'done','solved',
+        true,true,cl,cd,cm FROM result_attempts WHERE id=${point.resultAttemptId}::uuid
+      RETURNING id`);
+      await connection.execute(sql`UPDATE results
+      SET status='done',source='solved',converged=true,current_result_attempt_id=${accepted.id}::uuid
+      WHERE id=(SELECT result_id FROM result_attempts WHERE id=${point.resultAttemptId}::uuid)`);
+      const before = await snapshot(connection);
+      expect(
+        await progressiveStoppedStorageEligible(
+          connection,
+          input.executionId,
+          point,
+        ),
+      ).toBe(true);
+      expect(await snapshot(connection)).toEqual(before);
+    },
+    { failedPoints: true },
+  );
+});
+
+it.each([
+  ["accepted", "done", true, true],
+  ["completed but nonconverged", "done", false, false],
+  ["valid for polar", "failed", true, false],
+  ["converged", "failed", false, true],
+] as const)(
+  "refuses a %s attempt beneath a failed canonical cell",
+  async (_name, status, validForPolar, converged) => {
+    await withFixture(
+      async ({ connection, input }) => {
+        const point = input.points[0];
+        await connection.execute(sql`UPDATE result_attempts
+        SET status=${status},valid_for_polar=${validForPolar},converged=${converged}
+        WHERE id=${point.resultAttemptId}::uuid`);
+        const before = await snapshot(connection);
+        expect(
+          await progressiveStoppedStorageEligible(
+            connection,
+            input.executionId,
+            point,
+          ),
+        ).toBe(false);
+        expect(await snapshot(connection)).toEqual(before);
+      },
+      { failedPoints: true },
+    );
+  },
+);
+
+it("does not fall back to a cancelled scope when an exact failed source does not match", async () => {
+  await withFixture(
+    async ({ connection, input }) => {
+      const point = input.points[0];
+      await connection.execute(sql`UPDATE sync_sweep_promises SET status='cancelled',
+      response_payload='{"authoritativeLeaseLoss":true}'::jsonb`);
+      expect(
+        await progressiveStoppedStorageEligible(connection, input.executionId),
+      ).toBe(true);
+      expect(
+        await progressiveStoppedStorageEligible(
+          connection,
+          input.executionId,
+          point,
+        ),
+      ).toBe(true);
+      const before = await snapshot(connection);
+      for (const changed of [
+        { ...point, resultAttemptId: randomUUID() },
+        { ...point, pointContentSignature: "0".repeat(64) },
+        { ...point, sequence: point.sequence + 1 },
+      ]) {
+        expect(
+          await progressiveStoppedStorageEligible(
+            connection,
+            input.executionId,
+            changed,
+          ),
+        ).toBe(false);
+      }
+      expect(await snapshot(connection)).toEqual(before);
+    },
+    { failedPoints: true },
+  );
+});
+
 it("quarantines an exact stale remote-owner rejection instead of retrying forever", async () => {
   await withFixture(async ({ connection, input }) => {
     input.points = input.points.slice(0, 1);
@@ -957,24 +1074,30 @@ it("allows an expired claim without changing it and rejects a changed hub receip
 });
 
 it("accepts the maximum 64 exact points in one finite operation", async () => {
-  await withFixture(async ({ connection, input }) => {
-    expect(input.points).toHaveLength(64);
-    const before = await snapshot(
-      connection,
-      TABLES.filter(
-        (table) => table !== "progressive_worker_delivery_failures",
-      ),
-    );
-    expect(
-      (await replayProgressiveWorkerOutbox(connection, input, { apply: true }))
-        .requeuedCount,
-    ).toBe(64);
-    expect(await snapshot(connection, Object.keys(before))).toEqual(before);
-    const [counts] =
-      await connection.execute(sql`SELECT count(*)::int AS total, min(attempt_count) AS min_attempts,
+  await withFixture(
+    async ({ connection, input }) => {
+      expect(input.points).toHaveLength(64);
+      const before = await snapshot(
+        connection,
+        TABLES.filter(
+          (table) => table !== "progressive_worker_delivery_failures",
+        ),
+      );
+      expect(
+        (
+          await replayProgressiveWorkerOutbox(connection, input, {
+            apply: true,
+          })
+        ).requeuedCount,
+      ).toBe(64);
+      expect(await snapshot(connection, Object.keys(before))).toEqual(before);
+      const [counts] =
+        await connection.execute(sql`SELECT count(*)::int AS total, min(attempt_count) AS min_attempts,
       max(attempt_count) AS max_attempts FROM progressive_worker_delivery_failures WHERE state='retry' AND retry_after IS NOT NULL`);
-    expect(counts).toEqual({ total: 64, min_attempts: 5, max_attempts: 5 });
-  }, 64);
+      expect(counts).toEqual({ total: 64, min_attempts: 5, max_attempts: 5 });
+    },
+    { pendingCount: 64 },
+  );
 });
 
 it("runs CLI help and refuses ambiguous flags before connecting to a database", async () => {
