@@ -402,7 +402,7 @@ export async function recoverTerminalProgressiveNoEvidenceGaps(
             'obsolete execution physically stopped',
             'unstarted submission retry budget exhausted or history incomplete'
           ) THEN clock_timestamp() + interval '5 minutes' ELSE NULL END,
-          error = CASE WHEN unit.attempts = 3
+          error = CASE WHEN unit.attempts >= 2
             THEN unit.error ELSE ${TERMINAL_NO_EVIDENCE_RETRY_REASON} END
         FROM progressive_work work
         WHERE unit.id = ${unit.id}::uuid

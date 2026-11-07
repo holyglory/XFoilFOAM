@@ -4703,7 +4703,7 @@ command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vites
 name = "outbox-replay"
 tier = "development"
 requires = ["seed"]
-command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/progressive-worker-outbox-replay.test.ts"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "--no-file-parallelism", "test/progressive-worker-outbox-replay.test.ts", "test/progressive-stopped-storage.test.ts"]
 
 [[test.solver-throughput-recovery.check]]
 name = "admission-and-leases"
@@ -4727,7 +4727,7 @@ command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vites
 name = "retry-recovery-integration"
 tier = "development"
 requires = ["retry-selection"]
-command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "recovers later terminal gaps through canonical admission after a saturated recovery prefix"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "recovers later terminal gaps through canonical admission after a saturated recovery prefix|bounded completion retry eligibility|reconciles a stranded terminal retry before normal admission"]
 
 [[test.solver-throughput-recovery.check]]
 name = "stopped-failure-storage"

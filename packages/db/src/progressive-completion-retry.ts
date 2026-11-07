@@ -81,7 +81,8 @@ export async function requeueProgressiveCompletionRetries(
         UPDATE progressive_cfd_units
         SET state = 'pending', lease_token = NULL, lease_owner = NULL,
           lease_until = NULL, retry_after = NULL,
-          error = 'Completion retry admitted after an under-budget unresolved attempt'
+          error = CASE WHEN attempts >= 2 THEN error
+            ELSE 'Completion retry admitted after an under-budget unresolved attempt' END
         WHERE id = ${unit.id}::uuid AND state = 'gap' AND attempts IN (1, 2)
       `);
       await connection.execute(sql`

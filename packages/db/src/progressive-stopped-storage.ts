@@ -12,7 +12,6 @@ import {
 } from "./progressive-remote-report";
 import { validateProgressiveExecutionStopProof } from "./progressive-cfd-settlement";
 import type { EngineExecutionStopProof } from "../../engine-client/src/types";
-import { progressiveRemotePointProjection } from "./progressive-remote-point-projection";
 
 const stoppedAttemptOwner = sql`(
   (unit.state='blocked' AND unit.lease_token IS NULL AND unit.lease_until IS NULL)
@@ -23,6 +22,13 @@ export async function assertStoppedProgressiveStorage(
   db: DB,
   delivery: ProgressiveRemoteEvidenceDelivery,
 ) {
+  return (await assertStoppedProgressiveStorageAdmission(db, delivery)).source;
+}
+
+export async function assertStoppedProgressiveStorageAdmission(
+  db: DB,
+  delivery: ProgressiveRemoteEvidenceDelivery,
+) {
   const source = await resolveProgressiveRemoteEvidence(db, delivery);
   if (!source)
     throw new ProgressiveRemoteEvidenceConflict(
@@ -30,11 +36,13 @@ export async function assertStoppedProgressiveStorage(
     );
   const [existing] = await db.execute(sql`SELECT storage_only FROM progressive_remote_evidence_receipts
     WHERE sim_job_id=${delivery.engineJobId}::uuid AND point_content_signature=${source.contentSignature}`);
-  if (existing?.storage_only === true) return source;
-  if (progressiveRemotePointProjection(source).status === "failed") {
+  if (existing?.storage_only === true) return { source, kind: "retained-replay" as const };
+  const [promise] = await db.execute(sql`SELECT status FROM sync_sweep_promises
+    WHERE id=${delivery.promiseId}::uuid`);
+  if (promise?.status === "active") {
     const { assertProgressiveStoppedFailedEvidenceJob } = await import("./progressive-cfd-evidence");
     await assertProgressiveStoppedFailedEvidenceJob(db, delivery);
-    return source;
+    return { source, kind: "current-failed" as const };
   }
   const [stopped] = await db.execute(sql`
     SELECT job.status,job.engine_job_id,promise.status AS promise_status,
@@ -93,5 +101,5 @@ export async function assertStoppedProgressiveStorage(
     );
   validateProgressiveExecutionStopProof(proof);
   validateProgressiveExecutionStopProof(latest.report.stopProof);
-  return source;
+  return { source, kind: "legacy-closed" as const };
 }

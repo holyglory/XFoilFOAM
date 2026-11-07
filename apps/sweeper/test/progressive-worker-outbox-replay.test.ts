@@ -274,12 +274,12 @@ async function withFixture(
               converged: !(failedPoints && alpha >= 7),
               unsteady: false,
               first_order_fallback: false,
-              error:
-                failedPoints && alpha >= 7
-                  ? "Fixture solver failed after retaining evidence"
-                  : undefined,
-              failure_disposition:
-                failedPoints && alpha >= 7 ? "hard_solver" : undefined,
+              ...(failedPoints && alpha >= 7
+                ? {
+                    error: "Fixture solver failed after retaining evidence",
+                    failure_disposition: "hard_solver" as const,
+                  }
+                : {}),
               images: {},
               engine: runtime,
               solver_active_seconds: 48,

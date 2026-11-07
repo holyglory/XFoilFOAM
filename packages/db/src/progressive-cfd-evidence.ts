@@ -33,6 +33,7 @@ export {
 
 interface BoundUnit {
   token: string;
+  owner: string;
   unit_id: string;
   aoa_deg: number;
   active_seconds: number;
@@ -49,6 +50,7 @@ interface BoundUnit {
   execution_recipe_id: string;
   stage: number;
   lease_token: string | null;
+  lease_owner: string | null;
   lease_until: Date | string | null;
   work_state: string;
   latest_attempt: boolean;
@@ -77,6 +79,15 @@ function isRuntimeProgressObsoleteUnit(unit: BoundUnit): boolean {
       ["complete", "failed", "expired", "cancelled"].includes(unit.outcome) ||
       ["complete", "gap", "cancelled"].includes(unit.state))
   );
+}
+
+function isStoppedFailedStorageUnit(unit: BoundUnit): boolean {
+  if (!unit.latest_attempt) return false;
+  const unowned = unit.lease_token == null && unit.lease_owner == null && unit.lease_until == null;
+  return (unit.outcome === "failed" && ["gap", "pending"].includes(unit.state) && unowned) ||
+    (unit.outcome === "running" && ((unit.state === "blocked" && unowned) ||
+      (unit.state === "leased" && unit.lease_token === unit.token &&
+        unit.lease_owner === unit.owner && unit.lease_until != null)));
 }
 
 async function lockJobScope(
@@ -175,10 +186,10 @@ async function lockJobScope(
   if (recoveryScope)
     await lockProgressiveStorageRecoveryUnits(db, recoveryScope, simJobId);
   const units = (await db.execute(sql`
-    SELECT attempt.token, unit.id AS unit_id, unit.aoa_deg, attempt.active_seconds, unit.active_seconds AS unit_seconds,
+    SELECT attempt.token, attempt.owner, unit.id AS unit_id, unit.aoa_deg, attempt.active_seconds, unit.active_seconds AS unit_seconds,
       unit.active_budget_seconds, ${progressiveCfdEffectiveBudgetSql(sql`unit`)} AS effective_budget_seconds,
       unit.state, attempt.outcome, recipe.execution_revision_id,
-      unit.lease_token, unit.lease_until, work.state AS work_state,
+      unit.lease_token, unit.lease_owner, unit.lease_until, work.state AS work_state,
       NOT EXISTS (SELECT 1 FROM progressive_cfd_attempts newer WHERE newer.unit_id = unit.id
         AND (newer.started_at, newer.token) > (attempt.started_at, attempt.token)) AS latest_attempt,
       (EXISTS (SELECT 1 FROM progressive_cfd_evidence receipt WHERE receipt.attempt_token = attempt.token
@@ -232,8 +243,7 @@ async function lockJobScope(
                 new Date(String(unit.lease_until)).getTime() > Date.now()
               : unit.lease_token != null || unit.lease_until != null)
           : policy === "stopped-failed-storage"
-            ? selectedAoas!.has(unit.aoa_deg) && (!unit.latest_attempt || unit.outcome !== "failed" ||
-              !["gap", "pending"].includes(unit.state) || unit.lease_token != null || unit.lease_until != null)
+            ? selectedAoas!.has(unit.aoa_deg) && !isStoppedFailedStorageUnit(unit)
           : policy === "runtime"
             ? !isRuntimeProgressActiveUnit(unit) &&
               !isRuntimeProgressObsoleteUnit(unit)
@@ -322,12 +332,17 @@ export async function assertProgressiveStoppedFailedEvidenceJob(
   const selected = scope?.units.filter((unit) => unit.aoa_deg === delivery.aoaDeg) ?? [];
   if (!scope || selected.length !== 1)
     throw new ProgressiveCfdEvidenceScopeClosed("Stopped failure storage has no unique original selected owner");
-  const [owner] = await db.execute(sql`SELECT unit.lease_owner,job.ingest_lease_token,job.ingest_lease_expires_at
-    FROM progressive_cfd_units unit JOIN sim_jobs job ON job.id=${delivery.engineJobId}::uuid
-    WHERE unit.id=${selected[0].unit_id}::uuid FOR UPDATE OF job`);
-  if (!owner || owner.lease_owner != null || (owner.ingest_lease_token != null &&
+  const [owner] = await db.execute(sql`SELECT ingest_lease_token,ingest_lease_expires_at
+    FROM sim_jobs WHERE id=${delivery.engineJobId}::uuid FOR UPDATE`);
+  if (!owner || (owner.ingest_lease_token != null &&
     (owner.ingest_lease_expires_at == null || new Date(String(owner.ingest_lease_expires_at)).getTime() > Date.now())))
     throw new ProgressiveCfdEvidenceScopeClosed("Stopped failure storage conflicts with a live ingestion or selected unit owner");
+  const [promise] = await db.execute(sql`SELECT promise.status FROM sync_sweep_promises promise
+    JOIN progressive_remote_dispatches dispatch ON dispatch.promise_id=promise.id
+    WHERE promise.id=${delivery.promiseId}::uuid AND dispatch.sim_job_id=${delivery.engineJobId}::uuid
+      AND dispatch.solver_id=${delivery.solverId}::uuid FOR SHARE OF promise`);
+  if (promise?.status !== "active")
+    throw new ProgressiveCfdEvidenceScopeClosed("Current stopped failure contribution requires an active promise");
   assertProgressiveRemotePhysicalCase(source, selected[0].snapshot);
   return { source, scope: { ...scope, units: selected } };
 }

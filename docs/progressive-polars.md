@@ -308,6 +308,14 @@ previously misclassified gap requires the latest exact cancelled execution, no
 case evidence, and the current campaign generation and stage. It cannot reopen
 obsolete work, supersede another attempt, or replenish an exhausted budget.
 
+Terminal-gap recovery selects only rows on which its existing guarded transition
+can act before applying the per-pass limit. Already-eligible pending rows and
+exhausted gaps must not repeatedly hide later recoverable cases. Requeueing keeps
+the original terminal reason when bounded completion-retry eligibility depends on
+it; a display-only retry message must not make an admitted case ineligible again.
+The subsequent normal claim still enforces the same attempt count, remaining
+active-time budget, accepted-history exclusions and execution ownership.
+
 Fast-stage retries may reuse the same immutable numerical recovery plan after
 such a verified never-started cancellation. Each attempt retains its own immutable
 claim; the plan is not restricted to one lifetime claim. The retry keeps the exact
@@ -415,13 +423,43 @@ New compact evidence from a closed assignment uses the separate registered-worke
 `retained-progressive-evidence` endpoint. It requires the exact immutable dispatch
 and report, a terminal execution with no running attempt or live import owner,
 and both a persisted stop acknowledgement and a validated final report. Its
-immutable `storage_only` receipt is not a CFD contribution and cannot select a
-canonical point, fulfill a promise, reopen campaign work, or change a curve.
+immutable `storage_only` receipt cannot select a canonical point, fulfill a promise,
+or reopen campaign work. This legacy closed-assignment path does not create a
+current campaign CFD contribution or change a curve.
 The normal archive broker can then verify and store that exact retained source;
 existing signed custody and fresh generation-pinned readback still gate local
 deletion. Workers may retry an old inactive-promise refusal once through this
 path only after authenticated lease loss and acknowledged stopping. Explicit
 import conflicts, foreign ownership and storage-path refusals remain blocked.
+
+A separate current-scope admission path retains a selected, genuinely failed
+physical attempt after authenticated stopping without requiring every sibling
+angle to have produced evidence. Failure of the physical calculation is distinct
+from the scheduling attempt's state: the original scheduling owner may still be
+waiting for ingestion. This path requires the exact report and manifest identity,
+current epoch, campaign plan and numerical recipe, latest original selected owner,
+and no competing ingestion owner. It never converts an omitted angle into an
+attempt or changes a sibling's ownership. A scheduling promise may remain active
+while this transfer finishes; retiring it must not be a prerequisite for retaining
+the evidence needed to settle it.
+
+Such failed physical evidence remains nonaccepted and receives a storage-only
+receipt. An independently checked link to its original current-scope attempt can
+make an informative history available to the composite estimator under the
+existing history-quality rules. The receipt itself is not an acceptance decision:
+divergent, corrupt, nonphysical and startup-only histories remain excluded, and
+accepted CFD curves and canonical selections remain unchanged. Required archive
+custody must complete before settlement or local deletion. Legacy closed-scope
+retention remains separate and cannot acquire this current-scope link by falling
+through a failed ownership check.
+
+Reported failures containing no coefficients, retained histories, media or raw
+artifacts use a distinct immutable diagnostic acknowledgement rather than an
+invented CFD result. The acknowledgement binds the authenticated report and exact
+point signature; material-domain acknowledgements retain their version-1 identity,
+while infrastructure and hard-solver diagnostics carry a version-2 failure kind.
+An already-issued raw-attempt receipt remains the original receipt on replay.
+Unattempted angles receive neither diagnostic acknowledgements nor solver rows.
 An explicit import-conflict response is not a successful retained-attempt receipt
 or a transient transport failure. The compact worker records valid remote conflict
 IDs and the original HTTP status, including HTTP 200 conflict responses, then stops

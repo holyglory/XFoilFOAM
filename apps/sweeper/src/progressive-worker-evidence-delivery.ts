@@ -262,8 +262,11 @@ export async function deliverNextProgressiveWorkerEvidence(
         stoppedStorage = await progressiveStoppedStorageEligible(
           db,
           executionId,
-          { resultAttemptId: String(pending.result_attempt_id), pointContentSignature: source.contentSignature, sequence },
         );
+        if (!stoppedStorage && projection.status === "failed")
+          stoppedStorage = await progressiveStoppedStorageEligible(db, executionId, {
+            resultAttemptId: String(pending.result_attempt_id), pointContentSignature: source.contentSignature, sequence,
+          });
         if (stoppedStorage) {
           response = await post("retained-progressive-evidence");
           responseStatus = response.status;

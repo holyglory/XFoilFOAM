@@ -13,7 +13,7 @@ import {
   assertProgressiveRemotePhysicalCase,
   progressiveRemotePointProjection,
 } from "./progressive-remote-point-projection";
-import { assertStoppedProgressiveStorage } from "./progressive-stopped-storage";
+import { assertStoppedProgressiveStorageAdmission } from "./progressive-stopped-storage";
 
 export interface ProgressiveRemoteEvidenceDelivery {
   solverId: string;
@@ -192,8 +192,8 @@ export async function recordProgressiveRemoteEvidenceReceipt(
       );
     await assertProgressiveRemoteEvidenceAttempt(connection, input);
     if (input.storageOnly) {
-      await assertStoppedProgressiveStorage(connection, input);
-      if (progressiveRemotePointProjection(source).status === "failed")
+      const admission = await assertStoppedProgressiveStorageAdmission(connection, input);
+      if (admission.kind === "current-failed")
         await recordProgressiveCfdEvidence(connection, {
           simJobId: input.engineJobId, engineJobId: input.engineJobId,
           resultAttemptIds: [input.resultAttemptId], stoppedFailedStorage: input,

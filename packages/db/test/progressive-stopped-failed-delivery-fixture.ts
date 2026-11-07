@@ -11,6 +11,7 @@ import { resolveProgressiveRemoteEvidence } from "../src/progressive-remote-evid
 import { readProgressiveRemoteRetention } from "../src/progressive-remote-retention";
 import { claimProgressivePolarFit } from "../src/progressive-polar-cache";
 import { issueProgressiveRemoteDiagnosticReceipts } from "../src/progressive-remote-diagnostic-receipts";
+import { acknowledgeProgressiveWorkerReport, enqueueProgressiveWorkerReport } from "../src/progressive-worker-reports";
 import { resultAttempts, solverEvidenceArtifacts, syncBrokeredEvidenceUploads } from "../src/schema";
 import { registerVerifiedBrokeredEvidenceArchive } from "../src/brokered-evidence-archive";
 import { readProgressiveEvidenceCustodyReceipt } from "../src/progressive-evidence-custody";
@@ -54,7 +55,7 @@ async function verifyLegacyFailedAttemptAck(db: DB, executionId: string) {
   expect(await db.execute(sql`SELECT sim_job_id FROM progressive_remote_diagnostic_receipts WHERE sim_job_id=${executionId}::uuid`)).toHaveLength(0);
 }
 
-async function retainFailedArchive(db: DB, delivery: ProgressiveRemoteEvidenceDelivery, resultAttemptId: string) {
+async function retainStoppedArchive(db: DB, delivery: ProgressiveRemoteEvidenceDelivery, resultAttemptId: string) {
   const [raw] = await db.select().from(resultAttempts).where(eq(resultAttempts.id, resultAttemptId));
   const [solver] = await db.execute(sql`SELECT instance_id FROM registered_remote_solvers WHERE id=${delivery.solverId}::uuid`);
   const [promised] = await db.execute(sql`SELECT id FROM sync_sweep_promise_points
@@ -154,7 +155,7 @@ export async function verifyPriorRawStoppedProgressiveSettlement(db: DB, envelop
         expect(response.statusCode, response.body).toBe(200);
         const receipt = response.json().progressiveEvidenceReceipts[0];
         expect(receipt.storageOnly).toBe(false);
-        if (source === sources[0]) await retainFailedArchive(connection, delivery, String(receipt.resultAttemptId));
+        if (source === sources[0]) await retainStoppedArchive(connection, delivery, String(receipt.resultAttemptId));
       }
     });
     const before = await connection.execute(sql`SELECT point_content_signature,result_attempt_id,storage_only
@@ -210,7 +211,7 @@ export async function verifyStoppedFailedProgressiveDelivery(
   db: DB,
   envelope: ProgressiveRemoteExecutionEnvelope,
 ) {
-  for (const variant of ["physical", "divergent", "nonphysical", "startup", "infrastructure", "hard_solver", "history-without-manifest"] as const) {
+  for (const variant of ["physical", "running-leased", "running-blocked", "divergent", "nonphysical", "startup", "infrastructure", "hard_solver", "history-without-manifest"] as const) {
     const restore = new Error(`Restore stopped failed delivery ${variant}`);
     await expect(db.transaction(async (transaction) => {
       const connection = transaction as unknown as DB;
@@ -255,13 +256,25 @@ export async function verifyStoppedFailedProgressiveDelivery(
         executionId, solverId: envelope.solverId, promiseId: envelope.promiseId, report,
       });
       await applyProgressiveRemoteProgress(connection, executionId);
+      const selectedToken = envelope.scope.units[0].token;
+      const running = variant === "running-leased" || variant === "running-blocked";
       await connection.execute(sql`UPDATE progressive_cfd_attempts SET outcome='failed',finished_at=clock_timestamp()
-        WHERE sim_job_id=${executionId}::uuid`);
+        WHERE sim_job_id=${executionId}::uuid AND (${!running} OR token<>${selectedToken}::uuid)`);
       await connection.execute(sql`UPDATE progressive_cfd_units SET state='gap',lease_token=NULL,lease_owner=NULL,lease_until=NULL
-        WHERE id IN(SELECT unit_id FROM progressive_cfd_attempts WHERE sim_job_id=${executionId}::uuid)`);
-      const before = await connection.execute(sql`SELECT attempt.token,attempt.outcome,unit.id,unit.state,unit.lease_token
+        WHERE id IN(SELECT unit_id FROM progressive_cfd_attempts WHERE sim_job_id=${executionId}::uuid
+          AND (${!running} OR token<>${selectedToken}::uuid))`);
+      if (variant === "running-blocked")
+        await connection.execute(sql`UPDATE progressive_cfd_units SET state='blocked',lease_token=NULL,lease_owner=NULL,lease_until=NULL
+          WHERE id=(SELECT unit_id FROM progressive_cfd_attempts WHERE token=${selectedToken}::uuid)`);
+      const before = await connection.execute(sql`SELECT attempt.token,attempt.outcome,unit.id,unit.state,unit.lease_token,unit.lease_owner,unit.lease_until
         FROM progressive_cfd_attempts attempt JOIN progressive_cfd_units unit ON unit.id=attempt.unit_id
         WHERE attempt.sim_job_id=${executionId}::uuid ORDER BY unit.id`);
+      if (running) {
+        expect(before.find((unit) => unit.token === selectedToken)).toMatchObject({ outcome: "running",
+          state: variant === "running-leased" ? "leased" : "blocked",
+          lease_token: variant === "running-leased" ? selectedToken : null });
+        expect(before.filter((unit) => unit.token !== selectedToken).every((unit) => unit.outcome === "failed" && unit.state === "gap")).toBe(true);
+      }
       const source = progressiveReportedPointSources(result)[0];
       const reference = { sequence: 1, reportContentSignature: analysisContentHash(report), pointContentSignature: source.contentSignature };
       const delivery = {
@@ -291,7 +304,7 @@ export async function verifyStoppedFailedProgressiveDelivery(
         const strict = await app.inject({ method: "POST", url: "/api/sync/v1/polars", headers, payload });
         expect(strict.statusCode, strict.body).toBe(409);
         if (physical) {
-          if (variant === "physical") {
+          if (variant === "physical" || running) {
             const [original] = await connection.execute(sql`SELECT token,unit_id,execution_recipe_id,started_at
               FROM progressive_cfd_attempts attempt JOIN progressive_cfd_units unit ON unit.id=attempt.unit_id
               WHERE attempt.sim_job_id=${executionId}::uuid AND unit.aoa_deg=${point.aoa_deg}`);
@@ -306,6 +319,10 @@ export async function verifyStoppedFailedProgressiveDelivery(
                   ${new Date(original.started_at as string | Date).toISOString()}::timestamptz+interval '1 second',clock_timestamp(),'failed')`,
               sql`UPDATE sim_jobs SET request_payload=jsonb_set(request_payload,'{engineRequest,speeds}', '[999]'::jsonb)
                 WHERE id=${executionId}::uuid`,
+              sql`UPDATE progressive_cfd_units SET lease_token=${randomUUID()}::uuid
+                WHERE id=${original.unit_id}::uuid`,
+              sql`UPDATE progressive_cfd_units SET lease_owner='foreign-owner'
+                WHERE id=${original.unit_id}::uuid`,
             ];
             for (const mutation of guards) {
               const rollback = new Error("Restore stopped failure refusal");
@@ -341,8 +358,8 @@ export async function verifyStoppedFailedProgressiveDelivery(
           const request = buildProgressiveFitRequest(fit!);
           const observation = [...request.observations, ...request.histories.map((history) => history.observation)]
             .find((entry) => entry.attempt_id === receipt.resultAttemptId)!;
-          expect(observation.eligible).toBe(variant === "physical");
-          if (variant !== "physical") expect(observation.exclusion_reason).toBe(
+          expect(observation.eligible).toBe(variant === "physical" || running);
+          if (variant !== "physical" && !running) expect(observation.exclusion_reason).toBe(
             variant === "divergent" ? "divergent_or_fatal_solver_evidence"
               : variant === "nonphysical" ? "nonphysical_history_coefficients" : "startup_only_history",
           );
@@ -371,7 +388,7 @@ export async function verifyStoppedFailedProgressiveDelivery(
               throw rollback;
             })).rejects.toBe(rollback);
           }
-          await retainFailedArchive(connection, delivery, String(receipt.resultAttemptId));
+          await retainStoppedArchive(connection, delivery, String(receipt.resultAttemptId));
           expect(await readProgressiveRemoteRetention(connection, executionId)).toMatchObject({ kind: "retained",
             sources: [{ resultAttemptId: receipt.resultAttemptId, archived: true, storageOnly: true }] });
         } else {
@@ -392,7 +409,7 @@ export async function verifyStoppedFailedProgressiveDelivery(
           }
         }
       });
-      expect(await connection.execute(sql`SELECT attempt.token,attempt.outcome,unit.id,unit.state,unit.lease_token
+      expect(await connection.execute(sql`SELECT attempt.token,attempt.outcome,unit.id,unit.state,unit.lease_token,unit.lease_owner,unit.lease_until
         FROM progressive_cfd_attempts attempt JOIN progressive_cfd_units unit ON unit.id=attempt.unit_id
         WHERE attempt.sim_job_id=${executionId}::uuid ORDER BY unit.id`)).toEqual(before);
       expect(await connection.execute(sql`SELECT id FROM result_attempts WHERE sim_job_id=${executionId}::uuid AND valid_for_polar`)).toHaveLength(0);
@@ -414,6 +431,166 @@ export async function verifyStoppedFailedProgressiveDelivery(
         if (variant === "infrastructure") await verifyLegacyFailedAttemptAck(connection, executionId);
         expect(await settleProgressiveRemoteJob(connection, executionId)).toMatchObject({ kind: "settled" });
       }
+      throw restore;
+    })).rejects.toBe(restore);
+  }
+  await verifyLegacyClosedProgressiveStorage(db, envelope);
+}
+
+async function verifyLegacyClosedProgressiveStorage(db: DB, envelope: ProgressiveRemoteExecutionEnvelope) {
+  for (const variant of ["failed", "untyped-failed", "accepted"] as const) {
+    const accepted = variant === "accepted";
+    const restore = new Error(`Restore legacy closed storage ${variant}`);
+    await expect(db.transaction(async (transaction) => {
+      const connection = transaction as unknown as DB;
+      const executionId = envelope.scope.executionId;
+      const result = progressiveRemoteEvidenceResult(envelope);
+      result.state = "completed";
+      result.mesh_recovery_version = 3;
+      const [job] = await connection.execute(sql`SELECT job.airfoil_id,job.bc_ids,job.simulation_preset_revision_id,revision.snapshot
+        FROM sim_jobs job JOIN simulation_preset_revisions revision ON revision.id=job.simulation_preset_revision_id
+        WHERE job.id=${executionId}::uuid`);
+      result.polars[0].reynolds = Number((job.snapshot as { derived: { reynolds: number } }).derived.reynolds);
+      const point = result.polars[0].attempts![0];
+      point.cl = accepted ? 0.4 : null;
+      point.cd = accepted ? 0.03 : null;
+      point.cm = accepted ? 0 : null;
+      point.converged = accepted;
+      point.error = accepted ? null : "Retained physical failure from cancelled assignment";
+      if (accepted || variant === "untyped-failed") delete point.failure_disposition;
+      const report: ProgressiveRemoteReport = {
+        version: 1, solverId: envelope.solverId, promiseId: envelope.promiseId, executionId,
+        assignmentSignature: envelope.contentSignature, sequence: 1,
+        status: { job_id: executionId, state: "completed", total_cases: envelope.scope.units.length, completed_cases: 1 },
+        result, stopProof: { version: 1, job_id: executionId, execution_stopped: true, producer_stopped: true,
+          namespace_verified: true, remaining: [], observed_at: new Date().toISOString(), error: null,
+          fence: "terminal_result", ownership_basis: "recorded_execution_namespace" },
+      };
+      await storeProgressiveRemoteReport(connection, {
+        executionId, solverId: envelope.solverId, promiseId: envelope.promiseId, report,
+      });
+      await applyProgressiveRemoteProgress(connection, executionId);
+      await connection.execute(sql`UPDATE progressive_cfd_attempts SET outcome='cancelled',finished_at=clock_timestamp()
+        WHERE sim_job_id=${executionId}::uuid`);
+      await connection.execute(sql`UPDATE progressive_cfd_units SET state='gap',lease_token=NULL,lease_owner=NULL,lease_until=NULL
+        WHERE id IN(SELECT unit_id FROM progressive_cfd_attempts WHERE sim_job_id=${executionId}::uuid)`);
+      const newerToken = randomUUID();
+      await connection.execute(sql`INSERT INTO progressive_cfd_attempts
+        (token,unit_id,owner,execution_recipe_id,started_at,lease_until,outcome)
+        SELECT ${newerToken}::uuid,attempt.unit_id,'newer-sibling-owner',attempt.execution_recipe_id,
+          attempt.started_at+interval '1 second',clock_timestamp()+interval '1 hour','running'
+        FROM progressive_cfd_attempts attempt JOIN progressive_cfd_units unit ON unit.id=attempt.unit_id
+        WHERE attempt.sim_job_id=${executionId}::uuid AND unit.aoa_deg<>${point.aoa_deg} ORDER BY unit.ordinal LIMIT 1`);
+      await connection.execute(sql`UPDATE progressive_cfd_units SET state='leased',lease_token=${newerToken}::uuid,
+        lease_owner='newer-sibling-owner',lease_until=clock_timestamp()+interval '1 hour'
+        WHERE id=(SELECT unit_id FROM progressive_cfd_attempts WHERE token=${newerToken}::uuid)`);
+      const ownership = sql`SELECT attempt.token,attempt.outcome,unit.id,unit.state,unit.lease_token,unit.lease_owner,unit.lease_until
+        FROM progressive_cfd_attempts attempt JOIN progressive_cfd_units unit ON unit.id=attempt.unit_id
+        WHERE unit.id IN(SELECT unit_id FROM progressive_cfd_attempts WHERE sim_job_id=${executionId}::uuid) ORDER BY unit.id,attempt.token`;
+      const before = await connection.execute(ownership);
+      expect(before.some((unit) => unit.token === newerToken && unit.outcome === "running")).toBe(true);
+      const source = progressiveReportedPointSources(result)[0];
+      const projection = progressiveRemotePointProjection({ ...source, envelope, report });
+      expect(projection.status).toBe(accepted ? "done" : "failed");
+      if (variant === "untyped-failed") expect(projection.evidencePayload.failure_disposition ?? null).toBeNull();
+      const [cell] = await connection.execute(sql`SELECT id,status,current_result_attempt_id FROM results
+        WHERE airfoil_id=${job.airfoil_id}::uuid AND simulation_preset_revision_id=${job.simulation_preset_revision_id}::uuid
+          AND aoa_deg=${point.aoa_deg}`);
+      const token = "isolated-legacy-storage-credential";
+      const baseUrl = "https://isolated-legacy-storage.invalid/api/sync/v1";
+      const [solver] = await connection.execute(sql`SELECT instance_id FROM registered_remote_solvers WHERE id=${envelope.solverId}::uuid`);
+      await connection.execute(sql`UPDATE sync_api_settings SET enabled=true,remote_solver_transfer_paused=false,
+        instance_id=${solver.instance_id},remote_solver_registered_id=${envelope.solverId}::uuid,
+        remote_solver_auth_token=${token},upstream_base_url=${baseUrl} WHERE id=1`);
+      await connection.execute(sql`UPDATE sync_api_permissions SET can_push=true WHERE data_type IN('polars','sweeps')`);
+      await connection.execute(sql`UPDATE registered_remote_solvers SET auth_token_hash=${createHash("sha256").update(token).digest("hex")}
+        WHERE id=${envelope.solverId}::uuid`);
+      await connection.execute(sql`UPDATE sync_sweep_promises SET status='cancelled',source_base_url=${baseUrl},
+        source_instance_id=${solver.instance_id} WHERE id=${envelope.promiseId}::uuid`);
+      await connection.execute(sql`UPDATE sim_jobs SET status='cancelled',ingest_lease_token=NULL,ingest_lease_expires_at=NULL,
+        request_payload=request_payload||${JSON.stringify({ remoteSolver: true, syncPromiseId: envelope.promiseId,
+          upstreamBaseUrl: baseUrl, remoteProgressiveExecution: envelope })}::jsonb WHERE id=${executionId}::uuid`);
+      await connection.execute(sql`INSERT INTO progressive_worker_submission_intents(sim_job_id,token,assignment_signature,"authorization")
+        VALUES(${executionId}::uuid,${randomUUID()}::uuid,${envelope.contentSignature},${JSON.stringify({
+          kind: "authorized", executionId, contentSignature: envelope.contentSignature,
+        })}::jsonb)`);
+      const queued = await enqueueProgressiveWorkerReport(connection, { executionId, solverId: envelope.solverId,
+        promiseId: envelope.promiseId, assignmentSignature: envelope.contentSignature,
+        status: report.status, result, stopProof: report.stopProof });
+      expect(queued.contentSignature).toBe(analysisContentHash(report));
+      await acknowledgeProgressiveWorkerReport(connection, { executionId, solverId: envelope.solverId,
+        sequence: queued.sequence, contentSignature: queued.contentSignature });
+      const [raw] = await connection.insert(resultAttempts).values({
+        resultId: String(cell.id), airfoilId: String(job.airfoil_id), bcId: (job.bc_ids as string[])[0],
+        simulationPresetRevisionId: String(job.simulation_preset_revision_id), simJobId: executionId,
+        aoaDeg: projection.aoaDeg, status: projection.status, source: projection.source, regime: projection.regime,
+        cl: projection.cl, cd: projection.cd, cm: projection.cm, converged: projection.converged,
+        unsteady: projection.unsteady, error: projection.error, engineJobId: executionId,
+        engineCaseSlug: projection.engineCaseSlug, evidencePayload: projection.evidencePayload, validForPolar: false,
+      }).returning();
+      await connection.execute(sql`INSERT INTO progressive_worker_evidence_attempts
+        (sim_job_id,sequence,result_attempt_id,point_content_signature)
+        VALUES(${executionId}::uuid,${queued.sequence},${raw.id}::uuid,${source.contentSignature})`);
+      const delivery = { solverId: envelope.solverId, promiseId: envelope.promiseId, engineJobId: executionId,
+        aoaDeg: point.aoa_deg, engineCaseSlug: point.case_slug!, remoteResultId: String(cell.id), remoteResultAttemptId: raw.id,
+        progressiveEvidence: { sequence: queued.sequence, reportContentSignature: queued.contentSignature,
+          pointContentSignature: source.contentSignature } };
+      await withProgressiveSyncApi(connection, async (app) => {
+        const headers = { "x-xfoilfoam-solver-token": token };
+        const payload = { promiseId: envelope.promiseId, sourceInstanceId: String(solver.instance_id), fieldColorScales: [],
+          results: [{ ...projection, ...delivery, fieldExtents: [], evidenceArtifacts: [], media: [] }] };
+        const paths: string[] = [];
+        const fetcher: typeof fetch = async (url, options) => {
+          const route = new URL(String(url)).pathname;
+          paths.push(route);
+          const response = await app.inject({ method: "POST", url: route,
+            headers: Object.fromEntries(new Headers(options?.headers)), payload: JSON.parse(String(options?.body)) });
+          return new Response(response.body, { status: response.statusCode, headers: { "content-type": "application/json" } });
+        };
+        const rollback = new Error("Restore active promise refusal for cancelled original");
+        await expect(connection.transaction(async (nested) => {
+          await nested.execute(sql`UPDATE sync_sweep_promises SET status='active' WHERE id=${envelope.promiseId}::uuid`);
+          if (variant === "untyped-failed") {
+            await nested.execute(sql`UPDATE progressive_cfd_attempts SET outcome='running',finished_at=NULL
+              WHERE sim_job_id=${executionId}::uuid AND token=${envelope.scope.units[0].token}::uuid`);
+            await nested.execute(sql`UPDATE progressive_cfd_units SET state='blocked'
+              WHERE id=(SELECT unit_id FROM progressive_cfd_attempts WHERE token=${envelope.scope.units[0].token}::uuid)`);
+          }
+          const rejected = await app.inject({ method: "POST", url: "/api/sync/v1/retained-progressive-evidence", headers, payload });
+          expect(rejected.statusCode, rejected.body).toBe(409);
+          if (variant === "untyped-failed") {
+            await expect(deliverNextProgressiveWorkerEvidence(nested as unknown as DB, fetcher)).rejects.toThrow("409");
+            expect(paths).toEqual(["/api/sync/v1/polars"]);
+            expect(await nested.execute(sql`SELECT receipt FROM progressive_worker_hub_receipts
+              WHERE sim_job_id=${executionId}::uuid`)).toHaveLength(0);
+          }
+          throw rollback;
+        })).rejects.toBe(rollback);
+        paths.length = 0;
+        expect(await deliverNextProgressiveWorkerEvidence(connection, fetcher)).toBe(true);
+        expect(paths).toEqual(["/api/sync/v1/polars", "/api/sync/v1/retained-progressive-evidence"]);
+        const [stored] = await connection.execute(sql`SELECT receipt FROM progressive_worker_hub_receipts
+          WHERE sim_job_id=${executionId}::uuid AND point_content_signature=${source.contentSignature}`);
+        expect(stored.receipt).toMatchObject({ kind: "retained-progressive-attempt", storageOnly: true,
+          remoteResultAttemptId: raw.id, pointContentSignature: source.contentSignature });
+        const replay = await app.inject({ method: "POST", url: "/api/sync/v1/retained-progressive-evidence", headers, payload });
+        expect(replay.statusCode, replay.body).toBe(200);
+        expect(replay.json().progressiveEvidenceReceipts[0]).toEqual(stored.receipt);
+        expect(await connection.select().from(resultAttempts).where(eq(resultAttempts.id, raw.id))).toEqual([raw]);
+        expect(await deliverNextProgressiveWorkerEvidence(connection, fetcher)).toBe(false);
+        expect(await connection.execute(sql`SELECT evidence.result_attempt_id FROM progressive_cfd_evidence evidence
+          JOIN progressive_cfd_attempts attempt ON attempt.token=evidence.attempt_token
+          WHERE attempt.sim_job_id=${executionId}::uuid`)).toHaveLength(0);
+        await retainStoppedArchive(connection, delivery, String((stored.receipt as { resultAttemptId: string }).resultAttemptId));
+        expect(await readProgressiveRemoteRetention(connection, executionId)).toMatchObject({ kind: "retained",
+          sources: [{ archived: true, storageOnly: true }] });
+      });
+      expect(await connection.execute(ownership)).toEqual(before);
+      expect(await connection.execute(sql`SELECT id,status,current_result_attempt_id FROM results WHERE id=${cell.id}::uuid`)).toEqual([cell]);
+      expect(await connection.execute(sql`SELECT id FROM result_attempts WHERE sim_job_id=${executionId}::uuid AND valid_for_polar`)).toHaveLength(0);
+      expect(await connection.execute(sql`SELECT result_id,result_attempt_id FROM sync_sweep_promise_points
+        WHERE promise_id=${envelope.promiseId}::uuid AND (result_id IS NOT NULL OR result_attempt_id IS NOT NULL)`)).toHaveLength(0);
+      expect(await connection.execute(sql`SELECT status FROM sync_sweep_promises WHERE id=${envelope.promiseId}::uuid`)).toEqual([{ status: "cancelled" }]);
       throw restore;
     })).rejects.toBe(restore);
   }
