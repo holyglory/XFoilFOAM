@@ -4766,16 +4766,27 @@ requires = ["artifact-locking"]
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/progressive-remote-report.test.ts"]
 
 [[test.solver-throughput-recovery.check]]
-name = "cumulative-evidence-reuse"
+name = "physical-reservations"
 tier = "development"
 requires = ["report-contracts"]
-command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "progressive remote dispatch pins one exact request"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/progressive-promise-count-query.test.ts"]
+
+[[test.solver-throughput-recovery.check]]
+name = "cumulative-evidence-reuse"
+tier = "development"
+requires = ["physical-reservations"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "progressive remote dispatch pins one exact request|does not reserve remote CPU for an unstarted dispatch after its case lease expires"]
 
 [[test.solver-throughput-recovery.check]]
 name = "stored-media-recovery"
 tier = "development"
 requires = ["cumulative-evidence-reuse"]
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/media-repair.test.ts"]
+
+[[test.solver-throughput-recovery.check]]
+name = "preview-contracts"
+tier = "development"
+command = ["node", "--test", "scripts/dev/progressive-preview-origin.test.mjs", "scripts/dev/prepare-progressive-tsconfig.test.mjs", "scripts/dev/verify-progressive-web-delivery.test.mjs"]
 
 [[test.solver-throughput-recovery.check]]
 name = "database-types"
