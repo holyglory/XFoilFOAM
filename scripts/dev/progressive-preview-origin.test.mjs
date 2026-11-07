@@ -2,11 +2,16 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { originFromDeployment } from "./progressive-preview-origin.mjs";
+import {
+  originFromDeployment,
+  progressivePreviewDeployment,
+  progressivePreviewOrigin,
+} from "./progressive-preview-origin.mjs";
 
 const snapshot = (port = 20027) => ({
   ok: true,
   data: {
+    deployment_id: "existing-preview",
     state: "running",
     readiness: { ready: true, pending_apply: false },
     components: [
@@ -14,6 +19,136 @@ const snapshot = (port = 20027) => ({
       { name: "web", state: "running", owned: true, port },
     ],
   },
+});
+
+function lookupFixture(response = snapshot()) {
+  const calls = [];
+  return {
+    calls,
+    execute(executable, args, options) {
+      calls.push({ executable, args, options });
+      return JSON.stringify(response);
+    },
+  };
+}
+
+test("queries the current worktree through the v3 read-only operation", () => {
+  const lookup = lookupFixture();
+  const response = progressivePreviewDeployment({
+    deploymentId: null,
+    execute: lookup.execute,
+  });
+  assert.equal(originFromDeployment(response), "http://127.0.0.1:20027");
+  assert.deepEqual(lookup.calls, [
+    {
+      executable: "/usr/local/bin/devcoordinator2",
+      args: [
+        "--client",
+        "codex",
+        "call",
+        "deployment.status",
+        "--params",
+        JSON.stringify({
+          path: fileURLToPath(new URL("../../", import.meta.url)),
+          name: "progressive-preview",
+        }),
+      ],
+      options: { encoding: "utf8", timeout: 30_000, maxBuffer: 256 * 1024 },
+    },
+  ]);
+});
+
+test("targets an existing deployment without binding it to the candidate worktree", () => {
+  const lookup = lookupFixture();
+  assert.equal(
+    progressivePreviewOrigin({
+      deploymentId: "existing-preview",
+      execute: lookup.execute,
+    }),
+    "http://127.0.0.1:20027",
+  );
+  assert.equal(lookup.calls.length, 1);
+  assert.deepEqual(lookup.calls[0].args, [
+    "--client",
+    "codex",
+    "call",
+    "deployment.status",
+    "--params",
+    JSON.stringify({ deployment_id: "existing-preview" }),
+  ]);
+});
+
+test("uses the deployment ID environment override unless an explicit ID is supplied", () => {
+  const previous = process.env.PROGRESSIVE_PREVIEW_DEPLOYMENT_ID;
+  process.env.PROGRESSIVE_PREVIEW_DEPLOYMENT_ID = "existing-preview";
+  try {
+    const lookup = lookupFixture();
+    assert.equal(
+      progressivePreviewOrigin({ execute: lookup.execute }),
+      "http://127.0.0.1:20027",
+    );
+    assert.deepEqual(JSON.parse(lookup.calls[0].args[5]), {
+      deployment_id: "existing-preview",
+    });
+    const response = snapshot();
+    response.data.deployment_id = "explicit-preview";
+    const explicitLookup = lookupFixture(response);
+    progressivePreviewOrigin({
+      deploymentId: "explicit-preview",
+      execute: explicitLookup.execute,
+    });
+    assert.deepEqual(JSON.parse(explicitLookup.calls[0].args[5]), {
+      deployment_id: "explicit-preview",
+    });
+  } finally {
+    if (previous === undefined)
+      delete process.env.PROGRESSIVE_PREVIEW_DEPLOYMENT_ID;
+    else process.env.PROGRESSIVE_PREVIEW_DEPLOYMENT_ID = previous;
+  }
+});
+
+test("rejects invalid explicit IDs before invoking the CLI", () => {
+  const lookup = lookupFixture();
+  for (const deploymentId of ["", " ", 0, false])
+    assert.throws(
+      () =>
+        progressivePreviewDeployment({
+          deploymentId,
+          execute: lookup.execute,
+        }),
+      /deployment ID/,
+    );
+  assert.equal(lookup.calls.length, 0);
+});
+
+test("does not fall back to another deployment after a failed or mismatched lookup", () => {
+  const stale = snapshot();
+  stale.data.readiness.pending_apply = true;
+  for (const response of [
+    { ok: false, error: { code: "deployment_not_found" } },
+    snapshot(),
+    stale,
+  ]) {
+    const lookup = lookupFixture(response);
+    assert.throws(() =>
+      progressivePreviewOrigin({
+        deploymentId: "requested-preview",
+        execute: lookup.execute,
+      }),
+    );
+    assert.equal(lookup.calls.length, 1);
+  }
+  const failure = new Error("Coordinator unavailable");
+  assert.throws(
+    () =>
+      progressivePreviewOrigin({
+        deploymentId: null,
+        execute() {
+          throw failure;
+        },
+      }),
+    failure,
+  );
 });
 
 test("uses the actual web allocation rather than a prior or API port", () => {

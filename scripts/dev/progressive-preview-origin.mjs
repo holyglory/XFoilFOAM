@@ -26,20 +26,40 @@ export function originFromDeployment(response) {
   return `http://127.0.0.1:${web[0].port}`;
 }
 
-export function progressivePreviewOrigin() {
+export function progressivePreviewDeployment({
+  deploymentId = process.env.PROGRESSIVE_PREVIEW_DEPLOYMENT_ID,
+  execute = execFileSync,
+} = {}) {
+  const explicitId = deploymentId !== undefined && deploymentId !== null;
+  if (
+    explicitId &&
+    (typeof deploymentId !== "string" || deploymentId.trim().length === 0)
+  )
+    throw new Error("The progressive preview deployment ID must be non-empty");
   const root = fileURLToPath(new URL("../../", import.meta.url));
-  const response = execFileSync(
-    "/usr/local/bin/devcoordinator2",
-    [
-      "deployment",
-      "status",
-      root,
-      "--name",
-      "progressive-preview",
-      "--client",
-      "codex",
-    ],
-    { encoding: "utf8", timeout: 30_000, maxBuffer: 256 * 1024 },
+  const params = explicitId
+    ? { deployment_id: deploymentId }
+    : { path: root, name: "progressive-preview" };
+  const response = JSON.parse(
+    execute(
+      "/usr/local/bin/devcoordinator2",
+      [
+        "--client",
+        "codex",
+        "call",
+        "deployment.status",
+        "--params",
+        JSON.stringify(params),
+      ],
+      { encoding: "utf8", timeout: 30_000, maxBuffer: 256 * 1024 },
+    ),
   );
-  return originFromDeployment(JSON.parse(response));
+  originFromDeployment(response);
+  if (explicitId && response.data.deployment_id !== deploymentId)
+    throw new Error("The progressive preview deployment ID does not match");
+  return response;
+}
+
+export function progressivePreviewOrigin(options) {
+  return originFromDeployment(progressivePreviewDeployment(options));
 }

@@ -40,6 +40,27 @@ test("binds a real detail response to its unchanged observed deployment and sour
 
 for (const [label, mutate] of [
   [
+    "missing deployment identity",
+    (input) => {
+      delete input.before.data.deployment_id;
+      delete input.after.data.deployment_id;
+    },
+  ],
+  [
+    "missing generation",
+    (input) => {
+      delete input.before.data.current_generation;
+      delete input.after.data.current_generation;
+    },
+  ],
+  [
+    "invalid generation",
+    (input) => {
+      input.before.data.current_generation = 0;
+      input.after.data.current_generation = 0;
+    },
+  ],
+  [
     "changed generation",
     (input) => {
       input.after.data.current_generation = 4;
@@ -73,6 +94,18 @@ for (const [label, mutate] of [
     "unapplied source",
     (input) => {
       input.after.data.readiness.pending_apply = true;
+    },
+  ],
+  [
+    "unapplied initial source",
+    (input) => {
+      input.before.data.readiness.pending_apply = true;
+    },
+  ],
+  [
+    "unowned web allocation",
+    (input) => {
+      input.after.data.components[0].owned = false;
     },
   ],
   [

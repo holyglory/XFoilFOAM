@@ -4,7 +4,10 @@ import { createHash } from "node:crypto";
 import { mkdir, realpath, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { originFromDeployment } from "./progressive-preview-origin.mjs";
+import {
+  originFromDeployment,
+  progressivePreviewDeployment,
+} from "./progressive-preview-origin.mjs";
 
 export function webDeliveryProof({
   before,
@@ -18,6 +21,10 @@ export function webDeliveryProof({
 }) {
   const origin = originFromDeployment(before);
   assert.equal(originFromDeployment(after), origin);
+  assert(
+    typeof before.data.deployment_id === "string" &&
+      before.data.deployment_id.length > 0,
+  );
   assert.equal(before.data.deployment_id, after.data.deployment_id);
   assert(
     Number.isSafeInteger(before.data.current_generation) &&
@@ -60,14 +67,8 @@ async function main() {
   const executor =
     process.env.DEVCOORDINATOR_EXECUTOR ??
     join(dirname(await realpath(cli)), "devcoordinator2-executor");
-  const deployment = () =>
-    JSON.parse(
-      execFileSync(
-        cli,
-        ["deployment", "status", root, "--name", "progressive-preview"],
-        { encoding: "utf8", timeout: 30000, maxBuffer: 256 * 1024 },
-      ),
-    );
+  const deploymentId = process.env.PROGRESSIVE_PREVIEW_DEPLOYMENT_ID;
+  const deployment = () => progressivePreviewDeployment({ deploymentId });
   const source = () => {
     const result = JSON.parse(
       execFileSync(executor, ["source-digest", "--worktree", root], {
