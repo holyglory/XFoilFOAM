@@ -4935,3 +4935,61 @@ name = "canonical-journeys"
 tier = "development"
 requires = ["seed"]
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "retains exact stopped failed attempts without canonical publication|bounded completion retry eligibility|reconciles a stranded terminal retry before normal admission|recovers later terminal gaps through canonical admission after a saturated recovery prefix"]
+
+[test.checkpoint-placement-contracts]
+timeout_seconds = 120
+env = { PYTHONPATH = "src:.", PYTHONDONTWRITEBYTECODE = "1" }
+
+[[test.checkpoint-placement-contracts.check]]
+name = "contracts"
+tier = "development"
+command = [".venv/bin/python", "-m", "pytest", "tests/test_mpi_binding_experiment.py", "-q"]
+
+[test.checkpoint-placement]
+timeout_seconds = 1800
+env = { PYTHONPATH = "src:.", PYTHONDONTWRITEBYTECODE = "1" }
+
+[[test.checkpoint-placement.check]]
+name = "inputs"
+tier = "development"
+phase = "fixture"
+command = [".venv/bin/python", "-m", "scripts.materials.checkpoint_placement_control", "prepare"]
+resources = [{ kind = "directory", id = ".codex-artifacts/checkpoint-placement", access = "exclusive" }]
+
+[[test.checkpoint-placement.check]]
+name = "native"
+tier = "development"
+requires = ["inputs"]
+timeout_seconds = 1260
+command = [".venv/bin/python", "-m", "scripts.materials.checkpoint_placement_control", "apply"]
+
+[[test.checkpoint-placement.check]]
+name = "comparison"
+tier = "development"
+requires = ["native"]
+command = [".venv/bin/python", "-m", "scripts.materials.checkpoint_placement_control", "verify"]
+retained_artifacts = [{ name = "placement-fields", path = ".codex-artifacts/checkpoint-placement/output/snapshots", max_bytes = 268435456 }]
+
+[[test.checkpoint-placement.check]]
+name = "cleanup"
+tier = "development"
+phase = "cleanup"
+after = ["inputs", "native", "comparison"]
+command = [".venv/bin/python", "-m", "scripts.materials.checkpoint_placement_control", "cleanup"]
+retained_artifacts = [{ name = "placement-receipt", path = ".codex-artifacts/checkpoint-placement/receipt", max_bytes = 16777216 }]
+
+[deployment.checkpoint-placement]
+source = ["worktree"]
+components = ["benchmark"]
+public = false
+ttl_seconds = 1800
+
+[deployment.checkpoint-placement.component.benchmark]
+type = "compose"
+files = ["compose.checkpoint-placement.yml"]
+services = ["paired"]
+finite_services = ["paired"]
+build = false
+port = false
+route = false
+timeout_seconds = 1200
