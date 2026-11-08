@@ -11,9 +11,11 @@ import {
   createClient,
   discoverMissingResultMediaRepairs,
   failClaimedResultMediaRepair,
+  fieldColorScales,
   forceHistory,
   flowConditions,
   healExpiredResultMediaRepairClaims,
+  invalidateSatisfiedResultMediaRepair,
   mediums,
   renewResultMediaRepairClaim,
   RESULT_MEDIA_LOCAL_BYTES_UNAVAILABLE_MARKER,
@@ -25,6 +27,7 @@ import {
   resultMediaRepairs,
   resultMediaStorageBindings,
   resultMediaStorageUploads,
+  resultReviewVerdicts,
   referenceGeometryProfiles,
   results,
   schedulingProfiles,
@@ -1297,7 +1300,7 @@ describe("durable result media repair", () => {
         ).toBe(true);
       },
     );
-  });
+  }, 30_000);
 
   it("resolves imported manifests only through their exact current archive and rejects conflicting proof", async () => {
     const requests: RenderDefaultMediaRequest[] = [];
@@ -3603,6 +3606,241 @@ describe("durable result media repair", () => {
       .from(resultMediaRepairs)
       .where(eq(resultMediaRepairs.resultId, fixture.resultId));
     expect(repair.backgroundOwner).toBe(true);
+  });
+
+  describe("unpublished shared-scale repair cohort", () => {
+    const narrowFields = {
+      velocity_magnitude: { min: 0, max: 44, finite_count: 500 },
+      pressure: { min: -3, max: 2, finite_count: 500 },
+    };
+    const wideFields = {
+      ...narrowFields,
+      pressure: { min: -8, max: 6, finite_count: 500 },
+    };
+
+    async function createCohort(label: string, retainProducingJob = false) {
+      const airfoilId = await createAirfoil(label);
+      const [producer] = await db.insert(simJobs).values({
+        airfoilId,
+        bcIds: [bcId],
+        simulationPresetRevisionId: revisionId,
+        referenceChordM: 0.15,
+        status: "done",
+        ingestedAt: new Date(),
+      }).returning({ id: simJobs.id });
+      const first = await createSolvedResult(`${label}-a`, { airfoilId, aoa: 19 });
+      const second = await createSolvedResult(`${label}-b`, { airfoilId, aoa: 20, simJobId: producer.id });
+      await db.update(results).set({ status: "pending", currentResultAttemptId: null })
+        .where(inArray(results.id, [first.resultId, second.resultId]));
+      if (!retainProducingJob) {
+        await db.update(results).set({ simJobId: null }).where(eq(results.id, second.resultId));
+      }
+      for (const fixture of [first, second]) {
+        expect(await discoverMissingResultMediaRepairs(db, { resultId: fixture.resultId })).toBe(1);
+        await db.insert(resultFieldExtents).values(
+          Object.entries(fixture === first ? narrowFields : wideFields).map(([field, extent]) => ({
+            resultId: fixture.resultId,
+            resultAttemptId: fixture.resultAttemptId,
+            airfoilId,
+            simulationPresetRevisionId: revisionId,
+            field,
+            renderProfileKey: "default:v1:zoom2",
+            vmin: extent.min,
+            vmax: extent.max,
+            finiteCount: extent.finite_count,
+            sourceTimeStart: 1,
+            sourceTimeEnd: 2,
+            evidenceSha256: fixture.manifestSha,
+          })),
+        );
+      }
+      return { first, second, airfoilId, producingJobId: producer.id };
+    }
+
+    async function renderOwned(
+      connection: DB,
+      fixture: Fixture,
+      fields: typeof narrowFields,
+    ) {
+      const claim = await claimNextResultMediaRepair(connection, { resultId: fixture.resultId });
+      expect(claim?.claimToken).toBeTruthy();
+      const requests: RenderDefaultMediaRequest[] = [];
+      await repairDefaultMediaForStoredResult({
+        db: connection,
+        engine: engineWith({
+          extents: async () => ({ fields, window_start: 1, window_end: 2 }),
+          render: async (jobId, request) => {
+            requests.push(request);
+            return completeMediaResponse(jobId, request);
+          },
+        }),
+        resultId: fixture.resultId,
+        resultAttemptId: fixture.resultAttemptId,
+        heartbeat: async () => undefined,
+        repairFence: {
+          repairId: claim!.id,
+          resultAttemptId: fixture.resultAttemptId,
+          claimToken: claim!.claimToken!,
+          evidenceSignature: claim!.evidenceSignature,
+        },
+      });
+      expect(await completeSatisfiedResultMediaRepair(
+        connection, claim!.id, fixture.resultAttemptId, claim!.evidenceSignature,
+      )).toBe(true);
+      expect(requests).toHaveLength(1);
+      return { claim: claim!, request: requests[0]! };
+    }
+
+    const activeScales = (connection: DB, airfoilId: string) => connection
+      .select({
+        id: fieldColorScales.id,
+        field: fieldColorScales.field,
+        version: fieldColorScales.version,
+        signature: fieldColorScales.evidenceSignature,
+        vmin: fieldColorScales.vmin,
+        vmax: fieldColorScales.vmax,
+      })
+      .from(fieldColorScales)
+      .where(and(eq(fieldColorScales.airfoilId, airfoilId), eq(fieldColorScales.active, true)))
+      .orderBy(fieldColorScales.field);
+
+    async function reopenMissingMedia(connection: DB, fixture: Fixture, repairId: string, signature: string) {
+      await connection.delete(resultMedia).where(and(
+        eq(resultMedia.resultAttemptId, fixture.resultAttemptId),
+        eq(resultMedia.field, "pressure"),
+        eq(resultMedia.kind, "image"),
+        eq(resultMedia.role, "instantaneous"),
+      ));
+      expect(await invalidateSatisfiedResultMediaRepair(
+        connection, repairId, fixture.resultAttemptId, signature, "fixture: missing stored pressure image",
+      )).toBe("retry_wait");
+    }
+
+    it.each([false, true])("keeps the same scale for unpublished A to B to A across accepted unfinished repairs (retained producing job: %s)", async (retainProducingJob) => {
+      const cohort = await createCohort(`stable-unpublished-scale-${retainProducingJob}`, retainProducingJob);
+      const attemptIds = [cohort.first.resultAttemptId, cohort.second.resultAttemptId];
+      const attemptsBefore = await db.select().from(resultAttempts)
+        .where(inArray(resultAttempts.id, attemptIds)).orderBy(resultAttempts.id);
+      const first = await renderOwned(db, cohort.first, narrowFields);
+      expect(first.request.scales.pressure).toEqual({ vmin: -8, vmax: 8 });
+      const scales = await activeScales(db, cohort.airfoilId);
+      expect(scales.map((scale) => scale.version)).toEqual([1, 1]);
+      await refreshPolarCacheForRevision(db, cohort.airfoilId, revisionId);
+      const [acceptedFirst] = await db.select({ state: resultClassifications.state })
+        .from(resultClassifications).where(eq(resultClassifications.resultAttemptId, cohort.first.resultAttemptId));
+      expect(acceptedFirst.state).toBe("accepted");
+      const second = await renderOwned(db, cohort.second, wideFields);
+      expect(second.request.scales).toEqual(first.request.scales);
+      expect(await activeScales(db, cohort.airfoilId)).toEqual(scales);
+      await refreshPolarCacheForRevision(db, cohort.airfoilId, revisionId);
+      await reopenMissingMedia(db, cohort.first, first.claim.id, first.claim.evidenceSignature);
+      const repeated = await renderOwned(db, cohort.first, narrowFields);
+      expect(repeated.request.scales).toEqual(first.request.scales);
+      expect(repeated.request.scale_version).toBe(first.request.scale_version);
+      expect(await activeScales(db, cohort.airfoilId)).toEqual(scales);
+      expect(await db.select().from(resultAttempts)
+        .where(inArray(resultAttempts.id, attemptIds)).orderBy(resultAttempts.id)).toEqual(attemptsBefore);
+      expect(await db.select({ pointer: results.currentResultAttemptId }).from(results)
+        .where(inArray(results.id, [cohort.first.resultId, cohort.second.resultId]))).toEqual([
+        { pointer: null }, { pointer: null },
+      ]);
+      expect(await db.select({ finalized: resultMediaRepairs.downstreamFinalizedAt })
+        .from(resultMediaRepairs).where(inArray(resultMediaRepairs.resultId, [cohort.first.resultId, cohort.second.resultId]))).toEqual([
+        { finalized: null }, { finalized: null },
+      ]);
+    });
+
+    it("drops excluded replaced removed or mismatched siblings without restricting historical caller renders", async () => {
+      const cohort = await createCohort("invalidated-unpublished-scale", true);
+      const first = await renderOwned(db, cohort.first, narrowFields);
+      const initialScales = await activeScales(db, cohort.airfoilId);
+      const [siblingAttempt] = await db.select().from(resultAttempts)
+        .where(eq(resultAttempts.id, cohort.second.resultAttemptId));
+      const newerAttempt = async (connection: DB) => {
+        const [replacementJob] = await connection.insert(simJobs).values({
+          airfoilId: cohort.airfoilId,
+          bcIds: [bcId],
+          simulationPresetRevisionId: revisionId,
+          referenceChordM: 0.15,
+          status: "done",
+          ingestedAt: new Date(),
+        }).returning({ id: simJobs.id });
+        const [replacement] = await connection.insert(resultAttempts).values({
+          ...siblingAttempt,
+          id: randomUUID(),
+          simJobId: replacementJob.id,
+          engineCaseSlug: `${siblingAttempt.engineCaseSlug}-replacement`,
+          createdAt: new Date(siblingAttempt.createdAt.getTime() + 1_000),
+        }).returning({ id: resultAttempts.id });
+        return replacement.id;
+      };
+      const scenarios: Array<{ name: string; mutate: (connection: DB) => Promise<unknown> }> = [
+        { name: "excluded", mutate: (connection) => connection.insert(resultReviewVerdicts).values({
+          resultId: cohort.second.resultId, verdict: "exclude", reviewer: PREFIX,
+        }) },
+        { name: "replaced repair", mutate: async (connection) => connection.update(resultMediaRepairs)
+          .set({ resultAttemptId: await newerAttempt(connection) })
+          .where(eq(resultMediaRepairs.resultId, cohort.second.resultId)) },
+        { name: "newer source", mutate: newerAttempt },
+        { name: "removed repair", mutate: (connection) => connection.delete(resultMediaRepairs)
+          .where(eq(resultMediaRepairs.resultId, cohort.second.resultId)) },
+        { name: "mismatched signature", mutate: (connection) => connection.update(resultMediaRepairs)
+          .set({ evidenceSignature: "other-source" }).where(eq(resultMediaRepairs.resultId, cohort.second.resultId)) },
+        { name: "mismatched extent", mutate: (connection) => connection.update(resultFieldExtents)
+          .set({ evidenceSha256: "f".repeat(64) }).where(eq(resultFieldExtents.resultId, cohort.second.resultId)) },
+        { name: "other profile", mutate: (connection) => connection.update(resultFieldExtents)
+          .set({ renderProfileKey: "other:v1" }).where(eq(resultFieldExtents.resultId, cohort.second.resultId)) },
+        { name: "other rejection", mutate: (connection) => connection.update(resultClassifications)
+          .set({ reasons: ["missing-urans-video", "missing-frame-track"] })
+          .where(eq(resultClassifications.resultAttemptId, cohort.second.resultAttemptId)) },
+        { name: "superseded", mutate: (connection) => connection.update(resultClassifications)
+          .set({ state: "superseded_by_urans" }).where(eq(resultClassifications.resultAttemptId, cohort.second.resultAttemptId)) },
+        { name: "finalized", mutate: (connection) => connection.update(resultMediaRepairs)
+          .set({ state: "done", downstreamFinalizedAt: new Date() })
+          .where(eq(resultMediaRepairs.resultId, cohort.second.resultId)) },
+        { name: "blocked", mutate: (connection) => connection.update(resultMediaRepairs)
+          .set({ state: "blocked" }).where(eq(resultMediaRepairs.resultId, cohort.second.resultId)) },
+        { name: "new cell owner", mutate: (connection) => connection.update(results)
+          .set({ status: "running" }).where(eq(results.id, cohort.second.resultId)) },
+        { name: "different producing job", mutate: async (connection) => {
+          const [otherJob] = await connection.insert(simJobs).values({
+            airfoilId: cohort.airfoilId, bcIds: [bcId], simulationPresetRevisionId: revisionId,
+            referenceChordM: 0.15, status: "done", ingestedAt: new Date(),
+          }).returning({ id: simJobs.id });
+          return connection.update(results).set({ simJobId: otherJob.id })
+            .where(eq(results.id, cohort.second.resultId));
+        } },
+        { name: "live producing job", mutate: (connection) => connection.update(simJobs)
+          .set({ status: "running" }).where(eq(simJobs.id, cohort.producingJobId)) },
+        { name: "active ingest owner", mutate: (connection) => connection.update(simJobs)
+          .set({ ingestLeaseToken: randomUUID(), ingestLeaseExpiresAt: new Date(Date.now() + 60_000) })
+          .where(eq(simJobs.id, cohort.producingJobId)) },
+      ];
+      for (const scenario of scenarios) {
+        const rollback = new Error(`rollback ${scenario.name}`);
+        await db.transaction(async (rawTx) => {
+          const connection = rawTx as unknown as DB;
+          await scenario.mutate(connection);
+          await reopenMissingMedia(connection, cohort.first, first.claim.id, first.claim.evidenceSignature);
+          const rendered = await renderOwned(connection, cohort.first, narrowFields);
+          expect(rendered.request.scales.pressure, scenario.name).toEqual({ vmin: -3, vmax: 3 });
+          const scales = await activeScales(connection, cohort.airfoilId);
+          expect(scales.find((scale) => scale.field === "pressure")?.version, scenario.name).toBe(2);
+          expect(scales.find((scale) => scale.field === "velocity_magnitude"), scenario.name)
+            .toEqual(initialScales.find((scale) => scale.field === "velocity_magnitude"));
+          throw rollback;
+        }).catch((error) => {
+          if (error !== rollback) throw error;
+        });
+      }
+      await db.insert(resultReviewVerdicts).values({
+        resultId: cohort.second.resultId, verdict: "exclude", reviewer: PREFIX,
+      });
+      const historical = await renderOwned(db, cohort.second, wideFields);
+      expect(historical.request.scales.pressure).toEqual({ vmin: -8, vmax: 8 });
+      expect(await db.select({ pointer: results.currentResultAttemptId }).from(results)
+        .where(eq(results.id, cohort.second.resultId))).toEqual([{ pointer: null }]);
+    }, 30_000);
   });
 
   it("re-scales one claimed result at a time and reopens siblings on the old scale", async () => {

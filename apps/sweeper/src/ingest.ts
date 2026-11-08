@@ -8,6 +8,7 @@ import {
   airfoils,
   type CampaignLaneKey,
   fieldColorScales,
+  exactValidSolverManifestSql,
   enqueuePrecalcVerifications,
   forceHistory,
   hasExactValidSolverManifest,
@@ -3358,6 +3359,81 @@ async function rebalanceRepairFieldScales(
             OR (
               ${resultFieldExtents.resultId} = ${opts.repairSource.id}::uuid
               AND ${resultFieldExtents.resultAttemptId} = ${opts.repairSource.currentResultAttemptId}::uuid
+            )
+            OR EXISTS (
+              SELECT 1
+              FROM result_media_repairs sibling_repair
+              JOIN results sibling_result ON sibling_result.id = sibling_repair.result_id
+              JOIN result_attempts sibling_attempt
+                ON sibling_attempt.id = sibling_repair.result_attempt_id
+                AND sibling_attempt.result_id = sibling_result.id
+              JOIN result_classifications sibling_classification
+                ON sibling_classification.result_attempt_id = sibling_attempt.id
+              JOIN solver_evidence_artifacts sibling_manifest
+                ON sibling_manifest.result_id = sibling_result.id
+                AND sibling_manifest.result_attempt_id = sibling_attempt.id
+                AND sibling_manifest.kind = 'manifest'
+              JOIN solver_evidence_archives sibling_archive
+                ON sibling_archive.result_id = sibling_result.id
+                AND sibling_archive.result_attempt_id = sibling_attempt.id
+                AND sibling_archive.state = 'current'
+              JOIN solver_evidence_blobs sibling_blob
+                ON sibling_blob.id = sibling_archive.blob_id AND sibling_blob."verifiedAt" IS NOT NULL
+              JOIN solver_evidence_artifact_members sibling_member
+                ON sibling_member.archive_id = sibling_archive.id
+                AND sibling_member.artifact_id = sibling_manifest.id
+                AND sibling_member.member_path = 'evidence_manifest.json'
+              LEFT JOIN sim_jobs sibling_job ON sibling_job.id = sibling_attempt.sim_job_id
+              WHERE sibling_repair.result_id = ${resultFieldExtents.resultId}
+                AND sibling_repair.result_attempt_id = ${resultFieldExtents.resultAttemptId}
+                AND sibling_result.airfoil_id = ${resultFieldExtents.airfoilId}
+                AND sibling_result.simulation_preset_revision_id = ${resultFieldExtents.simulationPresetRevisionId}
+                AND sibling_result.status = 'pending'
+                AND sibling_result.current_result_attempt_id IS NULL
+                AND (sibling_result.sim_job_id IS NULL OR sibling_result.sim_job_id = sibling_attempt.sim_job_id)
+                AND sibling_attempt.status = 'done' AND sibling_attempt.source = 'solved'
+                AND sibling_attempt.valid_for_polar AND sibling_attempt.converged
+                AND (sibling_job.id IS NULL OR (
+                  sibling_job.status IN ('done', 'failed', 'cancelled')
+                  AND (sibling_job.ingest_lease_expires_at <= clock_timestamp()
+                    OR (sibling_job.ingest_lease_token IS NULL AND sibling_job.ingest_lease_expires_at IS NULL))
+                ))
+                AND (
+                  sibling_classification.state = 'accepted'
+                  OR (
+                    sibling_classification.state = 'rejected'
+                    AND sibling_classification.reasons = ARRAY['missing-urans-video']::text[]
+                    AND sibling_attempt.unsteady AND sibling_attempt.regime = 'urans'
+                  )
+                )
+                AND (
+                  sibling_repair.state IN ('pending', 'running', 'retry_wait')
+                  OR (sibling_repair.state = 'done' AND sibling_repair.downstream_finalized_at IS NULL)
+                )
+                AND sibling_manifest.sha256 = ${resultFieldExtents.evidenceSha256}
+                AND sibling_repair.evidence_signature = concat_ws(':',
+                  COALESCE(sibling_attempt.engine_job_id, ''),
+                  COALESCE(sibling_attempt.engine_case_slug, ''), sibling_manifest.sha256)
+                AND ${exactValidSolverManifestSql(sql`sibling_result.id`, sql`sibling_attempt.id`)}
+                AND ${resultFieldExtents.finiteCount} > 0
+                AND ${resultFieldExtents.vmin} > '-Infinity'::float8
+                AND ${resultFieldExtents.vmax} < 'Infinity'::float8
+                AND ${resultFieldExtents.vmin} <= ${resultFieldExtents.vmax}
+                AND NOT EXISTS (
+                  SELECT 1 FROM result_attempts newer
+                  WHERE newer.result_id = sibling_result.id
+                    AND (newer."createdAt", newer.id) > (sibling_attempt."createdAt", sibling_attempt.id)
+                )
+                AND NOT EXISTS (
+                  SELECT 1 FROM result_review_verdicts review
+                  WHERE review.result_id = sibling_result.id AND review."revokedAt" IS NULL
+                    AND review.verdict IN ('exclude', 'defer')
+                )
+                AND NOT EXISTS (
+                  SELECT 1 FROM sync_remote_result_deliveries delivery
+                  WHERE delivery.result_id = sibling_result.id AND delivery.result_attempt_id = sibling_attempt.id
+                    AND delivery.state IN ('delivered', 'superseded')
+                )
             )
           )`,
         ),
