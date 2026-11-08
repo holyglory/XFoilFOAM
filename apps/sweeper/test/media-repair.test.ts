@@ -904,6 +904,26 @@ describe("durable result media repair", () => {
   it.each(["direct", "needs_urans", "hard_solver"] as const)("publishes exact repaired pending precise results and completes gaps without rewriting failed history (%s)", async (recoveryReason) => {
     const firstAirfoil = await createAirfoil(`precise-media-first-${recoveryReason}`);
     const secondAirfoil = await createAirfoil(`precise-media-second-${recoveryReason}`);
+    let sharedCampaign: { id: string; planRevisionId: string } | undefined;
+    if (recoveryReason === "direct") {
+      const [campaign] = await db.insert(simCampaigns).values({
+        slug: `${PREFIX}-publication-contention`,
+        name: `${PREFIX} publication contention`,
+        idempotencyKey: `${PREFIX}-publication-contention`,
+        status: "active",
+      }).returning();
+      campaignIds.push(campaign.id);
+      const [plan] = await db.insert(simCampaignPlanRevisions).values({
+        campaignId: campaign.id,
+        revisionNumber: 1,
+        kind: "initial",
+        plan: {},
+        summary: {},
+      }).returning();
+      await db.update(simCampaigns).set({ currentPlanRevisionId: plan.id })
+        .where(eq(simCampaigns.id, campaign.id));
+      sharedCampaign = { id: campaign.id, planRevisionId: plan.id };
+    }
     const jobs: string[] = [];
     for (const airfoilId of [firstAirfoil, secondAirfoil]) {
       const jobId = randomUUID();
@@ -1027,6 +1047,50 @@ describe("durable result media repair", () => {
             resultAttemptId: candidate.resultAttemptId,
             evidenceSignature: repair.evidenceSignature,
           });
+        const withCampaignLock = async (verify: (release: () => void) => Promise<void>) => {
+          let markLocked!: () => void;
+          let release!: () => void;
+          const locked = new Promise<void>((resolve) => { markLocked = resolve; });
+          const released = new Promise<void>((resolve) => { release = resolve; });
+          const blocker = db.transaction(async (other) => {
+            await other.execute(querySql`SET LOCAL lock_timeout='2s'`);
+            await other.execute(querySql`SELECT id FROM sim_campaigns
+              WHERE id=${scope.campaignId}::uuid FOR NO KEY UPDATE`);
+            markLocked();
+            await released;
+          });
+          try {
+            await Promise.race([locked, blocker]);
+            await verify(release);
+          } finally {
+            release();
+            await blocker;
+          }
+        };
+        if (sharedCampaign) {
+          const [initialTimeout] = await connection.execute(querySql`SELECT current_setting('lock_timeout') AS value`);
+          for (const timeout of ["0", "50ms", "5s"]) {
+            await connection.execute(querySql`SELECT set_config('lock_timeout',${timeout},true)`);
+            await withCampaignLock(async () => {
+              const started = performance.now();
+              expect(await publish(connection), timeout).toBe("waiting");
+              const elapsed = performance.now() - started;
+              expect(elapsed).toBeGreaterThanOrEqual(timeout === "50ms" ? 40 : 1_900);
+              expect(elapsed).toBeLessThan(timeout === "50ms" ? 550 : 2_500);
+            });
+            const [restored] = await connection.execute(querySql`SELECT current_setting('lock_timeout') AS value`);
+            expect(restored.value).toBe(timeout);
+            const [unchanged] = await connection.select().from(results).where(eq(results.id, candidate.resultId));
+            expect(unchanged.currentResultAttemptId).toBeNull();
+            expect(await connection.select().from(resultMediaRepairs).where(eq(resultMediaRepairs.id, repair.id))).toEqual([repair]);
+            expect(await history()).toEqual(historyBefore);
+            expect(await budget()).toEqual(budgetBefore);
+            expect(await recoveryChain()).toEqual(recoveryBefore);
+            expect(await connection.execute(querySql`SELECT successor_unit_id FROM progressive_cfd_evidence_reuses
+              WHERE successor_unit_id=${unit.id}::uuid`)).toHaveLength(0);
+          }
+          await connection.execute(querySql`SELECT set_config('lock_timeout',${String(initialTimeout.value)},true)`);
+        }
         for (const scenario of [
           "queued",
           "running",
@@ -1218,7 +1282,34 @@ describe("durable result media repair", () => {
             }).catch((error) => { if (error !== restore) throw error; });
           }
         }
-        const publication = await publish(connection);
+        let publication: Awaited<ReturnType<typeof publish>> = "waiting";
+        if (sharedCampaign) {
+          const [publisher] = await connection.execute(querySql`SELECT pg_backend_pid() AS pid,current_setting('lock_timeout') AS timeout`);
+          await withCampaignLock(async (release) => {
+            let completed = false;
+            const pending = publish(connection).finally(() => { completed = true; });
+            void pending.catch(() => undefined);
+            let waiting = false;
+            const deadline = Date.now() + 1_000;
+            try {
+              while (!completed && Date.now() < deadline) {
+                const [activity] = await db.execute(querySql`SELECT EXISTS(SELECT 1 FROM pg_stat_activity
+                  WHERE pid=${Number(publisher.pid)} AND wait_event_type='Lock') AS waiting`);
+                if (activity.waiting) { waiting = true; break; }
+                await new Promise((resolve) => setTimeout(resolve, 10));
+              }
+              await new Promise((resolve) => setTimeout(resolve, 150));
+            } finally {
+              release();
+              publication = await pending;
+            }
+            expect(waiting).toBe(true);
+          });
+          const [restored] = await connection.execute(querySql`SELECT current_setting('lock_timeout') AS value`);
+          expect(restored.value).toBe(publisher.timeout);
+        } else {
+          publication = await publish(connection);
+        }
         const [publicationVerdict] = await connection
           .select({
             state: resultClassifications.state,
@@ -1387,7 +1478,7 @@ describe("durable result media repair", () => {
           ),
         ).toBe(true);
       },
-      { recoveryReason: recoveryReason === "direct" ? undefined : recoveryReason },
+      { recoveryReason: recoveryReason === "direct" ? undefined : recoveryReason, campaign: sharedCampaign },
     );
   }, 30_000);
 

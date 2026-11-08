@@ -50,6 +50,7 @@ export async function withRepairedProgressiveCfdEvidence(
   const lost = new Error(
     "Repaired progressive evidence changed during publication",
   );
+  let campaignLockTimeout: unknown = null;
   try {
     return await db.transaction(async (transaction) => {
       const connection = transaction as unknown as DB;
@@ -82,9 +83,31 @@ export async function withRepairedProgressiveCfdEvidence(
         SELECT id, current FROM calculation_epochs WHERE id = ${source.epoch_id}::uuid FOR SHARE
       `);
       if (!epoch?.current) return "waiting";
-      const [campaign] = await connection.execute(sql`
-        SELECT id, status, current_plan_revision_id FROM sim_campaigns
-        WHERE id = ${source.campaign_id}::uuid FOR UPDATE SKIP LOCKED
+      const [previousTimeout] = await connection.execute(sql`
+        SELECT current_setting('lock_timeout') AS value, setting::integer AS milliseconds
+        FROM pg_settings WHERE name = 'lock_timeout'
+      `);
+      const campaignWaitMilliseconds = Math.min(
+        Number(previousTimeout.milliseconds) || 2_000,
+        2_000,
+      );
+      await connection.execute(sql`
+        SELECT set_config('lock_timeout', ${`${campaignWaitMilliseconds}ms`}, true)
+      `);
+      let campaign;
+      try {
+        [campaign] = await connection.execute(sql`
+          SELECT id, status, current_plan_revision_id FROM sim_campaigns
+          WHERE id = ${source.campaign_id}::uuid FOR UPDATE
+        `);
+      } catch (error) {
+        const failure = error as { code?: string; cause?: { code?: string } };
+        if (failure?.code === "55P03" || failure?.cause?.code === "55P03")
+          campaignLockTimeout = error;
+        throw error;
+      }
+      await connection.execute(sql`
+        SELECT set_config('lock_timeout', ${String(previousTimeout.value)}, true)
       `);
       if (!campaign) return "waiting";
       const [scope] = await connection.execute(sql`
@@ -381,7 +404,11 @@ export async function withRepairedProgressiveCfdEvidence(
       return "published";
     });
   } catch (error) {
-    if (error === lost) return "waiting";
+    if (
+      error === lost ||
+      (campaignLockTimeout !== null && error === campaignLockTimeout)
+    )
+      return "waiting";
     throw error;
   }
 }

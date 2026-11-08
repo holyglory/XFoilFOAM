@@ -35,27 +35,32 @@ export async function withRepairedPreciseMediaFixture(
       }>;
     },
   ) => Promise<void>,
-  options: { recoveryReason?: "needs_urans" | "hard_solver" } = {},
+  options: {
+    recoveryReason?: "needs_urans" | "hard_solver";
+    campaign?: { id: string; planRevisionId: string };
+  } = {},
 ) {
   const restore = new Error("Restore repaired precise media fixture");
   try {
     await db.transaction(async (transaction) => {
       const connection = transaction as unknown as DB;
-      const campaignId = randomUUID();
-      const planRevisionId = randomUUID();
+      const campaignId = options.campaign?.id ?? randomUUID();
+      const planRevisionId = options.campaign?.planRevisionId ?? randomUUID();
       const generationId = randomUUID();
       const [epoch] = await connection.execute(
         sql`SELECT id FROM calculation_epochs WHERE current FOR SHARE`,
       );
       if (!epoch)
         throw new Error("Media recovery fixture requires a current epoch");
-      await connection.execute(sql`INSERT INTO sim_campaigns(id,slug,name,idempotency_key,status)
+      if (!options.campaign) {
+        await connection.execute(sql`INSERT INTO sim_campaigns(id,slug,name,idempotency_key,status)
         VALUES (${campaignId}::uuid,${campaignId},'Exact repaired precise media',${campaignId},'active')`);
-      await connection.execute(sql`INSERT INTO sim_campaign_plan_revisions(id,campaign_id,revision_number,kind,plan,summary)
+        await connection.execute(sql`INSERT INTO sim_campaign_plan_revisions(id,campaign_id,revision_number,kind,plan,summary)
         VALUES (${planRevisionId}::uuid,${campaignId}::uuid,1,'initial','{}','{}')`);
-      await connection.execute(
-        sql`UPDATE sim_campaigns SET current_plan_revision_id=${planRevisionId}::uuid WHERE id=${campaignId}::uuid`,
-      );
+        await connection.execute(
+          sql`UPDATE sim_campaigns SET current_plan_revision_id=${planRevisionId}::uuid WHERE id=${campaignId}::uuid`,
+        );
+      }
       await connection.execute(sql`INSERT INTO progressive_generations(id,epoch_id,campaign_id,plan_revision_id,scope_key,scope_signature,stage,status)
         VALUES (${generationId}::uuid,${epoch.id}::uuid,${campaignId}::uuid,${planRevisionId}::uuid,${generationId},${"a".repeat(64)},3,'active')`);
       const rawRows =
