@@ -131,6 +131,12 @@ precise grid while other low-Mach targets continue FAST work. This overlap does
 not admit any high-Mach work: the low cohort remains the exclusive admission
 frontier until every low precise obligation is settled.
 
+New claims prioritize eligible initial FAST anchors that have never been
+attempted, before new precise work or budget extensions. This gives untouched
+targets their first CFD coverage. Once no such anchor is eligible, the existing
+precise and retry ordering applies. Running jobs, recipes, time budgets, and
+acceptance requirements are unchanged.
+
 Every current generation's low precise work must close successfully before a
 new high CFD claim is issued. A fast gap can advance into precise recovery; a
 precise gap keeps the high cohort waiting. In-flight, locked, deferred or

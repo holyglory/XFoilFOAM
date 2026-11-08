@@ -4748,9 +4748,16 @@ requires = ["retry-recovery-integration"]
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "retains exact stopped failed attempts without canonical publication"]
 
 [[test.solver-throughput-recovery.check]]
-name = "artifact-metadata-replay"
+name = "initial-fast-coverage"
 tier = "development"
 requires = ["stopped-failure-storage"]
+
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "prioritizes untouched initial fast|subsonic through precise priority|distributes initial coverage before additional angles"]
+
+[[test.solver-throughput-recovery.check]]
+name = "artifact-metadata-replay"
+tier = "development"
+requires = ["initial-fast-coverage"]
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/evidence-object-storage-ingest.test.ts"]
 
 [[test.solver-throughput-recovery.check]]
@@ -4935,6 +4942,36 @@ name = "canonical-journeys"
 tier = "development"
 requires = ["seed"]
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "retains exact stopped failed attempts without canonical publication|bounded completion retry eligibility|reconciles a stranded terminal retry before normal admission|recovers later terminal gaps through canonical admission after a saturated recovery prefix"]
+
+[test.initial-fast-coverage]
+timeout_seconds = 900
+
+[test.initial-fast-coverage.postgres]
+image = "postgres:16-alpine"
+database = "aerodb"
+user = "aerodb"
+
+[[test.initial-fast-coverage.check]]
+name = "schema"
+tier = "development"
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "migrate"]
+
+[[test.initial-fast-coverage.check]]
+name = "seed"
+tier = "development"
+requires = ["schema"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "seed"]
+
+[[test.initial-fast-coverage.check]]
+name = "coverage-and-overlap"
+tier = "development"
+requires = ["seed"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "prioritizes untouched initial fast|subsonic through precise priority|distributes initial coverage before additional angles"]
+
+[[test.initial-fast-coverage.check]]
+name = "types"
+tier = "development"
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "typecheck"]
 
 [test.checkpoint-placement-contracts]
 timeout_seconds = 120

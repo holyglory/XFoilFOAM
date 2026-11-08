@@ -1450,12 +1450,13 @@ async function campaign(
   speeds = [32.173],
   angles = [-2, 0, 2],
   physical: { mediumId?: string; chordM?: number } = {},
+  airfoilIds = [originalId],
 ) {
   const launch = await materializeCampaignLaunch(db, {
     name: `${PREFIX}-${sequence++}`,
     priority: 5,
     idempotencyKey: randomUUID(),
-    airfoilIds: [originalId],
+    airfoilIds,
     plan: {
       mediumId: physical.mediumId ?? mediumId,
       ambients: [[288.15, 101325]],
@@ -13480,14 +13481,17 @@ describe("subsonic through precise priority", () => {
     expect(progressiveCfdBatchMaximum(3)).toBe(8);
   });
 
-  async function scope(policyBeforeBaselines = false, angles = [0]) {
-    const campaignId = await campaign("active", [340.3 * 0.5, 340.3, 340.3 * 2], angles);
+  async function scope(policyBeforeBaselines = false, angles = [0], additionalProfileCount = 0) {
+    const profileIds = [originalId];
+    for (let profileIndex = 0; profileIndex < additionalProfileCount; profileIndex += 1)
+      profileIds.push(await newProfile());
+    const campaignId = await campaign("active", [340.3 * 0.5, 340.3, 340.3 * 2], angles, {}, profileIds);
     await reconcileProgressiveGenerationRequest(db);
     const [generation] = await db.execute(sql`SELECT id, epoch_id FROM progressive_generations
       WHERE campaign_id = ${campaignId} ORDER BY created_at, id LIMIT 1`);
     if (policyBeforeBaselines) await adoptProgressiveSubsonicPriority(db, campaignId);
     const baselines: ProgressiveLease[] = [];
-    for (let index = 0; index < 3; index += 1) {
+    for (let index = 0; index < 3 * profileIds.length; index += 1) {
       const baseline = (await claim([1]))!;
       expect(baseline.generationId).toBe(generation.id);
       baselines.push(baseline);
@@ -13557,6 +13561,95 @@ describe("subsonic through precise priority", () => {
     expect(lease).toMatchObject({ stage: 3, targetId: fast.targetId, generationId: fixture.generationId });
     return lease;
   }
+
+  it("prioritizes untouched initial fast anchors ahead of an eligible low precise claim", async () => {
+    const fixture = await scope(true, [-2, 0, 2], 1);
+    expect(await initializeProgressiveCfdWork(db)).toBeGreaterThanOrEqual(4);
+
+    const fastAnchors = await claimProgressiveCfdBatch(db, {
+      owner: "isolated-fast-anchor-batch",
+      leaseSeconds: 120,
+      maximumUnits: 2,
+      localTimeStepVersion: 1,
+    });
+    expect(fastAnchors).toHaveLength(2);
+    const first = fastAnchors[0]!;
+    const second = fastAnchors[1]!;
+    expect(first.stage).toBe(2);
+    expect(second.stage).toBe(2);
+    expect(second.targetId).toBe(first.targetId);
+    const firstSettlement = await finish(first);
+    const secondSettlement = await finish(second);
+    expect(firstSettlement.settlement).toMatchObject({ gaps: 1 });
+    expect(secondSettlement.settlement).toMatchObject({ gaps: 1 });
+    await advanceProgressiveCfdStages(db);
+    expect(await initializeProgressiveCfdWork(db)).toBeGreaterThan(0);
+
+    const [precise] = await db.execute(sql`
+      SELECT unit.id, unit.attempts, unit.active_seconds, unit.active_budget_seconds,
+        unit.recipe, work.target_id
+      FROM progressive_cfd_units unit
+      JOIN progressive_work work ON work.id = unit.work_id
+      JOIN polar_analysis_targets target ON target.id = work.target_id
+      WHERE work.generation_id = ${fixture.generationId}
+        AND work.stage = 3 AND target.mach < 1.0 AND unit.state = 'pending'
+      ORDER BY unit.ordinal, unit.id
+      LIMIT 1
+    `);
+    const [initial] = await db.execute(sql`
+      SELECT unit.id, unit.attempts, unit.active_seconds, unit.active_budget_seconds,
+        unit.recipe, work.target_id
+      FROM progressive_cfd_units unit
+      JOIN progressive_work work ON work.id = unit.work_id
+      JOIN polar_analysis_targets target ON target.id = work.target_id
+      WHERE work.generation_id = ${fixture.generationId}
+        AND work.stage = 2 AND unit.purpose = 'initial' AND unit.state = 'pending'
+        AND unit.attempts = 0 AND target.mach < 1.0
+      ORDER BY unit.ordinal, unit.id
+      LIMIT 1
+    `);
+    expect(precise).toBeTruthy();
+    expect(initial).toBeTruthy();
+    const preciseBefore = await db.execute(sql`
+      SELECT unit.id, unit.state, unit.attempts, unit.active_seconds,
+        unit.active_budget_seconds, unit.recipe
+      FROM progressive_cfd_units unit
+      JOIN progressive_work work ON work.id = unit.work_id
+      WHERE work.generation_id = ${fixture.generationId} AND work.stage = 3
+      ORDER BY unit.id
+    `);
+    const initialBefore = initial;
+
+    const selected = (await claimCfd())!;
+    expect(selected).toMatchObject({
+      id: initial.id,
+      stage: 2,
+      targetId: initial.target_id,
+    });
+    expect(selected.recipe).toEqual(initialBefore.recipe);
+    expect(selected.remainingActiveSeconds).toBe(
+      Number(initialBefore.active_budget_seconds) - Number(initialBefore.active_seconds),
+    );
+    expect(
+      await db.execute(sql`
+        SELECT unit.id, unit.state, unit.attempts, unit.active_seconds,
+          unit.active_budget_seconds, unit.recipe
+        FROM progressive_cfd_units unit
+        JOIN progressive_work work ON work.id = unit.work_id
+        WHERE work.generation_id = ${fixture.generationId} AND work.stage = 3
+        ORDER BY unit.id
+      `),
+    ).toEqual(preciseBefore);
+    expect(await db.execute(sql`
+      SELECT attempts, active_seconds, active_budget_seconds, recipe
+      FROM progressive_cfd_units WHERE id = ${selected.id}
+    `)).toEqual([{
+      attempts: 1,
+      active_seconds: 0,
+      active_budget_seconds: initialBefore.active_budget_seconds,
+      recipe: initialBefore.recipe,
+    }]);
+  });
 
   it("keeps precise selection adoption busy until stopped attempts are settled", async () => {
     const fixture = await cfdEvidenceFixture(undefined, 2, [], [0]);
@@ -13733,7 +13826,7 @@ describe("subsonic through precise priority", () => {
     await db.execute(sql`UPDATE progressive_cfd_units SET retry_after = clock_timestamp() + interval '1 hour' WHERE id = ${low.id}`);
     expect(await claimCfd()).toBeNull();
     await db.execute(sql`UPDATE progressive_cfd_units SET retry_after = NULL WHERE id = ${low.id}`);
-    expect(await claimProgressiveCfdUnit(db, { owner: "high-only-capability", leaseSeconds: 120, localTimeStepVersion: 1, allowedSolverFamilies: ["rhoCentralFoam"] })).toBeNull();
+    expect(await claimProgressiveCfdUnit(db, { owner: "high-only-capability", leaseSeconds: 120, localTimeStepVersion: 1, allowedSolverFamilies: ["rhoPimpleFoam"] })).toBeNull();
     const claims = await Promise.all([claimCfd(), claimCfd(), claimCfd()]);
     const issued = claims.filter((lease) => lease !== null);
     expect(issued).toHaveLength(1);
@@ -14076,7 +14169,7 @@ describe("subsonic through precise priority", () => {
     ]);
     expect(await claimProgressiveCfdUnit(db, {
       owner: "high-cannot-bypass-precise-retry", leaseSeconds: 120,
-      localTimeStepVersion: 1, allowedSolverFamilies: ["rhoCentralFoam"],
+      localTimeStepVersion: 1, allowedSolverFamilies: ["rhoPimpleFoam"],
     })).toBeNull();
     const [highPending] = await db.execute(sql`
       SELECT count(*)::integer AS count
@@ -14110,7 +14203,7 @@ describe("subsonic through precise priority", () => {
       await storeNeuralFoilPrediction(db, baseline, predictionFixture(baseline));
     }
     await initializeProgressiveCfdWork(db);
-    expect(await claimProgressiveCfdUnit(db, { owner: "old-high-cannot-bypass-enrollment", leaseSeconds: 120, localTimeStepVersion: 1, allowedSolverFamilies: ["rhoCentralFoam"] })).toBeNull();
+    expect(await claimProgressiveCfdUnit(db, { owner: "old-high-cannot-bypass-enrollment", leaseSeconds: 120, localTimeStepVersion: 1, allowedSolverFamilies: ["rhoPimpleFoam"] })).toBeNull();
     const fresh = (await claimCfd())!;
     expect(fresh.physical.airfoilId).toBe(added);
     expect(fresh.physical.derived.mach).toBeCloseTo(0.5);
@@ -14128,7 +14221,7 @@ describe("subsonic through precise priority", () => {
   it("preserves pre-policy high ownership and ingests its exact evidence while low advances into precise", async () => {
     const fixture = await scope();
     await initializeProgressiveCfdWork(db);
-    const high = (await claimProgressiveCfdUnit(db, { owner: "already-issued-high", leaseSeconds: 120, localTimeStepVersion: 1, allowedSolverFamilies: ["rhoCentralFoam"] }))!;
+    const high = (await claimProgressiveCfdUnit(db, { owner: "already-issued-high", leaseSeconds: 120, localTimeStepVersion: 1, allowedSolverFamilies: ["rhoPimpleFoam"] }))!;
     expect(high.physical.derived.mach).toBe(2);
     const active = await cfdEvidenceFixture(undefined, 2, [], [0], false, { campaignId: fixture.campaignId, leases: [high] });
     const ownership = await db.execute(sql`SELECT * FROM progressive_cfd_attempts WHERE token = ${high.token}`);
@@ -14174,7 +14267,7 @@ describe("subsonic through precise priority", () => {
     if (mode === "low precise") lease = await precise(fixture);
     else {
       await initializeProgressiveCfdWork(db);
-      lease = (await claimProgressiveCfdUnit(db, { owner: "pre-policy-remote-high", leaseSeconds: 120, localTimeStepVersion: 1, allowedSolverFamilies: ["rhoCentralFoam"] }))!;
+      lease = (await claimProgressiveCfdUnit(db, { owner: "pre-policy-remote-high", leaseSeconds: 120, localTimeStepVersion: 1, allowedSolverFamilies: ["rhoPimpleFoam"] }))!;
     }
     const active = await cfdEvidenceFixture(undefined, 2, [], [0], false, { campaignId: fixture.campaignId, leases: [lease] });
     const [job] = await db.select().from(simJobs).where(eq(simJobs.id, active.composed.jobId));
