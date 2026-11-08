@@ -8,6 +8,8 @@ import { recoverProgressivePublicationLosses } from "../src/progressive-publicat
 import { claimProgressiveCfdUnit } from "../src/progressive-cfd";
 import { composeProgressiveCfdJob } from "../../../apps/sweeper/src/progressive-cfd-jobs";
 import { progressiveCfdOrdinaryAttemptCountSql } from "../src/progressive-attempt-budget";
+import { progressiveUnsteadyRecipe } from "../src/progressive-cfd-numerical-recovery";
+import { refreshPolarClassificationsForJob } from "../src/polar-cache";
 import { claimSimJobCancellation } from "../src/job-lifecycle";
 import {
   acknowledgeProgressiveCfdExecutionStop,
@@ -24,6 +26,7 @@ export async function withRepairedPreciseMediaFixture(
       planRevisionId: string;
       generationId: string;
       epochId: string;
+      recoveries: Array<{ planId: string; token: string; parentToken: string; parentJobId: string; diagnosticId: string }>;
       units: Array<{
         id: string;
         token: string;
@@ -32,6 +35,7 @@ export async function withRepairedPreciseMediaFixture(
       }>;
     },
   ) => Promise<void>,
+  options: { recoveryReason?: "needs_urans" | "hard_solver" } = {},
 ) {
   const restore = new Error("Restore repaired precise media fixture");
   try {
@@ -76,10 +80,16 @@ export async function withRepairedPreciseMediaFixture(
         resultAttemptId: string;
         workId: string;
       }> = [];
-      const recipe = {
+      const recipe: Record<string, unknown> = options.recoveryReason ? {
+        selection: { solver: "simpleFoam", reason: "low_mach_with_sonic_margin" },
+      } : {
         selection: { solver: "pimpleFoam", regime: "urans" },
         fidelity: "urans_full",
       };
+      const executionRecipe = options.recoveryReason ? {
+        ...progressiveUnsteadyRecipe(recipe, options.recoveryReason)!, uransFidelity: "full",
+      } : recipe;
+      const recoveries: Array<{ planId: string; token: string; parentToken: string; parentJobId: string; diagnosticId: string }> = [];
       for (const raw of rawRows) {
         expect(raw.sim_job_id).toBe(raw.engine_job_id);
         const key = `${raw.airfoil_id}:${raw.simulation_preset_revision_id}`;
@@ -116,7 +126,7 @@ export async function withRepairedPreciseMediaFixture(
           const targetId = target.signature;
           const recipeId = analysisContentHash({
             sourceRevisionId: raw.simulation_preset_revision_id,
-            recipe,
+            recipe: executionRecipe,
           });
           const workId = randomUUID();
           work = { workId, targetId, recipeId };
@@ -140,7 +150,7 @@ export async function withRepairedPreciseMediaFixture(
           await connection.execute(sql`INSERT INTO progressive_work(id,generation_id,target_id,stage,state)
             VALUES (${workId}::uuid,${generationId}::uuid,${targetId},3,'pending')`);
           await connection.execute(sql`INSERT INTO progressive_cfd_execution_recipes(id,source_revision_id,recipe,execution_revision_id)
-            VALUES (${recipeId},${raw.simulation_preset_revision_id}::uuid,${JSON.stringify(recipe)}::jsonb,${raw.simulation_preset_revision_id}::uuid)
+            VALUES (${recipeId},${raw.simulation_preset_revision_id}::uuid,${JSON.stringify(executionRecipe)}::jsonb,${raw.simulation_preset_revision_id}::uuid)
             ON CONFLICT (id) DO NOTHING`);
         }
         const unitId = randomUUID();
@@ -148,11 +158,11 @@ export async function withRepairedPreciseMediaFixture(
         await connection.execute(sql`INSERT INTO progressive_cfd_units(id,work_id,aoa_deg,ordinal,purpose,recipe,reason,policy_version,
           active_budget_seconds,active_seconds,state,attempts,error)
           VALUES (${unitId}::uuid,${work.workId}::uuid,${raw.aoa_deg},${units.length},'precise',${JSON.stringify(recipe)}::jsonb,
-          'original precise calculation','media-repair-fixture',32400,25200,'gap',1,'precise evidence remains unresolved')`);
+          'original precise calculation','media-repair-fixture',32400,25200,'gap',${options.recoveryReason ? 2 : 1},'precise evidence remains unresolved')`);
         await connection.execute(sql`INSERT INTO progressive_cfd_attempts(token,unit_id,owner,execution_recipe_id,sim_job_id,
           started_at,lease_until,outcome,active_seconds,finished_at,error)
           VALUES (${token}::uuid,${unitId}::uuid,'original precise owner',${work.recipeId},${raw.sim_job_id}::uuid,
-          clock_timestamp()-interval '9 hours',clock_timestamp()-interval '1 hour','failed',25200,
+          clock_timestamp()-interval '9 hours',clock_timestamp()-interval '1 hour','failed',${options.recoveryReason ? 24600 : 25200},
           clock_timestamp()-interval '30 minutes','precise evidence remains unresolved')`);
         await connection.execute(sql`INSERT INTO progressive_cfd_evidence(attempt_token,result_attempt_id,evidence_signature,solver_active_seconds)
           VALUES (${token}::uuid,${raw.id}::uuid,${analysisContentHash(raw.evidence_payload)},25200)`);
@@ -200,11 +210,66 @@ export async function withRepairedPreciseMediaFixture(
         await connection.execute(sql`INSERT INTO progressive_cfd_execution_stops(sim_job_id,engine_job_id,epoch_id,proof,proof_signature,observed_at)
           VALUES (${jobId}::uuid,${jobId},${epoch.id}::uuid,${JSON.stringify(proof)}::jsonb,${analysisContentHash(proof)},clock_timestamp())`);
       }
+      if (options.recoveryReason) {
+        for (const unit of units) {
+          const raw = rawRows.find((entry) => entry.id === unit.resultAttemptId)!;
+          const work = works.get(`${raw.airfoil_id}:${raw.simulation_preset_revision_id}`)!;
+          const parentToken = randomUUID();
+          const parentJobId = randomUUID();
+          const diagnosticId = randomUUID();
+          const planId = randomUUID();
+          const parentRecipeId = analysisContentHash({ sourceRevisionId: raw.simulation_preset_revision_id, recipe });
+          const request = { progressive: { executionId: parentJobId, epochId: epoch.id,
+            generationId, targetId: work.targetId, stage: 3, recipeId: parentRecipeId, tokens: [parentToken] },
+            engineRequest: { execution_id: parentJobId } };
+          await connection.execute(sql`INSERT INTO progressive_cfd_execution_recipes(id,source_revision_id,recipe,execution_revision_id)
+            VALUES(${parentRecipeId},${raw.simulation_preset_revision_id}::uuid,${JSON.stringify(recipe)}::jsonb,${raw.simulation_preset_revision_id}::uuid)
+            ON CONFLICT(id) DO NOTHING`);
+          await connection.execute(sql`INSERT INTO sim_jobs(id,airfoil_id,bc_ids,simulation_preset_revision_id,campaign_id,reference_chord_m,
+            engine_job_id,status,"ingestedAt",request_payload)
+            SELECT ${parentJobId}::uuid,airfoil_id,bc_ids,simulation_preset_revision_id,${campaignId}::uuid,reference_chord_m,
+              ${parentJobId},'done',clock_timestamp(),${JSON.stringify(request)}::jsonb FROM sim_jobs WHERE id=${raw.sim_job_id}::uuid`);
+          await connection.execute(sql`INSERT INTO progressive_cfd_attempts(token,unit_id,owner,execution_recipe_id,sim_job_id,
+            started_at,lease_until,outcome,active_seconds,finished_at,error)
+            VALUES(${parentToken}::uuid,${unit.id}::uuid,'original RANS owner',${parentRecipeId},${parentJobId}::uuid,
+              clock_timestamp()-interval '10 hours',clock_timestamp()-interval '9 hours','failed',600,
+              clock_timestamp()-interval '9 hours',${options.recoveryReason})`);
+          const payload = { fidelity: "rans", aoa_deg: Number(raw.aoa_deg), converged: options.recoveryReason === "needs_urans",
+            stalled: false, ...(options.recoveryReason === "needs_urans" ? { rans_hold_certificate: null } : {}),
+            failure_disposition: options.recoveryReason === "hard_solver" ? "hard_solver" : null };
+          await connection.execute(sql`INSERT INTO result_attempts(id,result_id,airfoil_id,bc_id,simulation_preset_revision_id,aoa_deg,
+            sim_job_id,engine_job_id,engine_case_slug,method_key,solver_implementation_id,status,source,regime,valid_for_polar,
+            converged,stalled,cl,cd,cm,evidence_payload,"createdAt","solvedAt")
+            SELECT ${diagnosticId}::uuid,result_id,airfoil_id,bc_id,simulation_preset_revision_id,aoa_deg,
+              ${parentJobId}::uuid,${parentJobId},engine_case_slug,method_key,solver_implementation_id,
+              ${options.recoveryReason === "hard_solver" ? "failed" : "done"}::result_status,'solved','rans',${options.recoveryReason === "needs_urans"},
+              ${options.recoveryReason === "needs_urans"},false,cl,cd,cm,${JSON.stringify(payload)}::jsonb,
+              "createdAt"-interval '1 hour',"solvedAt"-interval '1 hour' FROM result_attempts WHERE id=${raw.id}::uuid`);
+          const classifications = await refreshPolarClassificationsForJob(connection, String(raw.airfoil_id),
+            String(raw.simulation_preset_revision_id), parentJobId);
+          expect(classifications).toHaveLength(1);
+          expect(classifications[0].state).toBe(options.recoveryReason === "needs_urans" ? "needs_urans" : "rejected");
+          await connection.execute(sql`INSERT INTO progressive_cfd_evidence(attempt_token,result_attempt_id,evidence_signature,solver_active_seconds)
+            VALUES(${parentToken}::uuid,${diagnosticId}::uuid,${analysisContentHash(payload)},600)`);
+          await connection.execute(sql`INSERT INTO progressive_cfd_recovery_plans(id,unit_id,ordinal,parent_attempt_token,parent_job_id,
+            diagnostic_attempt_id,diagnostic_signature,scope,reason,recipe)
+            VALUES(${planId}::uuid,${unit.id}::uuid,1,${parentToken}::uuid,${parentJobId}::uuid,${diagnosticId}::uuid,
+              ${analysisContentHash(payload)},'targeted',${options.recoveryReason},${JSON.stringify(executionRecipe)}::jsonb)`);
+          await connection.execute(sql`INSERT INTO progressive_cfd_recovery_claims(attempt_token,recovery_plan_id)
+            VALUES(${unit.token}::uuid,${planId}::uuid)`);
+          const proof = { version: 1, job_id: parentJobId, execution_stopped: true, producer_stopped: true,
+            namespace_verified: true, remaining: [], error: null, fence: "terminal_result", observed_at: new Date().toISOString() };
+          await connection.execute(sql`INSERT INTO progressive_cfd_execution_stops(sim_job_id,engine_job_id,epoch_id,proof,proof_signature,observed_at)
+            VALUES(${parentJobId}::uuid,${parentJobId},${epoch.id}::uuid,${JSON.stringify(proof)}::jsonb,${analysisContentHash(proof)},clock_timestamp())`);
+          recoveries.push({ planId, token: unit.token, parentToken, parentJobId, diagnosticId });
+        }
+      }
       await verify(connection, {
         campaignId,
         planRevisionId,
         generationId,
         epochId: String(epoch.id),
+        recoveries,
         units,
       });
       throw restore;

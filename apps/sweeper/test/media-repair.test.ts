@@ -901,9 +901,9 @@ afterAll(async () => {
 });
 
 describe("durable result media repair", () => {
-  it("publishes exact repaired pending precise results and completes gaps without rewriting failed history", async () => {
-    const firstAirfoil = await createAirfoil("precise-media-first");
-    const secondAirfoil = await createAirfoil("precise-media-second");
+  it.each(["direct", "needs_urans", "hard_solver"] as const)("publishes exact repaired pending precise results and completes gaps without rewriting failed history (%s)", async (recoveryReason) => {
+    const firstAirfoil = await createAirfoil(`precise-media-first-${recoveryReason}`);
+    const secondAirfoil = await createAirfoil(`precise-media-second-${recoveryReason}`);
     const jobs: string[] = [];
     for (const airfoilId of [firstAirfoil, secondAirfoil]) {
       const jobId = randomUUID();
@@ -922,7 +922,7 @@ describe("durable result media repair", () => {
     const fixtures: Fixture[] = [];
     for (const ordinal of [0, 1, 2]) {
       const owner = ordinal === 0 ? 0 : 1;
-      const fixture = await createSolvedResult(`precise-media-${ordinal}`, {
+      const fixture = await createSolvedResult(`precise-media-${ordinal}-${recoveryReason}`, {
         airfoilId: owner === 0 ? firstAirfoil : secondAirfoil,
         aoa: 18 + ordinal,
         fidelity: "urans_full",
@@ -968,12 +968,17 @@ describe("durable result media repair", () => {
           .where(
             inArray(
               resultAttempts.id,
-              fixtures.map((fixture) => fixture.resultAttemptId),
+              [...fixtures.map((fixture) => fixture.resultAttemptId), ...scope.recoveries.map((entry) => entry.diagnosticId)],
             ),
           )
           .orderBy(resultAttempts.id);
         const historyBefore = await history();
         const budgetBefore = await budget();
+        const recoveryChain = () => connection.execute(querySql`
+          SELECT to_jsonb(plan) AS plan,to_jsonb(claim) AS claim
+          FROM progressive_cfd_recovery_plans plan JOIN progressive_cfd_recovery_claims claim ON claim.recovery_plan_id=plan.id
+          WHERE plan.unit_id IN (${querySql.join(scope.units.map((entry) => querySql`${entry.id}::uuid`), querySql`, `)}) ORDER BY plan.id,claim.attempt_token`);
+        const recoveryBefore = await recoveryChain();
         for (const fixture of [fixtures[0], fixtures[2], fixtures[1]]) {
           const claim = await claimNextResultMediaRepair(connection, {
             resultId: fixture.resultId,
@@ -1139,6 +1144,80 @@ describe("durable result media repair", () => {
               if (error !== restore) throw error;
             });
         }
+        const recovery = scope.recoveries.find((entry) => entry.token === unit.token);
+        if (recovery) {
+          const otherRecovery = scope.recoveries.find((entry) => entry.token !== unit.token)!;
+          for (const scenario of ["missing-claim", "foreign-unit", "unapproved-scope", "unapproved-ordinal",
+            "changed-plan", "diagnostic-hash", "changed-parent", "changed-parent-base", "foreign-diagnosis",
+            "wrong-physical-cell", "material_domain", "deterministic_mesh", "infrastructure",
+            "parent-unsettled", "parent-job-running", "missing-parent-stop", "parent-stop-hash", "newer-plan"]) {
+            const restore = new Error(`Restore refused recovery proof ${scenario}`);
+            await connection.transaction(async (nested) => {
+              const target = nested as unknown as DB;
+              const [saved] = await target.execute(querySql`SELECT to_jsonb(plan) AS plan
+                FROM progressive_cfd_recovery_plans plan WHERE id=${recovery.planId}::uuid`);
+              const plan = { ...(saved.plan as Record<string, unknown>) };
+              await target.execute(querySql`DELETE FROM progressive_cfd_recovery_claims WHERE attempt_token=${unit.token}::uuid`);
+              if (scenario !== "missing-claim" && scenario !== "foreign-unit") {
+                await target.execute(querySql`DELETE FROM progressive_cfd_recovery_plans WHERE id=${recovery.planId}::uuid`);
+                if (scenario === "unapproved-scope") plan.scope = "original_sweep";
+                if (scenario === "unapproved-ordinal") {
+                  plan.ordinal = 2; plan.reason = "accepted_precalc"; plan.scope = "original_sweep";
+                }
+                if (scenario === "changed-plan") plan.recipe = { ...(plan.recipe as object), unapprovedChange: true };
+                if (scenario === "diagnostic-hash") plan.diagnostic_signature = "0".repeat(64);
+                if (scenario === "changed-parent") plan.parent_job_id = jobs[1];
+                if (scenario === "foreign-diagnosis") plan.diagnostic_attempt_id = otherRecovery.diagnosticId;
+                if (scenario === "changed-parent-base") {
+                  const [execution] = await target.execute(querySql`SELECT execution_recipe_id
+                    FROM progressive_cfd_attempts WHERE token=${unit.token}::uuid`);
+                  await target.execute(querySql`UPDATE progressive_cfd_attempts SET execution_recipe_id=${execution.execution_recipe_id}
+                    WHERE token=${recovery.parentToken}::uuid`);
+                  await target.execute(querySql`UPDATE sim_jobs SET request_payload=jsonb_set(request_payload,
+                    '{progressive,recipeId}',to_jsonb(${execution.execution_recipe_id}::text)) WHERE id=${recovery.parentJobId}::uuid`);
+                }
+                if (scenario === "wrong-physical-cell") await target.execute(querySql`UPDATE result_attempts SET aoa_deg=aoa_deg+0.25
+                  WHERE id=${recovery.diagnosticId}::uuid`);
+                if (["material_domain", "deterministic_mesh", "infrastructure"].includes(scenario)) {
+                  const [diagnostic] = await target.execute(querySql`SELECT evidence_payload FROM result_attempts WHERE id=${recovery.diagnosticId}::uuid`);
+                  const payload = { ...(diagnostic.evidence_payload as object), failure_disposition: scenario, converged: false };
+                  const signature = analysisContentHash(payload);
+                  await target.execute(querySql`DELETE FROM progressive_cfd_evidence WHERE result_attempt_id=${recovery.diagnosticId}::uuid`);
+                  await target.execute(querySql`UPDATE result_attempts SET evidence_payload=${JSON.stringify(payload)}::jsonb,converged=false
+                    WHERE id=${recovery.diagnosticId}::uuid`);
+                  await target.execute(querySql`INSERT INTO progressive_cfd_evidence(attempt_token,result_attempt_id,evidence_signature,solver_active_seconds)
+                    VALUES(${recovery.parentToken}::uuid,${recovery.diagnosticId}::uuid,${signature},600)`);
+                  plan.diagnostic_signature = signature;
+                }
+                if (scenario === "parent-unsettled") await target.execute(querySql`UPDATE progressive_cfd_attempts SET outcome='expired'
+                  WHERE token=${recovery.parentToken}::uuid`);
+                if (scenario === "parent-job-running") await target.execute(querySql`UPDATE sim_jobs SET status='running'
+                  WHERE id=${recovery.parentJobId}::uuid`);
+                if (scenario === "missing-parent-stop" || scenario === "parent-stop-hash") {
+                  const [stopped] = await target.execute(querySql`SELECT to_jsonb(stop) AS stop FROM progressive_cfd_execution_stops stop
+                    WHERE sim_job_id=${recovery.parentJobId}::uuid`);
+                  await target.execute(querySql`DELETE FROM progressive_cfd_execution_stops WHERE sim_job_id=${recovery.parentJobId}::uuid`);
+                  if (scenario === "parent-stop-hash") await target.execute(querySql`INSERT INTO progressive_cfd_execution_stops
+                    SELECT * FROM jsonb_populate_record(NULL::progressive_cfd_execution_stops,
+                      ${JSON.stringify({ ...(stopped.stop as object), proof_signature: "0".repeat(64) })}::jsonb)`);
+                }
+                await target.execute(querySql`INSERT INTO progressive_cfd_recovery_plans
+                  SELECT * FROM jsonb_populate_record(NULL::progressive_cfd_recovery_plans,${JSON.stringify(plan)}::jsonb)`);
+                if (scenario === "newer-plan") await target.execute(querySql`INSERT INTO progressive_cfd_recovery_plans
+                  SELECT * FROM jsonb_populate_record(NULL::progressive_cfd_recovery_plans,${JSON.stringify({ ...plan,
+                    id: randomUUID(), ordinal: 2, reason: "accepted_precalc", scope: "original_sweep", parent_attempt_token: unit.token })}::jsonb)`);
+              }
+              if (scenario !== "missing-claim") await target.execute(querySql`INSERT INTO progressive_cfd_recovery_claims(attempt_token,recovery_plan_id)
+                VALUES(${unit.token}::uuid,${scenario === "foreign-unit" ? otherRecovery.planId : recovery.planId}::uuid)`);
+              expect(await publish(target), scenario).toBe("waiting");
+              expect(await target.execute(querySql`SELECT successor_unit_id FROM progressive_cfd_evidence_reuses
+                WHERE successor_unit_id=${unit.id}::uuid`), scenario).toHaveLength(0);
+              const [cell] = await target.select().from(results).where(eq(results.id, candidate.resultId));
+              expect(cell.currentResultAttemptId, scenario).toBeNull();
+              throw restore;
+            }).catch((error) => { if (error !== restore) throw error; });
+          }
+        }
         const publication = await publish(connection);
         const [publicationVerdict] = await connection
           .select({
@@ -1154,6 +1233,12 @@ describe("durable result media repair", () => {
           state: "accepted",
           reasons: [],
         });
+        const parentClassifications = recovery ? await connection.execute(querySql`
+          SELECT state,reasons FROM result_classifications WHERE result_attempt_id=${recovery.diagnosticId}::uuid`) : [];
+        expect({ publication: await publish(connection), parentClassifications }, JSON.stringify(parentClassifications))
+          .toMatchObject({ publication: "published" });
+        expect(await connection.execute(querySql`SELECT successor_unit_id FROM progressive_cfd_evidence_reuses
+          WHERE successor_unit_id=${unit.id}::uuid`)).toHaveLength(1);
         const [interrupted] = await connection
           .select()
           .from(resultMediaRepairs)
@@ -1270,6 +1355,7 @@ describe("durable result media repair", () => {
         }
         expect(await history()).toEqual(historyBefore);
         expect(await budget()).toEqual(budgetBefore);
+        expect(await recoveryChain()).toEqual(recoveryBefore);
         expect(
           await connection
             .select()
@@ -1277,20 +1363,22 @@ describe("durable result media repair", () => {
             .where(
               inArray(
                 resultAttempts.id,
-                fixtures.map((fixture) => fixture.resultAttemptId),
+                [...fixtures.map((fixture) => fixture.resultAttemptId), ...scope.recoveries.map((entry) => entry.diagnosticId)],
               ),
             )
             .orderBy(resultAttempts.id),
         ).toEqual(rawBefore);
         const receipts =
           await connection.execute(querySql`SELECT reuse.source_attempt_token,reuse.source_result_attempt_id,
-            unit.state FROM progressive_cfd_evidence_reuses reuse JOIN progressive_cfd_units unit ON unit.id=reuse.successor_unit_id
+            reuse.source_execution_recipe_id,attempt.execution_recipe_id,unit.state
+            FROM progressive_cfd_evidence_reuses reuse JOIN progressive_cfd_units unit ON unit.id=reuse.successor_unit_id
+            JOIN progressive_cfd_attempts attempt ON attempt.token=reuse.source_attempt_token
             JOIN progressive_work work ON work.id=unit.work_id WHERE work.generation_id=${scope.generationId}::uuid`);
         expect(receipts).toHaveLength(3);
         expect(
           receipts.every(
             (receipt) =>
-              receipt.state === "complete" &&
+              receipt.state === "complete" && receipt.source_execution_recipe_id === receipt.execution_recipe_id &&
               scope.units.some(
                 (entry) =>
                   entry.token === receipt.source_attempt_token &&
@@ -1299,6 +1387,7 @@ describe("durable result media repair", () => {
           ),
         ).toBe(true);
       },
+      { recoveryReason: recoveryReason === "direct" ? undefined : recoveryReason },
     );
   }, 30_000);
 

@@ -7,6 +7,7 @@ import type { EngineExecutionStopProof } from "../../engine-client/src/types";
 import { analysisContentHash, canonicalAnalysisJson } from "./analysis-target";
 import type { DB } from "./client";
 import { tryProgressiveAdmissionLock } from "./progressive-admission-lock";
+import { progressiveUnsteadyRecipe } from "./progressive-cfd-numerical-recovery";
 import { SOURCE_GEOMETRY_POLICY_VERSION } from "./progressive-evidence-geometry";
 import {
   progressiveCfdNeverStartedAttemptCountSql,
@@ -90,7 +91,7 @@ export async function withRepairedProgressiveCfdEvidence(
         SELECT generation.id AS generation_id, generation.epoch_id, generation.plan_revision_id,
           generation.status AS generation_status, generation.benchmark_only, work.id AS work_id, work.target_id, target.physical,
           work.stage, work.state AS work_state, ${effectiveProgressiveStageSql()} AS effective_stage,
-          unit.id AS unit_id, unit.state AS unit_state, unit.recipe, unit.lease_token,
+          unit.id AS unit_id, unit.aoa_deg, unit.state AS unit_state, unit.recipe, unit.lease_token,
           unit.lease_owner, unit.lease_until, attempt.token, attempt.outcome,
           attempt.sim_job_id, attempt.execution_recipe_id,
           recipe.source_revision_id, recipe.execution_revision_id, recipe.recipe AS execution_recipe,
@@ -188,11 +189,115 @@ export async function withRepairedProgressiveCfdEvidence(
           sourceRevisionId: scope.source_revision_id,
           recipe: scope.execution_recipe,
         }) !== scope.execution_recipe_id ||
-        analysisContentHash(scope.execution_recipe) !==
-          analysisContentHash(scope.recipe) ||
         analysisContentHash(scope.evidence_payload) !== scope.payload_signature
       )
         return "waiting";
+      if (
+        analysisContentHash(scope.execution_recipe) !==
+        analysisContentHash(scope.recipe)
+      ) {
+        const [recovery] = await connection.execute(sql`
+          SELECT plan.reason, plan.recipe, plan.diagnostic_signature,
+            parent.token, parent.execution_recipe_id,
+            parent_recipe.recipe AS parent_recipe, parent_recipe.source_revision_id,
+            parent_job.id AS parent_job_id, parent_job.engine_job_id, parent_job.request_payload,
+            diagnostic.evidence_payload, classification.state AS classification,
+            evidence.evidence_signature, stopped.proof, stopped.proof_signature
+          FROM progressive_cfd_recovery_claims claim
+          JOIN progressive_cfd_recovery_plans plan ON plan.id = claim.recovery_plan_id
+            AND plan.unit_id = ${scope.unit_id}::uuid
+          JOIN progressive_cfd_attempts parent ON parent.token = plan.parent_attempt_token
+            AND parent.unit_id = plan.unit_id AND parent.sim_job_id = plan.parent_job_id
+            AND parent.token <> ${scope.token}::uuid AND parent.outcome IN ('complete', 'failed', 'cancelled')
+          JOIN progressive_cfd_execution_recipes parent_recipe ON parent_recipe.id = parent.execution_recipe_id
+          JOIN sim_jobs parent_job ON parent_job.id = parent.sim_job_id
+            AND parent_job.campaign_id = ${campaign.id}::uuid AND parent_job.airfoil_id = ${scope.airfoil_id}::uuid
+            AND parent_job.simulation_preset_revision_id = parent_recipe.execution_revision_id
+            AND parent_job.status IN ('done', 'failed', 'cancelled')
+          JOIN progressive_cfd_execution_stops stopped ON stopped.sim_job_id = parent_job.id
+            AND stopped.engine_job_id = parent_job.engine_job_id AND stopped.epoch_id = ${epoch.id}::uuid
+          JOIN result_attempts diagnostic ON diagnostic.id = plan.diagnostic_attempt_id
+            AND diagnostic.sim_job_id = parent_job.id AND diagnostic.airfoil_id = ${scope.airfoil_id}::uuid
+            AND diagnostic.simulation_preset_revision_id = parent_recipe.execution_revision_id
+            AND diagnostic.aoa_deg = ${scope.aoa_deg} AND diagnostic.regime = 'rans'
+            AND diagnostic.source = 'solved' AND diagnostic.status IN ('done', 'failed')
+            AND diagnostic.engine_job_id = parent_job.engine_job_id
+            AND jsonb_typeof(diagnostic.evidence_payload) = 'object'
+          JOIN progressive_cfd_evidence evidence ON evidence.result_attempt_id = diagnostic.id
+            AND evidence.attempt_token = parent.token
+          LEFT JOIN result_classifications classification ON classification.result_attempt_id = diagnostic.id
+          WHERE claim.attempt_token = ${scope.token}::uuid AND plan.ordinal = 1 AND plan.scope = 'targeted'
+            AND plan.reason IN ('needs_urans', 'hard_solver')
+            AND NOT EXISTS (SELECT 1 FROM progressive_cfd_recovery_plans newer
+              WHERE newer.unit_id = plan.unit_id AND newer.ordinal > plan.ordinal)
+          ORDER BY plan.ordinal, plan.id, parent.token, diagnostic.id
+          FOR SHARE OF claim, plan, parent, parent_recipe, parent_job, diagnostic, evidence, stopped
+        `);
+        if (
+          !recovery ||
+          recovery.source_revision_id !== scope.source_revision_id ||
+          analysisContentHash(recovery.parent_recipe) !==
+            analysisContentHash(scope.recipe) ||
+          analysisContentHash({
+            sourceRevisionId: recovery.source_revision_id,
+            recipe: recovery.parent_recipe,
+          }) !== recovery.execution_recipe_id ||
+          analysisContentHash(recovery.evidence_payload) !==
+            recovery.evidence_signature ||
+          recovery.evidence_signature !== recovery.diagnostic_signature ||
+          analysisContentHash(recovery.proof) !== recovery.proof_signature
+        )
+          return "waiting";
+        const diagnosis = recovery.evidence_payload as Record<string, unknown>;
+        const reason = recovery.reason;
+        if (
+          (reason !== "needs_urans" && reason !== "hard_solver") ||
+          ["infrastructure", "deterministic_mesh", "material_domain"].includes(
+            String(diagnosis.failure_disposition),
+          ) ||
+          (reason === "hard_solver"
+            ? diagnosis.failure_disposition !== "hard_solver"
+            : diagnosis.failure_disposition === "hard_solver" ||
+              !["needs_urans", "superseded_by_urans"].includes(
+                String(recovery.classification),
+              ))
+        )
+          return "waiting";
+        const expected = progressiveUnsteadyRecipe(
+          recovery.parent_recipe as Record<string, unknown>,
+          reason,
+        );
+        if (!expected) return "waiting";
+        expected.uransFidelity = "full";
+        if (
+          analysisContentHash(expected) !== analysisContentHash(recovery.recipe) ||
+          analysisContentHash(recovery.recipe) !==
+            analysisContentHash(scope.execution_recipe)
+        )
+          return "waiting";
+        assertProgressiveExecutionIdentity(
+          String(recovery.parent_job_id),
+          recovery.engine_job_id as string | null,
+          recovery.request_payload,
+        );
+        const parentMetadata = (
+          recovery.request_payload as { progressive: Record<string, unknown> }
+        ).progressive;
+        const parentProof = recovery.proof as EngineExecutionStopProof;
+        validateProgressiveExecutionStopProof(parentProof);
+        if (
+          parentMetadata.epochId !== epoch.id ||
+          parentMetadata.generationId !== scope.generation_id ||
+          parentMetadata.targetId !== scope.target_id ||
+          parentMetadata.stage !== 3 ||
+          parentMetadata.recipeId !== recovery.execution_recipe_id ||
+          !Array.isArray(parentMetadata.tokens) ||
+          !parentMetadata.tokens.includes(recovery.token) ||
+          parentProof.job_id !== recovery.engine_job_id ||
+          parentProof.ownership_basis === "never_started_cancellation_fence"
+        )
+          return "waiting";
+      }
       const [job] = await connection.execute(sql`
         SELECT id, campaign_id, airfoil_id, simulation_preset_revision_id, engine_job_id, request_payload, status, "ingestedAt",
           (ingest_lease_expires_at <= clock_timestamp()
