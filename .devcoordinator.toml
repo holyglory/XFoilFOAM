@@ -4993,3 +4993,36 @@ build = false
 port = false
 route = false
 timeout_seconds = 1200
+
+[test.checkpoint-rank-count]
+timeout_seconds = 1800
+env = { PYTHONPATH = "src:.", PYTHONDONTWRITEBYTECODE = "1", CHECKPOINT_EXPERIMENT = "serial-mpi" }
+
+[[test.checkpoint-rank-count.check]]
+name = "inputs"
+tier = "development"
+phase = "fixture"
+command = [".venv/bin/python", "-m", "scripts.materials.checkpoint_placement_control", "prepare"]
+resources = [{ kind = "directory", id = ".codex-artifacts/checkpoint-placement", access = "exclusive" }]
+
+[[test.checkpoint-rank-count.check]]
+name = "native"
+tier = "development"
+requires = ["inputs"]
+timeout_seconds = 1260
+command = [".venv/bin/python", "-m", "scripts.materials.checkpoint_placement_control", "apply"]
+
+[[test.checkpoint-rank-count.check]]
+name = "comparison"
+tier = "development"
+requires = ["native"]
+command = [".venv/bin/python", "-m", "scripts.materials.checkpoint_placement_control", "verify"]
+retained_artifacts = [{ name = "placement-fields", path = ".codex-artifacts/checkpoint-placement/output/snapshots", max_bytes = 268435456 }]
+
+[[test.checkpoint-rank-count.check]]
+name = "cleanup"
+tier = "development"
+phase = "cleanup"
+after = ["inputs", "native", "comparison"]
+command = [".venv/bin/python", "-m", "scripts.materials.checkpoint_placement_control", "cleanup"]
+retained_artifacts = [{ name = "placement-receipt", path = ".codex-artifacts/checkpoint-placement/receipt", max_bytes = 16777216 }]

@@ -41,6 +41,10 @@ def write_json(path, value):
         output.write("\n")
 
 
+def value_digest(value):
+    return hashlib.sha256(json.dumps(value, sort_keys=True, allow_nan=False).encode()).hexdigest()
+
+
 def tree_identity(root):
     root = Path(root)
     result = {}
@@ -96,9 +100,9 @@ def time_state(path):
 
 
 def validate_endpoint(state, relative_step=END_STEP):
-    if relative_step not in (PRELUDE_STEPS, END_STEP):
+    if relative_step not in (0, PRELUDE_STEPS, END_STEP):
         raise ValueError("Only the fixed 62/125-step write boundaries are measurable")
-    expected_time = {PRELUDE_STEPS: MEASUREMENT_START_TIME, END_STEP: END_TIME}[relative_step]
+    expected_time = {0: START_TIME, PRELUDE_STEPS: MEASUREMENT_START_TIME, END_STEP: END_TIME}[relative_step]
     if not math.isfinite(state["value"]) or state["index"] != START_INDEX + relative_step or abs(state["value"] - float(expected_time)) > 1e-10:
         raise ValueError("The arm did not reach the fixed 62/125-step write boundary")
 
@@ -226,10 +230,16 @@ def checkpoint_directory(processor, relative_step):
     return matches[0]
 
 
-def checkpoint_ready(case, relative_step):
+def checkpoint_roots(case, ranks):
+    if ranks not in (1, 3):
+        raise ValueError("Only the approved one/three-rank comparison is supported")
+    return {"global": case} if ranks == 1 else {str(rank): case / f"processor{rank}" for rank in range(ranks)}
+
+
+def checkpoint_ready(case, relative_step, ranks=3):
     try:
-        for rank in range(3):
-            directory = checkpoint_directory(case / f"processor{rank}", relative_step)
+        for processor in checkpoint_roots(case, ranks).values():
+            directory = checkpoint_directory(processor, relative_step)
             for relative in (*FIELDS, "uniform/time"):
                 path = directory / relative
                 if path.is_symlink() or not path.is_file():
@@ -243,11 +253,10 @@ def checkpoint_ready(case, relative_step):
         return False
 
 
-def copy_checkpoint(case, destination, relative_step):
+def copy_checkpoint(case, destination, relative_step, ranks=3):
     records = {}
     sources = {}
-    for rank in range(3):
-        processor = case / f"processor{rank}"
+    for rank, processor in checkpoint_roots(case, ranks).items():
         directory = checkpoint_directory(processor, relative_step)
         shape = mesh_shape(processor)
         complete_ascii(directory / "uniform/time")
@@ -256,7 +265,8 @@ def copy_checkpoint(case, destination, relative_step):
         for field in FIELDS:
             parsed = parsed_field(directory / field, shape, field)
             fields[field] = {"sha256": digest(directory / field), "byteSize": (directory / field).stat().st_size,
-                             "count": parsed["count"], "width": parsed["width"], "dimensions": parsed["dimensions"]}
+                             "count": parsed["count"], "width": parsed["width"], "dimensions": parsed["dimensions"],
+                             "valueSha256": value_digest(parsed)}
         fields["uniform/time"] = {"sha256": digest(directory / "uniform/time"), "byteSize": (directory / "uniform/time").stat().st_size}
         records[str(rank)] = {"state": state, "directory": directory.name, "shape": shape, "files": fields}
         sources[str(rank)] = directory
@@ -265,7 +275,7 @@ def copy_checkpoint(case, destination, relative_step):
     destination.mkdir(parents=True, exist_ok=False)
     for rank, record in records.items():
         for relative, metadata in record["files"].items():
-            target = destination / f"processor{rank}" / relative
+            target = destination / ("global" if rank == "global" else f"processor{rank}") / relative
             target.parent.mkdir(parents=True, exist_ok=True)
             source = sources[rank] / relative
             shutil.copyfile(source, target)
@@ -283,18 +293,27 @@ def cgroup_cpu():
     return values
 
 
-def capture_boundary(relative_step, physical_time, execution, started, receipts):
+def phase_metrics(started, initial_cpu):
+    final_cpu = cgroup_cpu()
+    delta = {key: final_cpu[key] - initial_cpu[key] for key in initial_cpu}
+    if any(value < 0 for value in delta.values()):
+        raise ValueError("Cgroup accounting reset during a benchmark phase")
+    return {"wallSeconds": time.monotonic() - started, "cgroupCpuSeconds": delta["usage_usec"] / 1e6,
+            "cgroupCpuDelta": delta}
+
+
+def capture_boundary(relative_step, physical_time, execution, started, receipts, expected_ranks=3):
     before = time.monotonic()
     ranks = rank_cpu(receipts)
-    if len(ranks) != 3 or not math.isfinite(physical_time):
-        raise ValueError("Missing three-rank boundary measurement")
+    if set(ranks) != {str(rank) for rank in range(expected_ranks)} or not math.isfinite(physical_time):
+        raise ValueError("Missing exact-rank boundary measurement")
     validate_endpoint({"index": START_INDEX + relative_step, "value": physical_time}, relative_step)
     return {"relativeStep": relative_step, "time": physical_time, "elapsedSeconds": before - started,
             "rankCpu": ranks, "cgroupCpu": cgroup_cpu(), "sampleSpanSeconds": time.monotonic() - before,
             "masterExecutionSeconds": float(execution.group(1)), "masterClockSeconds": float(execution.group(2))}
 
 
-def interval_metrics(first, last):
+def interval_metrics(first, last, ranks=3):
     if (first["relativeStep"], last["relativeStep"]) != (PRELUDE_STEPS, END_STEP):
         raise ValueError("Incomplete 63-step timing interval")
     for boundary in (first, last):
@@ -304,7 +323,7 @@ def interval_metrics(first, last):
     if last["elapsedSeconds"] <= first["elapsedSeconds"]:
         raise ValueError("Incomplete 63-step timing interval")
     deltas = {}
-    if set(first["rankCpu"]) != {"0", "1", "2"} or set(last["rankCpu"]) != set(first["rankCpu"]):
+    if ranks not in (1, 3) or set(first["rankCpu"]) != {str(rank) for rank in range(ranks)} or set(last["rankCpu"]) != set(first["rankCpu"]):
         raise ValueError("Sparse rank CPU samples")
     for rank, initial in first["rankCpu"].items():
         final = last["rankCpu"][rank]
@@ -331,7 +350,7 @@ def native_identity():
     if os.environ.get("WM_PROJECT_VERSION", "").removeprefix("v") != "2606":
         raise ValueError("The native fixture requires OpenCFD2606")
     binaries = {}
-    for name in (*BINARY_HASHES, "decomposePar", "checkMesh", "mpirun"):
+    for name in (*BINARY_HASHES, "decomposePar", "reconstructPar", "checkMesh", "mpirun"):
         executable = shutil.which(name)
         if executable is None:
             raise ValueError(f"Missing native executable: {name}")
@@ -353,11 +372,73 @@ def run_finite(command, cwd, output, timeout):
         subprocess.run(command, cwd=cwd, stdout=stream, stderr=subprocess.STDOUT, timeout=timeout, check=True)
 
 
-def rank_entry(case, receipts, arm, cpus):
-    rank = int(os.environ["OMPI_COMM_WORLD_LOCAL_RANK"])
-    if int(os.environ["OMPI_COMM_WORLD_SIZE"]) != 3 or int(os.environ["OMPI_COMM_WORLD_LOCAL_SIZE"]) != 3 or rank not in range(3):
-        raise ValueError("Expected exactly three local MPI ranks")
-    if arm == "B":
+def field_comparison(first, second, shape, field):
+    original = parsed_field(first, shape, field)
+    candidate = parsed_field(second, shape, field)
+    if original["dimensions"] != candidate["dimensions"]:
+        raise ValueError("The pair has different field dimensions")
+    boundary_delta = 0.0
+    for patch, initial in original["boundary"].items():
+        final = candidate["boundary"][patch]
+        if initial["type"] != final["type"] or set(initial["arrays"]) != set(final["arrays"]):
+            raise ValueError("The pair has different boundary conditions")
+        for name, values in initial["arrays"].items():
+            other = final["arrays"][name]
+            if len(values) != len(other):
+                raise ValueError("The pair has different boundary field shapes")
+            boundary_delta = max(boundary_delta, max((abs(left - right) for left, right in zip(values, other)), default=0.0))
+    return {"internal": max((abs(left - right) for left, right in zip(original["internal"], candidate["internal"])), default=0.0),
+            "boundary": boundary_delta, "originalValueSha256": value_digest(original),
+            "candidateValueSha256": value_digest(candidate), "bytesIdentical": digest(first) == digest(second)}
+
+
+def reconstruct_global(case, destination, steps):
+    started, initial_cpu = time.monotonic(), cgroup_cpu()
+    destination.mkdir(parents=True, exist_ok=False)
+    for name in ("system", "constant"):
+        shutil.copytree(case / name, destination / name)
+    for rank in range(3):
+        shutil.copytree(case / f"processor{rank}/constant", destination / f"processor{rank}/constant")
+    selected_times = []
+    for step in steps:
+        proof = destination / "parallel-proof" / str(step)
+        records = copy_checkpoint(case, proof, step)
+        if len({record["directory"] for record in records.values()}) != 1:
+            raise ValueError("Ranks have different written time directory identities")
+        selected_times.append(records["0"]["directory"])
+        for rank, record in records.items():
+            shutil.copytree(proof / f"processor{rank}", destination / f"processor{rank}" / record["directory"])
+    run_finite(["reconstructPar", "-case", str(destination), "-time", ",".join(selected_times)],
+               destination, destination / "reconstructPar.log", 120)
+    return phase_metrics(started, initial_cpu)
+
+
+def validate_reconstructed_input(source, reconstructed):
+    shape = mesh_shape(source)
+    if mesh_shape(reconstructed) != shape or tree_identity(source / "constant") != tree_identity(reconstructed / "constant"):
+        raise ValueError("Reconstructed input changed the authenticated global mesh")
+    original = checkpoint_directory(source, 0)
+    candidate = checkpoint_directory(reconstructed, 0)
+    if time_state(original / "uniform/time") != time_state(candidate / "uniform/time"):
+        raise ValueError("Reconstructed input changed the authenticated checkpoint time")
+    fields = {field: field_comparison(original / field, candidate / field, shape, field) for field in FIELDS}
+    if any(value["originalValueSha256"] != value["candidateValueSha256"] for value in fields.values()):
+        raise ValueError("Reconstructed input differs from the authenticated global field values")
+    return {"valuesIdentical": True, "shape": shape, "time": time_state(original / "uniform/time"), "fields": fields}
+
+
+def rank_entry(case, receipts, arm, cpus, ranks=3, experiment="placement"):
+    if ranks == 1 and experiment == "serial-mpi":
+        if any(name.startswith("OMPI_COMM_WORLD_") for name in os.environ):
+            raise ValueError("Direct serial execution must not inherit an MPI rank")
+        rank = 0
+    elif ranks == 3:
+        rank = int(os.environ["OMPI_COMM_WORLD_LOCAL_RANK"])
+        if int(os.environ["OMPI_COMM_WORLD_SIZE"]) != 3 or int(os.environ["OMPI_COMM_WORLD_LOCAL_SIZE"]) != 3 or rank not in range(3):
+            raise ValueError("Expected exactly three local MPI ranks")
+    else:
+        raise ValueError("Unapproved rank count or experiment")
+    if experiment == "placement" and arm == "B":
         if cpus[rank] not in os.sched_getaffinity(0):
             raise ValueError("Selected core is outside the actual allowed CPU set")
         os.sched_setaffinity(0, {cpus[rank]})
@@ -365,7 +446,7 @@ def rank_entry(case, receipts, arm, cpus):
     write_json(receipts / f"rank-{rank}.json", {"rank": rank, "pid": os.getpid(), "startTicks": int(stat[19]),
                "affinity": sorted(os.sched_getaffinity(0))})
     executable = shutil.which("pimpleFoam")
-    os.execv(executable, [executable, "-parallel", "-case", str(case)])
+    os.execv(executable, [executable, *(["-parallel"] if ranks == 3 else []), "-case", str(case)])
 
 
 def rank_cpu(receipts):
@@ -437,7 +518,20 @@ def coefficient_trace(case, start=float(MEASUREMENT_START_TIME), end=float(END_T
     return result
 
 
-def run_arm(canonical, output, arm, identity, deadline):
+def coefficients_ready(case, start, end):
+    try:
+        coefficient_trace(case, start, end)
+        coefficient_trace(case, float(START_TIME), start, PRELUDE_STEPS)
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def run_arm(canonical, output, arm, identity, deadline, ranks=3, experiment="placement"):
+    expected_ranks = 1 if experiment == "serial-mpi" and arm in ("A1", "A2") else 3
+    if experiment not in ("placement", "serial-mpi") or ranks != expected_ranks:
+        raise ValueError("Arm rank count differs from its approved experiment")
+    copy_started, copy_cpu = time.monotonic(), cgroup_cpu()
     case = output / arm
     shutil.copytree(canonical, case)
     frozen = tree_identity(canonical)
@@ -445,9 +539,10 @@ def run_arm(canonical, output, arm, identity, deadline):
         raise ValueError("Arm input differs from the frozen decomposition")
     receipts = output / f"{arm}-ranks"
     receipts.mkdir()
-    command = ["mpirun", "--allow-run-as-root", "--bind-to", "none", "--use-hwthread-cpus", "-np", "3",
-               sys.executable, str(Path(__file__).resolve()), "rank", "--case", str(case), "--receipts", str(receipts),
-               "--arm", arm, "--cpus", ",".join(map(str, identity["boundCpus"]))]
+    command = (["mpirun", "--allow-run-as-root", "--bind-to", "none", "--use-hwthread-cpus", "-np", "3"] if ranks == 3 else [])
+    command += [sys.executable, str(Path(__file__).resolve()), "rank", "--case", str(case), "--receipts", str(receipts),
+                "--arm", arm, "--cpus", ",".join(map(str, identity["boundCpus"])), "--ranks", str(ranks), "--experiment", experiment]
+    copy_metrics = phase_metrics(copy_started, copy_cpu)
     log = output / f"{arm}.log"
     started = time.monotonic()
     initial_cgroup = cgroup_cpu()
@@ -473,17 +568,17 @@ def run_arm(canonical, output, arm, identity, deadline):
                         completed_steps += 1
                         if completed_steps in (PRELUDE_STEPS, END_STEP):
                             label = "start" if completed_steps == PRELUDE_STEPS else "end"
-                            boundaries[label] = capture_boundary(completed_steps, last_time, execution, started, receipts)
+                            boundaries[label] = capture_boundary(completed_steps, last_time, execution, started, receipts, ranks)
                             write_json(output / f"{arm}-boundary-{label}.json", boundaries[label])
                             if label == "end":
                                 write_deadline = min(limit, time.monotonic() + 2)
-                        if completed_steps == PRELUDE_STEPS + 1 and not checkpoint_ready(case, PRELUDE_STEPS):
+                        if completed_steps == PRELUDE_STEPS + 1 and not checkpoint_ready(case, PRELUDE_STEPS, ranks):
                             raise ValueError("Actual first scheduled write is incomplete; refusing further work")
                     if "end" in boundaries:
-                        if checkpoint_ready(case, END_STEP):
+                        if checkpoint_ready(case, END_STEP, ranks) and coefficients_ready(case, boundaries["start"]["time"], boundaries["end"]["time"]):
                             break
                         if completed_steps > END_STEP + 2 or time.monotonic() >= write_deadline:
-                            raise ValueError("Actual second scheduled write is incomplete; refusing further work")
+                            raise ValueError("Actual second scheduled fields or coefficients are incomplete; refusing further work")
                     if not line:
                         if process.poll() is not None:
                             raise ValueError("Native solver exited before a complete endpoint")
@@ -496,8 +591,14 @@ def run_arm(canonical, output, arm, identity, deadline):
         raise ValueError("Missing both measured write boundaries")
     if tree_identity(canonical) != frozen:
         raise ValueError("The shared frozen decomposition was modified")
+    reconstruction = None
+    snapshot_case, snapshot_ranks = case, ranks
+    if experiment == "serial-mpi" and ranks == 3:
+        snapshot_case = output / "reconstruction" / arm
+        reconstruction = reconstruct_global(case, snapshot_case, (PRELUDE_STEPS, END_STEP))
+        snapshot_ranks = 1
     snapshot_start = time.monotonic()
-    snapshots = {label: copy_checkpoint(case, output / "snapshots" / arm / label, step)
+    snapshots = {label: copy_checkpoint(snapshot_case, output / "snapshots" / arm / label, step, snapshot_ranks)
                  for label, step in (("start", PRELUDE_STEPS), ("end", END_STEP))}
     first, last = boundaries["start"], boundaries["end"]
     prelude = {"steps": PRELUDE_STEPS, "wallSeconds": first["elapsedSeconds"],
@@ -506,8 +607,9 @@ def run_arm(canonical, output, arm, identity, deadline):
                "masterExecutionSeconds": first["masterExecutionSeconds"], "masterClockSeconds": first["masterClockSeconds"],
                "includesRankStartup": True}
     total_logged = sum(line.startswith("ExecutionTime = ") for line in log.read_text().splitlines())
-    result = {"arm": arm, "boundaries": boundaries, "prelude": prelude, "measurement": interval_metrics(first, last),
-              "inputSha256": hashlib.sha256(json.dumps(frozen, sort_keys=True).encode()).hexdigest(),
+    result = {"arm": arm, "ranks": ranks, "experiment": experiment, "boundaries": boundaries, "prelude": prelude,
+              "measurement": interval_metrics(first, last, ranks), "inputSha256": value_digest(frozen),
+              "inputCopyAndValidation": copy_metrics, "reconstruction": reconstruction,
               "snapshots": snapshots, "coefficients": coefficient_trace(case, first["time"], last["time"]),
               "preludeCoefficients": coefficient_trace(case, float(START_TIME), first["time"], PRELUDE_STEPS),
               "checkpointValidationAndCopySeconds": time.monotonic() - snapshot_start, "totalLoggedSteps": total_logged,
@@ -522,6 +624,9 @@ def native_run(input_root, output):
     if not all(os.environ.get(name) for name in ("DC2_DEPLOYMENT", "DC2_COMPONENT", "DC2_GENERATION")):
         raise ValueError("Native execution requires the declared Coordinator fixture")
     owner = json.loads((input_root / "owner.json").read_text())
+    experiment = owner.get("experiment", "placement")
+    if experiment not in ("placement", "serial-mpi"):
+        raise ValueError("Unknown checkpoint experiment")
     if digest(Path(__file__)) != owner["driverSha256"]:
         raise ValueError("The native driver differs from the governed source snapshot")
     adapter = json.loads((input_root / "python-adapter.json").read_text())
@@ -534,6 +639,7 @@ def native_run(input_root, output):
         raise ValueError("Authenticated checkpoint input changed before native startup")
     identity = native_identity()
     write_json(output / "native-identity.json", identity)
+    setup_started, setup_cpu = time.monotonic(), cgroup_cpu()
     canonical = output / "canonical"
     shutil.copytree(input_root / "case", canonical)
     with (canonical / "system/decomposeParDict").open("x") as dictionary:
@@ -543,15 +649,43 @@ def native_run(input_root, output):
     run_finite(["decomposePar", "-help"], canonical, help_path, 15)
     if "-copyUniform" not in help_path.read_text():
         raise ValueError("Pinned decomposePar does not advertise required copyUniform support")
+    decomposition_started, decomposition_cpu = time.monotonic(), cgroup_cpu()
     run_finite(["decomposePar", "-case", str(canonical), "-latestTime", "-copyUniform"], canonical, output / "decomposePar.log", 120)
+    decomposition_metrics = phase_metrics(decomposition_started, decomposition_cpu)
     frozen = tree_identity(canonical)
     write_json(output / "frozen-decomposition.json", frozen)
-    arms = [run_arm(canonical, output, arm, identity, started + 1140) for arm in ("A1", "B", "A2")]
-    if len({arm["inputSha256"] for arm in arms}) != 1:
-        raise ValueError("Paired arms did not use identical decomposed inputs")
+    initial_proof = None
+    input_identities = {"parallel": value_digest(frozen)}
+    global_case = output / "global-input"
+    if experiment == "serial-mpi":
+        shutil.copytree(input_root / "case", global_case)
+        input_identities["global"] = value_digest(tree_identity(global_case))
+        reconstruct_help = output / "reconstructPar-help.log"
+        run_finite(["reconstructPar", "-help"], canonical, reconstruct_help, 15)
+        if "-time" not in reconstruct_help.read_text():
+            raise ValueError("Pinned reconstructPar lacks exact time selection")
+        reconstructed = output / "reconstruction/initial"
+        reconstruction_metrics = reconstruct_global(canonical, reconstructed, (0,))
+        initial_proof = validate_reconstructed_input(global_case, reconstructed)
+        initial_proof["reconstruction"] = reconstruction_metrics
+        copy_checkpoint(global_case, output / "snapshots/initial-source", 0, 1)
+        copy_checkpoint(reconstructed, output / "snapshots/initial-reconstructed", 0, 1)
+        write_json(output / "initial-reconstruction.json", initial_proof)
+    setup_metrics = phase_metrics(setup_started, setup_cpu)
+    if experiment == "serial-mpi":
+        arms = [run_arm(canonical if arm == "B" else global_case, output, arm, identity, started + 1140,
+                        ranks=3 if arm == "B" else 1, experiment=experiment) for arm in ("A1", "B", "A2")]
+        if any(arm["inputSha256"] != input_identities["parallel" if arm["arm"] == "B" else "global"] for arm in arms):
+            raise ValueError("Arm input differs from its verified global/decomposed checkpoint")
+    else:
+        arms = [run_arm(canonical, output, arm, identity, started + 1140) for arm in ("A1", "B", "A2")]
+        if len({arm["inputSha256"] for arm in arms}) != 1:
+            raise ValueError("Paired arms did not use identical decomposed inputs")
     if tree_identity(input_root / "case") != expected:
         raise ValueError("Read-only source checkpoint changed")
-    report = {"schemaVersion": 1, "kind": "checkpoint-placement-benchmark-only", "runId": owner["runId"],
+    report = {"schemaVersion": 1, "kind": "checkpoint-rank-count-benchmark-only" if experiment == "serial-mpi" else "checkpoint-placement-benchmark-only",
+              "runId": owner["runId"], "experiment": experiment, "initialReconstruction": initial_proof,
+              "inputIdentities": input_identities, "setup": setup_metrics, "decomposition": decomposition_metrics,
               "acceptedCfd": False, "published": False, "hzGainClaimed": False, "exclusiveCores": False,
               "fixedSteps": STEPS, "preludeSteps": PRELUDE_STEPS, "totalRequestedSteps": END_STEP,
               "sourcePhysicalStart": START_TIME, "physicalStart": MEASUREMENT_START_TIME, "physicalEnd": END_TIME, "identity": identity,
@@ -570,9 +704,11 @@ def main():
     parser.add_argument("--receipts", type=Path)
     parser.add_argument("--arm", choices=("A1", "B", "A2"))
     parser.add_argument("--cpus")
+    parser.add_argument("--ranks", type=int, choices=(1, 3), default=3)
+    parser.add_argument("--experiment", choices=("placement", "serial-mpi"), default="placement")
     args = parser.parse_args()
     if args.action == "rank":
-        rank_entry(args.case, args.receipts, args.arm, [int(value) for value in args.cpus.split(",")])
+        rank_entry(args.case, args.receipts, args.arm, [int(value) for value in args.cpus.split(",")], args.ranks, args.experiment)
     else:
         native_run(args.input, args.output)
 

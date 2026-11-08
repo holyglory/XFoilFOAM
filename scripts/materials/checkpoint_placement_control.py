@@ -23,7 +23,11 @@ def governed_owner():
     if not all(os.environ.get(name) for name in required):
         raise ValueError("Checkpoint fixture operations require an admitted governed check")
     os.fstat(int(os.environ["DEVCOORDINATOR_DIAGNOSTIC_FD"]))
+    experiment = os.environ.get("CHECKPOINT_EXPERIMENT", "placement")
+    if experiment not in ("placement", "serial-mpi"):
+        raise ValueError("Unknown governed checkpoint experiment")
     return {"runId": os.environ["DEVCOORDINATOR_RUN_ID"], "path": str(Path.cwd().resolve()), "name": NAME,
+            "experiment": experiment,
             "driverSha256": benchmark.digest(Path(benchmark.__file__)), "controllerSha256": benchmark.digest(Path(__file__)),
             "composeSha256": benchmark.digest(Path("compose.checkpoint-placement.yml"))}
 
@@ -130,7 +134,8 @@ def prepare(owner):
     benchmark.write_json(root / "input/case-files.json", identity)
     benchmark.write_json(root / "receipt/input.json", {"owner": owner, "archiveSha256": benchmark.ARCHIVE_SHA256,
         "manifestSha256": benchmark.MANIFEST_SHA256, "authenticatedMembers": count, "checkpoint": state,
-        "caseFiles": identity, "originalRanks": 1, "benchmarkRanks": 3, "acceptedCfd": False})
+        "caseFiles": identity, "originalRanks": 1,
+        "benchmarkRanks": [1, 3, 1] if owner.get("experiment") == "serial-mpi" else [3, 3, 3], "acceptedCfd": False})
     print(json.dumps({"prepared": True, "runId": owner["runId"], "authenticatedMembers": count}))
 
 
@@ -164,22 +169,8 @@ def aligned_coefficients(first, second):
 
 
 def field_delta(first, second, shape, field):
-    original = benchmark.parsed_field(first, shape, field)
-    candidate = benchmark.parsed_field(second, shape, field)
-    if original["dimensions"] != candidate["dimensions"]:
-        raise ValueError("The pair has different field dimensions")
-    boundary_delta = 0.0
-    for patch, initial in original["boundary"].items():
-        last = candidate["boundary"][patch]
-        if initial["type"] != last["type"] or set(initial["arrays"]) != set(last["arrays"]):
-            raise ValueError("The pair has different boundary conditions")
-        for name, values in initial["arrays"].items():
-            other = last["arrays"][name]
-            if len(values) != len(other):
-                raise ValueError("The pair has different boundary field shapes")
-            boundary_delta = max(boundary_delta, max((abs(left - right) for left, right in zip(values, other)), default=0.0))
-    return {"internal": max((abs(left - right) for left, right in zip(original["internal"], candidate["internal"])), default=0.0),
-            "boundary": boundary_delta}
+    comparison = benchmark.field_comparison(first, second, shape, field)
+    return {key: comparison[key] for key in ("internal", "boundary")}
 
 
 def verify(owner):
@@ -188,28 +179,44 @@ def verify(owner):
     if report["runId"] != owner["runId"] or report["acceptedCfd"] or report["published"] or report["fixedSteps"] != 63:
         raise ValueError("Unexpected publication or run identity in benchmark report")
     arms = {arm["arm"]: arm for arm in report["arms"]}
-    if list(arms) != ["A1", "B", "A2"] or len({arm["inputSha256"] for arm in arms.values()}) != 1:
+    experiment = owner.get("experiment", "placement")
+    if report.get("experiment", "placement") != experiment or list(arms) != ["A1", "B", "A2"]:
+        raise ValueError("Missing arm or changed frozen decomposition")
+    if experiment == "serial-mpi":
+        proof = report.get("initialReconstruction")
+        if not proof or proof.get("valuesIdentical") is not True or set(proof["fields"]) != set(benchmark.FIELDS):
+            raise ValueError("Missing exact global initial reconstruction proof")
+        if any(value["originalValueSha256"] != value["candidateValueSha256"] for value in proof["fields"].values()):
+            raise ValueError("Initial reconstructed values changed")
+        for name, arm in arms.items():
+            if arm["ranks"] != (3 if name == "B" else 1) or arm["inputSha256"] != report["inputIdentities"]["parallel" if name == "B" else "global"]:
+                raise ValueError("Rank-count arm differs from its approved inputs")
+    elif experiment != "placement" or len({arm["inputSha256"] for arm in arms.values()}) != 1:
         raise ValueError("Missing arm or changed frozen decomposition")
     comparisons = {}
     for baseline in ("A1", "A2"):
         left, right = arms[baseline], arms["B"]
         differences = aligned_coefficients(left["coefficients"], right["coefficients"])
         fields = {}
+        value_hashes = {}
         identical = True
         for label in ("start", "end"):
             if left["boundaries"][label]["time"] != right["boundaries"][label]["time"]:
                 raise ValueError("The pair has different written physical endpoints")
-            for rank in range(3):
-                original = left["snapshots"][label][str(rank)]
-                candidate = right["snapshots"][label][str(rank)]
+            for rank in (["global"] if experiment == "serial-mpi" else ["0", "1", "2"]):
+                directory = "global" if rank == "global" else f"processor{rank}"
+                original = left["snapshots"][label][rank]
+                candidate = right["snapshots"][label][rank]
                 if original["shape"] != candidate["shape"] or original["state"] != candidate["state"]:
                     raise ValueError("The pair has different written mesh/time states")
                 for field in benchmark.FIELDS:
-                    first = root / "output/snapshots" / baseline / label / f"processor{rank}" / field
-                    second = root / "output/snapshots/B" / label / f"processor{rank}" / field
+                    first = root / "output/snapshots" / baseline / label / directory / field
+                    second = root / "output/snapshots/B" / label / directory / field
                     if benchmark.digest(first) != original["files"][field]["sha256"] or benchmark.digest(second) != candidate["files"][field]["sha256"]:
                         raise ValueError("A validated endpoint copy changed")
-                    fields[f"{label}/processor{rank}/{field}"] = field_delta(first, second, original["shape"], field)
+                    comparison = benchmark.field_comparison(first, second, original["shape"], field)
+                    fields[f"{label}/{directory}/{field}"] = {key: comparison[key] for key in ("internal", "boundary")}
+                    value_hashes[f"{label}/{directory}/{field}"] = {key: comparison[key] for key in ("originalValueSha256", "candidateValueSha256")}
                     identical = identical and original["files"][field]["sha256"] == candidate["files"][field]["sha256"]
         comparisons[baseline] = {"baselineWallSeconds": left["measurement"]["wallSeconds"],
             "boundWallSeconds": right["measurement"]["wallSeconds"],
@@ -217,9 +224,16 @@ def verify(owner):
             "baselineRankCpuSeconds": left["measurement"]["rankCpuSeconds"], "boundRankCpuSeconds": right["measurement"]["rankCpuSeconds"],
             "baselinePrelude": left["prelude"], "boundPrelude": right["prelude"],
             "maxAbsoluteCoefficientDelta": differences, "maxAbsoluteFieldDeltaAtBothWrites": fields,
-            "fieldBytesIdentical": identical}
+            "fieldBytesIdentical": identical, "fieldValueHashes": value_hashes,
+            "fieldValuesIdentical": all(value["originalValueSha256"] == value["candidateValueSha256"] for value in value_hashes.values())}
+        if experiment == "serial-mpi":
+            comparisons[baseline]["parallelWallSeconds"] = comparisons[baseline].pop("boundWallSeconds")
+            comparisons[baseline]["parallelRankCpuSeconds"] = comparisons[baseline].pop("boundRankCpuSeconds")
+            comparisons[baseline]["parallelPrelude"] = comparisons[baseline].pop("boundPrelude")
+            comparisons[baseline]["parallelToSerialCpuCostRatio"] = right["measurement"]["rankCpuSeconds"] / left["measurement"]["rankCpuSeconds"]
+            comparisons[baseline]["idealThreeCoreParallelEfficiency"] = comparisons[baseline]["wallRatio"] / 3
     report["comparisons"] = comparisons
-    report["numericalEquivalence"] = "identical" if all(item["fieldBytesIdentical"] and not any(item["maxAbsoluteCoefficientDelta"].values()) for item in comparisons.values()) else "requires_review"
+    report["numericalEquivalence"] = "identical" if all(item["fieldValuesIdentical"] and not any(item["maxAbsoluteCoefficientDelta"].values()) for item in comparisons.values()) else "requires_review"
     benchmark.write_json(root / "receipt/comparison.json", report)
     print(json.dumps({"kind": report["kind"], "numericalEquivalence": report["numericalEquivalence"], "acceptedCfd": False}))
 

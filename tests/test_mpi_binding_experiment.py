@@ -142,7 +142,8 @@ def test_checkpoint_cleanup_uses_only_exact_coordinator_identity(tmp_path, monke
 
 
 @pytest.mark.parametrize("copy_uniform_supported", [False, True])
-def test_checkpoint_native_has_one_frozen_decomposition_for_all_arms(tmp_path, monkeypatch, copy_uniform_supported):
+@pytest.mark.parametrize("experiment", ["placement", "serial-mpi", "changed-initial"])
+def test_checkpoint_native_has_one_frozen_decomposition_for_all_arms(tmp_path, monkeypatch, copy_uniform_supported, experiment):
     import json
 
     source = tmp_path / "input"
@@ -150,7 +151,8 @@ def test_checkpoint_native_has_one_frozen_decomposition_for_all_arms(tmp_path, m
     (case / "system").mkdir(parents=True)
     (case / "system/controlDict").write_text("immutable actual-case fixture")
     (source / "case-files.json").write_text(json.dumps(checkpoint.tree_identity(case)))
-    (source / "owner.json").write_text(json.dumps({"runId": "fixture", "driverSha256": checkpoint.digest(checkpoint.__file__)}))
+    (source / "owner.json").write_text(json.dumps({"runId": "fixture", "driverSha256": checkpoint.digest(checkpoint.__file__),
+                                                "experiment": "serial-mpi" if experiment == "changed-initial" else experiment}))
     adapter = tmp_path / "python"
     adapter.mkdir()
     executable = adapter / "python"
@@ -163,19 +165,36 @@ def test_checkpoint_native_has_one_frozen_decomposition_for_all_arms(tmp_path, m
     for name in ("DC2_DEPLOYMENT", "DC2_COMPONENT", "DC2_GENERATION"):
         monkeypatch.setenv(name, "fixture")
     monkeypatch.setattr(checkpoint, "native_identity", lambda: {"boundCpus": [0, 1, 2]})
+    monkeypatch.setattr(checkpoint, "cgroup_cpu", lambda: {"usage_usec": 0})
     commands = []
 
     def finite(command, cwd, log, timeout):
         commands.append(command)
         if command == ["decomposePar", "-help"]:
             log.write_text("-copyUniform" if copy_uniform_supported else "unsupported pinned fixture")
+        if command == ["reconstructPar", "-help"]:
+            log.write_text("-time")
 
     monkeypatch.setattr(checkpoint, "run_finite", finite)
     arms = []
+    initial_verified = []
 
-    def arm(canonical, destination, name, identity, deadline):
+    def validate_initial(original, reconstructed):
+        if experiment == "changed-initial":
+            raise ValueError("Changed initial field fixture")
+        initial_verified.append(True)
+        return {"valuesIdentical": True}
+
+    monkeypatch.setattr(checkpoint, "reconstruct_global", lambda *args: {"wallSeconds": 1, "cgroupCpuSeconds": 1})
+    monkeypatch.setattr(checkpoint, "validate_reconstructed_input", validate_initial)
+    monkeypatch.setattr(checkpoint, "copy_checkpoint", lambda *args: {})
+
+    def arm(canonical, destination, name, identity, deadline, ranks=3, experiment="placement"):
+        if experiment == "serial-mpi":
+            assert initial_verified == [True]
+            assert ranks == (3 if name == "B" else 1)
         arms.append((name, checkpoint.tree_identity(canonical)))
-        return {"arm": name, "inputSha256": "same-frozen-input"}
+        return {"arm": name, "ranks": ranks, "inputSha256": checkpoint.value_digest(checkpoint.tree_identity(canonical))}
 
     monkeypatch.setattr(checkpoint, "run_arm", arm)
     if not copy_uniform_supported:
@@ -184,12 +203,23 @@ def test_checkpoint_native_has_one_frozen_decomposition_for_all_arms(tmp_path, m
         assert len(commands) == 2
         assert not arms
         return
+    if experiment == "changed-initial":
+        with pytest.raises(ValueError, match="Changed initial"):
+            checkpoint.native_run(source, output)
+        assert not arms
+        assert not (output / "report.json").exists()
+        return
     checkpoint.native_run(source, output)
-    assert [command[0] for command in commands] == ["checkMesh", "decomposePar", "decomposePar"]
+    assert [command[0] for command in commands] == ["checkMesh", "decomposePar", "decomposePar"] + (["reconstructPar"] if experiment == "serial-mpi" else [])
     assert commands[1] == ["decomposePar", "-help"]
     assert commands[2][-1] == "-copyUniform"
     assert [name for name, _ in arms] == ["A1", "B", "A2"]
-    assert arms[0][1] == arms[1][1] == arms[2][1]
+    assert arms[0][1] == arms[2][1]
+    if experiment == "placement":
+        assert arms[0][1] == arms[1][1]
+    else:
+        assert "system/decomposeParDict" not in arms[0][1]
+        assert "system/decomposeParDict" in arms[1][1]
     assert (case / "system/controlDict").read_text() == "immutable actual-case fixture"
     report = json.loads((output / "report.json").read_text())
     assert report["acceptedCfd"] is False
@@ -223,6 +253,11 @@ def test_checkpoint_declaration_is_private_finite_and_three_cpu_without_new_engi
     assert any(mount.endswith(":/python:ro") for mount in service["volumes"])
     assert "/python/bin/python3.12" in service["command"][0]
     assert not any("docker.sock" in mount for mount in service["volumes"])
+    ranks = configuration["test"]["checkpoint-rank-count"]
+    placement = configuration["test"]["checkpoint-placement"]
+    assert ranks["timeout_seconds"] == placement["timeout_seconds"] == 1800
+    assert ranks["env"]["CHECKPOINT_EXPERIMENT"] == "serial-mpi"
+    assert ranks["check"] == placement["check"]
 
 
 def test_checkpoint_stop_never_signals_a_foreign_process_group(monkeypatch):
@@ -297,13 +332,13 @@ def test_checkpoint_existing_python_relocates_without_installing_dependencies(tm
     assert checkpoint.tree_identity(staged) == receipt["files"]
 
 
-def checkpoint_boundary_fixture(step):
+def checkpoint_boundary_fixture(step, ranks=3):
     return {"relativeStep": step, "time": float(checkpoint.MEASUREMENT_START_TIME if step == 62 else checkpoint.END_TIME),
             "elapsedSeconds": float(step), "masterExecutionSeconds": step * 0.8, "masterClockSeconds": float(step),
             "cgroupCpu": {"usage_usec": step * 2500000, "user_usec": step * 2300000,
                           "system_usec": step * 200000, "throttled_usec": step * 10000},
             "rankCpu": {str(rank): {"pid": 100 + rank, "startTicks": 500 + rank, "affinity": [rank],
-                                    "userSeconds": step * 0.7, "systemSeconds": step * 0.1} for rank in range(3)}}
+                                    "userSeconds": step * 0.7, "systemSeconds": step * 0.1} for rank in range(ranks)}}
 
 
 @pytest.mark.parametrize("mutation", [None, "pid", "startTicks", "affinity", "sparse", "reset", "step", "time", "clock"])
@@ -340,7 +375,9 @@ def checkpoint_coefficients_fixture():
              "Cl": 0.4, "Cd": 0.03, "Cm": -0.02} for step in range(1, 64)]
 
 
-def test_checkpoint_arm_stops_after_actual_second_write_and_separates_prelude(tmp_path, monkeypatch):
+@pytest.mark.parametrize("experiment,ranks", [("placement", 3), ("serial-mpi", 1), ("serial-mpi", 3)])
+@pytest.mark.parametrize("delayed_coefficients", [False, True])
+def test_checkpoint_arm_stops_after_actual_second_write_and_separates_prelude(tmp_path, monkeypatch, experiment, ranks, delayed_coefficients):
     import json
     from types import SimpleNamespace
 
@@ -350,21 +387,28 @@ def test_checkpoint_arm_stops_after_actual_second_write_and_separates_prelude(tm
     (canonical / "frozen-input").write_text("one authenticated decomposition fixture")
     monkeypatch.setattr(checkpoint, "cgroup_cpu", lambda: {"usage_usec": 0})
     monkeypatch.setattr(checkpoint, "capture_boundary",
-                        lambda step, physical, execution, started, receipts: checkpoint_boundary_fixture(step))
-    monkeypatch.setattr(checkpoint, "checkpoint_ready", lambda case, step: step in (62, 125))
+                        lambda step, physical, execution, started, receipts, expected: checkpoint_boundary_fixture(step, expected))
+    monkeypatch.setattr(checkpoint, "checkpoint_ready", lambda case, step, ranks: step in (62, 125))
+    monkeypatch.setattr(checkpoint, "reconstruct_global", lambda *args: {"wallSeconds": 2, "cgroupCpuSeconds": 2})
     snapshots = []
-    monkeypatch.setattr(checkpoint, "copy_checkpoint", lambda case, destination, step: snapshots.append(step) or {})
+    monkeypatch.setattr(checkpoint, "copy_checkpoint", lambda case, destination, step, ranks: snapshots.append(step) or {})
     coefficient_calls = []
 
     def coefficients(case, start, end, expected_steps=63):
         coefficient_calls.append((start, end, expected_steps))
+        if delayed_coefficients and len(coefficient_calls) == 1:
+            raise ValueError("Final native coefficient row has not reached disk yet")
         return [{"time": end}] * expected_steps
 
     monkeypatch.setattr(checkpoint, "coefficient_trace", coefficients)
-    process = SimpleNamespace(returncode=-15)
+    process = SimpleNamespace(returncode=-15, poll=lambda: None)
 
     def launch(command, stdout, **kwargs):
-        assert command[:8] == ["mpirun", "--allow-run-as-root", "--bind-to", "none", "--use-hwthread-cpus", "-np", "3", checkpoint.sys.executable]
+        if ranks == 3:
+            assert command[:8] == ["mpirun", "--allow-run-as-root", "--bind-to", "none", "--use-hwthread-cpus", "-np", "3", checkpoint.sys.executable]
+        else:
+            assert command[0] == checkpoint.sys.executable
+            assert "mpirun" not in command
         rows = []
         for step in range(1, 126):
             physical = checkpoint.MEASUREMENT_START_TIME if step == 62 else checkpoint.END_TIME
@@ -375,17 +419,22 @@ def test_checkpoint_arm_stops_after_actual_second_write_and_separates_prelude(tm
 
     monkeypatch.setattr(checkpoint.subprocess, "Popen", launch)
     stop = Mock()
+    stop.side_effect = lambda process: coefficient_calls.append("stop-after-complete-coefficients")
     monkeypatch.setattr(checkpoint, "stop_owned", stop)
-    result = checkpoint.run_arm(canonical, output, "A1", {"boundCpus": [0, 1, 2]}, float("inf"))
+    arm = "B" if experiment == "serial-mpi" and ranks == 3 else "A1"
+    result = checkpoint.run_arm(canonical, output, arm, {"boundCpus": [0, 1, 2]}, float("inf"), ranks, experiment)
     stop.assert_called_once_with(process)
     assert snapshots == [62, 125]
     assert result["prelude"]["steps"] == result["prelude"]["wallSeconds"] == 62
     assert result["measurement"]["steps"] == result["measurement"]["wallSeconds"] == 63
     assert result["totalLoggedSteps"] == 125
     assert result["postEndpointLoggedSteps"] == 0
-    assert coefficient_calls == [(float(checkpoint.MEASUREMENT_START_TIME), float(checkpoint.END_TIME), 63),
-                                 (float(checkpoint.START_TIME), float(checkpoint.MEASUREMENT_START_TIME), 62)]
-    assert json.loads((output / "A1-measurement.json").read_text()) == result
+    expected = [(float(checkpoint.MEASUREMENT_START_TIME), float(checkpoint.END_TIME), 63),
+                (float(checkpoint.START_TIME), float(checkpoint.MEASUREMENT_START_TIME), 62)]
+    assert coefficient_calls[-5:] == expected + ["stop-after-complete-coefficients"] + expected
+    assert len(coefficient_calls) == (6 if delayed_coefficients else 5)
+    assert len(result["measurement"]["rankCpu"]) == ranks
+    assert json.loads((output / f"{arm}-measurement.json").read_text()) == result
 
 
 @pytest.mark.parametrize("mutation", [None, "sparse", "time", "duplicate", "nan"])
@@ -408,19 +457,21 @@ def test_checkpoint_comparison_requires_exact_aligned_63_real_coefficient_times(
         assert control.aligned_coefficients(first, last)["Cl"] == pytest.approx(0.01)
 
 
-def write_checkpoint_fixture(case):
+def write_checkpoint_fixture(case, ranks=3, include_initial=False):
     def foam(path, kind, body):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(f"FoamFile {{ version 2.0; format ascii; class {kind}; object {path.name}; }}\n"
                         + body + "\n" + checkpoint.FOAM_FOOTER.decode() + "\n")
 
-    for rank in range(3):
-        processor = case / f"processor{rank}"
+    for processor in checkpoint.checkpoint_roots(case, ranks).values():
         mesh = processor / "constant/polyMesh"
         foam(mesh / "owner", "labelList", "2(0 1)")
         foam(mesh / "neighbour", "labelList", "1(1)")
         foam(mesh / "boundary", "polyBoundaryMesh", "1(fixtureWall { type wall; nFaces 1; startFace 1; })")
-        for step, physical in ((62, checkpoint.MEASUREMENT_START_TIME), (125, checkpoint.END_TIME)):
+        times = [(62, checkpoint.MEASUREMENT_START_TIME), (125, checkpoint.END_TIME)]
+        if include_initial:
+            times.insert(0, (0, checkpoint.START_TIME))
+        for step, physical in times:
             directory = processor / physical
             foam(directory / "uniform/time", "dictionary",
                  f"value {physical};\nindex {checkpoint.START_INDEX + step};\ndeltaT 2.6666667e-05;\ndeltaT0 2.6666667e-05;")
@@ -469,38 +520,58 @@ def test_checkpoint_validates_all_three_rank_fields_before_copy(tmp_path, mutati
                 assert record["files"]["phi"]["count"] == 1
 
 
-@pytest.mark.parametrize("mutation", [None, "finite_delta", "misaligned", "sparse", "corrupt"])
-def test_checkpoint_paired_journey_compares_both_actual_writes_without_publication(tmp_path, mutation):
+@pytest.mark.parametrize("experiment,mutation", [
+    (experiment, mutation) for experiment in ("placement", "serial-mpi")
+    for mutation in (None, "finite_delta", "misaligned", "sparse", "corrupt")
+] + [("serial-mpi", mutation) for mutation in ("missing-proof", "changed-proof", "rank", "input")])
+def test_checkpoint_paired_journey_compares_both_actual_writes_without_publication(tmp_path, experiment, mutation):
     import json
 
-    owner = {"runId": "paired-fixture", "path": str(tmp_path), "name": control.NAME}
+    owner = {"runId": "paired-fixture", "path": str(tmp_path), "name": control.NAME, "experiment": experiment}
     root = tmp_path / control.RELATIVE_ROOT
     (root / "input").mkdir(parents=True)
     (root / "receipt").mkdir()
     checkpoint.write_json(root / "input/owner.json", owner)
     report = {"kind": "checkpoint-placement-benchmark-only", "runId": owner["runId"],
-              "acceptedCfd": False, "published": False, "fixedSteps": 63, "arms": []}
+              "acceptedCfd": False, "published": False, "fixedSteps": 63, "arms": [], "experiment": experiment}
+    if experiment == "serial-mpi":
+        initial = root / "initial"
+        write_checkpoint_fixture(initial, ranks=1, include_initial=True)
+        report["initialReconstruction"] = checkpoint.validate_reconstructed_input(initial, initial)
+        report["inputIdentities"] = {"global": "global-input", "parallel": "decomposed-input"}
     for arm in ("A1", "B", "A2"):
         case = root / "output" / arm
-        write_checkpoint_fixture(case)
+        snapshot_ranks = 1 if experiment == "serial-mpi" else 3
+        write_checkpoint_fixture(case, snapshot_ranks)
+        directory = "global" if experiment == "serial-mpi" else "processor1"
         if arm == "B" and mutation == "finite_delta":
-            target = case / "processor1" / checkpoint.MEASUREMENT_START_TIME / "p"
+            target = (case if snapshot_ranks == 1 else case / directory) / checkpoint.MEASUREMENT_START_TIME / "p"
             target.write_text(target.read_text().replace("2(1 2)", "2(1 2.5)"))
-        snapshots = {label: checkpoint.copy_checkpoint(case, root / "output/snapshots" / arm / label, step)
+        snapshots = {label: checkpoint.copy_checkpoint(case, root / "output/snapshots" / arm / label, step, snapshot_ranks)
                      for label, step in (("start", 62), ("end", 125))}
-        report["arms"].append({"arm": arm, "inputSha256": "identical-fixture-decomposition", "snapshots": snapshots,
+        ranks = 1 if experiment == "serial-mpi" and arm != "B" else 3
+        input_sha = "identical-fixture-decomposition" if experiment == "placement" else report["inputIdentities"]["parallel" if arm == "B" else "global"]
+        report["arms"].append({"arm": arm, "ranks": ranks, "inputSha256": input_sha, "snapshots": snapshots,
                                "boundaries": {"start": checkpoint_boundary_fixture(62), "end": checkpoint_boundary_fixture(125)},
                                "prelude": {"steps": 62, "wallSeconds": 62},
-                               "measurement": {"steps": 63, "wallSeconds": 63, "rankCpuSeconds": 150},
+                               "measurement": {"steps": 63, "wallSeconds": 63, "rankCpuSeconds": ranks * 50},
                                "coefficients": checkpoint_coefficients_fixture()})
     if mutation == "misaligned":
         report["arms"][1]["coefficients"][12]["time"] += 1e-8
     elif mutation == "sparse":
         report["arms"][1]["coefficients"].pop()
     elif mutation == "corrupt":
-        (root / "output/snapshots/B/end/processor2/U").write_text("incomplete")
+        (root / "output/snapshots/B/end" / ("global" if experiment == "serial-mpi" else "processor2") / "U").write_text("incomplete")
+    elif mutation == "missing-proof":
+        report.pop("initialReconstruction")
+    elif mutation == "changed-proof":
+        report["initialReconstruction"]["fields"]["p"]["candidateValueSha256"] = "changed"
+    elif mutation == "rank":
+        report["arms"][0]["ranks"] = 3
+    elif mutation == "input":
+        report["arms"][1]["inputSha256"] = "foreign"
     checkpoint.write_json(root / "output/report.json", report)
-    if mutation in ("misaligned", "sparse", "corrupt"):
+    if mutation not in (None, "finite_delta"):
         with pytest.raises(ValueError):
             control.verify(owner)
         assert not (root / "receipt/comparison.json").exists()
@@ -511,6 +582,79 @@ def test_checkpoint_paired_journey_compares_both_actual_writes_without_publicati
         assert comparison["numericalEquivalence"] == ("requires_review" if mutation else "identical")
         for value in comparison["comparisons"].values():
             assert value["baselinePrelude"]["steps"] == 62
-            assert value["baselineWallSeconds"] == value["boundWallSeconds"] == 63
-            assert len(value["maxAbsoluteFieldDeltaAtBothWrites"]) == 36
-            assert value["maxAbsoluteFieldDeltaAtBothWrites"]["start/processor1/p"]["internal"] == (0.5 if mutation else 0)
+            assert value["baselineWallSeconds"] == value["parallelWallSeconds" if experiment == "serial-mpi" else "boundWallSeconds"] == 63
+            assert len(value["maxAbsoluteFieldDeltaAtBothWrites"]) == (12 if experiment == "serial-mpi" else 36)
+            assert value["maxAbsoluteFieldDeltaAtBothWrites"][f"start/{directory}/p"]["internal"] == (0.5 if mutation else 0)
+            if experiment == "serial-mpi":
+                assert value["parallelToSerialCpuCostRatio"] == 3
+                assert value["idealThreeCoreParallelEfficiency"] == pytest.approx(1 / 3)
+
+
+@pytest.mark.parametrize("mutation", [None, "value", "boundary", "mesh", "time", "sparse", "nan"])
+def test_checkpoint_initial_reconstruction_requires_exact_global_values_and_boundaries(tmp_path, mutation):
+    original, reconstructed = tmp_path / "original", tmp_path / "reconstructed"
+    write_checkpoint_fixture(original, 1, True)
+    write_checkpoint_fixture(reconstructed, 1, True)
+    target = reconstructed / checkpoint.START_TIME / "p"
+    if mutation == "value":
+        target.write_text(target.read_text().replace("2(1 2)", "2(1 2.0000000000001)"))
+    elif mutation == "boundary":
+        target.write_text(target.read_text().replace("value uniform 0;", "value uniform 0.001;"))
+    elif mutation == "mesh":
+        target = reconstructed / "constant/polyMesh/owner"
+        target.write_text(target.read_text().replace("2(0 1)", "2(0 2)"))
+    elif mutation == "time":
+        target = reconstructed / checkpoint.START_TIME / "uniform/time"
+        target.write_text(target.read_text().replace("31550", "31551"))
+    elif mutation == "sparse":
+        target.unlink()
+    elif mutation == "nan":
+        target.write_text(target.read_text().replace("2(1 2)", "2(1 nan)"))
+    if mutation:
+        with pytest.raises(ValueError):
+            checkpoint.validate_reconstructed_input(original, reconstructed)
+    else:
+        result = checkpoint.validate_reconstructed_input(original, reconstructed)
+        assert result["valuesIdentical"] is True
+        assert set(result["fields"]) == set(checkpoint.FIELDS)
+
+
+@pytest.mark.parametrize("ranks", [1, 3])
+def test_checkpoint_serial_mpi_rank_entry_never_binds_and_serial_avoids_mpi(tmp_path, monkeypatch, ranks):
+    for name in list(checkpoint.os.environ):
+        if name.startswith("OMPI_COMM_WORLD_"):
+            monkeypatch.delenv(name)
+    if ranks == 3:
+        for name, value in (("OMPI_COMM_WORLD_LOCAL_RANK", "0"), ("OMPI_COMM_WORLD_SIZE", "3"), ("OMPI_COMM_WORLD_LOCAL_SIZE", "3")):
+            monkeypatch.setenv(name, value)
+    bind = Mock()
+    execute = Mock()
+    monkeypatch.setattr(checkpoint.os, "sched_setaffinity", bind)
+    monkeypatch.setattr(checkpoint.os, "execv", execute)
+    monkeypatch.setattr(checkpoint.shutil, "which", lambda name: "/pinned/pimpleFoam")
+    checkpoint.rank_entry(tmp_path, tmp_path, "B" if ranks == 3 else "A1", [0, 1, 2], ranks, "serial-mpi")
+    bind.assert_not_called()
+    execute.assert_called_once_with("/pinned/pimpleFoam", ["/pinned/pimpleFoam", *(["-parallel"] if ranks == 3 else []), "-case", str(tmp_path)])
+    first, last = checkpoint_boundary_fixture(62, ranks), checkpoint_boundary_fixture(125, ranks)
+    assert checkpoint.interval_metrics(first, last, ranks)["rankCpuSeconds"] == pytest.approx(63 * 0.8 * ranks)
+
+
+def test_checkpoint_reconstruction_uses_only_validated_times_and_never_mutates_input(tmp_path, monkeypatch):
+    import shutil
+
+    case, destination = tmp_path / "case", tmp_path / "reconstructed"
+    write_checkpoint_fixture(case, 3, True)
+    shutil.copytree(case / "processor0/constant", case / "constant")
+    (case / "system").mkdir()
+    (case / "system/controlDict").write_text("unchanged original numerics")
+    before = checkpoint.tree_identity(case)
+    monkeypatch.setattr(checkpoint, "cgroup_cpu", lambda: {"usage_usec": 0})
+    finite = Mock()
+    monkeypatch.setattr(checkpoint, "run_finite", finite)
+    checkpoint.reconstruct_global(case, destination, (62, 125))
+    command = finite.call_args.args[0]
+    assert command == ["reconstructPar", "-case", str(destination), "-time", f"{checkpoint.MEASUREMENT_START_TIME},{checkpoint.END_TIME}"]
+    assert checkpoint.tree_identity(case) == before
+    for rank in range(3):
+        assert not (destination / f"processor{rank}" / checkpoint.START_TIME).exists()
+        assert (destination / f"processor{rank}" / checkpoint.END_TIME / "phi").is_file()
