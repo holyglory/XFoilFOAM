@@ -672,6 +672,11 @@ epoch and plan, latest attempt, physical stop and absence of newer ownership.
 A durable evidence-reuse receipt records the recovery; the failed attempt history
 and accumulated compute budget remain unchanged. Blocked or interrupted
 publication leaves downstream repair finalization open for a later retry.
+If a shared color scale changes before that publication finishes, discovery may
+reopen the existing exact accepted repair for stale media. This exception requires
+an unowned pending cell, an unfinished repair, the same current stage-3 source and
+verified archive; it revalidates repair and cell ownership under locks. It does not
+adopt unrelated accepted history or bypass the normal publication checks.
 
 Migration 0193 repairs the exact recorded-history state in which both quarantine
 tables and their dedicated guards are missing. It validates an intact schema

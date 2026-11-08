@@ -971,14 +971,19 @@ describe("durable result media repair", () => {
           .orderBy(resultAttempts.id);
         const historyBefore = await history();
         const budgetBefore = await budget();
-        for (const fixture of fixtures) {
+        for (const fixture of [fixtures[0], fixtures[2], fixtures[1]]) {
           const claim = await claimNextResultMediaRepair(connection, {
             resultId: fixture.resultId,
           });
           expect(claim?.claimToken).toBeTruthy();
           await repairDefaultMediaForStoredResult({
             db: connection,
-            engine: engineWith(),
+            engine: fixture === fixtures[1] ? engineWith({
+              extents: async () => ({ fields: {
+                velocity_magnitude: { min: 0, max: 44, finite_count: 500 },
+                pressure: { min: -8, max: 6, finite_count: 500 },
+              } }),
+            }) : engineWith(),
             resultId: fixture.resultId,
             resultAttemptId: fixture.resultAttemptId,
             heartbeat: async () => undefined,
@@ -1152,11 +1157,83 @@ describe("durable result media repair", () => {
           .where(eq(resultMediaRepairs.id, repair.id));
         expect(interrupted.downstreamFinalizedAt).toBeNull();
         for (const fixture of fixtures) {
-          expect(
-            await resultMediaRepairTick(connection, engineWith(), {
-              resultId: fixture.resultId,
-            }),
-          ).toMatchObject({ finalized: 1, claimed: false });
+          if (fixture === fixtures[2]) {
+            const [stale] = await connection.execute(querySql`
+              SELECT classification.state,cell.current_result_attempt_id,repair.state AS repair_state,
+                repair.downstream_finalized_at,
+                (SELECT count(*)::int FROM result_media media JOIN field_color_scales scale
+                  ON scale.airfoil_id=cell.airfoil_id AND scale.simulation_preset_revision_id=cell.simulation_preset_revision_id
+                  AND scale.field=media.field AND scale.render_profile_key=media.render_profile_key AND scale.active
+                  WHERE media.result_attempt_id=${fixture.resultAttemptId}::uuid AND media.color_scale_id<>scale.id) AS stale_media
+              FROM results cell JOIN result_classifications classification ON classification.result_attempt_id=${fixture.resultAttemptId}::uuid
+              JOIN result_media_repairs repair ON repair.result_id=cell.id WHERE cell.id=${fixture.resultId}::uuid`);
+            expect(stale).toMatchObject({ state: "accepted", current_result_attempt_id: null,
+              repair_state: "done", downstream_finalized_at: null });
+            expect(Number(stale.stale_media)).toBeGreaterThan(0);
+            const unfinishedUnit = scope.units.find(entry => entry.resultAttemptId === fixture.resultAttemptId)!;
+            for (const scenario of ["new-job", "new-unit-owner", "newer-attempt", "newer-raw", "replaced-repair",
+              "finalized", "live-repair", "signature-drift", "invalid-cfd", "exclude", "defer", "old-plan", "old-epoch", "no-stale-media"]) {
+              const restore = new Error(`Restore rediscovery refusal ${scenario}`);
+              await connection.transaction(async nested => {
+                const target = nested as unknown as DB;
+                if (scenario === "new-job") {
+                  await target.update(results).set({ simJobId: jobs[0] }).where(eq(results.id, fixture.resultId));
+                } else if (scenario === "new-unit-owner") {
+                  await target.execute(querySql`UPDATE progressive_cfd_units SET state='leased',lease_token=gen_random_uuid(),
+                    lease_owner='replacement',lease_until=clock_timestamp()+interval '1 hour' WHERE id=${unfinishedUnit.id}::uuid`);
+                } else if (scenario === "newer-attempt") {
+                  await target.execute(querySql`INSERT INTO progressive_cfd_attempts(token,unit_id,owner,lease_until,started_at,outcome)
+                    VALUES(gen_random_uuid(),${unfinishedUnit.id}::uuid,'replacement',clock_timestamp()+interval '1 hour',clock_timestamp(),'running')`);
+                } else if (scenario === "newer-raw") {
+                  const [oldRaw] = await target.select().from(resultAttempts).where(eq(resultAttempts.id, fixture.resultAttemptId));
+                  await target.insert(resultAttempts).values({ ...oldRaw, id: randomUUID(),
+                    engineJobId: randomUUID(), createdAt: new Date(Date.now() + 60_000) });
+                } else if (scenario === "replaced-repair") {
+                  const [oldRaw] = await target.select().from(resultAttempts).where(eq(resultAttempts.id, fixture.resultAttemptId));
+                  const replacementId = randomUUID();
+                  await target.insert(resultAttempts).values({ ...oldRaw, id: replacementId,
+                    engineJobId: randomUUID(), createdAt: new Date(oldRaw.createdAt.getTime() - 60_000) });
+                  await target.update(resultMediaRepairs).set({ resultAttemptId: replacementId })
+                    .where(eq(resultMediaRepairs.resultId, fixture.resultId));
+                } else if (scenario === "finalized") {
+                  await target.update(resultMediaRepairs).set({ downstreamFinalizedAt: new Date() })
+                    .where(eq(resultMediaRepairs.resultId, fixture.resultId));
+                } else if (scenario === "live-repair") {
+                  await target.update(resultMediaRepairs).set({ state: "running", claimToken: randomUUID(),
+                    claimExpiresAt: new Date(Date.now() + 60_000) }).where(eq(resultMediaRepairs.resultId, fixture.resultId));
+                } else if (scenario === "signature-drift") {
+                  await target.update(resultMediaRepairs).set({ evidenceSignature: "different" })
+                    .where(eq(resultMediaRepairs.resultId, fixture.resultId));
+                } else if (scenario === "invalid-cfd") {
+                  await target.update(resultAttempts).set({ validForPolar: false }).where(eq(resultAttempts.id, fixture.resultAttemptId));
+                } else if (scenario === "exclude" || scenario === "defer") {
+                  await target.execute(querySql`INSERT INTO result_review_verdicts(result_id,verdict,reviewer)
+                    VALUES(${fixture.resultId}::uuid,${scenario},'fixture')`);
+                } else if (scenario === "old-plan") {
+                  const planId = randomUUID();
+                  await target.execute(querySql`INSERT INTO sim_campaign_plan_revisions(id,campaign_id,revision_number,kind,plan,summary)
+                    VALUES(${planId}::uuid,${scope.campaignId}::uuid,2,'edit','{}','{}')`);
+                  await target.execute(querySql`UPDATE sim_campaigns SET current_plan_revision_id=${planId}::uuid WHERE id=${scope.campaignId}::uuid`);
+                } else if (scenario === "old-epoch") {
+                  await target.execute(querySql`UPDATE calculation_epochs SET current=false WHERE id=${scope.epochId}::uuid`);
+                } else {
+                  await target.execute(querySql`UPDATE result_media media SET color_scale_id=scale.id FROM field_color_scales scale
+                    WHERE media.result_attempt_id=${fixture.resultAttemptId}::uuid AND scale.airfoil_id=${fixture.airfoilId}::uuid
+                      AND scale.simulation_preset_revision_id=${revisionId}::uuid AND scale.field=media.field
+                      AND scale.render_profile_key=media.render_profile_key AND scale.active`);
+                }
+                const before = await target.select().from(resultMediaRepairs).where(eq(resultMediaRepairs.resultId, fixture.resultId));
+                expect(await discoverMissingResultMediaRepairs(target, { resultId: fixture.resultId })).toBe(0);
+                expect(await target.select().from(resultMediaRepairs).where(eq(resultMediaRepairs.resultId, fixture.resultId))).toEqual(before);
+                const [cell] = await target.select().from(results).where(eq(results.id, fixture.resultId));
+                expect(cell.currentResultAttemptId).toBeNull();
+                throw restore;
+              }).catch(error => { if (error !== restore) throw error; });
+            }
+          }
+          const tick = await resultMediaRepairTick(connection, engineWith(), { resultId: fixture.resultId });
+          expect(tick).toMatchObject({ finalized: 1, claimed: fixture === fixtures[2] });
+          if (fixture === fixtures[2]) expect(tick.repairedMedia).toBeGreaterThan(0);
           const [cell] = await connection
             .select()
             .from(results)

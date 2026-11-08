@@ -13,6 +13,7 @@ import type { DB } from "./client";
 import { acquireResultEvidenceLock, acquireResultEvidenceLocks } from "./result-evidence-lock";
 import { analysisContentHash } from "./analysis-target";
 import { exactValidSolverManifestSql } from "./evidence-manifest";
+import { effectiveProgressiveStageSql } from "./progressive-execution-policy";
 import type { SimulationSetupSnapshot } from "./simulation-setup";
 import {
   recordSolverIncidentInTransaction,
@@ -485,6 +486,7 @@ export async function discoverMissingResultMediaRepairs(
       SELECT
         r.id AS result_id,
         candidate.id AS result_attempt_id,
+        candidate.classification_state = 'accepted' AND r.current_result_attempt_id IS NULL AS unfinished_accepted,
         COALESCE(candidate."solvedAt", candidate."createdAt") AS evidence_at,
         CASE
           WHEN producing_job.id IS NULL THEN true
@@ -510,6 +512,7 @@ export async function discoverMissingResultMediaRepairs(
       JOIN LATERAL (
         SELECT
           attempt.*,
+          classification.state AS classification_state,
           EXISTS (
             SELECT 1
             FROM sim_urans_verify_queue verify_item
@@ -539,6 +542,70 @@ export async function discoverMissingResultMediaRepairs(
                     AND verify_item.state = 'pending'
                     AND verify_item.last_outcome = 'media_repair_pending'
                 )
+              )
+            )
+            OR (
+              classification.state = 'accepted'
+              AND r.status = 'pending' AND r.current_result_attempt_id IS NULL AND r.sim_job_id IS NULL
+              AND attempt.airfoil_id = r.airfoil_id
+              AND attempt.simulation_preset_revision_id = r.simulation_preset_revision_id
+              AND attempt.valid_for_polar AND attempt.converged AND attempt.unsteady
+              AND attempt.regime = 'urans' AND attempt.evidence_payload ->> 'fidelity' = 'urans_full'
+              AND NOT EXISTS (
+                SELECT 1 FROM result_attempts newer WHERE newer.result_id = r.id
+                  AND (newer."createdAt", newer.id) > (attempt."createdAt", attempt.id)
+              )
+              AND NOT EXISTS (
+                SELECT 1 FROM result_review_verdicts review WHERE review.result_id = r.id
+                  AND review."revokedAt" IS NULL AND review.verdict IN ('exclude', 'defer')
+              )
+              AND ${exactValidSolverManifestSql(sql`r.id`, sql`attempt.id`)}
+              AND EXISTS (
+                SELECT 1 FROM result_media_repairs unfinished
+                JOIN sim_jobs producer ON producer.id = attempt.sim_job_id
+                JOIN solver_evidence_artifacts manifest ON manifest.result_id = r.id
+                  AND manifest.result_attempt_id = attempt.id AND manifest.kind = 'manifest'
+                JOIN solver_evidence_archives archive ON archive.result_id = r.id
+                  AND archive.result_attempt_id = attempt.id AND archive.state = 'current'
+                JOIN solver_evidence_blobs blob ON blob.id = archive.blob_id AND blob."verifiedAt" IS NOT NULL
+                JOIN solver_evidence_artifact_members member ON member.artifact_id = manifest.id
+                  AND member.archive_id = archive.id AND member.member_path = 'evidence_manifest.json'
+                WHERE unfinished.result_id = r.id AND unfinished.result_attempt_id = attempt.id
+                  AND unfinished.state = 'done' AND unfinished.downstream_finalized_at IS NULL
+                  AND unfinished.claim_token IS NULL AND unfinished.claim_expires_at IS NULL
+                  AND unfinished.evidence_signature = concat_ws(':', attempt.engine_job_id, attempt.engine_case_slug, manifest.sha256)
+                  AND producer.status IN ('done', 'failed', 'cancelled') AND producer."ingestedAt" IS NOT NULL
+                  AND (producer.ingest_lease_expires_at <= clock_timestamp()
+                    OR (producer.ingest_lease_token IS NULL AND producer.ingest_lease_expires_at IS NULL))
+              )
+              AND EXISTS (
+                SELECT 1 FROM progressive_cfd_evidence evidence
+                JOIN progressive_cfd_attempts original ON original.token = evidence.attempt_token
+                  AND original.sim_job_id = attempt.sim_job_id
+                JOIN progressive_cfd_units unit ON unit.id = original.unit_id
+                JOIN progressive_work work ON work.id = unit.work_id
+                JOIN progressive_generations generation ON generation.id = work.generation_id
+                JOIN calculation_epochs epoch ON epoch.id = generation.epoch_id AND epoch.current
+                JOIN sim_campaigns campaign ON campaign.id = generation.campaign_id
+                  AND campaign.current_plan_revision_id = generation.plan_revision_id
+                WHERE evidence.result_attempt_id = attempt.id AND original.outcome = 'failed'
+                  AND work.stage = 3 AND work.state IN ('pending', 'gap') AND ${effectiveProgressiveStageSql()} = 3
+                  AND generation.status = 'active' AND NOT generation.benchmark_only
+                  AND campaign.status IN ('active', 'attention', 'paused')
+                  AND unit.aoa_deg = attempt.aoa_deg
+                  AND unit.state = 'gap' AND unit.lease_token IS NULL
+                  AND unit.lease_owner IS NULL AND unit.lease_until IS NULL
+                  AND NOT EXISTS (
+                    SELECT 1 FROM progressive_cfd_attempts newer WHERE newer.unit_id = unit.id
+                      AND (newer.started_at, newer.token) > (original.started_at, original.token)
+                  )
+                  AND NOT EXISTS (
+                    SELECT 1 FROM progressive_cfd_attempts live
+                    JOIN progressive_cfd_units live_unit ON live_unit.id = live.unit_id
+                    JOIN progressive_work live_work ON live_work.id = live_unit.work_id
+                    WHERE live_work.generation_id = work.generation_id AND live_work.target_id = work.target_id
+                      AND live_unit.aoa_deg = unit.aoa_deg AND live.outcome = 'running'
+                  )
               )
             )
           )
@@ -695,15 +762,28 @@ export async function discoverMissingResultMediaRepairs(
           )
         )
     ), candidate AS (
-      SELECT repair_source.*
+      SELECT repair_source.*, locked_repair.id AS locked_repair_id
       FROM repair_source
       LEFT JOIN result_media_repairs existing
         ON existing.result_id = repair_source.result_id
-      WHERE existing.id IS NULL
+      LEFT JOIN LATERAL (
+        SELECT current_repair.id FROM results current_cell
+        JOIN result_media_repairs current_repair ON current_repair.result_id = current_cell.id
+        WHERE repair_source.unfinished_accepted AND current_cell.id = repair_source.result_id
+          AND current_cell.status = 'pending' AND current_cell.current_result_attempt_id IS NULL
+          AND current_cell.sim_job_id IS NULL AND current_repair.id = existing.id
+          AND current_repair.result_attempt_id = repair_source.result_attempt_id
+          AND current_repair.evidence_signature = repair_source.evidence_signature
+          AND current_repair.state = 'done' AND current_repair.downstream_finalized_at IS NULL
+          AND current_repair.claim_token IS NULL AND current_repair.claim_expires_at IS NULL
+        FOR UPDATE OF current_cell, current_repair SKIP LOCKED
+      ) locked_repair ON true
+      WHERE (existing.id IS NULL
          OR existing.result_attempt_id IS DISTINCT FROM repair_source.result_attempt_id
          OR existing.evidence_signature IS DISTINCT FROM repair_source.evidence_signature
          OR existing.state = 'done'
-         OR (existing.background_owner = false AND repair_source.background_owner)
+         OR (existing.background_owner = false AND repair_source.background_owner))
+        AND (repair_source.unfinished_accepted IS NOT TRUE OR locked_repair.id IS NOT NULL)
       ORDER BY repair_source.evidence_at, repair_source.result_id
       LIMIT ${limit}
     )
@@ -761,10 +841,20 @@ export async function discoverMissingResultMediaRepairs(
                                           OR result_media_repairs.state = 'done'
                                      THEN NULL ELSE result_media_repairs.downstream_finalized_at END,
       "updatedAt" = ${nowIso}::timestamptz
-    WHERE result_media_repairs.result_attempt_id IS DISTINCT FROM EXCLUDED.result_attempt_id
+    WHERE (result_media_repairs.result_attempt_id IS DISTINCT FROM EXCLUDED.result_attempt_id
        OR result_media_repairs.evidence_signature IS DISTINCT FROM EXCLUDED.evidence_signature
        OR result_media_repairs.state = 'done'
-       OR (result_media_repairs.background_owner = false AND EXCLUDED.background_owner)
+       OR (result_media_repairs.background_owner = false AND EXCLUDED.background_owner))
+      AND EXISTS (
+        SELECT 1 FROM candidate WHERE candidate.result_id = EXCLUDED.result_id
+          AND (candidate.unfinished_accepted IS NOT TRUE OR (
+            result_media_repairs.id = candidate.locked_repair_id
+            AND result_media_repairs.result_attempt_id = candidate.result_attempt_id
+            AND result_media_repairs.evidence_signature = candidate.evidence_signature
+            AND result_media_repairs.state = 'done' AND result_media_repairs.downstream_finalized_at IS NULL
+            AND result_media_repairs.claim_token IS NULL AND result_media_repairs.claim_expires_at IS NULL
+          ))
+      )
     RETURNING id
   `)) as unknown as Array<{ id: string }>;
   return rows.length;
