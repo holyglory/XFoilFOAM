@@ -2836,19 +2836,82 @@ async function manifestForAttempt(
   // choosing the newest row would reintroduce generation rediscovery.
   if (manifests.length !== 1) return null;
   const artifact = manifests[0]?.artifact;
-  const base =
-    artifact?.metadata && typeof artifact.metadata === "object"
-      ? (artifact.metadata as Record<string, unknown>).evidenceBase
+  if (
+    !artifact?.sha256 ||
+    !/^[a-f0-9]{64}$/i.test(artifact.sha256) ||
+    artifact.byteSize <= 0 ||
+    !artifact.storageKey.trim() ||
+    !artifact.mimeType.trim()
+  )
+    return null;
+  const [binding] = await db
+    .select({
+      source: solverEvidenceArtifacts,
+      archiveId: solverEvidenceArchives.id,
+      memberPath: solverEvidenceArtifactMembers.memberPath,
+    })
+    .from(solverEvidenceArchives)
+    .innerJoin(
+      solverEvidenceArtifacts,
+      eq(solverEvidenceArtifacts.id, solverEvidenceArchives.sourceArtifactId),
+    )
+    .leftJoin(
+      solverEvidenceArtifactMembers,
+      and(
+        eq(solverEvidenceArtifactMembers.archiveId, solverEvidenceArchives.id),
+        eq(solverEvidenceArtifactMembers.artifactId, artifact.id),
+      ),
+    )
+    .where(
+      and(
+        eq(solverEvidenceArchives.resultId, resultId),
+        eq(solverEvidenceArchives.resultAttemptId, resultAttemptId),
+        eq(solverEvidenceArchives.state, "current"),
+      ),
+    )
+    .limit(1);
+  const base = artifact.metadata?.evidenceBase;
+  const archive =
+    base === undefined || binding?.source.metadata?.evidenceBase !== undefined
+      ? await currentArchiveWithEvidenceBase(db, resultId, resultAttemptId)
       : null;
-  return typeof base === "string" &&
-    base.trim() &&
-    artifact?.sha256 &&
-    /^[a-f0-9]{64}$/i.test(artifact.sha256) &&
-    artifact.byteSize > 0 &&
-    artifact.storageKey.trim() &&
-    artifact.mimeType.trim()
-    ? { evidenceBase: base, sha256: artifact.sha256 }
-    : null;
+  if (base !== undefined) {
+    const evidenceBase = safeRelativePathParts(
+      base,
+      "manifest evidenceBase",
+    ).join("/");
+    if (
+      binding?.source.metadata?.evidenceBase !== undefined &&
+      (archive?.archive.id !== binding.archiveId ||
+        archive.evidenceBase !== evidenceBase)
+    )
+      return null;
+    return { evidenceBase, sha256: artifact.sha256 };
+  }
+  const source = binding?.source;
+  if (
+    !archive ||
+    !source ||
+    archive.archive.id !== binding.archiveId ||
+    binding.memberPath !== "evidence_manifest.json" ||
+    source.metadata?.manifestSha256 !== artifact.sha256 ||
+    (source.metadata?.manifestByteSize !== artifact.byteSize &&
+      source.metadata?.manifestByteSize !== String(artifact.byteSize)) ||
+    !(
+      [
+        "airfoilId",
+        "simJobId",
+        "engineJobId",
+        "engineCaseSlug",
+        "methodKey",
+        "solverImplementationId",
+        "solverRuntimeBuildId",
+        "aoaDeg",
+      ] as const
+    ).every((key) => source[key] === artifact[key])
+  )
+    return null;
+  return { evidenceBase: archive.evidenceBase, sha256: artifact.sha256 };
 }
 
 async function manifestEvidenceBaseForResult(

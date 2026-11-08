@@ -661,6 +661,10 @@ needed for publication. Missing or invalid setup values, foreign revisions and
 conflicting present display values fail before rendering. Repair never fills a
 canonical row just to bypass this check, and generated media does not turn invalid
 CFD into an accepted polar point.
+An imported manifest without its own evidence-base metadata may use the exact
+current archive's owned bundle only when the manifest checksum, size, member link
+and source ownership agree. Conflicting metadata, unsafe paths or missing archive
+proof remain unavailable; immutable imported artifacts are not rewritten.
 After verified media makes a stopped precise attempt acceptable, an exact
 post-repair transaction may publish its unowned pending cell and complete the
 matching current stage-3 gap. It rechecks the source, manifest, recipe, current

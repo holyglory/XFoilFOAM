@@ -47,6 +47,7 @@ import {
   solverProfiles,
   solverEvidenceArtifacts,
   solverEvidenceArchives,
+  solverEvidenceArtifactMembers,
   solverEvidenceBlobs,
   sweepDefinitions,
   type DB,
@@ -58,7 +59,7 @@ import {
   withEvidenceArtifactWriteLocks,
 } from "@aerodb/db";
 import { ensureSimulationPresetRevision } from "@aerodb/db/simulation-setup";
-import { createVerifiedRestartArchiveFixture } from "@aerodb/db/test-fixtures";
+import { createVerifiedRestartArchiveFixture, VERIFIED_RESTART_ARCHIVE_MEMBERS } from "@aerodb/db/test-fixtures";
 import { withRepairedPreciseMediaFixture } from "../../../packages/db/test/progressive-publication-recovery-fixture";
 import {
   ALL_IMAGE_FIELDS,
@@ -319,6 +320,129 @@ async function createSolvedResult(
     engineJobId,
     caseSlug,
   };
+}
+
+async function createImportedManifestArchive(
+  fixture: Fixture,
+  scenario = "valid",
+) {
+  const [manifest] = await db
+    .select()
+    .from(solverEvidenceArtifacts)
+    .where(
+      and(
+        eq(solverEvidenceArtifacts.resultAttemptId, fixture.resultAttemptId),
+        eq(solverEvidenceArtifacts.kind, "manifest"),
+      ),
+    );
+  const evidenceBase = `evidence/imported-${fixture.resultAttemptId}`;
+  await db
+    .update(solverEvidenceArtifacts)
+    .set({
+      storageKey: `sync-imports/${manifest.sha256}.json`,
+      metadata:
+        scenario === "conflicting-base"
+          ? { evidenceBase: "different/evidence" }
+          : scenario === "invalid-base"
+            ? { evidenceBase: null }
+            : { sourceInstanceId: "exact-import-source" },
+    })
+    .where(eq(solverEvidenceArtifacts.id, manifest.id));
+  const storedSha = createHash("sha256")
+    .update(fixture.resultAttemptId)
+    .digest("hex");
+  const storageKey = `solver-evidence/v1/sha256/${storedSha.slice(0, 2)}/${storedSha}.tar.zst`;
+  const metadata: Record<string, unknown> = {
+    evidenceBase: scenario === "unsafe-base" ? "../evidence" : evidenceBase,
+    manifestSha256: scenario === "wrong-sha" ? "f".repeat(64) : manifest.sha256,
+    manifestByteSize:
+      scenario === "wrong-size" ? "513" : String(manifest.byteSize),
+  };
+  if (scenario === "missing-identity") delete metadata.manifestSha256;
+  const { id: manifestId, ...owner } = manifest;
+  const [source] = await db
+    .insert(solverEvidenceArtifacts)
+    .values({
+      ...owner,
+      kind: scenario === "wrong-kind" ? "dictionary" : "engine_bundle",
+      engineCaseSlug:
+        scenario === "wrong-owner" ? "different-case" : manifest.engineCaseSlug,
+      storageKey,
+      mimeType: "application/zstd",
+      sha256: storedSha,
+      byteSize: 4096,
+      metadata,
+    })
+    .returning();
+  const [blob] = await db
+    .insert(solverEvidenceBlobs)
+    .values({
+      backend: "gcs",
+      bucket: "exact-import-test",
+      objectKey: storageKey,
+      generation: String(
+        BigInt(`0x${randomUUID().replaceAll("-", "").slice(0, 12)}`) + 1n,
+      ),
+      compression: "zstd",
+      mimeType: "application/zstd",
+      sha256: storedSha,
+      byteSize: 4096,
+      crc32c: "AAAAAA==",
+      uncompressedTarSha256: "d".repeat(64),
+      uncompressedTarByteSize: 8192,
+      verifiedAt: new Date(),
+      metadata: {
+        fixture: "verified-imported-archive",
+        archiveFormat: "tar+zstd",
+        zstdLevel: 10,
+      },
+    })
+    .returning();
+  evidenceBlobIds.push(blob.id);
+  const archiveId = randomUUID();
+  if (scenario !== "missing-archive") {
+    await db.insert(solverEvidenceArchives).values({
+      id: archiveId,
+      resultId: fixture.resultId,
+      resultAttemptId: fixture.resultAttemptId,
+      sourceArtifactId: source.id,
+      blobId: blob.id,
+    });
+    const members = await db
+      .insert(solverEvidenceArtifacts)
+      .values(
+        VERIFIED_RESTART_ARCHIVE_MEMBERS.map((path, index) => ({
+          ...owner,
+          kind: "time_directory" as const,
+          storageKey: `${PREFIX}/imported/${fixture.resultAttemptId}/${path}`,
+          mimeType: "application/octet-stream",
+          sha256: (index % 16).toString(16).repeat(64),
+          byteSize: 64,
+          metadata: {},
+        })),
+      )
+      .returning();
+    await db.insert(solverEvidenceArtifactMembers).values([
+      ...(scenario === "missing-member"
+        ? []
+        : [
+            {
+              archiveId,
+              artifactId: manifestId,
+              memberPath:
+                scenario === "wrong-member"
+                  ? "different_manifest.json"
+                  : "evidence_manifest.json",
+            },
+          ]),
+      ...members.map((member, index) => ({
+        archiveId,
+        artifactId: member.id,
+        memberPath: VERIFIED_RESTART_ARCHIVE_MEMBERS[index],
+      })),
+    ]);
+  }
+  return { archiveId, sourceId: source.id, manifestId, evidenceBase };
 }
 
 async function createBlockedPrecalcFixture(
@@ -802,11 +926,7 @@ describe("durable result media repair", () => {
         simJobId: jobs[owner],
         engineJobId: jobs[owner],
       });
-      const archive = await createVerifiedRestartArchiveFixture(db, {
-        resultId: fixture.resultId,
-        resultAttemptId: fixture.resultAttemptId,
-      });
-      evidenceBlobIds.push(archive.blobId);
+      await createImportedManifestArchive(fixture);
       await db
         .update(results)
         .set({
@@ -1100,6 +1220,84 @@ describe("durable result media repair", () => {
         ).toBe(true);
       },
     );
+  });
+
+  it("resolves imported manifests only through their exact current archive and rejects conflicting proof", async () => {
+    const requests: RenderDefaultMediaRequest[] = [];
+    const engine = engineWith({
+      render: async (jobId, request) => {
+        requests.push(request);
+        return completeMediaResponse(jobId, request);
+      },
+    });
+    for (const scenario of [
+      "missing-archive",
+      "missing-member",
+      "wrong-member",
+      "wrong-sha",
+      "wrong-size",
+      "missing-identity",
+      "wrong-owner",
+      "wrong-kind",
+      "unsafe-base",
+      "conflicting-base",
+      "invalid-base",
+    ]) {
+      const invalid = await createSolvedResult(`imported-${scenario}`, {
+        fidelity: "urans_full",
+      });
+      if (scenario === "wrong-kind") {
+        await expect(createImportedManifestArchive(invalid, scenario)).rejects.toThrow(
+          "solver evidence archive source must be an exact owned bundle artifact",
+        );
+        expect(requests, scenario).toHaveLength(0);
+        continue;
+      }
+      await createImportedManifestArchive(invalid, scenario);
+      await expect(
+        repairDefaultMediaForStoredResult({
+          db,
+          engine,
+          resultId: invalid.resultId,
+          resultAttemptId: invalid.resultAttemptId,
+          heartbeat: async () => undefined,
+        }),
+        scenario,
+      ).rejects.toThrow();
+      expect(requests, scenario).toHaveLength(0);
+    }
+    const fixture = await createSolvedResult("imported-manifest", {
+      fidelity: "urans_full",
+    });
+    const archive = await createImportedManifestArchive(fixture);
+    const [manifest] = await db
+      .select()
+      .from(solverEvidenceArtifacts)
+      .where(eq(solverEvidenceArtifacts.id, archive.manifestId));
+    const [source] = await db
+      .select()
+      .from(solverEvidenceArtifacts)
+      .where(eq(solverEvidenceArtifacts.id, archive.sourceId));
+    const outcome = await resultMediaRepairTick(db, engine, {
+      resultId: fixture.resultId,
+    });
+    expect(outcome).toMatchObject({ finalized: 1, repairedMedia: 6 });
+    expect(requests).toHaveLength(1);
+    expect(requests[0].evidence_base).toBe(archive.evidenceBase);
+    const storedMedia = await db.select().from(resultMedia)
+      .where(eq(resultMedia.resultAttemptId, fixture.resultAttemptId));
+    expect(storedMedia.filter((media) => media.kind === "video")).toHaveLength(2);
+    expect(storedMedia).toHaveLength(6);
+    const [unchanged] = await db
+      .select()
+      .from(solverEvidenceArtifacts)
+      .where(eq(solverEvidenceArtifacts.id, archive.manifestId));
+    const [unchangedSource] = await db
+      .select()
+      .from(solverEvidenceArtifacts)
+      .where(eq(solverEvidenceArtifacts.id, archive.sourceId));
+    expect(unchanged).toEqual(manifest);
+    expect(unchangedSource).toEqual(source);
   });
 
   it("renders every evidence-backed field in one engine pass per shared scale version", async () => {
