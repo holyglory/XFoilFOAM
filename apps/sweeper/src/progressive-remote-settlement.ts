@@ -823,7 +823,7 @@ export async function settleProgressiveRemoteJob(db: DB, executionId: string) {
         connection,
         executionId,
       );
-    const retained = await readProgressiveRemoteRetention(
+    let retained = await readProgressiveRemoteRetention(
       connection,
       executionId,
     );
@@ -848,6 +848,14 @@ export async function settleProgressiveRemoteJob(db: DB, executionId: string) {
         connection,
         executionId,
       );
+      // A terminal report can arrive before its exact worker evidence receipt.
+      // Re-read retention after the diagnostic/terminal attempt path; never
+      // run RANS-promotion logic against an empty source set and turn a
+      // temporary publication race into a permanent sweeper error.
+      retained = await readProgressiveRemoteRetention(connection, executionId);
+      if (retained.kind === "waiting") return retained;
+      if (retained.sources.length === 0)
+        return { kind: "waiting" as const, reason: "raw_evidence" };
     }
     const result = retained.report.result;
     const finalPoints = new Set(
