@@ -66,6 +66,7 @@ import { EngineClient, EngineError } from "../../engine-client/src/client";
 import type { EngineExecutionStopProof } from "../../engine-client/src/types";
 import {
   acknowledgeProgressiveCfdExecutionStop,
+  recoverOperatorVerifiedNeverStartedRemoteDispatches,
   settleProgressiveCfdExecution,
 } from "../src/progressive-cfd-settlement";
 import {
@@ -5197,6 +5198,110 @@ describe("progressive CPU admission", () => {
         await db.execute(
           sql`DELETE FROM registered_remote_solvers WHERE id=${solverId}::uuid`,
         );
+      }
+    });
+  });
+
+  it("releases an exact remote dispatch that never reached the worker", async () => {
+    await ready(async () => {
+      const leases = await claimProgressiveCfdBatch(db, {
+        owner: "never-started-remote-recovery-fixture",
+        leaseSeconds: 120,
+        maximumUnits: 2,
+        solverBudgetVersion: 2,
+      });
+      const composed = await composeProgressiveCfdJob(db, leases, {
+        cpuSlots: 1,
+        meshRecoveryVersion: 1,
+        solverBudgetVersion: 2,
+      });
+      const [job] = await db.select().from(simJobs).where(eq(simJobs.id, composed.jobId));
+      const solverId = randomUUID();
+      const promiseId = randomUUID();
+      try {
+        await db.execute(sql`INSERT INTO registered_remote_solvers
+          (id,instance_id,instance_name,cpu_capacity,cpu_budget,max_active_polar_promises)
+          VALUES (${solverId}::uuid,${randomUUID()},'isolated never-started worker',96,96,96)`);
+        await db.execute(sql`INSERT INTO sync_sweep_promises
+          (id,registered_solver_id,airfoil_id,simulation_preset_revision_id,aoa_count,"expiresAt")
+          VALUES (${promiseId}::uuid,${solverId}::uuid,${job.airfoilId}::uuid,
+            ${job.simulationPresetRevisionId}::uuid,${leases.length},clock_timestamp()+interval '1 hour')`);
+        for (const lease of leases)
+          await db.execute(sql`INSERT INTO sync_sweep_promise_points
+            (promise_id,airfoil_id,simulation_preset_revision_id,aoa_deg)
+            VALUES (${promiseId}::uuid,${job.airfoilId}::uuid,
+              ${job.simulationPresetRevisionId}::uuid,${lease.alpha})`);
+        await bindProgressiveRemoteDispatch(db, {
+          simJobId: job.id,
+          solverId,
+          promiseId,
+        });
+        await db.execute(sql`UPDATE sim_jobs
+          SET "updatedAt"=clock_timestamp()-interval '1 hour'
+          WHERE id=${job.id}::uuid`);
+        await db.execute(sql`UPDATE progressive_cfd_units
+          SET lease_until=clock_timestamp()-interval '1 second'
+          WHERE work_id=${leases[0].workId}::uuid`);
+        const recovered = await recoverOperatorVerifiedNeverStartedRemoteDispatches(db, {
+          solverId,
+          dispatches: [{ jobId: job.id, promiseId }],
+          expectedCount: 1,
+          operator: "test-operator",
+          crossHostAbsenceConfirmed: true,
+        });
+        expect(recovered.recoveredJobs).toBe(1);
+        const [state] = await db.execute(sql`SELECT status,engine_state,engine_job_id,"ingestedAt" FROM sim_jobs WHERE id=${job.id}::uuid`);
+        expect(state).toMatchObject({status:"cancelled",engine_state:"cancelled",engine_job_id:job.id});
+        expect(state.ingestedAt).not.toBeNull();
+        const units = await db.execute(sql`SELECT state,lease_token FROM progressive_cfd_units WHERE work_id=${leases[0].workId}::uuid ORDER BY ordinal`);
+        expect(units.every((unit) => unit.lease_token === null)).toBe(true);
+        expect(units.every((unit) => ["pending", "gap", "cancelled"].includes(String(unit.state)))).toBe(true);
+      } finally {
+        await db.execute(sql`DELETE FROM progressive_remote_dispatches WHERE sim_job_id=${job.id}::uuid`);
+        await db.execute(sql`DELETE FROM sync_sweep_promises WHERE id=${promiseId}::uuid`);
+        await db.execute(sql`DELETE FROM registered_remote_solvers WHERE id=${solverId}::uuid`);
+      }
+    });
+  });
+
+  it("rejects never-started remote recovery when the exact job is too young", async () => {
+    await ready(async () => {
+      const leases = await claimProgressiveCfdBatch(db, {
+        owner: "never-started-young-recovery-fixture",
+        leaseSeconds: 120,
+        maximumUnits: 2,
+        solverBudgetVersion: 2,
+      });
+      const composed = await composeProgressiveCfdJob(db, leases, {
+        cpuSlots: 1,
+        meshRecoveryVersion: 1,
+        solverBudgetVersion: 2,
+      });
+      const [job] = await db.select().from(simJobs).where(eq(simJobs.id, composed.jobId));
+      const solverId = randomUUID();
+      const promiseId = randomUUID();
+      try {
+        await db.execute(sql`INSERT INTO registered_remote_solvers
+          (id,instance_id,instance_name,cpu_capacity,cpu_budget,max_active_polar_promises)
+          VALUES (${solverId}::uuid,${randomUUID()},'isolated young worker',96,96,96)`);
+        await db.execute(sql`INSERT INTO sync_sweep_promises
+          (id,registered_solver_id,airfoil_id,simulation_preset_revision_id,aoa_count,"expiresAt")
+          VALUES (${promiseId}::uuid,${solverId}::uuid,${job.airfoilId}::uuid,
+            ${job.simulationPresetRevisionId}::uuid,${leases.length},clock_timestamp()+interval '1 hour')`);
+        for (const lease of leases)
+          await db.execute(sql`INSERT INTO sync_sweep_promise_points
+            (promise_id,airfoil_id,simulation_preset_revision_id,aoa_deg)
+            VALUES (${promiseId}::uuid,${job.airfoilId}::uuid,
+              ${job.simulationPresetRevisionId}::uuid,${lease.alpha})`);
+        await bindProgressiveRemoteDispatch(db, {simJobId:job.id,solverId,promiseId});
+        await expect(recoverOperatorVerifiedNeverStartedRemoteDispatches(db, {
+          solverId, dispatches:[{jobId:job.id,promiseId}], expectedCount:1,
+          operator:"test-operator", crossHostAbsenceConfirmed:true,
+        })).rejects.toThrow("ownership changed");
+      } finally {
+        await db.execute(sql`DELETE FROM progressive_remote_dispatches WHERE sim_job_id=${job.id}::uuid`);
+        await db.execute(sql`DELETE FROM sync_sweep_promises WHERE id=${promiseId}::uuid`);
+        await db.execute(sql`DELETE FROM registered_remote_solvers WHERE id=${solverId}::uuid`);
       }
     });
   });

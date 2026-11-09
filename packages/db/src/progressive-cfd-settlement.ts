@@ -6,7 +6,10 @@ import { assertProgressiveExecutionIdentity } from "./progressive-execution-iden
 import type { EngineExecutionStopProof } from "../../engine-client/src/types";
 import { analysisContentHash, canonicalAnalysisJson } from "./analysis-target";
 import type { DB } from "./client";
-import { tryProgressiveAdmissionLock } from "./progressive-admission-lock";
+import {
+  acquireProgressiveAdmissionLock,
+  tryProgressiveAdmissionLock,
+} from "./progressive-admission-lock";
 import { progressiveUnsteadyRecipe } from "./progressive-cfd-numerical-recovery";
 import { SOURCE_GEOMETRY_POLICY_VERSION } from "./progressive-evidence-geometry";
 import {
@@ -1025,6 +1028,161 @@ export async function recoverOperatorVerifiedStaleRemoteDispatches(
     });
     recoveredJobs += 1;
     settledUnits += Number(counts.complete ?? 0) + Number(counts.retry ?? 0) + Number(counts.gaps ?? 0) + Number(counts.cancelled ?? 0);
+  }
+  return { recoveredJobs, settledUnits };
+}
+
+/**
+ * Release remote dispatches that were claimed on the hub but never reached the
+ * remote worker. This is deliberately operator-scoped: the caller must prove
+ * the exact dispatch set is absent on the worker host. A live promise is never
+ * released by ordinary reconciliation because a fresh assignment may still
+ * legitimately be starting.
+ */
+export async function recoverOperatorVerifiedNeverStartedRemoteDispatches(
+  db: DB,
+  input: {
+    solverId: string;
+    dispatches: readonly OperatorStaleRemoteDispatch[];
+    expectedCount: number;
+    operator: string;
+    crossHostAbsenceConfirmed: true;
+    olderThanMinutes?: number;
+  },
+): Promise<{ recoveredJobs: number; settledUnits: number }> {
+  const uuid =
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  const olderThanMinutes = input.olderThanMinutes ?? 15;
+  if (
+    !uuid.test(input.solverId) ||
+    !input.operator.trim() ||
+    input.crossHostAbsenceConfirmed !== true ||
+    !Number.isSafeInteger(input.expectedCount) ||
+    input.expectedCount < 1 ||
+    input.expectedCount > 256 ||
+    input.dispatches.length !== input.expectedCount ||
+    new Set(input.dispatches.map((item) => item.jobId)).size !== input.expectedCount ||
+    new Set(input.dispatches.map((item) => item.promiseId)).size !== input.expectedCount ||
+    input.dispatches.some((item) => !uuid.test(item.jobId) || !uuid.test(item.promiseId)) ||
+    !Number.isSafeInteger(olderThanMinutes) ||
+    olderThanMinutes < 15 ||
+    olderThanMinutes > 24 * 30
+  )
+    throw new Error("Invalid bounded never-started remote dispatch recovery scope");
+
+  const batchId = randomUUID();
+  let recoveredJobs = 0;
+  let settledUnits = 0;
+  for (const dispatch of input.dispatches) {
+    const counts = await db.transaction(async (transaction) => {
+      const connection = transaction as unknown as DB;
+      await acquireProgressiveAdmissionLock(connection);
+      const [owned] = await connection.execute(sql`
+        SELECT job.id, job.status, job.engine_job_id, job.engine_state,
+          job."updatedAt", promise.status AS promise_status,
+          promise."expiresAt" AS promise_expires, campaign.status AS campaign_status
+        FROM progressive_remote_dispatches remote_dispatch
+        JOIN sync_sweep_promises promise ON promise.id = remote_dispatch.promise_id
+        JOIN sim_jobs job ON job.id = remote_dispatch.sim_job_id
+        JOIN sim_campaigns campaign ON campaign.id = job.campaign_id
+        WHERE remote_dispatch.sim_job_id = ${dispatch.jobId}::uuid
+          AND remote_dispatch.promise_id = ${dispatch.promiseId}::uuid
+          AND remote_dispatch.solver_id = ${input.solverId}::uuid
+          AND promise.registered_solver_id = remote_dispatch.solver_id
+          AND promise.status = 'active'
+          AND promise."expiresAt" > clock_timestamp()
+          AND job.status = 'pending' AND job.engine_job_id IS NULL AND job.engine_state IS NULL
+          AND job."updatedAt" <= clock_timestamp() - (${olderThanMinutes}::int * interval '1 minute')
+          AND campaign.status IN ('active', 'attention', 'paused')
+        FOR UPDATE OF promise, job, campaign
+      `);
+      if (!owned)
+        throw new Error(`Never-started remote recovery ownership changed for ${dispatch.jobId}`);
+
+      const attempts = await connection.execute(sql`
+        SELECT attempt.token, attempt.outcome, attempt.active_seconds,
+          unit.state, unit.lease_token, unit.lease_until
+        FROM progressive_cfd_attempts attempt
+        JOIN progressive_cfd_units unit ON unit.id = attempt.unit_id
+        WHERE attempt.sim_job_id = ${dispatch.jobId}::uuid
+        FOR UPDATE OF attempt, unit
+      `);
+      const [evidence] = await connection.execute(sql`
+        SELECT
+          EXISTS (SELECT 1 FROM progressive_remote_reports WHERE sim_job_id = ${dispatch.jobId}::uuid) AS reports,
+          EXISTS (SELECT 1 FROM result_attempts WHERE sim_job_id = ${dispatch.jobId}::uuid) AS results,
+          EXISTS (SELECT 1 FROM progressive_cfd_runtime_progress runtime
+            JOIN progressive_cfd_attempts attempt ON attempt.token = runtime.attempt_token
+            WHERE attempt.sim_job_id = ${dispatch.jobId}::uuid) AS runtime,
+          EXISTS (SELECT 1 FROM progressive_cfd_execution_stops WHERE sim_job_id = ${dispatch.jobId}::uuid) AS stops
+      `);
+      if (
+        !attempts.length ||
+        attempts.some((attempt) =>
+          attempt.outcome !== "running" ||
+          Number(attempt.active_seconds) !== 0 ||
+          attempt.state !== "leased" ||
+          attempt.lease_token !== attempt.token ||
+          attempt.lease_until == null ||
+          new Date(String(attempt.lease_until)).getTime() > Date.now(),
+        ) ||
+        evidence?.reports || evidence?.results || evidence?.runtime || evidence?.stops
+      )
+        throw new Error(`Never-started remote recovery evidence guard failed for ${dispatch.jobId}`);
+
+      const marker = {
+        kind: "active-remote-never-started",
+        operator: input.operator,
+        batchId,
+        expectedCount: input.expectedCount,
+        crossHostAbsenceConfirmed: true,
+        dispatches: input.dispatches,
+        markedAt: new Date().toISOString(),
+      };
+      await connection.execute(sql`
+        UPDATE sync_sweep_promises SET status = 'cancelled',
+          "cancelledAt" = coalesce("cancelledAt", clock_timestamp()),
+          response_payload = coalesce(response_payload, '{}'::jsonb) ||
+            jsonb_build_object('operatorRecovery', ${JSON.stringify(marker)}::jsonb),
+          "updatedAt" = clock_timestamp()
+        WHERE id = ${dispatch.promiseId}::uuid AND status = 'active'
+      `);
+      await connection.execute(sql`
+        UPDATE sync_sweep_promise_points SET status = 'cancelled', "updatedAt" = clock_timestamp()
+        WHERE promise_id = ${dispatch.promiseId}::uuid AND status = 'active'
+      `);
+      await connection.execute(sql`
+        UPDATE sim_jobs SET engine_job_id = ${dispatch.jobId}::uuid, status = 'cancelled',
+          engine_state = 'cancelled', "ingestedAt" = clock_timestamp(), "finishedAt" = clock_timestamp(),
+          "updatedAt" = clock_timestamp(),
+          error = 'Operator-verified remote execution never started; no remote mirror or evidence'
+        WHERE id = ${dispatch.jobId}::uuid AND status = 'pending' AND engine_job_id IS NULL
+      `);
+      await acknowledgeProgressiveCfdExecutionStop(connection, {
+        simJobId: dispatch.jobId,
+        proof: {
+          version: 1,
+          job_id: dispatch.jobId,
+          execution_stopped: true,
+          producer_stopped: true,
+          namespace_verified: true,
+          remaining: [],
+          observed_at: new Date().toISOString(),
+          error: null,
+          fence: "cancel_marker",
+          ownership_basis: "never_started_cancellation_fence",
+        },
+      });
+      return settleProgressiveCfdExecution(connection, dispatch.jobId, {
+        recoverNeverStarted: true,
+      });
+    });
+    recoveredJobs += 1;
+    settledUnits +=
+      Number(counts.complete ?? 0) +
+      Number(counts.retry ?? 0) +
+      Number(counts.gaps ?? 0) +
+      Number(counts.cancelled ?? 0);
   }
   return { recoveredJobs, settledUnits };
 }
