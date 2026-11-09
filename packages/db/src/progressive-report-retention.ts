@@ -43,8 +43,7 @@ export async function reclaimProgressiveReportHistory(
         FROM progressive_remote_reports report
         JOIN terminal ON terminal.id = report.sim_job_id
         GROUP BY report.sim_job_id
-      )
-      candidates AS MATERIALIZED (
+      ), candidates AS MATERIALIZED (
         SELECT report.sim_job_id, report.sequence,
           pg_column_size(report.report)::bigint AS report_bytes
       FROM progressive_remote_reports report
