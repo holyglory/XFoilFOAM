@@ -467,8 +467,11 @@ async function recoveryPromotions(
       item.delivery.progressiveEvidence.pointContentSignature ===
       source.contentSignature,
   );
-  if (!receipt)
-    throw new Error("Remote RANS promotion has no retained exact trigger");
+  // A valid RANS sibling may still be publishable when the failed trigger
+  // itself was never retained. Keep the trigger unresolved and let normal
+  // settlement classify that unit as a gap; never widen the promotion scope
+  // or manufacture a trigger just to settle the surrounding job.
+  if (!receipt) return [];
   const [revision] =
     await db.execute(sql`SELECT simulation_preset_revision_id FROM result_attempts
     WHERE id = ${receipt.resultAttemptId}::uuid AND sim_job_id = ${envelope.scope.executionId}::uuid`);
