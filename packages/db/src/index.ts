@@ -63,6 +63,7 @@ export * from "./brokered-evidence-archive";
 export * from "./sync-promise-purge";
 export * from "./progressive-cfd";
 export * from "./progressive-cfd-budget-extension";
+export * from "./progressive-report-retention";
 export * from "./progressive-cfd-execution";
 export * from "./solver-reservations";
 export * from "./progressive-execution-identity";
