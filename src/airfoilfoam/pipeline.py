@@ -222,6 +222,15 @@ def _uses_potential_compressible_startup(runner, solver_params) -> bool:
     )
 
 
+def _is_forced_physical_compressible_transient(runner, solver_params) -> bool:
+    context = getattr(runner, "flow_execution", None)
+    return (
+        is_compressible(runner)
+        and solver_params.force_transient
+        and getattr(context, "family", None) in {"rhoPimpleFoam", "rhoCentralFoam"}
+    )
+
+
 def _potential_initialization(case_dir, runner, patches, dialect, solver_params=None):
     if is_compressible(runner):
         return initialize_compressible_velocity(
@@ -5334,6 +5343,8 @@ def _prepare_transient_case(
     potential = _potential_initialization(tcase, runner, patches, dialect, solver_params)
     _checked_initialization_result(tcase, potential, stage="potentialFoam")
     _check_cancel(cancel_check)
+    if _is_forced_physical_compressible_transient(runner, solver_params):
+        return tmesh, patches
     # Unconditional steady (RANS) initialisation stage, for the URANS-only path
     # too: even a short, non-converged SIMPLE field gives the transient a
     # developed, already-separated start instead of violent uniform flow.
@@ -8521,15 +8532,8 @@ def run_case(
         # (e.g. the delicate symmetric AoA=0 state) that diverge with 2nd-order
         # convection. The fallback is more dissipative but reliably stable.
         #
-        # URANS-only (force_transient) cases run this steady RANS stage too: an
-        # accepted developed steady field is a good transient seed, and the
-        # steady log/coefficients are valuable attempt evidence. A successful
-        # but non-converged/non-accepted steady stage is evidence only; the
-        # transient falls back to the no-seed freestream initialisation path.
-        # A steady failure must not abort the URANS attempt, and the steady
-        # coefficients are never accepted as the reported result.
         steady_field_dir: Optional[Path] = None
-        if not is_density_based(runner) or not solver_params.force_transient:
+        if not _is_forced_physical_compressible_transient(runner, solver_params):
             res = solve_once(steady_solver_params)
             if not res.ok and steady_solver_params.momentum_scheme != "upwind":
                 outcome.first_order_fallback = True
@@ -8557,6 +8561,7 @@ def run_case(
         _finalize_outcome(
             case_dir, outcome, airfoil, resolved, spec, fluid, roughness, solver_params,
             runner, n_proc, render_images, solver_timeout, shared_mesh_dir=mesh_dir,
+            urans_budget_s=urans_budget_s,
             steady_field_dir=steady_field_dir,
             cancel_check=cancel_check,
             phase_progress=phase_progress,
@@ -9998,7 +10003,7 @@ def solve_polar_marched(
                 use_cold_start = not live_steady_state_accepted
 
             try:
-                if is_density_based(runner) and solver_params.force_transient:
+                if _is_forced_physical_compressible_transient(runner, solver_params):
                     _case_builder(
                         runner, airfoil, patches, resolved, spec, fluid, roughness, rans_solver,
                         n_proc=n_proc, dialect=dialect_for_runner(runner),

@@ -163,19 +163,16 @@ def _check_and_condemn_stall(store: JobStore, job_id: str, settings: Settings) -
         return
     logger.error("stall detector: job %s %s — failing job and exiting worker child", job_id, reason)
     try:
-        existing = store.read_result(job_id)
         status.state = JobState.failed
         status.phase = JobPhase.failed
         status.message = reason
         store.write_status(status)
-        store.write_result(
+        store.terminalize_result(
             JobResult(
                 job_id=job_id,
                 state=JobState.failed,
-                polars=existing.polars if existing is not None else [],
                 message=reason,
-                engine=(existing.engine if existing is not None else status.engine),
-                method_keys=(existing.method_keys if existing is not None else []),
+                engine=status.engine,
             )
         )
     except Exception:  # noqa: BLE001 - the exit below still converts the grind to the handled death class
@@ -1159,7 +1156,7 @@ def run_polar(self, job_id: str, request_json: str) -> dict:
                     failure_disposition=failure_disposition,
                 )
             )
-            store.write_result(
+            store.terminalize_result(
                 JobResult(
                     job_id=job_id,
                     state=JobState.failed,

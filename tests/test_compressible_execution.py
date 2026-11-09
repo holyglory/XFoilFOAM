@@ -329,10 +329,12 @@ def test_seed_identity_includes_gas_state_and_numerical_family(request_payload):
     assert EngineCache.solver_signature(request.solver, request.roughness) != EngineCache.solver_signature(SolverParams(), request.roughness)
 
 
+@pytest.mark.parametrize("family", ["rhoCentralFoam", "rhoPimpleFoam"])
 @pytest.mark.parametrize("marched", [False, True])
-def test_density_pipeline_skips_pseudo_steady_and_preserves_shared_mesh(request_payload, monkeypatch, tmp_path, marched):
-    request_payload["solver"].update(flow_solver_family="rhoCentralFoam", force_transient=True)
-    request_payload["speeds"] = [request_payload["speeds"][0] / 0.72 * 2]
+def test_density_pipeline_skips_pseudo_steady_and_preserves_shared_mesh(request_payload, monkeypatch, tmp_path, family, marched):
+    request_payload["solver"].update(flow_solver_family=family, force_transient=True)
+    mach = 2 if family == "rhoCentralFoam" else 0.95
+    request_payload["speeds"] = [request_payload["speeds"][0] / 0.72 * mach]
     request = PolarRequest.model_validate(request_payload)
     runner = RecordedRunner()
     configure_flow_execution(runner, request)
@@ -346,7 +348,7 @@ def test_density_pipeline_skips_pseudo_steady_and_preserves_shared_mesh(request_
     monkeypatch.setattr(pipeline, "_link_mesh", lambda destination, source, _: linked.append((destination, source)))
 
     def finalizer(case_dir, outcome, *args, **kwargs):
-        finalized.append((outcome.spec.aoa_deg, kwargs["shared_mesh_dir"]))
+        finalized.append((outcome.spec.aoa_deg, kwargs["shared_mesh_dir"], kwargs.get("steady_field_dir")))
         assert (case_dir / "constant/aerodynamicReference.json").is_file()
         assert (case_dir / "0/T").is_file()
         assert outcome.cl is None and outcome.iterations is None
@@ -367,7 +369,49 @@ def test_density_pipeline_skips_pseudo_steady_and_preserves_shared_mesh(request_
         )
         assert result.error and result.cl is None
     assert len(finalized) == (2 if marched else 1)
-    assert all(source == mesh_dir for _, source in linked + finalized)
+    assert all(source == mesh_dir for _, source in linked)
+    assert all(source == mesh_dir and steady_field is None for _, source, steady_field in finalized)
+    assert runner.commands == []
+
+
+@pytest.mark.parametrize("budget_override, expected_budget", [(180, 180), (None, 43200)])
+def test_fresh_compressible_case_forwards_urans_budget_override(
+    request_payload, monkeypatch, tmp_path, budget_override, expected_budget
+):
+    request_payload["solver"].update(flow_solver_family="rhoPimpleFoam", force_transient=True)
+    request_payload["speeds"] = [request_payload["speeds"][0] / 0.72 * 0.9]
+    request = PolarRequest.model_validate(request_payload)
+    runner = RecordedRunner()
+    configure_flow_execution(runner, request)
+    airfoil = Airfoil.from_contour("ag24", parse_airfoil(request.airfoil.coordinates))
+    patches = [
+        BoundaryPatch("airfoil", "wall"), BoundaryPatch("inlet", "inlet"),
+        BoundaryPatch("outlet", "outlet"), BoundaryPatch("frontAndBack", "empty"),
+    ]
+    mesher = SimpleNamespace(patches=lambda _: patches, cell_count=lambda _: 0)
+    mesh_dir = tmp_path / "mesh"
+    mesh_dir.mkdir()
+    monkeypatch.setattr(pipeline, "_link_mesh", lambda *_: None)
+
+    def fake_run_transient(case_dir, *args, **kwargs):
+        timeout = float(args[8])
+        transient_case = Path(case_dir) / "transient"
+        transient_case.mkdir(parents=True, exist_ok=True)
+        pipeline.write_march_budget_marker(
+            transient_case, end_t=1.0, budget_s=timeout, wall_start=0.0
+        )
+        return None
+
+    monkeypatch.setattr(pipeline, "_run_transient", fake_run_transient)
+    outcome = pipeline.run_case(
+        tmp_path / "case", airfoil, request.cases()[0], request.fluid, request.roughness,
+        request.mesh, request.solver, mesher, runner, mesh_dir=mesh_dir,
+        render_images=False, urans_budget_s=budget_override,
+    )
+
+    assert outcome.error is not None
+    marker = json.loads((tmp_path / "case" / "transient" / "march_budget.json").read_text())
+    assert marker["budget_s"] == pytest.approx(expected_budget)
     assert runner.commands == []
 
 
@@ -424,7 +468,7 @@ def test_density_steady_case_continues_from_uniform_freestream_after_material_se
 
 @pytest.mark.parametrize("timing", [(None, None), (1e-4, 1e-5)])
 @pytest.mark.parametrize("family,fallback,expected", [
-    ("rhoPimpleFoam", False, ["potentialFoam -initialiseUBCs -pName pXfoilfoamInitial", "rhoPimpleFoam"]),
+    ("rhoPimpleFoam", False, ["potentialFoam -initialiseUBCs -pName pXfoilfoamInitial"]),
     ("rhoPimpleFoam", True, ["potentialFoam -initialiseUBCs -pName pXfoilfoamInitial"]),
     ("rhoCentralFoam", False, []),
 ])
@@ -472,6 +516,12 @@ def test_transient_preparation_preserves_compressible_state_during_velocity_init
     assert float(root_entry(control, "writeInterval")) == pytest.approx(expected_cadence)
     assert float(root_entry(control, "maxDeltaT")) == pytest.approx(timing[1] or 2e-7)
     assert all((case_dir / name).read_bytes() == value for name, value in protected.items())
+    expected_commands = (
+        expected + [dialect_for_runner(runner).transient_solver_command]
+        if family == "rhoPimpleFoam"
+        else [dialect_for_runner(runner).transient_solver_command]
+    )
+    assert runner.commands == expected_commands
 
 
 def test_compressible_steady_material_failure_restarts_from_potential_seed(

@@ -1,10 +1,12 @@
 """Filesystem-backed job storage shared between the API and the worker."""
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
 import tempfile
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, TypeVar
@@ -32,6 +34,17 @@ _CONTINUATION_METADATA_SCHEMA_VERSION = 1
 class JobStore:
     def __init__(self, settings: Optional[Settings] = None):
         self.settings = settings or get_settings()
+
+    @contextmanager
+    def _publication_lock(self, job_id: str):
+        path = self.job_dir(job_id) / ".publication.lock"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a") as publication_lock:
+            fcntl.flock(publication_lock.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(publication_lock.fileno(), fcntl.LOCK_UN)
 
     # -- paths -------------------------------------------------------------- #
     def job_dir(self, job_id: str) -> Path:
@@ -117,24 +130,52 @@ class JobStore:
         polar and change only the lifecycle state/message.
         """
 
-        result = self.read_result(job_id)
-        if result is None or result.state in {
-            JobState.completed,
-            JobState.failed,
-            JobState.cancelled,
-        }:
-            return False
-        result.state = JobState.cancelled
-        result.message = reason
-        self.write_result(result)
-        return True
+        with self._publication_lock(job_id):
+            result = self.read_result(job_id)
+            if result is None or result.state in _TERMINAL_STATES:
+                return False
+            result.state = JobState.cancelled
+            result.message = reason
+            self._write_result_locked(result)
+            return True
+
+    def terminalize_result(self, terminal: JobResult) -> bool:
+        if terminal.state not in _TERMINAL_STATES or terminal.polars:
+            raise ValueError("Terminalization requires lifecycle metadata, not replacement case evidence")
+        with self._publication_lock(terminal.job_id):
+            existing = self.read_result(terminal.job_id)
+            if existing is not None and existing.state in _TERMINAL_STATES:
+                return False
+            result = existing.model_copy(deep=True) if existing is not None else terminal
+            if existing is not None:
+                for field in terminal.model_fields_set - {"polars"}:
+                    value = getattr(terminal, field)
+                    if value is not None:
+                        setattr(result, field, value)
+            self._write_result_locked(result)
+            return True
 
     def write_status(self, status: JobStatus) -> None:
+        with self._publication_lock(status.job_id):
+            previous = self.read_status(status.job_id)
+            result = self.read_result(status.job_id)
+            if result is not None and result.state in _TERMINAL_STATES and status.state != result.state:
+                return
+            if status.state not in _TERMINAL_STATES and (
+                (previous is not None and previous.state in _TERMINAL_STATES)
+                or (result is not None and result.state in _TERMINAL_STATES)
+            ):
+                return
+            self._write_status_locked(status, previous)
+
+    def _write_status_locked(self, status: JobStatus, previous: Optional[JobStatus]) -> None:
         path = self.job_dir(status.job_id) / "status.json"
         path.parent.mkdir(parents=True, exist_ok=True)
         now = datetime.now(timezone.utc)
-        previous = self.read_status(status.job_id)
         if previous:
+            if status.state in _TERMINAL_STATES:
+                status.completed_cases = max(status.completed_cases, previous.completed_cases)
+                status.total_cases = max(status.total_cases, previous.total_cases)
             status.task_id = status.task_id or previous.task_id
             if status.mesh_recovery_version is None:
                 status.mesh_recovery_version = previous.mesh_recovery_version
@@ -191,6 +232,20 @@ class JobStore:
         return self._read_model_info(path, JobStatus)
 
     def write_result(self, result: JobResult) -> None:
+        with self._publication_lock(result.job_id):
+            self._write_result_locked(result)
+
+    def _write_result_locked(self, result: JobResult) -> None:
+        existing = self.read_result(result.job_id)
+        if existing is not None and existing.state in _TERMINAL_STATES and result.state != existing.state:
+            return
+        if result.state not in _TERMINAL_STATES:
+            status = self.read_status(result.job_id)
+            if (
+                (existing is not None and existing.state in _TERMINAL_STATES)
+                or (status is not None and status.state in _TERMINAL_STATES)
+            ):
+                return
         path = self.job_dir(result.job_id) / "result.json"
         if (
             result.mesh_recovery_version is None
@@ -428,21 +483,14 @@ class JobStore:
                 status.state = JobState.failed
                 status.phase = JobPhase.failed
                 status.message = ORPHAN_MESSAGE
-                if existing_result is not None:
-                    # Partial result from mid-run: keep the solved-point /
-                    # attempt evidence, only flip the terminal state.
-                    existing_result.state = JobState.failed
-                    existing_result.message = ORPHAN_MESSAGE
-                    self.write_result(existing_result)
-                else:
-                    self.write_result(
-                        JobResult(
-                            job_id=job_id,
-                            state=JobState.failed,
-                            message=ORPHAN_MESSAGE,
-                            engine=status.engine,
-                        )
+                self.terminalize_result(
+                    JobResult(
+                        job_id=job_id,
+                        state=JobState.failed,
+                        message=ORPHAN_MESSAGE,
+                        engine=status.engine,
                     )
+                )
             status.active_solver = None
             status.active_case_slug = None
             status.active_aoa_deg = None

@@ -79,6 +79,12 @@ def _chord_slug(chord: float) -> str:
     return _slug(f"c{chord:g}")
 
 
+def _mesh_cpu_tokens_for_mesher(settings: Settings, mesher: Mesher) -> int:
+    if mesher.name.startswith("blockmesh-cgrid"):
+        return 1
+    return settings.resolved_mesh_cpu_budget()
+
+
 def polar_slug(chord: float, speed: float) -> str:
     return _slug(f"c{chord:g}_u{speed:g}")
 
@@ -432,7 +438,10 @@ def execute_job(
                         # directory before cache authentication runs.
                         / f"recipe-{requested_recipe_key}"
                     )
-                    mesh_cpu_tokens = settings.resolved_mesh_cpu_budget()
+                    mesh_cpu_tokens = _mesh_cpu_tokens_for_mesher(
+                        settings,
+                        requested_mesher,
+                    )
                     wait_for_cpu(
                         mesh_cpu_tokens,
                         f"waiting for CPU before meshing c={chord:g} m, U={speed:g} m/s",

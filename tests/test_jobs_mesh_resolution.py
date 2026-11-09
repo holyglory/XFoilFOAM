@@ -9,10 +9,12 @@ from __future__ import annotations
 
 from pathlib import Path
 from types import SimpleNamespace
+import json
 
 import pytest
 
 from airfoilfoam import jobs, physics
+from airfoilfoam.cancellation import JobCancelled
 from airfoilfoam.config import Settings
 from airfoilfoam.models import (
     AirfoilInput,
@@ -29,8 +31,9 @@ from airfoilfoam.storage import JobStore
 
 
 class _Mesher:
-    name = "test-speed-resolved"
-    cache_version = "test-speed-resolved-v1"
+    def __init__(self, name="test-speed-resolved"):
+        self.name = name
+        self.cache_version = f"{name}-v1"
 
 
 def _settings(tmp_path: Path, *, worker_cpu_budget: int = 1) -> Settings:
@@ -61,8 +64,14 @@ def _request(naca0012_selig_text: str, *, mesh: MeshParams) -> PolarRequest:
     )
 
 
-def _wire_fake_engine(monkeypatch, prepared, solved, observed_progress=None):
-    mesher = _Mesher()
+def _wire_fake_engine(
+    monkeypatch,
+    prepared,
+    solved,
+    observed_progress=None,
+    mesher_name="test-speed-resolved",
+):
+    mesher = _Mesher(mesher_name)
 
     def fake_prepare(mesh_dir, _airfoil, resolved, _chord, _mesher, _runner, **_kwargs):
         mesh_dir.mkdir(parents=True, exist_ok=True)
@@ -201,6 +210,150 @@ def test_mesh_builds_reserve_the_bounded_mesh_budget(tmp_path, monkeypatch, naca
 
     assert requests[:2] == [2, 2]
     assert set(requests[2:]) == {1}
+
+
+@pytest.mark.parametrize(
+    "mesher_name",
+    [
+        "blockmesh-cgrid",
+        "blockmesh-cgrid-finite-edge",
+        "blockmesh-cgrid-segmented-normal-20",
+        "blockmesh-cgrid-segmented-te-normal-20",
+        "blockmesh-cgrid-segmented-camber-c150-a200-s5",
+    ],
+)
+def test_blockmesh_variants_use_one_mesh_token_independent_of_global_mesh_budget(
+    tmp_path, monkeypatch, naca0012_selig_text, mesher_name
+):
+    prepared: list[tuple[Path, MeshParams]] = []
+    solved: list[tuple[CaseSpec, MeshParams, Path]] = []
+    requests: list[int] = []
+    _wire_fake_engine(
+        monkeypatch,
+        prepared,
+        solved,
+        mesher_name=mesher_name,
+    )
+
+    class _RecordingCpuTokenPool(RealCpuTokenPool):
+        def acquire(self, tokens, *args, **kwargs):
+            requests.append(tokens)
+            return super().acquire(tokens, *args, **kwargs)
+
+    monkeypatch.setattr(jobs, "CpuTokenPool", _RecordingCpuTokenPool)
+    settings = _settings(tmp_path, worker_cpu_budget=8)
+    settings.mesh_cpu_budget = 8
+
+    jobs.execute_job(
+        f"serial-mesh-{mesher_name}",
+        _request(naca0012_selig_text, mesh=MeshParams()),
+        store=JobStore(settings),
+        settings=settings,
+    )
+
+    assert requests[:2] == [1, 1]
+
+
+def test_cartesian_mesh_keeps_explicit_thread_budget(
+    tmp_path, monkeypatch, naca0012_selig_text
+):
+    prepared: list[tuple[Path, MeshParams]] = []
+    solved: list[tuple[CaseSpec, MeshParams, Path]] = []
+    requests: list[int] = []
+    _wire_fake_engine(
+        monkeypatch,
+        prepared,
+        solved,
+        mesher_name="cartesian2d-external-boundary-layer",
+    )
+
+    class _RecordingCpuTokenPool(RealCpuTokenPool):
+        def acquire(self, tokens, *args, **kwargs):
+            requests.append(tokens)
+            return super().acquire(tokens, *args, **kwargs)
+
+    monkeypatch.setattr(jobs, "CpuTokenPool", _RecordingCpuTokenPool)
+    settings = _settings(tmp_path, worker_cpu_budget=8)
+    settings.mesh_cpu_budget = 8
+
+    jobs.execute_job(
+        "cartesian-thread-budget",
+        _request(naca0012_selig_text, mesh=MeshParams()),
+        store=JobStore(settings),
+        settings=settings,
+    )
+
+    assert requests[:2] == [8, 8]
+
+
+@pytest.mark.parametrize("solver_processes", [1, 2])
+def test_serial_mesh_coexists_with_one_busy_token(
+    tmp_path, monkeypatch, naca0012_selig_text, solver_processes
+):
+    prepared: list[tuple[Path, MeshParams]] = []
+    solved: list[tuple[CaseSpec, MeshParams, Path]] = []
+    statuses = []
+    _wire_fake_engine(
+        monkeypatch,
+        prepared,
+        solved,
+        mesher_name="blockmesh-cgrid",
+    )
+    settings = _settings(tmp_path, worker_cpu_budget=8)
+    request = _request(naca0012_selig_text, mesh=MeshParams()).model_copy(
+        update={
+            "resources": ResourceParams(
+                policy="case_parallel",
+                cpu_budget=solver_processes,
+                case_concurrency=1,
+                solver_processes=solver_processes,
+            )
+        }
+    )
+    busy = RealCpuTokenPool(settings.cpu_token_state_path, budget=8)
+
+    with busy.acquire(1):
+        result = jobs.execute_job(
+            f"serial-mesh-busy-{solver_processes}",
+            request,
+            store=JobStore(settings),
+            settings=settings,
+            progress=lambda status: statuses.append(
+                (status.phase, status.cpu_tokens_waiting, status.cpu_tokens_held)
+            ),
+        )
+
+    assert result.state.value == "completed"
+    assert any(waiting == 1 and held == 0 for _, waiting, held in statuses)
+    assert any(held == 1 for _, _, held in statuses)
+    assert json.loads(settings.cpu_token_state_path.read_text())["leases"] == []
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [RuntimeError("mesh failed"), JobCancelled("cancelled")],
+)
+def test_serial_mesh_releases_token_on_failure_or_cancel(
+    tmp_path, monkeypatch, naca0012_selig_text, failure
+):
+    mesher = _Mesher("blockmesh-cgrid")
+    monkeypatch.setattr(jobs, "get_mesher", lambda _name: mesher)
+
+    def fail_prepare(*_args, **_kwargs):
+        raise failure
+
+    monkeypatch.setattr(jobs, "prepare_mesh_with_recovery", fail_prepare)
+    settings = _settings(tmp_path, worker_cpu_budget=8)
+
+    with pytest.raises(type(failure)):
+        jobs.execute_job(
+            "serial-mesh-release",
+            _request(naca0012_selig_text, mesh=MeshParams()),
+            store=JobStore(settings),
+            settings=settings,
+        )
+
+    assert json.loads(settings.cpu_token_state_path.read_text())["leases"] == []
 
 
 def test_multi_speed_job_deduplicates_only_an_exactly_equal_resolved_recipe(

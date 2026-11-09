@@ -31,6 +31,8 @@ from airfoilfoam.models import (  # noqa: E402
     JobState,
     JobStatus,
     MeshParams,
+    Polar,
+    PolarPoint,
     RoughnessParams,
     SolverParams,
 )
@@ -865,14 +867,29 @@ def _write_stale_running_job(store: JobStore, job_id: str, phase: JobPhase) -> N
 
 
 def test_check_and_condemn_marks_failed_and_exits_child(tmp_path, monkeypatch):
+    from airfoilfoam.execution_stop import execution_stop_proof, record_execution_owner
+
     settings = Settings(data_dir=tmp_path / "data", stall_no_progress_minutes=20)
     store = JobStore(settings)
     _write_stale_running_job(store, "jstall", JobPhase.solving_urans)
+    partial = JobResult(job_id="jstall", state=JobState.running, polars=[Polar(
+        speed=30, chord=1, reynolds=2_000_000,
+        points=[PolarPoint(case_slug="c1_u30_am4", aoa_deg=-4, cl=0.4, cd=0.02, cm=-0.01)],
+        attempts=[PolarPoint(case_slug=f"c1_u30_am{abs(angle)}", aoa_deg=angle, error="interrupted",
+                             solver_active_seconds=7201, converged=False) for angle in (-3, -2)],
+    )])
+    store.write_result(partial)
+    record_execution_owner(store, "jstall")
+    monkeypatch.setattr(tasks, "newest_progress_file_mtime", lambda *_args: _OLD.timestamp())
+    monkeypatch.setattr(store, "job_process_details", lambda *_args: [])
+    monkeypatch.setattr(store, "job_processes", lambda *_args, **_kwargs: [])
 
     exits = []
 
     def fake_exit(code):
         exits.append(code)
+        JobStore(settings).write_result(partial)
+        JobStore(settings).write_status(JobStatus(job_id="jstall", state=JobState.running, phase=JobPhase.solving_urans))
         raise SystemExit(code)
 
     monkeypatch.setattr(tasks.os, "_exit", fake_exit)
@@ -888,6 +905,11 @@ def test_check_and_condemn_marks_failed_and_exits_child(tmp_path, monkeypatch):
     result = store.read_result("jstall")
     assert result.state == JobState.failed
     assert result.message == status.message
+    assert result.polars == partial.polars
+    assert all(not attempt.converged for attempt in result.polars[0].attempts)
+    proof = execution_stop_proof(store, "jstall")
+    assert proof["execution_stopped"] is True
+    assert proof["fence"] == "terminal_result"
 
 
 def test_check_and_condemn_spares_fresh_status(tmp_path, monkeypatch):

@@ -1,13 +1,55 @@
 import fcntl
 import json
+import multiprocessing
 
 import pytest
 
 from airfoilfoam.config import Settings
 from airfoilfoam.execution_stop import execution_stop_proof, record_execution_owner
 from airfoilfoam.storage import JobStore
-from airfoilfoam.models import PolarRequest, JobResult, JobState
+from airfoilfoam.models import Polar, PolarPoint, PolarRequest, JobPhase, JobResult, JobState, JobStatus
 from airfoilfoam import tasks
+
+
+def retained_partial(job_id):
+    return JobResult(job_id=job_id, state=JobState.running, polars=[Polar(
+        speed=30, chord=1, reynolds=2_000_000,
+        points=[PolarPoint(case_slug="c1_u30_am4", aoa_deg=-4, cl=0.4, cd=0.02, cm=-0.01, converged=True)],
+        attempts=[PolarPoint(case_slug=f"c1_u30_am{abs(angle)}", aoa_deg=angle, cl=0.3, cd=0.03, cm=-0.02,
+                             converged=False, error="retained interrupted attempt", solver_active_seconds=7201,
+                             force_history={"t": [0.1, 0.2], "cl": [0.3, 0.4], "cd": [0.03, 0.04], "cm": [-0.02, -0.03]})
+                  for angle in (-3, -2)],
+    )])
+
+
+def publish_late_snapshot(settings, job_id, ready, release):
+    store = JobStore(settings)
+    result = retained_partial(job_id)
+    status = JobStatus(job_id=job_id, state=JobState.running, phase=JobPhase.solving_urans,
+                       completed_cases=2, total_cases=7)
+    ready.set()
+    if not release.wait(5):
+        raise TimeoutError("Test never released the delayed publication")
+    store.write_result(result)
+    store.write_status(status)
+
+
+def publish_paused_result(settings, job_id, ready, release):
+    class PausedStore(JobStore):
+        def _write_json_atomic(self, path, payload):
+            if path.name == "result.json":
+                ready.set()
+                if not release.wait(5):
+                    raise TimeoutError("Test never released the result replacement")
+            super()._write_json_atomic(path, payload)
+
+    PausedStore(settings).write_result(retained_partial(job_id))
+
+
+def fail_after_partial(settings, job_id, started, finished):
+    started.set()
+    JobStore(settings).terminalize_result(JobResult(job_id=job_id, state=JobState.failed, message="worker failed"))
+    finished.set()
 
 
 @pytest.fixture
@@ -49,17 +91,147 @@ def test_stop_requires_the_real_execution_lock_and_no_remaining_children(executi
     assert stopped["fence"] == "cancel_marker"
 
 
-def test_completed_execution_is_inspected_without_cancelling_or_modifying_its_result(execution):
+@pytest.mark.parametrize("terminal_state", [JobState.completed, JobState.failed, JobState.cancelled])
+@pytest.mark.parametrize("status_first", [False, True])
+def test_completed_execution_is_inspected_without_cancelling_or_modifying_its_result(execution, terminal_state, status_first):
     store, job_id, _ = execution
     (store.job_dir(job_id) / "cancelled").unlink()
-    store.write_result(JobResult(job_id=job_id, state=JobState.completed))
+    partial = retained_partial(job_id)
+    store.write_status(JobStatus(job_id=job_id, state=JobState.running, completed_cases=2, total_cases=7))
+    store.write_result(partial)
+    context = multiprocessing.get_context("spawn")
+    ready, release = context.Event(), context.Event()
+    writer = context.Process(target=publish_late_snapshot, args=(store.settings, job_id, ready, release))
+    writer.start()
+    try:
+        assert ready.wait(5)
+        terminal = partial.model_copy(update={"state": terminal_state, "message": "authoritative terminal result"})
+        status = JobStatus(job_id=job_id, state=terminal_state, phase=JobPhase(terminal_state.value),
+                           completed_cases=2, total_cases=7, message=terminal.message)
+        if status_first:
+            store.write_status(status)
+            store.write_result(partial)
+            assert store.read_result(job_id).model_dump() == partial.model_dump()
+        store.write_result(terminal)
+        store.write_status(JobStatus(job_id=job_id, state=JobState.running, completed_cases=1, total_cases=7))
+        store.write_status(status)
+        result_path = store.job_dir(job_id) / "result.json"
+        original = result_path.read_bytes()
+        status_original = (store.job_dir(job_id) / "status.json").read_bytes()
+        sidecars = {path.name: path.read_bytes() for path in (store.job_dir(job_id) / "continuation-metadata").glob("*.json")}
+        release.set()
+        writer.join(5)
+        assert writer.exitcode == 0
+        assert store.read_status(job_id).state is terminal_state
+        assert (store.job_dir(job_id) / "status.json").read_bytes() == status_original
+        assert store.read_result(job_id).state is terminal_state
+        assert store.read_result(job_id).polars == partial.polars
+        assert len(sidecars) == 3
+        assert sidecars == {path.name: path.read_bytes() for path in (store.job_dir(job_id) / "continuation-metadata").glob("*.json")}
+        conflicting = JobState.failed if terminal_state is JobState.completed else JobState.completed
+        store.write_result(JobResult(job_id=job_id, state=conflicting))
+        store.write_status(JobStatus(job_id=job_id, state=conflicting))
+        assert (store.job_dir(job_id) / "status.json").read_bytes() == status_original
+        assert result_path.read_bytes() == original
+        assert store.terminalize_cancelled_result(job_id) is False
+        assert store.terminalize_result(JobResult(job_id=job_id, state=terminal_state)) is False
+        assert result_path.read_bytes() == original
+    finally:
+        release.set()
+        if writer.is_alive():
+            writer.terminate()
+        writer.join(5)
     result_path = store.job_dir(job_id) / "result.json"
-    original = result_path.read_bytes()
     proof = execution_stop_proof(store, job_id)
     assert proof["execution_stopped"] is True
     assert proof["fence"] == "terminal_result"
     assert result_path.read_bytes() == original
     assert store.is_cancelled(job_id) is False
+    enriched = store.read_result(job_id)
+    enriched.message = "authoritative same-state metadata enrichment"
+    enriched.polars[0].points[0].y_plus_avg = 3.0
+    store.write_result(enriched)
+    assert store.read_result(job_id) == enriched
+    assert store.read_result(job_id).polars[0].attempts == partial.polars[0].attempts
+    assert execution_stop_proof(store, job_id)["execution_stopped"] is True
+
+
+def test_terminal_publication_serializes_with_partial_replacement_across_processes(tmp_path, monkeypatch):
+    settings = Settings(data_dir=tmp_path / "data")
+    store = JobStore(settings)
+    job_id = "partial-replacement-race"
+    store.write_status(JobStatus(job_id=job_id, state=JobState.running, completed_cases=2, total_cases=7))
+    earlier = retained_partial(job_id)
+    earlier.polars[0].attempts = []
+    store.write_result(earlier)
+    record_execution_owner(store, job_id)
+    context = multiprocessing.get_context("spawn")
+    ready, release, started, finished = [context.Event() for _ in range(4)]
+    partial = context.Process(target=publish_paused_result, args=(settings, job_id, ready, release))
+    terminal = context.Process(target=fail_after_partial, args=(settings, job_id, started, finished))
+    partial.start()
+    try:
+        assert ready.wait(5)
+        with (store.job_dir(job_id) / ".publication.lock").open("a") as contender:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(contender.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        terminal.start()
+        assert started.wait(5)
+        assert not finished.is_set()
+        release.set()
+        partial.join(5)
+        terminal.join(5)
+        assert partial.exitcode == terminal.exitcode == 0
+        assert finished.is_set()
+        result = store.read_result(job_id)
+        assert result.state is JobState.failed
+        assert result.polars == retained_partial(job_id).polars
+        monkeypatch.setattr(store, "job_processes", lambda *_args, **_kwargs: [])
+        assert execution_stop_proof(store, job_id)["execution_stopped"] is True
+    finally:
+        release.set()
+        for process in (partial, terminal):
+            if process.pid is not None:
+                if process.is_alive():
+                    process.terminate()
+                process.join(5)
+
+
+def test_worker_exception_preserves_partial_histories_and_terminal_stop_proof(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from airfoilfoam.openfoam.dialects import OPENCFD_2606_IDENTITY
+
+    settings = Settings(data_dir=tmp_path / "data")
+    store = JobStore(settings)
+    job_id = "failed-worker-partial-history"
+    request = PolarRequest.model_validate({"airfoil": {"name": "unused", "coordinates": "not loaded"},
+                                          "aoa": {"angles": [-4, -3, -2, -1, 0, 1, 2]},
+                                          "expected_engine": OPENCFD_2606_IDENTITY})
+    store.create(job_id, request)
+    partial = retained_partial(job_id)
+    monkeypatch.setattr(tasks, "get_settings", lambda: settings)
+    monkeypatch.setattr(tasks, "install_subprocess_signal_handlers", lambda: None)
+    monkeypatch.setattr(tasks, "_start_runtime_heartbeat", lambda *_args: (
+        SimpleNamespace(set=lambda: None), SimpleNamespace(join=lambda **_kwargs: None)))
+
+    def publish_then_fail(*_args, **_kwargs):
+        store.write_result(partial)
+        store.write_status(JobStatus(job_id=job_id, state=JobState.running, completed_cases=2, total_cases=7))
+        raise RuntimeError("worker failed after partial publication")
+
+    monkeypatch.setattr(tasks, "execute_job", publish_then_fail)
+    with pytest.raises(RuntimeError, match="worker failed after partial publication"):
+        tasks.run_polar(job_id, request.model_dump_json())
+    result = store.read_result(job_id)
+    assert result.state is JobState.failed
+    assert result.polars == partial.polars
+    assert store.read_status(job_id).completed_cases == 2
+    assert store.read_status(job_id).total_cases == 7
+    assert [point.aoa_deg for polar in result.polars for point in (*polar.points, *polar.attempts)] == [-4, -3, -2]
+    assert all(not point.converged and point.force_history is not None for polar in result.polars for point in polar.attempts)
+    monkeypatch.setattr(store, "job_processes", lambda *_args, **_kwargs: [])
+    assert execution_stop_proof(store, job_id)["execution_stopped"] is True
+    assert tasks.run_polar(job_id, request.model_dump_json())["state"] == "failed"
 
 
 @pytest.mark.parametrize("missing", ["marker", "owner", "namespace", "inventory"])
