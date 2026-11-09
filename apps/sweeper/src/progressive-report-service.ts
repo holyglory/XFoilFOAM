@@ -13,6 +13,7 @@ export async function runProgressiveReportService(
     publish?: () => Promise<boolean>;
     lane?: number;
     laneCount?: number;
+    pollIntervalMs?: number;
     reportError?: (error: unknown) => void;
   } = {},
 ): Promise<void> {
@@ -41,6 +42,14 @@ export async function runProgressiveReportService(
     notifications,
     "progressive_worker_report_changed",
     signal,
-    { drain: publish, reportError },
+    {
+      drain: publish,
+      reportError,
+      // A report can be written while the sweeper is restarting or while a
+      // LISTEN subscription is being replaced. The periodic fallback keeps
+      // terminal reports from becoming permanent backlog. Tests that inject a
+      // custom publisher can opt out or choose a shorter interval.
+      pollIntervalMs: options.pollIntervalMs ?? (options.publish ? undefined : 5_000),
+    },
   );
 }

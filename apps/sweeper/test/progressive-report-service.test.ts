@@ -344,6 +344,27 @@ describe("independent progressive report delivery", () => {
     await running;
   });
 
+  it("polls for reports when the notification was missed", async () => {
+    vi.useFakeTimers();
+    const channel = notifications();
+    const owner = new AbortController();
+    const publish = vi.fn().mockResolvedValue(false);
+    const running = runProgressiveReportService(
+      {} as DB,
+      channel.connection,
+      owner.signal,
+      { publish, pollIntervalMs: 5_000 },
+    );
+    await vi.advanceTimersByTimeAsync(0);
+    expect(publish).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(4_999);
+    expect(publish).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(publish).toHaveBeenCalledTimes(2);
+    owner.abort();
+    await running;
+  });
+
   it("retains wakeups during a slow publication and awaits it during shutdown", async () => {
     vi.useFakeTimers();
     const channel = notifications();
