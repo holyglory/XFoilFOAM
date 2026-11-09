@@ -51,8 +51,11 @@ export async function existingProgressiveReportAttempts(
     return null;
   const sources = progressiveReportedPointSources(report.result);
   if (!sources.length || sources.length > 512) return null;
+  // Bound distinct evidence identities, not the number of heartbeat reports
+  // repeating them. Different attempts for one point must remain distinguishable.
   const rows = await db.execute(sql`WITH candidates AS MATERIALIZED (
-    SELECT association.sim_job_id,association.sequence,association.point_content_signature,association.result_attempt_id,
+    SELECT DISTINCT ON (association.point_content_signature, association.result_attempt_id)
+      association.sim_job_id,association.sequence,association.point_content_signature,association.result_attempt_id,
       original.content_signature
     FROM progressive_worker_evidence_attempts association
     JOIN progressive_worker_evidence_receipts receipt ON receipt.sim_job_id=association.sim_job_id AND receipt.sequence=association.sequence
@@ -65,7 +68,7 @@ export async function existingProgressiveReportAttempts(
         sources.map((source) => sql`${source.contentSignature}`),
         sql`, `,
       )})
-    ORDER BY association.sequence DESC LIMIT 2049
+    ORDER BY association.point_content_signature, association.result_attempt_id, association.sequence DESC LIMIT 2049
     ), chosen AS MATERIALIZED (
       SELECT DISTINCT ON (candidate.point_content_signature) candidate.*
       FROM candidates candidate

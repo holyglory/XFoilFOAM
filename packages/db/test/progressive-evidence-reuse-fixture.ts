@@ -43,6 +43,16 @@ export async function verifyProgressiveEvidenceReuse(
       const before = await connection.execute(
         sql`SELECT * FROM result_attempts WHERE sim_job_id=${executionId}::uuid ORDER BY id`,
       );
+      const engine = new Proxy(
+        {},
+        {
+          get() {
+            throw new Error(
+              "Repeated immutable evidence must not call the engine",
+            );
+          },
+        },
+      ) as EngineClient;
       const projected = progressiveRemotePointProjection({
         ...progressiveReportedPointSources(repeated.result!)[0],
         report: repeated,
@@ -135,7 +145,7 @@ export async function verifyProgressiveEvidenceReuse(
             SELECT ${executionId}::uuid,sequence::bigint,${before[0].id}::uuid,${pointSignature}
             FROM jsonb_array_elements_text(${JSON.stringify(entries.map((row) => row.sequence))}::jsonb) incoming(sequence)`);
           };
-          await append(reports.slice(0, 128));
+          await append(reports);
           let loadedRows = 0;
           const measured = new Proxy(scoped, {
             get(target, property, receiver) {
@@ -177,16 +187,37 @@ export async function verifyProgressiveEvidenceReuse(
               throw conflictRollback;
             }),
           ).rejects.toBe(conflictRollback);
-          await append(reports.slice(128));
           expect(
             await existingProgressiveReportAttempts(scoped, repeated, envelope),
-          ).toBeNull();
+          ).toEqual(before.map((row) => String(row.id)));
+          await scoped.execute(sql`INSERT INTO progressive_worker_reports(sim_job_id,sequence,content_signature,report,acknowledged_at)
+            VALUES(${executionId}::uuid,${repeated.sequence},${validated.contentSignature},${JSON.stringify(repeated)}::jsonb,clock_timestamp())`);
+          expect(
+            await stageProgressiveWorkerEvidence(scoped, engine, executionId, {
+              reportSequence: repeated.sequence,
+            }),
+          ).toMatchObject({
+            kind: "staged",
+            reusedEvidence: true,
+            resultAttemptIds: before.map((row) => row.id),
+          });
+          expect(
+            await scoped.execute(sql`SELECT * FROM result_attempts
+              WHERE sim_job_id=${executionId}::uuid ORDER BY id`),
+          ).toEqual(before);
+          expect(
+            await stageProgressiveWorkerEvidence(scoped, engine, executionId, {
+              reportSequence: repeated.sequence,
+            }),
+          ).toEqual({ kind: "idle" });
           console.info(
             JSON.stringify({
-              repeatedSourceReports: 128,
+              repeatedSourceReports: reports.length,
               loadedEvidenceRows: loadedRows,
               conflictingAttemptRejected: true,
-              associationLimitPreserved: true,
+              distinctBindingBoundPreserved: true,
+              stageReusedWithoutEngineCall: true,
+              storedAttemptsUnchanged: true,
             }),
           );
           throw restoreRepeatedHistory;
@@ -243,16 +274,6 @@ export async function verifyProgressiveEvidenceReuse(
       ).rejects.toBe(refused);
       await connection.execute(sql`INSERT INTO progressive_worker_reports(sim_job_id,sequence,content_signature,report,acknowledged_at)
       VALUES(${executionId}::uuid,${repeated.sequence},${validated.contentSignature},${JSON.stringify(repeated)}::jsonb,clock_timestamp())`);
-      const engine = new Proxy(
-        {},
-        {
-          get() {
-            throw new Error(
-              "Repeated immutable evidence must not call the engine",
-            );
-          },
-        },
-      ) as EngineClient;
       await expect(
         transaction.transaction(async (nested) => {
           await expect(

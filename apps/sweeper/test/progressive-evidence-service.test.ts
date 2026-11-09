@@ -43,8 +43,8 @@ function gate() {
 
 afterEach(() => vi.useRealTimers());
 
-it("does not wait on a staging lane already holding the admission lock", async () => {
-  const execute = vi.fn(async () => [{ acquired: false }]);
+it("returns idle when no staging candidate is available", async () => {
+  const execute = vi.fn(async () => []);
   const db = {
     execute,
     transaction: async (run: (connection: DB) => Promise<unknown>) =>
@@ -327,7 +327,9 @@ it("keeps retry deadlines independent and wakes all slots for acknowledged evide
     expect(stage).toHaveBeenCalledTimes(12);
     expect(deliver).toHaveBeenCalledTimes(12);
     await vi.advanceTimersByTimeAsync(10000);
-    expect(stage).toHaveBeenCalledTimes(12);
+    // Two bounded fallback polls recover notifications missed by a listener.
+    expect(stage).toHaveBeenCalledTimes(20);
+    expect(deliver).toHaveBeenCalledTimes(20);
   } finally {
     owner.abort();
     await running;
@@ -477,11 +479,12 @@ it("clears rejected shared wake lookups and retries without retaining their fail
   expect(vi.getTimerCount()).toBe(0);
 });
 
-it("waits for live claim deadlines without spinning or retaining an expired deadline", async () => {
+it("polls at bounded intervals while awaiting a live claim and clears its expired deadline", async () => {
   vi.useFakeTimers();
   const channel = notifications();
   const owner = new AbortController();
-  const deadline = Date.now() + 60_000;
+  // Keep the deadline separate from the five-second fallback poll boundary.
+  const deadline = Date.now() + 60_037;
   const stage = vi.fn().mockResolvedValue(false);
   const deliver = vi.fn().mockResolvedValue(false);
   const nextWakeAt = vi.fn(async () =>
@@ -496,16 +499,18 @@ it("waits for live claim deadlines without spinning or retaining an expired dead
   );
   try {
     await vi.advanceTimersByTimeAsync(59_999);
-    expect(stage).toHaveBeenCalledTimes(4);
-    expect(deliver).toHaveBeenCalledTimes(4);
-    expect(nextWakeAt).toHaveBeenCalledTimes(2);
-    await vi.advanceTimersByTimeAsync(1);
-    expect(stage).toHaveBeenCalledTimes(8);
-    expect(deliver).toHaveBeenCalledTimes(8);
+    expect(stage).toHaveBeenCalledTimes(48);
+    expect(deliver).toHaveBeenCalledTimes(48);
+    await vi.advanceTimersByTimeAsync(38);
+    expect(stage).toHaveBeenCalledTimes(56);
+    expect(deliver).toHaveBeenCalledTimes(56);
+    await vi.advanceTimersByTimeAsync(4999);
+    expect(stage).toHaveBeenCalledTimes(60);
+    expect(deliver).toHaveBeenCalledTimes(60);
     const settledLookups = nextWakeAt.mock.calls.length;
-    await vi.advanceTimersByTimeAsync(60_000);
-    expect(stage).toHaveBeenCalledTimes(8);
-    expect(deliver).toHaveBeenCalledTimes(8);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(stage).toHaveBeenCalledTimes(60);
+    expect(deliver).toHaveBeenCalledTimes(60);
     expect(nextWakeAt).toHaveBeenCalledTimes(settledLookups);
   } finally {
     owner.abort();

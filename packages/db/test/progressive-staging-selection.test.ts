@@ -64,8 +64,8 @@ async function withWakeFixture(
         WHEN variant='retry-after-claim' THEN interval '3 hours' ELSE interval '1 hour' END
       FROM wake_cases WHERE variant IN ('future-retry','retry-and-claim','retry-after-claim','expired-retry')`);
     await transaction.execute(sql`CREATE TEMP TABLE result_attempts (
-      id uuid PRIMARY KEY,sim_job_id uuid,engine_job_id text,result_id uuid) ON COMMIT DROP`);
-    await transaction.execute(sql`INSERT INTO result_attempts
+      id uuid PRIMARY KEY,sim_job_id uuid,engine_job_id text,result_id uuid,evidence_payload jsonb) ON COMMIT DROP`);
+    await transaction.execute(sql`INSERT INTO result_attempts(id,sim_job_id,engine_job_id,result_id)
       SELECT id,CASE WHEN variant='wrong-attempt-job' THEN md5('foreign')::uuid ELSE id END,
         CASE WHEN variant='wrong-engine' THEN 'foreign' ELSE id::text END,
         CASE WHEN variant<>'missing-result-id' THEN id END FROM wake_cases`);
@@ -82,8 +82,9 @@ async function withWakeFixture(
     );
     await transaction.execute(sql`CREATE TEMP TABLE progressive_worker_delivery_failures (
       sim_job_id uuid,point_content_signature text,state text,retry_after timestamptz,
+      last_http_status integer,last_error text,remote_conflict_ids jsonb DEFAULT '[]'::jsonb,
       PRIMARY KEY(sim_job_id,point_content_signature)) ON COMMIT DROP`);
-    await transaction.execute(sql`INSERT INTO progressive_worker_delivery_failures
+    await transaction.execute(sql`INSERT INTO progressive_worker_delivery_failures(sim_job_id,point_content_signature,state,retry_after)
       SELECT id,id::text,CASE WHEN variant='blocked' THEN 'blocked' ELSE 'retry' END,
         clock_timestamp()+CASE WHEN variant IN ('expired-retry','blocked') THEN interval '-1 hour'
           WHEN variant='retry-after-claim' THEN interval '3 hours' ELSE interval '1 hour' END
@@ -209,7 +210,7 @@ it.each(["staging", "delivery"] as const)(
         sql`INSERT INTO progressive_worker_evidence_receipts SELECT id,1 FROM retained_wake_jobs`,
       );
       await connection.execute(
-        sql`INSERT INTO result_attempts SELECT id,id,id::text,id FROM retained_wake_jobs`,
+        sql`INSERT INTO result_attempts(id,sim_job_id,engine_job_id,result_id) SELECT id,id,id::text,id FROM retained_wake_jobs`,
       );
       await connection.execute(
         sql`INSERT INTO progressive_worker_evidence_attempts SELECT id,1,id,id::text FROM retained_wake_jobs`,
@@ -278,6 +279,9 @@ it.each(["staging", "delivery"] as const)(
       expect(await nextProgressiveEvidenceWakeAt(connection, scope)).toBeNull();
     });
   },
+  // Includes creating, indexing and analysing forty thousand fixture records;
+  // the query-plan ownership bounds above remain the performance assertion.
+  30_000,
 );
 
 it("serves fresh active reports and FIFO backlog without changing eligibility", async () => {
