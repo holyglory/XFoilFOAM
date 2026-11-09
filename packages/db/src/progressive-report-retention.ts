@@ -19,18 +19,18 @@ export async function reclaimProgressiveReportHistory(
   db: DB,
   input: { campaignId: string; batchSize?: number },
 ): Promise<ProgressiveReportRetentionResult> {
-  const batchSize = input.batchSize ?? 2000;
+  const batchSize = input.batchSize ?? 50000;
   if (
     !UUID.test(input.campaignId) ||
     !Number.isSafeInteger(batchSize) ||
     batchSize < 1 ||
-    batchSize > 10000
+    batchSize > 50000
   )
     throw new Error("Invalid bounded progressive report retention scope");
 
   return db.transaction(async (transaction) => {
     const connection = transaction as unknown as DB;
-    const candidates = await connection.execute(sql`
+    const deleted = await connection.execute(sql`
       WITH terminal AS MATERIALIZED (
         SELECT job.id
         FROM sim_jobs job
@@ -44,8 +44,9 @@ export async function reclaimProgressiveReportHistory(
         JOIN terminal ON terminal.id = report.sim_job_id
         GROUP BY report.sim_job_id
       )
-      SELECT report.sim_job_id, report.sequence,
-        pg_column_size(report.report)::bigint AS report_bytes
+      candidates AS MATERIALIZED (
+        SELECT report.sim_job_id, report.sequence,
+          pg_column_size(report.report)::bigint AS report_bytes
       FROM progressive_remote_reports report
       JOIN terminal ON terminal.id = report.sim_job_id
       JOIN final_sequence final ON final.sim_job_id = report.sim_job_id
@@ -74,26 +75,18 @@ export async function reclaimProgressiveReportHistory(
       ORDER BY report.received_at, report.sim_job_id, report.sequence
       LIMIT ${batchSize}
       FOR UPDATE OF report SKIP LOCKED
-    `);
-    if (!candidates.length) return { selected: 0, deleted: 0, bytes: 0 };
-
-    const keys = sql.join(
-      candidates.map(
-        (candidate) =>
-          sql`(${candidate.sim_job_id}::uuid, ${Number(candidate.sequence)}::bigint)`,
-      ),
-      sql`, `,
-    );
-    const deleted = await connection.execute(sql`
+      )
       DELETE FROM progressive_remote_reports report
-      WHERE (report.sim_job_id, report.sequence) IN (${keys})
-      RETURNING report.sim_job_id, report.sequence
+      USING candidates
+      WHERE report.sim_job_id = candidates.sim_job_id
+        AND report.sequence = candidates.sequence
+      RETURNING candidates.report_bytes
     `);
     return {
-      selected: candidates.length,
+      selected: deleted.length,
       deleted: deleted.length,
-      bytes: candidates.reduce(
-        (total, candidate) => total + Number(candidate.report_bytes ?? 0),
+      bytes: deleted.reduce(
+        (total, row) => total + Number(row.report_bytes ?? 0),
         0,
       ),
     };
