@@ -1,11 +1,18 @@
 from __future__ import annotations
 
 import json
+import fcntl
+import itertools
+from contextlib import contextmanager
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import os
+import signal
 import shutil
 import subprocess
 from pathlib import Path
 import sys
+import time
+import threading
 
 import pytest
 
@@ -3499,3 +3506,453 @@ def test_control_plane_deploy_accepts_stably_running_background_services(
     calls = Path(env["CALL_LOG"]).read_text().splitlines()
     assert sum(" ps --status running -q sweeper" in call for call in calls) >= 4
     assert sum(" ps --status running -q media-repair" in call for call in calls) >= 3
+
+
+# Exercise the complete operator command using the existing deployment fixture.
+# A stateful Docker boundary is needed here: the older deploy stub reports
+# configured states, so it cannot detect a failed stop/start or leaked SQL.
+COMPACTION_SCRIPT = ROOT / "scripts/deploy/compact-progressive-remote-reports.sh"
+COMPACTION_WRITERS = ("node-api", "web", "sweeper", "media-repair")
+COMPACTION_IDS = {
+    service: f"{index:064x}"
+    for index, service in enumerate(("api", "worker", "postgres", *COMPACTION_WRITERS), 1)
+}
+
+COMPACTION_DOCKER = r'''#!/usr/bin/env python3
+import json, os, sys, time
+from pathlib import Path
+
+args = sys.argv[1:]
+with open(os.environ['CALL_LOG'], 'a') as log:
+    log.write(json.dumps(args) + '\n')
+ids = json.loads(os.environ['COMPACTION_IDS'])
+root = Path(os.environ['COMPACTION_STATES'])
+writers = ['node-api', 'web', 'sweeper', 'media-repair']
+def load(service):
+    return json.loads((root / service).read_text())
+def save(service, row):
+    (root / service).write_text(json.dumps(row))
+def service_for(container):
+    return next(service for service, value in ids.items() if value == container)
+def event(name):
+    (root / name).touch()
+if args == ['compose', 'version']:
+    raise SystemExit(0)
+if args[0] == 'compose':
+    args = args[1:]
+    while args and args[0] in ['--env-file', '-p', '-f']:
+        args = args[2:]
+    if args == ['config', '--quiet']:
+        raise SystemExit(0)
+    if args == ['config', '--services']:
+        print('\n'.join(ids))
+        raise SystemExit(0)
+    assert args[:3] == ['ps', '--all', '-q'], args
+    service = args[3]
+    if os.environ.get('COMPACTION_PROBE_ERROR') == service:
+        raise SystemExit(43)
+    if load(service)['state'] != 'absent':
+        print(ids[service])
+    raise SystemExit(0)
+if args[0] == 'inspect':
+    row = load(service_for(args[-1]))
+    print(row['state'] + '|' + row['started'])
+    raise SystemExit(0)
+if args[0] in ['stop', 'start']:
+    action = args[0]
+    service = service_for(args[-1])
+    assert service in writers, 'ENGINE/POSTGRES MUTATION: ' + repr(args)
+    if action == 'start':
+        event('restore-entered')
+        if os.environ.get('COMPACTION_RESTORE_WAIT') == service:
+            time.sleep(3)
+        if os.environ.get('COMPACTION_START_ERROR') == service:
+            raise SystemExit(42)
+    row = load(service)
+    if os.environ.get('COMPACTION_FALSE_SUCCESS') != service:
+        row['state'] = 'running' if action == 'start' else 'exited'
+        save(service, row)
+    if action == 'stop' and os.environ.get('COMPACTION_STOP_ERROR') == service:
+        raise SystemExit(41)  # State changed even though client failed.
+    raise SystemExit(0)
+if args[0] == 'exec':
+    assert args[1] == '-e' and args[2].startswith('PGOPTIONS=')
+    assert args[3] == ids['postgres'] and args[4:8] == ['psql', '-X', '-w', '-v']
+    sql = args[-1]
+    if sql == 'VACUUM (FULL, ANALYZE) public.progressive_remote_reports;':
+        assert all(load(service)['state'] != 'running' for service in writers)
+        assert 'lock_timeout=5000' in args[2] and 'statement_timeout=' in args[2]
+        assert 'application_name=xfoilfoam_progressive_report_compaction' in args[2]
+        event('sql-active')
+        event('vacuum-entered')
+        if os.environ.get('COMPACTION_SQL_WAIT') == '1':
+            # SIGTERM kills this client; the marker models the independent DB
+            # session which remains active until cleanup explicitly cancels it.
+            while not (root / 'release-vacuum').exists():
+                time.sleep(0.02)
+        if os.environ.get('COMPACTION_SQL_ERROR') == '1':
+            raise SystemExit(45)
+        (root / 'sql-active').unlink()
+        raise SystemExit(0)
+    assert "application_name = 'xfoilfoam_progressive_report_compaction'" in sql
+    if 'pg_cancel_backend' in sql:
+        event('cancel-entered')
+        if os.environ.get('COMPACTION_CANCEL_ERROR') == '1':
+            raise SystemExit(46)
+        (root / 'sql-active').unlink(missing_ok=True)
+        print('t')
+        raise SystemExit(0)
+    assert sql.startswith('SELECT count(*)')
+    print(int((root / 'sql-active').exists()))
+    raise SystemExit(0)
+raise AssertionError('Unexpected Docker operation: ' + repr(args))
+'''
+
+
+def _compaction_harness(tmp_path: Path, running: tuple[bool, ...] = (True,) * 4) -> dict[str, str]:
+    env = _deploy_harness(tmp_path, sweeper_state="running")
+    Path(env["AIRFOILS_PRO_STATE_DIR"]).mkdir(exist_ok=True)
+    env.update({
+        "COMPOSE_PROJECT_NAME": "app",
+        "COMPOSE_OVERRIDE_FILE": "",
+        "COMMAND_TIMEOUT_SECONDS": "5",
+        "COMPACTION_TIMEOUT_SECONDS": "15",
+        "MAINTENANCE_TIMEOUT_SECONDS": "90",
+        "RESTORE_TIMEOUT_SECONDS": "60",
+        "READINESS_TIMEOUT_SECONDS": "2",
+        "COMPACTION_IDS": json.dumps(COMPACTION_IDS),
+        "COMPACTION_STATES": str(tmp_path / "container-states"),
+    })
+    states = Path(env["COMPACTION_STATES"])
+    states.mkdir()
+    for service in COMPACTION_IDS:
+        state = "running"
+        if service in COMPACTION_WRITERS and not running[COMPACTION_WRITERS.index(service)]:
+            state = "exited"
+        (states / service).write_text(json.dumps({"state": state, "started": "2026-11-09T00:00:00Z"}))
+    _write_executable(tmp_path / "bin/docker", COMPACTION_DOCKER)
+    _write_executable(tmp_path / "bin/curl", r'''#!/usr/bin/env python3
+import json, os, sys
+from pathlib import Path
+root = Path(os.environ['COMPACTION_STATES'])
+url = sys.argv[-1]
+with (root / 'requests').open('a') as log:
+    log.write(url + '\n')
+required = ['node-api'] if url.endswith('/health') else ['node-api', 'web']
+running = all(json.loads((root / s).read_text())['state'] == 'running' for s in required)
+print(('200' if running else '503') + '|' + ('application/json' if url.endswith('/health') else 'text/html'))
+''')
+    return env
+
+
+def _compact(env: dict[str, str], *args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(["bash", str(COMPACTION_SCRIPT), *args], env=env, text=True,
+                          capture_output=True, timeout=25, check=False)
+
+
+def _compaction_calls(env: dict[str, str]) -> list[list[str]]:
+    log = Path(env["CALL_LOG"])
+    return [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
+
+
+def _compaction_receipt(env: dict[str, str]) -> dict[str, str]:
+    receipts = list(Path(env["AIRFOILS_PRO_STATE_DIR"]).glob("progressive-report-compaction.*/result"))
+    assert len(receipts) == 1
+    return dict(line.split("=", 1) for line in receipts[0].read_text().splitlines())
+
+
+def _assert_compaction_restored(env: dict[str, str], running: tuple[bool, ...]) -> None:
+    states = Path(env["COMPACTION_STATES"])
+    for service in COMPACTION_IDS:
+        row = json.loads((states / service).read_text())
+        expected = "running"
+        if service in COMPACTION_WRITERS and not running[COMPACTION_WRITERS.index(service)]:
+            expected = "exited"
+        assert row == {"state": expected, "started": "2026-11-09T00:00:00Z"}
+    mutations = [args for args in _compaction_calls(env) if args[0] in ("start", "stop")]
+    assert all(args[-1] in [COMPACTION_IDS[s] for s in COMPACTION_WRITERS] for args in mutations)
+    for index, service in enumerate(COMPACTION_WRITERS):
+        if not running[index]:
+            assert not any(args[-1] == COMPACTION_IDS[service] for args in mutations)
+    assert _compaction_receipt(env)["recovery_failed"] == "false"
+    with open(env["LOCK_FILE"], "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+@pytest.mark.parametrize("running", list(itertools.product((False, True), repeat=4)))
+def test_control_plane_deploy_report_compaction_restores_all_prior_states(tmp_path: Path, running: tuple[bool, ...]) -> None:
+    env = _compaction_harness(tmp_path, running)
+    result = _compact(env, "--execute")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert _compaction_receipt(env)["exit"] == "0"
+    assert sum(args[-1] == 'VACUUM (FULL, ANALYZE) public.progressive_remote_reports;'
+               for args in _compaction_calls(env)) == 1
+    _assert_compaction_restored(env, running)
+
+
+@pytest.mark.parametrize("args", [(), ("--dry-run",), ("--server-run",)])
+def test_control_plane_deploy_report_compaction_defaults_to_no_effects(tmp_path: Path, args: tuple[str, ...]) -> None:
+    env = _compaction_harness(tmp_path)
+    result = _compact(env, *args)
+    assert result.returncode == 0 and "DRY RUN" in result.stdout
+    assert not _compaction_calls(env)
+    assert not Path(env["LOCK_FILE"]).exists()
+    assert not list(Path(env["AIRFOILS_PRO_STATE_DIR"]).glob("progressive-report-compaction.*"))
+
+
+@pytest.mark.parametrize(("fault", "exit_code"), [("COMPACTION_SQL_ERROR", 45), ("COMPACTION_STOP_ERROR", 41)])
+def test_control_plane_deploy_report_compaction_command_failure_restores(tmp_path: Path, fault: str, exit_code: int) -> None:
+    running = (True, False, True, True)
+    env = _compaction_harness(tmp_path, running)
+    env[fault] = "sweeper" if "STOP" in fault else "1"
+    result = _compact(env, "--execute")
+    assert result.returncode == exit_code, result.stdout + result.stderr
+    _assert_compaction_restored(env, running)
+    if "STOP" in fault:
+        assert not (Path(env["COMPACTION_STATES"]) / "vacuum-entered").exists()
+    else:
+        assert (Path(env["COMPACTION_STATES"]) / "cancel-entered").exists()
+
+
+def _await_compaction_file(env: dict[str, str], name: str, seconds: float = 8) -> None:
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if (Path(env["COMPACTION_STATES"]) / name).exists():
+            return
+        time.sleep(0.02)
+    pytest.fail(f"Compaction fixture never reached {name}")
+
+
+@pytest.mark.parametrize(("sig", "exit_code"), [(signal.SIGTERM, 143), (signal.SIGINT, 130), (signal.SIGHUP, 129)])
+def test_control_plane_deploy_report_compaction_interrupt_restores_and_holds_lock(tmp_path: Path, sig: int, exit_code: int) -> None:
+    env = _compaction_harness(tmp_path, (True, False, True, False))
+    env["COMPACTION_SQL_WAIT"] = "1"
+    process = subprocess.Popen(["bash", str(COMPACTION_SCRIPT), "--execute"], env=env,
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        _await_compaction_file(env, "vacuum-entered")
+        before = _compaction_calls(env)
+        contender = _compact(env, "--execute")
+        assert contender.returncode == 9
+        assert _compaction_calls(env) == before
+        process.send_signal(sig)
+        stdout, stderr = process.communicate(timeout=15)
+        assert process.returncode == exit_code, stdout + stderr
+        assert (Path(env["COMPACTION_STATES"]) / "cancel-entered").exists()
+        assert not (Path(env["COMPACTION_STATES"]) / "sql-active").exists()
+        _assert_compaction_restored(env, (True, False, True, False))
+    finally:
+        if process.poll() is None:
+            process.terminate()
+            process.communicate(timeout=15)
+
+
+@pytest.mark.parametrize("fault", ["COMPACTION_START_ERROR", "COMPACTION_RESTORE_WAIT"])
+def test_control_plane_deploy_report_compaction_does_not_hide_failed_restore(tmp_path: Path, fault: str) -> None:
+    env = _compaction_harness(tmp_path)
+    env.update({fault: "web", "COMMAND_TIMEOUT_SECONDS": "1"})
+    result = _compact(env, "--execute")
+    assert result.returncode == 18, result.stdout + result.stderr
+    assert "CRITICAL" in result.stderr
+    assert _compaction_receipt(env) == {"operation_exit": "0", "recovery_failed": "true", "readiness_failed": "true", "exit": "18"}
+    for service in ("node-api", "sweeper", "media-repair"):
+        assert json.loads((Path(env["COMPACTION_STATES"]) / service).read_text())["state"] == "running"
+
+
+def test_control_plane_deploy_report_compaction_sql_deadline_cancels_and_restores(tmp_path: Path) -> None:
+    env = _compaction_harness(tmp_path)
+    env.update({"COMPACTION_SQL_WAIT": "1", "COMPACTION_TIMEOUT_SECONDS": "1"})
+    start = time.monotonic()
+    result = _compact(env, "--execute")
+    assert result.returncode == 124, result.stdout + result.stderr
+    assert time.monotonic() - start < 15
+    assert not (Path(env["COMPACTION_STATES"]) / "sql-active").exists()
+    _assert_compaction_restored(env, (True,) * 4)
+
+
+@pytest.mark.parametrize("fault", ["COMPACTION_PROBE_ERROR", "COMPACTION_FALSE_SUCCESS"])
+def test_control_plane_deploy_report_compaction_refuses_unproven_state(tmp_path: Path, fault: str) -> None:
+    env = _compaction_harness(tmp_path)
+    env[fault] = "sweeper"
+    result = _compact(env, "--execute")
+    assert result.returncode == 14, result.stdout + result.stderr
+    assert not (Path(env["COMPACTION_STATES"]) / "vacuum-entered").exists()
+    if fault == "COMPACTION_PROBE_ERROR":
+        assert not any(args[0] in ("start", "stop", "exec") for args in _compaction_calls(env))
+    else:
+        _assert_compaction_restored(env, (True,) * 4)
+
+
+def test_control_plane_deploy_report_compaction_server_run_outlives_observer(tmp_path: Path) -> None:
+    env = _compaction_harness(tmp_path)
+    env["COMPACTION_SQL_WAIT"] = "1"
+    _write_executable(tmp_path / "bin/systemd-run", r'''#!/usr/bin/env python3
+import json, os, subprocess, sys
+from pathlib import Path
+args = sys.argv[1:]
+assert '--property=KillMode=mixed' in args and '--property=Type=exec' in args
+assert any(a.startswith('--property=TimeoutStopSec=') for a in args)
+assert any(a.startswith('--property=RuntimeMaxSec=') for a in args)
+env = dict(os.environ)
+for arg in args:
+    if arg.startswith('--setenv='):
+        key, value = arg[len('--setenv='):].split('=', 1)
+        env[key] = value
+root = Path(env['COMPACTION_STATES'])
+with (root / 'server.log').open('w') as log:
+    child = subprocess.Popen(args[args.index('/bin/bash'):], env=env, stdin=subprocess.DEVNULL,
+                             stdout=log, stderr=log, start_new_session=True)
+(root / 'server.pid').write_text(str(child.pid))
+''')
+    submitted = _compact(env, "--execute", "--server-run")
+    assert submitted.returncode == 0, submitted.stdout + submitted.stderr
+    # The observer and its launcher have exited. The detached command still
+    # owns the entire stop/SQL/restore sequence; no later chat command is needed.
+    root = Path(env["COMPACTION_STATES"])
+    pid = int((root / "server.pid").read_text())
+    try:
+        _await_compaction_file(env, "vacuum-entered")
+        assert os.getpgid(pid) == pid
+        (root / "release-vacuum").touch()
+        deadline = time.monotonic() + 12
+        while time.monotonic() < deadline:
+            if list(Path(env["AIRFOILS_PRO_STATE_DIR"]).glob("progressive-report-compaction.*/result")):
+                break
+            time.sleep(0.02)
+        assert _compaction_receipt(env)["exit"] == "0", (root / "server.log").read_text()
+        _assert_compaction_restored(env, (True,) * 4)
+    finally:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+
+
+@contextmanager
+def _compaction_http(env: dict[str, str], *, failure: str = "", transient: bool = False,
+                     entered: threading.Event | None = None, release: threading.Event | None = None):
+    """Real loopback HTTP requests at the restore boundary, with disposable pages.
+
+    This checks the operator's route-availability contract; it does not stand in
+    for production Next pages or authenticated admin interaction verification.
+    """
+    requests: list[str] = []
+    states = Path(env["COMPACTION_STATES"])
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            requests.append(self.path)
+            assert self.headers.get('Authorization') is None
+            assert self.headers.get('Cookie') is None
+            if entered is not None:
+                entered.set()
+            if release is not None:
+                release.wait(timeout=8)
+            required = ['node-api'] if self.path == '/health' else ['node-api', 'web']
+            available = all(json.loads((states / s).read_text())['state'] == 'running' for s in required)
+            status = 200 if available else 503
+            if self.path == failure or (transient and len(requests) == 1):
+                status = 503
+            self.send_response(status)
+            self.send_header('Content-Type', 'application/json' if self.path == '/health' else 'text/html')
+            self.send_header('Content-Length', '2')
+            self.end_headers()
+            self.wfile.write(b'{}')
+
+        def log_message(self, *args) -> None:
+            pass
+
+    server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    _write_executable(Path(env['APP_DIR']).parent / 'bin/curl', '#!/usr/bin/env bash\nexec /usr/bin/curl "$@"\n')
+    origin = f'http://127.0.0.1:{server.server_port}'
+    env.update({'PUBLIC_ORIGIN': origin, 'API_ORIGIN': origin})
+    try:
+        yield requests
+    finally:
+        if release is not None:
+            release.set()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_control_plane_deploy_report_compaction_checks_restored_real_http_routes(tmp_path: Path) -> None:
+    env = _compaction_harness(tmp_path)
+    with _compaction_http(env, transient=True) as requests:
+        result = _compact(env, '--execute')
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert set(requests) == {'/health', '/admin', '/airfoils/ag24'}
+    assert requests.count('/health') >= 2  # Wait for readiness after starting.
+    receipt = _compaction_receipt(env)
+    assert receipt['readiness_failed'] == 'false'
+    readiness = next(Path(env['AIRFOILS_PRO_STATE_DIR']).glob('progressive-report-compaction.*/readiness.tsv')).read_text()
+    assert all(label + '\tpassed\t200' in readiness for label in ['api-health', 'admin', 'airfoil-detail'])
+    _assert_compaction_restored(env, (True,) * 4)
+
+
+@pytest.mark.parametrize('failure', ['/health', '/admin', '/airfoils/ag24'])
+def test_control_plane_deploy_report_compaction_running_but_unavailable_fails(tmp_path: Path, failure: str) -> None:
+    env = _compaction_harness(tmp_path)
+    with _compaction_http(env, failure=failure) as requests:
+        result = _compact(env, '--execute')
+    assert result.returncode == 19, result.stdout + result.stderr
+    assert failure in requests
+    assert _compaction_receipt(env) == {'operation_exit': '0', 'recovery_failed': 'false', 'readiness_failed': 'true', 'exit': '19'}
+    _assert_compaction_restored(env, (True,) * 4)
+
+
+@pytest.mark.parametrize('running', [(False, True, True, True), (True, False, True, True)])
+def test_control_plane_deploy_report_compaction_skips_routes_for_pre_stopped_services(tmp_path: Path, running: tuple[bool, ...]) -> None:
+    env = _compaction_harness(tmp_path, running)
+    with _compaction_http(env) as requests:
+        result = _compact(env, '--execute')
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert requests == (['/health'] if running[0] else [])
+    _assert_compaction_restored(env, running)
+
+
+def test_control_plane_deploy_report_compaction_lock_covers_readiness_and_repeated_term(tmp_path: Path) -> None:
+    env = _compaction_harness(tmp_path)
+    entered, release = threading.Event(), threading.Event()
+    with _compaction_http(env, entered=entered, release=release):
+        process = subprocess.Popen(['bash', str(COMPACTION_SCRIPT), '--execute'], env=env,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            assert entered.wait(timeout=8)
+            assert _compact(env, '--execute').returncode == 9
+            process.send_signal(signal.SIGTERM)  # Cleanup cannot be interrupted again.
+            release.set()
+            stdout, stderr = process.communicate(timeout=10)
+            assert process.returncode == 0, stdout + stderr
+        finally:
+            release.set()
+            if process.poll() is None:
+                process.terminate()
+                process.communicate(timeout=10)
+    _assert_compaction_restored(env, (True,) * 4)
+
+
+def test_control_plane_deploy_report_compaction_rejects_credentials_and_unbounded_budgets(tmp_path: Path) -> None:
+    env = _compaction_harness(tmp_path)
+    env['PUBLIC_ORIGIN'] = 'https://private-user:private-secret@example.test'
+    result = _compact(env, '--execute')
+    assert result.returncode == 2
+    assert 'private-secret' not in result.stdout + result.stderr
+    assert not _compaction_calls(env)
+    env.pop('PUBLIC_ORIGIN')
+    env['COMPACTION_TIMEOUT_SECONDS'] = '0'
+    assert _compact(env, '--execute').returncode == 2
+    env['COMPACTION_TIMEOUT_SECONDS'] = '1801'
+    assert _compact(env, '--execute').returncode == 2
+
+
+def test_control_plane_deploy_report_compaction_accepts_explicit_longer_bounded_window(tmp_path: Path) -> None:
+    env = _compaction_harness(tmp_path)
+    env.update({'COMPACTION_TIMEOUT_SECONDS': '900', 'MAINTENANCE_TIMEOUT_SECONDS': '1200'})
+    result = _compact(env, '--execute')
+    assert result.returncode == 0, result.stdout + result.stderr
+    sql = next(args for args in _compaction_calls(env) if args[-1] == 'VACUUM (FULL, ANALYZE) public.progressive_remote_reports;')
+    assert 'statement_timeout=900000' in sql[2]
+    _assert_compaction_restored(env, (True,) * 4)
