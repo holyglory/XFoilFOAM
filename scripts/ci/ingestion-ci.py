@@ -21,10 +21,10 @@ import tomllib
 import traceback
 
 
-REVISION = "5c3eda88311dc3cb5c5e2be5ab8d89653f69844a"
+REVISION = "c79360da9edbf991f4d267031aa54d788d2be81a"
 BASELINE = "c5abb7587eba4c04e431056e1d3cddeeb76211b4"
-REGRESSION = "c5fa6b3d1e1db4f8256ff92c936ab8e8e7ccd2d2"
-BASELINE_REF = "refs/heads/codex/ingestion-lock-regression-source-20261110"
+REGRESSION = "5c3eda88311dc3cb5c5e2be5ab8d89653f69844a"
+BASELINE_REF = "refs/heads/codex/ingestion-recovery-final-20261110"
 MODES = {
     "types": ["workspace-types", "retention-test-types"],
     "database": [
