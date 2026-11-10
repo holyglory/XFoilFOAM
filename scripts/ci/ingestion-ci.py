@@ -21,7 +21,7 @@ import tomllib
 import traceback
 
 
-REVISION = "c79360da9edbf991f4d267031aa54d788d2be81a"
+REVISION = "a070dd7613305f6d7a44a0a2871fda65b05d6b0c"
 BASELINE = "c5abb7587eba4c04e431056e1d3cddeeb76211b4"
 REGRESSION = "5c3eda88311dc3cb5c5e2be5ab8d89653f69844a"
 BASELINE_REF = "refs/heads/codex/ingestion-recovery-final-20261110"
