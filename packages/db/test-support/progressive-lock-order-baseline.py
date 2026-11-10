@@ -14,7 +14,7 @@ import xml.etree.ElementTree as ET
 
 ROOT = Path(__file__).resolve().parents[3]
 BASELINE = "c5abb7587eba4c04e431056e1d3cddeeb76211b4"
-REGRESSION_SUITE = "c5fa6b3d1e1db4f8256ff92c936ab8e8e7ccd2d2"
+REGRESSION_SUITE = "5c3eda88311dc3cb5c5e2be5ab8d89653f69844a"
 SUITE = "packages/db/test/campaign-profile-enrollment.test.ts"
 EXPECTED = {
     "locks the campaign before the job while applying remote progress":

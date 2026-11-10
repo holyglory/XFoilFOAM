@@ -46,7 +46,7 @@ import { sourceAirModel } from "../../core/test/fixtures/source-air-model";
 import { progressivePredictionFixture as predictionFixture } from "../test-support/progressive-prediction";
 import { buildPolarRequest } from "../../../apps/sweeper/src/build-request";
 import { progressiveRecipes } from "../src/progressive-materialization";
-import { dirname, resolve } from "node:path";
+import { delimiter, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { and, eq, inArray, sql } from "drizzle-orm";
 import { PgDialect } from "drizzle-orm/pg-core";
@@ -1992,11 +1992,17 @@ function fittingRequest(
 function fitUsingPython(
   request: ProgressivePolarFitRequest,
 ): Promise<ProgressivePolarFitResponse> {
+  const pythonEnvironment = {
+    ...process.env,
+    PYTHONPATH: [resolve(ROOT, "src"), process.env.PYTHONPATH]
+      .filter(Boolean)
+      .join(delimiter),
+  };
   return new Promise((resolveResponse, reject) => {
     const child = spawn(
       process.env.XFOILFOAM_PYTHON ?? process.env.PYTHON ?? "python3",
       [resolve(ROOT, "tests/progressive_fit_gateway_fixture.py")],
-      { cwd: ROOT, stdio: ["pipe", "pipe", "pipe"] },
+      { cwd: ROOT, env: pythonEnvironment, stdio: ["pipe", "pipe", "pipe"] },
     );
     let output = "";
     let errors = "";
@@ -9694,6 +9700,7 @@ describe("persistent progressive polar cache", () => {
           [resolve(ROOT, "tests/windowed_force_history_fixture.py")],
           {
             cwd: ROOT,
+            env: pythonEnvironment,
             encoding: "utf8",
             timeout: 20_000,
             input: JSON.stringify({ offset: 203, alpha: unit.alpha }),
@@ -14624,7 +14631,7 @@ describe("sealed progressive generations", () => {
           const child = spawn(
             process.env.XFOILFOAM_PYTHON ?? process.env.PYTHON ?? "python3",
             [resolve(ROOT, "tests/prediction_gateway_fixture.py")],
-            { cwd: ROOT, stdio: ["pipe", "pipe", "pipe"] },
+            { cwd: ROOT, env: pythonEnvironment, stdio: ["pipe", "pipe", "pipe"] },
           );
           let output = "";
           let errors = "";
