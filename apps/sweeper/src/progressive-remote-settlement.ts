@@ -24,6 +24,7 @@ import {
 import { EngineClient, type JobResult } from "@aerodb/engine-client";
 import {
   readProgressiveRemoteRetention,
+  readProgressiveRemoteSourceClassifications,
   terminalReportHasNoPhysicalEvidence,
 } from "@aerodb/db/progressive-remote-retention";
 import {
@@ -425,7 +426,7 @@ async function recoveryPromotions(
   db: DB,
   envelope: ProgressiveRemoteExecutionEnvelope,
   retained: RetainedExecution,
-): Promise<ProgressiveRansPromotion[]> {
+): Promise<ProgressiveRansPromotion[] | null> {
   const reports =
     await db.execute(sql`SELECT DISTINCT ON (report#>'{result,polars,0,rans_precalc_promotion}')
       report, content_signature FROM progressive_remote_reports
@@ -467,11 +468,9 @@ async function recoveryPromotions(
       item.delivery.progressiveEvidence.pointContentSignature ===
       source.contentSignature,
   );
-  // A valid RANS sibling may still be publishable when the failed trigger
-  // itself was never retained. Keep the trigger unresolved and let normal
-  // settlement classify that unit as a gap; never widen the promotion scope
-  // or manufacture a trigger just to settle the surrounding job.
-  if (!receipt) return [];
+  // The original report remains the recovery obligation until its exact
+  // trigger is retained. An accepted sibling cannot stand in for that source.
+  if (!receipt) return null;
   const [revision] =
     await db.execute(sql`SELECT simulation_preset_revision_id FROM result_attempts
     WHERE id = ${receipt.resultAttemptId}::uuid AND sim_job_id = ${envelope.scope.executionId}::uuid`);
@@ -846,19 +845,25 @@ export async function settleProgressiveRemoteJob(db: DB, executionId: string) {
       return retained;
     }
     if (retained.sources.length === 0) {
+      const sources = await readProgressiveRemoteSourceClassifications(
+        connection,
+        executionId,
+      );
+      // A diagnostic-only final report can omit earlier physical history.
+      // Empty retention is sufficient only when every historical source is
+      // covered by the authenticated diagnostic path above.
+      if (sources.some((source) => source.kind === "requires_evidence"))
+        return { kind: "waiting" as const, reason: "raw_evidence" };
       await ingestTerminalRemoteFailureAttempts(connection, executionId);
       await recordProgressiveCfdMaterialDomainRecoveryPlans(
         connection,
         executionId,
       );
-      // A terminal report can arrive before its exact worker evidence receipt.
-      // Re-read retention after the diagnostic/terminal attempt path; never
-      // run RANS-promotion logic against an empty source set and turn a
-      // temporary publication race into a permanent sweeper error.
+      // Diagnostic custody can legitimately retain no physical attempts.
+      // Re-read after legacy material-failure ingestion without requiring
+      // physical evidence that the authenticated report never claimed.
       retained = await readProgressiveRemoteRetention(connection, executionId);
       if (retained.kind === "waiting") return retained;
-      if (retained.sources.length === 0)
-        return { kind: "waiting" as const, reason: "raw_evidence" };
     }
     const result = retained.report.result;
     const finalPoints = new Set(
@@ -939,6 +944,8 @@ export async function settleProgressiveRemoteJob(db: DB, executionId: string) {
         envelope,
         retained,
       );
+      if (promotions === null)
+        return { kind: "waiting" as const, reason: "promotion_trigger" };
       await recordProgressiveCfdRecoveryPlans(
         connection,
         executionId,

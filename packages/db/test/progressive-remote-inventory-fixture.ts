@@ -23,6 +23,50 @@ import { verifyPublicationRecovery } from "./progressive-publication-recovery-fi
 import { verifyRetainedReports } from "./retained-report-fixture";
 import * as ingestion from "../../../apps/sweeper/src/ingest";
 
+async function verifyPhysicalHistoryBeforeTerminalDiagnostic(db: DB, terminal: ProgressiveRemoteReport) {
+  const restore = new Error("Restore physical history before terminal diagnostic");
+  await expect(db.transaction(async (transaction) => {
+    const connection = transaction as unknown as DB;
+    const executionId = terminal.executionId;
+    const early = structuredClone(terminal);
+    early.sequence = 1;
+    early.status.state = "running";
+    early.result!.state = "running";
+    early.stopProof = null;
+    early.result!.polars[0].attempts![0].force_history = {
+      t: [0, 0.1, 0.2], cl: [0.3, 0.4, 0.4], cd: [0.03, 0.03, 0.03], cm: [0, 0, 0],
+    };
+    const final = { ...terminal, sequence: 2 };
+    for (const report of [early, final]) {
+      await storeProgressiveRemoteReport(connection, {
+        executionId, solverId: terminal.solverId, promiseId: terminal.promiseId, report,
+      });
+      expect(await applyProgressiveRemoteProgress(connection, executionId)).toMatchObject({ kind: "applied", sequence: report.sequence });
+    }
+    const owners = await connection.execute(sql`SELECT attempt.token,attempt.outcome,unit.state,unit.lease_token
+      FROM progressive_cfd_attempts attempt JOIN progressive_cfd_units unit ON unit.id=attempt.unit_id
+      WHERE attempt.sim_job_id=${executionId}::uuid ORDER BY attempt.token`);
+    for (let replay = 0; replay < 2; replay += 1) {
+      // The retention reader's legacy terminal-diagnostic fallback returns an empty
+      // source set even though a distinct earlier physical generation is pending.
+      expect(await readProgressiveRemoteRetention(connection, executionId)).toMatchObject({ kind: "retained", sources: [] });
+      expect(await settleProgressiveRemoteJob(connection, executionId)).toMatchObject({ kind: "waiting", reason: "raw_evidence" });
+      const [job] = await connection.execute(sql`SELECT "ingestedAt" FROM sim_jobs WHERE id=${executionId}::uuid`);
+      expect(job.ingestedAt).toBeNull();
+      expect(await connection.execute(sql`SELECT attempt.token,attempt.outcome,unit.state,unit.lease_token
+        FROM progressive_cfd_attempts attempt JOIN progressive_cfd_units unit ON unit.id=attempt.unit_id
+        WHERE attempt.sim_job_id=${executionId}::uuid ORDER BY attempt.token`)).toEqual(owners);
+      expect(await connection.execute(sql`SELECT id FROM result_attempts
+        WHERE sim_job_id=${executionId}::uuid AND valid_for_polar`)).toHaveLength(0);
+    }
+    expect(await connection.execute(sql`SELECT sequence FROM progressive_remote_report_inventories
+      WHERE sim_job_id=${executionId}::uuid`)).toHaveLength(2);
+    expect(await connection.execute(sql`SELECT point_content_signature FROM progressive_remote_diagnostic_receipts
+      WHERE sim_job_id=${executionId}::uuid`)).toHaveLength(1);
+    throw restore;
+  })).rejects.toBe(restore);
+}
+
 export async function verifyTerminalRemoteMaterialFailureIngest(
   db: DB,
   terminal: ProgressiveRemoteReport,
@@ -79,6 +123,7 @@ export async function verifyTerminalRemoteMaterialFailureIngest(
       FROM sim_jobs WHERE id=${executionId}::uuid`);
     expect(setup.solver).toBe("rhoSimpleFoam");
     await connection.execute(sql`DELETE FROM progressive_remote_reports WHERE sim_job_id=${executionId}::uuid`);
+    await verifyPhysicalHistoryBeforeTerminalDiagnostic(connection, failure);
     await storeProgressiveRemoteReport(connection, {
       executionId,
       solverId: failure.solverId,
