@@ -162,7 +162,7 @@ async function verifyDiagnosticOnlyRemoteSettlement(db: DB, envelope: Progressiv
           WHERE sim_job_id=${executionId}::uuid`);
         expect(receipts).toHaveLength(1);
         expect(receipts[0]).toMatchObject({ point_content_signature: source.contentSignature,
-          receipt: { kind: "retained-progressive-diagnostic", failureKind, executionId } });
+          receipt: { kind: "retained-progressive-diagnostic", version: 1, executionId } });
         expect(await settleProgressiveRemoteJob(connection, executionId)).toMatchObject({ kind: "settled" });
         expect(await connection.execute(sql`SELECT point_content_signature,receipt FROM progressive_remote_diagnostic_receipts
           WHERE sim_job_id=${executionId}::uuid`)).toEqual(receipts);
@@ -197,7 +197,7 @@ async function verifyMissingRemotePromotionTrigger(db: DB, envelope: Progressive
     expect(angles).toContain(0);
     expect(angles).toContain(1);
     const accepted = { ...polar.attempts![0], aoa_deg: 0, case_slug: "promotion-accepted-sibling",
-      converged: true, stalled: false, cm: 0, error: null };
+      converged: true, stalled: false, cm: 0, error: null, fidelity: "rans" as const };
     delete accepted.failure_disposition;
     const trigger = { ...accepted, aoa_deg: 1, case_slug: "promotion-missing-trigger",
       cl: null, cd: null, cm: null, converged: false, evidence_artifacts: [],
