@@ -112,7 +112,8 @@ async function verifyDiagnosticOnlyRemoteSettlement(db: DB, envelope: Progressiv
   for (const failureKind of ["material_domain"] as const) {
     for (const state of ["completed", "failed", "cancelled"] as const) {
       const restore = new Error(`Restore diagnostic-only settlement ${failureKind}/${state}`);
-      await expect(db.transaction(async (transaction) => {
+      try {
+        await db.transaction(async (transaction) => {
         const connection = transaction as unknown as DB;
         const executionId = envelope.scope.executionId;
         const result = progressiveRemoteEvidenceResult(envelope);
@@ -171,14 +172,19 @@ async function verifyDiagnosticOnlyRemoteSettlement(db: DB, envelope: Progressiv
           WHERE sim_job_id=${executionId}::uuid AND sequence=1`);
         expect(stored).toMatchObject({ report, content_signature: analysisContentHash(report) });
         throw restore;
-      })).rejects.toBe(restore);
+        });
+        throw new Error("Diagnostic-only settlement fixture did not reach its rollback sentinel");
+      } catch (error) {
+        if (error !== restore) throw error;
+      }
     }
   }
 }
 
 async function verifyMissingRemotePromotionTrigger(db: DB, envelope: ProgressiveRemoteExecutionEnvelope) {
   const restore = new Error("Restore remote promotion trigger custody");
-  await expect(db.transaction(async (transaction) => {
+  try {
+    await db.transaction(async (transaction) => {
     const connection = transaction as unknown as DB;
     const executionId = envelope.scope.executionId;
     const result = progressiveRemoteEvidenceResult(envelope);
@@ -293,7 +299,11 @@ async function verifyMissingRemotePromotionTrigger(db: DB, envelope: Progressive
       WHERE sim_job_id=${executionId}::uuid AND sequence=${early.sequence}`);
     expect(original).toMatchObject({ report: early, content_signature: analysisContentHash(early) });
     throw restore;
-  })).rejects.toBe(restore);
+    });
+    throw new Error("Promotion-custody fixture did not reach its rollback sentinel");
+  } catch (error) {
+    if (error !== restore) throw error;
+  }
 }
 
 export async function verifyPriorRawStoppedProgressiveSettlement(db: DB, envelope: ProgressiveRemoteExecutionEnvelope) {
