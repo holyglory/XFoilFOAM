@@ -11,7 +11,7 @@ permissions:
   contents: read
 
 env:
-  FUNCTIONAL_REF: a070dd7613305f6d7a44a0a2871fda65b05d6b0c
+  FUNCTIONAL_REF: 5398aebe52ce483f567bb771b84d985cc67457c0
   CI: 'true'
   COREPACK_ENABLE_DOWNLOAD_PROMPT: '0'
 
@@ -79,6 +79,11 @@ jobs:
         with:
           node-version: '22'
           package-manager-cache: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+      - name: Install the pinned Python fixture dependency
+        run: python -m pip install 'numpy==2.2.6'
       - name: Migrate, seed and run the exact final graph coverage
         run: python3 harness/scripts/ci/ingestion-ci.py database --source source --output "$RUNNER_TEMP/ingestion-ci-database"
       - name: Retain JUnit, baseline proofs, source identity and complete logs
