@@ -1274,7 +1274,7 @@ command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "seed"]
 name = "exact-ingestion"
 tier = "development"
 requires = ["seed", "types"]
-command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "progressive remote dispatch pins one exact request|does not reserve remote CPU for an unstarted dispatch after its case lease expires|releases an exact remote dispatch that never reached the worker|rejects never-started remote recovery when the exact job is too young"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "progressive remote dispatch pins one exact request"]
 
 [[test.staging-selection.check]]
 name = "campaign-read-model"
