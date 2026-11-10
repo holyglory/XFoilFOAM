@@ -45,6 +45,7 @@ import {
 import { sourceAirModel } from "../../core/test/fixtures/source-air-model";
 import { progressivePredictionFixture as predictionFixture } from "../test-support/progressive-prediction";
 import { buildPolarRequest } from "../../../apps/sweeper/src/build-request";
+import { progressiveRecipes } from "../src/progressive-materialization";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { and, eq, inArray, sql } from "drizzle-orm";
@@ -1586,6 +1587,7 @@ async function progressiveScope(
   campaignId: string,
   scopeKey = "initial",
   profileIds = [originalId],
+  completeCfdRecipes = false,
 ) {
   const [source] = await client.sql<
     {
@@ -1623,16 +1625,26 @@ async function progressiveScope(
       physical: target.physical,
       revisionId: source.revision_id,
       angles: [-2, 0, 2],
-      recipes: {
-        neuralfoil: {
-          recipe_id: "test-neuralfoil",
-          model_size: "large",
-          maximum_geometry_rms: 0.003,
-          maximum_geometry_error: 0.012,
-        },
-        fast: { recipe_id: "test-fast" },
-        precise: { recipe_id: "test-precise" },
-      },
+      recipes: completeCfdRecipes
+        ? {
+            neuralfoil: {
+              recipe_id: "test-neuralfoil",
+              model_size: "large",
+              maximum_geometry_rms: 0.003,
+              maximum_geometry_error: 0.012,
+            },
+            ...progressiveRecipes(source.snapshot),
+          }
+        : {
+            neuralfoil: {
+              recipe_id: "test-neuralfoil",
+              model_size: "large",
+              maximum_geometry_rms: 0.003,
+              maximum_geometry_error: 0.012,
+            },
+            fast: { recipe_id: "test-fast" },
+            precise: { recipe_id: "test-precise" },
+          },
     };
   });
   return {
@@ -1662,7 +1674,7 @@ async function fastCfdGeneration(twoProfiles = false) {
   }
   const generation = await sealProgressiveGeneration(
     db,
-    await progressiveScope(id, "cfd-test", profiles),
+    await progressiveScope(id, "cfd-test", profiles, true),
   );
   for (const _profile of profiles) {
     const baseline = (await claim([1]))!;
@@ -1982,7 +1994,7 @@ function fitUsingPython(
 ): Promise<ProgressivePolarFitResponse> {
   return new Promise((resolveResponse, reject) => {
     const child = spawn(
-      resolve(ROOT, ".venv/bin/python"),
+      process.env.XFOILFOAM_PYTHON ?? process.env.PYTHON ?? "python3",
       [resolve(ROOT, "tests/progressive_fit_gateway_fixture.py")],
       { cwd: ROOT, stdio: ["pipe", "pipe", "pipe"] },
     );
@@ -9678,7 +9690,7 @@ describe("persistent progressive polar cache", () => {
       evidenceIds.push(evidenceId);
       const history = JSON.parse(
         execFileSync(
-          resolve(ROOT, ".venv/bin/python"),
+          process.env.XFOILFOAM_PYTHON ?? process.env.PYTHON ?? "python3",
           [resolve(ROOT, "tests/windowed_force_history_fixture.py")],
           {
             cwd: ROOT,
@@ -12589,7 +12601,7 @@ describe("durable progressive CFD units", () => {
       expect(outcome.result).toMatchObject({ kind: "applied", sequence: 1, stopped: false });
       expect(await db.execute(sql`SELECT active_seconds FROM progressive_cfd_attempts WHERE token=${lease.token}`)).toEqual([{ active_seconds: 1 }]);
       expect(await applyProgressiveRemoteProgress(db, job.id)).toMatchObject({ kind: "idle" });
-      expect(await db.execute(sql`SELECT sequence FROM progressive_remote_progress_receipts WHERE sim_job_id=${job.id}::uuid`)).toEqual([{ sequence: 1 }]);
+      expect(await db.execute(sql`SELECT sequence::integer AS sequence FROM progressive_remote_progress_receipts WHERE sim_job_id=${job.id}::uuid`)).toEqual([{ sequence: 1 }]);
     } finally {
       await applying;
       await actor.sql.end();
@@ -14610,7 +14622,7 @@ describe("sealed progressive generations", () => {
         expect(request.conditions).toHaveLength(2);
         return new Promise((resolveResponse, reject) => {
           const child = spawn(
-            resolve(ROOT, ".venv/bin/python"),
+            process.env.XFOILFOAM_PYTHON ?? process.env.PYTHON ?? "python3",
             [resolve(ROOT, "tests/prediction_gateway_fixture.py")],
             { cwd: ROOT, stdio: ["pipe", "pipe", "pipe"] },
           );

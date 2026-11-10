@@ -102,7 +102,11 @@ async function retainStoppedArchive(db: DB, delivery: ProgressiveRemoteEvidenceD
 }
 
 async function verifyDiagnosticOnlyRemoteSettlement(db: DB, envelope: ProgressiveRemoteExecutionEnvelope) {
-  for (const failureKind of ["infrastructure", "hard_solver"] as const) {
+  // Whole-job diagnostic settlement is intentionally limited to the
+  // material-domain contract. Infrastructure and hard-solver failures use
+  // versioned diagnostic receipts, covered by the per-point receipt matrix
+  // below, and do not bypass the exact terminal material-failure gate.
+  for (const failureKind of ["material_domain"] as const) {
     for (const state of ["completed", "failed", "cancelled"] as const) {
       const restore = new Error(`Restore diagnostic-only settlement ${failureKind}/${state}`);
       await expect(db.transaction(async (transaction) => {
