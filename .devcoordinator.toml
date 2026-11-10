@@ -5063,3 +5063,106 @@ phase = "cleanup"
 after = ["inputs", "native", "comparison"]
 command = [".venv/bin/python", "-m", "scripts.materials.checkpoint_placement_control", "cleanup"]
 retained_artifacts = [{ name = "placement-receipt", path = ".codex-artifacts/checkpoint-placement/receipt", max_bytes = 16777216 }]
+
+
+# Combined frozen-snapshot proof. Parent starts only after the lock commit is integrated.
+[test.ingestion-recovery-final]
+timeout_seconds = 10800
+
+[test.ingestion-recovery-final.postgres]
+image = "postgres:16-alpine"
+database = "aerodb"
+user = "aerodb"
+
+[[test.ingestion-recovery-final.check]]
+name = "workspace"
+tier = "development"
+timeout_seconds = 600
+command = ["/usr/bin/corepack", "pnpm", "install", "--frozen-lockfile", "--ignore-scripts"]
+
+[[test.ingestion-recovery-final.check]]
+name = "schema"
+tier = "development"
+timeout_seconds = 300
+requires = ["workspace"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "migrate"]
+
+[[test.ingestion-recovery-final.check]]
+name = "seed"
+tier = "development"
+timeout_seconds = 600
+requires = ["schema"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "seed"]
+
+[[test.ingestion-recovery-final.check]]
+name = "workspace-types"
+tier = "development"
+timeout_seconds = 1200
+requires = ["workspace"]
+command = ["/usr/bin/corepack", "pnpm", "-r", "typecheck"]
+
+[[test.ingestion-recovery-final.check]]
+name = "retention-test-types"
+tier = "development"
+timeout_seconds = 600
+requires = ["workspace"]
+command = ["/usr/bin/corepack", "pnpm", "exec", "tsc", "--noEmit", "--target", "ES2022", "--lib", "ES2022", "--module", "ESNext", "--moduleResolution", "Bundler", "--moduleDetection", "force", "--strict", "--noImplicitOverride", "--noFallthroughCasesInSwitch", "--skipLibCheck", "--esModuleInterop", "--allowSyntheticDefaultImports", "--resolveJsonModule", "--isolatedModules", "--types", "node", "packages/db/test/progressive-report-retention.test.ts"]
+
+[[test.ingestion-recovery-final.check]]
+name = "report-contracts"
+tier = "development"
+timeout_seconds = 300
+requires = ["workspace"]
+command = ["/bin/bash", "-c", "exec /usr/bin/corepack pnpm --filter @aerodb/db exec vitest run test/progressive-remote-report.test.ts test/progressive-remote-execution.test.ts --reporter=default --reporter=junit --outputFile.junit=\"$DEVCOORDINATOR_DIAGNOSTICS_DIR/report.xml\""]
+diagnostic_sources = [{ format = "junit", path = "report.xml" }]
+
+[[test.ingestion-recovery-final.check]]
+name = "retention-contract"
+tier = "development"
+timeout_seconds = 300
+requires = ["schema"]
+command = ["/bin/bash", "-c", "exec /usr/bin/corepack pnpm --filter @aerodb/db exec vitest run test/progressive-report-retention.test.ts --reporter=default --reporter=junit --outputFile.junit=\"$DEVCOORDINATOR_DIAGNOSTICS_DIR/report.xml\""]
+diagnostic_sources = [{ format = "junit", path = "report.xml" }]
+
+[[test.ingestion-recovery-final.check]]
+name = "report-progress-poll-services"
+tier = "development"
+timeout_seconds = 600
+requires = ["schema"]
+command = ["/bin/bash", "-c", "exec /usr/bin/corepack pnpm --filter @aerodb/sweeper exec vitest run test/progressive-report-service.test.ts test/progressive-hub-progress-service.test.ts test/progressive-remote-progress-lock.test.ts test/progressive-remote-progress-policy.test.ts test/progressive-remote-admission-lock.test.ts test/progressive-service.test.ts test/progressive-restart-retention.test.ts test/service-lifecycle.test.ts --reporter=default --reporter=junit --outputFile.junit=\"$DEVCOORDINATOR_DIAGNOSTICS_DIR/report.xml\""]
+diagnostic_sources = [{ format = "junit", path = "report.xml" }]
+
+[[test.ingestion-recovery-final.check]]
+name = "settlement-campaign-regressions"
+tier = "development"
+timeout_seconds = 1200
+requires = ["seed"]
+command = ["/bin/bash", "-c", "exec /usr/bin/corepack pnpm --filter @aerodb/db exec vitest run test/campaign-profile-enrollment.test.ts -t 'retains exact stopped failed attempts|recovers terminal remote material failure ingestion|delivers an exact physical case beside a retained terminal material diagnostic|progressive remote dispatch pins one exact request' --reporter=default --reporter=junit --outputFile.junit=\"$DEVCOORDINATOR_DIAGNOSTICS_DIR/report.xml\""]
+diagnostic_sources = [{ format = "junit", path = "report.xml" }]
+resources = [{ kind = "database", id = "ingestion-recovery-campaign-fixtures", access = "exclusive" }]
+
+[[test.ingestion-recovery-final.check]]
+name = "campaign-lock-order-and-guards"
+tier = "development"
+timeout_seconds = 1200
+requires = ["seed"]
+command = ["/bin/bash", "-c", "exec /usr/bin/corepack pnpm --filter @aerodb/db exec vitest run test/campaign-profile-enrollment.test.ts -t 'locks the campaign before|serializes .* with one transaction|does not hold the sweeper state lock|progressive remote dispatch pins mixed terminal|keeps prior-generation stop safety|does not duplicate an expired execution|allows no new work on pause|prioritizes subsonic CFD targets|keeps low precise in-flight retries|requires a persisted exact physical stop' --reporter=default --reporter=junit --outputFile.junit=\"$DEVCOORDINATOR_DIAGNOSTICS_DIR/report.xml\""]
+diagnostic_sources = [{ format = "junit", path = "report.xml" }]
+resources = [{ kind = "database", id = "ingestion-recovery-campaign-fixtures", access = "exclusive" }]
+
+[[test.ingestion-recovery-final.check]]
+name = "old-source-lock-regressions"
+tier = "development"
+timeout_seconds = 600
+requires = ["seed"]
+command = ["/usr/bin/python3", "packages/db/test-support/progressive-lock-order-baseline.py"]
+resources = [{ kind = "database", id = "ingestion-recovery-campaign-fixtures", access = "exclusive" }]
+retained_artifacts = [{ name = "old-source-lock-order", path = ".codex-artifacts/progressive-lock-order-baseline", max_bytes = 1048576 }]
+
+[[test.ingestion-recovery-final.check]]
+name = "maintenance-contracts"
+tier = "development"
+timeout_seconds = 1800
+command = ["/bin/bash", "-c", "exec /home/holyglory/XFoilFOAM/.venv/bin/python -m pytest tests/test_deploy_sweeper_state.py tests/test_deployment_env_preflight.py tests/test_deployment_source_promotion.py tests/test_deployment_storage_prune.py -q --junitxml=\"$DEVCOORDINATOR_DIAGNOSTICS_DIR/maintenance.xml\""]
+env = { PYTHONPATH = "src:.", PYTHONDONTWRITEBYTECODE = "1" }
+diagnostic_sources = [{ format = "junit", path = "maintenance.xml" }]
