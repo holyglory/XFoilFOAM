@@ -1989,20 +1989,23 @@ function fittingRequest(
   };
 }
 
-function fitUsingPython(
-  request: ProgressivePolarFitRequest,
-): Promise<ProgressivePolarFitResponse> {
-  const pythonEnvironment = {
+function pythonFixtureEnvironment() {
+  return {
     ...process.env,
     PYTHONPATH: [resolve(ROOT, "src"), process.env.PYTHONPATH]
       .filter(Boolean)
       .join(delimiter),
   };
+}
+
+function fitUsingPython(
+  request: ProgressivePolarFitRequest,
+): Promise<ProgressivePolarFitResponse> {
   return new Promise((resolveResponse, reject) => {
     const child = spawn(
       process.env.XFOILFOAM_PYTHON ?? process.env.PYTHON ?? "python3",
       [resolve(ROOT, "tests/progressive_fit_gateway_fixture.py")],
-      { cwd: ROOT, env: pythonEnvironment, stdio: ["pipe", "pipe", "pipe"] },
+      { cwd: ROOT, env: pythonFixtureEnvironment(), stdio: ["pipe", "pipe", "pipe"] },
     );
     let output = "";
     let errors = "";
@@ -9700,7 +9703,7 @@ describe("persistent progressive polar cache", () => {
           [resolve(ROOT, "tests/windowed_force_history_fixture.py")],
           {
             cwd: ROOT,
-            env: pythonEnvironment,
+            env: pythonFixtureEnvironment(),
             encoding: "utf8",
             timeout: 20_000,
             input: JSON.stringify({ offset: 203, alpha: unit.alpha }),
@@ -14631,7 +14634,7 @@ describe("sealed progressive generations", () => {
           const child = spawn(
             process.env.XFOILFOAM_PYTHON ?? process.env.PYTHON ?? "python3",
             [resolve(ROOT, "tests/prediction_gateway_fixture.py")],
-            { cwd: ROOT, env: pythonEnvironment, stdio: ["pipe", "pipe", "pipe"] },
+            { cwd: ROOT, env: pythonFixtureEnvironment(), stdio: ["pipe", "pipe", "pipe"] },
           );
           let output = "";
           let errors = "";

@@ -5189,6 +5189,7 @@ timeout_seconds = 1200
 requires = ["seed"]
 command = ["/bin/bash", "-c", "exec /usr/bin/corepack pnpm --filter @aerodb/db exec vitest run test/campaign-profile-enrollment.test.ts -t 'locks the campaign before|serializes .* with one transaction|does not hold the sweeper state lock|progressive remote dispatch pins mixed terminal|keeps prior-generation stop safety|does not duplicate an expired execution|allows no new work on pause|prioritizes subsonic CFD targets|keeps low precise in-flight retries|requires a persisted exact physical stop|keeps never-started retry accounting attempt-local|caps repeated never-started submissions|only retries diagnosed infrastructure|progressive remote dispatch retains recovery on its original execution owner|transfers a terminal stopped local recovery parent' --reporter=default --reporter=junit --outputFile.junit=\"$DEVCOORDINATOR_DIAGNOSTICS_DIR/report.xml\""]
 diagnostic_sources = [{ format = "junit", path = "report.xml" }]
+env = { XFOILFOAM_PYTHON = "/home/holyglory/XFoilFOAM/.venv/bin/python" }
 resources = [{ kind = "database", id = "ingestion-recovery-campaign-fixtures", access = "exclusive" }]
 
 [[test.ingestion-recovery-final.check]]

@@ -519,6 +519,12 @@ async function ingestTerminalRemoteFailureAttempts(
     !terminalReportHasNoPhysicalEvidence(validated.report)
   )
     return false;
+  // This compatibility path only imports material-domain diagnostics. Other
+  // authenticated diagnostic kinds already have their own immutable receipts.
+  const sourceResult = validated.report.result as JobResult;
+  const attempts = sourceResult.polars.flatMap((polar) => polar.attempts ?? []);
+  if (!attempts.length || !attempts.every((point) => point.failure_disposition === "material_domain"))
+    return false;
   const [existing] = await db.execute(sql`
     SELECT EXISTS (
       SELECT 1 FROM result_attempts
@@ -539,15 +545,6 @@ async function ingestTerminalRemoteFailureAttempts(
     throw new Error(
       "Remote material-domain report has no immutable setup revision",
     );
-  const sourceResult = validated.report.result as JobResult;
-  const attempts = sourceResult.polars.flatMap((polar) => polar.attempts ?? []);
-  if (
-    !attempts.length ||
-    !attempts.every(
-      (point) => point.failure_disposition === "material_domain",
-    )
-  )
-    return false;
   const report = sourceResult;
   const payload = (job.request_payload ?? {}) as Record<string, unknown>;
   const engineRequest = (payload.engineRequest ?? {}) as Record<string, unknown>;

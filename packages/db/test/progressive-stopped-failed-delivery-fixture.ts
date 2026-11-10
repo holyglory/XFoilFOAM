@@ -8,10 +8,7 @@ import type { ProgressiveRemoteExecutionEnvelope } from "../src/progressive-remo
 import { progressiveRemotePointProjection } from "../src/progressive-remote-point-projection";
 import { storeProgressiveRemoteReport } from "../src/progressive-remote-reports";
 import { resolveProgressiveRemoteEvidence } from "../src/progressive-remote-evidence";
-import {
-  readProgressiveRemoteRetention,
-  readProgressiveRemoteSourceClassifications,
-} from "../src/progressive-remote-retention";
+import { readProgressiveRemoteRetention } from "../src/progressive-remote-retention";
 import { claimProgressivePolarFit } from "../src/progressive-polar-cache";
 import { issueProgressiveRemoteDiagnosticReceipts } from "../src/progressive-remote-diagnostic-receipts";
 import { acknowledgeProgressiveWorkerReport, enqueueProgressiveWorkerReport } from "../src/progressive-worker-reports";
@@ -105,11 +102,7 @@ async function retainStoppedArchive(db: DB, delivery: ProgressiveRemoteEvidenceD
 }
 
 async function verifyDiagnosticOnlyRemoteSettlement(db: DB, envelope: ProgressiveRemoteExecutionEnvelope) {
-  // Whole-job diagnostic settlement is intentionally limited to the
-  // material-domain contract. Infrastructure and hard-solver failures use
-  // versioned diagnostic receipts, covered by the per-point receipt matrix
-  // below, and do not bypass the exact terminal material-failure gate.
-  for (const failureKind of ["material_domain"] as const) {
+  for (const failureKind of ["material_domain", "infrastructure", "hard_solver"] as const) {
     for (const state of ["completed", "failed", "cancelled"] as const) {
       const restore = new Error(`Restore diagnostic-only settlement ${failureKind}/${state}`);
       try {
@@ -121,13 +114,18 @@ async function verifyDiagnosticOnlyRemoteSettlement(db: DB, envelope: Progressiv
         const [revision] = await connection.execute(sql`SELECT snapshot FROM simulation_preset_revisions
           WHERE id=(SELECT simulation_preset_revision_id FROM sim_jobs WHERE id=${executionId}::uuid)`);
         polar.reynolds = Number((revision.snapshot as { derived: { reynolds: number } }).derived.reynolds);
-        polar.attempts = [{ ...polar.attempts![0], cl: null, cd: null, cm: null,
-          evidence_artifacts: [], failure_disposition: failureKind, error: "Retained terminal diagnostic only" }];
+        const template = polar.attempts![0];
+        polar.attempts = envelope.scope.units.map((unit) => ({
+          ...template, aoa_deg: unit.alpha, case_slug: `diagnostic-${unit.alpha}`,
+          cl: null, cd: null, cm: null, evidence_artifacts: [],
+          failure_disposition: failureKind, error: "Retained terminal diagnostic only",
+        }));
         result.state = state;
         const report: ProgressiveRemoteReport = {
           version: 1, solverId: envelope.solverId, promiseId: envelope.promiseId, executionId,
           assignmentSignature: envelope.contentSignature, sequence: 1,
-          status: { job_id: executionId, state, total_cases: envelope.scope.units.length, completed_cases: 1 }, result,
+          status: { job_id: executionId, state, total_cases: envelope.scope.units.length,
+            completed_cases: polar.attempts.length }, result,
           stopProof: { version: 1, job_id: executionId, execution_stopped: true, producer_stopped: true,
             namespace_verified: true, remaining: [], observed_at: new Date().toISOString(), error: null,
             fence: "terminal_result", ownership_basis: "recorded_execution_namespace" },
@@ -144,13 +142,8 @@ async function verifyDiagnosticOnlyRemoteSettlement(db: DB, envelope: Progressiv
           WHERE sim_job_id=${executionId}::uuid ORDER BY token`);
         await connection.execute(sql`DELETE FROM progressive_remote_diagnostic_receipts WHERE sim_job_id=${executionId}::uuid`);
         const diagnosticRetention = await readProgressiveRemoteRetention(connection, executionId);
-        const diagnosticClassifications = await readProgressiveRemoteSourceClassifications(connection, executionId);
-        console.log("DIAGNOSTIC_RETENTION", JSON.stringify(diagnosticRetention));
-        console.log("DIAGNOSTIC_CLASSIFICATIONS", JSON.stringify(diagnosticClassifications));
         expect(diagnosticRetention).toMatchObject({ kind: "retained", sources: [] });
-        const source = progressiveReportedPointSources(result)[0];
         const diagnosticSettlement = await settleProgressiveRemoteJob(connection, executionId);
-        console.log("DIAGNOSTIC_SETTLEMENT", JSON.stringify(diagnosticSettlement));
         expect(diagnosticSettlement).toMatchObject({ kind: "settled", counts: { complete: 0 } });
         const [job] = await connection.execute(sql`SELECT status,"ingestedAt" FROM sim_jobs WHERE id=${executionId}::uuid`);
         expect(job.status).toBe(state === "completed" ? "done" : state);
@@ -160,9 +153,13 @@ async function verifyDiagnosticOnlyRemoteSettlement(db: DB, envelope: Progressiv
           WHERE sim_job_id=${executionId}::uuid`)).toHaveLength(0);
         const receipts = await connection.execute(sql`SELECT point_content_signature,receipt FROM progressive_remote_diagnostic_receipts
           WHERE sim_job_id=${executionId}::uuid`);
-        expect(receipts).toHaveLength(1);
-        expect(receipts[0]).toMatchObject({ point_content_signature: source.contentSignature,
-          receipt: { kind: "retained-progressive-diagnostic", version: 1, executionId } });
+        expect(receipts).toHaveLength(polar.attempts.length);
+        for (const source of progressiveReportedPointSources(result)) {
+          const receipt = receipts.find((entry) => entry.point_content_signature === source.contentSignature);
+          expect(receipt).toMatchObject({ point_content_signature: source.contentSignature,
+            receipt: { kind: "retained-progressive-diagnostic", executionId,
+              ...(failureKind === "material_domain" ? { version: 1 } : { version: 2, failureKind }) } });
+        }
         expect(await settleProgressiveRemoteJob(connection, executionId)).toMatchObject({ kind: "settled" });
         expect(await connection.execute(sql`SELECT point_content_signature,receipt FROM progressive_remote_diagnostic_receipts
           WHERE sim_job_id=${executionId}::uuid`)).toEqual(receipts);
@@ -257,7 +254,6 @@ async function verifyMissingRemotePromotionTrigger(db: DB, envelope: Progressive
       await retainStoppedArchive(connection, delivery, String(receipt.resultAttemptId));
     });
     const promotionRetention = await readProgressiveRemoteRetention(connection, executionId);
-    console.log("PROMOTION_RETENTION", JSON.stringify(promotionRetention));
     expect(promotionRetention).toMatchObject({
       kind: "retained", sources: [{ archived: true, storageOnly: false }],
     });
@@ -281,13 +277,6 @@ async function verifyMissingRemotePromotionTrigger(db: DB, envelope: Progressive
       expect(diagnostics).toHaveLength(1);
       expect(diagnostics[0]).toMatchObject({ point_content_signature: triggerSource.contentSignature,
         receipt: { kind: "retained-progressive-diagnostic", failureKind: "hard_solver" } });
-      const publicationState = await connection.execute(sql`SELECT raw.id,raw.aoa_deg,raw.status,raw.valid_for_polar,
-          classification.state,result.current_result_attempt_id
-        FROM result_attempts raw
-        JOIN results result ON result.id=raw.result_id
-        LEFT JOIN result_classifications classification ON classification.result_attempt_id=raw.id
-        WHERE raw.sim_job_id=${executionId}::uuid ORDER BY raw.aoa_deg,raw.id`);
-      console.log("PROMOTION_PUBLICATION_STATE", JSON.stringify(publicationState));
       const [published] = await connection.execute(sql`SELECT raw.aoa_deg,raw.valid_for_polar,classification.state
         FROM results result JOIN result_attempts raw ON raw.id=result.current_result_attempt_id
         JOIN result_classifications classification ON classification.result_attempt_id=raw.id
