@@ -24,7 +24,7 @@ import traceback
 REVISION = "a070dd7613305f6d7a44a0a2871fda65b05d6b0c"
 BASELINE = "c5abb7587eba4c04e431056e1d3cddeeb76211b4"
 REGRESSION = "5c3eda88311dc3cb5c5e2be5ab8d89653f69844a"
-BASELINE_REF = "refs/heads/codex/ingestion-recovery-final-20261110"
+BASELINE_REF = "refs/heads/codex/ingestion-lock-regression-source-20261110"
 MODES = {
     "types": ["workspace-types", "retention-test-types"],
     "database": [
@@ -161,7 +161,7 @@ def run(mode: str, source: Path, output: Path) -> int:
                             "https://github.com/holyglory/XFoilFOAM.git", BASELINE_REF], cwd=source, check=True)
             for commit in (BASELINE, REGRESSION):
                 subprocess.run(["git", "cat-file", "-e", commit + "^{commit}"], cwd=source, check=True)
-                subprocess.run(["git", "merge-base", "--is-ancestor", commit, "FETCH_HEAD"], cwd=source, check=True)
+            subprocess.run(["git", "merge-base", "--is-ancestor", BASELINE, "FETCH_HEAD"], cwd=source, check=True)
             report["baseline_source_ref"] = BASELINE_REF
             report["baseline_ref_commit"] = git(source, "rev-parse", "FETCH_HEAD")
             scratch = Path(os.environ["RUNNER_TEMP"]) / "ingestion-baseline-scratch"
