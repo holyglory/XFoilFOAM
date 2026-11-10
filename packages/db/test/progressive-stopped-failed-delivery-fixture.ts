@@ -141,7 +141,9 @@ async function verifyDiagnosticOnlyRemoteSettlement(db: DB, envelope: Progressiv
         await connection.execute(sql`DELETE FROM progressive_remote_diagnostic_receipts WHERE sim_job_id=${executionId}::uuid`);
         expect(await readProgressiveRemoteRetention(connection, executionId)).toMatchObject({ kind: "retained", sources: [] });
         const source = progressiveReportedPointSources(result)[0];
-        expect(await settleProgressiveRemoteJob(connection, executionId)).toMatchObject({ kind: "settled", counts: { complete: 0 } });
+        const diagnosticSettlement = await settleProgressiveRemoteJob(connection, executionId);
+        console.log("DIAGNOSTIC_SETTLEMENT", JSON.stringify(diagnosticSettlement));
+        expect(diagnosticSettlement).toMatchObject({ kind: "settled", counts: { complete: 0 } });
         const [job] = await connection.execute(sql`SELECT status,"ingestedAt" FROM sim_jobs WHERE id=${executionId}::uuid`);
         expect(job.status).toBe(state === "completed" ? "done" : state);
         expect(job.ingestedAt).not.toBeNull();
@@ -264,6 +266,13 @@ async function verifyMissingRemotePromotionTrigger(db: DB, envelope: Progressive
       expect(diagnostics).toHaveLength(1);
       expect(diagnostics[0]).toMatchObject({ point_content_signature: triggerSource.contentSignature,
         receipt: { kind: "retained-progressive-diagnostic", failureKind: "hard_solver" } });
+      const publicationState = await connection.execute(sql`SELECT raw.id,raw.aoa_deg,raw.status,raw.valid_for_polar,
+          classification.state,result.current_result_attempt_id
+        FROM result_attempts raw
+        JOIN results result ON result.id=raw.result_id
+        LEFT JOIN result_classifications classification ON classification.result_attempt_id=raw.id
+        WHERE raw.sim_job_id=${executionId}::uuid ORDER BY raw.aoa_deg,raw.id`);
+      console.log("PROMOTION_PUBLICATION_STATE", JSON.stringify(publicationState));
       const [published] = await connection.execute(sql`SELECT raw.aoa_deg,raw.valid_for_polar,classification.state
         FROM results result JOIN result_attempts raw ON raw.id=result.current_result_attempt_id
         JOIN result_classifications classification ON classification.result_attempt_id=raw.id
