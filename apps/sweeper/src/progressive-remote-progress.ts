@@ -60,8 +60,10 @@ async function applyProgressiveRemoteProgressInTransaction(
     await connection.execute(
       sql`SELECT id FROM calculation_epochs WHERE id = ${envelope.scope.epochId}::uuid FOR SHARE`,
     );
+    // Runtime and stop receipts also lock the campaign. Take it before the job,
+    // in the same order as publication and settlement.
     const [campaign] = await connection.execute(sql`SELECT campaign.id FROM sim_campaigns campaign JOIN sim_jobs job ON job.campaign_id = campaign.id
-      WHERE job.id = ${executionId}::uuid`);
+      WHERE job.id = ${executionId}::uuid FOR UPDATE OF campaign`);
     if (!campaign) return { kind: "waiting" as const };
     const [job] = await connection.execute(
       sql`SELECT engine_job_id, status, engine_state, completed_cases, request_payload

@@ -5015,6 +5015,47 @@ after = ["inputs", "native", "comparison"]
 command = [".venv/bin/python", "-m", "scripts.materials.checkpoint_placement_control", "cleanup"]
 retained_artifacts = [{ name = "placement-receipt", path = ".codex-artifacts/checkpoint-placement/receipt", max_bytes = 16777216 }]
 
+[test.progressive-lock-order]
+timeout_seconds = 3600
+
+[test.progressive-lock-order.postgres]
+image = "postgres:16-alpine"
+database = "aerodb"
+user = "aerodb"
+
+[[test.progressive-lock-order.check]]
+name = "workspace"
+tier = "development"
+command = ["/usr/bin/corepack", "pnpm", "install", "--frozen-lockfile", "--ignore-scripts", "--offline"]
+
+[[test.progressive-lock-order.check]]
+name = "types"
+tier = "development"
+requires = ["workspace"]
+command = ["/usr/bin/corepack", "pnpm", "-r", "typecheck"]
+
+[[test.progressive-lock-order.check]]
+name = "progress-and-maintenance-contracts"
+tier = "development"
+requires = ["types"]
+timeout_seconds = 120
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/progressive-remote-progress-lock.test.ts", "test/progressive-remote-admission-lock.test.ts", "test/progressive-service.test.ts"]
+
+[[test.progressive-lock-order.check]]
+name = "old-source-regressions"
+tier = "development"
+requires = ["types"]
+timeout_seconds = 300
+command = ["/usr/bin/python3", "packages/db/test-support/progressive-lock-order-baseline.py"]
+retained_artifacts = [{ name = "old-source-lock-order", path = ".codex-artifacts/progressive-lock-order-baseline", max_bytes = 1048576 }]
+
+[[test.progressive-lock-order.check]]
+name = "campaign-lock-order-and-guards"
+tier = "development"
+requires = ["types"]
+timeout_seconds = 300
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "locks the campaign before|serializes .* with one transaction|does not hold the sweeper state lock|progressive remote dispatch pins mixed terminal|keeps prior-generation stop safety|does not duplicate an expired execution|allows no new work on pause|prioritizes subsonic CFD targets|keeps low precise in-flight retries|requires a persisted exact physical stop"]
+
 [deployment.checkpoint-placement]
 source = ["worktree"]
 components = ["benchmark"]

@@ -12492,6 +12492,214 @@ describe("progressive CFD evidence accounting", () => {
 });
 
 describe("durable progressive CFD units", () => {
+  function signal<T = void>() {
+    let resolve!: (value: T) => void;
+    const promise = new Promise<T>((ready) => { resolve = ready; });
+    return { promise, resolve };
+  }
+
+  async function fixtureBackendPid(connection: DB) {
+    const [backend] = await connection.execute(sql`
+      SELECT pg_backend_pid() AS pid, current_database() AS database
+    `);
+    expect(backend.database).toBe(DATABASE);
+    return Number(backend.pid);
+  }
+
+  async function waitForFixtureBlock(waiter: number, owner: number) {
+    await expect.poll(async () => {
+      const [row] = await db.execute(sql`
+        SELECT EXISTS (SELECT 1 FROM pg_stat_activity
+          WHERE datname = current_database() AND pid = ${waiter}::integer
+            AND wait_event_type = 'Lock'
+            AND ${owner}::integer = ANY(pg_blocking_pids(pid))) AS waiting
+      `);
+      return row.waiting;
+    }, { timeout: 5_000, interval: 25 }).toBe(true);
+  }
+
+  it("locks the campaign before the job while applying remote progress", async () => {
+    const fixture = await cfdEvidenceFixture(undefined, 2, [], [0]);
+    const lease = fixture.leases[0];
+    const solverId = randomUUID();
+    const promiseId = randomUUID();
+    const actor = createClient({ url: targetUrl.toString(), max: 1 });
+    const [settings] = await db.execute(sql`SELECT enabled, remote_solver_enabled FROM sync_api_settings WHERE id=1`);
+    const [state] = await db.execute(sql`SELECT enabled FROM sweeper_state WHERE id=1`);
+    let applying: Promise<{ result: Awaited<ReturnType<typeof applyProgressiveRemoteProgress>> | null; error: unknown }> | undefined;
+    try {
+      await db.execute(sql`UPDATE sweeper_state SET enabled=true WHERE id=1`);
+      await db.execute(sql`UPDATE sync_api_settings SET enabled=true,remote_solver_enabled=false WHERE id=1`);
+      const [job] = await db.select().from(simJobs).where(eq(simJobs.id, fixture.composed.jobId));
+      await db.execute(sql`INSERT INTO registered_remote_solvers
+        (id,instance_id,instance_name,cpu_capacity,cpu_budget,max_active_polar_promises)
+        VALUES (${solverId}::uuid,${randomUUID()},'campaign lock-order fixture',96,96,96)`);
+      await db.execute(sql`INSERT INTO sync_sweep_promises
+        (id,registered_solver_id,airfoil_id,simulation_preset_revision_id,aoa_count,"expiresAt")
+        VALUES (${promiseId}::uuid,${solverId}::uuid,${job.airfoilId}::uuid,
+          ${job.simulationPresetRevisionId}::uuid,1,clock_timestamp()+interval '1 hour')`);
+      await db.execute(sql`INSERT INTO sync_sweep_promise_points
+        (promise_id,airfoil_id,simulation_preset_revision_id,aoa_deg)
+        VALUES (${promiseId}::uuid,${job.airfoilId}::uuid,${job.simulationPresetRevisionId}::uuid,${lease.alpha})`);
+      await db.update(simJobs).set({ status: "pending", engineJobId: null, engineState: null }).where(eq(simJobs.id, job.id));
+      const bound = await bindProgressiveRemoteDispatch(db, { simJobId: job.id, solverId, promiseId });
+      await storeProgressiveRemoteReport(db, {
+        solverId, promiseId, executionId: job.id,
+        report: {
+          version: 1, solverId, promiseId, executionId: job.id,
+          assignmentSignature: bound.envelope.contentSignature, sequence: 1,
+          status: {
+            job_id: job.id, state: "running", total_cases: 1, completed_cases: 0,
+            solver_budget_progress: {
+              version: 1, job_id: job.id, observed_at: new Date().toISOString(),
+              cases: [{
+                chord: fixture.execution.snapshot.referenceGeometry.referenceLengthM,
+                speed: fixture.execution.snapshot.flowState.speedMps, aoa_deg: lease.alpha,
+                limit_seconds: fixture.composed.request.resources!.case_solver_budget_seconds!,
+                solver_active_seconds: 1, solver_running: true,
+              }],
+            },
+          },
+          result: null, stopProof: null,
+        },
+      });
+      await db.transaction(async (transaction) => {
+        const owner = transaction as unknown as DB;
+        const ownerPid = await fixtureBackendPid(owner);
+        expect(await owner.execute(sql`SELECT id FROM sim_campaigns WHERE id=${fixture.campaignId}::uuid FOR UPDATE`)).toHaveLength(1);
+        const started = signal<number>();
+        applying = actor.db.transaction(async (transaction) => {
+          const connection = transaction as unknown as DB;
+          started.resolve(await fixtureBackendPid(connection));
+          return applyProgressiveRemoteProgress(connection, job.id);
+        }).then((result) => ({ result, error: null }), (error: unknown) => ({ result: null, error }));
+        const actorPid = await Promise.race([started.promise, applying.then(() => { throw new Error("Progress actor exited before observation"); })]);
+        await waitForFixtureBlock(actorPid, ownerPid);
+        const jobAvailable = await transaction.transaction(async (probe) => {
+          expect(await probe.execute(sql`SELECT id FROM sim_jobs WHERE id=${job.id}::uuid FOR UPDATE NOWAIT`)).toHaveLength(1);
+          return true;
+        }).catch((error: { code?: string }) => {
+          if (error.code === "55P03") return false;
+          throw error;
+        });
+        expect.soft(jobAvailable, "campaign-lock-order: progress must not hold the job while waiting for campaign").toBe(true);
+      });
+      const outcome = await applying!;
+      expect(outcome.error).toBeNull();
+      expect(outcome.result).toMatchObject({ kind: "applied", sequence: 1, stopped: false });
+      expect(await db.execute(sql`SELECT active_seconds FROM progressive_cfd_attempts WHERE token=${lease.token}`)).toEqual([{ active_seconds: 1 }]);
+      expect(await applyProgressiveRemoteProgress(db, job.id)).toMatchObject({ kind: "idle" });
+      expect(await db.execute(sql`SELECT sequence FROM progressive_remote_progress_receipts WHERE sim_job_id=${job.id}::uuid`)).toEqual([{ sequence: 1 }]);
+    } finally {
+      await applying;
+      await actor.sql.end();
+      await db.execute(sql`DELETE FROM progressive_remote_dispatches WHERE sim_job_id=${fixture.composed.jobId}::uuid`);
+      await db.execute(sql`DELETE FROM sync_sweep_promises WHERE id=${promiseId}::uuid`);
+      await db.execute(sql`DELETE FROM registered_remote_solvers WHERE id=${solverId}::uuid`);
+      await db.execute(sql`UPDATE sync_api_settings SET enabled=${settings.enabled},remote_solver_enabled=${settings.remote_solver_enabled} WHERE id=1`);
+      await db.execute(sql`UPDATE sweeper_state SET enabled=${state.enabled} WHERE id=1`);
+    }
+  }, 30_000);
+
+  async function claimAndComposeBeside(
+    contend: (connection: DB, generation: Awaited<ReturnType<typeof fastCfdGeneration>>) => Promise<void>,
+  ) {
+    const generation = await fastCfdGeneration();
+    await initializeProgressiveCfdWork(db);
+    const reader = createClient({ url: targetUrl.toString(), max: 1 });
+    const [state] = await db.execute(sql`SELECT enabled FROM sweeper_state WHERE id=1`);
+    const pools = await db.execute(sql`SELECT id,enabled FROM solver_execution_pools`);
+    const claimed = signal<number>();
+    const compose = signal();
+    const reading = signal<number>();
+    let claiming: Promise<{ jobId: string | null; error: unknown }> | undefined;
+    let inspecting: Promise<{ error: unknown }> | undefined;
+    let leases: ProgressiveCfdLease[] = [];
+    try {
+      await db.execute(sql`UPDATE sweeper_state SET enabled=true WHERE id=1`);
+      await db.execute(sql`UPDATE solver_execution_pools SET enabled=true`);
+      claiming = db.transaction(async (transaction) => {
+        const connection = transaction as unknown as DB;
+        leases = await claimProgressiveCfdBatch(connection, {
+          owner: "claim-compose-lock-order", leaseSeconds: 120, maximumUnits: 1,
+          solverBudgetVersion: 2, localTimeStepVersion: 1,
+        });
+        expect(leases).toHaveLength(1);
+        claimed.resolve(await fixtureBackendPid(connection));
+        await compose.promise;
+        await connection.execute(sql`SET LOCAL lock_timeout='750ms'`);
+        return composeProgressiveCfdJob(connection, leases, {
+          cpuSlots: 1, meshRecoveryVersion: 1, solverBudgetVersion: 2, localTimeStepVersion: 1,
+        });
+      }).then((result) => ({ jobId: result.jobId, error: null }), (error: unknown) => ({ jobId: null, error }));
+      const claimPid = await Promise.race([claimed.promise, claiming.then(() => { throw new Error("Claim actor exited before composition"); })]);
+      inspecting = reader.db.transaction(async (transaction) => {
+        const connection = transaction as unknown as DB;
+        reading.resolve(await fixtureBackendPid(connection));
+        await contend(connection, generation);
+      }).then(() => ({ error: null }), (error: unknown) => ({ error }));
+      const readerPid = await Promise.race([reading.promise, inspecting.then(() => { throw new Error("Campaign reader exited before observation"); })]);
+      await waitForFixtureBlock(readerPid, claimPid);
+      compose.resolve();
+      const outcome = await claiming;
+      return { outcome, contender: await inspecting, leases, generation };
+    } finally {
+      compose.resolve();
+      await claiming;
+      await inspecting;
+      await reader.sql.end();
+      for (const pool of pools)
+        await db.execute(sql`UPDATE solver_execution_pools SET enabled=${pool.enabled} WHERE id=${pool.id}::uuid`);
+      await db.execute(sql`UPDATE sweeper_state SET enabled=${state.enabled} WHERE id=1`);
+    }
+  }
+
+  it("locks the campaign before dependent rows across claim and compose", async () => {
+    const { outcome, contender } = await claimAndComposeBeside(async (connection, generation) => {
+      // Model the campaign reader used by start authorization, then read the
+      // generation that the claimant already owns. Either wait must be safe.
+      await connection.execute(sql`SELECT id FROM sim_campaigns WHERE id=${generation.campaignId}::uuid FOR SHARE`);
+      await connection.execute(sql`SELECT id FROM progressive_generations WHERE id=${generation.generationId}::uuid FOR SHARE`);
+    });
+    expect.soft(outcome.error, "campaign-lock-order: composition must not upgrade campaign after locking generation").toBeNull();
+    expect(contender.error).toBeNull();
+    if (outcome.jobId) {
+      expect(await db.execute(sql`SELECT status FROM sim_jobs WHERE id=${outcome.jobId}::uuid`)).toEqual([{ status: "pending" }]);
+      expect(await db.execute(sql`SELECT sim_job_id FROM progressive_cfd_attempts WHERE sim_job_id=${outcome.jobId}::uuid`)).toHaveLength(1);
+    }
+  }, 30_000);
+
+  it.each(["pause", "reset"] as const)("serializes %s with one transaction claiming and composing CFD work", async (action) => {
+    const { outcome, contender, leases, generation } = await claimAndComposeBeside(async (connection, generation) => {
+      if (action === "pause")
+        expect(await connection.execute(sql`UPDATE sim_campaigns SET status='paused' WHERE id=${generation.campaignId}::uuid RETURNING id`)).toHaveLength(1);
+      else
+        await rotateCalculationEpoch(connection, "claim-compose lock-order reset");
+    });
+    expect(outcome.error).toBeNull();
+    expect(outcome.jobId).not.toBeNull();
+    expect(contender.error).toBeNull();
+    if (action === "pause")
+      expect(await db.execute(sql`SELECT status FROM sim_campaigns WHERE id=${generation.campaignId}::uuid`)).toEqual([{ status: "paused" }]);
+    else
+      expect(await db.execute(sql`SELECT id FROM calculation_epochs WHERE current`)).not.toEqual([{ id: leases[0].epochId }]);
+    const [before] = await db.execute(sql`SELECT count(*)::integer AS count FROM sim_jobs WHERE campaign_id=${generation.campaignId}::uuid`);
+    const [state] = await db.execute(sql`SELECT enabled FROM sweeper_state WHERE id=1`);
+    try {
+      await db.execute(sql`UPDATE sweeper_state SET enabled=true WHERE id=1`);
+      await expect(composeProgressiveCfdJob(db, leases, {
+        cpuSlots: 1, meshRecoveryVersion: 1, solverBudgetVersion: 2, localTimeStepVersion: 1,
+      })).rejects.toThrow(action === "pause" ? "Campaign does not admit new CFD execution" : "Obsolete CFD calculation epoch");
+      expect(await claimProgressiveCfdBatch(db, {
+        owner: "after-control-transition", leaseSeconds: 120, maximumUnits: 1,
+        solverBudgetVersion: 2, localTimeStepVersion: 1,
+      })).toEqual([]);
+    } finally {
+      await db.execute(sql`UPDATE sweeper_state SET enabled=${state.enabled} WHERE id=1`);
+    }
+    expect(await db.execute(sql`SELECT count(*)::integer AS count FROM sim_jobs WHERE campaign_id=${generation.campaignId}::uuid`)).toEqual([before]);
+  }, 30_000);
+
   it("does not hold the sweeper state lock while candidate selection waits", async () => {
     const generation = await fastCfdGeneration();
     await initializeProgressiveCfdWork(db);
@@ -12499,51 +12707,41 @@ describe("durable progressive CFD units", () => {
       sql`SELECT enabled FROM sweeper_state WHERE id = 1`,
     );
     await db.execute(sql`UPDATE sweeper_state SET enabled = true WHERE id = 1`);
-    const locker = createClient({ url: databaseUrl(), max: 1 });
+    const locker = createClient({ url: targetUrl.toString(), max: 1 });
+    const claimant = createClient({ url: targetUrl.toString(), max: 1 });
+    const started = signal<number>();
     let release!: () => void;
-    let locked!: () => void;
+    let locked!: (ownerPid: number) => void;
     const released = new Promise<void>((resolve) => {
       release = resolve;
     });
-    const campaignLocked = new Promise<void>((resolve) => {
+    const campaignLocked = new Promise<number>((resolve) => {
       locked = resolve;
     });
     const holding = locker.db.transaction(async (transaction) => {
-      await transaction.execute(
+      expect(await transaction.execute(
         sql`SELECT id FROM sim_campaigns WHERE id = ${generation.campaignId}::uuid FOR UPDATE`,
-      );
-      locked();
+      )).toHaveLength(1);
+      locked(await fixtureBackendPid(transaction as unknown as DB));
       await released;
     });
-    const claiming = async () =>
-      claimProgressiveCfdUnit(db, {
+    const claiming = async () => claimant.db.transaction(async (transaction) => {
+      const connection = transaction as unknown as DB;
+      started.resolve(await fixtureBackendPid(connection));
+      return claimProgressiveCfdUnit(connection, {
         owner: "lock-scope-regression",
         leaseSeconds: 120,
         requireSweeperEnabled: true,
         campaignLockMode: "wait",
         localTimeStepVersion: 1,
       });
+    });
     let pending: ReturnType<typeof claiming> | undefined;
     try {
-      await campaignLocked;
+      const ownerPid = await campaignLocked;
       pending = claiming();
-      await expect
-        .poll(
-          async () => {
-            const [row] = await db.execute(sql`
-              SELECT EXISTS (
-                SELECT 1 FROM pg_stat_activity
-                WHERE pid <> pg_backend_pid()
-                  AND wait_event_type = 'Lock'
-                  AND query LIKE '%FROM sim_campaigns%'
-                  AND query LIKE '%FOR UPDATE%'
-              ) AS waiting
-            `);
-            return row.waiting;
-          },
-          { timeout: 5_000, interval: 25 },
-        )
-        .toBe(true);
+      const claimPid = await Promise.race([started.promise, pending.then(() => { throw new Error("Claim actor exited before lock observation"); })]);
+      await waitForFixtureBlock(claimPid, ownerPid);
       await db.transaction(async (transaction) => {
         await transaction.execute(sql`SET LOCAL lock_timeout = '300ms'`);
         await transaction.execute(
@@ -12558,6 +12756,7 @@ describe("durable progressive CFD units", () => {
       await holding.catch(() => undefined);
       await pending?.catch(() => undefined);
       await locker.sql.end();
+      await claimant.sql.end();
       await db.execute(
         sql`UPDATE sweeper_state SET enabled = ${before?.enabled ?? false} WHERE id = 1`,
       );

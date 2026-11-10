@@ -16,7 +16,7 @@ import { selectPendingProgressiveRemoteReport } from "../src/progressive-remote-
 
 afterEach(() => vi.resetAllMocks());
 
-it("projects an immutable remote report without taking the campaign lock", async () => {
+it("locks the campaign before the job when projecting an immutable remote report", async () => {
   const executionId = "11111111-1111-4111-8111-111111111111";
   const epochId = "22222222-2222-4222-8222-222222222222";
   const campaignId = "33333333-3333-4333-8333-333333333333";
@@ -60,14 +60,19 @@ it("projects an immutable remote report without taking the campaign lock", async
   });
 
   const dialect = new PgDialect();
-  const campaignQuery = dialect.sqlToQuery(execute.mock.calls[2][0]).sql;
-  expect(campaignQuery).toContain("FROM sim_campaigns");
-  expect(campaignQuery).not.toContain("FOR UPDATE");
+  const queries = execute.mock.calls.map(([query]) => dialect.sqlToQuery(query).sql);
+  const epochIndex = queries.findIndex((query) => query.includes("FROM calculation_epochs"));
+  const campaignIndex = queries.findIndex((query) => query.includes("FROM sim_campaigns"));
+  const jobIndex = queries.findIndex((query) => query.includes("FROM sim_jobs"));
+  expect(epochIndex).toBeGreaterThanOrEqual(0);
+  expect(campaignIndex).toBeGreaterThan(epochIndex);
+  expect(jobIndex).toBeGreaterThan(campaignIndex);
+  expect(queries[epochIndex]).toContain("FOR SHARE");
+  const campaignQuery = queries[campaignIndex];
+  expect(campaignQuery).toContain("FOR UPDATE OF campaign");
   expect(campaignQuery).not.toContain("SKIP LOCKED");
 
-  const jobQuery = dialect.sqlToQuery(execute.mock.calls[3][0]).sql;
-  expect(jobQuery).toContain("FROM sim_jobs");
-  expect(jobQuery).toContain("FOR UPDATE");
+  expect(queries[jobIndex]).toContain("FOR UPDATE");
 });
 
 it("uses a contiguous receipt prefix to bound retained report history", async () => {
