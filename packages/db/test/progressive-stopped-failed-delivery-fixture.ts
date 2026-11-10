@@ -8,7 +8,10 @@ import type { ProgressiveRemoteExecutionEnvelope } from "../src/progressive-remo
 import { progressiveRemotePointProjection } from "../src/progressive-remote-point-projection";
 import { storeProgressiveRemoteReport } from "../src/progressive-remote-reports";
 import { resolveProgressiveRemoteEvidence } from "../src/progressive-remote-evidence";
-import { readProgressiveRemoteRetention } from "../src/progressive-remote-retention";
+import {
+  readProgressiveRemoteRetention,
+  readProgressiveRemoteSourceClassifications,
+} from "../src/progressive-remote-retention";
 import { claimProgressivePolarFit } from "../src/progressive-polar-cache";
 import { issueProgressiveRemoteDiagnosticReceipts } from "../src/progressive-remote-diagnostic-receipts";
 import { acknowledgeProgressiveWorkerReport, enqueueProgressiveWorkerReport } from "../src/progressive-worker-reports";
