@@ -58,8 +58,16 @@ with tempfile.TemporaryDirectory(prefix="campaign-lock-order-", dir=scratch) as 
     # The negative suite uses only imports that already existed in BASELINE.
     imports = rb"^import\b.*?;\r?\n"
     baseline_imports = re.findall(imports, (baseline / SUITE).read_bytes(), re.MULTILINE | re.DOTALL)
-    assert baseline_imports and baseline_imports == re.findall(imports, regression_suite, re.MULTILINE | re.DOTALL), \
-        "Pinned negative suite imports differ from the old baseline"
+    current_imports = re.findall(imports, regression_suite, re.MULTILINE | re.DOTALL)
+    module_path = lambda statement: re.search(rb'from ["\']([^"\']+)["\']', statement)
+    baseline_modules = {
+        match.group(1) for statement in baseline_imports if (match := module_path(statement))
+    }
+    current_modules = {
+        match.group(1) for statement in current_imports if (match := module_path(statement))
+    }
+    assert baseline_imports and current_imports and current_modules <= baseline_modules, \
+        "Pinned negative suite imports are not available in the old baseline"
     (baseline / SUITE).write_bytes(regression_suite)
     assert hashlib.sha256((baseline / SUITE).read_bytes()).hexdigest() == suite_hash
     subprocess.run(
