@@ -11,7 +11,7 @@ permissions:
   contents: read
 
 env:
-  FUNCTIONAL_REF: 782b7ac59e9d68bc2c741929812f066215c46300
+  FUNCTIONAL_REF: ca3cddaddf047f820733ef1a09961bcf308f1d1e
   CI: 'true'
   COREPACK_ENABLE_DOWNLOAD_PROMPT: '0'
 
@@ -83,7 +83,7 @@ jobs:
         with:
           python-version: '3.12'
       - name: Install the pinned Python fixture dependencies
-        run: python -m pip install 'fastapi==0.139.0' 'pydantic==2.13.4' 'numpy==2.5.1'
+        run: python -m pip install 'fastapi==0.139.0' 'pydantic==2.13.4' 'numpy==2.5.1' 'google-crc32c==1.8.0'
       - name: Migrate, seed and run the exact final graph coverage
         run: python3 harness/scripts/ci/ingestion-ci.py database --source source --output "$RUNNER_TEMP/ingestion-ci-database"
       - name: Retain JUnit, baseline proofs, source identity and complete logs
