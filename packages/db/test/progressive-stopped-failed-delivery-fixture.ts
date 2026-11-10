@@ -139,7 +139,11 @@ async function verifyDiagnosticOnlyRemoteSettlement(db: DB, envelope: Progressiv
         const owners = await connection.execute(sql`SELECT token,outcome FROM progressive_cfd_attempts
           WHERE sim_job_id=${executionId}::uuid ORDER BY token`);
         await connection.execute(sql`DELETE FROM progressive_remote_diagnostic_receipts WHERE sim_job_id=${executionId}::uuid`);
-        expect(await readProgressiveRemoteRetention(connection, executionId)).toMatchObject({ kind: "retained", sources: [] });
+        const diagnosticRetention = await readProgressiveRemoteRetention(connection, executionId);
+        const diagnosticClassifications = await readProgressiveRemoteSourceClassifications(connection, executionId);
+        console.log("DIAGNOSTIC_RETENTION", JSON.stringify(diagnosticRetention));
+        console.log("DIAGNOSTIC_CLASSIFICATIONS", JSON.stringify(diagnosticClassifications));
+        expect(diagnosticRetention).toMatchObject({ kind: "retained", sources: [] });
         const source = progressiveReportedPointSources(result)[0];
         const diagnosticSettlement = await settleProgressiveRemoteJob(connection, executionId);
         console.log("DIAGNOSTIC_SETTLEMENT", JSON.stringify(diagnosticSettlement));
@@ -243,7 +247,9 @@ async function verifyMissingRemotePromotionTrigger(db: DB, envelope: Progressive
       expect(receipt.storageOnly).toBe(false);
       await retainStoppedArchive(connection, delivery, String(receipt.resultAttemptId));
     });
-    expect(await readProgressiveRemoteRetention(connection, executionId)).toMatchObject({
+    const promotionRetention = await readProgressiveRemoteRetention(connection, executionId);
+    console.log("PROMOTION_RETENTION", JSON.stringify(promotionRetention));
+    expect(promotionRetention).toMatchObject({
       kind: "retained", sources: [{ archived: true, storageOnly: false }],
     });
     const before = await connection.execute(sql`SELECT attempt.token,attempt.outcome,unit.state,unit.lease_token
