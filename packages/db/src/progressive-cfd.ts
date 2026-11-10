@@ -386,7 +386,9 @@ export async function claimProgressiveCfdUnit(
           AND unit.state = 'pending' AND ${attemptAvailable} AND unit.active_seconds < ${effectiveBudget}
           AND (unit.retry_after IS NULL OR unit.retry_after <= clock_timestamp())
       )
-      ORDER BY campaign.priority DESC, campaign."createdAt", campaign.id LIMIT 1 FOR SHARE ${input.campaignLockMode === "wait" ? sql`` : sql`SKIP LOCKED`}
+      -- Composition needs this same mutex. Acquire it before generation/work
+      -- locks instead of upgrading a shared campaign lock afterwards.
+      ORDER BY campaign.priority DESC, campaign."createdAt", campaign.id LIMIT 1 FOR UPDATE ${input.campaignLockMode === "wait" ? sql`` : sql`SKIP LOCKED`}
     `);
     if (!campaign) return null;
     const cohortReadiness = campaign.all_stage3
