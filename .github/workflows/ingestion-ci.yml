@@ -11,7 +11,7 @@ permissions:
   contents: read
 
 env:
-  FUNCTIONAL_REF: 309d9f3c243d53291f8af21253f326b4659b275e
+  FUNCTIONAL_REF: 03b39e5a725707742101e14ca6c37c318ecb3bc7
   CI: 'true'
   COREPACK_ENABLE_DOWNLOAD_PROMPT: '0'
 
@@ -82,8 +82,8 @@ jobs:
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: '3.12'
-      - name: Install the pinned Python fixture dependencies
-        run: python -m pip install 'fastapi==0.139.0' 'pydantic==2.13.4' 'numpy==2.5.1' 'google-crc32c==1.8.0' 'zstandard==0.25.0'
+      - name: Install the locked Python fixture dependencies
+        run: python -m pip install --require-hashes -r source/docker/requirements.lock
       - name: Migrate, seed and run the exact final graph coverage
         run: python3 harness/scripts/ci/ingestion-ci.py database --source source --output "$RUNNER_TEMP/ingestion-ci-database"
       - name: Retain JUnit, baseline proofs, source identity and complete logs

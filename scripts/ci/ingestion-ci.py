@@ -21,7 +21,7 @@ import tomllib
 import traceback
 
 
-REVISION = "309d9f3c243d53291f8af21253f326b4659b275e"
+REVISION = "03b39e5a725707742101e14ca6c37c318ecb3bc7"
 BASELINE = "c5abb7587eba4c04e431056e1d3cddeeb76211b4"
 REGRESSION = REVISION
 BASELINE_REF = "refs/heads/codex/ingestion-lock-regression-source-20261110"
@@ -179,8 +179,10 @@ def run(mode: str, source: Path, output: Path) -> int:
                     # Only interpreter selection changes; the pinned pytest file list
                     # and full suite stay exactly as declared in the final graph.
                     command = [part.replace("/home/holyglory/XFoilFOAM/.venv/bin/python", sys.executable) for part in command]
-                record = execute(source, output, name, command, row["timeout_seconds"],
-                                 {**environment, **row.get("env", {})})
+                check_environment = {**environment, **row.get("env", {})}
+                if check_environment.get("XFOILFOAM_PYTHON") == "/home/holyglory/XFoilFOAM/.venv/bin/python":
+                    check_environment["XFOILFOAM_PYTHON"] = sys.executable
+                record = execute(source, output, name, command, row["timeout_seconds"], check_environment)
                 if record["status"] == "passed":
                     succeeded.add(name)
             report["checks"].append(record)
