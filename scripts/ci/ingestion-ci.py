@@ -157,7 +157,7 @@ def run(mode: str, source: Path, output: Path) -> int:
                 return 1
         if mode == "database":
             # Fetch only the public regression-source ref; never move functional HEAD.
-            subprocess.run(["git", "fetch", "--no-tags", "--depth=128",
+            subprocess.run(["git", "fetch", "--no-tags", "--depth=10000",
                             "https://github.com/holyglory/XFoilFOAM.git", BASELINE_REF], cwd=source, check=True)
             for commit in (BASELINE, REGRESSION):
                 subprocess.run(["git", "cat-file", "-e", commit + "^{commit}"], cwd=source, check=True)
