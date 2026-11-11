@@ -35,6 +35,12 @@ async function selectSettlementJobs(
   return terminalJobs;
 }
 
+async function createReportStopFixture(connection: Pick<DB, "execute">) {
+  await connection.execute(sql`CREATE TEMP TABLE progressive_cfd_execution_stops (
+    sim_job_id uuid PRIMARY KEY, engine_job_id text
+  ) ON COMMIT DROP`);
+}
+
 async function analyzeSelectionFixture(connection: Pick<DB, "execute">) {
   const tables = await connection.execute(sql`SELECT relname FROM pg_class
     WHERE relnamespace=pg_my_temp_schema() AND relkind='r'`);
@@ -116,6 +122,7 @@ it("recognizes exact completed canonical cleanup without deleting again or doubl
 
 it("keeps the oldest multi-report backlog selected after a bounded pass", async () => {
   await client.db.transaction(async (transaction) => {
+    await createReportStopFixture(transaction);
     await transaction.execute(sql`CREATE TEMP TABLE sim_jobs ON COMMIT DROP AS
       SELECT md5('old-backlog')::uuid AS id,md5('campaign')::uuid AS campaign_id,
         NULL::text AS engine_job_id,'running'::text AS status,
@@ -173,6 +180,7 @@ it("keeps the oldest multi-report backlog selected after a bounded pass", async 
 
 it("prioritizes current unsubmitted remote reports before older running backlog", async () => {
   await client.db.transaction(async (transaction) => {
+    await createReportStopFixture(transaction);
     await transaction.execute(sql`CREATE TEMP TABLE sim_jobs ON COMMIT DROP AS
       SELECT md5('old-running')::uuid AS id,md5('campaign')::uuid AS campaign_id,
         NULL::text AS engine_job_id,'running'::text AS status,
@@ -213,8 +221,9 @@ it("prioritizes current unsubmitted remote reports before older running backlog"
   });
 });
 
-it("drains pending remote jobs carrying their own stopped execution identity first", async () => {
+it("prioritizes pending remote jobs with an assigned engine before running jobs", async () => {
   await client.db.transaction(async (transaction) => {
+    await createReportStopFixture(transaction);
     await transaction.execute(sql`CREATE TEMP TABLE sim_jobs ON COMMIT DROP AS
       SELECT md5('stopped-pending')::uuid AS id,md5('campaign')::uuid AS campaign_id,
         md5('stopped-pending')::text AS engine_job_id,'pending'::text AS status,
@@ -253,6 +262,7 @@ it("drains pending remote jobs carrying their own stopped execution identity fir
 
 it("prioritizes active remote reports before terminal ingestion backlog", async () => {
   await client.db.transaction(async (transaction) => {
+    await createReportStopFixture(transaction);
     await transaction.execute(sql`CREATE TEMP TABLE sim_jobs ON COMMIT DROP AS
       SELECT md5('old-terminal')::uuid AS id,md5('campaign')::uuid AS campaign_id,
         NULL::text AS engine_job_id,'ingesting'::text AS status,
@@ -296,6 +306,7 @@ it.each([
   { reportCount: 120, activeCount: 80 },
 ])("reserves a bounded terminal lane with $activeCount active jobs and $reportCount reports each", async ({ reportCount, activeCount }) => {
   await client.db.transaction(async (transaction) => {
+    await createReportStopFixture(transaction);
     await transaction.execute(sql`CREATE TEMP TABLE sim_jobs ON COMMIT DROP AS
       SELECT md5('active-' || ordinal)::uuid AS id, md5('campaign')::uuid AS campaign_id,
         md5('active-engine-' || ordinal)::text AS engine_job_id, 'running'::text AS status,
@@ -357,6 +368,157 @@ it.each([
     expect(activeOnly.some((row) => terminalIds.has(row.sim_job_id))).toBe(false);
   });
 });
+
+it.each([8, 48])(
+  "reserves stopped reports before a %i-job report slice despite stale active status",
+  async (reportBudget) => {
+    await client.db.transaction(async (transaction) => {
+      await createReportStopFixture(transaction);
+      await transaction.execute(sql`CREATE TEMP TABLE report_lane_cases ON COMMIT DROP AS
+      SELECT md5(variant)::uuid AS id,variant,status,
+        variant LIKE 'stopped-%' AS stopped
+      FROM (VALUES
+        ('stopped-running-completed','running'),('stopped-running-failed','running'),
+        ('stopped-submitted','submitted'),('stopped-pending','pending'),
+        ('stopped-running-cancelled','running'),('wrong-job','running'),
+        ('wrong-engine','running'),('foreign-identity','running'),
+        ('missing-stop','running'),('missing-engine','running'),('active-running','running')
+      ) AS cases(variant,status)
+      UNION ALL SELECT md5('fresh-'||ordinal)::uuid,'fresh-'||ordinal,'pending',false
+      FROM generate_series(1,80) ordinal`);
+      await transaction.execute(sql`CREATE TEMP TABLE sim_jobs ON COMMIT DROP AS
+      SELECT id,md5('campaign')::uuid AS campaign_id,status,
+        CASE WHEN variant='missing-engine' THEN NULL
+          WHEN variant='foreign-identity' THEN 'foreign-engine' ELSE id::text END AS engine_job_id,
+        timestamptz '2026-11-11T03:53:00Z' AS "updatedAt",
+        timestamptz '2026-11-10T23:52:00Z' AS "polledAt"
+      FROM report_lane_cases`);
+      await transaction.execute(sql`CREATE TEMP TABLE progressive_remote_dispatches ON COMMIT DROP AS
+      SELECT id AS sim_job_id FROM sim_jobs`);
+      await transaction.execute(sql`INSERT INTO progressive_cfd_execution_stops
+      SELECT CASE WHEN variant='wrong-job' THEN md5('another-job')::uuid ELSE id END,
+        CASE WHEN variant IN ('wrong-engine','foreign-identity') THEN 'foreign-engine' ELSE id::text END
+      FROM report_lane_cases WHERE stopped OR variant IN ('wrong-job','wrong-engine','foreign-identity','missing-engine')`);
+      await transaction.execute(sql`CREATE TEMP TABLE progressive_remote_reports ON COMMIT DROP AS
+      SELECT id AS sim_job_id,sequence::bigint,
+        CASE WHEN variant LIKE 'fresh-%' THEN timestamptz '2026-11-11T03:53:00Z'
+          WHEN stopped THEN timestamptz '2026-11-10T23:53:00Z'
+          ELSE timestamptz '2026-11-10T22:00:00Z' END AS received_at,
+        jsonb_build_object('status',jsonb_build_object('state',
+          CASE WHEN sequence=1 OR variant LIKE 'fresh-%' OR variant='active-running' THEN 'running'
+            WHEN variant LIKE '%failed' THEN 'failed' WHEN variant LIKE '%cancelled' THEN 'cancelled'
+            ELSE 'completed' END)) AS report
+      FROM report_lane_cases CROSS JOIN generate_series(1,2) sequence`);
+      await transaction.execute(sql`CREATE TEMP TABLE progressive_remote_progress_receipts (
+      sim_job_id uuid,sequence bigint,PRIMARY KEY(sim_job_id,sequence)
+    ) ON COMMIT DROP`);
+      await transaction.execute(sql`CREATE TEMP TABLE progressive_remote_report_inventories (
+      sim_job_id uuid,sequence bigint,PRIMARY KEY(sim_job_id,sequence)
+    ) ON COMMIT DROP`);
+      await transaction.execute(
+        sql`INSERT INTO progressive_remote_progress_receipts SELECT id,1 FROM report_lane_cases`,
+      );
+      await transaction.execute(
+        sql`INSERT INTO progressive_remote_report_inventories SELECT id,1 FROM report_lane_cases`,
+      );
+      await analyzeSelectionFixture(transaction);
+
+      const cases = await transaction.execute(
+        sql`SELECT id,variant,stopped FROM report_lane_cases ORDER BY id`,
+      );
+      const fresh = new Set(
+        cases
+          .filter((row) => String(row.variant).startsWith("fresh-"))
+          .map((row) => String(row.id)),
+      );
+      const stopped = cases
+        .filter((row) => row.stopped)
+        .map((row) => String(row.id));
+      const allIds = cases.map((row) => String(row.id));
+      const originalJobs = await transaction.execute(
+        sql`SELECT * FROM sim_jobs ORDER BY id`,
+      );
+      const finalReports =
+        await transaction.execute(sql`SELECT report.* FROM progressive_remote_reports report
+      JOIN report_lane_cases fixture ON fixture.id=report.sim_job_id
+      WHERE fixture.stopped AND report.sequence=2 ORDER BY report.sim_job_id`);
+      expect(finalReports).toHaveLength(5);
+
+      // Even older final-report JSON must not promote a job without its exact
+      // acknowledged stop. Fresh pending work keeps all six admission slots.
+      const first = await transaction.execute(progressiveReportJobsSql());
+      expect(first).toHaveLength(64);
+      expect(first.slice(0, 6).map((row) => String(row.sim_job_id))).toEqual(
+        [...fresh].slice(0, 6),
+      );
+      expect(first.slice(6, 8).map((row) => String(row.sim_job_id))).toEqual(
+        stopped.slice(0, 2),
+      );
+      for (const budget of [8, 32, reportBudget])
+        expect(
+          first.slice(0, budget).map((row) => String(row.sim_job_id)),
+        ).toEqual(expect.arrayContaining(stopped.slice(0, 2)));
+      expect(
+        first.every(
+          (row) =>
+            fresh.has(String(row.sim_job_id)) ||
+            stopped.includes(String(row.sim_job_id)),
+        ),
+      ).toBe(true);
+      expect(new Set(first.map((row) => row.sim_job_id)).size).toBe(
+        first.length,
+      );
+      expect(await transaction.execute(progressiveReportJobsSql([]))).toEqual(
+        [],
+      );
+
+      // Consume only the actual report slice, persisting both receipt kinds.
+      // Leave projected job statuses intact: stop priority must not depend on
+      // manually changing them, and every original case must remain reachable.
+      const visited = new Set<string>();
+      let selected = first;
+      let passes = 0;
+      while (selected.length && passes < allIds.length) {
+        const pendingStopped = stopped.filter((id) => !visited.has(id));
+        expect(
+          selected
+            .slice(6, 6 + Math.min(2, pendingStopped.length))
+            .map((row) => String(row.sim_job_id)),
+        ).toEqual(pendingStopped.slice(0, 2));
+        const passIds = selected
+          .slice(0, reportBudget)
+          .map((row) => String(row.sim_job_id));
+        for (const id of passIds) {
+          expect(visited.has(id)).toBe(false);
+          visited.add(id);
+        }
+        const scope = sql.join(
+          passIds.map((id) => sql`${id}::uuid`),
+          sql`, `,
+        );
+        await transaction.execute(sql`INSERT INTO progressive_remote_progress_receipts
+        SELECT sim_job_id,sequence FROM progressive_remote_reports WHERE sim_job_id IN (${scope})
+        ON CONFLICT DO NOTHING`);
+        await transaction.execute(sql`INSERT INTO progressive_remote_report_inventories
+        SELECT sim_job_id,sequence FROM progressive_remote_reports WHERE sim_job_id IN (${scope})
+        ON CONFLICT DO NOTHING`);
+        selected = await transaction.execute(progressiveReportJobsSql());
+        passes++;
+      }
+      expect(selected).toEqual([]);
+      expect([...visited].sort()).toEqual(allIds);
+      expect(
+        await transaction.execute(sql`SELECT * FROM sim_jobs ORDER BY id`),
+      ).toEqual(originalJobs);
+      expect(
+        await transaction.execute(sql`SELECT report.* FROM progressive_remote_reports report
+      JOIN report_lane_cases fixture ON fixture.id=report.sim_job_id
+      WHERE fixture.stopped AND report.sequence=2 ORDER BY report.sim_job_id`),
+      ).toEqual(finalReports);
+    });
+  },
+  30_000,
+);
 
 it("selects closed terminal jobs with retained evidence for classification settlement", async () => {
   await client.db.transaction(async (transaction) => {

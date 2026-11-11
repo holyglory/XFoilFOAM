@@ -43,7 +43,13 @@ export function progressiveReportJobsSql(jobIds?: string[]) {
     ), eligible AS MATERIALIZED (
       SELECT job.id AS sim_job_id, job.campaign_id,
         state.has_unapplied, state.has_indexed, state.oldest_unapplied_report,
+        -- An authenticated stop can arrive before its final report is applied.
+        -- Keep that report in the reserved lane even while job.status lags.
         CASE WHEN job.status NOT IN ('pending', 'submitted', 'running')
+          OR EXISTS (SELECT 1 FROM progressive_cfd_execution_stops stopped
+            WHERE stopped.sim_job_id = job.id
+              AND stopped.engine_job_id = job.engine_job_id
+              AND stopped.engine_job_id = job.id::text)
           THEN true ELSE false END AS terminal_job,
         CASE WHEN state.has_unapplied THEN 0 ELSE 1 END AS report_priority,
         CASE WHEN job.status = 'pending' AND job.engine_job_id IS NOT NULL THEN 0
