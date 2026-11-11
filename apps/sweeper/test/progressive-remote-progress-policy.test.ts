@@ -69,17 +69,21 @@ it.each([
     const connection = { execute, transaction } as unknown as DB;
     const receipt = await reconcileProgressiveRemoteProgress(connection);
     const dialect = new PgDialect();
+    const statement = (query: SQL) => {
+      const { sql, params } = dialect.sqlToQuery(query);
+      return { sql, params };
+    };
     const selectionQueries = selectionExecute.mock.calls.map(([query]) =>
-      dialect.sqlToQuery(query as SQL),
+      statement(query as SQL),
     );
     expect(selectionQueries).toEqual([
       { sql: "SHOW jit", params: [] },
       { sql: "SET LOCAL jit = off", params: [] },
-      dialect.sqlToQuery(progressiveSettlementJobsSql()),
+      statement(progressiveSettlementJobsSql()),
       { sql: "SELECT set_config('jit', $1, true)", params: ["on"] },
     ]);
-    expect(dialect.sqlToQuery(execute.mock.calls[0][0] as SQL)).toEqual(
-      dialect.sqlToQuery(progressiveReportJobsSql()),
+    expect(statement(execute.mock.calls[0][0] as SQL)).toEqual(
+      statement(progressiveReportJobsSql()),
     );
     expect(execute.mock.invocationCallOrder[0]).toBeLessThan(
       selectionExecute.mock.invocationCallOrder[0],
