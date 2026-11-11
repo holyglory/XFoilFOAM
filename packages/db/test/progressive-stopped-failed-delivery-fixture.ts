@@ -827,28 +827,28 @@ async function verifyCancelledAcceptedPublication(db: DB, envelope: ProgressiveR
     };
     const before = await protectedState(connection);
     const shadow = async (scoped: DB, table: string) => scoped.execute(sql`CREATE TEMP TABLE ${sql.identifier(table)} ON COMMIT DROP AS SELECT * FROM public.${sql.identifier(table)}`);
-    const refusals: Array<(scoped: DB) => Promise<unknown>> = [
-      (scoped) => scoped.execute(sql`UPDATE calculation_epochs SET current=false WHERE id=${envelope.scope.epochId}::uuid`),
-      (scoped) => scoped.execute(sql`UPDATE sim_campaigns SET current_plan_revision_id=NULL WHERE id=${job.campaign_id}::uuid`),
-      async (scoped) => { await shadow(scoped, "progressive_cfd_units"); return scoped.execute(sql`UPDATE progressive_cfd_units SET recipe=recipe||'{"foreign":true}'::jsonb WHERE id=${envelope.scope.units[0].unitId}::uuid`); },
-      (scoped) => scoped.execute(sql`UPDATE registered_remote_solvers SET revoked_at=clock_timestamp() WHERE id=${envelope.solverId}::uuid`),
-      async (scoped) => { await shadow(scoped, "solver_evidence_archives"); return scoped.execute(sql`DELETE FROM solver_evidence_archives WHERE result_attempt_id=${raw.id}::uuid`); },
-      ...["exclude", "defer"].map((verdict) => (scoped: DB) => scoped.execute(sql`INSERT INTO result_review_verdicts(result_id,verdict,reviewer)
-        VALUES(${raw.resultId}::uuid,${verdict},'isolated publication refusal')`)),
-      async (scoped) => { await shadow(scoped, "progressive_remote_reports"); return scoped.execute(sql`UPDATE progressive_remote_reports
-        SET report=jsonb_set(report,'{status,message}','"changed"'::jsonb) WHERE sim_job_id=${executionId}::uuid`); },
-      async (scoped) => { await shadow(scoped, "progressive_cfd_execution_stops"); return scoped.execute(sql`DELETE FROM progressive_cfd_execution_stops WHERE sim_job_id=${executionId}::uuid`); },
-      async (scoped) => { await shadow(scoped, "progressive_remote_evidence_receipts"); return scoped.execute(sql`DELETE FROM progressive_remote_evidence_receipts WHERE sim_job_id=${executionId}::uuid AND result_attempt_id=${raw.id}::uuid`); },
-      async (scoped) => { await shadow(scoped, "result_attempts"); return scoped.execute(sql`UPDATE result_attempts SET cl=cl+1 WHERE id=${raw.id}::uuid`); },
-      async (scoped) => { await shadow(scoped, "solver_evidence_artifacts"); return scoped.execute(sql`DELETE FROM solver_evidence_artifacts WHERE result_attempt_id=${raw.id}::uuid AND kind='manifest'`); },
-      async (scoped) => { await shadow(scoped, "progressive_cfd_evidence"); return scoped.execute(sql`UPDATE progressive_cfd_evidence SET attempt_token=${envelope.scope.units[1].token}::uuid WHERE result_attempt_id=${raw.id}::uuid`); },
-      async (scoped) => {
+    const refusals: Array<[string, (scoped: DB) => Promise<unknown>]> = [
+      ["obsolete epoch", (scoped) => scoped.execute(sql`UPDATE calculation_epochs SET current=false WHERE id=${envelope.scope.epochId}::uuid`)],
+      ["foreign plan", (scoped) => scoped.execute(sql`UPDATE sim_campaigns SET current_plan_revision_id=NULL WHERE id=${job.campaign_id}::uuid`)],
+      ["foreign unit recipe", async (scoped) => { await shadow(scoped, "progressive_cfd_units"); return scoped.execute(sql`UPDATE progressive_cfd_units SET recipe=recipe||'{"foreign":true}'::jsonb WHERE id=${envelope.scope.units[0].unitId}::uuid`); }],
+      ["revoked solver", (scoped) => scoped.execute(sql`UPDATE registered_remote_solvers SET revoked_at=clock_timestamp() WHERE id=${envelope.solverId}::uuid`)],
+      ["missing archive", async (scoped) => { await shadow(scoped, "solver_evidence_archives"); return scoped.execute(sql`DELETE FROM solver_evidence_archives WHERE result_attempt_id=${raw.id}::uuid`); }],
+      ...["exclude", "defer"].map((verdict) => [`review ${verdict}`, (scoped: DB) => scoped.execute(sql`INSERT INTO result_review_verdicts(result_id,verdict,reviewer)
+        VALUES(${raw.resultId}::uuid,${verdict},'isolated publication refusal')`]) as [string, (scoped: DB) => Promise<unknown>]),
+      ["tampered report", async (scoped) => { await shadow(scoped, "progressive_remote_reports"); return scoped.execute(sql`UPDATE progressive_remote_reports
+        SET report=jsonb_set(report,'{status,message}','"changed"'::jsonb) WHERE sim_job_id=${executionId}::uuid`); }],
+      ["missing stop proof", async (scoped) => { await shadow(scoped, "progressive_cfd_execution_stops"); return scoped.execute(sql`DELETE FROM progressive_cfd_execution_stops WHERE sim_job_id=${executionId}::uuid`); }],
+      ["missing physical receipt", async (scoped) => { await shadow(scoped, "progressive_remote_evidence_receipts"); return scoped.execute(sql`DELETE FROM progressive_remote_evidence_receipts WHERE sim_job_id=${executionId}::uuid AND result_attempt_id=${raw.id}::uuid`); }],
+      ["tampered raw coefficients", async (scoped) => { await shadow(scoped, "result_attempts"); return scoped.execute(sql`UPDATE result_attempts SET cl=cl+1 WHERE id=${raw.id}::uuid`); }],
+      ["missing manifest", async (scoped) => { await shadow(scoped, "solver_evidence_artifacts"); return scoped.execute(sql`DELETE FROM solver_evidence_artifacts WHERE result_attempt_id=${raw.id}::uuid AND kind='manifest'`); }],
+      ["foreign evidence token", async (scoped) => { await shadow(scoped, "progressive_cfd_evidence"); return scoped.execute(sql`UPDATE progressive_cfd_evidence SET attempt_token=${envelope.scope.units[1].token}::uuid WHERE result_attempt_id=${raw.id}::uuid`); }],
+      ["live result owner", async (scoped) => {
         const owner = randomUUID();
         await scoped.execute(sql`INSERT INTO sim_jobs(id,engine_job_id,airfoil_id,bc_ids,reference_chord_m,status)
           SELECT ${owner}::uuid,${owner},airfoil_id,bc_ids,reference_chord_m,'running' FROM sim_jobs WHERE id=${executionId}::uuid`);
         return scoped.execute(sql`UPDATE results SET sim_job_id=${owner}::uuid,status='running' WHERE id=${raw.resultId}::uuid`);
-      },
-      async (scoped) => {
+      }],
+      ["live successor unit", async (scoped) => {
         const newer = randomUUID();
         await shadow(scoped, "progressive_cfd_attempts");
         await shadow(scoped, "progressive_cfd_units");
@@ -857,12 +857,12 @@ async function verifyCancelledAcceptedPublication(db: DB, envelope: ProgressiveR
           FROM progressive_cfd_attempts WHERE token=${envelope.scope.units[0].token}::uuid`);
         return scoped.execute(sql`UPDATE progressive_cfd_units SET state='leased',lease_token=${newer}::uuid,
           lease_owner='live successor',lease_until=clock_timestamp()+interval '1 hour' WHERE id=${envelope.scope.units[0].unitId}::uuid`);
-      },
+      }],
     ];
-    for (const mutate of refusals) await withRollbackFixture(connection, "Restore historical publication refusal", async (scoped) => {
+    for (const [label, mutate] of refusals) await withRollbackFixture(connection, `Restore historical publication refusal: ${label}`, async (scoped) => {
       await mutate(scoped);
       try { await settleProgressiveRemoteJob(scoped, executionId); } catch (error) { expect(error).toBeInstanceOf(Error); }
-      expect(await scoped.execute(sql`SELECT current_result_attempt_id FROM results WHERE id=${raw.resultId}::uuid`)).toEqual([{ current_result_attempt_id: null }]);
+      expect(await scoped.execute(sql`SELECT current_result_attempt_id FROM results WHERE id=${raw.resultId}::uuid`), label).toEqual([{ current_result_attempt_id: null }]);
     });
     await withRollbackFixture(connection, "Protect newer accepted canonical result", async (scoped) => {
       const newer = randomUUID();
