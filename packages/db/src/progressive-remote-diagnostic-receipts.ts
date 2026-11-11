@@ -18,7 +18,8 @@ interface ProgressiveRemoteDiagnosticReceiptIdentity {
 
 export type ProgressiveRemoteDiagnosticReceipt = ProgressiveRemoteDiagnosticReceiptIdentity & (
   { version: 1; failureKind?: never } |
-  { version: 2; failureKind: "infrastructure" | "hard_solver" }
+  { version: 2; failureKind: "infrastructure" | "hard_solver" } |
+  { version: 3; failureKind: "infrastructure"; custody: "terminal_history"; attemptToken: string }
 );
 
 export async function recordProgressiveRemoteDiagnosticReceipt(
@@ -39,8 +40,11 @@ export async function recordProgressiveRemoteDiagnosticReceipt(
           pointContentSignature: receipt.pointContentSignature,
         },
       });
-      if (!anchor || (receipt.version !== 1 && receipt.version !== 2) ||
+      if (!anchor || (receipt.version !== 1 && receipt.version !== 2 && receipt.version !== 3) ||
         (receipt.version === 2 && !["infrastructure", "hard_solver"].includes(receipt.failureKind)) ||
+        (receipt.version === 3 && (receipt.failureKind !== "infrastructure" || receipt.custody !== "terminal_history" ||
+          progressiveReportedDiagnosticFailureKind(source.point) !== "infrastructure" ||
+          !source.envelope.scope.units.some((unit) => unit.alpha === delivery.aoaDeg && unit.token === receipt.attemptToken))) ||
         receipt.kind !== "retained-progressive-diagnostic" ||
         receipt.executionId !== delivery.engineJobId || receipt.pointContentSignature !== source.contentSignature)
         throw new ProgressiveRemoteEvidenceConflict("Diagnostic receipt replay changed its exact retained source identity");
@@ -68,7 +72,7 @@ export async function recordProgressiveRemoteDiagnosticReceipt(
       FOR SHARE OF job,campaign,dispatch,solver`);
     if (!job) throw new ProgressiveRemoteEvidenceConflict("Diagnostic receipt has no current authenticated execution owner");
     const metadata = (job.request_payload as { progressive: Record<string, unknown> }).progressive;
-    const units = await connection.execute(sql`SELECT attempt.token,attempt.outcome,attempt.execution_recipe_id,
+    const units = await connection.execute(sql`SELECT attempt.token,attempt.outcome,attempt.execution_recipe_id,attempt.finished_at,
       unit.aoa_deg,unit.state,unit.lease_token,unit.lease_until,work.target_id,work.stage,
       generation.id AS generation_id,generation.epoch_id,revision.snapshot,
       NOT EXISTS (SELECT 1 FROM progressive_cfd_attempts newer WHERE newer.unit_id=unit.id
@@ -92,17 +96,25 @@ export async function recordProgressiveRemoteDiagnosticReceipt(
       units.some((unit) => !tokens.includes(unit.token) || unit.generation_id !== metadata.generationId ||
         unit.epoch_id !== metadata.epochId || unit.target_id !== metadata.targetId ||
         unit.stage !== metadata.stage || unit.execution_recipe_id !== metadata.recipeId) ||
-      selected.length !== 1 || selected[0].latest_attempt !== true ||
-      !((selected[0].outcome === "failed" && ["gap","pending"].includes(String(selected[0].state)) &&
+      selected.length !== 1)
+      throw new ProgressiveRemoteEvidenceConflict("Diagnostic receipt differs from the latest stopped material-failure ownership");
+    // Custody of a stopped infrastructure report survives a successor attempt.
+    // This distinct receipt cannot authorize diagnostic-backed numerical recovery.
+    const terminalHistory = failureKind === "infrastructure" && selected[0].latest_attempt === false &&
+      ["failed", "cancelled"].includes(String(selected[0].outcome)) && selected[0].finished_at != null;
+    if (!terminalHistory && !(selected[0].latest_attempt === true &&
+      ((selected[0].outcome === "failed" && ["gap","pending"].includes(String(selected[0].state)) &&
         selected[0].lease_token == null && selected[0].lease_until == null) ||
         (selected[0].outcome === "running" && ["leased","blocked"].includes(String(selected[0].state)) &&
           (selected[0].state === "blocked" ? selected[0].lease_token == null
-            : selected[0].lease_token === selected[0].token))))
+            : selected[0].lease_token === selected[0].token)))))
       throw new ProgressiveRemoteEvidenceConflict("Diagnostic receipt differs from the latest stopped material-failure ownership");
     assertProgressiveRemotePhysicalCase(source, selected[0].snapshot as Parameters<typeof assertProgressiveRemotePhysicalCase>[1]);
     const [clock] = await connection.execute(sql`SELECT clock_timestamp() AS at`);
     const receipt: ProgressiveRemoteDiagnosticReceipt = {
-      ...(failureKind === "material_domain" ? { version: 1 as const }
+      ...(terminalHistory ? { version: 3 as const, failureKind: "infrastructure" as const,
+        custody: "terminal_history" as const, attemptToken: String(selected[0].token) }
+        : failureKind === "material_domain" ? { version: 1 as const }
         : { version: 2 as const, failureKind }),
       kind: "retained-progressive-diagnostic", executionId: delivery.engineJobId,
       sequence: delivery.progressiveEvidence.sequence,

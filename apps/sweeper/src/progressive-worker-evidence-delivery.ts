@@ -66,8 +66,10 @@ export async function recordProgressiveWorkerEvidenceReceipt(
   const diagnostic = receipt?.kind === "retained-progressive-diagnostic";
   if (
     !receipt ||
-    (receipt.version !== 1 && !(diagnostic && receipt.version === 2)) ||
+    (receipt.version !== 1 && !(diagnostic && (receipt.version === 2 || receipt.version === 3))) ||
     (diagnostic && receipt.version === 2 && !["infrastructure", "hard_solver"].includes(String(receipt.failureKind))) ||
+    (diagnostic && receipt.version === 3 && (receipt.failureKind !== "infrastructure" ||
+      receipt.custody !== "terminal_history" || typeof receipt.attemptToken !== "string" || !uuid.test(receipt.attemptToken))) ||
     (!diagnostic && receipt.kind !== "retained-progressive-attempt") ||
     receipt.executionId !== expected.executionId ||
     !Number.isSafeInteger(receipt.sequence) ||
@@ -128,6 +130,8 @@ export async function recordProgressiveWorkerEvidenceReceipt(
         result: (anchor.report as unknown as ProgressiveRemoteReport).result!,
       });
       if (!source.stopped || anchor.content_signature !== receipt.reportContentSignature ||
+        (receipt.version === 3 && !envelope.scope.units.some((unit) =>
+          unit.alpha === point?.point.aoa_deg && unit.token === receipt.attemptToken)) ||
         !progressiveReportedPointSources((anchor.report as unknown as ProgressiveRemoteReport).result!)
           .some((entry) => entry.contentSignature === expected.pointContentSignature) || !point ||
         (receipt.version === 1 ? point.point.failure_disposition !== "material_domain" || point.point.converged !== false ||

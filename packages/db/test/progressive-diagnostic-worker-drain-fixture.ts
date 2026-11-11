@@ -123,10 +123,8 @@ export async function verifyDiagnosticWorkerDrain(
     { ...first.delivery,progressiveEvidence: { ...first.delivery.progressiveEvidence,pointContentSignature: "0".repeat(64) } },
   ]) await expect(recordProgressiveRemoteDiagnosticReceipt(db,changed)).rejects.toThrow();
   for (const mutation of [
-    sql`INSERT INTO progressive_cfd_attempts(token,unit_id,owner,execution_recipe_id,started_at,lease_until,outcome)
-      SELECT ${randomUUID()}::uuid,attempt.unit_id,'isolated new owner',attempt.execution_recipe_id,attempt.started_at+interval '1 second',
-        clock_timestamp(),'failed' FROM progressive_cfd_attempts attempt JOIN progressive_cfd_units unit ON unit.id=attempt.unit_id
-        WHERE attempt.sim_job_id=${executionId}::uuid AND unit.aoa_deg=${first.delivery.aoaDeg}`,
+    sql`UPDATE progressive_cfd_attempts SET outcome=${issued.version === 3 ? "cancelled" : "running"},finished_at=NULL
+      WHERE sim_job_id=${executionId}::uuid`,
     sql`UPDATE calculation_epochs SET current=false WHERE id=${envelope.scope.epochId}::uuid`,
   ]) {
     const restore = new Error("Restore diagnostic first-issuance refusal");
@@ -179,6 +177,16 @@ export async function verifyDiagnosticWorkerDrain(
   };
   expect(await nextProgressiveEvidenceWakeAt(db,"delivery")).not.toBeNull();
   for (const reference of references) {
+    if (issued.version === 3) for (const changed of [
+      { ...issued, attemptToken: randomUUID() },
+      { ...issued, custody: "current_owner" },
+      { ...issued, failureKind: "hard_solver" },
+      { ...issued, failureKind: "material_domain" },
+      { ...issued, version: "3" },
+    ]) await expect(recordProgressiveWorkerEvidenceReceipt(db, changed, {
+      executionId, pointContentSignature: reference.source.contentSignature,
+      resultId: reference.attempt.resultId!, resultAttemptId: reference.attempt.id,
+    })).rejects.toThrow();
     await expect(recordProgressiveWorkerEvidenceReceipt(db,{ ...issued,pointContentSignature: "0".repeat(64) }, {
       executionId,pointContentSignature: reference.source.contentSignature,
       resultId: reference.attempt.resultId!,resultAttemptId: reference.attempt.id,

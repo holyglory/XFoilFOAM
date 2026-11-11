@@ -10,7 +10,7 @@ import { storeProgressiveRemoteReport } from "../src/progressive-remote-reports"
 import { resolveProgressiveRemoteEvidence } from "../src/progressive-remote-evidence";
 import { readProgressiveRemoteRetention } from "../src/progressive-remote-retention";
 import { claimProgressivePolarFit } from "../src/progressive-polar-cache";
-import { issueProgressiveRemoteDiagnosticReceipts } from "../src/progressive-remote-diagnostic-receipts";
+import { issueProgressiveRemoteDiagnosticReceipts, recordProgressiveRemoteDiagnosticReceipt } from "../src/progressive-remote-diagnostic-receipts";
 import { readProgressiveDiagnosticRecoveryTrigger } from "../src/progressive-cfd-evidence";
 import { settleProgressiveCfdExecution } from "../src/progressive-cfd-settlement";
 import { recordProgressiveCfdRecoveryPlans, type ProgressiveRansPromotion } from "../src/progressive-cfd-numerical-recovery";
@@ -124,6 +124,8 @@ async function retainStoppedArchive(db: DB, delivery: ProgressiveRemoteEvidenceD
 async function verifyDiagnosticOnlyRemoteSettlement(db: DB, envelope: ProgressiveRemoteExecutionEnvelope) {
   for (const failureKind of ["material_domain", "infrastructure", "hard_solver"] as const) {
     for (const state of ["completed", "failed", "cancelled"] as const) {
+      for (const retired of failureKind === "infrastructure" && state === "completed"
+        ? ["current", "gap", "leased"] as const : ["current"] as const) {
       const restore = new Error(`Restore diagnostic-only settlement ${failureKind}/${state}`);
       try {
         await db.transaction(async (transaction) => {
@@ -158,9 +160,56 @@ async function verifyDiagnosticOnlyRemoteSettlement(db: DB, envelope: Progressiv
           WHERE sim_job_id=${executionId}::uuid`);
         await connection.execute(sql`UPDATE progressive_cfd_units SET state='gap',lease_token=NULL,lease_owner=NULL,lease_until=NULL
           WHERE id IN(SELECT unit_id FROM progressive_cfd_attempts WHERE sim_job_id=${executionId}::uuid)`);
-        const owners = await connection.execute(sql`SELECT token,outcome FROM progressive_cfd_attempts
+        if (retired !== "current") {
+          for (const unit of envelope.scope.units) {
+            const successor = randomUUID();
+            await connection.execute(sql`INSERT INTO progressive_cfd_attempts
+              (token,unit_id,owner,execution_recipe_id,started_at,lease_until,outcome,finished_at)
+              SELECT ${successor}::uuid,unit_id,'successor diagnostic fixture',execution_recipe_id,
+                started_at+interval '1 second',clock_timestamp()+interval '1 hour',
+                ${retired === "leased" ? "running" : "failed"},
+                ${retired === "leased" ? null : new Date().toISOString()}::timestamptz
+              FROM progressive_cfd_attempts WHERE token=${unit.token}::uuid`);
+            if (retired === "leased") await connection.execute(sql`UPDATE progressive_cfd_units
+              SET state='leased',lease_token=${successor}::uuid,lease_owner='successor diagnostic fixture',
+                lease_until=clock_timestamp()+interval '1 hour' WHERE id=${unit.unitId}::uuid`);
+          }
+        }
+        const owners = await connection.execute(sql`SELECT * FROM progressive_cfd_attempts
           WHERE sim_job_id=${executionId}::uuid ORDER BY token`);
         await connection.execute(sql`DELETE FROM progressive_remote_diagnostic_receipts WHERE sim_job_id=${executionId}::uuid`);
+        if (retired !== "current") {
+          const source = progressiveReportedPointSources(result)[0];
+          const delivery = { solverId: envelope.solverId, promiseId: envelope.promiseId, engineJobId: executionId,
+            aoaDeg: source.point.aoa_deg, engineCaseSlug: source.point.case_slug ?? null,
+            progressiveEvidence: { sequence: report.sequence, reportContentSignature: analysisContentHash(report),
+              pointContentSignature: source.contentSignature } };
+          for (const changed of [
+            { ...delivery, solverId: randomUUID() },
+            { ...delivery, promiseId: randomUUID() },
+            { ...delivery, engineCaseSlug: 'foreign-case' },
+            { ...delivery, progressiveEvidence: { ...delivery.progressiveEvidence, reportContentSignature: "0".repeat(64) } },
+            { ...delivery, progressiveEvidence: { ...delivery.progressiveEvidence, pointContentSignature: "0".repeat(64) } },
+          ]) await expect(recordProgressiveRemoteDiagnosticReceipt(connection, changed)).rejects.toThrow();
+          for (const mutation of [
+            sql`UPDATE calculation_epochs SET current=false WHERE id=${envelope.scope.epochId}::uuid`,
+            sql`UPDATE progressive_cfd_attempts SET finished_at=NULL WHERE sim_job_id=${executionId}::uuid`,
+            sql`UPDATE progressive_cfd_attempts SET outcome='cancelled',finished_at=NULL WHERE sim_job_id=${executionId}::uuid`,
+            sql`DELETE FROM progressive_cfd_execution_stops WHERE sim_job_id=${executionId}::uuid`,
+            sql`UPDATE sim_jobs SET request_payload=jsonb_set(request_payload,'{progressive,recipeId}', '"foreign-recipe"'::jsonb)
+              WHERE id=${executionId}::uuid`,
+          ]) await withRollbackFixture(connection, "Restore retired diagnostic refusal", async (scoped) => {
+            await scoped.execute(mutation);
+            await expect(recordProgressiveRemoteDiagnosticReceipt(scoped, delivery)).rejects.toThrow();
+            expect(await scoped.execute(sql`SELECT receipt FROM progressive_remote_diagnostic_receipts
+              WHERE sim_job_id=${executionId}::uuid`)).toHaveLength(0);
+          });
+        }
+        const unitOwners = await connection.execute(sql`SELECT * FROM progressive_cfd_units
+          WHERE id IN(SELECT unit_id FROM progressive_cfd_attempts WHERE sim_job_id=${executionId}::uuid) ORDER BY id`);
+        const successorOwners = await connection.execute(sql`SELECT * FROM progressive_cfd_attempts
+          WHERE sim_job_id IS NULL AND unit_id IN(SELECT unit_id FROM progressive_cfd_attempts WHERE sim_job_id=${executionId}::uuid)
+          ORDER BY token`);
         const diagnosticRetention = await readProgressiveRemoteRetention(connection, executionId);
         expect(diagnosticRetention).toMatchObject({ kind: "retained", sources: [] });
         const diagnosticSettlement = await settleProgressiveRemoteJob(connection, executionId);
@@ -174,17 +223,36 @@ async function verifyDiagnosticOnlyRemoteSettlement(db: DB, envelope: Progressiv
         const receipts = await connection.execute(sql`SELECT point_content_signature,receipt FROM progressive_remote_diagnostic_receipts
           WHERE sim_job_id=${executionId}::uuid`);
         expect(receipts).toHaveLength(polar.attempts.length);
+        if (retired !== "current") {
+          const source = progressiveReportedPointSources(result)[0];
+          await expect(readProgressiveDiagnosticRecoveryTrigger(connection, executionId, {
+            sequence: report.sequence, reportContentSignature: analysisContentHash(report),
+            pointContentSignature: source.contentSignature,
+          })).rejects.toThrow("Numerical recovery changed its exact diagnostic receipt or stop proof");
+        }
         for (const source of progressiveReportedPointSources(result)) {
           const receipt = receipts.find((entry) => entry.point_content_signature === source.contentSignature);
           expect(receipt).toMatchObject({ point_content_signature: source.contentSignature,
             receipt: { kind: "retained-progressive-diagnostic", executionId,
-              ...(failureKind === "material_domain" ? { version: 1 } : { version: 2, failureKind }) } });
+              ...(retired !== "current" ? { version: 3, failureKind, custody: "terminal_history",
+                attemptToken: envelope.scope.units.find((unit) => unit.alpha === source.point.aoa_deg)!.token }
+                : failureKind === "material_domain" ? { version: 1 } : { version: 2, failureKind }) } });
         }
         expect(await settleProgressiveRemoteJob(connection, executionId)).toMatchObject({ kind: "settled" });
         expect(await connection.execute(sql`SELECT point_content_signature,receipt FROM progressive_remote_diagnostic_receipts
           WHERE sim_job_id=${executionId}::uuid`)).toEqual(receipts);
-        expect(await connection.execute(sql`SELECT token,outcome FROM progressive_cfd_attempts
+        expect(await connection.execute(sql`SELECT * FROM progressive_cfd_attempts
           WHERE sim_job_id=${executionId}::uuid ORDER BY token`)).toEqual(owners);
+        if (retired !== "current") {
+          expect(await connection.execute(sql`SELECT * FROM progressive_cfd_units
+            WHERE id IN(SELECT unit_id FROM progressive_cfd_attempts WHERE sim_job_id=${executionId}::uuid) ORDER BY id`)).toEqual(unitOwners);
+          expect(await connection.execute(sql`SELECT * FROM progressive_cfd_attempts
+            WHERE sim_job_id IS NULL AND unit_id IN(SELECT unit_id FROM progressive_cfd_attempts WHERE sim_job_id=${executionId}::uuid)
+            ORDER BY token`)).toEqual(successorOwners);
+          expect(await connection.execute(sql`SELECT id FROM progressive_cfd_recovery_plans
+            WHERE parent_job_id=${executionId}::uuid`)).toHaveLength(0);
+          if (retired === "leased") await verifyDiagnosticWorkerDrain(connection, envelope, report);
+        }
         const [stored] = await connection.execute(sql`SELECT report,content_signature FROM progressive_remote_reports
           WHERE sim_job_id=${executionId}::uuid AND sequence=1`);
         expect(stored).toMatchObject({ report, content_signature: analysisContentHash(report) });
@@ -193,6 +261,7 @@ async function verifyDiagnosticOnlyRemoteSettlement(db: DB, envelope: Progressiv
         throw new Error("Diagnostic-only settlement fixture did not reach its rollback sentinel");
       } catch (error) {
         if (error !== restore) throw error;
+      }
       }
     }
   }
