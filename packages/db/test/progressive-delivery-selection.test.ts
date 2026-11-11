@@ -424,7 +424,7 @@ it.each([8, 48])(
       await analyzeSelectionFixture(transaction);
 
       const cases = await transaction.execute(
-        sql`SELECT id,variant,stopped FROM report_lane_cases ORDER BY id`,
+      sql`SELECT id,variant,status,stopped FROM report_lane_cases ORDER BY id`,
       );
       const fresh = new Set(
         cases
@@ -480,11 +480,18 @@ it.each([8, 48])(
       let passes = 0;
       while (selected.length && passes < allIds.length) {
         const pendingStopped = stopped.filter((id) => !visited.has(id));
+        // The oldest-report/ID order chooses the reserved head; the final
+        // existing lane order still puts pending jobs before submitted/running.
+        const reserved = pendingStopped.slice(0, 2).sort((left, right) => {
+          const priority = (id: string) =>
+            cases.find((row) => row.id === id)?.status === "pending" ? 0 : 2;
+          return priority(left) - priority(right) || left.localeCompare(right);
+        });
         expect(
           selected
             .slice(6, 6 + Math.min(2, pendingStopped.length))
             .map((row) => String(row.sim_job_id)),
-        ).toEqual(pendingStopped.slice(0, 2));
+        ).toEqual(reserved);
         const passIds = selected
           .slice(0, reportBudget)
           .map((row) => String(row.sim_job_id));
