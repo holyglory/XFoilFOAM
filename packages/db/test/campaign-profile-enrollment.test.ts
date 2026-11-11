@@ -178,6 +178,7 @@ import {
   claimProgressiveCfdUnit,
   claimProgressiveCfdBatch,
   progressiveCfdBatchMaximum,
+  MAX_PRECISE_CFD_BATCH_UNITS,
   PROGRESSIVE_CFD_CANDIDATE_PREFIX_SIZE,
   heartbeatProgressiveCfdUnit,
   type ProgressiveCfdLease,
@@ -1589,6 +1590,7 @@ async function progressiveScope(
   scopeKey = "initial",
   profileIds = [originalId],
   completeCfdRecipes = false,
+  angles = [-2, 0, 2],
 ) {
   const [source] = await client.sql<
     {
@@ -1625,7 +1627,7 @@ async function progressiveScope(
       targetId: target.signature,
       physical: target.physical,
       revisionId: source.revision_id,
-      angles: [-2, 0, 2],
+      angles,
       recipes: completeCfdRecipes
         ? {
             neuralfoil: {
@@ -1666,7 +1668,7 @@ const claim = (stages: (1 | 2 | 3)[] = [1, 2, 3]) =>
 const claimCfd = () =>
   claimProgressiveCfdUnit(db, { owner: "isolated-cfd", leaseSeconds: 120, localTimeStepVersion: 1 });
 
-async function fastCfdGeneration(twoProfiles = false) {
+async function fastCfdGeneration(twoProfiles = false, angles = [-2, 0, 2]) {
   const id = await campaign();
   const profiles = [originalId];
   if (twoProfiles) {
@@ -1675,7 +1677,7 @@ async function fastCfdGeneration(twoProfiles = false) {
   }
   const generation = await sealProgressiveGeneration(
     db,
-    await progressiveScope(id, "cfd-test", profiles, true),
+    await progressiveScope(id, "cfd-test", profiles, true, angles),
   );
   for (const _profile of profiles) {
     const baseline = (await claim([1]))!;
@@ -13187,7 +13189,8 @@ describe("durable progressive CFD units", () => {
   }, 120_000);
 
   it.each(["release", "pause", "timeout"] as const)("waits for a contended campaign during normal remote admission (%s)", async (action) => {
-    const generation = await fastCfdGeneration();
+    const remoteAngles = Array.from({ length: 20 }, (_, index) => index - 10);
+    const generation = await fastCfdGeneration(false, remoteAngles);
     await initializeProgressiveCfdWork(db);
     const solverId = randomUUID();
     const locker = createClient({ url: targetUrl.toString(), max: 1 });
@@ -13275,7 +13278,65 @@ describe("durable progressive CFD units", () => {
         } });
         const [created] = await createdWork();
         expect(created).toMatchObject({ jobs: 1, dispatches: 1, promises: 1 });
-        expect(created.attempts).toBeGreaterThan(0);
+        expect(created.attempts).toBe(16);
+        if (outcome.result?.kind === "prepared")
+          expect(outcome.result.envelope.scope.units.map((unit) => unit.alpha)).toEqual(
+            remoteAngles.slice(0, 16),
+          );
+        const leased = await db.execute(sql`
+          SELECT unit.aoa_deg, unit.state, unit.lease_owner
+          FROM progressive_cfd_units unit
+          JOIN progressive_work work ON work.id = unit.work_id
+          WHERE work.generation_id = ${generation.generationId}::uuid AND work.stage = 2
+          ORDER BY unit.aoa_deg
+        `);
+        expect(leased).toEqual([
+          ...remoteAngles.slice(0, 16).map((aoa_deg) => ({
+            aoa_deg,
+            state: "leased",
+            lease_owner: `remote-progressive-${solverId}`,
+          })),
+          ...remoteAngles.slice(16).map((aoa_deg) => ({
+            aoa_deg,
+            state: "pending",
+            lease_owner: null,
+          })),
+        ]);
+
+        const beforeFailedComposition = await createdWork();
+        const beforeFailedUnits = await db.execute(sql`
+          SELECT unit.aoa_deg, unit.state, unit.lease_token, unit.lease_owner,
+            unit.attempts
+          FROM progressive_cfd_units unit
+          JOIN progressive_work work ON work.id = unit.work_id
+          WHERE work.generation_id = ${generation.generationId}::uuid AND work.stage = 2
+          ORDER BY unit.aoa_deg
+        `);
+        const mismatchedCapability = {
+          ...capability,
+          executionPools: ["remote-capability-mismatch"],
+        };
+        await db.execute(sql`
+          UPDATE registered_remote_solvers
+          SET metadata = ${JSON.stringify({
+            progressiveExecution: mismatchedCapability,
+            progressiveExecutionObservedAt: new Date().toISOString(),
+          })}::jsonb
+          WHERE id = ${solverId}::uuid
+        `);
+        await expect(prepareProgressiveRemoteDispatch(db, solverId)).resolves.toMatchObject({
+          kind: "waiting",
+          reason: expect.stringContaining("exact engine"),
+        });
+        expect(await createdWork()).toEqual(beforeFailedComposition);
+        expect(await db.execute(sql`
+          SELECT unit.aoa_deg, unit.state, unit.lease_token, unit.lease_owner,
+            unit.attempts
+          FROM progressive_cfd_units unit
+          JOIN progressive_work work ON work.id = unit.work_id
+          WHERE work.generation_id = ${generation.generationId}::uuid AND work.stage = 2
+          ORDER BY unit.aoa_deg
+        `)).toEqual(beforeFailedUnits);
       } else {
         expect(outcome.result).toMatchObject({ kind: "waiting", reason: action === "timeout"
           ? expect.stringContaining("database lock during claim") : "No eligible campaign cases are ready" });
@@ -14147,6 +14208,39 @@ describe("subsonic through precise priority", () => {
     expect(progressiveCfdBatchMaximum(2)).toBe(64);
     expect(progressiveCfdBatchMaximum(3)).toBe(8);
   });
+
+  it("keeps a precise remote-sized claim at the existing stage maximum", async () => {
+    const angles = Array.from({ length: 12 }, (_, index) => index - 5);
+    const fixture = await scope(true, angles);
+    const firstPrecise = await precise(fixture);
+    const expected = await db.execute(sql`
+      SELECT unit.id
+      FROM progressive_cfd_units unit
+      JOIN progressive_work work ON work.id = unit.work_id
+      WHERE work.generation_id = ${fixture.generationId}::uuid
+        AND work.stage = 3 AND unit.state = 'pending'
+      ORDER BY unit.ordinal, unit.id
+      LIMIT ${MAX_PRECISE_CFD_BATCH_UNITS}
+    `);
+    expect(expected.length).toBeGreaterThanOrEqual(MAX_PRECISE_CFD_BATCH_UNITS);
+
+    const batch = await claimProgressiveCfdBatch(db, {
+      owner: "isolated-precise-remote-sized-claim",
+      leaseSeconds: 120,
+      maximumUnits: 20,
+      capToStageMaximum: true,
+      solverBudgetVersion: 2,
+      localTimeStepVersion: 1,
+    });
+    expect(batch).toHaveLength(MAX_PRECISE_CFD_BATCH_UNITS);
+    expect(batch.every((lease) => lease.stage === 3)).toBe(true);
+    expect(batch.map((lease) => lease.id)).toEqual(expected.map((row) => String(row.id)));
+    expect(batch.map((lease) => lease.alpha)).toEqual(
+      [...batch].map((lease) => lease.alpha).sort((left, right) => left - right),
+    );
+    expect(batch.every((lease) => lease.owner === "isolated-precise-remote-sized-claim")).toBe(true);
+    expect(batch.every((lease) => lease.id !== firstPrecise.id)).toBe(true);
+  }, 120_000);
 
   async function scope(policyBeforeBaselines = false, angles = [0], additionalProfileCount = 0) {
     const profileIds = [originalId];

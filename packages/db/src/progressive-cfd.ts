@@ -227,6 +227,7 @@ export async function claimProgressiveCfdUnit(
     localTimeStepVersion?: number | null;
     remoteSolverId?: string;
     campaignLockMode?: "skip" | "wait";
+    capToStageMaximum?: boolean;
     sameTarget?: {
       generationId: string;
       targetId: string;
@@ -663,6 +664,7 @@ export async function claimProgressiveCfdBatch(
     localTimeStepVersion?: number | null;
     remoteSolverId?: string;
     campaignLockMode?: "skip" | "wait";
+    capToStageMaximum?: boolean;
   },
 ): Promise<ProgressiveCfdLease[]> {
   return db.transaction(async (transaction) => {
@@ -670,8 +672,10 @@ export async function claimProgressiveCfdBatch(
     if (!(await tryProgressiveAdmissionLock(connection))) return [];
     const first = await claimProgressiveCfdUnit(connection, input);
     if (!first) return [];
-    const maximum =
-      input.maximumUnits ?? progressiveCfdBatchMaximum(first.stage);
+    const stageMaximum = progressiveCfdBatchMaximum(first.stage);
+    const maximum = input.capToStageMaximum
+      ? Math.min(input.maximumUnits ?? stageMaximum, stageMaximum)
+      : input.maximumUnits ?? stageMaximum;
     if (!Number.isInteger(maximum) || maximum < 1 || maximum > 512)
       throw new Error("Invalid bounded CFD batch size");
     const batch = [first];

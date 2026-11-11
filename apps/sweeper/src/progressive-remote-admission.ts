@@ -22,6 +22,7 @@ import { REQUIRED_PRECALC_EVIDENCE_RECOVERY_VERSION } from "./build-request";
 import { retireSettledProgressivePromise } from "./progressive-remote-lease-retirement";
 
 const PROGRESSIVE_REPORT_BACKPRESSURE_LIMIT = 2_000;
+export const PROGRESSIVE_REMOTE_ADMISSION_MAX_UNITS = 16;
 
 export interface ProgressiveRemoteCapabilities {
   localTimeStepVersion?: number | null;
@@ -256,6 +257,8 @@ export async function prepareProgressiveRemoteDispatch(
       const claimInput = {
         owner: `remote-progressive-${solverId}`,
         remoteSolverId: solverId,
+        maximumUnits: PROGRESSIVE_REMOTE_ADMISSION_MAX_UNITS,
+        capToStageMaximum: true,
         leaseSeconds: PROGRESSIVE_REMOTE_START_LEASE_SECONDS,
         requireSweeperEnabled: true,
         solverBudgetVersion: 2,

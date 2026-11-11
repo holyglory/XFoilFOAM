@@ -27,7 +27,10 @@ vi.mock("../src/progressive-cfd-jobs", () => ({
   composeProgressiveCfdJob: hooks.compose,
 }));
 
-import { prepareProgressiveRemoteDispatch } from "../src/progressive-remote-admission";
+import {
+  prepareProgressiveRemoteDispatch,
+  PROGRESSIVE_REMOTE_ADMISSION_MAX_UNITS,
+} from "../src/progressive-remote-admission";
 
 afterEach(() => vi.resetAllMocks());
 
@@ -122,7 +125,11 @@ it("does not hold the solver row lock while a candidate claim is running", async
   expect(hooks.bind).toHaveBeenCalledOnce();
   expect(hooks.claim).toHaveBeenCalledWith(
     expect.anything(),
-    expect.objectContaining({ campaignLockMode: "skip" }),
+    expect.objectContaining({
+      campaignLockMode: "skip",
+      maximumUnits: PROGRESSIVE_REMOTE_ADMISSION_MAX_UNITS,
+      capToStageMaximum: true,
+    }),
   );
 });
 
@@ -192,12 +199,20 @@ it("keeps the transaction bounds when a nonblocking campaign claim skips a busy 
   expect(hooks.claim).toHaveBeenNthCalledWith(
     1,
     expect.anything(),
-    expect.objectContaining({ campaignLockMode: "skip" }),
+    expect.objectContaining({
+      campaignLockMode: "skip",
+      maximumUnits: PROGRESSIVE_REMOTE_ADMISSION_MAX_UNITS,
+      capToStageMaximum: true,
+    }),
   );
   expect(hooks.claim).toHaveBeenNthCalledWith(
     2,
     expect.anything(),
-    expect.objectContaining({ campaignLockMode: "wait" }),
+    expect.objectContaining({
+      campaignLockMode: "wait",
+      maximumUnits: PROGRESSIVE_REMOTE_ADMISSION_MAX_UNITS,
+      capToStageMaximum: true,
+    }),
   );
   const timeouts = execute.mock.calls.map(([statement]) => new PgDialect().sqlToQuery(statement).sql)
     .filter((statement) => /lock_timeout|statement_timeout/.test(statement));
