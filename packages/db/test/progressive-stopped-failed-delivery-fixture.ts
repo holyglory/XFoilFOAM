@@ -830,9 +830,9 @@ async function verifyCancelledAcceptedPublication(db: DB, envelope: ProgressiveR
     const refusals: Array<(scoped: DB) => Promise<unknown>> = [
       (scoped) => scoped.execute(sql`UPDATE calculation_epochs SET current=false WHERE id=${envelope.scope.epochId}::uuid`),
       (scoped) => scoped.execute(sql`UPDATE sim_campaigns SET current_plan_revision_id=NULL WHERE id=${job.campaign_id}::uuid`),
-      (scoped) => scoped.execute(sql`UPDATE progressive_cfd_units SET recipe=recipe||'{"foreign":true}'::jsonb WHERE id=${envelope.scope.units[0].unitId}::uuid`),
+      async (scoped) => { await shadow(scoped, "progressive_cfd_units"); return scoped.execute(sql`UPDATE progressive_cfd_units SET recipe=recipe||'{"foreign":true}'::jsonb WHERE id=${envelope.scope.units[0].unitId}::uuid`); },
       (scoped) => scoped.execute(sql`UPDATE registered_remote_solvers SET revoked_at=clock_timestamp() WHERE id=${envelope.solverId}::uuid`),
-      (scoped) => scoped.execute(sql`DELETE FROM solver_evidence_archives WHERE result_attempt_id=${raw.id}::uuid`),
+      async (scoped) => { await shadow(scoped, "solver_evidence_archives"); return scoped.execute(sql`DELETE FROM solver_evidence_archives WHERE result_attempt_id=${raw.id}::uuid`); },
       ...["exclude", "defer"].map((verdict) => (scoped: DB) => scoped.execute(sql`INSERT INTO result_review_verdicts(result_id,verdict,reviewer)
         VALUES(${raw.resultId}::uuid,${verdict},'isolated publication refusal')`)),
       async (scoped) => { await shadow(scoped, "progressive_remote_reports"); return scoped.execute(sql`UPDATE progressive_remote_reports
@@ -848,6 +848,8 @@ async function verifyCancelledAcceptedPublication(db: DB, envelope: ProgressiveR
       },
       async (scoped) => {
         const newer = randomUUID();
+        await shadow(scoped, "progressive_cfd_attempts");
+        await shadow(scoped, "progressive_cfd_units");
         await scoped.execute(sql`INSERT INTO progressive_cfd_attempts(token,unit_id,owner,execution_recipe_id,started_at,lease_until,outcome)
           SELECT ${newer}::uuid,unit_id,'live successor',execution_recipe_id,clock_timestamp(),clock_timestamp()+interval '1 hour','running'
           FROM progressive_cfd_attempts WHERE token=${envelope.scope.units[0].token}::uuid`);
