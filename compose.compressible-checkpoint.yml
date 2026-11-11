@@ -1,0 +1,24 @@
+services:
+  paired:
+    image: opencfd/openfoam-run:2606@sha256:4229997e74defb81548222d511b8e3b95b98305e5df41b8e88b031813fe47eeb
+    pull_policy: never
+    network_mode: none
+    # Four MPI ranks in both arms; one equal CPU of accounting/output headroom.
+    cpus: 5
+    user: "1000:1003"
+    environment:
+      HOME: /tmp
+      PYTHONDONTWRITEBYTECODE: "1"
+      DC2_DEPLOYMENT: "${DC2_DEPLOYMENT}"
+      DC2_COMPONENT: "${DC2_COMPONENT}"
+      DC2_GENERATION: "${DC2_GENERATION}"
+    volumes:
+      - ./.codex-artifacts/compressible-checkpoint-placement-v2/input:/input:ro
+      - ./.codex-artifacts/compressible-checkpoint-placement-v2/output:/output
+      - ./.codex-artifacts/compressible-checkpoint-placement-v2/python:/python:ro
+      - ./.codex-artifacts/compressible-checkpoint-placement-v2/input/library/libxfoilfoamThermophysics.so:/opt/xfoilfoam-thermophysics/lib/libxfoilfoamThermophysics.so:ro
+      - ./scripts/materials/compressible_checkpoint_placement.py:/driver/compressible_checkpoint_placement.py:ro
+      - ./scripts/materials/checkpoint_placement.py:/driver/checkpoint_placement.py:ro
+    entrypoint: ["bash", "-lc"]
+    command:
+      - source /usr/lib/openfoam/openfoam2606/etc/bashrc && exec /python/bin/python3.12 /driver/compressible_checkpoint_placement.py native --input /input --output /output

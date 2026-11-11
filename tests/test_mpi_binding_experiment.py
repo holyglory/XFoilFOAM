@@ -658,3 +658,174 @@ def test_checkpoint_reconstruction_uses_only_validated_times_and_never_mutates_i
     for rank in range(3):
         assert not (destination / f"processor{rank}" / checkpoint.START_TIME).exists()
         assert (destination / f"processor{rank}" / checkpoint.END_TIME / "phi").is_file()
+
+# The real compressible checkpoint has a separate four-rank contract. These
+# cases exercise its acceptance boundary; legacy incompressible results do not
+# count as evidence for this experiment.
+from scripts.materials import compressible_checkpoint_placement as compressible
+from scripts.materials import compressible_checkpoint_control as compressible_control
+
+
+def test_compressible_restart_changes_only_top_level_restart_and_output_policy():
+    original = '''application rhoPimpleFoam;
+startFrom startTime;
+startTime 0.0120482540975;
+endTime 0.25301210951918673;
+deltaT 4.819277108433735e-6;
+adjustTimeStep yes;
+maxCo 0.5;
+maxDeltaT 9.63855421686747e-6;
+writeControl runTime;
+writeInterval 0.008032128514056224;
+functions
+{
+    forceCoeffs1
+    {
+        writeControl timeStep;
+        writeInterval 1;
+    }
+}
+libs ("/opt/xfoilfoam-thermophysics/lib/libxfoilfoamThermophysics.so");
+'''
+    result = compressible.prepare_control(original)
+    assert result == original.replace('startFrom startTime;', 'startFrom latestTime;').replace(
+        'writeControl runTime;', 'writeControl timeStep;').replace(
+        'writeInterval 0.008032128514056224;', 'writeInterval 200;')
+    with pytest.raises(ValueError, match='Missing'):
+        compressible.prepare_control(original.replace('startFrom startTime;\n', ''))
+    with pytest.raises(ValueError, match='Duplicate'):
+        compressible.prepare_control(original + 'writeInterval 9;\n')
+    with pytest.raises(ValueError, match='compressible'):
+        compressible.prepare_control(original.replace('rhoPimpleFoam', 'pimpleFoam'))
+
+
+def test_compressible_placement_uses_four_distinct_allowed_cores_and_exact_rank_count(tmp_path, monkeypatch):
+    for cpu, core in [(0,0),(1,1),(2,2),(3,3),(4,0)]:
+        root=tmp_path/f'cpu{cpu}/topology';root.mkdir(parents=True)
+        (root/'physical_package_id').write_text('0');(root/'core_id').write_text(str(core))
+        (root/'thread_siblings_list').write_text('0,4' if core==0 else str(cpu))
+    selected, topology=compressible.distinct_cores({0,1,2,3,4},tmp_path)
+    assert selected==[0,1,2,3] and len(topology)==5
+    with pytest.raises(ValueError,match='four'):compressible.distinct_cores({0,1,2,4},tmp_path)
+    for variable,value in [('OMPI_COMM_WORLD_LOCAL_RANK','3'),('OMPI_COMM_WORLD_SIZE','4'),('OMPI_COMM_WORLD_LOCAL_SIZE','4')]:monkeypatch.setenv(variable,value)
+    affinity={0,1,2,3,4};actual=[]
+    monkeypatch.setattr(compressible.os,'sched_getaffinity',lambda pid:set(affinity))
+    monkeypatch.setattr(compressible.os,'sched_setaffinity',lambda pid,cpus:(affinity.clear(),affinity.update(cpus)))
+    monkeypatch.setattr(compressible.common,'write_json',lambda path,value:actual.append(value))
+    monkeypatch.setattr(compressible.shutil,'which',lambda name:'/native/'+name)
+    execute=Mock();monkeypatch.setattr(compressible.os,'execv',execute)
+    monkeypatch.setattr(compressible.os,'chdir',lambda path: None)
+    compressible.rank_entry(tmp_path,tmp_path,'A1',[0,1,2,3,4],selected)
+    assert actual[-1]['affinity']==[0,1,2,3,4]
+    compressible.rank_entry(tmp_path,tmp_path,'B1',[0,1,2,3,4],selected)
+    assert actual[-1]['affinity']==[3]
+    assert execute.call_args.args[0]=='/native/rhoPimpleFoam'
+    monkeypatch.setenv('OMPI_COMM_WORLD_SIZE','3')
+    with pytest.raises(ValueError,match='four'):compressible.rank_entry(tmp_path,tmp_path,'A2',[3],selected)
+
+
+def compressible_boundary(step, elapsed):
+    return {'step':step,'index':compressible.START_INDEX+step,'time':0.1888+step*6e-7,
+            'monotonicSeconds':elapsed,'masterClockSeconds':int(elapsed),'masterExecutionSeconds':elapsed*0.8,
+            'rankCpu':{str(i):{'pid':100+i,'startTicks':1000+i,'affinity':[i],
+                             'userSeconds':elapsed*0.7,'systemSeconds':elapsed*0.01} for i in range(4)},
+            'cgroupCpu':{'usage_usec':int(elapsed*3e6),'user_usec':int(elapsed*2.8e6),'system_usec':int(elapsed*0.2e6),
+                         'throttled_usec':0,'nr_throttled':0}}
+
+
+@pytest.mark.parametrize('mutation',[None,'throttle-time','throttle-period','missing-rank','pid','affinity','short-window','endpoint'])
+def test_compressible_interval_excludes_warmup_and_rejects_noncomparable_measurement(mutation):
+    start,end=compressible_boundary(200,20),compressible_boundary(1200,140)
+    if mutation=='throttle-time':end['cgroupCpu']['throttled_usec']=1
+    elif mutation=='throttle-period':end['cgroupCpu']['nr_throttled']=1
+    elif mutation=='missing-rank':del end['rankCpu']['3']
+    elif mutation=='pid':end['rankCpu']['0']['pid']+=1
+    elif mutation=='affinity':end['rankCpu']['0']['affinity']=[5]
+    elif mutation=='short-window':end['monotonicSeconds']=30
+    elif mutation=='endpoint':end['time']=start['time']
+    if mutation:
+        with pytest.raises(ValueError):compressible.interval(start,end)
+    else:
+        result=compressible.interval(start,end)
+        assert result['wallSeconds']==120 and result['steps']==1000
+        assert result['rankCpuSeconds']==pytest.approx(120*0.71*4)
+        assert result['integerLogQuantizationFraction']==pytest.approx(2/120)
+
+
+def compressible_report():
+    import copy
+    arms=[]
+    for name,duration in [('A1',140),('B1',120),('B2',121),('A2',139)]:
+        boundaries={'start':compressible_boundary(200,20),'end':compressible_boundary(1200,20+duration)}
+        snapshots={label:{str(rank):{'state':{'index':b['index'],'value':b['time']},'shape':{'cells':10},
+                    'fields':{f:{'valueSha256':f} for f in (*compressible.FIELDS,'e')}} for rank in range(4)} for label,b in boundaries.items()}
+        arms.append({'arm':name,'ranks':4,'inputSha256':'one-authenticated-input','boundaries':boundaries,
+                     'measurement':compressible.interval(boundaries['start'],boundaries['end']),
+                     'warnings':[],'coefficients':[{'time':0.18952,'Cl':0.4,'Cd':0.03,'Cm':-0.02}], 'snapshots':snapshots})
+    return {'arms':copy.deepcopy(arms),'acceptedCfd':False,'published':False}
+
+
+@pytest.mark.parametrize('mutation',[None,'missing-arm','wrong-ranks','different-input','material-warning','different-time',
+    'missing-temperature','changed-temperature','changed-energy','changed-density','changed-flux','coefficient','throttle'])
+def test_compressible_bracket_requires_all_physical_fields_and_exact_real_endpoints(mutation):
+    report=compressible_report();arm=report['arms'][1]
+    if mutation=='missing-arm':report['arms'].pop()
+    elif mutation=='wrong-ranks':arm['ranks']=3
+    elif mutation=='different-input':arm['inputSha256']='foreign'
+    elif mutation=='material-warning':arm['warnings']=['Temperature out of range']
+    elif mutation=='different-time':arm['boundaries']['end']['time']+=1e-6
+    elif mutation=='missing-temperature':del arm['snapshots']['end']['0']['fields']['T']
+    elif mutation and mutation.startswith('changed-'):
+        field={'changed-temperature':'T','changed-energy':'e','changed-density':'rho','changed-flux':'phi'}[mutation]
+        arm['snapshots']['end']['0']['fields'][field]['valueSha256']='different'
+    elif mutation=='coefficient':arm['coefficients'][0]['Cl']=0.5
+    elif mutation=='throttle':arm['boundaries']['end']['cgroupCpu']['throttled_usec']=1
+    if mutation:
+        with pytest.raises(ValueError):compressible.compare(report)
+    else:
+        result=compressible.compare(report)
+        assert result['numericalEquivalence']=='identical' and result['repeatableGain']
+        assert result['productionAdoption'] is False
+        assert result['conservativeWallSpeedup']==pytest.approx(139/121)
+
+
+@pytest.mark.parametrize('durations',[(120,120,121,119),(140,120,121,180)])
+def test_compressible_no_gain_or_unstable_bracket_keeps_production_unchanged(durations):
+    report=compressible_report()
+    for arm,duration in zip(report['arms'],durations):
+        arm['boundaries']['end']=compressible_boundary(1200,20+duration)
+        arm['measurement']=compressible.interval(arm['boundaries']['start'],arm['boundaries']['end'])
+    result=compressible.compare(report)
+    assert not result['repeatableGain'] and not result['productionAdoption']
+    assert result['conclusion']=='no repeatable gain; keep production unchanged'
+
+
+def test_compressible_fixture_governs_authentication_native_and_cleanup_with_no_route():
+    import tomllib,yaml
+    from pathlib import Path
+    root=Path(__file__).resolve().parents[1]
+    config=tomllib.loads((root/'.devcoordinator.toml').read_text())
+    graph=config['test']['compressible-placement'];checks={c['name']:c for c in graph['check']}
+    assert checks['inputs']['requires']==['contracts'] and checks['native']['requires']==['inputs']
+    assert checks['comparison']['requires']==['native']
+    assert set(checks['cleanup']['after'])=={'contracts','inputs','native','comparison'}
+    assert checks['cleanup']['phase']=='cleanup'
+    service=yaml.safe_load((root/'compose.compressible-checkpoint.yml').read_text())['services']['paired']
+    assert service['image']==compressible.IMAGE and service['network_mode']=='none'
+    assert not service.get('privileged') and not service.get('ports') and service['cpus']==5
+    assert any(v.endswith(str(compressible.LIBRARY_PATH)+':ro') for v in service['volumes'])
+    assert set(compressible.FIELDS)=={'T','U','alphat','k','nut','omega','p','phi','rho'}
+    assert compressible.ARMS==('A1','B1','B2','A2') and compressible.RANKS==4
+
+
+@pytest.mark.parametrize("line,invalid", [
+    ("trapFpe: Floating point exception trapping enabled (FOAM_SIGFPE).", False),
+    ("--> FOAM Warning : allowSystemOperations : Allowing user-supplied system call operations.", False),
+    ("Floating point exception (core dumped)", True),
+    ("--> FOAM Warning : Temperature out of range in janaf", True),
+    ("--> FOAM FATAL ERROR: thermophysical properties", True),
+    ("cannot load libxfoilfoamThermophysics.so", True),
+    ("symbol lookup error: undefined symbol: thermo", True),
+])
+def test_compressible_warning_guard_preserves_startup_notices_but_rejects_material_faults(line, invalid):
+    assert compressible.invalid_native_line(line) is invalid

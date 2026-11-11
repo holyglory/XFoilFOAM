@@ -5216,3 +5216,62 @@ timeout_seconds = 1800
 command = ["/bin/bash", "-c", "exec /home/holyglory/XFoilFOAM/.venv/bin/python -m pytest tests/test_deploy_sweeper_state.py tests/test_deployment_env_preflight.py tests/test_deployment_source_promotion.py tests/test_deployment_storage_prune.py -q --junitxml=\"$DEVCOORDINATOR_DIAGNOSTICS_DIR/maintenance.xml\""]
 env = { PYTHONPATH = "src:.", PYTHONDONTWRITEBYTECODE = "1" }
 diagnostic_sources = [{ format = "junit", path = "maintenance.xml" }]
+
+[test.compressible-placement]
+timeout_seconds = 3600
+env = { PYTHONPATH = "src:.", PYTHONDONTWRITEBYTECODE = "1" }
+
+[[test.compressible-placement.check]]
+name = "contracts"
+tier = "development"
+timeout_seconds = 180
+command = ["/home/holyglory/XFoilFOAM/.venv/bin/python", "-m", "pytest", "tests/test_mpi_binding_experiment.py", "-q"]
+
+[[test.compressible-placement.check]]
+name = "inputs"
+tier = "development"
+phase = "fixture"
+timeout_seconds = 300
+requires = ["contracts"]
+command = ["/home/holyglory/XFoilFOAM/.venv/bin/python", "-m", "scripts.materials.compressible_checkpoint_control", "prepare"]
+resources = [{ kind = "directory", id = ".codex-artifacts/compressible-checkpoint-placement-v2", access = "exclusive" }]
+
+[[test.compressible-placement.check]]
+name = "native"
+tier = "development"
+timeout_seconds = 2800
+requires = ["inputs"]
+command = ["/home/holyglory/XFoilFOAM/.venv/bin/python", "-m", "scripts.materials.compressible_checkpoint_control", "apply"]
+
+[[test.compressible-placement.check]]
+name = "comparison"
+tier = "development"
+timeout_seconds = 120
+requires = ["native"]
+command = ["/home/holyglory/XFoilFOAM/.venv/bin/python", "-m", "scripts.materials.compressible_checkpoint_control", "verify"]
+retained_artifacts = [{ name = "compressible-fields", path = ".codex-artifacts/compressible-checkpoint-placement-v2/output/snapshots", max_bytes = 268435456 }]
+
+[[test.compressible-placement.check]]
+name = "cleanup"
+tier = "development"
+phase = "cleanup"
+timeout_seconds = 180
+after = ["contracts", "inputs", "native", "comparison"]
+command = ["/home/holyglory/XFoilFOAM/.venv/bin/python", "-m", "scripts.materials.compressible_checkpoint_control", "cleanup"]
+retained_artifacts = [{ name = "compressible-placement-receipt", path = ".codex-artifacts/compressible-checkpoint-placement-v2/receipt", max_bytes = 134217728 }]
+
+[deployment.compressible-placement]
+source = ["worktree"]
+components = ["benchmark"]
+public = false
+ttl_seconds = 3000
+
+[deployment.compressible-placement.component.benchmark]
+type = "compose"
+files = ["compose.compressible-checkpoint.yml"]
+services = ["paired"]
+finite_services = ["paired"]
+build = false
+port = false
+route = false
+timeout_seconds = 2700
