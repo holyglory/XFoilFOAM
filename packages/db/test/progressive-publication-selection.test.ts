@@ -223,6 +223,9 @@ it("prioritizes active exact-owned reports before stale pending backlog", async 
         throw corruptHeadRollback;
       }),
     ).rejects.toBe(corruptHeadRollback);
+    // Keep a non-empty jumbo backlog: 84k cumulative rows with roughly 3.2KiB
+    // of report payload per row. The selector must still inspect only each
+    // job's unacknowledged head and preserve queue order.
     await transaction.execute(sql`INSERT INTO progressive_worker_reports(sim_job_id,sequence,acknowledged_at,report,created_at)
       SELECT md5('eligible')::uuid,sequence,CASE WHEN sequence<80000 THEN clock_timestamp() ELSE NULL::timestamptz END,
         jsonb_build_object('solverId',md5('solver')::uuid,'diagnostic',repeat(md5(sequence::text),100)),
@@ -288,17 +291,24 @@ it("prioritizes active exact-owned reports before stale pending backlog", async 
             reportSelectionMs: plan["Execution Time"],
           }),
         );
-        const expectedIndex =
-          pass === "active" || laneCount > 1
-            ? "fixture_publication_pending_idx"
-            : "fixture_publication_order_idx";
+        // The selector resolves the unacknowledged head through the pending
+        // index, then may fetch that exact row through the primary key. Both
+        // paths stay bounded; the report-order index would re-scan a job's
+        // entire unacknowledged history before checking its head sequence.
+        const expectedIndexes = new Set([
+          "fixture_publication_pending_idx",
+          "progressive_worker_reports_pkey",
+        ]);
         expect(
           scans.some(
             (node) =>
-              node["Index Name"] === expectedIndex &&
+              expectedIndexes.has(String(node["Index Name"] ?? "")) &&
               Number(node["Actual Loops"]) > 0,
           ),
         ).toBe(true);
+        expect(
+          scans.some((node) => node["Index Name"] === "fixture_publication_order_idx"),
+        ).toBe(false);
         expect(scannedRows).toBeLessThan(32);
         expect(scans.some((node) => node["Node Type"] === "Seq Scan")).toBe(
           false,
