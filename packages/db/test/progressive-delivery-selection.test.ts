@@ -8,8 +8,10 @@ import { selectProgressiveRemoteProgressJobs } from "../../../apps/sweeper/src/p
 import { progressiveDeliverySelectionSql } from "../../../apps/sweeper/src/progressive-delivery-selection";
 import {
   progressiveReportJobsSql,
+  progressiveReportPressureSql,
   progressiveSettlementJobsSql,
 } from "../../../apps/sweeper/src/progressive-progress-selection";
+import { progressiveReportBackpressureIsActive } from "../../../apps/sweeper/src/progressive-remote-progress";
 import {
   nextProgressiveArchiveWakeAt,
   progressiveArchiveSelectionSql,
@@ -371,6 +373,70 @@ it.each([
   });
 });
 
+it.each([
+  { terminalCount: 1, ageSeconds: 120, pressured: true },
+  { terminalCount: 80, ageSeconds: 10, pressured: true },
+  { terminalCount: 1, ageSeconds: 0, pressured: false },
+])("drains $terminalCount stopped jobs aged $ageSeconds seconds below report-count pressure while preserving live headroom", async ({ terminalCount, ageSeconds, pressured }) => {
+  await client.db.transaction(async (transaction) => {
+    await createReportStopFixture(transaction);
+    await transaction.execute(sql`CREATE TEMP TABLE terminal_pressure_cases ON COMMIT DROP AS
+      SELECT md5('pressure-live-'||ordinal)::uuid id,'live'::text kind FROM generate_series(1,300) ordinal
+      UNION ALL SELECT md5('pressure-terminal-'||ordinal)::uuid,'terminal' FROM generate_series(1,${terminalCount}) ordinal
+      UNION ALL SELECT md5(kind)::uuid,kind FROM unnest(ARRAY['wrong-engine','foreign-identity','not-dispatched','already-applied']) kind`);
+    await transaction.execute(sql`CREATE TEMP TABLE sim_jobs ON COMMIT DROP AS
+      SELECT id,md5('pressure-campaign')::uuid campaign_id,'running'::text status,
+        CASE WHEN kind='foreign-identity' THEN 'foreign-engine' ELSE id::text END engine_job_id,
+        clock_timestamp() AS "updatedAt",NULL::timestamptz AS "polledAt"
+      FROM terminal_pressure_cases`);
+    await transaction.execute(sql`CREATE TEMP TABLE progressive_remote_dispatches ON COMMIT DROP AS
+      SELECT id sim_job_id FROM terminal_pressure_cases WHERE kind<>'not-dispatched'`);
+    await transaction.execute(sql`INSERT INTO progressive_cfd_execution_stops
+      SELECT id,CASE WHEN kind IN('wrong-engine','foreign-identity') THEN 'foreign-engine' ELSE id::text END
+      FROM terminal_pressure_cases WHERE kind<>'live'`);
+    await transaction.execute(sql`CREATE TEMP TABLE progressive_remote_reports ON COMMIT DROP AS
+      SELECT id sim_job_id,1::bigint sequence,clock_timestamp()-
+        CASE WHEN kind='terminal' THEN ${ageSeconds}*interval '1 second'
+          WHEN kind IN('wrong-engine','foreign-identity','not-dispatched') THEN interval '1 day'
+          ELSE interval '0 seconds' END received_at
+      FROM terminal_pressure_cases`);
+    await transaction.execute(sql`CREATE TEMP TABLE progressive_remote_progress_receipts ON COMMIT DROP AS
+      SELECT id sim_job_id,1::bigint sequence FROM terminal_pressure_cases WHERE kind='already-applied'`);
+    await transaction.execute(sql`CREATE TEMP TABLE progressive_remote_report_inventories ON COMMIT DROP AS
+      SELECT * FROM progressive_remote_progress_receipts`);
+    const terminalIds = new Set((await transaction.execute(sql`SELECT id FROM terminal_pressure_cases WHERE kind='terminal'`)).map((row) => String(row.id)));
+    const before = await transaction.execute(sql`SELECT * FROM sim_jobs ORDER BY id`);
+    const [pressure] = await transaction.execute(progressiveReportPressureSql());
+    expect(pressure.pending_reports).toBeLessThan(2000);
+    expect(pressure.pending_terminal_jobs).toBe(terminalCount);
+    expect(progressiveReportBackpressureIsActive(Number(pressure.pending_reports),Number(pressure.pending_terminal_jobs),Number(pressure.oldest_terminal_age_ms))).toBe(pressured);
+    const reportBudget = pressured ? 48 : 8;
+    let remaining = terminalCount;
+    for (let pass = 0; pass < 3 && remaining; pass += 1) {
+      const selected = (await transaction.execute(progressiveReportJobsSql(undefined, reportBudget))).slice(0,reportBudget);
+      expect(selected).toHaveLength(reportBudget);
+      expect(selected.slice(0,6).every((row) => !terminalIds.has(String(row.sim_job_id)))).toBe(true);
+      const finished = selected.filter((row) => terminalIds.has(String(row.sim_job_id)));
+      expect(finished).toHaveLength(Math.min(remaining,reportBudget-6));
+      for (const row of finished) {
+        await transaction.execute(sql`INSERT INTO progressive_remote_progress_receipts VALUES(${row.sim_job_id}::uuid,1)`);
+        await transaction.execute(sql`INSERT INTO progressive_remote_report_inventories VALUES(${row.sim_job_id}::uuid,1)`);
+      }
+      remaining -= finished.length;
+      // Live reports stay pending throughout: a continuing live queue cannot
+      // starve the reserved stopped jobs even with only one final report each.
+    }
+    expect(remaining).toBe(0);
+    expect((await transaction.execute(progressiveReportPressureSql()))[0].pending_terminal_jobs).toBe(0);
+    const wrong = (await transaction.execute(sql`SELECT id FROM terminal_pressure_cases WHERE kind IN('wrong-engine','foreign-identity','not-dispatched')`)).map((row) => String(row.id));
+    const [scoped] = await transaction.execute(progressiveReportPressureSql(wrong));
+    expect(scoped.pending_terminal_jobs).toBe(0);
+    expect(scoped.pending_reports).toBe(2);
+    expect(await transaction.execute(sql`SELECT * FROM sim_jobs ORDER BY id`)).toEqual(before);
+    expect((await transaction.execute(progressiveReportPressureSql([])))[0]).toMatchObject({ pending_reports: 0, pending_terminal_jobs: 0, oldest_terminal_age_ms: 0 });
+  });
+});
+
 it.each([8, 48])(
   "reserves stopped reports before a %i-job report slice despite stale active status",
   async (reportBudget) => {
@@ -445,21 +511,25 @@ it.each([8, 48])(
       JOIN report_lane_cases fixture ON fixture.id=report.sim_job_id
       WHERE fixture.stopped AND report.sequence=2 ORDER BY report.sim_job_id`);
       expect(finalReports).toHaveLength(5);
+      const terminalReserve = reportBudget - 6;
+      const reservedOrder = (pending: string[]) => pending.slice(0, terminalReserve).sort((left, right) => {
+        const priority = (id: string) =>
+          cases.find((row) => row.id === id)?.status === "pending" ? 0 : 2;
+        return priority(left) - priority(right) || left.localeCompare(right);
+      });
 
       // Even older final-report JSON must not promote a job without its exact
       // acknowledged stop. Fresh pending work keeps all six admission slots.
-      const first = await transaction.execute(progressiveReportJobsSql());
+      const first = await transaction.execute(progressiveReportJobsSql(undefined, reportBudget));
       expect(first).toHaveLength(64);
       expect(first.slice(0, 6).map((row) => String(row.sim_job_id))).toEqual(
         [...fresh].slice(0, 6),
       );
-      expect(first.slice(6, 8).map((row) => String(row.sim_job_id))).toEqual(
-        stopped.slice(0, 2),
+      expect(first.slice(6, 6 + Math.min(terminalReserve, stopped.length)).map((row) => String(row.sim_job_id))).toEqual(
+        reservedOrder(stopped),
       );
-      for (const budget of [8, 32, reportBudget])
-        expect(
-          first.slice(0, budget).map((row) => String(row.sim_job_id)),
-        ).toEqual(expect.arrayContaining(stopped.slice(0, 2)));
+      expect(first.slice(0, reportBudget).map((row) => String(row.sim_job_id)))
+        .toEqual(expect.arrayContaining(reservedOrder(stopped)));
       expect(
         first.every(
           (row) =>
@@ -484,14 +554,10 @@ it.each([8, 48])(
         const pendingStopped = stopped.filter((id) => !visited.has(id));
         // The oldest-report/ID order chooses the reserved head; the final
         // existing lane order still puts pending jobs before submitted/running.
-        const reserved = pendingStopped.slice(0, 2).sort((left, right) => {
-          const priority = (id: string) =>
-            cases.find((row) => row.id === id)?.status === "pending" ? 0 : 2;
-          return priority(left) - priority(right) || left.localeCompare(right);
-        });
+        const reserved = reservedOrder(pendingStopped);
         expect(
           selected
-            .slice(6, 6 + Math.min(2, pendingStopped.length))
+            .slice(6, 6 + reserved.length)
             .map((row) => String(row.sim_job_id)),
         ).toEqual(reserved);
         const passIds = selected
@@ -511,7 +577,7 @@ it.each([8, 48])(
         await transaction.execute(sql`INSERT INTO progressive_remote_report_inventories
         SELECT sim_job_id,sequence FROM progressive_remote_reports WHERE sim_job_id IN (${scope})
         ON CONFLICT DO NOTHING`);
-        selected = await transaction.execute(progressiveReportJobsSql());
+        selected = await transaction.execute(progressiveReportJobsSql(undefined, reportBudget));
         passes++;
       }
       expect(selected).toEqual([]);

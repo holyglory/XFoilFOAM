@@ -1,7 +1,6 @@
 import { sql } from "drizzle-orm";
 
 const PROGRESSIVE_REPORT_JOB_LIMIT = 64;
-const PROGRESSIVE_TERMINAL_REPORT_JOB_RESERVE = 2;
 const PROGRESSIVE_ACTIVE_REPORT_JOB_HEADROOM = 6;
 const PROGRESSIVE_SETTLEMENT_JOB_LIMIT = 128;
 const PROGRESSIVE_NORMAL_SETTLEMENT_JOB_HEADROOM = 6;
@@ -26,7 +25,39 @@ function executionScope(jobIds?: string[]) {
     : sql`true`;
 }
 
-export function progressiveReportJobsSql(jobIds?: string[]) {
+const terminalReportJob = sql`(job.status NOT IN ('pending', 'submitted', 'running')
+  OR EXISTS (SELECT 1 FROM progressive_cfd_execution_stops stopped
+    WHERE stopped.sim_job_id = job.id
+      AND stopped.engine_job_id = job.engine_job_id
+      AND stopped.engine_job_id = job.id::text))`;
+
+export function progressiveReportPressureSql(jobIds?: string[]) {
+  return sql`WITH pending AS MATERIALIZED (
+    SELECT report.sim_job_id, count(*)::integer AS reports, min(report.received_at) AS oldest
+    FROM progressive_remote_reports report
+    LEFT JOIN progressive_remote_progress_receipts receipt
+      ON receipt.sim_job_id = report.sim_job_id AND receipt.sequence = report.sequence
+    LEFT JOIN progressive_remote_report_inventories inventory
+      ON inventory.sim_job_id = report.sim_job_id AND inventory.sequence = report.sequence
+    WHERE receipt.sim_job_id IS NULL OR inventory.sim_job_id IS NULL
+    GROUP BY report.sim_job_id
+  ), eligible AS (
+    SELECT pending.*, ${terminalReportJob} AS terminal_job
+    FROM pending JOIN sim_jobs job ON job.id = pending.sim_job_id
+    WHERE ${executionScope(jobIds)}
+      AND EXISTS (SELECT 1 FROM progressive_remote_dispatches dispatch WHERE dispatch.sim_job_id = job.id)
+  )
+  SELECT coalesce(sum(reports), 0)::integer AS pending_reports,
+    count(*) FILTER (WHERE terminal_job)::integer AS pending_terminal_jobs,
+    coalesce(max(extract(epoch FROM (clock_timestamp() - oldest)) * 1000)
+      FILTER (WHERE terminal_job), 0)::double precision AS oldest_terminal_age_ms
+  FROM eligible`;
+}
+
+export function progressiveReportJobsSql(jobIds?: string[], reportBudget = 8) {
+  if (!Number.isSafeInteger(reportBudget) || reportBudget < 8 || reportBudget > PROGRESSIVE_REPORT_JOB_LIMIT)
+    throw new Error("Report drain budget must preserve live headroom within its selection bound");
+  const terminalReserve = reportBudget - PROGRESSIVE_ACTIVE_REPORT_JOB_HEADROOM;
   return sql`WITH report_state AS MATERIALIZED (
       SELECT report.sim_job_id,
         min(report.received_at) FILTER (
@@ -45,12 +76,7 @@ export function progressiveReportJobsSql(jobIds?: string[]) {
         state.has_unapplied, state.has_indexed, state.oldest_unapplied_report,
         -- An authenticated stop can arrive before its final report is applied.
         -- Keep that report in the reserved lane even while job.status lags.
-        CASE WHEN job.status NOT IN ('pending', 'submitted', 'running')
-          OR EXISTS (SELECT 1 FROM progressive_cfd_execution_stops stopped
-            WHERE stopped.sim_job_id = job.id
-              AND stopped.engine_job_id = job.engine_job_id
-              AND stopped.engine_job_id = job.id::text)
-          THEN true ELSE false END AS terminal_job,
+        ${terminalReportJob} AS terminal_job,
         CASE WHEN state.has_unapplied THEN 0 ELSE 1 END AS report_priority,
         CASE WHEN job.status = 'pending' AND job.engine_job_id IS NOT NULL THEN 0
           WHEN job.status = 'pending' AND job.engine_job_id IS NULL THEN 1
@@ -78,7 +104,7 @@ export function progressiveReportJobsSql(jobIds?: string[]) {
       WHERE eligible.terminal_job AND eligible.has_unapplied
       ORDER BY eligible.report_priority, eligible.oldest_unapplied_report NULLS LAST,
         eligible.last_polled_at, eligible.sim_job_id
-      LIMIT ${PROGRESSIVE_TERMINAL_REPORT_JOB_RESERVE}
+      LIMIT ${terminalReserve}
     ), ordered AS (
       SELECT active_head.*, 0 AS lane FROM active_head
       UNION ALL

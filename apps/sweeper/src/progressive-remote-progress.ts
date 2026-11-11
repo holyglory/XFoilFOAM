@@ -18,24 +18,34 @@ import { issueProgressiveRemoteDiagnosticReceipts } from "@aerodb/db/progressive
 import { activeReconcileConcurrency, runWithConcurrency } from "./reconcile";
 import {
   progressiveReportJobsSql,
+  progressiveReportPressureSql,
   progressiveSettlementJobsSql,
 } from "./progressive-progress-selection";
 
 const MAX_PROGRESSIVE_REPORTS_PER_EXECUTION = 16;
-const MAX_PROGRESSIVE_CAMPAIGN_JOBS_PER_RECONCILIATION = 16;
 const MAX_PROGRESSIVE_REPORT_JOBS_PER_RECONCILIATION = 8;
 const MAX_PROGRESSIVE_TERMINAL_JOBS_PER_RECONCILIATION = 8;
+const MAX_PROGRESSIVE_CAMPAIGN_JOBS_PER_RECONCILIATION =
+  MAX_PROGRESSIVE_REPORT_JOBS_PER_RECONCILIATION + MAX_PROGRESSIVE_TERMINAL_JOBS_PER_RECONCILIATION;
 const HIGH_PROGRESSIVE_REPORTS_PER_EXECUTION = 256;
-const HIGH_PROGRESSIVE_CAMPAIGN_JOBS_PER_RECONCILIATION = 64;
 const HIGH_PROGRESSIVE_REPORT_JOBS_PER_RECONCILIATION = 48;
 const HIGH_PROGRESSIVE_TERMINAL_JOBS_PER_RECONCILIATION = 32;
+const HIGH_PROGRESSIVE_CAMPAIGN_JOBS_PER_RECONCILIATION =
+  HIGH_PROGRESSIVE_REPORT_JOBS_PER_RECONCILIATION + HIGH_PROGRESSIVE_TERMINAL_JOBS_PER_RECONCILIATION;
 const PROGRESSIVE_REPORTS_PER_TRANSACTION = 8;
 export const PROGRESSIVE_REPORT_BACKPRESSURE_LIMIT = 2_000;
+export const PROGRESSIVE_TERMINAL_REPORT_JOB_PRESSURE_LIMIT = 8;
+export const PROGRESSIVE_TERMINAL_REPORT_AGE_PRESSURE_MS = 60_000;
 
 export function progressiveReportBackpressureIsActive(
   pendingReports: number,
+  pendingTerminalJobs = 0,
+  oldestTerminalAgeMs = 0,
 ): boolean {
-  return Number.isFinite(pendingReports) && pendingReports >= PROGRESSIVE_REPORT_BACKPRESSURE_LIMIT;
+  return (Number.isFinite(pendingReports) && pendingReports >= PROGRESSIVE_REPORT_BACKPRESSURE_LIMIT) ||
+    (Number.isFinite(pendingTerminalJobs) && pendingTerminalJobs > 0 &&
+      (pendingTerminalJobs >= PROGRESSIVE_TERMINAL_REPORT_JOB_PRESSURE_LIMIT ||
+        (Number.isFinite(oldestTerminalAgeMs) && oldestTerminalAgeMs >= PROGRESSIVE_TERMINAL_REPORT_AGE_PRESSURE_MS)));
 }
 
 async function applyProgressiveRemoteProgressInTransaction(
@@ -321,14 +331,19 @@ async function reconcileProgressiveRemoteCampaign(
         if (terminal.kind === "settled") receipt.settled += 1;
         else receipt.waiting += 1;
       }
-      await db.execute(
-        sql`UPDATE sim_jobs SET "polledAt" = clock_timestamp() WHERE id = ${executionId}::uuid`,
-      );
     } catch (error) {
       receipt.errors.push({
         executionId,
         reason: error instanceof Error ? error.message : String(error),
       });
+    } finally {
+      // A rejected ownership/custody proof remains rejected. Rotate its poll
+      // timestamp so repeated closed-settlement errors do not pin that lane.
+      try {
+        await db.execute(sql`UPDATE sim_jobs SET "polledAt" = clock_timestamp() WHERE id = ${executionId}::uuid`);
+      } catch (error) {
+        receipt.errors.push({ executionId, reason: error instanceof Error ? error.message : String(error) });
+      }
     }
   }
   return receipt;
@@ -337,8 +352,9 @@ async function reconcileProgressiveRemoteCampaign(
 export async function selectProgressiveRemoteProgressJobs(
   db: DB,
   jobIds?: string[],
+  reportBudget = MAX_PROGRESSIVE_REPORT_JOBS_PER_RECONCILIATION,
 ) {
-  const jobs = await db.execute(progressiveReportJobsSql(jobIds));
+  const jobs = await db.execute(progressiveReportJobsSql(jobIds, reportBudget));
   const terminalJobs = await db.transaction(
     async (transaction) => {
       // This frequent read does not amortize JIT compilation. Restore the
@@ -383,22 +399,17 @@ export async function reconcileProgressiveRemoteProgress(
     errors: [] as Array<{ executionId: string; reason: string }>,
   };
   if (options.jobIds?.length === 0) return receipt;
-  const { jobs, terminalJobs } = await selectProgressiveRemoteProgressJobs(
-    db,
-    options.jobIds,
-  );
-  const [backlog] = await db.execute(sql`
-    SELECT count(*)::int AS pending_reports
-    FROM progressive_remote_reports report
-    LEFT JOIN progressive_remote_progress_receipts receipt
-      ON receipt.sim_job_id = report.sim_job_id AND receipt.sequence = report.sequence
-    LEFT JOIN progressive_remote_report_inventories inventory
-      ON inventory.sim_job_id = report.sim_job_id AND inventory.sequence = report.sequence
-    WHERE receipt.sim_job_id IS NULL OR inventory.sim_job_id IS NULL
-  `);
+  const drainStarted = performance.now();
+  const [backlog] = await db.execute(progressiveReportPressureSql(options.jobIds));
   const reportBacklogIsPressured = progressiveReportBackpressureIsActive(
     Number(backlog?.pending_reports ?? 0),
+    Number(backlog?.pending_terminal_jobs ?? 0),
+    Number(backlog?.oldest_terminal_age_ms ?? 0),
   );
+  const reportJobLimit = reportBacklogIsPressured
+    ? HIGH_PROGRESSIVE_REPORT_JOBS_PER_RECONCILIATION
+    : MAX_PROGRESSIVE_REPORT_JOBS_PER_RECONCILIATION;
+  const { jobs, terminalJobs } = await selectProgressiveRemoteProgressJobs(db, options.jobIds, reportJobLimit);
   const reportLimit = reportBacklogIsPressured
     ? HIGH_PROGRESSIVE_REPORTS_PER_EXECUTION
     : MAX_PROGRESSIVE_REPORTS_PER_EXECUTION;
@@ -412,12 +423,7 @@ export async function reconcileProgressiveRemoteProgress(
         ? HIGH_PROGRESSIVE_TERMINAL_JOBS_PER_RECONCILIATION
         : MAX_PROGRESSIVE_TERMINAL_JOBS_PER_RECONCILIATION,
     ),
-    ...jobs.slice(
-      0,
-      reportBacklogIsPressured
-        ? HIGH_PROGRESSIVE_REPORT_JOBS_PER_RECONCILIATION
-        : MAX_PROGRESSIVE_REPORT_JOBS_PER_RECONCILIATION,
-    ),
+    ...jobs.slice(0, reportJobLimit),
   ] as unknown as Array<ProgressiveProgressJob>;
   const groupedJobs = new Map<string, ProgressiveProgressJob[]>();
   for (const job of selectedJobs) {
@@ -452,5 +458,19 @@ export async function reconcileProgressiveRemoteProgress(
       }
     },
   );
+  console.log(JSON.stringify({
+    component: "progressive-report-drain",
+    checkedAt: new Date().toISOString(),
+    durationMs: performance.now() - drainStarted,
+    pendingReports: Number(backlog?.pending_reports ?? 0),
+    pendingTerminalJobs: Number(backlog?.pending_terminal_jobs ?? 0),
+    oldestTerminalAgeMs: Number(backlog?.oldest_terminal_age_ms ?? 0),
+    pressured: reportBacklogIsPressured,
+    reportJobLimit,
+    campaignJobLimit,
+    selectedJobCount: [...groupedJobs.values()].reduce((count, group) => count + Math.min(group.length, campaignJobLimit), 0),
+    applied: receipt.applied, stopped: receipt.stopped, settled: receipt.settled,
+    waiting: receipt.waiting, errors: receipt.errors.length,
+  }));
   return receipt;
 }
