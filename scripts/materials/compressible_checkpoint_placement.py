@@ -261,7 +261,7 @@ def invalid_native_line(line):
     return bool(re.search(r'FOAM FATAL|FOAM Warning|[Tt]emperature.*(?:out of|limit)|[Cc]annot load|undefined symbol|[Ff]loating point exception', line))
 
 
-def run_arm(canonical, output, arm, identity, plan, deadline):
+def run_arm(canonical, output, arm, identity, plan, deadline, rank_driver=None):
     case = output / arm
     frozen = common.tree_identity(canonical)
     shutil.copytree(canonical, case)
@@ -269,7 +269,7 @@ def run_arm(canonical, output, arm, identity, plan, deadline):
         raise ValueError('Arm did not restore identical inputs')
     receipt_dir = output / f'{arm}-ranks'; receipt_dir.mkdir()
     command = ['mpirun', '--allow-run-as-root', '--bind-to', 'none', '--use-hwthread-cpus', '-np', '4',
-               sys.executable, str(Path(__file__).resolve()), 'rank', '--case', str(case), '--receipts', str(receipt_dir),
+               sys.executable, str(rank_driver or Path(__file__).resolve()), 'rank', '--case', str(case), '--receipts', str(receipt_dir),
                '--arm', arm, '--allowed', ','.join(map(str, identity['allowedCpus'])), '--bound', ','.join(map(str, identity['boundCpus']))]
     log = output / f'{arm}.log'
     started, initial_cpu = time.monotonic(), cpu_stats()

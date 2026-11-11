@@ -1,0 +1,19 @@
+{
+  "sourcePackage": "openfoam2606-source_2606.0~rc2-1_all.deb",
+  "packageSha256": "d2f4b4a056e38a8d96a268c00492eaa599d34c136965d3eba097560d5816c6d2",
+  "upstreamPath": "applications/solvers/compressible/rhoPimpleFoam",
+  "license": "GPL-3.0-or-later",
+  "memberSha256": {
+    "EEqn.H": "85715aff4f27b95777ff47113cf49a88e90898756ee0f0cacb07ad22d72d5233",
+    "Make/files": "03a6053dfb861a0e52c9dea214c0155cb8b5cf1df2a8512b88e8d40a2e04b5bb",
+    "Make/options": "8d9713bd412d33fe035bd5b1fcdda23e78c1afbacd844f6653d55b0c4ff1aefe",
+    "UEqn.H": "64eb9bd6ca63bc254fef0455e6d3c2ab3c4c745d57e7ae21d45a47244a970a8e",
+    "correctPhi.H": "c1e4e0fb3f9515357a751fa375ca8741583702c791137e335c27ae9e2042594a",
+    "createFieldRefs.H": "d81413d7a682adf6619cd6cd2b17c2fa26e88f9b98aef1ab054410055ad46e3d",
+    "createFields.H": "f2d5317f8fb8f5a992c2a237d2cca7bf4e794bff00f23b0a97e54e63356d35f8",
+    "pEqn.H": "31fccc8a740bbaff3c4f5ee7913dd105a7759c92a136dd6685f1e82fd911b70a",
+    "pcEqn.H": "f4cdabe4b599dbdf6c496f50d72dcca18fa003d3e50e862b1b9e4dc4e315b14f",
+    "rhoPimpleFoam.C": "05a3380efed79cc734838fec87a809d87d971427da7f50f2ae8017ce7b5714a8",
+    "setRDeltaT.H": "6f62d2178a866e84f71ec4b0b9db82347fc6fb9d02d1ab16b1bc2f3ba0946572"
+  }
+}

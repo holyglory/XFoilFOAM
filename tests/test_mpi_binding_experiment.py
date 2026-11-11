@@ -5,6 +5,46 @@ from scripts.materials.mpi_binding_experiment import configure_unbound_mpi
 from scripts.materials import checkpoint_placement as checkpoint
 from scripts.materials import checkpoint_placement_control as control
 from scripts.materials import compressible_cost_profile as cost_profile
+from scripts.materials import build_compressible_phase_profile as phase_builder
+from scripts.materials import compressible_phase_profile as phase_profile
+
+
+def test_phase_probe_generation_preserves_authenticated_algorithm_bytes(tmp_path):
+    from pathlib import Path
+    source = Path(__file__).parent / 'fixtures/openfoam2606-phase-profile'
+    phase_builder.generate(source, tmp_path / 'solver', tmp_path / 'proof')
+    for name in phase_builder.SOURCE_SHA256:
+        if name.endswith(('.H', '.C')):
+            assert phase_builder.strip_probes((tmp_path / 'solver' / name).read_text()) == (source / name).read_text()
+    energy = (tmp_path / 'solver/EEqn.H').read_text()
+    assert energy.index('endProfiling(phaseEAssembly)') < energy.index('EEqn.solve()')
+    assert energy.index('endProfiling(phaseESolve)') < energy.index('addProfiling(phaseThermo')
+    assert energy.index('addProfiling(phaseThermo') < energy.index('thermo.correct()') < energy.index('endProfiling(phaseThermo)')
+    pressure = (tmp_path / 'solver/pEqn.H').read_text()
+    assert pressure.count('endProfiling(phasePMatrix)') == 2
+    assert pressure.count('addProfiling(phasePSolve') == 2
+    with pytest.raises(ValueError, match='Unauthenticated'):
+        phase_builder.instrument('EEqn.H', (source / 'EEqn.H').read_text().replace('thermo.correct();', ''))
+
+
+def test_phase_rank_uses_experimental_binary_without_binding_or_changing_rank_count(tmp_path, monkeypatch):
+    import os
+    monkeypatch.setenv('OMPI_COMM_WORLD_LOCAL_RANK', '0')
+    monkeypatch.setenv('OMPI_COMM_WORLD_SIZE', '4')
+    monkeypatch.setenv('OMPI_COMM_WORLD_LOCAL_SIZE', '4')
+    allowed = sorted(os.sched_getaffinity(0))
+    monkeypatch.setattr(phase_profile, 'build_identity', lambda: {'experimentalBinarySha256': 'observational'})
+    execute = Mock()
+    bind = Mock()
+    monkeypatch.setattr(os, 'execv', execute)
+    monkeypatch.setattr(os, 'sched_setaffinity', bind)
+    monkeypatch.chdir(tmp_path)
+    phase_profile.rank_entry(tmp_path, tmp_path, allowed)
+    execute.assert_called_once_with(phase_profile.BINARY, [str(phase_profile.BINARY), '-parallel', '-case', str(tmp_path)])
+    bind.assert_not_called()
+    monkeypatch.setenv('OMPI_COMM_WORLD_SIZE', '3')
+    with pytest.raises(ValueError, match='four'):
+        phase_profile.rank_entry(tmp_path, tmp_path, allowed)
 
 
 def test_cost_profile_instrumentation_preserves_every_existing_entry():

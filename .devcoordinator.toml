@@ -5327,3 +5327,62 @@ build = false
 port = false
 route = false
 timeout_seconds = 750
+
+[test.compressible-phase-profile-v2]
+timeout_seconds = 3600
+env = { PYTHONPATH = "src:.", PYTHONDONTWRITEBYTECODE = "1" }
+
+[[test.compressible-phase-profile-v2.check]]
+name = "contracts"
+tier = "development"
+timeout_seconds = 180
+command = ["/home/holyglory/XFoilFOAM/.venv/bin/python", "-m", "pytest", "tests/test_mpi_binding_experiment.py", "-q"]
+
+[[test.compressible-phase-profile-v2.check]]
+name = "inputs"
+tier = "development"
+phase = "fixture"
+timeout_seconds = 300
+requires = ["contracts"]
+command = ["/home/holyglory/XFoilFOAM/.venv/bin/python", "-m", "scripts.materials.compressible_phase_profile_control", "prepare"]
+resources = [{ kind = "directory", id = ".codex-artifacts/compressible-phase-profile-v2", access = "exclusive" }]
+
+[[test.compressible-phase-profile-v2.check]]
+name = "native"
+tier = "development"
+timeout_seconds = 2500
+requires = ["inputs"]
+command = ["/home/holyglory/XFoilFOAM/.venv/bin/python", "-m", "scripts.materials.compressible_phase_profile_control", "apply"]
+
+[[test.compressible-phase-profile-v2.check]]
+name = "verification"
+tier = "development"
+timeout_seconds = 120
+requires = ["native"]
+command = ["/home/holyglory/XFoilFOAM/.venv/bin/python", "-m", "scripts.materials.compressible_phase_profile_control", "verify"]
+retained_artifacts = [{ name = "profile-fields", path = ".codex-artifacts/compressible-phase-profile-v2/output/snapshots", max_bytes = 268435456 }]
+
+[[test.compressible-phase-profile-v2.check]]
+name = "cleanup"
+tier = "development"
+phase = "cleanup"
+timeout_seconds = 180
+after = ["contracts", "inputs", "native", "verification"]
+command = ["/home/holyglory/XFoilFOAM/.venv/bin/python", "-m", "scripts.materials.compressible_phase_profile_control", "cleanup"]
+retained_artifacts = [{ name = "cost-profile-receipt", path = ".codex-artifacts/compressible-phase-profile-v2/receipt", max_bytes = 134217728 }]
+
+[deployment.compressible-phase-profile-v2]
+source = ["worktree"]
+components = ["profile"]
+public = false
+ttl_seconds = 2700
+
+[deployment.compressible-phase-profile-v2.component.profile]
+type = "compose"
+files = ["compose.compressible-phase-profile-v2.yml"]
+services = ["profile"]
+finite_services = ["profile"]
+build = true
+port = false
+route = false
+timeout_seconds = 2400

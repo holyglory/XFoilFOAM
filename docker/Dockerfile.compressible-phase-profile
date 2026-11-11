@@ -1,0 +1,29 @@
+# Worker image: OpenFOAM + Python. The container *is* the OpenFOAM environment,
+# so the solver runs locally inside it (AIRFOILFOAM_OPENFOAM_RUNNER=local).
+FROM opencfd/openfoam-run:2606@sha256:4229997e74defb81548222d511b8e3b95b98305e5df41b8e88b031813fe47eeb AS phase-build
+
+ARG TARGETARCH
+USER root
+COPY docker/ubuntu-apt-https.sh /tmp/ubuntu-apt-https.sh
+RUN sh /tmp/ubuntu-apt-https.sh && apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl g++ make python3 binutils \
+    && case "${TARGETARCH}" in \
+         amd64) tools_sha="159d102ba465301e3f8562fe3e9dd917414b77a5491bdec206ee25d5ee89e2da" ;; \
+         arm64) tools_sha="5b0c88c2fbd85fd17e9d6559d0cc716815fccb8fb6158b53973cfdc7b416c5fd" ;; \
+         *) exit 1 ;; \
+       esac \
+    && curl -fL "https://dl.openfoam.com/repos/deb/dists/resolute/main/pool/2606_0/binary-${TARGETARCH}/openfoam2606-tools_2606.0~rc2-1_${TARGETARCH}.deb" -o /tmp/tools.deb \
+    && echo "${tools_sha}  /tmp/tools.deb" | sha256sum -c - \
+    && curl -fL https://dl.openfoam.com/repos/deb/dists/resolute/main/pool/2606_0/binary-all/openfoam2606-source_2606.0~rc2-1_all.deb -o /tmp/source.deb \
+    && echo "d2f4b4a056e38a8d96a268c00492eaa599d34c136965d3eba097560d5816c6d2  /tmp/source.deb" | sha256sum -c - \
+    && test "$(dpkg-query -W -f='${Version}' openfoam2606)" = "2606.0~rc2-1" \
+    && dpkg -i /tmp/tools.deb /tmp/source.deb \
+    && rm /tmp/tools.deb /tmp/source.deb \
+    && rm -rf /var/lib/apt/lists/*
+RUN bash -lc 'source /usr/lib/openfoam/openfoam2606/etc/bashrc || exit 1; set -e; test "$WM_PROJECT_VERSION" = v2606; wmakeLnIncludeAll -update "$FOAM_SRC"'
+COPY scripts/materials/build_compressible_phase_profile.py /build/build_compressible_phase_profile.py
+RUN bash -lc 'source /usr/lib/openfoam/openfoam2606/etc/bashrc || exit 1; set -e; export FOAM_USER_APPBIN=/opt/phase-profile/bin; mkdir -p "$FOAM_USER_APPBIN"; python3 /build/build_compressible_phase_profile.py build --source "$WM_PROJECT_DIR/applications/solvers/compressible/rhoPimpleFoam" --destination /build/phase-solver --proof /opt/phase-profile/proof'
+
+FROM opencfd/openfoam-run:2606@sha256:4229997e74defb81548222d511b8e3b95b98305e5df41b8e88b031813fe47eeb
+COPY --from=phase-build /opt/phase-profile /opt/phase-profile
+USER 1000:1003
