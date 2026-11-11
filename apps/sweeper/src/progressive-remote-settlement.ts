@@ -777,7 +777,7 @@ export async function settleProgressiveRemoteJob(db: DB, executionId: string) {
     if (!campaign)
       return { kind: "waiting" as const, reason: "campaign_lock" };
     // Reuse stopped-publication validation for occupied cells before taking the
-    // job lock: epoch -> campaign -> generation/work/unit/attempt -> job/result.
+    // job lock: epoch -> campaign -> generation/work/unit/attempt -> job.
     // This authorizes retirement only; it never promotes an occupied cell.
     const [historical] = await connection.execute(sql`SELECT id FROM sim_jobs
       WHERE id=${executionId}::uuid AND status='cancelled' AND "ingestedAt" IS NULL`);
@@ -922,14 +922,9 @@ export async function settleProgressiveRemoteJob(db: DB, executionId: string) {
       )
       .map((source) => source.resultAttemptId);
     if (finalAttemptIds.length) {
-      if (historical && stoppedAcceptedIds.length) {
-        await connection.execute(sql`SELECT selected.id FROM result_attempts raw
-          JOIN results result ON result.id=raw.result_id
-          JOIN result_attempts selected ON selected.id=result.current_result_attempt_id AND selected.result_id=result.id
-          JOIN result_classifications classification ON classification.result_attempt_id=selected.id
-          WHERE raw.id IN (${sql.join(stoppedAcceptedIds.map((id) => sql`${id}::uuid`), sql`, `)})
-          ORDER BY selected.id FOR SHARE OF selected,classification`);
-      }
+      // Read the selected point/classification/custody together without taking
+      // canonical row locks outside the cache scope. This decision retires only
+      // the historical job; later cache/review changes still own canonical truth.
       const unpublished =
         await connection.execute(sql`SELECT raw.id, raw.regime, raw.evidence_payload->>'fidelity' AS fidelity,
           selected.regime AS selected_regime, selected.evidence_payload->>'fidelity' AS selected_fidelity,

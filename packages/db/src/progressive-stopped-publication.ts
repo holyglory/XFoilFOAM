@@ -19,6 +19,8 @@ function refuse(): never {
 // existing accepted result; it never changes an attempt, unit, recipe or receipt.
 // Settlement can opt into occupied cells to validate their retained historical
 // source under the same scope/owner gates. It must not pass those IDs to promotion.
+// Canonical rows/classifications are observations here, not locked before the
+// cache scope. Empty-slot publication revalidates them under cache locks below.
 export async function readStoppedAcceptedProgressivePublication(
   db: DB,
   executionId: string,
@@ -101,8 +103,7 @@ export async function readStoppedAcceptedProgressivePublication(
         AND (${includeOccupied} OR result.current_result_attempt_id IS NULL)
         AND coalesce((SELECT review.verdict::text FROM result_review_verdicts review
           WHERE review.result_id=result.id AND review."revokedAt" IS NULL
-          ORDER BY review."createdAt" DESC,review.id DESC LIMIT 1),'') NOT IN ('exclude','defer')
-      ${includeOccupied ? sql`FOR SHARE OF result,raw,classification` : sql``}`);
+          ORDER BY review."createdAt" DESC,review.id DESC LIMIT 1),'') NOT IN ('exclude','defer')`);
     if (!raw) continue;
     const unit = units.find((item) => item.token === raw.attempt_token && item.aoa_deg === raw.aoa_deg);
     if (!unit || unit.airfoil_id !== job.airfoil_id || raw.airfoil_id !== job.airfoil_id ||
