@@ -5268,3 +5268,62 @@ timeout_seconds = 1800
 command = ["/bin/bash", "-c", "exec /home/holyglory/XFoilFOAM/.venv/bin/python -m pytest tests/test_deploy_sweeper_state.py tests/test_deployment_env_preflight.py tests/test_deployment_source_promotion.py tests/test_deployment_storage_prune.py -q --junitxml=\"$DEVCOORDINATOR_DIAGNOSTICS_DIR/maintenance.xml\""]
 env = { PYTHONPATH = "src:.", PYTHONDONTWRITEBYTECODE = "1" }
 diagnostic_sources = [{ format = "junit", path = "maintenance.xml" }]
+
+[test.compressible-cost-profile]
+timeout_seconds = 1500
+env = { PYTHONPATH = "src:.", PYTHONDONTWRITEBYTECODE = "1" }
+
+[[test.compressible-cost-profile.check]]
+name = "contracts"
+tier = "development"
+timeout_seconds = 180
+command = ["/home/holyglory/XFoilFOAM/.venv/bin/python", "-m", "pytest", "tests/test_mpi_binding_experiment.py", "-q"]
+
+[[test.compressible-cost-profile.check]]
+name = "inputs"
+tier = "development"
+phase = "fixture"
+timeout_seconds = 300
+requires = ["contracts"]
+command = ["/home/holyglory/XFoilFOAM/.venv/bin/python", "-m", "scripts.materials.compressible_cost_profile_control", "prepare"]
+resources = [{ kind = "directory", id = ".codex-artifacts/compressible-cost-profile", access = "exclusive" }]
+
+[[test.compressible-cost-profile.check]]
+name = "native"
+tier = "development"
+timeout_seconds = 900
+requires = ["inputs"]
+command = ["/home/holyglory/XFoilFOAM/.venv/bin/python", "-m", "scripts.materials.compressible_cost_profile_control", "apply"]
+
+[[test.compressible-cost-profile.check]]
+name = "verification"
+tier = "development"
+timeout_seconds = 120
+requires = ["native"]
+command = ["/home/holyglory/XFoilFOAM/.venv/bin/python", "-m", "scripts.materials.compressible_cost_profile_control", "verify"]
+retained_artifacts = [{ name = "profile-fields", path = ".codex-artifacts/compressible-cost-profile/output/snapshots", max_bytes = 268435456 }]
+
+[[test.compressible-cost-profile.check]]
+name = "cleanup"
+tier = "development"
+phase = "cleanup"
+timeout_seconds = 180
+after = ["contracts", "inputs", "native", "verification"]
+command = ["/home/holyglory/XFoilFOAM/.venv/bin/python", "-m", "scripts.materials.compressible_cost_profile_control", "cleanup"]
+retained_artifacts = [{ name = "cost-profile-receipt", path = ".codex-artifacts/compressible-cost-profile/receipt", max_bytes = 134217728 }]
+
+[deployment.compressible-cost-profile]
+source = ["worktree"]
+components = ["profile"]
+public = false
+ttl_seconds = 1000
+
+[deployment.compressible-cost-profile.component.profile]
+type = "compose"
+files = ["compose.compressible-cost-profile.yml"]
+services = ["profile"]
+finite_services = ["profile"]
+build = false
+port = false
+route = false
+timeout_seconds = 750

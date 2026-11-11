@@ -4,6 +4,31 @@ import pytest
 from scripts.materials.mpi_binding_experiment import configure_unbound_mpi
 from scripts.materials import checkpoint_placement as checkpoint
 from scripts.materials import checkpoint_placement_control as control
+from scripts.materials import compressible_cost_profile as cost_profile
+
+
+def test_cost_profile_instrumentation_preserves_every_existing_entry():
+    original = ('application rhoPimpleFoam;\nmaxCo 0.5;\nwritePrecision 12;\n'
+                'functions\n{\n forceCoeffs1 { type forceCoeffs; writeInterval 1; }\n}\n')
+    changed = cost_profile.instrument_control(original)
+    assert changed.removesuffix('\nprofiling {}\n').replace(cost_profile.PARALLEL, '', 1) == original
+    with pytest.raises(ValueError, match='overwrite'):
+        cost_profile.instrument_control(changed)
+    with pytest.raises(ValueError, match='one original'):
+        cost_profile.instrument_control('application rhoPimpleFoam;')
+
+
+def test_cost_profile_parser_keeps_nested_times_separate_and_rejects_missing_data():
+    text = ('profiling { trigger0 { id 0; description "application"; calls 1; totalTime 10; childTime 9; active true; }'
+            'trigger1 { id 1; parentId 0; description "fvMatrix::solve.p"; calls 12; totalTime 6; childTime 2; active false; }}')
+    entries = cost_profile.profile_entries(text)
+    assert entries[1]['parent'] == 0
+    assert entries[0]['total'] == 10
+    assert entries[1]['total'] - entries[1]['child'] == 4
+    with pytest.raises(ValueError, match='Incomplete'):
+        cost_profile.profile_entries(text.replace('totalTime 6;', ''))
+    with pytest.raises(ValueError, match='Missing'):
+        cost_profile.profile_entries('')
 
 
 def test_explicit_binding_only_changes_mpi_launch_and_preserves_bounds_and_monitor():
