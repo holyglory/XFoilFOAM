@@ -202,7 +202,7 @@ export async function verifyCurrentPreciseEvidenceReuse(
           if (cheapRefusal) expect(first.reusedUnitIds).toEqual([unitId]);
           else {
             expect(first.reusedUnitIds).toEqual([]);
-            expect(first.refused).toMatchObject([{ unitId: blocked.unit_id, reason: expect.stringContaining("Source authentication failed") }]);
+            expect(first.refused).toEqual([{ unitId: blocked.unit_id, reason: "source is not an archived final physical point" }]);
             const reused: string[] = [];
             for (let pass = 0; pass < 3 && !reused.length; pass++)
               reused.push(...(await reconcileCurrentPreciseEvidenceReuse(target, scan)).reusedUnitIds);
