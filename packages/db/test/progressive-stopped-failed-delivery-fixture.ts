@@ -29,6 +29,7 @@ import { verifyDiagnosticWorkerDrain } from "./progressive-diagnostic-worker-dra
 import { withProgressiveSyncApi } from "../../../apps/api/test/progressive-polar-import-fixture";
 import { applyProgressiveRemoteProgress } from "../../../apps/sweeper/src/progressive-remote-progress";
 import { settleProgressiveRemoteJob, promoteRetainedProgressiveAttempts } from "../../../apps/sweeper/src/progressive-remote-settlement";
+import { progressiveSettlementJobsSql } from "../../../apps/sweeper/src/progressive-progress-selection";
 import { buildProgressiveFitRequest } from "../../../apps/sweeper/src/progressive-fitting";
 import { deliverNextProgressiveWorkerEvidence } from "../../../apps/sweeper/src/progressive-worker-evidence-delivery";
 import { resolveEngineRuntimeBuild } from "../../../apps/api/src/engine-provenance";
@@ -930,6 +931,20 @@ async function verifyCancelledAcceptedPublication(db: DB, envelope: ProgressiveR
           expect(await selectedState(scoped, selected.id, selected.jobId)).toBe(snapshot);
           const [retiredJob] = await scoped.execute(sql`SELECT "ingestedAt" IS NOT NULL ingested FROM sim_jobs WHERE id=${executionId}::uuid`);
           expect(retiredJob.ingested).toBe(sufficient);
+          const pending = await scoped.execute(progressiveSettlementJobsSql([executionId]));
+          expect(pending.map((row) => row.sim_job_id)).toEqual(sufficient ? [] : [executionId]);
+          if (sufficient && replay === 0) {
+            for (const reason of ["active promise", "blocked unit", "missing canonical"] as const)
+              await withRollbackFixture(scoped, `Retain explicit settlement repair (${reason})`, async (repair) => {
+                if (reason === "active promise") await repair.execute(sql`UPDATE sync_sweep_promises SET status='active'
+                  WHERE id=${envelope.promiseId}::uuid`);
+                else if (reason === "blocked unit") await repair.execute(sql`UPDATE progressive_cfd_units SET state='blocked'
+                  WHERE id=${envelope.scope.units[1].unitId}::uuid`);
+                else await repair.execute(sql`UPDATE results SET current_result_attempt_id=NULL WHERE id=${raw.resultId}::uuid`);
+                expect((await repair.execute(progressiveSettlementJobsSql([executionId]))).map((row) => row.sim_job_id), reason)
+                  .toEqual([executionId]);
+              });
+          }
         }
       });
     for (const guard of ["rejected", "missing classification", "missing selected raw", "wrong airfoil", "wrong revision", "wrong AoA",
