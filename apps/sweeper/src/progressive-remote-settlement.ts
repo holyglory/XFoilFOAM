@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { sql } from "drizzle-orm";
 import { effectiveProgressiveStageSql } from "@aerodb/db/progressive-execution-policy";
 import { progressiveBenchmarkAttemptSql } from "@aerodb/db/progressive-recipe-policy";
-import { assertProgressiveCfdTerminalDiagnostics } from "@aerodb/db/progressive-cfd-evidence";
+import { assertProgressiveCfdTerminalDiagnostics, readProgressiveDiagnosticRecoveryTrigger } from "@aerodb/db/progressive-cfd-evidence";
 import { issueProgressiveRemoteDiagnosticReceipts } from "@aerodb/db/progressive-remote-diagnostic-receipts";
 import { polarEvidencePublicationRank } from "@aerodb/core";
 import {
@@ -429,7 +429,7 @@ async function recoveryPromotions(
 ): Promise<ProgressiveRansPromotion[] | null> {
   const reports =
     await db.execute(sql`SELECT DISTINCT ON (report#>'{result,polars,0,rans_precalc_promotion}')
-      report, content_signature FROM progressive_remote_reports
+      report, content_signature, sequence FROM progressive_remote_reports
     WHERE sim_job_id = ${envelope.scope.executionId}::uuid
       AND report#>'{result,polars,0,rans_precalc_promotion}' IS NOT NULL
       AND report#>'{result,polars,0,rans_precalc_promotion}' <> 'null'::jsonb
@@ -470,7 +470,17 @@ async function recoveryPromotions(
   );
   // The original report remains the recovery obligation until its exact
   // trigger is retained. An accepted sibling cannot stand in for that source.
-  if (!receipt) return null;
+  if (!receipt) {
+    const diagnostic = await readProgressiveDiagnosticRecoveryTrigger(db, envelope.scope.executionId, {
+      sequence: Number(reports[0].sequence), reportContentSignature: String(reports[0].content_signature),
+      pointContentSignature: source.contentSignature,
+    });
+    if (!diagnostic) return null;
+    return [{
+      revisionId: diagnostic.revisionId, triggerDiagnosticReceipt: diagnostic.reference,
+      triggerAoaDeg: promotion.trigger_aoa_deg, ...scope,
+    }];
+  }
   const [revision] =
     await db.execute(sql`SELECT simulation_preset_revision_id FROM result_attempts
     WHERE id = ${receipt.resultAttemptId}::uuid AND sim_job_id = ${envelope.scope.executionId}::uuid`);

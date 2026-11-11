@@ -1359,6 +1359,13 @@
       "when": 1794094800000,
       "tag": "0193_restore_quarantine_schema",
       "breakpoints": true
+    },
+    {
+      "idx": 194,
+      "version": "7",
+      "when": 1794355200000,
+      "tag": "0194_progressive_diagnostic_recovery",
+      "breakpoints": true
     }
   ]
 }

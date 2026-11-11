@@ -7631,8 +7631,8 @@ export const progressiveCfdRecoveryPlans = pgTable(
       .notNull()
       .references(() => simJobs.id, { onDelete: "cascade" }),
     diagnosticAttemptId: uuid("diagnostic_attempt_id")
-      .notNull()
       .references(() => resultAttempts.id, { onDelete: "cascade" }),
+    diagnosticPointContentSignature: text("diagnostic_point_content_signature"),
     diagnosticSignature: text("diagnostic_signature").notNull(),
     scope: text("scope").notNull(),
     reason: text("reason").notNull(),
@@ -7642,6 +7642,20 @@ export const progressiveCfdRecoveryPlans = pgTable(
       .default(sql`clock_timestamp()`),
   },
   (table) => ({
+    diagnosticSource: foreignKey({
+      name: "progressive_cfd_recovery_plans_diagnostic_source_fk",
+      columns: [table.parentJobId, table.diagnosticPointContentSignature],
+      foreignColumns: [progressiveRemoteDiagnosticReceipts.simJobId, progressiveRemoteDiagnosticReceipts.pointContentSignature],
+    }).onDelete("cascade"),
+    diagnosticSourceCheck: check(
+      "progressive_cfd_recovery_plans_diagnostic_source_check",
+      sql`(${table.diagnosticAttemptId} IS NOT NULL) <> (${table.diagnosticPointContentSignature} IS NOT NULL)`,
+    ),
+    diagnosticReceiptCheck: check(
+      "progressive_cfd_recovery_plans_diagnostic_receipt_check",
+      sql`${table.diagnosticPointContentSignature} IS NULL OR (${table.diagnosticPointContentSignature} ~ '^[a-f0-9]{64}$'
+        AND ${table.ordinal} = 1 AND ${table.scope} = 'original_sweep' AND ${table.reason} = 'hard_solver')`,
+    ),
     signatureCheck: check(
       "progressive_cfd_recovery_plans_diagnostic_signature_check",
       sql`${table.diagnosticSignature} ~ '^[a-f0-9]{64}$'`,

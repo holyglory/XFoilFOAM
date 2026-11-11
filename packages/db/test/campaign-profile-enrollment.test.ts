@@ -8270,6 +8270,42 @@ describe("progressive execution stop and settlement", () => {
 });
 
 describe("bounded progressive numerical recovery", () => {
+  it.each([
+    { angles: [-4, 4], triggerAoaDeg: 4, earlyState: null, speed: 34.1941 },
+    { angles: [-4, 4], triggerAoaDeg: 4, earlyState: "gap" as const, speed: 34.1942 },
+    { angles: [-5, 0], triggerAoaDeg: 0, earlyState: "gap" as const, speed: 34.1943 },
+    { angles: [0, 9], triggerAoaDeg: 0, earlyState: "pending" as const, speed: 34.1944 },
+    { angles: [-5, 5], triggerAoaDeg: 5, earlyState: "gap" as const, speed: 34.1945 },
+  ])("recovers an all-diagnostic original sweep at $triggerAoaDeg degrees after early settlement $earlyState", async ({ angles, triggerAoaDeg, earlyState, speed }) => {
+    const fixture = await cfdEvidenceFixture(speed, 2, [], angles, false, undefined, { chordM: 1.19402 }, angles.length, true);
+    expect(fixture.leases.map((unit) => unit.alpha).sort((a, b) => a - b)).toEqual(angles);
+    const [job] = await db.select().from(simJobs).where(eq(simJobs.id, fixture.composed.jobId));
+    const [admission] = await db.select({ enabled: sweeperState.enabled }).from(sweeperState).where(eq(sweeperState.id, 1));
+    const solverId = randomUUID();
+    const promiseId = randomUUID();
+    try {
+      await db.execute(sql`INSERT INTO registered_remote_solvers
+        (id,instance_id,instance_name,cpu_capacity,cpu_budget,max_active_polar_promises)
+        VALUES (${solverId}::uuid,${randomUUID()},'isolated diagnostic recovery worker',96,96,96)`);
+      await db.update(sweeperState).set({ enabled: true }).where(eq(sweeperState.id, 1));
+      await db.execute(sql`INSERT INTO sync_sweep_promises
+        (id,registered_solver_id,airfoil_id,simulation_preset_revision_id,aoa_count,"expiresAt")
+        VALUES (${promiseId}::uuid,${solverId}::uuid,${job.airfoilId}::uuid,
+          ${job.simulationPresetRevisionId}::uuid,${angles.length},clock_timestamp()+interval '1 hour')`);
+      for (const alpha of angles) await db.execute(sql`INSERT INTO sync_sweep_promise_points
+        (promise_id,airfoil_id,simulation_preset_revision_id,aoa_deg)
+        VALUES (${promiseId}::uuid,${job.airfoilId}::uuid,${job.simulationPresetRevisionId}::uuid,${alpha})`);
+      const { envelope } = await bindProgressiveRemoteDispatch(db, { simJobId: job.id, solverId, promiseId });
+      const { verifyDiagnosticOnlyPromotionRecovery } = await import("./progressive-stopped-failed-delivery-fixture");
+      await verifyDiagnosticOnlyPromotionRecovery(db, envelope, triggerAoaDeg, earlyState);
+    } finally {
+      await db.update(sweeperState).set({ enabled: admission.enabled }).where(eq(sweeperState.id, 1));
+      await db.execute(sql`DELETE FROM progressive_remote_dispatches WHERE sim_job_id=${job.id}::uuid`);
+      await db.execute(sql`DELETE FROM sync_sweep_promises WHERE id=${promiseId}::uuid`);
+      await db.execute(sql`DELETE FROM registered_remote_solvers WHERE id=${solverId}::uuid`);
+    }
+  }, 240_000);
+
   async function composeRecovery(
     leases: Awaited<ReturnType<typeof claimProgressiveCfdBatch>>,
   ) {
@@ -8567,6 +8603,7 @@ describe("bounded progressive numerical recovery", () => {
         expect(plan).toMatchObject({
           scope: "original_sweep",
           diagnostic_attempt_id: ids.at(-1),
+          diagnostic_point_content_signature: null,
         });
         expect(plan.recipe).toMatchObject({
           mesh: originals[index].mesh,
@@ -8578,6 +8615,20 @@ describe("bounded progressive numerical recovery", () => {
           sql`UPDATE progressive_cfd_recovery_plans SET reason = 'needs_urans' WHERE id = ${plans[0].id}`,
         ),
       ).rejects.toThrow();
+      for (const scenario of ["neither", "both", "missing-receipt", "diagnostic-targeted"]) {
+        const invalid = { ...plans[0],
+          diagnostic_attempt_id: scenario === "both" ? ids.at(-1) : null,
+          diagnostic_point_content_signature: scenario === "neither" ? null : "0".repeat(64),
+          ...(scenario === "diagnostic-targeted" ? { scope: "targeted" } : {}),
+        };
+        await expect(db.transaction(async (transaction) => {
+          await transaction.execute(sql`DELETE FROM progressive_cfd_recovery_plans WHERE id=${plans[0].id}::uuid`);
+          await transaction.execute(sql`INSERT INTO progressive_cfd_recovery_plans
+            SELECT * FROM jsonb_populate_record(NULL::progressive_cfd_recovery_plans,${JSON.stringify(invalid)}::jsonb)`);
+        })).rejects.toThrow(scenario === "missing-receipt" ? "progressive_cfd_recovery_plans_diagnostic_source_fk"
+          : scenario === "diagnostic-targeted" ? "progressive_cfd_recovery_plans_diagnostic_receipt_check"
+          : "progressive_cfd_recovery_plans_diagnostic_source_check");
+      }
       expect(
         await settleProgressiveCfdExecution(db, fixture.composed.jobId),
       ).toMatchObject({ retry: 4, complete: 0, gaps: 0 });

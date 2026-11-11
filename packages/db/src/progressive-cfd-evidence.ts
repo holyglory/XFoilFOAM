@@ -11,7 +11,8 @@ import {
 import { assertProgressiveExecutionIdentity } from "./progressive-execution-identity";
 import { readProgressiveRemoteRetention, readProgressiveRemoteSourceClassifications } from "./progressive-remote-retention";
 import { assertStoppedProgressiveStorage } from "./progressive-stopped-storage";
-import { resolveProgressiveRemoteEvidence, assertProgressiveReportedManifest, ProgressiveRemoteEvidenceConflict } from "./progressive-remote-evidence";
+import { resolveProgressiveRemoteEvidence, assertProgressiveReportedManifest, ProgressiveRemoteEvidenceConflict, type ProgressiveRemoteEvidenceReference } from "./progressive-remote-evidence";
+import { readProgressiveDiagnosticRecoverySources } from "./progressive-cfd-diagnostic-recovery";
 import { progressiveRemotePointProjection, assertProgressiveRemotePhysicalCase } from "./progressive-remote-point-projection";
 import { progressiveReportedPointSources } from "./progressive-remote-report";
 import type { ProgressiveRemoteEvidenceDelivery } from "./progressive-remote-evidence-receipts";
@@ -54,6 +55,7 @@ interface BoundUnit {
   lease_until: Date | string | null;
   work_state: string;
   latest_attempt: boolean;
+  has_case_history: boolean;
   requested_budget_seconds?: number;
   snapshot: {
     flowState: { speedMps: number };
@@ -99,6 +101,7 @@ async function lockJobScope(
     policy?: JobScopePolicy;
     evidenceAoas?: readonly number[];
     terminalDiagnostics?: boolean;
+    diagnosticRecovery?: ProgressiveRemoteEvidenceReference & { receiptSignature?: string; historySignature?: string };
   } = {},
 ) {
   const recoveryScope = options.recoveryScope;
@@ -185,6 +188,10 @@ async function lockJobScope(
     );
   if (recoveryScope)
     await lockProgressiveStorageRecoveryUnits(db, recoveryScope, simJobId);
+  const diagnosticRecovery = options.diagnosticRecovery
+    ? await readProgressiveDiagnosticRecoverySources(db, simJobId, options.diagnosticRecovery)
+    : null;
+  if (options.diagnosticRecovery && !diagnosticRecovery) return null;
   const units = (await db.execute(sql`
     SELECT attempt.token, attempt.owner, unit.id AS unit_id, unit.aoa_deg, attempt.active_seconds, unit.active_seconds AS unit_seconds,
       unit.active_budget_seconds, ${progressiveCfdEffectiveBudgetSql(sql`unit`)} AS effective_budget_seconds,
@@ -192,6 +199,12 @@ async function lockJobScope(
       unit.lease_token, unit.lease_owner, unit.lease_until, work.state AS work_state,
       NOT EXISTS (SELECT 1 FROM progressive_cfd_attempts newer WHERE newer.unit_id = unit.id
         AND (newer.started_at, newer.token) > (attempt.started_at, attempt.token)) AS latest_attempt,
+      ${options.diagnosticRecovery ? sql`(EXISTS (SELECT 1 FROM progressive_cfd_evidence evidence
+          JOIN progressive_cfd_attempts history ON history.token = evidence.attempt_token WHERE history.unit_id = unit.id)
+        OR EXISTS (SELECT 1 FROM result_attempts raw WHERE raw.sim_job_id = attempt.sim_job_id AND raw.aoa_deg = unit.aoa_deg)
+        OR EXISTS (SELECT 1 FROM progressive_cfd_runtime_progress runtime
+          JOIN progressive_cfd_attempts history ON history.token = runtime.attempt_token
+          WHERE history.unit_id = unit.id AND runtime.active_seconds > 0))` : sql`false`} AS has_case_history,
       (EXISTS (SELECT 1 FROM progressive_cfd_evidence receipt WHERE receipt.attempt_token = attempt.token
         AND receipt.budget_guard_exhausted) OR EXISTS (SELECT 1 FROM progressive_cfd_runtime_progress runtime
         WHERE runtime.attempt_token = attempt.token AND runtime.engine_job_id = ${engineJobId})) AS budget_guard_confirmed,
@@ -226,6 +239,15 @@ async function lockJobScope(
   }).map((unit) => unit.token));
   if (options.terminalDiagnostics && retainedDiagnostics.size !== units.length)
     throw new ProgressiveCfdEvidenceScopeClosed("Terminal diagnostics require exact stopped, unowned material failures for every original unit");
+  const omitted = new Set(diagnosticRecovery?.intentionallyOmittedAoas ?? []);
+  if (diagnosticRecovery && units.some((unit) => omitted.has(unit.aoa_deg) &&
+    (unit.active_seconds !== 0 || unit.unit_seconds !== 0 || unit.has_case_history)))
+    throw new ProgressiveCfdEvidenceScopeClosed("Numerical recovery cannot omit a case with recorded work or physical history");
+  const terminalRecovery = new Set(diagnosticRecovery ? units.filter((unit) =>
+    unit.latest_attempt && unit.outcome === "failed" && ["gap", "pending"].includes(unit.state) &&
+    unit.lease_token == null && unit.lease_owner == null && unit.lease_until == null &&
+    (omitted.has(unit.aoa_deg) || diagnosticRecovery.attemptedAoas.includes(unit.aoa_deg)),
+  ).map((unit) => unit.token) : []);
   if (
     !units.length ||
     units.length !== Number(count.count) ||
@@ -249,10 +271,13 @@ async function lockJobScope(
           : policy === "runtime"
             ? !isRuntimeProgressActiveUnit(unit) &&
               !isRuntimeProgressObsoleteUnit(unit)
-            : !retainedDiagnostics.has(unit.token) &&
+            : !retainedDiagnostics.has(unit.token) && !terminalRecovery.has(unit.token) &&
               (unit.outcome !== "running" || !["leased", "blocked"].includes(unit.state) ||
-                (selectedAoas !== null && (!unit.latest_attempt ||
-                  (unit.state === "leased" && unit.lease_token !== unit.token))))),
+                ((selectedAoas !== null || diagnosticRecovery !== null) && (!unit.latest_attempt ||
+                  (unit.state === "leased" && unit.lease_token !== unit.token))) ||
+                (diagnosticRecovery !== null && (unit.state === "leased"
+                  ? unit.lease_owner !== unit.owner || unit.lease_until == null
+                  : unit.lease_token != null || unit.lease_owner != null || unit.lease_until != null)))),
     )
   )
     throw new ProgressiveCfdEvidenceScopeClosed(
@@ -304,6 +329,7 @@ async function lockJobScope(
   return {
     airfoilId: String(job.airfoil_id),
     units,
+    diagnosticRecovery,
   };
 }
 
@@ -522,6 +548,45 @@ export async function assertProgressiveCfdEvidenceJob(
       }
     }
     return scope !== null;
+  });
+}
+
+// This is the shared reconciliation/planning boundary. The private lock derives
+// any terminal or zero-work omitted allowance from the authenticated report.
+export async function readProgressiveDiagnosticRecoveryTrigger(
+  db: DB,
+  simJobId: string,
+  reference: ProgressiveRemoteEvidenceReference & { receiptSignature?: string; historySignature?: string },
+) {
+  return db.transaction(async (transaction) => {
+    const connection = transaction as unknown as DB;
+    const scope = await lockJobScope(connection, simJobId, simJobId, { diagnosticRecovery: reference });
+    if (!scope?.diagnosticRecovery) return null;
+    const validated = scope.diagnosticRecovery;
+    for (const source of validated.reportedSources) {
+      const unit = scope.units.find((candidate) => candidate.aoa_deg === source.point.aoa_deg);
+      if (!unit) throw new ProgressiveRemoteEvidenceConflict("Numerical recovery changed an original physical case");
+      assertProgressiveRemotePhysicalCase(source, unit.snapshot);
+    }
+    const physical = await connection.execute(sql`SELECT raw.id, raw.sim_job_id, raw.engine_job_id, raw.airfoil_id,
+      raw.simulation_preset_revision_id, raw.aoa_deg, raw.evidence_payload, evidence.evidence_signature, evidence.attempt_token
+      FROM progressive_cfd_attempts attempt JOIN progressive_cfd_evidence evidence ON evidence.attempt_token = attempt.token
+      JOIN result_attempts raw ON raw.id = evidence.result_attempt_id
+      WHERE attempt.sim_job_id = ${simJobId}::uuid ORDER BY raw.id LIMIT 2049`);
+    const retained = new Set(validated.physicalSources.map((entry) => entry.resultAttemptId));
+    if (physical.length > 2048 || physical.length !== retained.size || physical.some((raw) => {
+      const unit = scope.units.find((candidate) => candidate.token === raw.attempt_token);
+      return !unit || !retained.has(String(raw.id)) || raw.sim_job_id !== simJobId || raw.engine_job_id !== simJobId ||
+        raw.airfoil_id !== scope.airfoilId || raw.simulation_preset_revision_id !== unit.execution_revision_id ||
+        raw.aoa_deg !== unit.aoa_deg || analysisContentHash(raw.evidence_payload) !== raw.evidence_signature;
+    })) throw new ProgressiveRemoteEvidenceConflict("Numerical recovery changed retained physical evidence identity or coverage");
+    const unit = scope.units.find((candidate) => candidate.aoa_deg === validated.triggerAoaDeg)!;
+    return {
+      revisionId: unit.execution_revision_id, attemptToken: unit.token,
+      triggerAoaDeg: validated.triggerAoaDeg, attemptedAoas: validated.attemptedAoas,
+      intentionallyOmittedAoas: validated.intentionallyOmittedAoas,
+      diagnosticAoas: validated.diagnosticAoas, reference: validated.reference,
+    };
   });
 }
 

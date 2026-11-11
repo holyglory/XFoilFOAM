@@ -250,6 +250,8 @@ export async function withRepairedProgressiveCfdEvidence(
             AND evidence.attempt_token = parent.token
           LEFT JOIN result_classifications classification ON classification.result_attempt_id = diagnostic.id
           WHERE claim.attempt_token = ${scope.token}::uuid AND plan.ordinal = 1 AND plan.scope = 'targeted'
+            -- Diagnostic-backed original sweeps never authorize targeted repaired-evidence publication.
+            AND plan.diagnostic_point_content_signature IS NULL
             AND plan.reason IN ('needs_urans', 'hard_solver')
             AND NOT EXISTS (SELECT 1 FROM progressive_cfd_recovery_plans newer
               WHERE newer.unit_id = plan.unit_id AND newer.ordinal > plan.ordinal)
@@ -695,6 +697,12 @@ export async function settleProgressiveCfdExecution(
         EXISTS (SELECT 1 FROM progressive_cfd_recovery_plans recovery
           WHERE recovery.unit_id = unit.id AND recovery.parent_attempt_token = attempt.token) AS numerical_recovery,
         EXISTS (SELECT 1 FROM progressive_cfd_recovery_plans recovery
+          WHERE recovery.unit_id = unit.id AND recovery.parent_attempt_token = attempt.token
+            AND recovery.parent_job_id = attempt.sim_job_id AND recovery.ordinal = 1
+            AND recovery.scope = 'original_sweep' AND recovery.reason = 'hard_solver'
+            AND recovery.diagnostic_attempt_id IS NULL
+            AND recovery.diagnostic_point_content_signature IS NOT NULL) AS diagnostic_recovery,
+        EXISTS (SELECT 1 FROM progressive_cfd_recovery_plans recovery
           WHERE recovery.unit_id = unit.id AND recovery.parent_attempt_token = attempt.token AND recovery.ordinal = 2) AS precise_verification,
         (unit.policy_version = ${PROGRESSIVE_COMPUTE_POLICY.version}
           AND ${progressiveCfdPreciseVerificationAvailableSql("unit", "attempt")}) AS unused_precise_verification,
@@ -762,6 +770,14 @@ export async function settleProgressiveCfdExecution(
             new Date(String(unit.lease_until)).getTime() <= Date.now()) &&
         ["complete", "failed", "cancelled"].includes(String(unit.outcome));
       const recoverableStoredEvidence = recoveringStoredEvidence;
+      // A stopped original sweep may have been settled before its authenticated
+      // diagnostic plan was admitted. Reuse the ordinary retry/budget gates;
+      // neither terminal ownership nor a pending state alone grants a retry.
+      const recoveringDiagnosticPromotion =
+        unit.diagnostic_recovery === true && unit.latest_attempt === true &&
+        unit.current_scope === true && unit.recoverable_stage === true &&
+        unit.outcome === "failed" && ["gap", "pending"].includes(String(unit.state)) &&
+        unit.lease_token == null && unit.lease_until == null;
       const staleTerminalUnit =
         unit.latest_attempt === true &&
         unit.outcome !== "running" &&
@@ -783,6 +799,7 @@ export async function settleProgressiveCfdExecution(
       if (
         unit.outcome !== "running" &&
         !recovering &&
+        !recoveringDiagnosticPromotion &&
         !recoverableStoredEvidence
       )
         continue;
@@ -796,6 +813,7 @@ export async function settleProgressiveCfdExecution(
       }
       if (
         !recovering &&
+        !recoveringDiagnosticPromotion &&
         !recoverableStoredEvidence &&
         !["leased", "blocked"].includes(String(unit.state))
       )
@@ -887,7 +905,7 @@ export async function settleProgressiveCfdExecution(
           WHERE unit_id = ${unit.id} AND state = 'claimed'
             AND claim_attempt_token = ${unit.token}::uuid`);
       }
-      if ((recovering || budgetExtensionRetry) && retry)
+      if ((recovering || recoveringDiagnosticPromotion || budgetExtensionRetry) && retry)
         await connection.execute(sql`UPDATE progressive_work SET state = 'pending', error = NULL, completed_at = NULL
           WHERE id = ${unit.work_id} AND state = 'gap'`);
       if (complete) counts.complete += 1;

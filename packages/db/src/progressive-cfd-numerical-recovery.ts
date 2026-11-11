@@ -2,16 +2,19 @@ import { sql } from "drizzle-orm";
 import { PROGRESSIVE_COMPUTE_POLICY } from "@aerodb/core";
 import { analysisContentHash, canonicalAnalysisJson } from "./analysis-target";
 import type { DB } from "./client";
-import { assertProgressiveCfdEvidenceJob } from "./progressive-cfd-evidence";
+import { assertProgressiveCfdEvidenceJob, readProgressiveDiagnosticRecoveryTrigger } from "./progressive-cfd-evidence";
 import { assertProgressiveExecutionIdentity } from "./progressive-execution-identity";
+import type { ProgressiveDiagnosticRecoveryReference } from "./progressive-cfd-diagnostic-recovery";
 
-export interface ProgressiveRansPromotion {
+export type ProgressiveRansPromotion = {
   revisionId: string;
-  triggerResultAttemptId: string;
   triggerAoaDeg: number;
   attemptedAoas: number[];
   intentionallyOmittedAoas: number[];
-}
+} & (
+  { triggerResultAttemptId: string; triggerDiagnosticReceipt?: never } |
+  { triggerResultAttemptId?: never; triggerDiagnosticReceipt: ProgressiveDiagnosticRecoveryReference }
+);
 
 export function progressiveMaterialDomainRecipe(
   recipe: Record<string, unknown>,
@@ -108,7 +111,21 @@ export async function recordProgressiveCfdRecoveryPlans(
       throw new Error(
         "Numerical recovery requires a physically stopped parent execution",
       );
+    const promotion = promotions[0];
+    if (promotion && ((typeof promotion.triggerResultAttemptId === "string") ===
+      (promotion.triggerDiagnosticReceipt != null)))
+      throw new Error("Numerical recovery requires one exclusive trigger source");
+    if (promotion?.triggerDiagnosticReceipt &&
+      ![promotion.triggerDiagnosticReceipt.receiptSignature, promotion.triggerDiagnosticReceipt.historySignature]
+        .every((signature) => typeof signature === "string" && /^[a-f0-9]{64}$/.test(signature)))
+      throw new Error("Numerical recovery requires exact diagnostic receipt and history hashes");
+    const remoteTrigger = promotion?.triggerDiagnosticReceipt
+      ? await readProgressiveDiagnosticRecoveryTrigger(connection, simJobId, promotion.triggerDiagnosticReceipt)
+      : null;
+    if (promotion?.triggerDiagnosticReceipt && !remoteTrigger)
+      throw new Error("Numerical recovery is missing its exact diagnostic receipt or stopped producer");
     if (
+      !remoteTrigger &&
       !(await assertProgressiveCfdEvidenceJob(
         connection,
         simJobId,
@@ -161,7 +178,6 @@ export async function recordProgressiveCfdRecoveryPlans(
       throw new Error(
         "Numerical recovery has changed or unbounded diagnostic evidence",
       );
-    const promotion = promotions[0];
     let trigger: RecoveryEvidence | undefined;
     if (promotion) {
       const request = job.request as {
@@ -186,7 +202,7 @@ export async function recordProgressiveCfdRecoveryPlans(
         (item) => item.id === promotion.triggerResultAttemptId,
       );
       const triggerUnit = units.find(
-        (unit) => unit.token === trigger?.attempt_token,
+        (unit) => unit.token === (trigger?.attempt_token ?? remoteTrigger?.attemptToken),
       );
       if (
         units.length < 2 ||
@@ -196,10 +212,14 @@ export async function recordProgressiveCfdRecoveryPlans(
           [...requested].sort((left, right) => left - right),
         ) !== canonicalAnalysisJson(angles) ||
         request.solver?.rans_failure_policy !== "abort_for_precalc" ||
-        !trigger ||
-        trigger.regime !== "rans" ||
-        trigger.aoa_deg !== promotion.triggerAoaDeg ||
-        trigger.evidence_payload.failure_disposition !== "hard_solver" ||
+        (!trigger && !remoteTrigger) ||
+        (trigger && (trigger.regime !== "rans" || trigger.aoa_deg !== promotion.triggerAoaDeg ||
+          trigger.evidence_payload.failure_disposition !== "hard_solver")) ||
+        (remoteTrigger && (remoteTrigger.revisionId !== promotion.revisionId ||
+          remoteTrigger.triggerAoaDeg !== promotion.triggerAoaDeg ||
+          canonicalAnalysisJson(remoteTrigger.attemptedAoas) !== canonicalAnalysisJson(promotion.attemptedAoas) ||
+          canonicalAnalysisJson(remoteTrigger.intentionallyOmittedAoas) !== canonicalAnalysisJson(promotion.intentionallyOmittedAoas))) ||
+        !Number.isFinite(promotion.triggerAoaDeg) ||
         promotion.triggerAoaDeg < 0 ||
         promotion.triggerAoaDeg > 5 ||
         triggerIndex < 0 ||
@@ -209,7 +229,7 @@ export async function recordProgressiveCfdRecoveryPlans(
         canonicalAnalysisJson(promotion.intentionallyOmittedAoas) !==
           canonicalAnalysisJson(omitted) ||
         canonicalAnalysisJson(
-          [...new Set(evidence.map((item) => item.aoa_deg))].sort(
+          [...new Set([...evidence.map((item) => item.aoa_deg), ...(remoteTrigger?.diagnosticAoas ?? [])])].sort(
             (left, right) => left - right,
           ),
         ) !==
@@ -254,10 +274,10 @@ export async function recordProgressiveCfdRecoveryPlans(
               (item.evidence_payload.failure_disposition === "hard_solver" ||
                 item.classification === "needs_urans"),
           ));
-      if (!diagnostic) continue;
+      if (!diagnostic && !remoteTrigger) continue;
       const reason = verification
         ? "accepted_precalc"
-        : diagnostic.evidence_payload.failure_disposition === "hard_solver"
+        : remoteTrigger || diagnostic!.evidence_payload.failure_disposition === "hard_solver"
           ? "hard_solver"
           : "needs_urans";
       const recipe = verification
@@ -268,22 +288,24 @@ export async function recordProgressiveCfdRecoveryPlans(
           );
       if (!recipe) continue;
       if (!verification)
-        recipe.uransFidelity = trigger || unit.stage === 2 ? "precalc" : "full";
-      const scope = trigger || verification ? "original_sweep" : "targeted";
+        recipe.uransFidelity = trigger || remoteTrigger || unit.stage === 2 ? "precalc" : "full";
+      const scope = trigger || remoteTrigger || verification ? "original_sweep" : "targeted";
       const ordinal = verification ? 2 : 1;
       const values = {
         unit_id: unit.id,
         ordinal,
         parent_attempt_token: unit.token,
         parent_job_id: simJobId,
-        diagnostic_attempt_id: diagnostic.id,
-        diagnostic_signature: diagnostic.evidence_signature,
+        diagnostic_attempt_id: remoteTrigger ? null : diagnostic!.id,
+        diagnostic_point_content_signature: remoteTrigger?.reference.pointContentSignature ?? null,
+        diagnostic_signature: remoteTrigger ? analysisContentHash(remoteTrigger.reference) : diagnostic!.evidence_signature,
         scope,
         reason,
         recipe,
       };
       const [existing] = await connection.execute(sql`
-        SELECT unit_id, ordinal, parent_attempt_token, parent_job_id, diagnostic_attempt_id, diagnostic_signature, scope, reason, recipe
+        SELECT unit_id, ordinal, parent_attempt_token, parent_job_id, diagnostic_attempt_id,
+          diagnostic_point_content_signature, diagnostic_signature, scope, reason, recipe
         FROM progressive_cfd_recovery_plans WHERE unit_id = ${unit.id} AND ordinal = ${ordinal}
       `);
       if (existing) {
@@ -295,8 +317,10 @@ export async function recordProgressiveCfdRecoveryPlans(
       }
       await connection.execute(sql`
         INSERT INTO progressive_cfd_recovery_plans
-          (unit_id, ordinal, parent_attempt_token, parent_job_id, diagnostic_attempt_id, diagnostic_signature, scope, reason, recipe)
-        VALUES (${unit.id}, ${ordinal}, ${unit.token}, ${simJobId}, ${diagnostic.id}, ${diagnostic.evidence_signature},
+          (unit_id, ordinal, parent_attempt_token, parent_job_id, diagnostic_attempt_id, diagnostic_point_content_signature,
+            diagnostic_signature, scope, reason, recipe)
+        VALUES (${unit.id}, ${ordinal}, ${unit.token}, ${simJobId}, ${values.diagnostic_attempt_id},
+          ${values.diagnostic_point_content_signature}, ${values.diagnostic_signature},
           ${scope}, ${reason}, ${canonicalAnalysisJson(recipe)}::jsonb)
       `);
       inserted += 1;
