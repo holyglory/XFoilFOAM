@@ -17,7 +17,13 @@ function refuse(): never {
 
 // Caller holds this transaction through publication. This authorizes only the
 // existing accepted result; it never changes an attempt, unit, recipe or receipt.
-export async function readStoppedAcceptedProgressivePublication(db: DB, executionId: string) {
+// Settlement can opt into occupied cells to validate their retained historical
+// source under the same scope/owner gates. It must not pass those IDs to promotion.
+export async function readStoppedAcceptedProgressivePublication(
+  db: DB,
+  executionId: string,
+  includeOccupied = false,
+) {
   const [initial] = await db.execute(sql`SELECT campaign_id,request_payload->'progressive'->>'epochId' AS epoch_id
     FROM sim_jobs WHERE id=${executionId}::uuid AND status='cancelled' AND "ingestedAt" IS NULL`);
   if (!initial) return null;
@@ -91,10 +97,12 @@ export async function readStoppedAcceptedProgressivePublication(db: DB, executio
       JOIN result_classifications classification ON classification.result_attempt_id=raw.id AND classification.state='accepted'
       JOIN results result ON result.id=raw.result_id
       WHERE raw.id=${entry.resultAttemptId}::uuid AND raw.sim_job_id=${executionId}::uuid AND raw.engine_job_id=${executionId}
-        AND raw.status='done' AND raw.valid_for_polar AND result.current_result_attempt_id IS NULL
+        AND raw.status='done' AND raw.valid_for_polar
+        AND (${includeOccupied} OR result.current_result_attempt_id IS NULL)
         AND coalesce((SELECT review.verdict::text FROM result_review_verdicts review
           WHERE review.result_id=result.id AND review."revokedAt" IS NULL
-          ORDER BY review."createdAt" DESC,review.id DESC LIMIT 1),'') NOT IN ('exclude','defer')`);
+          ORDER BY review."createdAt" DESC,review.id DESC LIMIT 1),'') NOT IN ('exclude','defer')
+      ${includeOccupied ? sql`FOR SHARE OF result,raw,classification` : sql``}`);
     if (!raw) continue;
     const unit = units.find((item) => item.token === raw.attempt_token && item.aoa_deg === raw.aoa_deg);
     if (!unit || unit.airfoil_id !== job.airfoil_id || raw.airfoil_id !== job.airfoil_id ||

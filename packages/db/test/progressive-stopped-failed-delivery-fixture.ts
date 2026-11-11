@@ -725,7 +725,8 @@ export async function verifyDiagnosticOnlyPromotionRecovery(
 }
 
 async function verifyCancelledAcceptedPublication(db: DB, envelope: ProgressiveRemoteExecutionEnvelope) {
-  for (const retired of [false, true]) await withRollbackFixture(db, "Restore cancelled accepted publication", async (connection) => {
+  for (const incomingFidelity of ["urans_full", "urans_precalc"] as const)
+  for (const retired of [false, true]) await withRollbackFixture(db, `Restore cancelled accepted publication (${incomingFidelity}/${retired})`, async (connection) => {
     const executionId = envelope.scope.executionId;
     expect(envelope.scope.stage).toBe(3);
     const [job] = await connection.execute(sql`SELECT job.airfoil_id,job.simulation_preset_revision_id,job.campaign_id,
@@ -736,7 +737,7 @@ async function verifyCancelledAcceptedPublication(db: DB, envelope: ProgressiveR
     const polar = result.polars[0];
     polar.reynolds = Number((job.snapshot as { derived: { reynolds: number } }).derived.reynolds);
     const accepted = { ...polar.attempts![0], aoa_deg: envelope.scope.units[0].alpha, case_slug: "cancelled-accepted",
-      converged: true, unsteady: true, stalled: false, cl: 0.4, cd: 0.03, cm: 0, error: null, fidelity: "urans_full" as const,
+      converged: true, unsteady: true, stalled: false, cl: 0.4, cd: 0.03, cm: 0, error: null, fidelity: incomingFidelity,
       force_history: { t: [0, 1, 2, 3], cl: [0.4, 0.4, 0.4, 0.4], cd: [0.03, 0.03, 0.03, 0.03], cm: [0, 0, 0, 0] },
       frame_track: {
         period_s: 1, periods_retained: 5, stationary: true, drift_frac: 0,
@@ -866,20 +867,104 @@ async function verifyCancelledAcceptedPublication(db: DB, envelope: ProgressiveR
       try { await settleProgressiveRemoteJob(scoped, executionId); } catch (error) { expect(error).toBeInstanceOf(Error); }
       expect(await scoped.execute(sql`SELECT current_result_attempt_id FROM results WHERE id=${raw.resultId}::uuid`), label).toEqual([{ current_result_attempt_id: null }]);
     });
-    await withRollbackFixture(connection, "Protect newer accepted canonical result", async (scoped) => {
-      const newer = randomUUID();
-      const newerJob = randomUUID();
+    // A distinct solve has its own job/attempt identity and registered archive;
+    // it must not violate per-job/result/AoA/regime uniqueness or borrow custody.
+    const selectedFixture = async (scoped: DB, fidelity: "urans_full" | "urans_precalc" | "rans") => {
+      const id = randomUUID(), jobId = randomUUID();
       await scoped.execute(sql`INSERT INTO sim_jobs(id,engine_job_id,airfoil_id,bc_ids,simulation_preset_revision_id,campaign_id,reference_chord_m,status,engine_state)
-        SELECT ${newerJob}::uuid,${newerJob},airfoil_id,bc_ids,simulation_preset_revision_id,campaign_id,reference_chord_m,'done','completed'
+        SELECT ${jobId}::uuid,${jobId},airfoil_id,bc_ids,simulation_preset_revision_id,campaign_id,reference_chord_m,'done','completed'
         FROM sim_jobs WHERE id=${executionId}::uuid`);
-      await scoped.insert(resultAttempts).values({ ...raw, id: newer, simJobId: newerJob, engineJobId: newerJob, solvedAt: new Date() });
-      await scoped.execute(sql`INSERT INTO result_classifications(result_attempt_id,airfoil_id,simulation_preset_revision_id,aoa_deg,state,region,reasons,confidence,classifier_version)
-        SELECT ${newer}::uuid,airfoil_id,simulation_preset_revision_id,aoa_deg,state,region,reasons,confidence,classifier_version
-        FROM result_classifications WHERE result_attempt_id=${raw.id}::uuid`);
-      await scoped.execute(sql`UPDATE results SET current_result_attempt_id=${newer}::uuid WHERE id=${raw.resultId}::uuid`);
-      await settleProgressiveRemoteJob(scoped, executionId);
-      expect(await scoped.execute(sql`SELECT current_result_attempt_id FROM results WHERE id=${raw.resultId}::uuid`)).toEqual([{ current_result_attempt_id: newer }]);
-    });
+      const [selected] = await scoped.insert(resultAttempts).values({
+        ...raw, id, simJobId: jobId, engineJobId: jobId, solvedAt: new Date(), createdAt: new Date(),
+        regime: fidelity === "rans" ? "rans" : "urans", unsteady: fidelity !== "rans",
+        evidencePayload: JSON.parse(JSON.stringify({ ...(raw.evidencePayload as Record<string, unknown>), fidelity })),
+      }).returning();
+      const originalArtifacts = await scoped.select().from(solverEvidenceArtifacts)
+        .where(eq(solverEvidenceArtifacts.resultAttemptId, raw.id));
+      const originalBundle = originalArtifacts.find((artifact) => artifact.kind === "engine_bundle")!;
+      const originalManifest = originalArtifacts.find((artifact) => artifact.kind === "manifest")!;
+      const { remoteEvidenceUploadId: _originalUpload, ...metadata } = originalBundle.metadata as Record<string, unknown>;
+      const identity = { ...metadata, verifiedAt: new Date(String(metadata.verifiedAt)) } as unknown as
+        Parameters<typeof registerVerifiedBrokeredEvidenceArchive>[1]["identity"];
+      const artifacts = [];
+      for (const artifact of [originalBundle, originalManifest]) artifacts.push((await scoped.insert(solverEvidenceArtifacts).values({
+        ...artifact, id: randomUUID(), resultAttemptId: id, simJobId: jobId, engineJobId: jobId,
+        metadata: artifact.kind === "engine_bundle" ? metadata : artifact.metadata,
+      }).returning())[0]);
+      await registerVerifiedBrokeredEvidenceArchive(scoped, {
+        resultId: raw.resultId!, resultAttemptId: id, sourceArtifactId: artifacts[0].id,
+        manifestArtifactId: artifacts[1].id, evidenceBase: "isolated-case", identity, memberSet: progressiveArchiveMembers,
+      });
+      await scoped.insert(resultMedia).values({ resultId: raw.resultId!, resultAttemptId: id,
+        kind: "video", role: "instantaneous", field: "velocity", mimeType: "video/mp4",
+        storageKey: `isolated/${id}.mp4`, sha256: "a".repeat(64), byteSize: 1 });
+      await refreshPolarClassificationsForJob(scoped, String(job.airfoil_id), String(job.simulation_preset_revision_id), jobId);
+      expect(await scoped.execute(sql`SELECT state FROM result_classifications WHERE result_attempt_id=${id}::uuid`))
+        .toEqual([{ state: "accepted" }]);
+      await scoped.execute(sql`UPDATE results SET current_result_attempt_id=${id}::uuid,sim_job_id=${jobId}::uuid,
+        engine_job_id=${jobId},status='done',source='solved',regime=${selected.regime}::regime,
+        cl=${selected.cl},cd=${selected.cd},cm=${selected.cm},fidelity=${fidelity}
+        WHERE id=${raw.resultId}::uuid`);
+      return { id, jobId };
+    };
+    const selectedState = async (scoped: DB, id: string, jobId: string) => {
+      const state = [await protectedState(scoped)];
+      for (const [table, column, value] of [
+        ["results", "id", raw.resultId!], ["result_attempts", "id", id],
+        ["sim_jobs", "id", jobId], ["result_classifications", "result_attempt_id", id],
+        ["solver_evidence_archives", "result_attempt_id", id], ["solver_evidence_artifacts", "result_attempt_id", id],
+      ]) state.push(analysisContentHash(await scoped.execute(sql`SELECT to_jsonb(row) row FROM ${sql.identifier(table)} row
+        WHERE ${sql.identifier(column)}=${value}::uuid ORDER BY to_jsonb(row)::text`)));
+      return analysisContentHash(state);
+    };
+    for (const fidelity of ["urans_full", "urans_precalc", "rans"] as const)
+      await withRollbackFixture(connection, `Selected fidelity (${incomingFidelity}/${fidelity}/${retired})`, async (scoped) => {
+        const selected = await selectedFixture(scoped, fidelity);
+        const snapshot = await selectedState(scoped, selected.id, selected.jobId);
+        const sufficient = fidelity === "urans_full" || (incomingFidelity === "urans_precalc" && fidelity === "urans_precalc");
+        for (let replay = 0; replay < 2; replay++) {
+          const outcome = await settleProgressiveRemoteJob(scoped, executionId);
+          expect(outcome).toMatchObject(sufficient
+            ? { kind: "settled", counts: { complete: 0 } }
+            : { kind: "waiting", reason: "accepted_point_publication" });
+          expect(await selectedState(scoped, selected.id, selected.jobId)).toBe(snapshot);
+          const [retiredJob] = await scoped.execute(sql`SELECT "ingestedAt" IS NOT NULL ingested FROM sim_jobs WHERE id=${executionId}::uuid`);
+          expect(retiredJob.ingested).toBe(sufficient);
+        }
+      });
+    for (const guard of ["rejected", "missing classification", "missing selected raw", "wrong airfoil", "wrong revision", "wrong AoA",
+      "selected archive missing", "selected manifest missing", "missing physical receipt", "missing archive",
+      "review exclude", "review defer", "live result owner", "live successor unit", "live ingest owner"] as const)
+      await withRollbackFixture(connection, `Refuse selected canonical retirement (${guard}/${incomingFidelity}/${retired})`, async (scoped) => {
+        const selected = await selectedFixture(scoped, "urans_full");
+        if (guard === "rejected") await scoped.execute(sql`UPDATE result_classifications SET state='rejected' WHERE result_attempt_id=${selected.id}::uuid`);
+        else if (guard === "missing classification") await scoped.execute(sql`DELETE FROM result_classifications WHERE result_attempt_id=${selected.id}::uuid`);
+        else if (guard === "missing selected raw") {
+          await shadow(scoped, "result_attempts");
+          await scoped.execute(sql`DELETE FROM result_attempts WHERE id=${selected.id}::uuid`);
+        } else if (["wrong airfoil", "wrong revision", "wrong AoA"].includes(guard)) {
+          await shadow(scoped, "result_attempts");
+          const mutation = guard === "wrong airfoil" ? sql`airfoil_id=${randomUUID()}::uuid`
+            : guard === "wrong revision" ? sql`simulation_preset_revision_id=${randomUUID()}::uuid` : sql`aoa_deg=aoa_deg+0.25`;
+          await scoped.execute(sql`UPDATE result_attempts SET ${mutation} WHERE id=${selected.id}::uuid`);
+        } else if (guard === "selected archive missing") {
+          await shadow(scoped, "solver_evidence_archives");
+          await scoped.execute(sql`DELETE FROM solver_evidence_archives WHERE result_attempt_id=${selected.id}::uuid`);
+        } else if (guard === "selected manifest missing") {
+          await shadow(scoped, "solver_evidence_artifacts");
+          await scoped.execute(sql`DELETE FROM solver_evidence_artifacts WHERE result_attempt_id=${selected.id}::uuid AND kind='manifest'`);
+        } else if (guard === "live ingest owner") {
+          await scoped.execute(sql`UPDATE sim_jobs SET ingest_lease_token=${randomUUID()}::uuid,
+            ingest_lease_expires_at=clock_timestamp()+interval '1 hour' WHERE id=${selected.jobId}::uuid`);
+        } else await refusals.find(([label]) => label === guard)![1](scoped);
+        const snapshot = await selectedState(scoped, selected.id, selected.jobId);
+        let outcome: Awaited<ReturnType<typeof settleProgressiveRemoteJob>> | undefined;
+        try { outcome = await settleProgressiveRemoteJob(scoped, executionId); }
+        catch (error) { expect(error, guard).toBeInstanceOf(Error); }
+        expect(outcome?.kind === "settled" && !("evidencePending" in outcome && outcome.evidencePending), guard).toBe(false);
+        expect(await selectedState(scoped, selected.id, selected.jobId), guard).toBe(snapshot);
+        expect(await scoped.execute(sql`SELECT "ingestedAt" FROM sim_jobs WHERE id=${executionId}::uuid`), guard).toEqual([{ ingestedAt: null }]);
+      });
     for (const change of ["classification", "review"] as const)
       await withRollbackFixture(connection, "Revalidate publication under cache locks", async (scoped) => {
         const publication = await readStoppedAcceptedProgressivePublication(scoped, executionId);

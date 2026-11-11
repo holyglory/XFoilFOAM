@@ -776,6 +776,21 @@ export async function settleProgressiveRemoteJob(db: DB, executionId: string) {
       WHERE job.id = ${executionId}::uuid FOR UPDATE OF campaign`);
     if (!campaign)
       return { kind: "waiting" as const, reason: "campaign_lock" };
+    // Reuse stopped-publication validation for occupied cells before taking the
+    // job lock: epoch -> campaign -> generation/work/unit/attempt -> job/result.
+    // This authorizes retirement only; it never promotes an occupied cell.
+    const [historical] = await connection.execute(sql`SELECT id FROM sim_jobs
+      WHERE id=${executionId}::uuid AND status='cancelled' AND "ingestedAt" IS NULL`);
+    let stoppedAcceptedIds: readonly string[] = [];
+    if (historical) {
+      try {
+        stoppedAcceptedIds = (await readStoppedAcceptedProgressivePublication(
+          connection, executionId, true,
+        ))?.attemptIds ?? [];
+      } catch (error) {
+        if (!(error instanceof ProgressiveCfdEvidenceScopeClosed)) throw error;
+      }
+    }
     const [job] =
       await connection.execute(sql`SELECT engine_job_id, request_payload, status, "ingestedAt",
         ingest_lease_expires_at > clock_timestamp() AS ingestion_owned,
@@ -907,39 +922,77 @@ export async function settleProgressiveRemoteJob(db: DB, executionId: string) {
       )
       .map((source) => source.resultAttemptId);
     if (finalAttemptIds.length) {
+      if (historical && stoppedAcceptedIds.length) {
+        await connection.execute(sql`SELECT selected.id FROM result_attempts raw
+          JOIN results result ON result.id=raw.result_id
+          JOIN result_attempts selected ON selected.id=result.current_result_attempt_id AND selected.result_id=result.id
+          JOIN result_classifications classification ON classification.result_attempt_id=selected.id
+          WHERE raw.id IN (${sql.join(stoppedAcceptedIds.map((id) => sql`${id}::uuid`), sql`, `)})
+          ORDER BY selected.id FOR SHARE OF selected,classification`);
+      }
       const unpublished =
         await connection.execute(sql`SELECT raw.id, raw.regime, raw.evidence_payload->>'fidelity' AS fidelity,
           selected.regime AS selected_regime, selected.evidence_payload->>'fidelity' AS selected_fidelity,
-          (selected.status = 'done' AND selected.valid_for_polar AND selected_class.state = 'accepted') AS selected_accepted
+          (selected.airfoil_id = raw.airfoil_id
+            AND selected.simulation_preset_revision_id = raw.simulation_preset_revision_id
+            AND selected.aoa_deg = raw.aoa_deg
+            AND result.airfoil_id = raw.airfoil_id
+            AND result.simulation_preset_revision_id = raw.simulation_preset_revision_id
+            AND result.aoa_deg = raw.aoa_deg) AS selected_exact_cell,
+          (selected.status = 'done' AND selected.valid_for_polar AND selected_class.state = 'accepted') AS selected_accepted,
+          (result.status = 'done' AND result.source = 'solved'
+            AND result.sim_job_id = selected.sim_job_id
+            AND owner.status IN ('done','failed','cancelled')
+            AND (owner.ingest_lease_token IS NULL OR owner.ingest_lease_expires_at <= clock_timestamp())
+            AND coalesce(selected."solvedAt",selected."createdAt") >= coalesce(raw."solvedAt",raw."createdAt")
+            AND NOT ${progressiveBenchmarkAttemptSql(sql`selected.id`)}
+            AND EXISTS (
+              SELECT 1 FROM solver_evidence_archives archive
+              JOIN solver_evidence_blobs blob ON blob.id=archive.blob_id
+              JOIN solver_evidence_artifact_members member ON member.archive_id=archive.id
+              JOIN solver_evidence_artifacts manifest ON manifest.id=member.artifact_id
+              WHERE archive.result_attempt_id=selected.id AND archive.result_id=result.id AND archive.state='current'
+                AND manifest.result_attempt_id=selected.id AND manifest.result_id=result.id AND manifest.kind='manifest'
+                AND manifest.sim_job_id=selected.sim_job_id AND manifest.engine_job_id=selected.engine_job_id
+                AND manifest.airfoil_id=selected.airfoil_id AND manifest.aoa_deg=selected.aoa_deg
+                AND manifest.sha256 ~ '^[0-9a-fA-F]{64}$' AND manifest.byte_size>0
+                AND length(trim(manifest.storage_key))>0 AND length(trim(manifest.mime_type))>0
+                AND blob."verifiedAt" IS NOT NULL
+            )) AS selected_retained_owner
         FROM result_attempts raw
         JOIN result_classifications classification ON classification.result_attempt_id = raw.id
         JOIN results result ON result.id = raw.result_id
         LEFT JOIN result_attempts selected ON selected.id = result.current_result_attempt_id AND selected.result_id = result.id
         LEFT JOIN result_classifications selected_class ON selected_class.result_attempt_id = selected.id
+        LEFT JOIN sim_jobs owner ON owner.id=result.sim_job_id
         WHERE raw.id IN (${sql.join(
           finalAttemptIds.map((id) => sql`${id}::uuid`),
           sql`, `,
         )})
           AND raw.status = 'done' AND raw.valid_for_polar AND classification.state = 'accepted'
           AND NOT ${progressiveBenchmarkAttemptSql(sql`raw.id`)}
-          AND coalesce((SELECT review.verdict FROM result_review_verdicts review WHERE review.result_id = result.id
-            AND review."revokedAt" IS NULL ORDER BY review."createdAt" DESC, review.id DESC LIMIT 1), '') NOT IN ('exclude', 'defer')
+          AND (${job.status === "cancelled"} OR coalesce((SELECT review.verdict FROM result_review_verdicts review WHERE review.result_id = result.id
+            AND review."revokedAt" IS NULL ORDER BY review."createdAt" DESC, review.id DESC LIMIT 1), '') NOT IN ('exclude', 'defer'))
           AND result.current_result_attempt_id IS DISTINCT FROM raw.id`);
       if (
         job.benchmark_only !== true &&
         unpublished.some(
-          (source) =>
-            source.selected_accepted !== true ||
-            polarEvidencePublicationRank(
+          (source) => {
+            const incomingRank = polarEvidencePublicationRank(
+              "accepted", source.fidelity as string | null,
+              source.regime as "rans" | "urans" | null,
+            );
+            const selectedRank = polarEvidencePublicationRank(
               "accepted",
               source.selected_fidelity as string | null,
               source.selected_regime as "rans" | "urans" | null,
-            ) <=
-              polarEvidencePublicationRank(
-                "accepted",
-                source.fidelity as string | null,
-                source.regime as "rans" | "urans" | null,
-              ),
+            );
+            return source.selected_accepted !== true || source.selected_exact_cell !== true ||
+              (job.status === "cancelled"
+                ? !stoppedAcceptedIds.includes(String(source.id)) ||
+                  source.selected_retained_owner !== true || selectedRank < incomingRank
+                : selectedRank <= incomingRank);
+          },
         )
       ) {
         if (authoritativeLeaseLoss) {
