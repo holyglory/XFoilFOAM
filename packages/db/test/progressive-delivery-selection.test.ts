@@ -25,6 +25,7 @@ afterAll(() => client.sql.end());
 async function selectSettlementJobs(
   connection: Pick<DB, "execute" | "transaction">,
   jobIds?: string[],
+  expectedPreviousJobs?: Array<{ sim_job_id: string; campaign_id: string }>,
 ) {
   const before = await connection.execute(sql`SHOW jit`);
   const { jobs, terminalJobs } = await selectProgressiveRemoteProgressJobs(
@@ -33,9 +34,11 @@ async function selectSettlementJobs(
   );
   expect(await connection.execute(sql`SHOW jit`)).toEqual(before);
   expect(jobs).toEqual(await connection.execute(progressiveReportJobsSql(jobIds)));
-  expect(terminalJobs).toEqual(
-    await connection.execute(previousProgressiveSettlementJobsSql(jobIds)),
-  );
+  const previousJobs = await connection.execute(previousProgressiveSettlementJobsSql(jobIds));
+  // Changed eligibility has its own explicit historical expectation; all other
+  // cases still require exact equivalence with the frozen previous query.
+  if (expectedPreviousJobs === undefined) expect(terminalJobs).toEqual(previousJobs);
+  else expect(previousJobs).toEqual(expectedPreviousJobs);
   return terminalJobs;
 }
 
@@ -914,16 +917,17 @@ it("selects closed terminal jobs with retained evidence for classification settl
     // Ingestion can finish before late evidence arrives. Classification releases
     // that history, while accepted evidence with a missing canonical point still
     // needs the independent publication repair path.
+    const retainedByPreviousQuery = [{ sim_job_id: lateId, campaign_id: String(selected[0].campaign_id) }];
     await transaction.execute(sql`INSERT INTO result_classifications(result_attempt_id,state)
       VALUES (md5('late-attempt')::uuid,'rejected')`);
-    expect(await selectSettlementJobs(transaction, historyIds)).toEqual([]);
+    expect(await selectSettlementJobs(transaction, historyIds, retainedByPreviousQuery)).toEqual([]);
     await transaction.execute(sql`UPDATE result_classifications SET state='accepted'
       WHERE result_attempt_id=md5('late-attempt')::uuid`);
     await transaction.execute(sql`UPDATE result_attempts SET valid_for_polar=true
       WHERE id=md5('late-attempt')::uuid`);
     await transaction.execute(sql`INSERT INTO results(id,current_result_attempt_id,sim_job_id)
       VALUES(md5('late-result')::uuid,md5('late-attempt')::uuid,${lateId}::uuid)`);
-    expect(await selectSettlementJobs(transaction, historyIds)).toEqual([]);
+    expect(await selectSettlementJobs(transaction, historyIds, retainedByPreviousQuery)).toEqual([]);
     await transaction.execute(sql`UPDATE results SET current_result_attempt_id=NULL
       WHERE id=md5('late-result')::uuid`);
     expect((await selectSettlementJobs(transaction, historyIds)).map((row) => row.sim_job_id)).toEqual([lateId]);
