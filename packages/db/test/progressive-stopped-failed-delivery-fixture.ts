@@ -750,11 +750,11 @@ async function verifyCancelledAcceptedPublication(db: DB, envelope: ProgressiveR
         image_pattern: "frames/{field}/f{i04}.png",
       } };
     delete accepted.failure_disposition;
-    const rejected = { ...accepted, aoa_deg: envelope.scope.units[1].alpha, case_slug: "cancelled-rejected",
-      force_history: undefined, frame_track: undefined,
+    const { force_history: _acceptedForceHistory, frame_track: _acceptedFrameTrack, ...acceptedWithoutHistory } = accepted;
+    const rejected = { ...acceptedWithoutHistory, aoa_deg: envelope.scope.units[1].alpha, case_slug: "cancelled-rejected",
       converged: false, cl: null, cd: null, cm: null, error: "Retained rejected physical sibling", failure_disposition: "hard_solver" as const };
     const diagnostic = { ...rejected, aoa_deg: envelope.scope.units[2].alpha, case_slug: "cancelled-diagnostic",
-      evidence_artifacts: [], force_history: undefined, frame_track: undefined, failure_disposition: "infrastructure" as const };
+      evidence_artifacts: [], failure_disposition: "infrastructure" as const };
     delete diagnostic.force_history;
     polar.points = [accepted];
     polar.attempts = [accepted, rejected, diagnostic];
