@@ -2,6 +2,7 @@ import { sql } from "drizzle-orm";
 
 const PROGRESSIVE_REPORT_JOB_LIMIT = 64;
 const PROGRESSIVE_ACTIVE_REPORT_JOB_HEADROOM = 6;
+const PROGRESSIVE_TERMINAL_REPORT_JOB_HEADROOM = 2;
 const PROGRESSIVE_SETTLEMENT_JOB_LIMIT = 128;
 const PROGRESSIVE_NORMAL_SETTLEMENT_JOB_HEADROOM = 6;
 const PROGRESSIVE_CLOSED_SETTLEMENT_JOB_RESERVE = 2;
@@ -57,7 +58,6 @@ export function progressiveReportPressureSql(jobIds?: string[]) {
 export function progressiveReportJobsSql(jobIds?: string[], reportBudget = 8) {
   if (!Number.isSafeInteger(reportBudget) || reportBudget < 8 || reportBudget > PROGRESSIVE_REPORT_JOB_LIMIT)
     throw new Error("Report drain budget must preserve live headroom within its selection bound");
-  const terminalReserve = reportBudget - PROGRESSIVE_ACTIVE_REPORT_JOB_HEADROOM;
   return sql`WITH report_state AS MATERIALIZED (
       SELECT report.sim_job_id,
         min(report.received_at) FILTER (
@@ -104,7 +104,7 @@ export function progressiveReportJobsSql(jobIds?: string[], reportBudget = 8) {
       WHERE eligible.terminal_job AND eligible.has_unapplied
       ORDER BY eligible.report_priority, eligible.oldest_unapplied_report NULLS LAST,
         eligible.last_polled_at, eligible.sim_job_id
-      LIMIT ${terminalReserve}
+      LIMIT ${PROGRESSIVE_TERMINAL_REPORT_JOB_HEADROOM}
     ), ordered AS (
       SELECT active_head.*, 0 AS lane FROM active_head
       UNION ALL
@@ -123,7 +123,11 @@ export function progressiveReportJobsSql(jobIds?: string[], reportBudget = 8) {
     )
     SELECT sim_job_id, campaign_id
     FROM ordered
-    ORDER BY lane, report_priority, lifecycle_priority,
+    -- Guaranteed heads retain their existing order. The shared remainder ages
+    -- live and terminal reports together, ahead of lifecycle priority.
+    ORDER BY lane, report_priority,
+      CASE WHEN lane = 2 THEN oldest_unapplied_report END NULLS LAST,
+      lifecycle_priority,
       oldest_unapplied_report NULLS LAST, last_polled_at, sim_job_id
     LIMIT ${PROGRESSIVE_REPORT_JOB_LIMIT}`;
 }

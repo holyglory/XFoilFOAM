@@ -437,6 +437,100 @@ it.each([
   });
 });
 
+it.each(["live", "terminal"] as const)(
+  "ages both report queues across repeated arrivals when %s reports are oldest",
+  async (oldestKind) => {
+    await client.db.transaction(async (transaction) => {
+      await createReportStopFixture(transaction);
+      // Match the measured 265-job queue size, with mixed lifecycle priorities.
+      await transaction.execute(sql`CREATE TEMP TABLE age_cases ON COMMIT DROP AS
+        SELECT md5(kind||ordinal)::uuid id,kind,ordinal,0 AS arrival
+        FROM (VALUES ('live',65),('terminal',200)) lanes(kind,total)
+        CROSS JOIN LATERAL generate_series(1,total) ordinal`);
+      await transaction.execute(sql`CREATE TEMP TABLE sim_jobs ON COMMIT DROP AS
+        SELECT id,md5('age-campaign')::uuid campaign_id,
+          CASE WHEN kind='live' AND ordinal%2=1 THEN 'pending' ELSE 'running' END::text status,
+          CASE WHEN kind='live' AND ordinal%2=1 THEN NULL ELSE id::text END engine_job_id,
+          timestamptz '2026-01-01' AS "updatedAt",NULL::timestamptz AS "polledAt"
+        FROM age_cases`);
+      await transaction.execute(sql`CREATE TEMP TABLE progressive_remote_dispatches ON COMMIT DROP AS
+        SELECT id sim_job_id FROM age_cases`);
+      await transaction.execute(sql`INSERT INTO progressive_cfd_execution_stops
+        SELECT id,id::text FROM age_cases WHERE kind='terminal'`);
+      await transaction.execute(sql`CREATE TEMP TABLE progressive_remote_reports ON COMMIT DROP AS
+        SELECT id sim_job_id,1::bigint sequence,timestamptz '2026-01-01' +
+          ordinal*CASE WHEN kind='live' THEN interval '3 minutes' ELSE interval '1 minute' END +
+          CASE WHEN kind=${oldestKind} THEN interval '0 seconds' ELSE interval '90 seconds' END AS received_at
+        FROM age_cases`);
+      await transaction.execute(sql`CREATE TEMP TABLE progressive_remote_progress_receipts (
+        sim_job_id uuid,sequence bigint,PRIMARY KEY(sim_job_id,sequence)) ON COMMIT DROP`);
+      await transaction.execute(sql`CREATE TEMP TABLE progressive_remote_report_inventories (
+        sim_job_id uuid,sequence bigint,PRIMARY KEY(sim_job_id,sequence)) ON COMMIT DROP`);
+      const originals = await transaction.execute(sql`SELECT * FROM progressive_remote_reports ORDER BY sim_job_id`);
+      const originalIds = new Set(originals.map((row) => String(row.sim_job_id)));
+      const visited = new Set<string>();
+      for (let pass = 0; pass < 8; pass += 1) {
+        const pressure = (await transaction.execute(progressiveReportPressureSql()))[0];
+        expect(progressiveReportBackpressureIsActive(Number(pressure.pending_reports),
+          Number(pressure.pending_terminal_jobs),Number(pressure.oldest_terminal_age_ms))).toBe(true);
+        const candidates = await transaction.execute(sql`SELECT fixture.id,fixture.kind,report.received_at,
+          CASE WHEN job.status='pending' THEN 1 ELSE 2 END lifecycle
+          FROM age_cases fixture JOIN sim_jobs job ON job.id=fixture.id
+          JOIN progressive_remote_reports report ON report.sim_job_id=fixture.id
+          WHERE NOT EXISTS(SELECT 1 FROM progressive_remote_progress_receipts receipt
+            WHERE receipt.sim_job_id=fixture.id AND receipt.sequence=report.sequence)`);
+        const selected = (await transaction.execute(progressiveReportJobsSql(undefined,48))).slice(0,48);
+        expect(selected).toHaveLength(48);
+        const byId = new Map(candidates.map((row) => [String(row.id),row]));
+        expect(selected.slice(0,6).every((row) => byId.get(String(row.sim_job_id))?.kind==='live')).toBe(true);
+        expect(selected.slice(6,8).every((row) => byId.get(String(row.sim_job_id))?.kind==='terminal')).toBe(true);
+        const heads = new Set(selected.slice(0,8).map((row) => String(row.sim_job_id)));
+        const oldestRemainder = candidates.filter((row) => !heads.has(String(row.id))).sort((left,right) =>
+          new Date(String(left.received_at)).getTime()-new Date(String(right.received_at)).getTime() ||
+          Number(left.lifecycle)-Number(right.lifecycle) || String(left.id).localeCompare(String(right.id)));
+        expect(selected.slice(8).map((row) => String(row.sim_job_id)))
+          .toEqual(oldestRemainder.slice(0,40).map((row) => String(row.id)));
+        if (pass===0) {
+          expect(selected.slice(8).some((row) => byId.get(String(row.sim_job_id))?.kind==='live')).toBe(true);
+          expect(selected.slice(8).some((row) => byId.get(String(row.sim_job_id))?.kind==='terminal')).toBe(true);
+        }
+        const ids = selected.map((row) => String(row.sim_job_id));
+        expect(new Set(ids).size).toBe(ids.length);
+        for (const id of ids) { expect(visited.has(id)).toBe(false);visited.add(id); }
+        const scope = sql.join(ids.map((id) => sql`${id}::uuid`),sql`, `);
+        await transaction.execute(sql`INSERT INTO progressive_remote_progress_receipts
+          SELECT sim_job_id,sequence FROM progressive_remote_reports WHERE sim_job_id IN (${scope})`);
+        await transaction.execute(sql`INSERT INTO progressive_remote_report_inventories
+          SELECT sim_job_id,sequence FROM progressive_remote_reports WHERE sim_job_id IN (${scope})`);
+        // Model normal first-report projection, so fully applied pending jobs
+        // no longer need the existing indexed-report projection fallback.
+        await transaction.execute(sql`UPDATE sim_jobs SET engine_job_id=id::text,status='running'
+          WHERE id IN (${scope}) AND engine_job_id IS NULL`);
+        if (pass<7) {
+          await transaction.execute(sql`INSERT INTO age_cases
+            SELECT md5(kind||${pass}::text||'-arrival-'||ordinal)::uuid,kind,ordinal,${pass+1}
+            FROM (VALUES ('live'),('terminal')) lanes(kind) CROSS JOIN generate_series(1,16) ordinal`);
+          await transaction.execute(sql`INSERT INTO sim_jobs
+            SELECT id,md5('age-campaign')::uuid,CASE WHEN kind='live' THEN 'pending' ELSE 'running' END,
+              CASE WHEN kind='live' THEN NULL ELSE id::text END,timestamptz '2026-01-02',NULL::timestamptz
+            FROM age_cases WHERE arrival=${pass+1}`);
+          await transaction.execute(sql`INSERT INTO progressive_remote_dispatches
+            SELECT id FROM age_cases WHERE arrival=${pass+1}`);
+          await transaction.execute(sql`INSERT INTO progressive_cfd_execution_stops
+            SELECT id,id::text FROM age_cases WHERE arrival=${pass+1} AND kind='terminal'`);
+          await transaction.execute(sql`INSERT INTO progressive_remote_reports
+            SELECT id,1,timestamptz '2026-01-02'+arrival*interval '1 hour'+ordinal*interval '1 minute'
+            FROM age_cases WHERE arrival=${pass+1}`);
+        }
+      }
+      expect([...originalIds].every((id) => visited.has(id))).toBe(true);
+      expect(await transaction.execute(sql`SELECT report.* FROM progressive_remote_reports report
+        JOIN age_cases fixture ON fixture.id=report.sim_job_id WHERE fixture.arrival=0 ORDER BY report.sim_job_id`)).toEqual(originals);
+    });
+  },
+  30_000,
+);
+
 it.each([8, 48])(
   "reserves stopped reports before a %i-job report slice despite stale active status",
   async (reportBudget) => {
@@ -511,7 +605,7 @@ it.each([8, 48])(
       JOIN report_lane_cases fixture ON fixture.id=report.sim_job_id
       WHERE fixture.stopped AND report.sequence=2 ORDER BY report.sim_job_id`);
       expect(finalReports).toHaveLength(5);
-      const terminalReserve = reportBudget - 6;
+      const terminalReserve = 2;
       const reservedOrder = (pending: string[]) => pending.slice(0, terminalReserve).sort((left, right) => {
         const priority = (id: string) =>
           cases.find((row) => row.id === id)?.status === "pending" ? 0 : 2;
@@ -531,7 +625,7 @@ it.each([8, 48])(
       expect(first.slice(0, reportBudget).map((row) => String(row.sim_job_id)))
         .toEqual(expect.arrayContaining(reservedOrder(stopped)));
       expect(
-        first.every(
+        first.slice(0, 8).every(
           (row) =>
             fresh.has(String(row.sim_job_id)) ||
             stopped.includes(String(row.sim_job_id)),
