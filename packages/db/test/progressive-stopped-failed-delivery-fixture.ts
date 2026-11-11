@@ -949,7 +949,7 @@ async function verifyCancelledAcceptedPublication(db: DB, envelope: ProgressiveR
       });
     for (const guard of ["rejected", "missing classification", "missing selected raw", "wrong airfoil", "wrong revision", "wrong AoA",
       "selected archive missing", "selected manifest missing", "missing physical receipt", "missing archive",
-      "review exclude", "review defer", "live result owner", "live successor unit", "live ingest owner"] as const)
+      "live result owner", "live successor unit", "live ingest owner"] as const)
       await withRollbackFixture(connection, `Refuse selected canonical retirement (${guard}/${incomingFidelity}/${retired})`, async (scoped) => {
         const selected = await selectedFixture(scoped, "urans_full");
         if (guard === "rejected") await scoped.execute(sql`UPDATE result_classifications SET state='rejected' WHERE result_attempt_id=${selected.id}::uuid`);
@@ -980,6 +980,29 @@ async function verifyCancelledAcceptedPublication(db: DB, envelope: ProgressiveR
         expect(await selectedState(scoped, selected.id, selected.jobId), guard).toBe(snapshot);
         expect(await scoped.execute(sql`SELECT "ingestedAt" FROM sim_jobs WHERE id=${executionId}::uuid`), guard).toEqual([{ ingestedAt: null }]);
       });
+    for (const verdict of ["exclude", "defer"] as const)
+      for (const occupied of [false, true])
+        await withRollbackFixture(connection, `Retire reviewed history without publication (${verdict}/${occupied}/${incomingFidelity}/${retired})`, async (scoped) => {
+          const selected = occupied ? await selectedFixture(scoped, "urans_full") : null;
+          await scoped.execute(sql`INSERT INTO result_review_verdicts(result_id,verdict,reviewer)
+            VALUES(${raw.resultId}::uuid,${verdict},'reviewed historical retirement')`);
+          const canonicalBefore = await scoped.execute(sql`SELECT * FROM results WHERE id=${raw.resultId}::uuid`);
+          const historyBefore = await protectedState(scoped);
+          const selectedBefore = selected ? await selectedState(scoped, selected.id, selected.jobId) : null;
+          // Review prevents publishing the old point, including into an empty
+          // slot. Its complete retained custody still permits job retirement.
+          expect((await readStoppedAcceptedProgressivePublication(scoped, executionId))?.attemptIds).toEqual([]);
+          for (let replay = 0; replay < 2; replay++) {
+            expect(await settleProgressiveRemoteJob(scoped, executionId))
+              .toMatchObject({ kind: "settled", counts: { complete: 0 } });
+            expect(await scoped.execute(sql`SELECT * FROM results WHERE id=${raw.resultId}::uuid`)).toEqual(canonicalBefore);
+            expect(await protectedState(scoped)).toBe(historyBefore);
+            if (selected) expect(await selectedState(scoped, selected.id, selected.jobId)).toBe(selectedBefore);
+            expect(await scoped.execute(sql`SELECT "ingestedAt" IS NOT NULL ingested FROM sim_jobs WHERE id=${executionId}::uuid`))
+              .toEqual([{ ingested: true }]);
+            expect(await scoped.execute(progressiveSettlementJobsSql([executionId]))).toEqual([]);
+          }
+        });
     for (const change of ["classification", "review"] as const)
       await withRollbackFixture(connection, "Revalidate publication under cache locks", async (scoped) => {
         const publication = await readStoppedAcceptedProgressivePublication(scoped, executionId);

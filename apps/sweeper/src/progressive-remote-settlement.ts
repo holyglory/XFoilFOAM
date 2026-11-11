@@ -966,8 +966,8 @@ export async function settleProgressiveRemoteJob(db: DB, executionId: string) {
         )})
           AND raw.status = 'done' AND raw.valid_for_polar AND classification.state = 'accepted'
           AND NOT ${progressiveBenchmarkAttemptSql(sql`raw.id`)}
-          AND (${job.status === "cancelled"} OR coalesce((SELECT review.verdict FROM result_review_verdicts review WHERE review.result_id = result.id
-            AND review."revokedAt" IS NULL ORDER BY review."createdAt" DESC, review.id DESC LIMIT 1), '') NOT IN ('exclude', 'defer'))
+          AND coalesce((SELECT review.verdict FROM result_review_verdicts review WHERE review.result_id = result.id
+            AND review."revokedAt" IS NULL ORDER BY review."createdAt" DESC, review.id DESC LIMIT 1), '') NOT IN ('exclude', 'defer')
           AND result.current_result_attempt_id IS DISTINCT FROM raw.id`);
       if (
         job.benchmark_only !== true &&
