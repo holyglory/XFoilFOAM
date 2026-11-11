@@ -1,6 +1,8 @@
 import { afterAll, expect, it } from "vitest";
 import { sql } from "drizzle-orm";
 import { createClient } from "../src/client";
+import { previousProgressiveSettlementJobsSql } from "../test-support/progressive-progress-selection-baseline";
+import { selectProgressiveRemoteProgressJobs } from "../../../apps/sweeper/src/progressive-remote-progress";
 import { progressiveDeliverySelectionSql } from "../../../apps/sweeper/src/progressive-delivery-selection";
 import {
   progressiveReportJobsSql,
@@ -15,6 +17,23 @@ import { reconcileCompletedProgressiveArchiveReclaims } from "../../../apps/swee
 
 const client = createClient({ max: 1 });
 afterAll(() => client.sql.end());
+
+async function selectSettlementJobs(
+  connection: Pick<DB, "execute" | "transaction">,
+  jobIds?: string[],
+) {
+  const before = await connection.execute(sql`SHOW jit`);
+  const { jobs, terminalJobs } = await selectProgressiveRemoteProgressJobs(
+    connection as DB,
+    jobIds,
+  );
+  expect(await connection.execute(sql`SHOW jit`)).toEqual(before);
+  expect(jobs).toEqual(await connection.execute(progressiveReportJobsSql(jobIds)));
+  expect(terminalJobs).toEqual(
+    await connection.execute(previousProgressiveSettlementJobsSql(jobIds)),
+  );
+  return terminalJobs;
+}
 
 async function analyzeSelectionFixture(connection: Pick<DB, "execute">) {
   const tables = await connection.execute(sql`SELECT relname FROM pg_class
@@ -437,7 +456,18 @@ it("selects closed terminal jobs with retained evidence for classification settl
       const [plan] = rows[0]["QUERY PLAN"] as Array<{ Plan: { "Total Cost": number }; JIT?: unknown }>;
       return { cost: plan.Plan["Total Cost"], jit: plan.JIT ?? null };
     })));
-    const selected = await transaction.execute(progressiveSettlementJobsSql());
+    // Success restores both possible caller settings, including a nested
+    // savepoint; a release of that savepoint alone would leak SET LOCAL.
+    for (const jit of ["on", "off"]) {
+      await transaction.execute(sql`SELECT set_config('jit', ${jit}, true)`);
+      await selectSettlementJobs(transaction);
+    }
+    await transaction.execute(sql`SET LOCAL jit = on`);
+    await transaction.execute(sql`ALTER TABLE pg_temp.sim_jobs RENAME COLUMN engine_state TO unavailable_column`);
+    await expect(selectProgressiveRemoteProgressJobs(transaction as unknown as DB)).rejects.toThrow();
+    expect(await transaction.execute(sql`SHOW jit`)).toMatchObject([{ jit: "on" }]);
+    await transaction.execute(sql`ALTER TABLE pg_temp.sim_jobs RENAME COLUMN unavailable_column TO engine_state`);
+    const selected = await selectSettlementJobs(transaction);
     const [{ id: retainedId }, { id: unretainedId }] =
       await transaction.execute(
         sql`SELECT md5('retained')::uuid AS id UNION ALL SELECT md5('unretained')::uuid AS id`,
@@ -453,7 +483,7 @@ it("selects closed terminal jobs with retained evidence for classification settl
     expect(variants.map((row) => row.variant)).toEqual(["retained", "stored-closed", "stored-closed-2", "stored-high", "stored-inactive"]);
     await transaction.execute(sql`UPDATE sim_jobs SET "ingestedAt"=clock_timestamp() WHERE id=md5('stored-closed')::uuid`);
     const [closed] = await transaction.execute(sql`SELECT id FROM fixture_storage_jobs WHERE variant='stored-closed'`);
-    expect(await transaction.execute(progressiveSettlementJobsSql([String(closed.id)]))).toEqual([]);
+    expect(await selectSettlementJobs(transaction, [String(closed.id)])).toEqual([]);
     await transaction.execute(sql`UPDATE sim_jobs SET "ingestedAt"=NULL WHERE id=md5('stored-closed')::uuid`);
     await transaction.execute(sql`INSERT INTO sim_jobs(id,campaign_id,engine_job_id,status,engine_state,"updatedAt","polledAt",request_payload)
       SELECT md5('unfinished-'||ordinal)::uuid,md5('campaign')::uuid,md5('unfinished-'||ordinal),
@@ -476,7 +506,7 @@ it("selects closed terminal jobs with retained evidence for classification settl
     const unfinishedRows = await transaction.execute(sql`SELECT id FROM sim_jobs WHERE status='ingesting' ORDER BY id`);
     const unfinishedIds = new Set(unfinishedRows.map((row) => String(row.id)));
     for (let pass = 0; pass < 2; pass += 1) {
-      const selected = await transaction.execute(progressiveSettlementJobsSql());
+      const selected = await selectSettlementJobs(transaction);
       const selectedIds = selected.map((row) => String(row.sim_job_id));
       expect(selected).toHaveLength(128);
       expect(new Set(selectedIds).size).toBe(128);
@@ -489,23 +519,69 @@ it("selects closed terminal jobs with retained evidence for classification settl
     }
     const [high] = await transaction.execute(sql`SELECT id FROM fixture_storage_jobs WHERE variant='stored-high'`);
     const lowerCohortIds = [...unfinishedIds].slice(0,9);
-    const mixedCohorts = await transaction.execute(progressiveSettlementJobsSql([...lowerCohortIds,String(high.id)]));
+    const mixedCohorts = await selectSettlementJobs(transaction, [...lowerCohortIds,String(high.id)]);
     expect(mixedCohorts.slice(0,9).every((row) => lowerCohortIds.includes(String(row.sim_job_id)))).toBe(true);
     expect(mixedCohorts[9].sim_job_id).toBe(high.id);
     const [inactive] = await transaction.execute(sql`SELECT id FROM fixture_storage_jobs WHERE variant='stored-inactive'`);
-    const mixedCampaigns = await transaction.execute(progressiveSettlementJobsSql([...lowerCohortIds,String(inactive.id)]));
+    const mixedCampaigns = await selectSettlementJobs(transaction, [...lowerCohortIds,String(inactive.id)]);
     expect(mixedCampaigns.slice(0,9).every((row) => lowerCohortIds.includes(String(row.sim_job_id)))).toBe(true);
     expect(mixedCampaigns[9].sim_job_id).toBe(inactive.id);
-    const oneReady = await transaction.execute(progressiveSettlementJobsSql([...unfinishedIds,readyIds[0]]));
+    const oneReady = await selectSettlementJobs(transaction, [...unfinishedIds,readyIds[0]]);
     expect(oneReady.slice(0,8).filter((row) => row.sim_job_id===readyIds[0])).toHaveLength(1);
     expect(oneReady.slice(0,8).filter((row) => unfinishedIds.has(String(row.sim_job_id)))).toHaveLength(7);
     await transaction.execute(sql`UPDATE sim_jobs SET "ingestedAt"=clock_timestamp()
       WHERE id IN (${sql.join(readyIds.map((id) => sql`${id}::uuid`),sql`,`)})`);
-    const noneReady = await transaction.execute(progressiveSettlementJobsSql([...unfinishedIds,...readyIds]));
+    const noneReady = await selectSettlementJobs(transaction, [...unfinishedIds,...readyIds]);
     expect(noneReady).toHaveLength(128);
     expect(noneReady.every((row) => unfinishedIds.has(String(row.sim_job_id)))).toBe(true);
+    await transaction.execute(sql`SET LOCAL jit = off`);
+    // Closed history is not a bounded candidate prefix: new evidence can arrive
+    // behind any number of older, already-ingested jobs.
+    await transaction.execute(sql`INSERT INTO sim_jobs(id,campaign_id,engine_job_id,status,engine_state,
+      "ingestedAt","updatedAt","polledAt",request_payload)
+      SELECT md5('history-'||ordinal)::uuid,md5('campaign')::uuid,md5('history-'||ordinal),
+        'done','completed',timestamptz '2020-01-01',timestamptz '2020-01-01',
+        timestamptz '2020-01-01'+ordinal*interval '1 second','{}'::jsonb
+      FROM generate_series(1,1024) ordinal`);
+    await transaction.execute(sql`INSERT INTO progressive_remote_dispatches(sim_job_id,promise_id,solver_id,envelope)
+      SELECT md5('history-'||ordinal)::uuid,md5('history-'||ordinal)::uuid,
+        md5('history-'||ordinal)::uuid,'{}'::jsonb FROM generate_series(1,1024) ordinal`);
+    await transaction.execute(sql`INSERT INTO sync_sweep_promises
+      SELECT md5('history-'||ordinal)::uuid,'expired' FROM generate_series(1,1024) ordinal`);
+    await analyzeSelectionFixture(transaction);
+    const history =
+      await transaction.execute(sql`SELECT md5('history-'||ordinal)::uuid AS id
+      FROM generate_series(1,1024) ordinal`);
+    const historyIds = history.map((row) => String(row.id));
+    expect(await selectSettlementJobs(transaction, historyIds)).toEqual([]);
+    const lateId = historyIds[1023];
+    await transaction.execute(
+      sql`INSERT INTO progressive_cfd_execution_stops(sim_job_id) VALUES (${lateId}::uuid)`,
+    );
+    await transaction.execute(sql`INSERT INTO result_attempts(id,result_id,sim_job_id,status,valid_for_polar)
+      VALUES (md5('late-attempt')::uuid,md5('late-result')::uuid,${lateId}::uuid,'done',false)`);
+    await transaction.execute(sql`INSERT INTO progressive_remote_evidence_receipts(sim_job_id,storage_only)
+      VALUES (${lateId}::uuid,false)`);
+    expect(await selectSettlementJobs(transaction, historyIds)).toEqual([
+      { sim_job_id: lateId, campaign_id: String(selected[0].campaign_id) },
+    ]);
+    await transaction.execute(sql`INSERT INTO progressive_remote_reports(sim_job_id,sequence,received_at)
+      VALUES (${lateId}::uuid,2,clock_timestamp()-interval '2 hours')`);
+    expect(await selectSettlementJobs(transaction, historyIds)).toEqual([]);
+    await transaction.execute(
+      sql`INSERT INTO progressive_remote_progress_receipts VALUES (${lateId}::uuid,2)`,
+    );
+    expect(await selectSettlementJobs(transaction, historyIds)).toEqual([]);
+    await transaction.execute(
+      sql`INSERT INTO progressive_remote_report_inventories VALUES (${lateId}::uuid,2)`,
+    );
+    expect(
+      (await selectSettlementJobs(transaction, historyIds)).map(
+        (row) => row.sim_job_id,
+      ),
+    ).toEqual([lateId]);
   });
-});
+}, 30_000);
 
 it("settles fulfilled and active jobs fairly while expired work keeps arriving", async () => {
   await client.db.transaction(async (transaction) => {
@@ -659,7 +735,7 @@ it("settles fulfilled and active jobs fairly while expired work keeps arriving",
       sql`SELECT id FROM fixture_settlement_jobs WHERE variant='report-unapplied-1'`,
     );
     expect(reports[0].sim_job_id).toBe(oldestReport.id);
-    const first = await transaction.execute(progressiveSettlementJobsSql());
+    const first = await selectSettlementJobs(transaction);
     expect(first).toHaveLength(128);
     expect(first).toEqual(allSettlements.slice(0, 128));
     expect(first[0].sim_job_id).toBe(fulfilled.id);
@@ -680,6 +756,13 @@ it("settles fulfilled and active jobs fairly while expired work keeps arriving",
       expect(await transaction.execute(selector(explicitIds))).toEqual(
         eligible.filter((row) => explicitIds.includes(String(row.sim_job_id))),
       );
+      if (selector === progressiveSettlementJobsSql) {
+        await selectSettlementJobs(transaction, explicitIds);
+        await selectSettlementJobs(transaction, []);
+        await selectSettlementJobs(transaction, [
+          "00000000-0000-4000-8000-000000000001",
+        ]);
+      }
       expect(await transaction.execute(selector([]))).toEqual([]);
       expect(
         await transaction.execute(
@@ -709,7 +792,7 @@ it("settles fulfilled and active jobs fairly while expired work keeps arriving",
           AND NOT EXISTS (SELECT 1 FROM progressive_remote_report_inventories inventory
             WHERE inventory.sim_job_id=report.sim_job_id AND inventory.sequence=report.sequence)`);
     }
-    const second = await transaction.execute(progressiveSettlementJobsSql());
+    const second = await selectSettlementJobs(transaction);
     expect(second).toHaveLength(128);
     expect(second).toEqual((await expectedSettlements()).slice(0, 128));
     const visited = new Set([...first, ...second].map((row) => row.sim_job_id));
@@ -726,7 +809,7 @@ it("settles fulfilled and active jobs fairly while expired work keeps arriving",
         FROM fixture_settlement_jobs fixture WHERE fixture.id=job.id
           AND (fixture.variant IN ('fulfilled','active') OR fixture.variant LIKE 'expired-%')`);
       await nested.execute(sql`UPDATE sync_sweep_promises SET status='fulfilled' WHERE id=md5('active')::uuid`);
-      const remaining = await nested.execute(progressiveSettlementJobsSql());
+      const remaining = await selectSettlementJobs(nested);
       const expectedRemaining = await nested.execute(sql`SELECT id AS sim_job_id FROM fixture_settlement_jobs
         WHERE variant IN ('stopped-running','done-active','done-closed-pointer-gap','done-closed-evidence','unapplied','unindexed')
           OR variant LIKE 'report-%' ORDER BY id`);
@@ -764,8 +847,79 @@ it("settles fulfilled and active jobs fairly while expired work keeps arriving",
         sql`SELECT id,status,engine_state FROM sim_jobs ORDER BY id`,
       ),
     ).toEqual(jobStates);
+
+    const [stopped] = await transaction.execute(
+      sql`SELECT id FROM fixture_settlement_jobs WHERE variant='stopped-running'`,
+    );
+    for (const status of [
+      "pending",
+      "submitted",
+      "running",
+      "ingesting",
+      "done",
+      "failed",
+      "cancelled",
+    ]) {
+      await transaction.execute(
+        sql`UPDATE sim_jobs SET status=${status} WHERE id=${stopped.id}::uuid`,
+      );
+      expect(
+        (await selectSettlementJobs(transaction, [String(stopped.id)])).map(
+          (row) => row.sim_job_id,
+        ),
+      ).toEqual([stopped.id]);
+    }
+
+    // A newer attempt suppresses recovery of the old lease even across jobs.
+    const [closed] = await transaction.execute(
+      sql`SELECT id FROM fixture_settlement_jobs WHERE variant='done-closed'`,
+    );
+    await transaction.execute(sql`UPDATE progressive_cfd_units SET state='blocked',lease_token=NULL,lease_until=NULL
+      WHERE id=${closed.id}::uuid`);
+    await transaction.execute(
+      sql`INSERT INTO progressive_cfd_execution_stops(sim_job_id) VALUES (${closed.id}::uuid)`,
+    );
+    await transaction.execute(sql`INSERT INTO progressive_cfd_attempts(token,sim_job_id,outcome,unit_id,started_at)
+      VALUES (md5('original-closed')::uuid,${closed.id}::uuid,'cancelled',${closed.id}::uuid,timestamptz '2020-01-01')`);
+    expect(
+      await selectSettlementJobs(transaction, [String(closed.id)]),
+    ).toHaveLength(1);
+    await transaction.execute(sql`INSERT INTO progressive_cfd_attempts(token,sim_job_id,outcome,unit_id,started_at)
+      VALUES (md5('new-owner')::uuid,${fulfilled.id}::uuid,'complete',${closed.id}::uuid,timestamptz '2020-01-02')`);
+    expect(
+      await selectSettlementJobs(transaction, [String(closed.id)]),
+    ).toEqual([]);
+
+    // Stage/epoch promotion must not hide old exact result identities awaiting publication.
+    const [pointer] = await transaction.execute(
+      sql`SELECT id FROM fixture_settlement_jobs WHERE variant='done-closed-pointer-gap'`,
+    );
+    await transaction.execute(sql`UPDATE progressive_cfd_units SET state='complete',lease_token=NULL,lease_until=NULL
+      WHERE id=${pointer.id}::uuid`);
+    await transaction.execute(sql`UPDATE sim_jobs SET "ingestedAt"=timestamptz '2020-01-01',
+      request_payload='{"progressive":{"stage":1,"epoch":1}}'::jsonb WHERE id=${pointer.id}::uuid`);
+    await transaction.execute(sql`UPDATE sim_campaigns SET status='complete'`);
+    expect(
+      await selectSettlementJobs(transaction, [String(pointer.id)]),
+    ).toHaveLength(1);
+    await transaction.execute(sql`INSERT INTO result_review_verdicts(id,result_id,verdict,"createdAt")
+      VALUES (md5('defer-late')::uuid,md5('result-done-closed-pointer-gap')::uuid,'defer',timestamptz '2020-01-01')`);
+    expect(
+      await selectSettlementJobs(transaction, [String(pointer.id)]),
+    ).toEqual([]);
+    await transaction.execute(
+      sql`UPDATE result_review_verdicts SET "revokedAt"=clock_timestamp()`,
+    );
+    expect(
+      await selectSettlementJobs(transaction, [String(pointer.id)]),
+    ).toHaveLength(1);
+    await transaction.execute(sql`UPDATE results SET current_result_attempt_id=md5('attempt-done-closed-pointer-gap')::uuid
+      WHERE id=md5('result-done-closed-pointer-gap')::uuid`);
+    expect(
+      await selectSettlementJobs(transaction, [String(pointer.id)]),
+    ).toEqual([]);
   });
-}, 15_000);
+}, 30_000);
 
 it("resumes due archive retries and expired claims before untouched work while preserving ownership and deadlines", async () => {
   await client.db.transaction(async (transaction) => {

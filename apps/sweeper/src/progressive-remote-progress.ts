@@ -334,6 +334,30 @@ async function reconcileProgressiveRemoteCampaign(
   return receipt;
 }
 
+export async function selectProgressiveRemoteProgressJobs(
+  db: DB,
+  jobIds?: string[],
+) {
+  const jobs = await db.execute(progressiveReportJobsSql(jobIds));
+  const terminalJobs = await db.transaction(
+    async (transaction) => {
+      // This frequent read does not amortize JIT compilation. Restore the
+      // caller's setting explicitly as this may be a nested savepoint.
+      const [settings] = await transaction.execute(sql`SHOW jit`);
+      await transaction.execute(sql`SET LOCAL jit = off`);
+      const selected = await transaction.execute(
+        progressiveSettlementJobsSql(jobIds),
+      );
+      await transaction.execute(
+        sql`SELECT set_config('jit', ${String(settings.jit)}, true)`,
+      );
+      return selected;
+    },
+    { accessMode: "read only" },
+  );
+  return { jobs, terminalJobs };
+}
+
 export async function reconcileProgressiveRemoteProgress(
   db: DB,
   options: { jobIds?: string[] } = {},
@@ -359,9 +383,9 @@ export async function reconcileProgressiveRemoteProgress(
     errors: [] as Array<{ executionId: string; reason: string }>,
   };
   if (options.jobIds?.length === 0) return receipt;
-  const jobs = await db.execute(progressiveReportJobsSql(options.jobIds));
-  const terminalJobs = await db.execute(
-    progressiveSettlementJobsSql(options.jobIds),
+  const { jobs, terminalJobs } = await selectProgressiveRemoteProgressJobs(
+    db,
+    options.jobIds,
   );
   const [backlog] = await db.execute(sql`
     SELECT count(*)::int AS pending_reports
