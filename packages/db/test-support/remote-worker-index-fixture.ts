@@ -151,7 +151,7 @@ export async function verifyRemoteWorkerIdentityIndex(
       await transaction.execute(sql`SELECT md5('retained-worker-index')::uuid id,
       mod((hashtext(md5('retained-worker-index')::uuid::text)::bigint & 2147483647),4)::integer lane`);
     await transaction.execute(sql`INSERT INTO sim_jobs(id,status,request_payload)
-      VALUES(${worker.id}::uuid,'cancelled',jsonb_build_object('remoteSolver',true,'syncPromiseId',${String(worker.id)},
+      VALUES(${worker.id}::uuid,'cancelled',jsonb_build_object('remoteSolver',true,'syncPromiseId',${String(worker.id)}::text,
         'upstreamBaseUrl','https://worker-index.invalid'))`);
     await transaction.execute(sql`INSERT INTO sync_sweep_promises
       VALUES(${worker.id}::uuid,'cancelled',clock_timestamp()-interval '1 hour',md5('worker-index-solver')::uuid,'https://worker-index.invalid')`);
