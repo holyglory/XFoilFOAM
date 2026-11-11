@@ -738,7 +738,17 @@ async function verifyCancelledAcceptedPublication(db: DB, envelope: ProgressiveR
     const accepted = { ...polar.attempts![0], aoa_deg: envelope.scope.units[0].alpha, case_slug: "cancelled-accepted",
       converged: true, unsteady: true, stalled: false, cm: 0, error: null, fidelity: "urans_full" as const,
       force_history: { t: [0, 1, 2, 3], cl: [0.4, 0.4, 0.4, 0.4], cd: [0.03, 0.03, 0.03, 0.03], cm: [0, 0, 0, 0] },
-      frame_track: { stationary: true, periods_retained: 5 } };
+      frame_track: {
+        period_s: 1, periods_retained: 5, stationary: true, drift_frac: 0,
+        window: { t_start: 0, t_end: 3 },
+        stats: {
+          cl: { mean: 0.4, std: 0, min: 0.4, max: 0.4 },
+          cd: { mean: 0.03, std: 0, min: 0.03, max: 0.03 },
+          cm: { mean: 0, std: 0, min: 0, max: 0 },
+        },
+        fields: ["U"], frames: [{ i: 0, t: 0, cl: 0.4, cd: 0.03, cm: 0 }],
+        image_pattern: "frames/{field}/f{i04}.png",
+      } };
     delete accepted.failure_disposition;
     const rejected = { ...accepted, aoa_deg: envelope.scope.units[1].alpha, case_slug: "cancelled-rejected",
       converged: false, cl: null, cd: null, cm: null, error: "Retained rejected physical sibling", failure_disposition: "hard_solver" as const };
