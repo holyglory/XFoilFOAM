@@ -868,10 +868,11 @@ async function verifyCancelledAcceptedPublication(db: DB, envelope: ProgressiveR
     });
     await withRollbackFixture(connection, "Protect newer accepted canonical result", async (scoped) => {
       const newer = randomUUID();
-      await scoped.insert(resultAttempts).values({
-        ...raw, id: newer, solvedAt: new Date(),
-        regime: raw.regime === "rans" ? "urans" : "rans",
-      });
+      const newerJob = randomUUID();
+      await scoped.execute(sql`INSERT INTO sim_jobs(id,engine_job_id,airfoil_id,bc_ids,simulation_preset_revision_id,campaign_id,reference_chord_m,status,engine_state)
+        SELECT ${newerJob}::uuid,${newerJob},airfoil_id,bc_ids,simulation_preset_revision_id,campaign_id,reference_chord_m,'done','completed'
+        FROM sim_jobs WHERE id=${executionId}::uuid`);
+      await scoped.insert(resultAttempts).values({ ...raw, id: newer, simJobId: newerJob, engineJobId: newerJob, solvedAt: new Date() });
       await scoped.execute(sql`INSERT INTO result_classifications(result_attempt_id,airfoil_id,simulation_preset_revision_id,aoa_deg,state,region,reasons,confidence,classifier_version)
         SELECT ${newer}::uuid,airfoil_id,simulation_preset_revision_id,aoa_deg,state,region,reasons,confidence,classifier_version
         FROM result_classifications WHERE result_attempt_id=${raw.id}::uuid`);
