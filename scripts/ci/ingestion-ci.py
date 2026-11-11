@@ -21,7 +21,7 @@ import tomllib
 import traceback
 
 
-REVISION = "49656832299d31d9c4ca47b182db5367a735b30a"
+REVISION = "bdc72b819c99c6b9ce780d24ee029b0fa2801af6"
 BASELINE = "c5abb7587eba4c04e431056e1d3cddeeb76211b4"
 REGRESSION = REVISION
 BASELINE_REF = "refs/heads/codex/ingestion-lock-regression-source-20261110"
