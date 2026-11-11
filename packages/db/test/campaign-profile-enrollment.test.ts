@@ -13066,6 +13066,24 @@ describe("durable progressive CFD units", () => {
       });
       expect(sameTarget.calls).toEqual(["unrestricted"]);
       expect(sameTarget.lease?.id).toBe(heads[0].id);
+      for (const firstAvailable of [1, 31, 63]) {
+        const rollback = new Error(`restore ordered prefix position ${firstAvailable}`);
+        try {
+          await db.transaction(async (transaction) => {
+            const unavailable = sql.join(heads.slice(0, firstAvailable).map((unit) => sql`${unit.id}::uuid`), sql`, `);
+            // Budget exhaustion changes eligibility but leaves candidate
+            // ordering intact. Check interior and final prefix positions
+            // against the unrestricted selector, including its exact lease.
+            await transaction.execute(sql`UPDATE progressive_cfd_units
+              SET active_seconds=active_budget_seconds WHERE id IN (${unavailable})`);
+            await compare(transaction as unknown as DB, String(heads[firstAvailable].id), true);
+            throw rollback;
+          });
+          throw new Error("Ordered-prefix fixture did not roll back");
+        } catch (error) {
+          if (error !== rollback) throw error;
+        }
+      }
       for (const mode of ["exhausted", "deferred", "wrong-stage"] as const) {
         const rollback = new Error(`restore unavailable prefix ${mode}`);
         try {

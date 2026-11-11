@@ -496,14 +496,20 @@ export async function claimProgressiveCfdUnit(
         // These cheap heads are an ordered superset, never an eligibility test.
         // Ineligible or locked heads cannot hide work beyond the prefix: the
         // complete selector below is executed separately on every prefix miss.
+        // Number the bounded, ordered result rather than windowing the entire
+        // pending population. ARRAY preserves the exact candidate order and
+        // lets PostgreSQL use a top-N sort before WITH ORDINALITY enumerates it.
         const heads = sql`candidate_heads AS MATERIALIZED (
-          SELECT unit.id, row_number() OVER (ORDER BY ${candidateOrder}) AS head_order
+          SELECT head.id, head.head_order
+          FROM unnest(ARRAY(
+          SELECT unit.id
           ${candidateFrom}
           WHERE generation.campaign_id = ${campaign.id} AND generation.epoch_id = ${epoch.id}
             AND generation.plan_revision_id = (SELECT current_plan_revision_id FROM sim_campaigns WHERE id = ${campaign.id})
             AND generation.status = 'active' AND work.stage IN (2, 3) AND work.state = 'pending'
             AND unit.state = 'pending'
           ORDER BY ${candidateOrder} LIMIT ${PROGRESSIVE_CFD_CANDIDATE_PREFIX_SIZE}
+          )) WITH ORDINALITY AS head(id, head_order)
         )`;
         candidatePrefix = {
           heads,
