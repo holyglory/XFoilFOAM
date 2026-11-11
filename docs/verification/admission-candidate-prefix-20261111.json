@@ -1,0 +1,42 @@
+{
+  "baseRevision": "5e45bc74b1d9d9410f8c98af88542efe37302a98",
+  "prefixSize": 64,
+  "startedAt": "2026-11-11T03:33:11.013326+00:00",
+  "completedAt": "2026-11-11T03:33:24.078632+00:00",
+  "scope": "Captured first selected-unit SELECT against the deployed CASE baseline; not full-dispatch throughput",
+  "method": "ABBA in one read-only repeatable-read snapshot, 20s per statement, exact row-lock clause removed for read-only profiling; JIT unchanged",
+  "runs": [
+    {
+      "variant": "baseline",
+      "planningMs": 48.759,
+      "executionMs": 2839.547
+    },
+    {
+      "variant": "candidate",
+      "planningMs": 54.475,
+      "executionMs": 1642.84
+    },
+    {
+      "variant": "candidate",
+      "planningMs": 26.61,
+      "executionMs": 1324.363
+    },
+    {
+      "variant": "baseline",
+      "planningMs": 50.778,
+      "executionMs": 2985.752
+    }
+  ],
+  "meanExecutionMs": {
+    "baseline": 2912.6495,
+    "candidate": 1483.6015
+  },
+  "meanReductionPercent": 49.06,
+  "sameSelection": true,
+  "sourceRenderedPrefixMatchesMeasuredQuery": true,
+  "sourceRenderedUnrestrictedFallbackUnchanged": true,
+  "sourceSha256": "1e9213174c8079311a423c2bf9e38dd540a2131f56f27fba2a82a46630a711e0",
+  "eligibilityProof": "Cheap ordered heads contain every eligible candidate in the prefix. The guarded per-ID join uses the full existing predicate/order and row locks. A hit is the first eligible prefix member; a miss executes the unchanged unrestricted query in a separate awaited call. Same-target and all-precise paths do not use heads.",
+  "rejectedNaiveJoin": "A direct ordinary join was reordered late and scanned the 64 heads 77,524 times. The guarded lateral join bounds primary-key lookups before expensive checks.",
+  "limits": "A prefix miss adds prefix-query overhead before the full scan. Locking/guard/fallback regressions and live dispatch throughput remain pending parent pinned CI and rollout. Raw SQL, parameters, selected identities, full plans and snapshot details remain in ignored private artifacts."
+}

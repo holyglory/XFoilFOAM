@@ -178,6 +178,7 @@ import {
   claimProgressiveCfdUnit,
   claimProgressiveCfdBatch,
   progressiveCfdBatchMaximum,
+  PROGRESSIVE_CFD_CANDIDATE_PREFIX_SIZE,
   heartbeatProgressiveCfdUnit,
   type ProgressiveCfdLease,
 } from "../src/progressive-cfd";
@@ -12965,6 +12966,152 @@ describe("durable progressive CFD units", () => {
     });
     expect((await claimCfd())?.generationId).toBe(generation.id);
   });
+
+  it("preserves candidate-prefix eligibility and lazily falls back beyond unavailable heads", async () => {
+    expect(PROGRESSIVE_CFD_CANDIDATE_PREFIX_SIZE).toBe(64);
+    const profiles = [originalId];
+    for (let index = 0; index < PROGRESSIVE_CFD_CANDIDATE_PREFIX_SIZE / 2; index += 1)
+      profiles.push(await newProfile());
+    const campaignId = await campaign("active", [32.173], [-2, 0, 2], { chordM: 0.76364 }, profiles);
+    const first = await sealProgressiveGeneration(db,
+      await progressiveScope(campaignId, "candidate-prefix-heads", profiles.slice(0, -1), true));
+    const later = await sealProgressiveGeneration(db,
+      await progressiveScope(campaignId, "candidate-prefix-tail", profiles.slice(-1), true));
+    for (const _profile of profiles) {
+      const baseline = (await claim([1]))!;
+      await storeNeuralFoilPrediction(db, baseline, predictionFixture(baseline));
+    }
+    expect(await initializeProgressiveCfdWork(db)).toBe(PROGRESSIVE_CFD_CANDIDATE_PREFIX_SIZE + 2);
+    const units = await db.execute(sql`SELECT unit.id,unit.ordinal,work.target_id,work.generation_id
+      FROM progressive_cfd_units unit JOIN progressive_work work ON work.id=unit.work_id
+      JOIN progressive_generations generation ON generation.id=work.generation_id
+      WHERE generation.campaign_id=${campaignId}::uuid
+      ORDER BY generation.created_at,generation.id,unit.ordinal,work.target_id`);
+    const heads = units.slice(0, PROGRESSIVE_CFD_CANDIDATE_PREFIX_SIZE);
+    const tail = units[PROGRESSIVE_CFD_CANDIDATE_PREFIX_SIZE];
+    expect(heads.every((unit) => unit.generation_id === first.id)).toBe(true);
+    expect(tail.generation_id).toBe(later.id);
+    const observer = createClient({ url: targetUrl.toString(), max: 1 });
+    const headIds = sql.join(heads.map((unit) => sql`${unit.id}::uuid`), sql`, `);
+    const emptyPrefix = (query: SQL): SQL => new SQL(query.queryChunks.map((chunk) =>
+      chunk instanceof SQL ? emptyPrefix(chunk)
+        : typeof chunk === "number" && chunk === PROGRESSIVE_CFD_CANDIDATE_PREFIX_SIZE ? sql`${0}` : chunk));
+    async function probe(connection: DB, forceEmpty = false,
+      sameTarget?: Parameters<typeof claimProgressiveCfdUnit>[1]["sameTarget"], checkLocks = false) {
+      const rollback = new Error("restore candidate-prefix claim");
+      let lease: ProgressiveCfdLease | null = null;
+      const calls: string[] = [];
+      const captured = {
+        transaction: (run: (transaction: DB) => Promise<ProgressiveCfdLease | null>) =>
+          connection.transaction(async (transaction) => {
+            const execute = transaction.execute.bind(transaction);
+            const spy = vi.spyOn(transaction, "execute").mockImplementation((statement) => {
+              const query = typeof statement === "string" ? sql.raw(statement) : statement.getSQL();
+              const rendered = new PgDialect().sqlToQuery(query);
+              const prefix = rendered.sql.includes("candidate_heads AS MATERIALIZED");
+              if (prefix) calls.push("prefix");
+              else if (rendered.sql.includes("selected AS MATERIALIZED")) calls.push("unrestricted");
+              if (prefix && forceEmpty) {
+                // Execute a genuinely empty head query in PostgreSQL. No result
+                // rows are mocked: the normal lazy fallback must still claim.
+                expect(rendered.params.filter((value) => value === PROGRESSIVE_CFD_CANDIDATE_PREFIX_SIZE)).toHaveLength(1);
+                const empty = emptyPrefix(query);
+                expect(new PgDialect().sqlToQuery(empty).params)
+                  .toEqual(rendered.params.map((value) => value === PROGRESSIVE_CFD_CANDIDATE_PREFIX_SIZE ? 0 : value));
+                return execute(empty);
+              }
+              return execute(statement);
+            });
+            try { lease = await run(transaction as unknown as DB); }
+            finally { spy.mockRestore(); }
+            if (checkLocks && lease) {
+              const selectedId = lease.id;
+              await observer.db.transaction(async (inspecting) => {
+                const unlocked = await inspecting.execute(sql`SELECT unit.id FROM progressive_cfd_units unit
+                  JOIN progressive_work work ON work.id=unit.work_id
+                  WHERE work.generation_id IN (${first.id}::uuid,${later.id}::uuid) AND unit.id<>${selectedId}::uuid
+                  FOR UPDATE OF unit NOWAIT`);
+                expect(unlocked).toHaveLength(units.length - 1);
+              });
+            }
+            throw rollback;
+          }),
+      } as unknown as DB;
+      try {
+        await claimProgressiveCfdUnit(captured, {
+          owner: "candidate-prefix-fixture", leaseSeconds: 120, localTimeStepVersion: 1, sameTarget,
+        });
+        throw new Error("Candidate-prefix fixture did not roll back");
+      } catch (error) {
+        if (error !== rollback) throw error;
+      }
+      const result = lease as ProgressiveCfdLease | null;
+      const identity = result ? (({ token: _token, ...rest }) => rest)(result) : null;
+      return { lease: identity, calls };
+    }
+    async function compare(connection: DB, expectedId: string, hit: boolean, checkLocks = false) {
+      const reference = await probe(connection, true);
+      expect(reference.calls).toEqual(["prefix", "unrestricted"]);
+      expect(reference.lease?.id).toBe(expectedId);
+      const actual = await probe(connection, false, undefined, checkLocks);
+      expect(actual.lease).toEqual(reference.lease);
+      expect(actual.calls).toEqual(hit ? ["prefix"] : ["prefix", "unrestricted"]);
+      return actual.lease!;
+    }
+    try {
+      const selected = await compare(db, String(heads[0].id), true, true);
+      const sameTarget = await probe(db, false, {
+        generationId: selected.generationId, targetId: selected.targetId, recipe: selected.recipe,
+        remainingActiveSeconds: selected.remainingActiveSeconds, recoveryParentJobId: selected.recoveryParentJobId,
+      });
+      expect(sameTarget.calls).toEqual(["unrestricted"]);
+      expect(sameTarget.lease?.id).toBe(heads[0].id);
+      for (const mode of ["exhausted", "deferred", "wrong-stage"] as const) {
+        const rollback = new Error(`restore unavailable prefix ${mode}`);
+        try {
+          await db.transaction(async (transaction) => {
+            const connection = transaction as unknown as DB;
+            if (mode === "exhausted") await connection.execute(sql`UPDATE progressive_cfd_units
+              SET active_seconds=active_budget_seconds WHERE id IN (${headIds})`);
+            else if (mode === "deferred") await connection.execute(sql`UPDATE progressive_cfd_units
+              SET retry_after=clock_timestamp()+interval '1 hour' WHERE id IN (${headIds})`);
+            else {
+              await connection.execute(sql`UPDATE progressive_generations SET stage=3 WHERE id=${first.id}::uuid`);
+              await connection.execute(sql`UPDATE progressive_generation_cohorts SET stage=3 WHERE generation_id=${first.id}::uuid`);
+            }
+            await compare(connection, String(tail.id), false);
+            throw rollback;
+          });
+          throw new Error("Unavailable-prefix fixture did not roll back");
+        } catch (error) {
+          if (error !== rollback) throw error;
+        }
+      }
+      const release = signal();
+      const locked = signal();
+      const holding = observer.db.transaction(async (transaction) => {
+        expect(await transaction.execute(sql`SELECT id FROM progressive_cfd_units WHERE id IN (${headIds}) FOR UPDATE`))
+          .toHaveLength(PROGRESSIVE_CFD_CANDIDATE_PREFIX_SIZE);
+        locked.resolve();
+        await release.promise;
+      }).then(() => ({ error: null }), (error: unknown) => ({ error }));
+      try {
+        await Promise.race([locked.promise, holding.then((outcome) => {
+          throw outcome.error ?? new Error("Prefix locker exited before observation");
+        })]);
+        await compare(db, String(tail.id), false);
+      } finally {
+        release.resolve();
+        const outcome = await holding;
+        if (outcome.error) throw outcome.error;
+      }
+      expect(await db.execute(sql`SELECT attempt.token FROM progressive_cfd_attempts attempt
+        JOIN progressive_cfd_units unit ON unit.id=attempt.unit_id JOIN progressive_work work ON work.id=unit.work_id
+        WHERE work.generation_id IN (${first.id}::uuid,${later.id}::uuid)`)).toHaveLength(0);
+    } finally {
+      await observer.sql.end();
+    }
+  }, 180_000);
 
   it("preserves full-history admission decisions with the first-attempt shortcut", async () => {
     const generation = await fastCfdGeneration(true);

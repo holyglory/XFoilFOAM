@@ -83,6 +83,9 @@ export interface ProgressiveCfdLease {
 
 export const MAX_PRECISE_CFD_BATCH_UNITS = 8;
 
+// A query-cost bound only; a prefix miss always runs the unrestricted selector.
+export const PROGRESSIVE_CFD_CANDIDATE_PREFIX_SIZE = 64;
+
 export function preciseProgressiveSolverSelection(
   selection: Record<string, unknown>,
   policy?: unknown,
@@ -406,6 +409,7 @@ export async function claimProgressiveCfdUnit(
       ? sql`true`
       : progressiveInitialCoverageCompleteSql();
     let selected: SQL;
+    let candidatePrefix: { heads: SQL; selected: SQL } | undefined;
     if (campaign.all_stage3) {
       const selectStage3Candidate = async (
         machPredicate: SQL,
@@ -456,12 +460,10 @@ export async function claimProgressiveCfdUnit(
         SELECT ${selectedId}::uuid AS id
       )`;
     } else {
-      selected = sql`selected AS MATERIALIZED (
-      SELECT unit.id
-      FROM progressive_cfd_units unit JOIN progressive_work work ON work.id = unit.work_id
+      const candidateFrom = sql`FROM progressive_cfd_units unit JOIN progressive_work work ON work.id = unit.work_id
       JOIN progressive_generations generation ON generation.id = work.generation_id
-      JOIN polar_analysis_targets target ON target.id = work.target_id
-      WHERE generation.campaign_id = ${campaign.id} AND generation.epoch_id = ${epoch.id}
+      JOIN polar_analysis_targets target ON target.id = work.target_id`;
+      const candidateGuard = sql`generation.campaign_id = ${campaign.id} AND generation.epoch_id = ${epoch.id}
         AND (work.stage = 3 OR ${cohortInitialized})
         AND ${targetFilter}
         AND ${familyFilter}
@@ -474,19 +476,51 @@ export async function claimProgressiveCfdUnit(
         AND ${progressiveCfdAdmissionSql("generation", sql`work.target_id`, true)}
         AND unit.state = 'pending' AND ${attemptAvailable} AND unit.active_seconds < ${effectiveBudget}
         AND (unit.retry_after IS NULL OR unit.retry_after <= clock_timestamp())
-        AND (unit.purpose <> 'adaptive' OR ${initialCoverageComplete})
-      ORDER BY CASE WHEN target.mach < 1.0 THEN 0 WHEN target.mach >= 1.0 THEN 1 ELSE 2 END,
+        AND (unit.purpose <> 'adaptive' OR ${initialCoverageComplete})`;
+      const candidateOrder = sql`CASE WHEN target.mach < 1.0 THEN 0 WHEN target.mach >= 1.0 THEN 1 ELSE 2 END,
         CASE WHEN target.mach >= 1.0 THEN target.mach END ASC NULLS LAST,
         generation.created_at, generation.id,
         CASE WHEN work.stage = 2 AND unit.purpose = 'initial' AND unit.attempts = 0 THEN 0 ELSE 1 END,
         CASE WHEN ${pendingBudgetExtension} THEN 0 ELSE 1 END,
         CASE WHEN work.stage = 3 THEN 0 ELSE 1 END,
         CASE WHEN unit.purpose = 'initial' THEN 0 ELSE 1 END,
-        unit.retry_after NULLS FIRST, unit.retry_after, unit.ordinal, work.target_id LIMIT 1 FOR UPDATE OF generation, work, unit SKIP LOCKED
-      )`;
+        unit.retry_after NULLS FIRST, unit.retry_after, unit.ordinal, work.target_id`;
+      const candidateQuery = (headId?: SQL) => sql`
+        SELECT unit.id ${candidateFrom}
+        WHERE ${headId ? sql`unit.id = ${headId} AND` : sql``} ${candidateGuard}
+        ORDER BY ${candidateOrder}
+        LIMIT 1 FOR UPDATE OF generation, work, unit SKIP LOCKED
+      `;
+      selected = sql`selected AS MATERIALIZED (${candidateQuery()})`;
+      if (!input.sameTarget) {
+        // These cheap heads are an ordered superset, never an eligibility test.
+        // Ineligible or locked heads cannot hide work beyond the prefix: the
+        // complete selector below is executed separately on every prefix miss.
+        const heads = sql`candidate_heads AS MATERIALIZED (
+          SELECT unit.id, row_number() OVER (ORDER BY ${candidateOrder}) AS head_order
+          ${candidateFrom}
+          WHERE generation.campaign_id = ${campaign.id} AND generation.epoch_id = ${epoch.id}
+            AND generation.plan_revision_id = (SELECT current_plan_revision_id FROM sim_campaigns WHERE id = ${campaign.id})
+            AND generation.status = 'active' AND work.stage IN (2, 3) AND work.state = 'pending'
+            AND unit.state = 'pending'
+          ORDER BY ${candidateOrder} LIMIT ${PROGRESSIVE_CFD_CANDIDATE_PREFIX_SIZE}
+        )`;
+        candidatePrefix = {
+          heads,
+          selected: sql`selected AS MATERIALIZED (
+            SELECT candidate.id
+            FROM (SELECT id, head_order FROM candidate_heads ORDER BY head_order OFFSET 0) heads
+            JOIN LATERAL (${candidateQuery(sql`heads.id`)}) candidate ON true
+            ORDER BY heads.head_order LIMIT 1
+          )`,
+        };
+        // The ordered lateral join drives at most one primary-key lookup per
+        // head before applying full guards and the original row locks. A plain
+        // join can be reordered behind the expensive unrestricted scan.
+      }
     }
-    const [unit] = (await connection.execute(sql`
-      WITH ${progressiveAdmissionFrontierSql(String(epoch.id))}${cohortReadiness}, ${selected}
+    const readSelectedUnit = (selection: SQL, heads?: SQL) => connection.execute(sql`
+      WITH ${progressiveAdmissionFrontierSql(String(epoch.id))}${cohortReadiness}${heads ? sql`, ${heads}` : sql``}, ${selection}
       SELECT unit.id, unit.work_id, work.generation_id, work.target_id, scope.revision_id,
         work.stage, unit.aoa_deg, ${effectiveRecipe} AS recipe, target.physical,
         (SELECT recovery.id FROM progressive_cfd_recovery_plans recovery WHERE recovery.unit_id = unit.id ORDER BY recovery.ordinal DESC LIMIT 1) AS recovery_plan_id,
@@ -517,7 +551,12 @@ export async function claimProgressiveCfdUnit(
       JOIN progressive_generations generation ON generation.id = work.generation_id
       JOIN progressive_generation_targets scope ON scope.generation_id = generation.id AND scope.target_id = work.target_id
       JOIN polar_analysis_targets target ON target.id = work.target_id
-    `)) as unknown as Array<{
+    `);
+    let candidates = candidatePrefix
+      ? await readSelectedUnit(candidatePrefix.selected, candidatePrefix.heads)
+      : [];
+    if (!candidates.length) candidates = await readSelectedUnit(selected);
+    const [unit] = candidates as unknown as Array<{
       id: string;
       work_id: string;
       generation_id: string;
