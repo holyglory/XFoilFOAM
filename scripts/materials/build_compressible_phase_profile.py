@@ -8,6 +8,7 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
 
 SOURCE_SHA256 = {
     'EEqn.H': '85715aff4f27b95777ff47113cf49a88e90898756ee0f0cacb07ad22d72d5233',
@@ -153,8 +154,13 @@ def build(source, destination, proof):
     expected_original = '94e8a1a8f14f4e7dace8c3734302669441629f9b14f865fcb3485a4457658949'
     if sha(original) != expected_original:
         raise ValueError('Original native binary differs')
-    with (proof / 'wmake.log').open('wb') as log:
-        subprocess.run(['wmake', str(destination)], check=True, stdout=log, stderr=subprocess.STDOUT, timeout=900)
+    try:
+        with (proof / 'wmake.log').open('wb') as log:
+            subprocess.run(['wmake', str(destination)], check=True, stdout=log, stderr=subprocess.STDOUT, timeout=900)
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        # BuildKit must retain compiler diagnostics even when no image is produced.
+        sys.stderr.write((proof / 'wmake.log').read_text(errors='replace'))
+        raise
     binary = Path(os.environ['FOAM_USER_APPBIN']) / 'xfoilfoamRhoPimplePhaseProfile'
     if sha(original) != expected_original:
         raise ValueError('Original binary was mutated')

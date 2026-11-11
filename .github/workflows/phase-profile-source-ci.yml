@@ -1,0 +1,39 @@
+name: Phase profile public-source preflight
+
+on:
+  push:
+    branches:
+      - codex/phase-profile-source-ci-v2-20261111
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  source-preflight:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Checkout exact source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Build the pinned source instrumentation
+        env:
+          PROFILE_IMAGE: phase-profile-ci:${{ github.sha }}
+        run: |
+          mkdir -p ci-phase-evidence
+          git rev-parse HEAD > ci-phase-evidence/source-commit.txt
+          docker build --progress=plain -f docker/Dockerfile.compressible-phase-profile -t "$PROFILE_IMAGE" . > ci-phase-evidence/build.stdout.log 2> ci-phase-evidence/build.stderr.log
+      - name: Inspect public runtime identities and executable startup
+        env:
+          PROFILE_IMAGE: phase-profile-ci:${{ github.sha }}
+        run: python3 scripts/materials/inspect_phase_profile_ci.py "$PROFILE_IMAGE" ci-phase-evidence
+      - name: Retain source, compiler and startup evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: phase-profile-source-preflight-${{ github.sha }}
+          path: ci-phase-evidence
+          if-no-files-found: error
+          retention-days: 14

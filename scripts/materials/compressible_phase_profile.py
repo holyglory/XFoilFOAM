@@ -33,6 +33,18 @@ def build_identity():
     return proof
 
 
+def inspect_build(output):
+    shutil.copytree(PROOF, output / 'build-proof')
+    shutil.copy2(BINARY, output / BINARY.name)
+    proof = json.loads((PROOF / 'build-proof.json').read_text())
+    actual = {name: common.digest(name) if Path(name).is_file() else None for name in proof['dependencySha256']}
+    mismatches = {name: {'build': expected, 'runtime': actual[name]} for name, expected in proof['dependencySha256'].items()
+                  if expected != actual[name]}
+    common.write_json(output / 'runtime-preflight.json', {'buildProof': proof, 'runtimeDependencySha256': actual,
+                      'dependencyMismatches': mismatches, 'experimentalBinarySha256': common.digest(BINARY),
+                      'originalBinarySha256': common.digest(shutil.which('rhoPimpleFoam')), 'nativeProfileStarted': False})
+
+
 def rank_entry(case, receipts, allowed):
     rank = int(os.environ['OMPI_COMM_WORLD_LOCAL_RANK'])
     if int(os.environ['OMPI_COMM_WORLD_SIZE']) != 4 or int(os.environ['OMPI_COMM_WORLD_LOCAL_SIZE']) != 4 or rank not in range(4):
@@ -119,7 +131,7 @@ def verify(root):
 
 if __name__ == '__main__':
     p = argparse.ArgumentParser()
-    p.add_argument('action', choices=['native', 'rank'])
+    p.add_argument('action', choices=['native', 'rank', 'inspect'])
     p.add_argument('--input', type=Path)
     p.add_argument('--output', type=Path)
     p.add_argument('--case', type=Path)
@@ -128,7 +140,9 @@ if __name__ == '__main__':
     p.add_argument('--allowed')
     p.add_argument('--bound')
     a = p.parse_args()
-    if a.action == 'native':
+    if a.action == 'inspect':
+        inspect_build(a.output)
+    elif a.action == 'native':
         native_run(a.input, a.output)
     else:
         rank_entry(a.case, a.receipts, list(map(int, a.allowed.split(','))))
