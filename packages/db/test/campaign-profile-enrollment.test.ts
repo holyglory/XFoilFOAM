@@ -1693,6 +1693,7 @@ async function cfdEvidenceFixture(
   physical: { mediumId?: string; chordM?: number } = {},
   maximumUnits?: number,
   deferSubmission = false,
+  historicalRansSweep = false,
 ) {
   const campaignId = prepared?.campaignId ?? await campaign("active", [speed, ...extraSpeeds], angles, physical);
   let retriedUnitId: string | undefined;
@@ -1835,6 +1836,41 @@ async function cfdEvidenceFixture(
       .update(sweeperState)
       .set({ enabled: prepared ? priorAdmission?.enabled ?? false : false })
       .where(eq(sweeperState.id, 1));
+  }
+  if (historicalRansSweep) {
+    // Historical RANS recovery remains supported, but the current stage-3
+    // composer deliberately submits URANS. Build that older request from the
+    // steady execution snapshot while this new fixture job is still unstarted.
+    // Never rewrite a submitted request, report, stop fence, or result history.
+    expect(stage).toBe(3);
+    expect(composed.request.solver).toMatchObject({ rans_failure_policy: "continue", force_transient: true });
+    const family = execution.snapshot.solver.flowSolverFamily;
+    expect(["simpleFoam", "rhoSimpleFoam"]).toContain(family);
+    const [airfoil] = await db.select().from(airfoils).where(eq(airfoils.id, leases[0].physical.airfoilId));
+    const { request } = buildPolarRequest({
+      airfoil: { ...airfoil, points: leases[0].physical.geometry.map(([x, y]) => ({ x, y })) },
+      setup: execution.snapshot, aoaList: leases.map((lease) => lease.alpha).sort((a, b) => a - b),
+      wave: 1, ransFailurePolicy: "abort_for_precalc", cpuSlots: 1, solverFamilyOverride: family!,
+    });
+    const historicalRequest = {
+      ...request, execution_id: composed.request.execution_id,
+      expected_execution_pool: composed.request.expected_execution_pool,
+      expected_mesh_recovery_version: composed.request.expected_mesh_recovery_version,
+      expected_solver_budget_version: composed.request.expected_solver_budget_version,
+      resources: composed.request.resources,
+    };
+    const updated = await db.execute(sql`UPDATE sim_jobs job SET wave=1,method_key='openfoam.rans',
+      request_payload=jsonb_set(request_payload,'{engineRequest}',${JSON.stringify(historicalRequest)}::jsonb)
+      WHERE job.id=${composed.jobId}::uuid AND job.status='pending' AND job.engine_job_id IS NULL
+        AND NOT EXISTS(SELECT 1 FROM result_attempts raw WHERE raw.sim_job_id=job.id)
+        AND NOT EXISTS(SELECT 1 FROM progressive_remote_dispatches dispatch WHERE dispatch.sim_job_id=job.id)
+        AND NOT EXISTS(SELECT 1 FROM progressive_remote_reports report WHERE report.sim_job_id=job.id)
+        AND NOT EXISTS(SELECT 1 FROM progressive_cfd_execution_stops stopped WHERE stopped.sim_job_id=job.id)
+      RETURNING id`);
+    expect(updated).toEqual([{ id: composed.jobId }]);
+    composed = { ...composed, request: historicalRequest };
+    expect(composed.request.solver).toMatchObject({ rans_failure_policy: "abort_for_precalc", force_transient: false });
+    expect(composed.request.aoa?.angles).toEqual([...angles].sort((a, b) => a - b));
   }
   const engineJobId = composed.request.execution_id!;
   if (!deferSubmission)
@@ -8270,13 +8306,11 @@ describe("progressive execution stop and settlement", () => {
 });
 
 describe("bounded progressive numerical recovery", () => {
-  it.each([
-    { angles: [-4, 4], triggerAoaDeg: 4, earlyState: null, speed: 34.1941 },
-    { angles: [-4, 4], triggerAoaDeg: 4, earlyState: "gap" as const, speed: 34.1942 },
-    { angles: [-5, 0], triggerAoaDeg: 0, earlyState: "gap" as const, speed: 34.1943 },
-    { angles: [0, 9], triggerAoaDeg: 0, earlyState: "pending" as const, speed: 34.1944 },
-    { angles: [-5, 5], triggerAoaDeg: 5, earlyState: "gap" as const, speed: 34.1945 },
-  ])("recovers an all-diagnostic original sweep at $triggerAoaDeg degrees after early settlement $earlyState", async ({ angles, triggerAoaDeg, earlyState, speed }) => {
+  async function withFreshDiagnosticExecution(
+    speed: number,
+    angles: number[],
+    verify: (envelope: Awaited<ReturnType<typeof bindProgressiveRemoteDispatch>>["envelope"]) => Promise<void>,
+  ) {
     const fixture = await cfdEvidenceFixture(speed, 2, [], angles, false, undefined, { chordM: 1.19402 }, angles.length, true);
     expect(fixture.leases.map((unit) => unit.alpha).sort((a, b) => a - b)).toEqual(angles);
     const [job] = await db.select().from(simJobs).where(eq(simJobs.id, fixture.composed.jobId));
@@ -8296,14 +8330,33 @@ describe("bounded progressive numerical recovery", () => {
         (promise_id,airfoil_id,simulation_preset_revision_id,aoa_deg)
         VALUES (${promiseId}::uuid,${job.airfoilId}::uuid,${job.simulationPresetRevisionId}::uuid,${alpha})`);
       const { envelope } = await bindProgressiveRemoteDispatch(db, { simJobId: job.id, solverId, promiseId });
-      const { verifyDiagnosticOnlyPromotionRecovery } = await import("./progressive-stopped-failed-delivery-fixture");
-      await verifyDiagnosticOnlyPromotionRecovery(db, envelope, triggerAoaDeg, earlyState);
+      expect(envelope.request.solver?.rans_failure_policy).toBe("abort_for_precalc");
+      expect(await db.execute(sql`SELECT sequence FROM progressive_remote_reports WHERE sim_job_id=${job.id}::uuid`)).toHaveLength(0);
+      await verify(envelope);
     } finally {
       await db.update(sweeperState).set({ enabled: admission.enabled }).where(eq(sweeperState.id, 1));
       await db.execute(sql`DELETE FROM progressive_remote_dispatches WHERE sim_job_id=${job.id}::uuid`);
       await db.execute(sql`DELETE FROM sync_sweep_promises WHERE id=${promiseId}::uuid`);
       await db.execute(sql`DELETE FROM registered_remote_solvers WHERE id=${solverId}::uuid`);
     }
+  }
+
+  it.each([
+    { angles: [-4, 4], triggerAoaDeg: 4, earlyState: null, speed: 34.1941 },
+    { angles: [-4, 4], triggerAoaDeg: 4, earlyState: "gap" as const, speed: 34.1942 },
+    { angles: [-5, 0], triggerAoaDeg: 0, earlyState: "gap" as const, speed: 34.1943 },
+    { angles: [0, 9], triggerAoaDeg: 0, earlyState: "pending" as const, speed: 34.1944 },
+    { angles: [-5, 5], triggerAoaDeg: 5, earlyState: "gap" as const, speed: 34.1945 },
+  ])("recovers an all-diagnostic original sweep at $triggerAoaDeg degrees after early settlement $earlyState", async ({ angles, triggerAoaDeg, earlyState, speed }) => {
+    const { verifyDiagnosticOnlyPromotionRecovery } = await import("./progressive-stopped-failed-delivery-fixture");
+    await withFreshDiagnosticExecution(speed, angles, (envelope) =>
+      verifyDiagnosticOnlyPromotionRecovery(db, envelope, triggerAoaDeg, earlyState));
+  }, 240_000);
+
+  it("recovers an authenticated mixed RANS promotion from a fresh stage-2 execution", async () => {
+    const { verifyDiagnosticMixedPromotionRecovery } = await import("./progressive-stopped-failed-delivery-fixture");
+    await withFreshDiagnosticExecution(34.1946, [0, 1], (envelope) =>
+      verifyDiagnosticMixedPromotionRecovery(db, envelope));
   }, 240_000);
 
   async function composeRecovery(
@@ -8537,7 +8590,7 @@ describe("bounded progressive numerical recovery", () => {
     "conserves the exact original sweep after a hard RANS failure at %s degrees",
     async (triggerAlpha) => {
       const angles = [-2, 0, 5, 8];
-      const fixture = await cfdEvidenceFixture(32.619, 3, [42.619], angles);
+      const fixture = await cfdEvidenceFixture(32.619, 3, [42.619], angles, false, undefined, {}, undefined, false, true);
       const originals = fixture.leases.map((lease) =>
         structuredClone(lease.recipe),
       );
@@ -8679,7 +8732,7 @@ describe("bounded progressive numerical recovery", () => {
   it.each([false, true])(
     "verifies only accepted preliminary sweep recovery within the original time allocation (cancel first=%s)",
     async (cancelFirst) => {
-      const fixture = await cfdEvidenceFixture(33.119, 3, [], [0, 5]);
+      const fixture = await cfdEvidenceFixture(33.119, 3, [], [0, 5], false, undefined, {}, undefined, false, true);
       const failure = await fixture.save(10, "rans", 5, {
         failure_disposition: "hard_solver",
       });
@@ -9319,7 +9372,7 @@ describe("bounded progressive numerical recovery", () => {
   });
 
   it("persists an engine promotion through terminal ingestion before admitting its original replacement scope", async () => {
-    const fixture = await cfdEvidenceFixture(33.219, 3, [], [-2, 0, 5]);
+    const fixture = await cfdEvidenceFixture(33.219, 3, [], [-2, 0, 5], false, undefined, {}, undefined, false, true);
     const engine = new EngineClient("http://unused.invalid");
     vi.spyOn(engine, "getJob").mockResolvedValue({
       job_id: fixture.engineJobId,

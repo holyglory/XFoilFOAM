@@ -30,6 +30,22 @@ import { buildProgressiveFitRequest } from "../../../apps/sweeper/src/progressiv
 import { deliverNextProgressiveWorkerEvidence } from "../../../apps/sweeper/src/progressive-worker-evidence-delivery";
 import { resolveEngineRuntimeBuild } from "../../../apps/api/src/engine-provenance";
 
+// Roll back fixture writes without replacing the original API/guard/assertion
+// failure with a second assertion about the rollback sentinel.
+async function withRollbackFixture(db: DB, label: string, run: (connection: DB) => Promise<void>) {
+  const rollback = new Error(label);
+  try {
+    await db.transaction(async (transaction) => {
+      await run(transaction as unknown as DB);
+      throw rollback;
+    });
+  } catch (error) {
+    if (error === rollback) return;
+    throw error;
+  }
+  throw new Error(`Fixture did not roll back: ${label}`);
+}
+
 async function verifyLegacyFailedAttemptAck(db: DB, executionId: string) {
   const [source] = await db.execute(sql`SELECT association.*,attempt.result_id,attempt.evidence_payload,original.token
     FROM progressive_worker_evidence_attempts association JOIN result_attempts attempt ON attempt.id=association.result_attempt_id
@@ -182,7 +198,7 @@ async function verifyDiagnosticOnlyRemoteSettlement(db: DB, envelope: Progressiv
   }
 }
 
-async function verifyMissingRemotePromotionTrigger(db: DB, envelope: ProgressiveRemoteExecutionEnvelope) {
+export async function verifyDiagnosticMixedPromotionRecovery(db: DB, envelope: ProgressiveRemoteExecutionEnvelope) {
   const restore = new Error("Restore remote promotion trigger custody");
   try {
     await db.transaction(async (transaction) => {
@@ -195,6 +211,8 @@ async function verifyMissingRemotePromotionTrigger(db: DB, envelope: Progressive
       WHERE id=(SELECT simulation_preset_revision_id FROM sim_jobs WHERE id=${executionId}::uuid)`);
     polar.reynolds = Number((revision.snapshot as { derived: { reynolds: number } }).derived.reynolds);
     const angles = [...(envelope.request.aoa?.angles ?? [])].sort((a, b) => a - b);
+    expect(envelope.scope.stage).toBe(2);
+    expect(envelope.request.solver?.rans_failure_policy).toBe("abort_for_precalc");
     expect(angles).toContain(0);
     expect(angles).toContain(1);
     const accepted = { ...polar.attempts![0], aoa_deg: 0, case_slug: "promotion-accepted-sibling",
@@ -280,14 +298,12 @@ async function verifyMissingRemotePromotionTrigger(db: DB, envelope: Progressive
       attemptedAoas: [0, 1], intentionallyOmittedAoas: polar.rans_precalc_promotion!.intentionally_omitted_aoas,
     };
     const rejects = async (mutate: (scoped: DB) => Promise<unknown>, candidate: ProgressiveRansPromotion = promotion) => {
-      const rollback = new Error("Restore diagnostic recovery rejection probe");
-      await expect(connection.transaction(async (nested) => {
+      await withRollbackFixture(connection, "Restore diagnostic recovery rejection probe", async (nested) => {
         const scoped = nested as unknown as DB;
         await mutate(scoped);
         await expect(recordProgressiveCfdRecoveryPlans(scoped, executionId, [candidate])).rejects.toThrow();
         expect(await scoped.execute(sql`SELECT id FROM progressive_cfd_recovery_plans WHERE parent_job_id=${executionId}::uuid`)).toHaveLength(0);
-        throw rollback;
-      })).rejects.toBe(rollback);
+      });
     };
     // Shadow immutable rows only inside rollback probes. Production immutability
     // stays enforced; these probes exercise authentic retained-source validation.
@@ -356,7 +372,8 @@ async function verifyMissingRemotePromotionTrigger(db: DB, envelope: Progressive
     await rejects(untouched, { ...promotion, triggerDiagnosticReceipt: { ...diagnostic!.reference, reportContentSignature: "0".repeat(64) } });
     for (const triggerAoaDeg of [-1, 0, 6]) await rejects(untouched, { ...promotion, triggerAoaDeg });
     await rejects(untouched, { ...promotion, attemptedAoas: [0], intentionallyOmittedAoas: angles.filter((alpha) => alpha !== 0) });
-    await rejects(untouched, { ...promotion, intentionallyOmittedAoas: [] });
+    await rejects(untouched, { ...promotion,
+      intentionallyOmittedAoas: promotion.intentionallyOmittedAoas.length ? [] : [promotion.triggerAoaDeg] });
     const sibling = String(receipts[0].result_attempt_id);
     await rejects(untouched, { revisionId: promotion.revisionId, triggerResultAttemptId: sibling, triggerAoaDeg: 1,
       attemptedAoas: promotion.attemptedAoas, intentionallyOmittedAoas: promotion.intentionallyOmittedAoas });
@@ -435,13 +452,14 @@ export async function verifyDiagnosticOnlyPromotionRecovery(
   triggerAoaDeg: number,
   earlyState: "gap" | "pending" | null,
 ) {
-  const restore = new Error("Restore all-diagnostic original sweep recovery");
-  await expect(db.transaction(async (transaction) => {
+  await withRollbackFixture(db, "Restore all-diagnostic original sweep recovery", async (transaction) => {
     const connection = transaction as unknown as DB;
     const executionId = envelope.scope.executionId;
     const originalUnits = await connection.execute(sql`SELECT unit.id,unit.recipe FROM progressive_cfd_units unit
       JOIN progressive_cfd_attempts attempt ON attempt.unit_id=unit.id WHERE attempt.sim_job_id=${executionId}::uuid`);
     const angles = [...(envelope.request.aoa?.angles ?? [])].sort((a, b) => a - b);
+    expect(envelope.scope.stage).toBe(2);
+    expect(envelope.request.solver?.rans_failure_policy).toBe("abort_for_precalc");
     const ordered = angles.includes(0)
       ? [0, ...angles.filter((angle) => angle > 0), ...angles.filter((angle) => angle < 0).reverse()]
       : angles;
@@ -468,18 +486,21 @@ export async function verifyDiagnosticOnlyPromotionRecovery(
     };
     const promotionReport: ProgressiveRemoteReport = {
       ...partial, sequence: 2,
-      status: { ...partial.status, state: "completed", completed_cases: attempted.length },
-      result: { ...result, state: "completed" },
-      stopProof: { version: 1, job_id: executionId, execution_stopped: true, producer_stopped: true,
-        namespace_verified: true, remaining: [], observed_at: new Date().toISOString(), error: null,
-        fence: "terminal_result", ownership_basis: "recorded_execution_namespace" },
+      status: { ...partial.status, completed_cases: attempted.length },
+      result,
+      stopProof: null,
     };
     // The latest report deliberately has JSON null for its promotion. Recovery
     // must retain the actual original promotion, not require it in the last row.
     const final = structuredClone(promotionReport);
     final.sequence = 3;
+    final.status.state = "completed";
+    final.result!.state = "completed";
     final.result!.polars[0].attempts = [];
     final.result!.polars[0].rans_precalc_promotion = null;
+    final.stopProof = { version: 1, job_id: executionId, execution_stopped: true, producer_stopped: true,
+      namespace_verified: true, remaining: [], observed_at: new Date().toISOString(), error: null,
+      fence: "terminal_result", ownership_basis: "recorded_execution_namespace" };
     const token = "isolated-all-diagnostic-recovery-credential";
     await connection.execute(sql`UPDATE sync_api_settings SET enabled=true WHERE id=1`);
     await connection.execute(sql`UPDATE sync_api_permissions SET can_push=true WHERE data_type IN ('polars','sweeps')`);
@@ -492,6 +513,15 @@ export async function verifyDiagnosticOnlyPromotionRecovery(
         expect(response.statusCode, response.body).toBe(200);
         expect(await applyProgressiveRemoteProgress(connection, executionId)).toMatchObject({ kind: "applied", sequence: report.sequence });
       }
+      // A later report may not replace the terminal result. The promotion must
+      // already exist in the running history before the one final stop fence.
+      const changed = structuredClone(final);
+      changed.sequence += 1;
+      changed.result!.polars[0] = structuredClone(promotionReport.result!.polars[0]);
+      const refused = await app.inject({ method: "POST", url: `/api/sync/v1/progressive-executions/${executionId}/reports`,
+        headers: { "x-xfoilfoam-solver-token": token }, payload: { promiseId: envelope.promiseId, report: changed } });
+      expect(refused.statusCode, refused.body).toBe(409);
+      expect(refused.json().error).toBe("Final remote execution evidence cannot change after its stop fence");
     });
     const diagnostics = await issueProgressiveRemoteDiagnosticReceipts(connection, executionId);
     expect(diagnostics).toHaveLength(attempted.length);
@@ -517,14 +547,12 @@ export async function verifyDiagnosticOnlyPromotionRecovery(
     const promotion: ProgressiveRansPromotion = { revisionId: trigger!.revisionId, triggerDiagnosticReceipt: trigger!.reference,
       triggerAoaDeg, attemptedAoas: attempted, intentionallyOmittedAoas: omitted };
     const probe = async (mutate: (scoped: DB) => Promise<unknown>) => {
-      const rollback = new Error("Restore all-diagnostic source probe");
-      await expect(connection.transaction(async (nested) => {
+      await withRollbackFixture(connection, "Restore all-diagnostic source probe", async (nested) => {
         const scoped = nested as unknown as DB;
         await mutate(scoped);
         await expect(recordProgressiveCfdRecoveryPlans(scoped, executionId, [promotion])).rejects.toThrow();
         expect(await scoped.execute(sql`SELECT id FROM progressive_cfd_recovery_plans WHERE parent_job_id=${executionId}::uuid`)).toHaveLength(0);
-        throw rollback;
-      })).rejects.toBe(rollback);
+      });
     };
     await probe(async (scoped) => {
       await scoped.execute(sql`CREATE TEMP TABLE progressive_generation_cohorts ON COMMIT DROP AS SELECT * FROM public.progressive_generation_cohorts`);
@@ -572,8 +600,7 @@ export async function verifyDiagnosticOnlyPromotionRecovery(
       diagnostic_attempt_id: null, diagnostic_point_content_signature: triggerSource.contentSignature,
       diagnostic_signature: analysisContentHash(trigger!.reference) });
     if (earlyState) for (const unit of envelope.scope.units) {
-      const rollback = new Error("Restore diagnostic settlement lease-owner probe");
-      await expect(connection.transaction(async (nested) => {
+      await withRollbackFixture(connection, "Restore diagnostic settlement lease-owner probe", async (nested) => {
         const scoped = nested as unknown as DB;
         await scoped.execute(sql`UPDATE sim_jobs SET status='done',"ingestedAt"=clock_timestamp() WHERE id=${executionId}::uuid`);
         await scoped.execute(sql`UPDATE progressive_cfd_units SET lease_owner='foreign-diagnostic-recovery-owner'
@@ -586,20 +613,17 @@ export async function verifyDiagnosticOnlyPromotionRecovery(
           await settleProgressiveCfdExecution(scoped, executionId);
           expect(await scoped.execute(ownership)).toEqual(before);
         }
-        throw rollback;
-      })).rejects.toBe(rollback);
+      });
     }
     if (!omitted.length) {
-      const rollback = new Error("Restore exhausted diagnostic retry budgets");
-      await expect(connection.transaction(async (nested) => {
+      await withRollbackFixture(connection, "Restore exhausted diagnostic retry budgets", async (nested) => {
         const scoped = nested as unknown as DB;
         await scoped.execute(sql`UPDATE progressive_cfd_units SET active_seconds=active_budget_seconds
           WHERE id IN (SELECT unit_id FROM progressive_cfd_attempts WHERE sim_job_id=${executionId}::uuid)`);
         await scoped.execute(sql`UPDATE sim_jobs SET status='done',"ingestedAt"=clock_timestamp() WHERE id=${executionId}::uuid`);
         const counts = await settleProgressiveCfdExecution(scoped, executionId);
         expect(counts).toMatchObject({ retry: 0, gaps: angles.length });
-        throw rollback;
-      })).rejects.toBe(rollback);
+      });
     }
     for (let replay = 0; replay < 2; replay += 1) {
       expect(await settleProgressiveRemoteJob(connection, executionId)).toMatchObject({ kind: "settled" });
@@ -625,12 +649,10 @@ export async function verifyDiagnosticOnlyPromotionRecovery(
     // The retry has a new owner. Replaying the old authenticated request cannot
     // mutate its plan or take the newly claimed units back.
     await expect(recordProgressiveCfdRecoveryPlans(connection, executionId, [promotion])).rejects.toThrow();
-    throw restore;
-  })).rejects.toBe(restore);
+  });
 }
 
 export async function verifyPriorRawStoppedProgressiveSettlement(db: DB, envelope: ProgressiveRemoteExecutionEnvelope) {
-  await verifyMissingRemotePromotionTrigger(db, envelope);
   const restore = new Error("Restore final progress with prior raw failures");
   await db.transaction(async (transaction) => {
     const connection = transaction as unknown as DB;
@@ -913,8 +935,7 @@ export async function verifyStoppedFailedProgressiveDelivery(
           const [canonical] = await connection.execute(sql`SELECT current_result_attempt_id FROM results WHERE id=${receipt.resultId}::uuid`);
           expect(canonical.current_result_attempt_id).toBeNull();
           if (variant === "physical") {
-            const rollback = new Error("Restore lost stopped-failure ACK after retry");
-            await expect(connection.transaction(async (nested) => {
+            await withRollbackFixture(connection, "Restore lost stopped-failure ACK after retry", async (nested) => {
               const [original] = await nested.execute(sql`SELECT attempt.unit_id,attempt.execution_recipe_id,attempt.started_at
                 FROM progressive_cfd_attempts attempt JOIN progressive_cfd_units unit ON unit.id=attempt.unit_id
                 WHERE attempt.sim_job_id=${executionId}::uuid AND unit.aoa_deg=${point.aoa_deg}`);
@@ -927,8 +948,7 @@ export async function verifyStoppedFailedProgressiveDelivery(
               const changed = await app.inject({ method: "POST", url: "/api/sync/v1/retained-progressive-evidence", headers,
                 payload: { ...payload, results: [{ ...payload.results[0], progressiveEvidence: { ...reference, pointContentSignature: "0".repeat(64) } }] } });
               expect(changed.statusCode, changed.body).toBe(409);
-              throw rollback;
-            })).rejects.toBe(rollback);
+            });
           }
           await retainStoppedArchive(connection, delivery, String(receipt.resultAttemptId));
           expect(await readProgressiveRemoteRetention(connection, executionId)).toMatchObject({ kind: "retained",
@@ -984,8 +1004,7 @@ export async function verifyStoppedFailedProgressiveDelivery(
 async function verifyLegacyClosedProgressiveStorage(db: DB, envelope: ProgressiveRemoteExecutionEnvelope) {
   for (const variant of ["failed", "untyped-failed", "accepted"] as const) {
     const accepted = variant === "accepted";
-    const restore = new Error(`Restore legacy closed storage ${variant}`);
-    await expect(db.transaction(async (transaction) => {
+    await withRollbackFixture(db, `Restore legacy closed storage ${variant}`, async (transaction) => {
       const connection = transaction as unknown as DB;
       const executionId = envelope.scope.executionId;
       const result = progressiveRemoteEvidenceResult(envelope);
@@ -1102,8 +1121,7 @@ async function verifyLegacyClosedProgressiveStorage(db: DB, envelope: Progressiv
             headers: Object.fromEntries(new Headers(options?.headers)), payload: JSON.parse(String(options?.body)) });
           return new Response(response.body, { status: response.statusCode, headers: { "content-type": "application/json" } });
         };
-        const rollback = new Error("Restore active promise refusal for cancelled original");
-        await expect(connection.transaction(async (nested) => {
+        await withRollbackFixture(connection, "Restore active promise refusal for cancelled original", async (nested) => {
           await nested.execute(sql`UPDATE sync_sweep_promises SET status='active' WHERE id=${envelope.promiseId}::uuid`);
           if (variant === "untyped-failed") {
             await nested.execute(sql`UPDATE progressive_cfd_attempts SET outcome='running',finished_at=NULL
@@ -1119,8 +1137,7 @@ async function verifyLegacyClosedProgressiveStorage(db: DB, envelope: Progressiv
             expect(await nested.execute(sql`SELECT receipt FROM progressive_worker_hub_receipts
               WHERE sim_job_id=${executionId}::uuid`)).toHaveLength(0);
           }
-          throw rollback;
-        })).rejects.toBe(rollback);
+        });
         paths.length = 0;
         expect(await deliverNextProgressiveWorkerEvidence(connection, fetcher)).toBe(true);
         expect(paths).toEqual(["/api/sync/v1/polars", "/api/sync/v1/retained-progressive-evidence"]);
@@ -1150,7 +1167,6 @@ async function verifyLegacyClosedProgressiveStorage(db: DB, envelope: Progressiv
       expect(await connection.execute(sql`SELECT result_id,result_attempt_id FROM sync_sweep_promise_points
         WHERE promise_id=${envelope.promiseId}::uuid AND (result_id IS NOT NULL OR result_attempt_id IS NOT NULL)`)).toHaveLength(0);
       expect(await connection.execute(sql`SELECT status FROM sync_sweep_promises WHERE id=${envelope.promiseId}::uuid`)).toEqual([{ status: "cancelled" }]);
-      throw restore;
-    })).rejects.toBe(restore);
+    });
   }
 }
