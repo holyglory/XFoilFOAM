@@ -48,7 +48,7 @@ import { buildPolarRequest } from "../../../apps/sweeper/src/build-request";
 import { progressiveRecipes } from "../src/progressive-materialization";
 import { delimiter, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { and, eq, inArray, sql } from "drizzle-orm";
+import { and, eq, inArray, sql, SQL, StringChunk } from "drizzle-orm";
 import { PgDialect } from "drizzle-orm/pg-core";
 import * as progressiveCampaigns from "../src/progressive-campaigns";
 import { migrate } from "drizzle-orm/postgres-js/migrator";
@@ -12965,6 +12965,79 @@ describe("durable progressive CFD units", () => {
     });
     expect((await claimCfd())?.generationId).toBe(generation.id);
   });
+
+  it("preserves full-history admission decisions with the first-attempt shortcut", async () => {
+    const generation = await fastCfdGeneration(true);
+    expect(await initializeProgressiveCfdWork(db)).toBe(4);
+    const marker = "CASE WHEN unit.attempts < 2 THEN true ELSE (";
+    const fullHistory = (query: SQL): SQL => new SQL(query.queryChunks.map((chunk) => {
+      if (chunk instanceof SQL) return fullHistory(chunk);
+      if (chunk instanceof StringChunk)
+        return new StringChunk(chunk.value.map((text) => text.replaceAll(marker, "CASE WHEN false THEN true ELSE (")));
+      return chunk;
+    }));
+    async function probe(forceHistory: boolean) {
+      const rollback = new Error("restore admission equivalence probe");
+      let selected: ProgressiveCfdLease | null = null;
+      let shortcutQueries = 0;
+      const captured = {
+        transaction: (run: (connection: DB) => Promise<ProgressiveCfdLease | null>) =>
+          db.transaction(async (transaction) => {
+            const execute = transaction.execute.bind(transaction);
+            const spy = vi.spyOn(transaction, "execute").mockImplementation((statement) => {
+              const query = typeof statement === "string" ? sql.raw(statement) : statement.getSQL();
+              if (new PgDialect().sqlToQuery(query).sql.includes(marker)) shortcutQueries += 1;
+              return execute(forceHistory ? fullHistory(query) : statement);
+            });
+            try { selected = await run(transaction as unknown as DB); }
+            finally { spy.mockRestore(); }
+            throw rollback;
+          }),
+      } as unknown as DB;
+      try {
+        await claimProgressiveCfdUnit(captured, { owner: "attempt-equivalence", leaseSeconds: 120, localTimeStepVersion: 1 });
+        throw new Error("Admission equivalence fixture did not roll back");
+      } catch (error) {
+        if (error !== rollback) throw error;
+      }
+      expect(shortcutQueries).toBeGreaterThan(0);
+      const lease = selected as ProgressiveCfdLease | null;
+      if (!lease) return null;
+      const { token: _token, ...identity } = lease;
+      return identity;
+    }
+    const units = () => db.execute(sql`SELECT unit.* FROM progressive_cfd_units unit
+      JOIN progressive_work work ON work.id=unit.work_id
+      WHERE work.generation_id=${generation.generationId}::uuid ORDER BY unit.id`);
+    async function compare(expected: "eligible" | "unavailable") {
+      const before = await units();
+      const reference = await probe(true);
+      const shortcut = await probe(false);
+      expect(shortcut).toEqual(reference);
+      if (expected === "eligible") expect(shortcut).not.toBeNull();
+      else expect(shortcut).toBeNull();
+      expect(await units()).toEqual(before);
+      expect(await db.execute(sql`SELECT attempt.token FROM progressive_cfd_attempts attempt
+        JOIN progressive_cfd_units unit ON unit.id=attempt.unit_id
+        JOIN progressive_work work ON work.id=unit.work_id
+        WHERE work.generation_id=${generation.generationId}::uuid`)).toHaveLength(0);
+    }
+    for (const attempts of [0,1,2,3,4,5]) {
+      await db.execute(sql`UPDATE progressive_cfd_units SET attempts=${attempts}
+        WHERE work_id IN(SELECT id FROM progressive_work WHERE generation_id=${generation.generationId}::uuid)`);
+      await compare(attempts < 2 ? "eligible" : "unavailable");
+    }
+    await db.execute(sql`UPDATE progressive_cfd_units SET attempts=0,active_seconds=active_budget_seconds
+      WHERE work_id IN(SELECT id FROM progressive_work WHERE generation_id=${generation.generationId}::uuid)`);
+    await compare("unavailable");
+    await db.execute(sql`UPDATE progressive_cfd_units SET active_seconds=0,retry_after=clock_timestamp()+interval '1 hour'
+      WHERE work_id IN(SELECT id FROM progressive_work WHERE generation_id=${generation.generationId}::uuid)`);
+    await compare("unavailable");
+    await db.execute(sql`UPDATE progressive_cfd_units SET retry_after=NULL
+      WHERE work_id IN(SELECT id FROM progressive_work WHERE generation_id=${generation.generationId}::uuid)`);
+    await db.execute(sql`UPDATE sim_campaigns SET status='paused' WHERE id=${generation.campaignId}::uuid`);
+    await compare("unavailable");
+  }, 120_000);
 
   it.each(["release", "pause", "timeout"] as const)("waits for a contended campaign during normal remote admission (%s)", async (action) => {
     const generation = await fastCfdGeneration();

@@ -1,0 +1,41 @@
+{
+  "baseRevision": "74a9991fde7a2bba656d391df3e69fa4f12a45b2",
+  "observedAt": "2026-11-11T02:19:04.589303+00:00",
+  "scope": "Captured first selected-unit SELECT; not full dispatch throughput",
+  "method": "ABBA in one read-only repeatable-read transaction; one exact FOR UPDATE OF generation, work, unit SKIP LOCKED clause removed; no locks remain; 20s statement limit; session JIT unchanged",
+  "statementTimeoutMs": 20000,
+  "jitChanged": false,
+  "runs": [
+    {
+      "variant": "baseline",
+      "executionMs": 4057.915,
+      "planningMs": 58.714
+    },
+    {
+      "variant": "candidate",
+      "executionMs": 3197.883,
+      "planningMs": 31.433
+    },
+    {
+      "variant": "candidate",
+      "executionMs": 3422.549,
+      "planningMs": 22.768
+    },
+    {
+      "variant": "baseline",
+      "executionMs": 5197.516,
+      "planningMs": 49.946
+    }
+  ],
+  "meanExecutionMs": {
+    "baseline": 4627.7155,
+    "candidate": 3310.216
+  },
+  "meanReductionPercent": 28.47,
+  "sameSelection": true,
+  "sourceRenderedQueryMatchesMeasuredCase": true,
+  "sourceSha256": "71559473e1520adcf3af07078772e2f92fb6cbe33b97eb1d0221fa155be92abb",
+  "eligibilityProof": "For attempts < 2, ordinary = attempts - publication correction (0/1) - never-started count (>=0) is <2 and attempts<4. For attempts>=2 the entire original predicate is unchanged. All budget, ownership, epoch, stage, Mach, ordering and lock predicates remain outside and unchanged.",
+  "rejectedExperiment": "Ordered-head and low-prefix rewrites were measured but not shipped; the narrow low-prefix variant regressed to 13.26-13.49s against a 5.57s paired baseline.",
+  "limits": "Real PostgreSQL regression execution and normal-dispatch/live-throughput verification remain with parent pinned CI and rollout. Raw SQL, parameters, selected identities, full plans and snapshot details stay in private ignored artifacts."
+}

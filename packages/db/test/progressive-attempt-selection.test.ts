@@ -60,6 +60,27 @@ it("counts only exact proven unstarted cancellations without scanning unrelated 
       { variant: "wrong-stop", ordinary: 2 },
     ];
     expect(await counts()).toEqual(expected);
+    // The shortcut is valid even with publication and exact never-started
+    // corrections: both subtract nonnegative values from the raw counter.
+    // Exercise the real history subqueries over every counter through its cap.
+    const equivalence = await transaction.execute(sql`
+      SELECT fixture.variant, sample.attempts,
+        sample.attempts - original.attempts + ${progressiveCfdOrdinaryAttemptCountSql()} AS ordinary,
+        (sample.attempts < 4 AND
+          sample.attempts - original.attempts + ${progressiveCfdOrdinaryAttemptCountSql()} < 2) AS original_available,
+        CASE WHEN sample.attempts < 2 THEN true ELSE (sample.attempts < 4 AND
+          sample.attempts - original.attempts + ${progressiveCfdOrdinaryAttemptCountSql()} < 2) END AS shortcut_available
+      FROM progressive_cfd_units unit JOIN fixture_units fixture ON fixture.id=unit.id
+      JOIN progressive_cfd_units original ON original.id=unit.id
+      CROSS JOIN generate_series(0,5) sample(attempts)
+      ORDER BY fixture.variant,sample.attempts
+    `);
+    expect(equivalence).toHaveLength(expected.length * 6);
+    for (const row of equivalence) {
+      expect(row.shortcut_available, `${row.variant}: raw ${row.attempts}, ordinary ${row.ordinary}`)
+        .toBe(row.original_available);
+      if (Number(row.attempts) < 2) expect(row.shortcut_available).toBe(true);
+    }
     await transaction.execute(sql`INSERT INTO progressive_cfd_units(id,attempts,ordinal)
       SELECT md5('pending-'||ordinal)::uuid,0,0 FROM generate_series(1,64000) ordinal`);
     await transaction.execute(sql`INSERT INTO progressive_cfd_attempts(token,unit_id,sim_job_id,outcome,active_seconds)
