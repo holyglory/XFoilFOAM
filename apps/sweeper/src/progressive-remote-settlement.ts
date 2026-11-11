@@ -4,6 +4,7 @@ import { effectiveProgressiveStageSql } from "@aerodb/db/progressive-execution-p
 import { progressiveBenchmarkAttemptSql } from "@aerodb/db/progressive-recipe-policy";
 import { assertProgressiveCfdTerminalDiagnostics, readProgressiveDiagnosticRecoveryTrigger } from "@aerodb/db/progressive-cfd-evidence";
 import { issueProgressiveRemoteDiagnosticReceipts } from "@aerodb/db/progressive-remote-diagnostic-receipts";
+import { readStoppedAcceptedProgressivePublication, lockStoppedPublicationResults } from "@aerodb/db/progressive-stopped-publication";
 import { polarEvidencePublicationRank } from "@aerodb/core";
 import {
   acknowledgeProgressiveCfdExecutionStop,
@@ -127,6 +128,7 @@ export async function promoteRetainedProgressiveAttempts(
     airfoilId: string;
     simulationPresetRevisionId: string;
     attemptIds: readonly string[];
+    stoppedPublication?: boolean;
   },
 ) {
   if (!input.attemptIds.length) return false;
@@ -163,6 +165,7 @@ export async function promoteRetainedProgressiveAttempts(
         AND raw.valid_for_polar
         AND NOT ${progressiveBenchmarkAttemptSql(sql`raw.id`)}
         AND result.current_result_attempt_id IS DISTINCT FROM raw.id
+        AND (${input.stoppedPublication !== true} OR result.current_result_attempt_id IS NULL)
         AND coalesce((SELECT review.verdict::text
           FROM result_review_verdicts review
           WHERE review.result_id = result.id AND review."revokedAt" IS NULL
@@ -247,6 +250,8 @@ export async function promoteRetainedProgressiveAttempts(
       input.simulationPresetRevisionId,
       {
         beforeEvidenceLoad: async (transaction) => {
+          if (input.stoppedPublication)
+            await lockStoppedPublicationResults(transaction, input.executionId, input.attemptIds);
           const promoted = await transaction.execute(promotion);
           if (!promoted.length) throw noPromotion;
         },
@@ -260,6 +265,17 @@ export async function promoteRetainedProgressiveAttempts(
 }
 
 async function publishAcceptedProgressiveAttempts(db: DB, executionId: string) {
+  const [historical] = await db.execute(sql`SELECT id FROM sim_jobs
+    WHERE id=${executionId}::uuid AND status='cancelled' AND "ingestedAt" IS NULL`);
+  if (historical) {
+    await db.transaction(async (transaction) => {
+      const connection = transaction as unknown as DB;
+      const publication = await readStoppedAcceptedProgressivePublication(connection, executionId);
+      if (publication?.attemptIds.length)
+        await promoteRetainedProgressiveAttempts(connection, { ...publication, stoppedPublication: true });
+    });
+    return;
+  }
   const [candidate] = await db.execute(sql`
     SELECT job.airfoil_id, job.simulation_preset_revision_id, job.campaign_id
     FROM sim_jobs job
