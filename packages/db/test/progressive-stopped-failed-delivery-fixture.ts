@@ -878,7 +878,11 @@ async function verifyCancelledAcceptedPublication(db: DB, envelope: ProgressiveR
       const [selected] = await scoped.insert(resultAttempts).values({
         ...raw, id, simJobId: jobId, engineJobId: jobId, solvedAt: new Date(), createdAt: new Date(),
         regime: fidelity === "rans" ? "rans" : "urans", unsteady: fidelity !== "rans",
-        evidencePayload: JSON.parse(JSON.stringify({ ...(raw.evidencePayload as Record<string, unknown>), fidelity })),
+        // Ingestion marks every unsteady row stalled. A new converged steady
+        // RANS solve must not inherit that URANS-only marker from the template.
+        stalled: fidelity === "rans" ? false : raw.stalled,
+        evidencePayload: JSON.parse(JSON.stringify({ ...(raw.evidencePayload as Record<string, unknown>),
+          fidelity, unsteady: fidelity !== "rans", stalled: false })),
       }).returning();
       const originalArtifacts = await scoped.select().from(solverEvidenceArtifacts)
         .where(eq(solverEvidenceArtifacts.resultAttemptId, raw.id));
@@ -900,8 +904,9 @@ async function verifyCancelledAcceptedPublication(db: DB, envelope: ProgressiveR
         kind: "video", role: "instantaneous", field: "velocity", mimeType: "video/mp4",
         storageKey: `isolated/${id}.mp4`, sha256: "a".repeat(64), byteSize: 1 });
       await refreshPolarClassificationsForJob(scoped, String(job.airfoil_id), String(job.simulation_preset_revision_id), jobId);
-      expect(await scoped.execute(sql`SELECT state FROM result_classifications WHERE result_attempt_id=${id}::uuid`))
-        .toEqual([{ state: "accepted" }]);
+      const classifications = await scoped.execute(sql`SELECT state,reasons FROM result_classifications WHERE result_attempt_id=${id}::uuid`);
+      expect(classifications, `Selected fixture ${incomingFidelity}/${fidelity}/${retired}: ${JSON.stringify(classifications)}`)
+        .toEqual([{ state: "accepted", reasons: [] }]);
       await scoped.execute(sql`UPDATE results SET current_result_attempt_id=${id}::uuid,sim_job_id=${jobId}::uuid,
         engine_job_id=${jobId},status='done',source='solved',regime=${selected.regime}::regime,
         cl=${selected.cl},cd=${selected.cd},cm=${selected.cm},fidelity=${fidelity}

@@ -1,5 +1,40 @@
 schema = 2
 
+[test.stopped-canonical-retirement]
+timeout_seconds = 900
+
+[test.stopped-canonical-retirement.postgres]
+image = "postgres:16-alpine"
+database = "aerodb"
+user = "aerodb"
+
+[[test.stopped-canonical-retirement.check]]
+name = "workspace"
+tier = "development"
+command = ["/usr/bin/corepack", "pnpm", "install", "--frozen-lockfile", "--ignore-scripts"]
+
+[[test.stopped-canonical-retirement.check]]
+name = "schema"
+tier = "development"
+requires = ["workspace"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "migrate"]
+
+[[test.stopped-canonical-retirement.check]]
+name = "selected-history-retirement"
+tier = "development"
+requires = ["schema"]
+timeout_seconds = 300
+command = ["/bin/bash", "-c", "exec /usr/bin/corepack pnpm --filter @aerodb/db exec vitest run test/campaign-profile-enrollment.test.ts -t 'retains exact stopped failed attempts without canonical publication' --reporter=default --reporter=junit --outputFile.junit=\"$DEVCOORDINATOR_DIAGNOSTICS_DIR/report.xml\""]
+diagnostic_sources = [{ format = "junit", path = "report.xml" }]
+
+[[test.stopped-canonical-retirement.check]]
+name = "settlement-selection"
+tier = "development"
+requires = ["schema"]
+timeout_seconds = 180
+command = ["/bin/bash", "-c", "exec /usr/bin/corepack pnpm --filter @aerodb/db exec vitest run test/progressive-delivery-selection.test.ts -t 'selects closed terminal jobs with retained evidence for classification settlement|settles fulfilled and active jobs fairly' --reporter=default --reporter=junit --outputFile.junit=\"$DEVCOORDINATOR_DIAGNOSTICS_DIR/report.xml\""]
+diagnostic_sources = [{ format = "junit", path = "report.xml" }]
+
 [test.hz-publication-selector]
 timeout_seconds = 900
 

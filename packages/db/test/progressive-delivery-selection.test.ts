@@ -911,6 +911,20 @@ it("selects closed terminal jobs with retained evidence for classification settl
         (row) => row.sim_job_id,
       ),
     ).toEqual([lateId]);
+    // Late evidence stays reachable after ingestion until it is classified.
+    // Once classified it must not make completed history poll forever; the
+    // independent accepted-but-unpublished repair branch remains available.
+    await transaction.execute(sql`INSERT INTO result_classifications(result_attempt_id,state)
+      VALUES (md5('late-attempt')::uuid,'rejected')`);
+    expect(await transaction.execute(progressiveSettlementJobsSql(historyIds))).toEqual([]);
+    await transaction.execute(sql`UPDATE result_classifications SET state='accepted'
+      WHERE result_attempt_id=md5('late-attempt')::uuid`);
+    await transaction.execute(sql`UPDATE result_attempts SET valid_for_polar=true WHERE id=md5('late-attempt')::uuid`);
+    await transaction.execute(sql`INSERT INTO results(id,current_result_attempt_id,sim_job_id)
+      VALUES(md5('late-result')::uuid,md5('late-attempt')::uuid,${lateId}::uuid)`);
+    expect(await transaction.execute(progressiveSettlementJobsSql(historyIds))).toEqual([]);
+    await transaction.execute(sql`UPDATE results SET current_result_attempt_id=NULL WHERE id=md5('late-result')::uuid`);
+    expect((await transaction.execute(progressiveSettlementJobsSql(historyIds))).map((row) => row.sim_job_id)).toEqual([lateId]);
   });
 }, 30_000);
 

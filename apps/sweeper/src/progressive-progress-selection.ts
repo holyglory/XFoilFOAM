@@ -209,13 +209,14 @@ export function progressiveSettlementJobsSql(jobIds?: string[]) {
           WHERE dispatch.sim_job_id = job.id AND promise.status = 'active'))
         OR retained.ready_closed
         OR (job.status IN ('done', 'failed', 'cancelled')
-          AND job."ingestedAt" IS NULL
           AND EXISTS (SELECT 1 FROM progressive_cfd_execution_stops stopped
             WHERE stopped.sim_job_id = job.id)
           AND EXISTS (SELECT 1 FROM progressive_remote_evidence_receipts evidence
             WHERE evidence.sim_job_id = job.id AND NOT evidence.storage_only)
           AND EXISTS (SELECT 1 FROM result_attempts raw
-            WHERE raw.sim_job_id = job.id AND raw.status = 'done'))
+            WHERE raw.sim_job_id = job.id AND raw.status = 'done'
+              AND (job."ingestedAt" IS NULL OR NOT EXISTS (
+                SELECT 1 FROM result_classifications classified WHERE classified.result_attempt_id = raw.id))))
         OR (job.status IN ('done', 'failed', 'cancelled')
           AND EXISTS (SELECT 1 FROM progressive_cfd_execution_stops stopped
             WHERE stopped.sim_job_id = job.id)
