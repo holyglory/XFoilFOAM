@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { eq, sql } from "drizzle-orm";
 import { expect } from "vitest";
+import { solverPointEvidencePayload, stalledForPoint, validForPolarPoint, type PolarPoint } from "../../engine-client/src";
 import type { DB } from "../src/client";
 import { analysisContentHash } from "../src/analysis-target";
 import { progressiveReportedPointSources, type ProgressiveRemoteReport } from "../src/progressive-remote-report";
@@ -872,13 +873,27 @@ async function verifyCancelledAcceptedPublication(db: DB, envelope: ProgressiveR
     // it must not violate per-job/result/AoA/regime uniqueness or borrow custody.
     const selectedFixture = async (scoped: DB, fidelity: "urans_full" | "urans_precalc" | "rans") => {
       const id = randomUUID(), jobId = randomUUID();
+      // Build steady evidence independently: the URANS template has stalled=true
+      // after ingestion and carries unsteady history that does not belong to RANS.
+      const point: PolarPoint = fidelity === "rans" ? {
+        aoa_deg: raw.aoaDeg, case_slug: raw.engineCaseSlug,
+        cl: raw.cl, cd: raw.cd, cm: raw.cm,
+        converged: true, unsteady: false, first_order_fallback: false,
+        images: {}, error: null, fidelity, engine: accepted.engine,
+        evidence_artifacts: accepted.evidence_artifacts,
+      } : { ...accepted, fidelity };
+      const payload = JSON.parse(JSON.stringify(solverPointEvidencePayload(point, {
+        fidelity, meshRecoveryVersion: result.mesh_recovery_version,
+      })));
       await scoped.execute(sql`INSERT INTO sim_jobs(id,engine_job_id,airfoil_id,bc_ids,simulation_preset_revision_id,campaign_id,reference_chord_m,status,engine_state)
         SELECT ${jobId}::uuid,${jobId},airfoil_id,bc_ids,simulation_preset_revision_id,campaign_id,reference_chord_m,'done','completed'
         FROM sim_jobs WHERE id=${executionId}::uuid`);
       const [selected] = await scoped.insert(resultAttempts).values({
         ...raw, id, simJobId: jobId, engineJobId: jobId, solvedAt: new Date(), createdAt: new Date(),
-        regime: fidelity === "rans" ? "rans" : "urans", unsteady: fidelity !== "rans",
-        evidencePayload: JSON.parse(JSON.stringify({ ...(raw.evidencePayload as Record<string, unknown>), fidelity })),
+        status: "done", source: "solved", regime: fidelity === "rans" ? "rans" : "urans",
+        converged: point.converged, unsteady: point.unsteady, stalled: stalledForPoint(point),
+        firstOrderFallback: point.first_order_fallback, validForPolar: validForPolarPoint(point),
+        error: point.error ?? null, evidencePayload: payload,
       }).returning();
       const originalArtifacts = await scoped.select().from(solverEvidenceArtifacts)
         .where(eq(solverEvidenceArtifacts.resultAttemptId, raw.id));
@@ -900,8 +915,9 @@ async function verifyCancelledAcceptedPublication(db: DB, envelope: ProgressiveR
         kind: "video", role: "instantaneous", field: "velocity", mimeType: "video/mp4",
         storageKey: `isolated/${id}.mp4`, sha256: "a".repeat(64), byteSize: 1 });
       await refreshPolarClassificationsForJob(scoped, String(job.airfoil_id), String(job.simulation_preset_revision_id), jobId);
-      expect(await scoped.execute(sql`SELECT state FROM result_classifications WHERE result_attempt_id=${id}::uuid`))
-        .toEqual([{ state: "accepted" }]);
+      const classifications = await scoped.execute(sql`SELECT state,reasons FROM result_classifications WHERE result_attempt_id=${id}::uuid`);
+      expect(classifications, `Selected fixture ${incomingFidelity}/${fidelity}/${retired}: ${JSON.stringify(classifications)}`)
+        .toEqual([{ state: "accepted", reasons: [] }]);
       await scoped.execute(sql`UPDATE results SET current_result_attempt_id=${id}::uuid,sim_job_id=${jobId}::uuid,
         engine_job_id=${jobId},status='done',source='solved',regime=${selected.regime}::regime,
         cl=${selected.cl},cd=${selected.cd},cm=${selected.cm},fidelity=${fidelity}
