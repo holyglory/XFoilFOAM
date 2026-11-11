@@ -737,7 +737,8 @@ async function verifyCancelledAcceptedPublication(db: DB, envelope: ProgressiveR
     polar.reynolds = Number((job.snapshot as { derived: { reynolds: number } }).derived.reynolds);
     const accepted = { ...polar.attempts![0], aoa_deg: envelope.scope.units[0].alpha, case_slug: "cancelled-accepted",
       converged: true, unsteady: true, stalled: false, cm: 0, error: null, fidelity: "urans_full" as const,
-      force_history: { t: [0, 1, 2, 3], cl: [0.4, 0.4, 0.4, 0.4], cd: [0.03, 0.03, 0.03, 0.03], cm: [0, 0, 0, 0] } };
+      force_history: { t: [0, 1, 2, 3], cl: [0.4, 0.4, 0.4, 0.4], cd: [0.03, 0.03, 0.03, 0.03], cm: [0, 0, 0, 0] },
+      frame_track: { stationary: true, periods_retained: 5 } };
     delete accepted.failure_disposition;
     const rejected = { ...accepted, aoa_deg: envelope.scope.units[1].alpha, case_slug: "cancelled-rejected",
       converged: false, cl: null, cd: null, cm: null, error: "Retained rejected physical sibling", failure_disposition: "hard_solver" as const };
