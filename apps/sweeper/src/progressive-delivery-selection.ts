@@ -75,8 +75,11 @@ export function progressiveDeliverySelectionSql(
   ) => sql`SELECT point.*, job.request_payload, settings.upstream_base_url,
       settings.remote_solver_auth_token, settings.remote_solver_registered_id, settings.instance_id, settings.instance_name,
       promise.id AS promise_id
-    FROM (${points}) point
-    JOIN sim_jobs job ON job.id = point.sim_job_id
+    -- Keep outstanding-point evaluation outside the ownership lookup. An
+    -- upstream-only index estimate can otherwise put every worker job outside
+    -- this expensive subquery and repeat it thousands of times.
+    FROM (${points} OFFSET 0) point
+    JOIN LATERAL (SELECT * FROM sim_jobs WHERE id = point.sim_job_id OFFSET 0) job ON true
     JOIN sync_sweep_promises promise ON promise.id::text = job.request_payload->>'syncPromiseId'
     JOIN sync_api_settings settings ON settings.id = 1
     WHERE NOT settings.remote_solver_transfer_paused AND settings.remote_solver_auth_token <> ''

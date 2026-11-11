@@ -5147,7 +5147,7 @@ name = "retention-test-types"
 tier = "development"
 timeout_seconds = 600
 requires = ["workspace"]
-command = ["/usr/bin/corepack", "pnpm", "exec", "tsc", "--noEmit", "--target", "ES2022", "--lib", "ES2022", "--module", "ESNext", "--moduleResolution", "Bundler", "--moduleDetection", "force", "--strict", "--noImplicitOverride", "--noFallthroughCasesInSwitch", "--skipLibCheck", "--esModuleInterop", "--allowSyntheticDefaultImports", "--resolveJsonModule", "--isolatedModules", "--types", "node", "packages/db/test/progressive-report-retention.test.ts", "packages/db/test/progressive-stopped-failed-delivery-fixture.ts"]
+command = ["/usr/bin/corepack", "pnpm", "exec", "tsc", "--noEmit", "--target", "ES2022", "--lib", "ES2022", "--module", "ESNext", "--moduleResolution", "Bundler", "--moduleDetection", "force", "--strict", "--noImplicitOverride", "--noFallthroughCasesInSwitch", "--skipLibCheck", "--esModuleInterop", "--allowSyntheticDefaultImports", "--resolveJsonModule", "--isolatedModules", "--types", "node", "packages/db/test/progressive-report-retention.test.ts", "packages/db/test/progressive-stopped-failed-delivery-fixture.ts", "packages/db/test/progressive-worker-evidence-delivery-fixture.ts", "packages/db/test/progressive-delivery-selection.test.ts"]
 
 [[test.ingestion-recovery-final.check]]
 name = "report-contracts"

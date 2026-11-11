@@ -1373,6 +1373,13 @@
       "when": 1794374599512,
       "tag": "0195_remote_worker_identity_index",
       "breakpoints": true
+    },
+    {
+      "idx": 196,
+      "version": "7",
+      "when": 1794377049277,
+      "tag": "0196_restore_remote_worker_identity_index",
+      "breakpoints": true
     }
   ]
 }

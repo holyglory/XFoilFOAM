@@ -5,12 +5,102 @@ import { nextProgressiveEvidenceWakeAt } from "../../../apps/sweeper/src/progres
 import { reopenResolvedProgressiveConflicts } from "../../../apps/sweeper/src/progressive-conflict-recovery";
 import { sql } from "drizzle-orm";
 import { expect, vi } from "vitest";
-import type { DB } from "../src/client";
+import { createClient, type DB } from "../src/client";
+import { databaseUrl } from "../src/env";
+import { progressiveStagingSelectionSql } from "../../../apps/sweeper/src/progressive-staging-selection";
 import {
   deliverNextProgressiveWorkerEvidence,
   progressiveWorkerEvidenceReference,
   recordProgressiveWorkerEvidenceReceipt,
 } from "../../../apps/sweeper/src/progressive-worker-evidence-delivery";
+
+async function verifyBoundedDeliveryClaim(db: DB, executionId: string) {
+  const [database] = await db.execute(sql`SELECT current_database() AS name,pg_backend_pid() AS pid`);
+  const url = new URL(databaseUrl());
+  url.pathname = `/${String(database.name)}`;
+  const observer = createClient({ url: url.toString(), max: 1 });
+  let unlock!: () => void;
+  let locked!: (connection: DB) => void;
+  const released = new Promise<void>((resolve) => { unlock = resolve; });
+  const acquired = new Promise<DB>((resolve) => { locked = resolve; });
+  const holding = observer.db.transaction(async (transaction) => {
+    await transaction.execute(sql`SELECT pg_advisory_xact_lock(hashtextextended(${executionId},0))`);
+    locked(transaction as unknown as DB);
+    await released;
+  }).then(() => ({ error: null }), (error: unknown) => ({ error }));
+  const rollback = new Error("restore delivery claim timeout probe");
+  try {
+    const inspection = await Promise.race([acquired, holding.then((result) => {
+      throw result.error ?? new Error("Claim blocker exited before acquiring its lock");
+    })]);
+    try {
+      await db.transaction(async (transaction) => {
+        const connection = transaction as unknown as DB;
+        const [backend] = await connection.execute(sql`SELECT pg_backend_pid() AS pid`);
+        const history = sql`SELECT sequence,content_signature FROM progressive_worker_reports
+          WHERE sim_job_id=${executionId}::uuid ORDER BY sequence`;
+        const reports = await connection.execute(history);
+        const attempts = await connection.execute(sql`SELECT id,evidence_payload FROM result_attempts WHERE sim_job_id=${executionId}::uuid ORDER BY id`);
+        const claims = await connection.execute(sql`SELECT * FROM progressive_worker_evidence_delivery_claims WHERE sim_job_id=${executionId}::uuid`);
+        await connection.execute(sql.raw(`CREATE FUNCTION pg_temp.block_delivery_claim_fixture() RETURNS trigger LANGUAGE plpgsql AS $body$
+          BEGIN
+            IF current_setting('statement_timeout') NOT IN ('500ms','30s') THEN
+              RAISE EXCEPTION 'Delivery claim did not install its bounded server timeout';
+            END IF;
+            PERFORM pg_advisory_xact_lock(hashtextextended(NEW.sim_job_id::text,0));
+            RETURN NEW;
+          END $body$`));
+        await connection.execute(sql`CREATE TRIGGER block_delivery_claim_fixture BEFORE INSERT OR UPDATE
+          ON progressive_worker_evidence_delivery_claims FOR EACH ROW EXECUTE FUNCTION pg_temp.block_delivery_claim_fixture()`);
+        await connection.execute(sql`SET LOCAL statement_timeout='500ms'`);
+        const unpublished = vi.fn();
+        const pending = deliverNextProgressiveWorkerEvidence(connection, unpublished)
+          .then((result) => ({ result, error: null }), (error: unknown) => ({ result: null, error }));
+        try {
+          await expect.poll(async () => {
+            await inspection.execute(sql`SELECT pg_stat_clear_snapshot()`);
+            const [state] = await inspection.execute(sql`SELECT wait_event FROM pg_stat_activity WHERE pid=${backend.pid}::integer`);
+            return state?.wait_event;
+          }, { timeout: 1000, interval: 10 }).toBe("advisory");
+          // Another staging selector can still use the database while this claim
+          // waits; only its own statement/savepoint is cancelled at the deadline.
+          await inspection.execute(progressiveStagingSelectionSql(false));
+          const timedOut = await pending;
+          expect(String(timedOut.error)).toContain("statement timeout");
+          expect(unpublished).not.toHaveBeenCalled();
+          expect(await connection.execute(sql`SHOW statement_timeout`)).toEqual([{ statement_timeout: "500ms" }]);
+          expect(await connection.execute(sql`SELECT * FROM progressive_worker_evidence_delivery_claims WHERE sim_job_id=${executionId}::uuid`)).toEqual(claims);
+          expect(await connection.execute(history)).toEqual(reports);
+          expect(await connection.execute(sql`SELECT id,evidence_payload FROM result_attempts WHERE sim_job_id=${executionId}::uuid ORDER BY id`)).toEqual(attempts);
+          unlock();
+          expect((await holding).error).toBeNull();
+          await connection.execute(sql`SET LOCAL statement_timeout='0'`);
+          const retry = vi.fn(async () => {
+            expect(await connection.execute(sql`SHOW statement_timeout`)).toEqual([{ statement_timeout: "0" }]);
+            expect(await connection.execute(sql`SELECT claim_token FROM progressive_worker_evidence_delivery_claims WHERE sim_job_id=${executionId}::uuid`)).toHaveLength(1);
+            throw new Error("isolated retry reached HTTP after its bounded claim");
+          });
+          await expect(deliverNextProgressiveWorkerEvidence(connection, retry)).rejects.toThrow("isolated retry reached HTTP");
+          expect(retry).toHaveBeenCalledOnce();
+          expect(await connection.execute(history)).toEqual(reports);
+          throw rollback;
+        } finally {
+          // Finish the claim before this callback rolls back its enclosing
+          // savepoint, including when a lock-observation assertion fails.
+          unlock();
+          await pending;
+        }
+      });
+      throw new Error("Delivery timeout fixture did not roll back");
+    } catch (error) {
+      if (error !== rollback) throw error;
+    }
+  } finally {
+    unlock();
+    await holding;
+    await observer.sql.end();
+  }
+}
 
 export async function verifyProgressiveWorkerEvidenceDelivery(
   db: DB,
@@ -63,6 +153,7 @@ export async function verifyProgressiveWorkerEvidenceDelivery(
     await db.execute(
       sql`UPDATE sync_api_settings SET remote_solver_transfer_paused = false WHERE id = 1`,
     );
+    await verifyBoundedDeliveryClaim(db, executionId);
     const offline = vi.fn(async () => {
       throw new Error("isolated unavailable hub");
     });

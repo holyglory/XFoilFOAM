@@ -27,6 +27,29 @@ const REMOTE_EVIDENCE_DELIVERY_TIMEOUT_MS = Number(
 const STALE_REMOTE_OWNER_ERROR =
   "remote solver does not own this exact promise payload";
 
+const DELIVERY_CLAIM_TIMEOUT_MS = 30_000;
+
+async function claimNextProgressiveWorkerDelivery(
+  db: DB,
+  preferActive: boolean,
+  claimToken: string,
+) {
+  return db.transaction(async (transaction) => {
+    const connection = transaction as unknown as DB;
+    const [previous] = await connection.execute(sql`
+      SELECT current_setting('statement_timeout') AS value, setting::integer AS milliseconds
+      FROM pg_settings WHERE name = 'statement_timeout'
+    `);
+    const timeout = Math.min(Number(previous.milliseconds) || DELIVERY_CLAIM_TIMEOUT_MS, DELIVERY_CLAIM_TIMEOUT_MS);
+    await connection.execute(sql`SELECT set_config('statement_timeout', ${`${timeout}ms`}, true)`);
+    const rows = await connection.execute(progressiveDeliverySelectionSql(preferActive, claimToken));
+    // Successful nested calls must restore their caller's setting. A failure
+    // rolls back this transaction/savepoint, including its local GUC and claim.
+    await connection.execute(sql`SELECT set_config('statement_timeout', ${String(previous.value)}, true)`);
+    return rows;
+  });
+}
+
 export async function recordProgressiveWorkerEvidenceReceipt(
   db: DB,
   supplied: unknown,
@@ -147,11 +170,10 @@ export async function deliverNextProgressiveWorkerEvidence(
 ): Promise<boolean> {
   await requeueStoppedProgressiveStorage(db, { retryStoppedStorage: true });
   const claimToken = randomUUID();
-  const [pending] = await db.execute(
-    progressiveDeliverySelectionSql(
-      selection.preferActive === true,
-      claimToken,
-    ),
+  // The claim commits before any HTTP request. A server-side deadline releases
+  // the shared evidence connection even if a future planner choice regresses.
+  const [pending] = await claimNextProgressiveWorkerDelivery(
+    db, selection.preferActive === true, claimToken,
   );
   if (!pending) return false;
   const executionId = String(pending.sim_job_id);
