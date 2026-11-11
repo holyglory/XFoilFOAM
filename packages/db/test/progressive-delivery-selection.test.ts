@@ -1,4 +1,5 @@
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { afterAll, expect, it } from "vitest";
 import { sql } from "drizzle-orm";
 import { createClient } from "../src/client";
@@ -1425,17 +1426,30 @@ it("preserves exact eligible deliveries, active priority, fallback and cumulativ
           };
           visit(plan.Plan as Record<string, unknown>);
           const outstanding = nodes.filter((node) => node['Subplan Name'] === 'CTE outstanding_sources');
+          const jobLookups = nodes.filter((node) => node['Relation Name'] === 'sim_jobs' && Number(node['Actual Loops']) > 0);
+          const enumeratedSources = outstanding.reduce((sum, node) => sum + Number(node['Actual Rows']) * Number(node['Actual Loops']), 0);
+          const lookupLoops = jobLookups.reduce((sum, node) => sum + Number(node['Actual Loops']), 0);
+          const examinedJobs = jobLookups.reduce((sum, node) => sum + Number(node['Actual Loops']) *
+            (Number(node['Actual Rows']) + Number(node['Rows Removed by Filter'] ?? 0) + Number(node['Rows Removed by Index Recheck'] ?? 0)), 0);
+          if (process.env.DEVCOORDINATOR_DIAGNOSTICS_DIR)
+            writeFileSync(join(process.env.DEVCOORDINATOR_DIAGNOSTICS_DIR, `dense-full-claim-${active}.plan.json`), JSON.stringify(plan, null, 2));
+          console.info(JSON.stringify({ component: 'dense-worker-full-claim', active, workerJobs: 12000,
+            historicalReports: 192000, executionMs: plan['Execution Time'], enumeratedSources, lookupLoops, examinedJobs,
+            outstandingEvaluations: outstanding.map((node) => node['Actual Loops']),
+            jobLookups: jobLookups.map((node) => ({ type: node['Node Type'], index: node['Index Name'],
+              condition: node['Index Cond'], loops: node['Actual Loops'], rows: node['Actual Rows'] })) }));
           expect(outstanding.length).toBeGreaterThan(0);
           expect(outstanding.every((node) => Number(node['Actual Loops']) <= 1)).toBe(true);
-          expect(nodes.some((node) => node['Alias'] === 'point' && Number(node['Actual Loops']) > 0)).toBe(true);
-          expect(await nested.execute(sql`SELECT sim_job_id,sequence,result_attempt_id,point_content_signature
+          expect(jobLookups.length).toBeGreaterThan(0);
+          expect(jobLookups.every((node) => ['Index Scan', 'Index Only Scan'].includes(String(node['Node Type'])) &&
+            /\bid\s*=\s*\w+\.sim_job_id\b/.test(String(node['Index Cond'])))).toBe(true);
+          expect(lookupLoops).toBeLessThanOrEqual(enumeratedSources);
+          expect(examinedJobs).toBeLessThanOrEqual(enumeratedSources);
+          expect(await nested.execute(sql`SELECT sim_job_id,sequence::integer AS sequence,result_attempt_id,point_content_signature
             FROM progressive_worker_evidence_delivery_claims`)).toEqual(wanted.map((row) => ({
               sim_job_id: row.sim_job_id, sequence: row.sequence, result_attempt_id: row.result_attempt_id,
               point_content_signature: row.point_content_signature,
             })));
-          console.info(JSON.stringify({ component: 'dense-worker-full-claim', active, workerJobs: 12000,
-            historicalReports: 192000, executionMs: plan['Execution Time'],
-            outstandingEvaluations: outstanding.map((node) => node['Actual Loops']) }));
           throw rollback;
         });
         throw new Error('Dense claim fixture did not roll back');
