@@ -3,6 +3,7 @@ import type { DB } from "./client";
 import { analysisContentHash } from "./analysis-target";
 import { tryProgressiveAdmissionLock } from "./progressive-admission-lock";
 import { SOURCE_GEOMETRY_POLICY_VERSION } from "./progressive-evidence-geometry";
+import { reconcileCurrentPreciseEvidenceReuse } from "./progressive-current-evidence-reuse";
 
 export const MAX_PROGRESSIVE_CFD_REUSE_UNITS = 256;
 
@@ -410,6 +411,7 @@ export async function reconcileAcceptedProgressiveCfdEvidence(
   db: DB,
   campaignId?: string,
 ): Promise<number> {
+  const current = await reconcileCurrentPreciseEvidenceReuse(db, { campaignId });
   const adoptions = await db.execute(sql`
     SELECT adoption.generation_id, adoption.previous_generation_ids, adoption.epoch_id
     FROM progressive_recipe_adoptions adoption
@@ -434,5 +436,5 @@ export async function reconcileAcceptedProgressiveCfdEvidence(
       (adoption.previous_generation_ids as string[]).map(String),
       String(adoption.epoch_id),
     );
-  return reused;
+  return reused + current.reusedUnitIds.length;
 }
