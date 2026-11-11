@@ -267,7 +267,8 @@ export async function prepareProgressiveRemoteDispatch(
       } as const;
       let leases = await claimProgressiveCfdBatch(connection, claimInput);
       if (!leases.length) {
-        await connection.execute(sql`SET LOCAL lock_timeout = '750ms'`);
+        // Keep the transaction's 10s lock bound: normal scoped settlement can
+        // hold the campaign mutex longer than a subsecond fallback would allow.
         leases = await claimProgressiveCfdBatch(connection, {
           ...claimInput,
           campaignLockMode: "wait",

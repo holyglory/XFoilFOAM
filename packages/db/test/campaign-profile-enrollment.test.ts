@@ -12966,6 +12966,128 @@ describe("durable progressive CFD units", () => {
     expect((await claimCfd())?.generationId).toBe(generation.id);
   });
 
+  it.each(["release", "pause", "timeout"] as const)("waits for a contended campaign during normal remote admission (%s)", async (action) => {
+    const generation = await fastCfdGeneration();
+    await initializeProgressiveCfdWork(db);
+    const solverId = randomUUID();
+    const locker = createClient({ url: targetUrl.toString(), max: 1 });
+    const actor = createClient({ url: targetUrl.toString(), max: 1 });
+    const [state] = await db.execute(sql`SELECT enabled,admission_fence_active,disk_admission_blocked FROM sweeper_state WHERE id=1`);
+    const [settings] = await db.execute(sql`SELECT enabled,remote_solver_enabled FROM sync_api_settings WHERE id=1`);
+    const [permission] = await db.execute(sql`SELECT can_fetch FROM sync_api_permissions WHERE data_type='sweeps'`);
+    const [pool] = await db.execute(sql`SELECT pool.id,pool.enabled,pool.routing_key,revision.snapshot
+      FROM progressive_generation_targets target
+      JOIN simulation_preset_revisions revision ON revision.id=target.revision_id
+      JOIN solver_execution_pools pool ON pool.solver_implementation_id=revision.solver_implementation_id
+      WHERE target.generation_id=${generation.generationId}::uuid ORDER BY pool.id LIMIT 1`);
+    const engine = (pool.snapshot as SimulationSetupSnapshot).engine!;
+    const capability = {
+      version: 1, solverBudgetVersion: 2, meshRecoveryVersion: 1, uransRecoveryVersion: 14, localTimeStepVersion: 1,
+      engine: { family: engine.family, distribution: engine.distribution, version: engine.releaseVersion,
+        numerics_revision: engine.numericsRevision, adapter_contract_version: engine.adapterContractVersion },
+      executionPools: [pool.routing_key],
+    };
+    const release = signal();
+    const locked = signal<number>();
+    const started = signal<number>();
+    let holding: Promise<{ error: unknown }> | undefined;
+    let preparing: Promise<{ result: Awaited<ReturnType<typeof prepareProgressiveRemoteDispatch>> | null; error: unknown }> | undefined;
+    let preparationFinished = false;
+    let deadline: ReturnType<typeof setTimeout> | undefined;
+    const createdWork = () => db.execute(sql`SELECT
+      (SELECT count(*)::integer FROM sim_jobs WHERE campaign_id=${generation.campaignId}::uuid) AS jobs,
+      (SELECT count(*)::integer FROM progressive_cfd_attempts attempt JOIN progressive_cfd_units unit ON unit.id=attempt.unit_id
+        JOIN progressive_work work ON work.id=unit.work_id WHERE work.generation_id=${generation.generationId}::uuid) AS attempts,
+      (SELECT count(*)::integer FROM progressive_remote_dispatches WHERE solver_id=${solverId}::uuid) AS dispatches,
+      (SELECT count(*)::integer FROM sync_sweep_promises WHERE registered_solver_id=${solverId}::uuid) AS promises`);
+    try {
+      await db.execute(sql`UPDATE sweeper_state SET enabled=true,admission_fence_active=false,disk_admission_blocked=false WHERE id=1`);
+      await db.execute(sql`UPDATE sync_api_settings SET enabled=true,remote_solver_enabled=false WHERE id=1`);
+      await db.execute(sql`UPDATE solver_execution_pools SET enabled=true WHERE id=${pool.id}::uuid`);
+      await db.execute(sql`INSERT INTO sync_api_permissions(data_type,can_fetch,can_push) VALUES('sweeps',true,false)
+        ON CONFLICT(data_type) DO UPDATE SET can_fetch=true`);
+      await db.execute(sql`INSERT INTO registered_remote_solvers
+        (id,instance_id,instance_name,cpu_capacity,cpu_budget,max_active_polar_promises,auth_token_hash,credential_version,last_heartbeat_at,metadata)
+        VALUES(${solverId}::uuid,${`${PREFIX}-${solverId}`},'campaign contention worker',96,96,96,${"a".repeat(64)},1,clock_timestamp(),
+          ${JSON.stringify({ progressiveExecution: capability, progressiveExecutionObservedAt: new Date().toISOString() })}::jsonb)`);
+      const empty = [{ jobs: 0, attempts: 0, dispatches: 0, promises: 0 }];
+      expect(await createdWork()).toEqual(empty);
+      holding = locker.db.transaction(async (transaction) => {
+        const connection = transaction as unknown as DB;
+        expect(await connection.execute(sql`SELECT id FROM sim_campaigns WHERE id=${generation.campaignId}::uuid FOR UPDATE`)).toHaveLength(1);
+        locked.resolve(await fixtureBackendPid(connection));
+        await release.promise;
+        if (action === "pause")
+          await connection.execute(sql`UPDATE sim_campaigns SET status='paused' WHERE id=${generation.campaignId}::uuid`);
+      }).then(() => ({ error: null }), (error: unknown) => ({ error }));
+      const ownerPid = await Promise.race([locked.promise, holding.then((outcome) => {
+        throw outcome.error ?? new Error("Campaign owner exited before acquiring its mutex");
+      })]);
+      const began = performance.now();
+      preparing = actor.db.transaction(async (transaction) => {
+        const connection = transaction as unknown as DB;
+        started.resolve(await fixtureBackendPid(connection));
+        return prepareProgressiveRemoteDispatch(connection, solverId);
+      }).then((result) => ({ result, error: null }), (error: unknown) => ({ result: null, error }))
+        .finally(() => { preparationFinished = true; });
+      const actorPid = await Promise.race([started.promise, preparing.then((outcome) => {
+        throw outcome.error ?? new Error("Admission exited before backend observation");
+      })]);
+      await waitForFixtureBlock(actorPid, ownerPid);
+      // The barrier owns release. Time only keeps real, observed contention
+      // beyond the former 750ms cutoff; it never stands in for lock evidence.
+      await new Promise((resolve) => setTimeout(resolve, 1500));
+      expect(preparationFinished, "normal dispatch must keep waiting past 750ms").toBe(false);
+      await waitForFixtureBlock(actorPid, ownerPid);
+      expect(await createdWork()).toEqual(empty);
+      if (action !== "timeout") {
+        release.resolve();
+        expect((await holding).error).toBeNull();
+      }
+      const outcome = await Promise.race([preparing, new Promise<never>((_, reject) => {
+        deadline = setTimeout(() => reject(new Error("Remote admission exceeded its bounded lock/statement wait")), 20_000);
+      })]);
+      clearTimeout(deadline);
+      expect(outcome.error).toBeNull();
+      if (action === "release") {
+        expect(outcome.result).toMatchObject({ kind: "prepared", envelope: {
+          solverId, scope: { generationId: generation.generationId, stage: 2 },
+        } });
+        const [created] = await createdWork();
+        expect(created).toMatchObject({ jobs: 1, dispatches: 1, promises: 1 });
+        expect(created.attempts).toBeGreaterThan(0);
+      } else {
+        expect(outcome.result).toMatchObject({ kind: "waiting", reason: action === "timeout"
+          ? expect.stringContaining("database lock during claim") : "No eligible campaign cases are ready" });
+        expect(await createdWork()).toEqual(empty);
+        if (action === "timeout") {
+          expect(performance.now() - began).toBeGreaterThanOrEqual(9000);
+          release.resolve();
+          expect((await holding).error).toBeNull();
+        } else {
+          expect(await prepareProgressiveRemoteDispatch(db, solverId)).toMatchObject({ kind: "waiting" });
+          expect(await createdWork()).toEqual(empty);
+        }
+      }
+    } finally {
+      clearTimeout(deadline);
+      release.resolve();
+      await holding;
+      await preparing;
+      await locker.sql.end();
+      await actor.sql.end();
+      await db.execute(sql`DELETE FROM progressive_remote_dispatches WHERE solver_id=${solverId}::uuid`);
+      await db.execute(sql`DELETE FROM sync_sweep_promises WHERE registered_solver_id=${solverId}::uuid`);
+      await db.execute(sql`DELETE FROM registered_remote_solvers WHERE id=${solverId}::uuid`);
+      if (permission) await db.execute(sql`UPDATE sync_api_permissions SET can_fetch=${permission.can_fetch} WHERE data_type='sweeps'`);
+      else await db.execute(sql`DELETE FROM sync_api_permissions WHERE data_type='sweeps'`);
+      await db.execute(sql`UPDATE solver_execution_pools SET enabled=${pool.enabled} WHERE id=${pool.id}::uuid`);
+      await db.execute(sql`UPDATE sync_api_settings SET enabled=${settings.enabled},remote_solver_enabled=${settings.remote_solver_enabled} WHERE id=1`);
+      await db.execute(sql`UPDATE sweeper_state SET enabled=${state.enabled},admission_fence_active=${state.admission_fence_active},
+        disk_admission_blocked=${state.disk_admission_blocked} WHERE id=1`);
+    }
+  }, 45_000);
+
   it.each(["rans", "urans"] as const)(
     "reclaims only its stopped failed %s cell for an authorized retry",
     async (regime) => {

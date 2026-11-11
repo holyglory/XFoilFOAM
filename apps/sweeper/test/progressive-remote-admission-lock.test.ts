@@ -126,7 +126,7 @@ it("does not hold the solver row lock while a candidate claim is running", async
   );
 });
 
-it("briefly waits after a nonblocking campaign claim skips a busy row", async () => {
+it("keeps the transaction bounds when a nonblocking campaign claim skips a busy row", async () => {
   const solverId = "11111111-1111-4111-8111-111111111111";
   const epochId = "22222222-2222-4222-8222-222222222222";
   const airfoilId = "33333333-3333-4333-8333-333333333333";
@@ -164,7 +164,6 @@ it("briefly waits after a nonblocking campaign claim skips a busy row", async ()
       },
     ])
     .mockResolvedValueOnce([{ acquired: true }])
-    .mockResolvedValueOnce([])
     .mockResolvedValueOnce([{ airfoil_id: airfoilId, simulation_preset_revision_id: revisionId }])
     .mockResolvedValue([]);
   const db = {
@@ -200,6 +199,9 @@ it("briefly waits after a nonblocking campaign claim skips a busy row", async ()
     expect.anything(),
     expect.objectContaining({ campaignLockMode: "wait" }),
   );
+  const timeouts = execute.mock.calls.map(([statement]) => new PgDialect().sqlToQuery(statement).sql)
+    .filter((statement) => /lock_timeout|statement_timeout/.test(statement));
+  expect(timeouts).toEqual(["SET LOCAL lock_timeout = '10s'; SET LOCAL statement_timeout = '15s'"]);
 });
 
 it("defers exact cells owned by another active promise before inserting a successor", async () => {
