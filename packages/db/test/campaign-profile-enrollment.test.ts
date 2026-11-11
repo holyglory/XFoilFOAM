@@ -3236,8 +3236,13 @@ describe("progressive durable stage transitions", () => {
   }, 120_000);
 
   describe("bounded completion retry eligibility", () => {
-    async function stoppedCompletionRetryFixture(stage: 2 | 3, reason: string) {
-      const first = await fitFixture(stage, false, [0, 8]);
+    async function stoppedCompletionRetryFixture(
+      stage: 2 | 3,
+      reason: string,
+      angles = [8],
+      recordFailedEvidence = false,
+    ) {
+      const first = await fitFixture(stage, false, [0, ...angles]);
       const accepted = first.leases.find((lease) => lease.alpha === 0)!;
       const evidence = await first.save(20, stage === 3 ? "urans" : "rans", 0);
       await first.record([evidence]);
@@ -3284,26 +3289,359 @@ describe("progressive durable stage transitions", () => {
           SET state = 'gap', error = ${reason}, completed_at = clock_timestamp()
           WHERE id = ${fixture.leases[0].workId}::uuid`);
       };
+      const failedEvidence: string[] = [];
+      if (recordFailedEvidence) {
+        for (const alpha of angles) failedEvidence.push(await first.save(50, "rans", alpha));
+        await first.record(failedEvidence);
+      }
       await stop(first, 50);
-      expect(await recoverTerminalProgressiveNoEvidenceGaps(db)).toBe(1);
+      if (recordFailedEvidence) {
+        // Physical failures are deliberately outside automatic no-evidence recovery.
+        expect(await recoverTerminalProgressiveNoEvidenceGaps(db)).toBe(0);
+        await db.execute(sql`UPDATE progressive_cfd_units SET state = 'pending'
+          WHERE id IN (${sql.join(first.leases.filter((lease) => angles.includes(lease.alpha))
+            .map((lease) => sql`${lease.id}::uuid`), sql`, `)})`);
+        await db.execute(sql`UPDATE progressive_work SET state = 'pending'
+          WHERE id = ${first.leases[0].workId}::uuid`);
+      } else {
+        expect(await recoverTerminalProgressiveNoEvidenceGaps(db)).toBe(angles.length);
+      }
       const second = await claimProgressiveCfdBatch(db, {
         owner: "completion-retry-second-attempt", leaseSeconds: 120,
-        maximumUnits: 1, solverBudgetVersion: 2, localTimeStepVersion: 1,
+        maximumUnits: angles.length, solverBudgetVersion: 2, localTimeStepVersion: 1,
       });
-      expect(second).toHaveLength(1);
-      expect(second[0]).toMatchObject({ alpha: 8 });
-      const fixture = await cfdEvidenceFixture(undefined, stage, [], [8], false, {
+      expect(second.map((lease) => lease.alpha).sort((a, b) => a - b))
+        .toEqual([...angles].sort((a, b) => a - b));
+      const fixture = await cfdEvidenceFixture(undefined, stage, [], angles, false, {
         campaignId: first.campaignId, leases: second,
       });
+      if (recordFailedEvidence) {
+        const current = await Promise.all(angles.map((alpha) => fixture.save(57, "rans", alpha)));
+        await fixture.record(current);
+        failedEvidence.push(...current);
+      }
       await stop(fixture, 57);
-      return { fixture, lease: second[0], accepted, evidence };
+      return { fixture, first, lease: second[0], accepted, evidence, failedEvidence };
     }
+
+    async function completionRetrySnapshot(connection: DB, campaignId: string) {
+      const units = sql`SELECT unit.id FROM progressive_cfd_units unit
+        JOIN progressive_work work ON work.id = unit.work_id
+        JOIN progressive_generations generation ON generation.id = work.generation_id
+        WHERE generation.campaign_id = ${campaignId}::uuid`;
+      const jobs = sql`SELECT id FROM sim_jobs WHERE campaign_id = ${campaignId}::uuid`;
+      return {
+        units: await connection.execute(sql`SELECT * FROM progressive_cfd_units
+          WHERE id IN (${units}) ORDER BY id`),
+        work: await connection.execute(sql`SELECT work.* FROM progressive_work work
+          JOIN progressive_generations generation ON generation.id = work.generation_id
+          WHERE generation.campaign_id = ${campaignId}::uuid ORDER BY work.id`),
+        attempts: await connection.execute(sql`SELECT * FROM progressive_cfd_attempts
+          WHERE unit_id IN (${units}) ORDER BY token`),
+        evidence: await connection.execute(sql`SELECT * FROM progressive_cfd_evidence
+          WHERE attempt_token IN (SELECT token FROM progressive_cfd_attempts WHERE unit_id IN (${units}))
+          ORDER BY attempt_token, result_attempt_id`),
+        raw: await connection.execute(sql`SELECT * FROM result_attempts
+          WHERE sim_job_id IN (${jobs}) ORDER BY id`),
+        results: await connection.execute(sql`SELECT * FROM results
+          WHERE sim_job_id IN (${jobs}) ORDER BY id`),
+        classifications: await connection.execute(sql`SELECT * FROM result_classifications
+          WHERE result_attempt_id IN (SELECT id FROM result_attempts WHERE sim_job_id IN (${jobs}))
+            OR result_id IN (SELECT id FROM results WHERE sim_job_id IN (${jobs})) ORDER BY id`),
+        jobs: await connection.execute(sql`SELECT * FROM sim_jobs WHERE id IN (${jobs}) ORDER BY id`),
+        stops: await connection.execute(sql`SELECT * FROM progressive_cfd_execution_stops
+          WHERE sim_job_id IN (${jobs}) ORDER BY sim_job_id`),
+        plans: await connection.execute(sql`SELECT * FROM progressive_cfd_recovery_plans
+          WHERE unit_id IN (${units}) ORDER BY id`),
+        recoveryClaims: await connection.execute(sql`SELECT * FROM progressive_cfd_recovery_claims
+          WHERE recovery_plan_id IN (SELECT id FROM progressive_cfd_recovery_plans WHERE unit_id IN (${units}))
+          ORDER BY attempt_token`),
+      };
+    }
+
+    async function completionRetryPromise(connection: DB, jobId: string) {
+      const solverId = randomUUID();
+      const promiseId = randomUUID();
+      const [job] = await connection.select().from(simJobs).where(eq(simJobs.id, jobId));
+      const payload = job.requestPayload as {
+        engineRequest: Awaited<ReturnType<typeof cfdEvidenceFixture>>["composed"]["request"];
+        progressive: unknown;
+      };
+      const envelope = sealProgressiveRemoteExecution({
+        solverId, promiseId, request: payload.engineRequest, scope: payload.progressive,
+      });
+      await connection.execute(sql`INSERT INTO registered_remote_solvers
+        (id, instance_id, instance_name, cpu_capacity, cpu_budget, max_active_polar_promises)
+        VALUES (${solverId}::uuid, ${randomUUID()}, 'completion retry guard', 1, 1, 1)`);
+      await connection.execute(sql`INSERT INTO sync_sweep_promises
+        (id, registered_solver_id, airfoil_id, simulation_preset_revision_id, aoa_count, "expiresAt")
+        VALUES (${promiseId}::uuid, ${solverId}::uuid, ${job.airfoilId}::uuid,
+          ${job.simulationPresetRevisionId}::uuid, 1, clock_timestamp() + interval '1 hour')`);
+      await connection.execute(sql`INSERT INTO progressive_remote_dispatches
+        (sim_job_id, promise_id, solver_id, cpu_slots, content_signature, envelope)
+        VALUES (${job.id}::uuid, ${promiseId}::uuid, ${solverId}::uuid, 1,
+          ${envelope.contentSignature}, ${JSON.stringify(envelope)}::jsonb)`);
+    }
+
+    it("requeues only the exact stopped physical failures while paused, then normal admission claims them", async () => {
+      const { fixture, lease } = await stoppedCompletionRetryFixture(
+        3, "precise evidence remains unresolved", [8, 10, 12], true,
+      );
+      const selected = fixture.leases.filter((candidate) => candidate.alpha !== 10);
+      expect(await recoverTerminalProgressiveNoEvidenceGaps(db)).toBe(0);
+      await db.update(simCampaigns).set({ status: "paused" }).where(eq(simCampaigns.id, fixture.campaignId));
+      const before = await completionRetrySnapshot(db, fixture.campaignId);
+      expect(await requeueProgressiveCompletionRetries(db, {
+        campaignId: fixture.campaignId, expectedCount: 2,
+        unitIds: selected.map((candidate) => candidate.id).reverse(),
+      })).toEqual({ requeued: 2 });
+      const after = await completionRetrySnapshot(db, fixture.campaignId);
+      expect(after).toEqual({
+        ...before,
+        units: before.units.map((unit) => selected.some((candidate) => candidate.id === unit.id)
+          ? { ...unit, state: "pending" } : unit),
+        work: before.work.map((work) => work.id === lease.workId
+          ? { ...work, state: "pending", error: null, completed_at: null } : work),
+      });
+      expect(await claimProgressiveCfdBatch(db, {
+        owner: "exact-completion-paused", leaseSeconds: 120, maximumUnits: 3,
+        solverBudgetVersion: 2, localTimeStepVersion: 1,
+      })).toEqual([]);
+      await db.update(simCampaigns).set({ status: "active" }).where(eq(simCampaigns.id, fixture.campaignId));
+      const claimed = await claimProgressiveCfdBatch(db, {
+        owner: "exact-completion-normal", leaseSeconds: 120, maximumUnits: 3,
+        solverBudgetVersion: 2, localTimeStepVersion: 1,
+      });
+      expect(claimed.map((candidate) => candidate.id).sort()).toEqual(selected.map((candidate) => candidate.id).sort());
+      for (const candidate of claimed) {
+        const prior = before.units.find((unit) => unit.id === candidate.id)!;
+        expect(candidate.remainingActiveSeconds).toBe(Number(prior.active_budget_seconds) - Number(prior.active_seconds));
+        expect(candidate.recipe).toEqual(prior.recipe);
+      }
+      const final = await completionRetrySnapshot(db, fixture.campaignId);
+      expect(final.attempts.filter((attempt) => !claimed.some((candidate) => candidate.token === attempt.token)))
+        .toEqual(before.attempts);
+      for (const key of ["evidence", "raw", "results", "classifications", "jobs", "stops", "plans", "recoveryClaims"] as const)
+        expect(final[key]).toEqual(before[key]);
+      await expect(requeueProgressiveCompletionRetries(db, {
+        campaignId: fixture.campaignId, expectedCount: 2, unitIds: selected.map((candidate) => candidate.id),
+      })).rejects.toThrow("candidate count changed");
+      expect(await completionRetrySnapshot(db, fixture.campaignId)).toEqual(final);
+    }, 120_000);
+
+    it.each([
+      "current promise", "historical promise", "live unbound attempt", "unfinished history",
+      "foreign campaign", "foreign unit", "obsolete epoch", "obsolete plan", "unacknowledged stop",
+      "unacknowledged historical stop", "foreign engine", "active historical job", "accepted attempt history",
+      "accepted result history", "exhausted budget", "exhausted attempts", "stale lease", "changed reason",
+    ])("rejects the whole exact completion retry set with %s", async (guard) => {
+      const { fixture, first, failedEvidence, accepted } = await stoppedCompletionRetryFixture(
+        3, "precise evidence remains unresolved", [8, 10], true,
+      );
+      const unit = fixture.leases.find((candidate) => candidate.alpha === 10)!;
+      const rollback = new Error("Restore exact completion retry guard fixture");
+      await expect(db.transaction(async (transaction) => {
+        const connection = transaction as unknown as DB;
+        const input = { campaignId: fixture.campaignId, expectedCount: 2, unitIds: fixture.leases.map((candidate) => candidate.id) };
+        switch (guard) {
+          case "current promise": await completionRetryPromise(connection, fixture.composed.jobId); break;
+          case "historical promise": await completionRetryPromise(connection, first.composed.jobId); break;
+          case "live unbound attempt":
+            await connection.execute(sql`INSERT INTO progressive_cfd_attempts
+              (token, unit_id, owner, lease_until, started_at, outcome, execution_recipe_id)
+              SELECT ${randomUUID()}::uuid, unit_id, 'exact-completion-live',
+                clock_timestamp() + interval '10 minutes', clock_timestamp() + interval '1 second',
+                'running', execution_recipe_id FROM progressive_cfd_attempts WHERE token = ${unit.token}::uuid`);
+            break;
+          case "unfinished history":
+            await connection.execute(sql`UPDATE progressive_cfd_attempts SET finished_at = NULL
+              WHERE unit_id = ${unit.id}::uuid AND sim_job_id = ${first.composed.jobId}::uuid`); break;
+          case "foreign campaign": input.campaignId = randomUUID(); break;
+          case "foreign unit": input.unitIds[1] = accepted.id; break;
+          case "obsolete epoch":
+            await connection.execute(sql`UPDATE calculation_epochs SET current = false WHERE current`);
+            await connection.execute(sql`INSERT INTO calculation_epochs (reason) VALUES ('exact completion obsolete epoch')`); break;
+          case "obsolete plan":
+            await connection.execute(sql`UPDATE sim_campaigns SET current_plan_revision_id = NULL
+              WHERE id = ${fixture.campaignId}::uuid`); break;
+          case "unacknowledged stop":
+          case "unacknowledged historical stop":
+            await connection.execute(sql`DELETE FROM progressive_cfd_execution_stops
+              WHERE sim_job_id = ${guard === "unacknowledged stop" ? fixture.composed.jobId : first.composed.jobId}::uuid`); break;
+          case "foreign engine":
+            await connection.execute(sql`UPDATE sim_jobs SET engine_job_id = ${randomUUID()}
+              WHERE id = ${fixture.composed.jobId}::uuid`); break;
+          case "active historical job":
+            await connection.execute(sql`UPDATE sim_jobs SET status = 'ingesting'
+              WHERE id = ${first.composed.jobId}::uuid`); break;
+          case "accepted attempt history":
+          case "accepted result history": {
+            const evidenceId = failedEvidence[1];
+            const identity = guard === "accepted attempt history" ? sql`result_attempt_id` : sql`result_id`;
+            const value = guard === "accepted attempt history" ? sql`id` : sql`result_id`;
+            await connection.execute(sql`INSERT INTO result_classifications
+              (${identity}, airfoil_id, simulation_preset_revision_id, aoa_deg, classifier_version, state, reasons)
+              SELECT ${value}, airfoil_id, simulation_preset_revision_id, aoa_deg,
+                'exact-completion-history-guard', 'accepted', '{}' FROM result_attempts WHERE id = ${evidenceId}::uuid`);
+            break;
+          }
+          case "exhausted budget":
+            await connection.execute(sql`UPDATE progressive_cfd_units SET active_seconds = active_budget_seconds
+              WHERE id = ${unit.id}::uuid`); break;
+          case "exhausted attempts":
+            await connection.execute(sql`UPDATE progressive_cfd_units SET attempts = 3 WHERE id = ${unit.id}::uuid`); break;
+          case "stale lease":
+            await connection.execute(sql`UPDATE progressive_cfd_units SET lease_until = clock_timestamp() - interval '1 hour'
+              WHERE id = ${unit.id}::uuid`); break;
+          case "changed reason":
+            await connection.execute(sql`UPDATE progressive_cfd_units SET error = 'a different unresolved failure'
+              WHERE id = ${unit.id}::uuid`); break;
+        }
+        const before = await completionRetrySnapshot(connection, fixture.campaignId);
+        await expect(requeueProgressiveCompletionRetries(connection, input)).rejects.toThrow("candidate count changed");
+        expect(await completionRetrySnapshot(connection, fixture.campaignId)).toEqual(before);
+        // The count-only API inherits the same ownership and history fences.
+        if (!["foreign campaign", "foreign unit", "exhausted budget", "exhausted attempts", "stale lease", "changed reason"].includes(guard)) {
+          await expect(requeueProgressiveCompletionRetries(connection, {
+            campaignId: fixture.campaignId, expectedCount: 2,
+          })).rejects.toThrow("candidate count changed");
+          expect(await completionRetrySnapshot(connection, fixture.campaignId)).toEqual(before);
+        }
+        throw rollback;
+      })).rejects.toBe(rollback);
+    }, 120_000);
+
+    it("rejects duplicate or malformed exact IDs and count mismatches without changing any unit", async () => {
+      const { fixture } = await stoppedCompletionRetryFixture(3, "precise evidence remains unresolved", [8, 10]);
+      const ids = fixture.leases.map((candidate) => candidate.id);
+      const before = await completionRetrySnapshot(db, fixture.campaignId);
+      for (const request of [
+        { unitIds: [], expectedCount: 1 },
+        { unitIds: ids, expectedCount: 1 },
+        { unitIds: [ids[0], ids[0].toUpperCase()], expectedCount: 2 },
+        { unitIds: [ids[0], "invalid-uuid"], expectedCount: 2 },
+        { unitIds: ids, expectedCount: 0 },
+        { unitIds: ids, expectedCount: 2049 },
+        { unitIds: [ids[0], randomUUID()], expectedCount: 2 },
+        { expectedCount: 3 },
+      ]) {
+        await expect(requeueProgressiveCompletionRetries(db, {
+          campaignId: fixture.campaignId, ...request,
+        })).rejects.toThrow(/Completion retry/);
+        expect(await completionRetrySnapshot(db, fixture.campaignId)).toEqual(before);
+      }
+    }, 120_000);
+
+    async function waitForCompletionRetryBlock(waiter: number, owner: number) {
+      const deadline = Date.now() + 5_000;
+      while (Date.now() < deadline) {
+        const [row] = await db.execute(sql`SELECT ${owner}::integer = ANY(pg_blocking_pids(${waiter}::integer)) AS blocked`);
+        if (row.blocked) return;
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      throw new Error("Exact completion retry did not reach the expected database lock");
+    }
+
+    it("locks the epoch before admission so an overlapping reset cannot invert completion retry locks", async () => {
+      const { fixture } = await stoppedCompletionRetryFixture(3, "precise evidence remains unresolved");
+      const holder = createClient({ url: targetUrl.toString(), max: 1 });
+      const actor = createClient({ url: targetUrl.toString(), max: 1 });
+      const resetter = createClient({ url: targetUrl.toString(), max: 1 });
+      let unlock!: () => void;
+      let locked!: () => void;
+      const release = new Promise<void>((resolve) => { unlock = resolve; });
+      const ready = new Promise<void>((resolve) => { locked = resolve; });
+      let retry: Promise<unknown> | undefined;
+      let reset: Promise<unknown> | undefined;
+      const before = await completionRetrySnapshot(db, fixture.campaignId);
+      const [actorSession] = await actor.db.execute(sql`SELECT pg_backend_pid()::int AS pid`);
+      const [holderSession] = await holder.db.execute(sql`SELECT pg_backend_pid()::int AS pid`);
+      const [resetSession] = await resetter.db.execute(sql`SELECT pg_backend_pid()::int AS pid`);
+      const blocking = holder.db.transaction(async (transaction) => {
+        await acquireProgressiveAdmissionLock(transaction as unknown as DB);
+        locked();
+        await release;
+      });
+      try {
+        await ready;
+        retry = requeueProgressiveCompletionRetries(actor.db, {
+          campaignId: fixture.campaignId, expectedCount: 1, unitIds: [fixture.leases[0].id],
+        });
+        void retry.catch(() => {});
+        await waitForCompletionRetryBlock(Number(actorSession.pid), Number(holderSession.pid));
+        reset = resetter.db.transaction(async (transaction) => {
+          await transaction.execute(sql`SET LOCAL lock_timeout = '8s'`);
+          await transaction.execute(sql`SELECT id FROM calculation_epochs WHERE current FOR UPDATE`);
+          await acquireProgressiveAdmissionLock(transaction as unknown as DB);
+        });
+        void reset.catch(() => {});
+        await waitForCompletionRetryBlock(Number(resetSession.pid), Number(actorSession.pid));
+        expect(await completionRetrySnapshot(db, fixture.campaignId)).toEqual(before);
+        unlock();
+        await blocking;
+        expect(await retry).toEqual({ requeued: 1 });
+        await reset;
+        const after = await completionRetrySnapshot(db, fixture.campaignId);
+        expect(after.attempts).toEqual(before.attempts);
+        expect(after.jobs).toEqual(before.jobs);
+      } finally {
+        unlock();
+        await Promise.allSettled([blocking, retry, reset]);
+        await Promise.all([holder.sql.end(), actor.sql.end(), resetter.sql.end()]);
+      }
+    }, 120_000);
+
+    it("locks the campaign before units and rolls back the entire exact set after a concurrent ownership change", async () => {
+      const { fixture } = await stoppedCompletionRetryFixture(3, "precise evidence remains unresolved", [8, 10]);
+      const holder = createClient({ url: targetUrl.toString(), max: 1 });
+      const actor = createClient({ url: targetUrl.toString(), max: 1 });
+      const [holderSession] = await holder.db.execute(sql`SELECT pg_backend_pid()::int AS pid`);
+      const [actorSession] = await actor.db.execute(sql`SELECT pg_backend_pid()::int AS pid`);
+      let unlock!: () => void;
+      let locked!: () => void;
+      const release = new Promise<void>((resolve) => { unlock = resolve; });
+      const ready = new Promise<void>((resolve) => { locked = resolve; });
+      let retry: Promise<unknown> | undefined;
+      const blocking = holder.db.transaction(async (transaction) => {
+        await transaction.execute(sql`SELECT id FROM sim_campaigns WHERE id = ${fixture.campaignId}::uuid FOR UPDATE`);
+        locked();
+        await release;
+        await transaction.execute(sql`UPDATE progressive_cfd_units SET state = 'cancelled'
+          WHERE id = ${fixture.leases[1].id}::uuid`);
+      });
+      try {
+        await ready;
+        retry = requeueProgressiveCompletionRetries(actor.db, {
+          campaignId: fixture.campaignId, expectedCount: 2, unitIds: fixture.leases.map((unit) => unit.id),
+        });
+        void retry.catch(() => {});
+        await waitForCompletionRetryBlock(Number(actorSession.pid), Number(holderSession.pid));
+        // An independent transaction can still lock units while retry waits on its campaign.
+        await db.transaction(async (transaction) => {
+          await transaction.execute(sql`SELECT id FROM progressive_cfd_units
+            WHERE id = ${fixture.leases[0].id}::uuid FOR UPDATE NOWAIT`);
+        });
+        const before = await completionRetrySnapshot(db, fixture.campaignId);
+        unlock();
+        await blocking;
+        await expect(retry).rejects.toThrow("candidate count changed");
+        const after = await completionRetrySnapshot(db, fixture.campaignId);
+        expect(after).toEqual({ ...before, units: before.units.map((unit) => unit.id === fixture.leases[1].id
+          ? { ...unit, state: "cancelled" } : unit) });
+      } finally {
+        unlock();
+        await Promise.allSettled([blocking, retry]);
+        await Promise.all([holder.sql.end(), actor.sql.end()]);
+      }
+    }, 120_000);
 
     it.each([
       { stage: 2, path: "terminal", reason: "terminal execution has no measured case evidence" },
       { stage: 3, path: "terminal", reason: "precise evidence remains unresolved" },
       { stage: 2, path: "manual", reason: "fast pass has no informative accepted evidence" },
       { stage: 3, path: "manual", reason: "precise evidence remains unresolved" },
+      { stage: 2, path: "exact", reason: "fast pass has no informative accepted evidence" },
+      { stage: 3, path: "exact", reason: "precise evidence remains unresolved" },
       { stage: 2, path: "legacy-marker", reason: "terminal execution has no measured case evidence" },
     ] as const)("commits a claimable third attempt without losing its reason ($stage/$path)", async ({ stage, path, reason }) => {
       const { fixture, lease, accepted, evidence } = await stoppedCompletionRetryFixture(stage, reason);
@@ -3404,9 +3742,10 @@ describe("progressive durable stage transitions", () => {
           expect(await recoverTerminalProgressiveNoEvidenceGaps(db)).toBe(0);
           expect((await readUnit())[0]).toMatchObject({ state: "gap", attempts: 2, error: reason });
         }
-        if (path === "manual")
+        if (path === "manual" || path === "exact")
           expect(await requeueProgressiveCompletionRetries(db, {
             campaignId: fixture.campaignId, expectedCount: 1,
+            ...(path === "exact" ? { unitIds: [lease.id] } : {}),
           })).toEqual({ requeued: 1 });
         else
           expect(await recoverTerminalProgressiveNoEvidenceGaps(db)).toBe(1);
@@ -3445,9 +3784,10 @@ describe("progressive durable stage transitions", () => {
           .toMatchObject({ outcome: "running", sim_job_id: null });
         expect(await recoverTerminalProgressiveNoEvidenceGaps(db)).toBe(0);
         expect(await claimProgressiveCfdUnit(observer.db, input)).toBeNull();
-        if (path === "manual")
+        if (path === "manual" || path === "exact")
           await expect(requeueProgressiveCompletionRetries(db, {
             campaignId: fixture.campaignId, expectedCount: 1,
+            ...(path === "exact" ? { unitIds: [lease.id] } : {}),
           })).rejects.toThrow("candidate count changed");
         expect(await readHistory()).toEqual(claimedHistory);
         expect(await readProtected()).toEqual(protectedBefore);
@@ -9232,8 +9572,28 @@ describe("bounded progressive numerical recovery", () => {
     120_000,
   );
 
-  it("admits one exact rhoPimpleFoam fallback for a material-domain failure", async () => {
-    const fixture = await cfdEvidenceFixture(166, 2, [], [0]);
+  it.each([
+    { stage: 2, second: false, gate: null },
+    { stage: 2, second: true, gate: null },
+    { stage: 3, second: true, gate: null },
+    { stage: 3, second: true, gate: "attempt cap" },
+    { stage: 3, second: true, gate: "budget" },
+  ] as const)("admits one exact rhoPimpleFoam fallback for a material-domain failure ($stage/$second/$gate)", async ({ stage, second, gate }) => {
+    let fixture = await cfdEvidenceFixture(166, stage, [], [0], false, undefined, {}, undefined, false, stage === 3);
+    if (second) {
+      await heartbeatProgressiveCfdUnit(db, fixture.leases[0], { attemptActiveSeconds: 20, leaseSeconds: 120 });
+      await stopped(fixture);
+      expect(await settleProgressiveCfdExecution(db, fixture.composed.jobId))
+        .toMatchObject({ retry: 0, gaps: 1, complete: 0 });
+      expect(await recoverTerminalProgressiveNoEvidenceGaps(db)).toBe(1);
+      const leases = await claimProgressiveCfdBatch(db, {
+        owner: "material-domain-second-rans", leaseSeconds: 120,
+        solverBudgetVersion: 2, allowedSolverFamilies: ["rhoSimpleFoam"],
+      });
+      expect(leases).toHaveLength(1);
+      fixture = await cfdEvidenceFixture(166, stage, [], [0], false,
+        { campaignId: fixture.campaignId, leases }, {}, undefined, false, stage === 3);
+    }
     const evidence = await fixture.save(20, "rans", 0, {
       failure_disposition: "material_domain",
     });
@@ -9267,13 +9627,39 @@ describe("bounded progressive numerical recovery", () => {
       diagnostic_attempt_id: evidence,
       aoa_deg: 0,
       recipe: {
-        uransFidelity: "precalc",
+        uransFidelity: stage === 3 ? "full" : "precalc",
         selection: {
           solver: "rhoPimpleFoam",
           reason: "bounded_material_domain_recovery",
         },
       },
     });
+    const readImmutable = () => db.execute(sql`
+      SELECT to_jsonb(plan) AS plan, to_jsonb(raw) AS raw, to_jsonb(receipt) AS receipt,
+        to_jsonb(executed) AS execution_recipe, unit.recipe, unit.active_budget_seconds
+      FROM progressive_cfd_recovery_plans plan
+      JOIN progressive_cfd_units unit ON unit.id = plan.unit_id
+      JOIN progressive_cfd_evidence receipt ON receipt.result_attempt_id = plan.diagnostic_attempt_id
+      JOIN result_attempts raw ON raw.id = receipt.result_attempt_id
+      JOIN progressive_cfd_attempts attempt ON attempt.token = receipt.attempt_token
+      JOIN progressive_cfd_execution_recipes executed ON executed.id = attempt.execution_recipe_id
+      WHERE plan.parent_job_id = ${fixture.composed.jobId}::uuid`);
+    const immutable = await readImmutable();
+    const history = await db.execute(sql`SELECT * FROM progressive_cfd_attempts
+      WHERE unit_id = ${fixture.leases[0].id}::uuid AND token <> ${fixture.leases[0].token}::uuid ORDER BY token`);
+    if (gate) {
+      await db.execute(sql`UPDATE progressive_cfd_units
+        SET ${gate === "attempt cap" ? sql`attempts = 4` : sql`active_seconds = active_budget_seconds`}
+        WHERE id = ${fixture.leases[0].id}::uuid`);
+      expect(await settleProgressiveCfdExecution(db, fixture.composed.jobId))
+        .toMatchObject({ retry: 0, complete: 0, gaps: 1 });
+      expect(await claimProgressiveCfdBatch(db, {
+        owner: "material-domain-exhausted", leaseSeconds: 120,
+        solverBudgetVersion: 2, allowedSolverFamilies: ["rhoPimpleFoam"],
+      })).toEqual([]);
+      expect(await readImmutable()).toEqual(immutable);
+      return;
+    }
     expect(
       await settleProgressiveCfdExecution(db, fixture.composed.jobId),
     ).toMatchObject({ retry: 1, complete: 0, gaps: 0 });
@@ -9288,10 +9674,18 @@ describe("bounded progressive numerical recovery", () => {
       recoveryParentJobId: fixture.composed.jobId,
       recoveryPlanId: expect.any(String),
       recipe: {
-        uransFidelity: "precalc",
+        uransFidelity: stage === 3 ? "full" : "precalc",
         selection: { solver: "rhoPimpleFoam" },
       },
     });
+    const [unit] = await db.execute(sql`SELECT state, attempts, active_seconds, active_budget_seconds
+      FROM progressive_cfd_units WHERE id = ${fixture.leases[0].id}::uuid`);
+    expect(unit).toMatchObject({ state: "leased", attempts: second ? 3 : 2, active_seconds: second ? 40 : 20 });
+    expect(replacement.remainingActiveSeconds).toBe(Number(unit.active_budget_seconds) - Number(unit.active_seconds));
+    expect(await readImmutable()).toEqual(immutable);
+    expect(await db.execute(sql`SELECT * FROM progressive_cfd_attempts
+      WHERE unit_id = ${fixture.leases[0].id}::uuid AND token NOT IN (
+        ${fixture.leases[0].token}::uuid, ${replacement.token}::uuid) ORDER BY token`)).toEqual(history);
   }, 120_000);
 
   it("does not create a material fallback for another solver family", () => {

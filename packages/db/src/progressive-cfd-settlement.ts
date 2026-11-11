@@ -12,6 +12,7 @@ import { SOURCE_GEOMETRY_POLICY_VERSION } from "./progressive-evidence-geometry"
 import {
   progressiveCfdNeverStartedAttemptCountSql,
   progressiveCfdOrdinaryAttemptCountSql,
+  progressiveCfdMaterialDomainRecoveryAvailableSql,
   progressiveCfdPreciseVerificationAvailableSql,
 } from "./progressive-attempt-budget";
 import {
@@ -706,6 +707,7 @@ export async function settleProgressiveCfdExecution(
           WHERE recovery.unit_id = unit.id AND recovery.parent_attempt_token = attempt.token AND recovery.ordinal = 2) AS precise_verification,
         (unit.policy_version = ${PROGRESSIVE_COMPUTE_POLICY.version}
           AND ${progressiveCfdPreciseVerificationAvailableSql("unit", "attempt")}) AS unused_precise_verification,
+        ${progressiveCfdMaterialDomainRecoveryAvailableSql("unit", "attempt")} AS unused_material_recovery,
         ${historicalEvidence} AS historical_recovery,
         EXISTS (SELECT 1 FROM progressive_cfd_evidence receipt,
           jsonb_array_elements(coalesce(fitted.response->'estimate'->'contributors', '[]'::jsonb)) contributor
@@ -866,6 +868,10 @@ export async function settleProgressiveCfdExecution(
           (Number(unit.never_started_attempts) < 1 &&
             Number(unit.recorded_attempts) === Number(unit.attempts))) &&
         (ordinaryAttempts < 2 ||
+          (ordinaryAttempts === 2 &&
+            Number(unit.attempts) < 4 &&
+            unit.numerical_recovery === true &&
+            unit.unused_material_recovery === true) ||
           (ordinaryAttempts === 2 &&
             unit.stage === 3 &&
             (unit.precise_verification === true ||
