@@ -755,7 +755,6 @@ async function verifyCancelledAcceptedPublication(db: DB, envelope: ProgressiveR
       converged: false, cl: null, cd: null, cm: null, error: "Retained rejected physical sibling", failure_disposition: "hard_solver" as const };
     const diagnostic = { ...rejected, aoa_deg: envelope.scope.units[2].alpha, case_slug: "cancelled-diagnostic",
       evidence_artifacts: [], failure_disposition: "infrastructure" as const };
-    delete diagnostic.force_history;
     polar.points = [accepted];
     polar.attempts = [accepted, rejected, diagnostic];
     const report: ProgressiveRemoteReport = { version: 1, solverId: envelope.solverId, promiseId: envelope.promiseId,
