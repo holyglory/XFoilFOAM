@@ -833,8 +833,10 @@ async function verifyCancelledAcceptedPublication(db: DB, envelope: ProgressiveR
       ["foreign unit recipe", async (scoped) => { await shadow(scoped, "progressive_cfd_units"); return scoped.execute(sql`UPDATE progressive_cfd_units SET recipe=recipe||'{"foreign":true}'::jsonb WHERE id=${envelope.scope.units[0].unitId}::uuid`); }],
       ["revoked solver", (scoped) => scoped.execute(sql`UPDATE registered_remote_solvers SET revoked_at=clock_timestamp() WHERE id=${envelope.solverId}::uuid`)],
       ["missing archive", async (scoped) => { await shadow(scoped, "solver_evidence_archives"); return scoped.execute(sql`DELETE FROM solver_evidence_archives WHERE result_attempt_id=${raw.id}::uuid`); }],
-      ...["exclude", "defer"].map((verdict) => [`review ${verdict}`, (scoped: DB) => scoped.execute(sql`INSERT INTO result_review_verdicts(result_id,verdict,reviewer)
-        VALUES(${raw.resultId}::uuid,${verdict},'isolated publication refusal')`]) as [string, (scoped: DB) => Promise<unknown>]),
+      ["review exclude", (scoped) => scoped.execute(sql`INSERT INTO result_review_verdicts(result_id,verdict,reviewer)
+        VALUES(${raw.resultId}::uuid,'exclude','isolated publication refusal')`)],
+      ["review defer", (scoped) => scoped.execute(sql`INSERT INTO result_review_verdicts(result_id,verdict,reviewer)
+        VALUES(${raw.resultId}::uuid,'defer','isolated publication refusal')`)],
       ["tampered report", async (scoped) => { await shadow(scoped, "progressive_remote_reports"); return scoped.execute(sql`UPDATE progressive_remote_reports
         SET report=jsonb_set(report,'{status,message}','"changed"'::jsonb) WHERE sim_job_id=${executionId}::uuid`); }],
       ["missing stop proof", async (scoped) => { await shadow(scoped, "progressive_cfd_execution_stops"); return scoped.execute(sql`DELETE FROM progressive_cfd_execution_stops WHERE sim_job_id=${executionId}::uuid`); }],
