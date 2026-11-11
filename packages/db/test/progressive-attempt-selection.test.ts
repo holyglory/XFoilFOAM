@@ -183,14 +183,14 @@ it("recovers actionable terminal gaps beyond a full page of pending and exhauste
       "progressive_generations (id uuid PRIMARY KEY, campaign_id uuid, epoch_id uuid, plan_revision_id uuid, status text, stage integer)",
       "progressive_generation_cohorts (generation_id uuid, cohort text, stage integer)",
       "progressive_generation_cohort_targets (generation_id uuid, target_id text, cohort text)",
-      "progressive_generation_targets (generation_id uuid, target_id text, recipes jsonb)",
+      "progressive_generation_targets (generation_id uuid, target_id text, recipes jsonb, revision_id uuid)",
       "progressive_work (id uuid PRIMARY KEY, generation_id uuid, target_id text, stage integer, state text, error text, completed_at timestamptz)",
       "progressive_cfd_units (id uuid PRIMARY KEY, work_id uuid, state text, error text, attempts integer, ordinal integer, aoa_deg double precision, purpose text, policy_version text, active_seconds double precision, active_budget_seconds double precision, lease_token uuid, lease_owner text, lease_until timestamptz, retry_after timestamptz, recipe jsonb)",
-      'sim_jobs (id uuid PRIMARY KEY, campaign_id uuid, engine_job_id text, status text, engine_state text, request_payload jsonb, "updatedAt" timestamptz)',
-      "progressive_cfd_attempts (token uuid PRIMARY KEY, unit_id uuid, sim_job_id uuid, outcome text, active_seconds double precision, error text, started_at timestamptz, finished_at timestamptz)",
-      "progressive_cfd_execution_stops (sim_job_id uuid, engine_job_id text, proof jsonb)",
-      "progressive_cfd_evidence (attempt_token uuid, result_attempt_id uuid)",
-      "result_attempts (id uuid PRIMARY KEY, result_id uuid, cl double precision, cd double precision, cm double precision)",
+      'sim_jobs (id uuid PRIMARY KEY, campaign_id uuid, engine_job_id text, status text, engine_state text, request_payload jsonb, "updatedAt" timestamptz, "ingestedAt" timestamptz, ingest_lease_token text, ingest_lease_expires_at timestamptz, airfoil_id uuid, simulation_preset_revision_id uuid)',
+      "progressive_cfd_attempts (token uuid PRIMARY KEY, unit_id uuid, sim_job_id uuid, outcome text, active_seconds double precision, error text, started_at timestamptz, finished_at timestamptz, execution_recipe_id text)",
+      "progressive_cfd_execution_stops (sim_job_id uuid, engine_job_id text, proof jsonb, epoch_id uuid)",
+      "progressive_cfd_evidence (attempt_token uuid, result_attempt_id uuid, evidence_signature text)",
+      "result_attempts (id uuid PRIMARY KEY, result_id uuid, cl double precision, cd double precision, cm double precision, sim_job_id uuid, engine_job_id text, airfoil_id uuid, aoa_deg double precision, simulation_preset_revision_id uuid, status text, valid_for_polar boolean, regime text, evidence_payload jsonb)",
       "result_classifications (result_attempt_id uuid, result_id uuid, state text)",
       "progressive_remote_dispatches (sim_job_id uuid, promise_id uuid, content_signature text)",
       "sync_sweep_promises (id uuid PRIMARY KEY, status text)",
@@ -241,6 +241,7 @@ it("recovers actionable terminal gaps beyond a full page of pending and exhauste
       precise: { recipeId: "sealed-precise", solverProcesses: 4, maxCo: 0.4 },
     };
     await transaction.execute(sql`INSERT INTO progressive_generation_targets
+      (generation_id,target_id,recipes)
       SELECT generation_id,target_id,${JSON.stringify(recipes)}::jsonb FROM recovery_fixture`);
     await transaction.execute(sql`INSERT INTO progressive_work
       SELECT work_id,generation_id,target_id,CASE WHEN variant='precise-live' THEN 3 ELSE 2 END,
@@ -259,31 +260,39 @@ it("recovers actionable terminal gaps beyond a full page of pending and exhauste
         ${JSON.stringify(recipes)}::jsonb->CASE WHEN variant='precise-live' THEN 'precise' ELSE 'fast' END
       FROM recovery_fixture fixture JOIN progressive_work work ON work.id=fixture.work_id`);
     await transaction.execute(sql`INSERT INTO sim_jobs
+      (id,campaign_id,engine_job_id,status,engine_state,request_payload,"updatedAt","ingestedAt")
       SELECT fixture.id,md5('recovery-campaign')::uuid,fixture.id::text,
         CASE WHEN variant IN ('new-owner','precise-live') THEN 'running' ELSE 'cancelled' END,
         CASE WHEN variant IN ('new-owner','precise-live') THEN 'running' ELSE 'cancelled' END,
-        jsonb_build_object('recipe',unit.recipe),clock_timestamp()-interval '1 hour'
+        jsonb_build_object('recipe',unit.recipe),clock_timestamp()-interval '1 hour',
+        CASE WHEN variant IN ('new-owner','precise-live') THEN NULL::timestamptz
+          ELSE clock_timestamp()-interval '1 hour' END
       FROM recovery_fixture fixture JOIN progressive_cfd_units unit ON unit.id=fixture.id`);
     await transaction.execute(sql`INSERT INTO progressive_cfd_attempts
+      (token,unit_id,sim_job_id,outcome,active_seconds,error,started_at,finished_at)
       SELECT id,id,id,CASE WHEN variant IN ('new-owner','precise-live') THEN 'running' ELSE 'failed' END,
         0,${failure},clock_timestamp()-interval '1 hour',
         CASE WHEN variant IN ('new-owner','precise-live') THEN NULL::timestamptz ELSE clock_timestamp() END
       FROM recovery_fixture`);
     await transaction.execute(sql`INSERT INTO progressive_cfd_execution_stops
+      (sim_job_id,engine_job_id,proof)
       SELECT id,id::text,jsonb_build_object('version',1,'job_id',id::text,
         'execution_stopped',true,'producer_stopped',true,'namespace_verified',true,
         'remaining','[]'::jsonb,'error',NULL,'fence','cancel_marker',
         'ownership_basis','recorded_execution_namespace')
       FROM recovery_fixture WHERE variant NOT IN ('missing-stop','new-owner','precise-live')`);
     await transaction.execute(sql`INSERT INTO result_attempts
+      (id,result_id,cl,cd,cm)
       SELECT id,id,0.1,0.02,0.0 FROM recovery_fixture WHERE variant='accepted-history'`);
     await transaction.execute(sql`INSERT INTO result_classifications
       SELECT id,id,'accepted' FROM recovery_fixture WHERE variant='accepted-history'`);
     await transaction.execute(sql`INSERT INTO progressive_cfd_attempts
+      (token,unit_id,sim_job_id,outcome,active_seconds,error,started_at,finished_at)
       SELECT md5(id::text)::uuid,id,id,'complete',82,NULL,
         clock_timestamp()-interval '2 hours',clock_timestamp()-interval '1 hour'
       FROM recovery_fixture WHERE variant='accepted-history'`);
     await transaction.execute(sql`INSERT INTO progressive_cfd_evidence
+      (attempt_token,result_attempt_id)
       SELECT md5(id::text)::uuid,id FROM recovery_fixture WHERE variant='accepted-history'`);
     await transaction.execute(sql`INSERT INTO sync_sweep_promises
       SELECT id,'active' FROM recovery_fixture WHERE variant='active-promise'`);
