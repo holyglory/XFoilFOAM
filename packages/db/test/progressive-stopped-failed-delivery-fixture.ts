@@ -571,6 +571,24 @@ export async function verifyDiagnosticOnlyPromotionRecovery(
     for (const plan of plans) expect(plan).toMatchObject({ ordinal: 1, scope: "original_sweep", reason: "hard_solver",
       diagnostic_attempt_id: null, diagnostic_point_content_signature: triggerSource.contentSignature,
       diagnostic_signature: analysisContentHash(trigger!.reference) });
+    if (earlyState) for (const unit of envelope.scope.units) {
+      const rollback = new Error("Restore diagnostic settlement lease-owner probe");
+      await expect(connection.transaction(async (nested) => {
+        const scoped = nested as unknown as DB;
+        await scoped.execute(sql`UPDATE sim_jobs SET status='done',"ingestedAt"=clock_timestamp() WHERE id=${executionId}::uuid`);
+        await scoped.execute(sql`UPDATE progressive_cfd_units SET lease_owner='foreign-diagnostic-recovery-owner'
+          WHERE id=${unit.unitId}::uuid`);
+        const ownership = sql`SELECT attempt.outcome,unit.state,unit.lease_token,unit.lease_owner,unit.lease_until
+          FROM progressive_cfd_attempts attempt JOIN progressive_cfd_units unit ON unit.id=attempt.unit_id
+          WHERE attempt.token=${unit.token}::uuid`;
+        const before = await scoped.execute(ownership);
+        for (let replay = 0; replay < 2; replay += 1) {
+          await settleProgressiveCfdExecution(scoped, executionId);
+          expect(await scoped.execute(ownership)).toEqual(before);
+        }
+        throw rollback;
+      })).rejects.toBe(rollback);
+    }
     if (!omitted.length) {
       const rollback = new Error("Restore exhausted diagnostic retry budgets");
       await expect(connection.transaction(async (nested) => {

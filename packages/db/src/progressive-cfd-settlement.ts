@@ -679,7 +679,7 @@ export async function settleProgressiveCfdExecution(
       );
     const units = await connection.execute(sql`
       SELECT attempt.token, attempt.outcome, attempt.active_seconds AS attempt_active_seconds,
-        unit.id, unit.state, unit.lease_token, unit.lease_until, unit.attempts, unit.active_seconds, unit.active_budget_seconds,
+        unit.id, unit.state, unit.lease_token, unit.lease_owner, unit.lease_until, unit.attempts, unit.active_seconds, unit.active_budget_seconds,
         ${progressiveCfdEffectiveBudgetSql(sql`unit`)} AS effective_budget_seconds, work.id AS work_id,
         (SELECT extension.state FROM progressive_cfd_budget_extensions extension
           WHERE extension.unit_id = unit.id LIMIT 1) AS budget_extension_state,
@@ -777,7 +777,7 @@ export async function settleProgressiveCfdExecution(
         unit.diagnostic_recovery === true && unit.latest_attempt === true &&
         unit.current_scope === true && unit.recoverable_stage === true &&
         unit.outcome === "failed" && ["gap", "pending"].includes(String(unit.state)) &&
-        unit.lease_token == null && unit.lease_until == null;
+        unit.lease_token == null && unit.lease_owner == null && unit.lease_until == null;
       const staleTerminalUnit =
         unit.latest_attempt === true &&
         unit.outcome !== "running" &&
