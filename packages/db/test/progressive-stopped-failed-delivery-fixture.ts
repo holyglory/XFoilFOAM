@@ -736,7 +736,7 @@ async function verifyCancelledAcceptedPublication(db: DB, envelope: ProgressiveR
     const polar = result.polars[0];
     polar.reynolds = Number((job.snapshot as { derived: { reynolds: number } }).derived.reynolds);
     const accepted = { ...polar.attempts![0], aoa_deg: envelope.scope.units[0].alpha, case_slug: "cancelled-accepted",
-      converged: true, unsteady: true, stalled: false, cm: 0, error: null, fidelity: "urans_full" as const,
+      converged: true, unsteady: true, stalled: false, cl: 0.4, cd: 0.03, cm: 0, error: null, fidelity: "urans_full" as const,
       force_history: { t: [0, 1, 2, 3], cl: [0.4, 0.4, 0.4, 0.4], cd: [0.03, 0.03, 0.03, 0.03], cm: [0, 0, 0, 0] },
       frame_track: {
         period_s: 1, periods_retained: 5, stationary: true, drift_frac: 0,
@@ -751,9 +751,10 @@ async function verifyCancelledAcceptedPublication(db: DB, envelope: ProgressiveR
       } };
     delete accepted.failure_disposition;
     const rejected = { ...accepted, aoa_deg: envelope.scope.units[1].alpha, case_slug: "cancelled-rejected",
+      force_history: undefined, frame_track: undefined,
       converged: false, cl: null, cd: null, cm: null, error: "Retained rejected physical sibling", failure_disposition: "hard_solver" as const };
     const diagnostic = { ...rejected, aoa_deg: envelope.scope.units[2].alpha, case_slug: "cancelled-diagnostic",
-      evidence_artifacts: [], force_history: undefined, failure_disposition: "infrastructure" as const };
+      evidence_artifacts: [], force_history: undefined, frame_track: undefined, failure_disposition: "infrastructure" as const };
     delete diagnostic.force_history;
     polar.points = [accepted];
     polar.attempts = [accepted, rejected, diagnostic];
