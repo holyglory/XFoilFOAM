@@ -171,13 +171,21 @@ def build(source, destination, proof):
                    for p in (rules / folder).rglob('*') if p.is_file()}
     deps = capture(['ldd', str(binary)])
     dependency_files = {path: sha(path) for path in re.findall(r'=> (/\S+)', deps)}
+    runtime_base = Path('/opt/phase-runtime-base')
+    runtime_dependencies = {line.split(None, 1)[1].strip(): line.split(None, 1)[0]
+                            for line in (runtime_base / 'libraries.sha256').read_text().splitlines()}
+    runtime_solver = (runtime_base / 'solver.sha256').read_text().split()[0]
+    if runtime_solver != expected_original or set(dependency_files) != set(runtime_dependencies):
+        raise ValueError('Instrumented executable changed the pinned native dependency set')
+    shutil.copytree(runtime_base, proof / 'runtime-base')
     result = {'kind': 'experimental-instrumentation-only', 'originalBinarySha256': expected_original,
               'experimentalBinarySha256': sha(binary), 'experimentalBinaryBytes': binary.stat().st_size,
               'environment': {key: os.environ.get(key) for key in ['WM_OPTIONS','WM_COMPILER','WM_COMPILE_OPTION','WM_PRECISION_OPTION','WM_LABEL_SIZE','WM_PROJECT_VERSION']},
               'compiler': capture(['g++','--version']), 'originalCompilerComment': capture(['readelf','-p','.comment',str(original)]),
               'experimentalCompilerComment': capture(['readelf','-p','.comment',str(binary)]),
               'makeOptionsSha256': sha(destination / 'Make/options'), 'ruleHashes': rule_hashes,
-              'dependencies': deps, 'dependencySha256': dependency_files, 'productionEvidence': False}
+              'dependencies': deps, 'dependencySha256': dependency_files,
+              'runtimeBaseDependencySha256': runtime_dependencies, 'productionEvidence': False}
     (proof / 'build-proof.json').write_text(json.dumps(result, indent=2))
 
 

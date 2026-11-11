@@ -34,18 +34,21 @@ finally:
 proof = json.loads((out / 'build-proof/build-proof.json').read_text())
 original = '/usr/lib/openfoam/openfoam2606/platforms/linux64GccDPInt32Opt/bin/rhoPimpleFoam'
 experimental = '/opt/phase-profile/bin/xfoilfoamRhoPimplePhaseProfile'
-paths = list(proof['dependencySha256']) + [original, experimental]
+paths = list(proof['runtimeBaseDependencySha256']) + [original, experimental]
 hashes = run('runtime-hashes', ['docker', 'run', '--rm', '--network', 'none', '--entrypoint', 'sha256sum', image, *paths])
 hashes.check_returncode()
 actual = {line.split(None, 1)[1].strip(): line.split(None, 1)[0] for line in hashes.stdout.decode().splitlines()}
-mismatches = {path: {'build': expected, 'runtime': actual.get(path)} for path, expected in proof['dependencySha256'].items()
+mismatches = {path: {'pinnedRuntime': expected, 'runtime': actual.get(path)} for path, expected in proof['runtimeBaseDependencySha256'].items()
               if expected != actual.get(path)}
+build_differences = {path: {'build': expected, 'pinnedRuntime': actual.get(path)} for path, expected in proof['dependencySha256'].items()
+                     if expected != actual.get(path)}
 help_result = run('experimental-help', ['docker', 'run', '--rm', '--network', 'none', '--entrypoint', 'bash', image, '-lc',
     'source /usr/lib/openfoam/openfoam2606/etc/bashrc && exec /opt/phase-profile/bin/xfoilfoamRhoPimplePhaseProfile -help'])
 image_id = run('image-identity', ['docker', 'image', 'inspect', image, '--format', '{{.Id}}'])
 image_id.check_returncode()
 summary = {'sourceCommit': os.environ['GITHUB_SHA'], 'imageId': image_id.stdout.decode().strip(),
     'buildProof': proof, 'runtimeDependencySha256': actual, 'dependencyMismatches': mismatches,
+    'buildStageDifferences': build_differences,
     'experimentalHelpExit': help_result.returncode, 'privateCheckpointUsed': False,
     'solverWindowStarted': False, 'productionCredentialsUsed': False, 'imagePublished': False,
     'coordinatorProof': False, 'trajectoryProof': False}

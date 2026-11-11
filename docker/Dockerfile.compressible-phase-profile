@@ -1,6 +1,11 @@
 # Worker image: OpenFOAM + Python. The container *is* the OpenFOAM environment,
 # so the solver runs locally inside it (AIRFOILFOAM_OPENFOAM_RUNNER=local).
-FROM opencfd/openfoam-run:2606@sha256:4229997e74defb81548222d511b8e3b95b98305e5df41b8e88b031813fe47eeb AS phase-build
+FROM opencfd/openfoam-run:2606@sha256:4229997e74defb81548222d511b8e3b95b98305e5df41b8e88b031813fe47eeb AS runtime-base
+USER root
+COPY scripts/materials/capture_phase_runtime_base.sh /build/capture_phase_runtime_base.sh
+RUN bash /build/capture_phase_runtime_base.sh
+
+FROM runtime-base AS phase-build
 
 ARG TARGETARCH
 USER root
@@ -24,6 +29,6 @@ RUN bash -lc 'source /usr/lib/openfoam/openfoam2606/etc/bashrc || exit 1; set -e
 COPY scripts/materials/build_compressible_phase_profile.py /build/build_compressible_phase_profile.py
 RUN bash -lc 'source /usr/lib/openfoam/openfoam2606/etc/bashrc || exit 1; set -e; export FOAM_USER_APPBIN=/opt/phase-profile/bin; mkdir -p "$FOAM_USER_APPBIN"; python3 /build/build_compressible_phase_profile.py build --source "$WM_PROJECT_DIR/applications/solvers/compressible/rhoPimpleFoam" --destination /build/phase-solver --proof /opt/phase-profile/proof'
 
-FROM opencfd/openfoam-run:2606@sha256:4229997e74defb81548222d511b8e3b95b98305e5df41b8e88b031813fe47eeb
+FROM runtime-base
 COPY --from=phase-build /opt/phase-profile /opt/phase-profile
 USER 1000:1003

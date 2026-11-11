@@ -26,9 +26,9 @@ def build_identity():
         raise ValueError('Original solver changed')
     if proof['environment']['WM_OPTIONS'] != 'linux64GccDPInt32Opt':
         raise ValueError('Experimental solver changed precision or build mode')
-    for name, expected in proof['dependencySha256'].items():
+    for name, expected in proof['runtimeBaseDependencySha256'].items():
         if common.digest(name) != expected:
-            raise ValueError('Build/runtime native dependency differs: ' + name)
+            raise ValueError('Pinned runtime native dependency differs: ' + name)
     proof['runtimeLdd'] = subprocess.check_output(['ldd', str(BINARY)], text=True)
     return proof
 
@@ -37,8 +37,8 @@ def inspect_build(output):
     shutil.copytree(PROOF, output / 'build-proof')
     shutil.copy2(BINARY, output / BINARY.name)
     proof = json.loads((PROOF / 'build-proof.json').read_text())
-    actual = {name: common.digest(name) if Path(name).is_file() else None for name in proof['dependencySha256']}
-    mismatches = {name: {'build': expected, 'runtime': actual[name]} for name, expected in proof['dependencySha256'].items()
+    actual = {name: common.digest(name) if Path(name).is_file() else None for name in proof['runtimeBaseDependencySha256']}
+    mismatches = {name: {'pinnedRuntime': expected, 'runtime': actual[name]} for name, expected in proof['runtimeBaseDependencySha256'].items()
                   if expected != actual[name]}
     common.write_json(output / 'runtime-preflight.json', {'buildProof': proof, 'runtimeDependencySha256': actual,
                       'dependencyMismatches': mismatches, 'experimentalBinarySha256': common.digest(BINARY),
