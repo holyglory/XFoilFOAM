@@ -9688,6 +9688,55 @@ describe("bounded progressive numerical recovery", () => {
         ${fixture.leases[0].token}::uuid, ${replacement.token}::uuid) ORDER BY token`)).toEqual(history);
   }, 120_000);
 
+  it("reopens an evidence-bearing material-domain gap for its existing precise recovery plan", async () => {
+    const fixture = await cfdEvidenceFixture(166, 3, [], [0]);
+    const evidence = await fixture.save(20, "rans", 0, {
+      failure_disposition: "material_domain",
+    });
+    await fixture.record([evidence]);
+    await stopped(fixture);
+
+    // Let ordinary settlement record the unresolved precise gap first. The
+    // material-domain recovery plan is created by the later diagnostic path,
+    // which is the production ordering that previously stranded this state.
+    await expect(settleProgressiveCfdExecution(db, fixture.composed.jobId))
+      .resolves.toMatchObject({ retry: 0, gaps: 1 });
+    expect(
+      await recordProgressiveCfdMaterialDomainRecoveryPlans(
+        db,
+        fixture.composed.jobId,
+      ),
+    ).toBe(1);
+
+    expect(await recoverTerminalProgressiveNoEvidenceGaps(db)).toBe(1);
+    expect(await recoverTerminalProgressiveNoEvidenceGaps(db)).toBe(0);
+    const [unit] = await db.execute(sql`
+      SELECT state,error FROM progressive_cfd_units
+      WHERE id=${fixture.leases[0].id}::uuid
+    `);
+    expect(unit).toMatchObject({
+      state: "pending",
+      error: "precise evidence remains unresolved",
+    });
+    expect(
+      await db.execute(sql`
+        SELECT count(*)::int AS count FROM progressive_cfd_evidence
+        WHERE attempt_token=${fixture.leases[0].token}::uuid
+      `),
+    ).toEqual([{ count: 1 }]);
+    const [claim] = await claimProgressiveCfdBatch(db, {
+      owner: "material-domain-evidence-bearing-gap",
+      leaseSeconds: 120,
+      solverBudgetVersion: 2,
+      allowedSolverFamilies: ["rhoPimpleFoam"],
+    });
+    expect(claim).toMatchObject({
+      id: fixture.leases[0].id,
+      recoveryPlanId: expect.any(String),
+      recipe: { selection: { solver: "rhoPimpleFoam" } },
+    });
+  }, 120_000);
+
   it("does not create a material fallback for another solver family", () => {
     expect(
       progressiveMaterialDomainRecipe(
