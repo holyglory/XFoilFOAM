@@ -1,6 +1,7 @@
 import { afterAll, expect, it } from "vitest";
 import { sql } from "drizzle-orm";
 import { createClient } from "../src/client";
+import { verifyRemoteWorkerIdentityIndex } from "../test-support/remote-worker-index-fixture";
 import {
   progressivePublicationBatchSelectionSql,
   progressivePublicationSelectionSql,
@@ -9,6 +10,13 @@ import {
 
 const client = createClient({ max: 1 });
 afterAll(() => client.sql.end());
+
+it("avoids bulky HUB job scans while retaining disabled-worker publication custody", async () => {
+  await verifyRemoteWorkerIdentityIndex(client.db, false, [
+    { name: "publication-active-lane", query: (lane) => progressivePublicationSelectionSql(lane, 4, "active") },
+    { name: "publication-backlog-lane", query: (lane) => progressivePublicationSelectionSql(lane, 4, "backlog") },
+  ]);
+}, 120_000);
 
 it("prioritizes active exact-owned reports before stale pending backlog", async () => {
   await client.db.transaction(async (transaction) => {

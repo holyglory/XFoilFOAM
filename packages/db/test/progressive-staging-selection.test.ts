@@ -1,6 +1,7 @@
 import { afterAll, expect, it } from "vitest";
 import { sql } from "drizzle-orm";
 import { createClient, type DB } from "../src/client";
+import { verifyRemoteWorkerIdentityIndex } from "../test-support/remote-worker-index-fixture";
 import { progressiveStagingSelectionSql } from "../../../apps/sweeper/src/progressive-staging-selection";
 import { nextProgressiveEvidenceWakeAt } from "../../../apps/sweeper/src/progressive-evidence-service";
 import {
@@ -10,6 +11,13 @@ import {
 
 const client = createClient({ max: 1 });
 afterAll(() => client.sql.end());
+
+it("avoids bulky HUB job scans while retaining disabled-worker staging custody", async () => {
+  await verifyRemoteWorkerIdentityIndex(client.db, true, [
+    { name: "staging-active", query: () => progressiveStagingSelectionSql(true) },
+    { name: "staging-backlog", query: () => progressiveStagingSelectionSql(false) },
+  ]);
+}, 120_000);
 
 async function withWakeFixture(
   scope: ProgressiveEvidenceWakeScope,

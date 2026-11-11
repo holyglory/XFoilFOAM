@@ -4094,6 +4094,13 @@ export const simJobs = pgTable(
     syncPromiseIdentityIdx: index("sim_jobs_sync_promise_identity_idx").on(
       sql`(${t.requestPayload}->>'syncPromiseId')`,
     ),
+    remoteWorkerIdentityIdx: index("sim_jobs_remote_worker_identity_idx")
+      .on(
+        sql`(${t.requestPayload}->>'upstreamBaseUrl')`,
+        sql`(${t.requestPayload}->>'syncPromiseId')`,
+        t.id,
+      )
+      .where(sql`${t.requestPayload}->>'remoteSolver' = 'true'`),
     remotePayloadCleanupIdx: index("sim_jobs_remote_payload_cleanup_idx")
       .on(t.updatedAt, t.id)
       .where(sql`(

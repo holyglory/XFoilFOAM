@@ -5178,7 +5178,7 @@ name = "progress-selection-regressions"
 tier = "development"
 timeout_seconds = 300
 requires = ["schema"]
-command = ["/bin/bash", "-c", "exec /usr/bin/corepack pnpm --filter @aerodb/db exec vitest run test/progressive-delivery-selection.test.ts --reporter=default --reporter=junit --outputFile.junit=\"$DEVCOORDINATOR_DIAGNOSTICS_DIR/report.xml\""]
+command = ["/bin/bash", "-c", "exec /usr/bin/corepack pnpm --filter @aerodb/db exec vitest run test/progressive-delivery-selection.test.ts test/progressive-staging-selection.test.ts test/progressive-publication-selection.test.ts --reporter=default --reporter=junit --outputFile.junit=\"$DEVCOORDINATOR_DIAGNOSTICS_DIR/report.xml\""]
 diagnostic_sources = [{ format = "junit", path = "report.xml" }]
 
 [[test.ingestion-recovery-final.check]]

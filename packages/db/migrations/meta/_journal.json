@@ -1366,6 +1366,13 @@
       "when": 1794355200000,
       "tag": "0194_progressive_diagnostic_recovery",
       "breakpoints": true
+    },
+    {
+      "idx": 195,
+      "version": "7",
+      "when": 1794374599512,
+      "tag": "0195_remote_worker_identity_index",
+      "breakpoints": true
     }
   ]
 }
