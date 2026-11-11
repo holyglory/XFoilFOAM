@@ -10,9 +10,9 @@ import {
   progressiveCfdNoAcceptedHistoryAndSettledSql,
   progressiveCfdOrdinaryAttemptCountSql,
   progressiveCfdCompletionRetryAvailableSql,
-  progressiveCfdMaterialDomainRecoveryAvailableSql,
   progressiveCfdPreciseVerificationAvailableSql,
 } from "./progressive-attempt-budget";
+import { progressiveCfdMaterialGapRecoveryAvailableSql, verifyProgressiveCfdMaterialGap } from "./progressive-cfd-material-gap";
 import { tryProgressiveAdmissionLock } from "./progressive-admission-lock";
 import { STALE_HZ_RESET_REASON } from "./progressive-remote-stale-recovery";
 import {
@@ -167,11 +167,25 @@ export async function recoverTerminalProgressiveNoEvidenceGaps(
 ): Promise<number> {
   return db.transaction(async (transaction) => {
     const connection = transaction as unknown as DB;
-    if (!(await tryProgressiveAdmissionLock(connection))) return 0;
     const [epoch] = await connection.execute(
       sql`SELECT id FROM calculation_epochs WHERE current FOR SHARE`,
     );
     if (!epoch) throw new Error("Calculation epoch is missing");
+    if (!(await tryProgressiveAdmissionLock(connection))) return 0;
+    // Campaign control owns the outer mutex, before any unit or job lock.
+    const campaigns = await connection.execute(sql`
+      SELECT campaign.id FROM sim_campaigns campaign
+      WHERE campaign.status IN ('active', 'attention', 'paused') AND EXISTS (
+        SELECT 1 FROM progressive_generations generation
+        JOIN progressive_work work ON work.generation_id = generation.id
+        JOIN progressive_cfd_units unit ON unit.work_id = work.id
+        WHERE generation.campaign_id = campaign.id AND generation.epoch_id = ${epoch.id}
+          AND generation.status = 'active' AND generation.plan_revision_id = campaign.current_plan_revision_id
+          AND work.state IN ('pending', 'gap') AND unit.state IN ('leased', 'gap', 'pending')
+      ) ORDER BY campaign.id FOR UPDATE SKIP LOCKED
+    `);
+    if (!campaigns.length) return 0;
+    const campaignIds = sql.join(campaigns.map((campaign) => sql`${campaign.id}::uuid`), sql`, `);
     await connection.execute(sql`
       WITH stranded AS MATERIALIZED (
         SELECT attempt.token, unit.id AS unit_id
@@ -184,6 +198,7 @@ export async function recoverTerminalProgressiveNoEvidenceGaps(
         JOIN progressive_cfd_execution_stops stopped ON stopped.sim_job_id = job.id
           AND stopped.engine_job_id = job.engine_job_id
         WHERE generation.epoch_id = ${epoch.id}
+          AND generation.campaign_id IN (${campaignIds})
           AND generation.status = 'active'
           AND generation.plan_revision_id = campaign.current_plan_revision_id
           AND ${effectiveProgressiveStageSql()} = work.stage
@@ -277,13 +292,10 @@ export async function recoverTerminalProgressiveNoEvidenceGaps(
           WHERE claimed.unit_id = recovery.unit_id
         )
     )`;
-    const materialDomainRecovery =
-      progressiveCfdMaterialDomainRecoveryAvailableSql("unit");
     const attemptAvailable = sql`(
       ${ordinaryAttempts} < 2
       OR ${progressiveCfdCompletionRetryAvailableSql()}
       OR ${publicationRecovery}
-      OR ${materialDomainRecovery}
       OR (
         ${ordinaryAttempts} = 2
         AND work.stage = 3
@@ -302,7 +314,8 @@ export async function recoverTerminalProgressiveNoEvidenceGaps(
     const claimEligible = sql`${attemptAvailable}
       AND unit.active_seconds < ${progressiveCfdEffectiveBudgetSql(sql`unit`)}`;
     const units = await connection.execute(sql`
-      SELECT unit.id, unit.work_id
+      SELECT unit.id, unit.work_id, attempt.token,
+        EXISTS (SELECT 1 FROM progressive_cfd_evidence evidence WHERE evidence.attempt_token = attempt.token) AS has_evidence
       FROM progressive_cfd_units unit
       JOIN progressive_work work ON work.id = unit.work_id
       JOIN progressive_generations generation ON generation.id = work.generation_id
@@ -315,6 +328,7 @@ export async function recoverTerminalProgressiveNoEvidenceGaps(
         ON stopped.sim_job_id = attempt_job.id
         AND stopped.engine_job_id = attempt_job.engine_job_id
       WHERE generation.epoch_id = ${epoch.id}
+          AND generation.campaign_id IN (${campaignIds})
         AND generation.status = 'active'
         AND generation.plan_revision_id = campaign.current_plan_revision_id
         AND ${effectiveProgressiveStageSql()} = work.stage
@@ -328,10 +342,6 @@ export async function recoverTerminalProgressiveNoEvidenceGaps(
             unit.state = 'pending'
             AND unit.error = ${TERMINAL_NO_EVIDENCE_RETRY_REASON}
           )
-        )
-        AND (
-          unit.attempts < 3
-          OR ${progressiveCfdBoundedNoEvidenceRecoveryAvailableSql()}
         )
         AND unit.lease_token IS NULL
         AND unit.lease_owner IS NULL
@@ -369,6 +379,11 @@ export async function recoverTerminalProgressiveNoEvidenceGaps(
           )
         )
         AND (
+          unit.attempts < 3
+          OR ${progressiveCfdMaterialGapRecoveryAvailableSql()}
+          OR ${progressiveCfdBoundedNoEvidenceRecoveryAvailableSql()}
+        )
+        AND (
           stopped.sim_job_id IS NOT NULL
           OR (
             attempt.error = ${STALE_HZ_RESET_REASON}
@@ -379,21 +394,19 @@ export async function recoverTerminalProgressiveNoEvidenceGaps(
           )
         )
         AND ${progressiveCfdNoAcceptedHistoryAndSettledSql()}
-        AND (
-          NOT EXISTS (
-            SELECT 1 FROM progressive_cfd_evidence evidence
-            WHERE evidence.attempt_token = attempt.token
-          )
-          OR ${materialDomainRecovery}
-        )
         AND NOT EXISTS (
           SELECT 1 FROM progressive_cfd_attempts newer
           WHERE newer.unit_id = unit.id
             AND (newer.started_at, newer.token) > (attempt.started_at, attempt.token)
         )
         AND (
-          (unit.state = 'gap' AND ${requeueEligible})
-          OR (unit.state = 'pending' AND NOT (${claimEligible}))
+          (
+            NOT EXISTS (SELECT 1 FROM progressive_cfd_evidence evidence WHERE evidence.attempt_token = attempt.token)
+            AND (unit.attempts < 3 OR ${progressiveCfdBoundedNoEvidenceRecoveryAvailableSql()})
+            AND ((unit.state = 'gap' AND ${requeueEligible})
+              OR (unit.state = 'pending' AND NOT (${claimEligible})))
+          )
+          OR ${progressiveCfdMaterialGapRecoveryAvailableSql()}
         )
       ORDER BY unit.attempts, unit.id
       LIMIT ${PROGRESSIVE_TERMINAL_RECOVERY_UNITS_PER_PASS}
@@ -401,6 +414,7 @@ export async function recoverTerminalProgressiveNoEvidenceGaps(
     `);
     let recovered = 0;
     for (const unit of units) {
+      if (unit.has_evidence && !(await verifyProgressiveCfdMaterialGap(connection, String(unit.id), String(unit.token)))) continue;
       const [requeued] = await connection.execute(sql`
         UPDATE progressive_cfd_units AS unit
         SET state = 'pending', lease_token = NULL, lease_owner = NULL,

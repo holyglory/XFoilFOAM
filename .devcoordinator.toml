@@ -1017,9 +1017,22 @@ timeout_seconds = 900
 timeout_seconds = 900
 
 [[test.material-domain-recovery.check]]
-name = "bounded-material-domain-fallback"
+name = "workspace"
 tier = "development"
-command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "admits one exact rhoPimpleFoam fallback"]
+command = ["/usr/bin/corepack", "pnpm", "install", "--frozen-lockfile", "--ignore-scripts"]
+
+[[test.material-domain-recovery.check]]
+name = "schema"
+tier = "development"
+requires = ["workspace"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "migrate"]
+
+[[test.material-domain-recovery.check]]
+name = "bounded-material-domain-recovery"
+tier = "development"
+requires = ["schema"]
+command = ["/bin/bash", "-c", "exec /usr/bin/corepack pnpm --filter @aerodb/db exec vitest run test/campaign-profile-enrollment.test.ts -t 'admits one exact rhoPimpleFoam fallback|reopens an evidence-bearing material-domain gap' --reporter=default --reporter=junit --outputFile.junit=\"$DEVCOORDINATOR_DIAGNOSTICS_DIR/report.xml\""]
+diagnostic_sources = [{ format = "junit", path = "report.xml" }]
 
 [test.material-domain-recovery.postgres]
 image = "postgres:16-alpine"
