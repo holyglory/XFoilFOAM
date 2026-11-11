@@ -1050,6 +1050,10 @@ async function verifyCancelledAcceptedPublication(db: DB, envelope: ProgressiveR
       expect(sim.statusCode, sim.body).toBe(200);
       expect(sim.json()).toMatchObject({ resultId: raw.resultId });
     });
+    if (incomingFidelity === "urans_full" && !retired) {
+      const { verifyCurrentPreciseEvidenceReuse } = await import("./progressive-current-evidence-reuse-fixture");
+      await verifyCurrentPreciseEvidenceReuse(connection, envelope, raw.id);
+    }
   });
 }
 
