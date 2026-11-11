@@ -10,6 +10,7 @@ import {
   progressiveCfdNoAcceptedHistoryAndSettledSql,
   progressiveCfdOrdinaryAttemptCountSql,
   progressiveCfdCompletionRetryAvailableSql,
+  progressiveCfdMaterialDomainRecoveryAvailableSql,
   progressiveCfdPreciseVerificationAvailableSql,
 } from "./progressive-attempt-budget";
 import { tryProgressiveAdmissionLock } from "./progressive-admission-lock";
@@ -276,10 +277,13 @@ export async function recoverTerminalProgressiveNoEvidenceGaps(
           WHERE claimed.unit_id = recovery.unit_id
         )
     )`;
+    const materialDomainRecovery =
+      progressiveCfdMaterialDomainRecoveryAvailableSql("unit");
     const attemptAvailable = sql`(
       ${ordinaryAttempts} < 2
       OR ${progressiveCfdCompletionRetryAvailableSql()}
       OR ${publicationRecovery}
+      OR ${materialDomainRecovery}
       OR (
         ${ordinaryAttempts} = 2
         AND work.stage = 3
@@ -375,9 +379,12 @@ export async function recoverTerminalProgressiveNoEvidenceGaps(
           )
         )
         AND ${progressiveCfdNoAcceptedHistoryAndSettledSql()}
-        AND NOT EXISTS (
-          SELECT 1 FROM progressive_cfd_evidence evidence
-          WHERE evidence.attempt_token = attempt.token
+        AND (
+          NOT EXISTS (
+            SELECT 1 FROM progressive_cfd_evidence evidence
+            WHERE evidence.attempt_token = attempt.token
+          )
+          OR ${materialDomainRecovery}
         )
         AND NOT EXISTS (
           SELECT 1 FROM progressive_cfd_attempts newer
