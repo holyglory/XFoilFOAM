@@ -477,7 +477,8 @@ export async function claimProgressiveCfdUnit(
         AND unit.state = 'pending' AND ${attemptAvailable} AND unit.active_seconds < ${effectiveBudget}
         AND (unit.retry_after IS NULL OR unit.retry_after <= clock_timestamp())
         AND (unit.purpose <> 'adaptive' OR ${initialCoverageComplete})`;
-      const candidateOrder = sql`CASE WHEN target.mach < 1.0 THEN 0 WHEN target.mach >= 1.0 THEN 1 ELSE 2 END,
+      const candidateOrder = sql`CASE WHEN ${progressiveCfdMaterialDomainRecoveryAvailableSql("unit")} THEN 0 ELSE 1 END,
+        CASE WHEN target.mach < 1.0 THEN 0 WHEN target.mach >= 1.0 THEN 1 ELSE 2 END,
         CASE WHEN target.mach >= 1.0 THEN target.mach END ASC NULLS LAST,
         generation.created_at, generation.id,
         CASE WHEN work.stage = 2 AND unit.purpose = 'initial' AND unit.attempts = 0 THEN 0 ELSE 1 END,
