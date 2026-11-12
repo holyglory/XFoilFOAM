@@ -21,6 +21,7 @@ import signal
 import time as time_mod
 from pathlib import Path
 from types import SimpleNamespace
+import pytest
 
 from airfoilfoam import pipeline, tasks
 from airfoilfoam.config import Settings
@@ -46,6 +47,9 @@ from airfoilfoam.pipeline import (
     write_transient_start_marker,
 )
 from airfoilfoam.storage import JobStore
+from airfoilfoam.openfoam.budget import BudgetedRunner, begin_case_budget
+from airfoilfoam.openfoam.dialects import OPENCFD_2606_IDENTITY
+from airfoilfoam.openfoam.runner import InfrastructureError
 from airfoilfoam.tasks import (
     MARCH_HOPELESS_FACTOR,
     MARCH_TRAIL_MIN_SPAN_S,
@@ -389,6 +393,52 @@ def test_must_catch_march_stopped_chunk_grades_continuable(tmp_path, monkeypatch
     # Neither guard marker travels into the staged continuation.
     assert not (staged / MARCH_BUDGET_MARKER_FILENAME).exists()
     assert not (staged / MARCH_STOP_MARKER_FILENAME).exists()
+
+
+def test_pipeline_march_marker_uses_remaining_physical_case_budget(tmp_path, monkeypatch):
+    """The marker must track BudgetedRunner's case allowance, not the outer
+    task timeout, or the heartbeat warmup can outlive the real solver budget."""
+
+    class FakeCaseBuilder:
+        def __init__(self, *_a, **_k):
+            pass
+
+        def write_transient(self, *_a, **_k) -> None:
+            pass
+
+    class InnerRunner:
+        external_paths_visible = False
+        settings = SimpleNamespace(
+            engine_identity=lambda: OPENCFD_2606_IDENTITY,
+            resolved_worker_cpu_budget=lambda: 4,
+        )
+
+        def solver(self, case_dir, *_args, **_kwargs):
+            raise InfrastructureError("budget-marker launch probe")
+
+    monkeypatch.setattr(pipeline, "CaseBuilder", FakeCaseBuilder)
+    _case_dir, tcase = _transient_case(tmp_path)
+    spec = CaseSpec(chord=1.0, speed=50.0, aoa_deg=25.0)
+    runner = BudgetedRunner(InnerRunner(), 10.0)
+    begin_case_budget(runner, spec)
+
+    with pytest.raises(InfrastructureError, match="budget-marker launch probe"):
+        _run_transient_attempt(
+            tcase,
+            airfoil=None, tmesh=None, patches={},
+            spec=spec,
+            fluid=FLUID, roughness=RoughnessParams(),
+            solver_params=SolverParams(force_transient=True, urans_min_periods=3),
+            runner=runner,
+            n_proc=1,
+            timeout=100.0,
+            run_time=0.3,
+            delta_t=1e-5,
+            coeff_start_time=0.0,
+        )
+    marker = read_march_budget_marker(tcase)
+    assert marker is not None
+    assert marker["budget_s"] == pytest.approx(10.0)
 
 
 def test_clean_run_grades_normally_despite_stale_stop_marker(tmp_path, monkeypatch):
