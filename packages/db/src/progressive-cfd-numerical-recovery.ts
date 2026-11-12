@@ -1,4 +1,4 @@
-import { sql } from "drizzle-orm";
+import { sql, type SQL } from "drizzle-orm";
 import { PROGRESSIVE_COMPUTE_POLICY } from "@aerodb/core";
 import { analysisContentHash, canonicalAnalysisJson } from "./analysis-target";
 import type { DB } from "./client";
@@ -81,6 +81,21 @@ export function normalizeProgressiveMaterialDomainRecoveryRecipe(
     (normalized.solver as Record<string, unknown>).transient_max_courant =
       (normalized.solver as Record<string, unknown>).transientMaxCourant;
   return normalized;
+}
+
+export function normalizeProgressiveMaterialDomainRecoveryRecipeSql(
+  recipe: SQL,
+): SQL {
+  return sql`CASE WHEN ${recipe}->'selection'->>'reason' = 'bounded_material_domain_recovery'
+    AND ${recipe}->'selection'->>'solver' = 'rhoPimpleFoam'
+    THEN jsonb_set(
+      jsonb_set(${recipe}, '{solver,momentumScheme}', '"upwind"'::jsonb),
+      '{solver,transientMaxCourant}', to_jsonb(least(coalesce(
+        (${recipe}->'solver'->>'transientMaxCourant')::double precision,
+        (${recipe}->'solver'->>'transient_max_courant')::double precision,
+        1
+      ), 1))
+    ) ELSE ${recipe} END`;
 }
 
 interface RecoveryUnit {
