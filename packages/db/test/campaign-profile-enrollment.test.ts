@@ -9787,6 +9787,72 @@ describe("bounded progressive numerical recovery", () => {
     });
   }, 120_000);
 
+  it("reopens an attempt-two material-domain gap without exceeding the bounded retry", async () => {
+    const fixture = await cfdEvidenceFixture(166.5, 3, [], [0]);
+    const evidence = await fixture.save(20, "rans", 0, {
+      failure_disposition: "material_domain",
+    });
+    await fixture.record([evidence]);
+    const [currentJob] = await db.execute(sql`
+      SELECT airfoil_id,bc_ids,reference_chord_m,campaign_id,simulation_preset_revision_id,
+        request_payload FROM sim_jobs WHERE id=${fixture.composed.jobId}::uuid
+    `);
+    const priorJobId = randomUUID();
+    const priorToken = randomUUID();
+    const proof = executionStopProof(priorJobId);
+    await db.execute(sql`
+      INSERT INTO sim_jobs
+        (id,engine_job_id,airfoil_id,bc_ids,reference_chord_m,campaign_id,
+         simulation_preset_revision_id,status,engine_state,request_payload,
+         "ingestedAt","finishedAt")
+      VALUES (${priorJobId}::uuid,${priorJobId},${currentJob.airfoil_id},
+        ${JSON.stringify(currentJob.bc_ids)}::jsonb,${currentJob.reference_chord_m},${currentJob.campaign_id},
+        ${currentJob.simulation_preset_revision_id},'cancelled'::sim_job_status,
+        'cancelled',${JSON.stringify(currentJob.request_payload)}::jsonb,
+        clock_timestamp(),clock_timestamp())
+    `);
+    await db.execute(sql`
+      INSERT INTO progressive_cfd_attempts
+        (token,unit_id,owner,execution_recipe_id,sim_job_id,started_at,lease_until,
+         outcome,active_seconds,finished_at,error)
+      SELECT ${priorToken}::uuid,unit_id,owner,execution_recipe_id,
+        ${priorJobId}::uuid,started_at-interval '1 second',started_at-interval '1 second',
+        'cancelled',0,started_at-interval '1 second','never-started fixture history'
+      FROM progressive_cfd_attempts WHERE token=${fixture.leases[0].token}::uuid
+    `);
+    await db.execute(sql`
+      INSERT INTO progressive_cfd_execution_stops
+        (sim_job_id,engine_job_id,epoch_id,proof,proof_signature,observed_at)
+      VALUES (${priorJobId}::uuid,${priorJobId},${fixture.leases[0].epochId}::uuid,
+        ${JSON.stringify(proof)}::jsonb,${analysisContentHash(proof)},clock_timestamp())
+    `);
+    await stopped(fixture);
+    await db.execute(sql`
+      UPDATE progressive_cfd_units SET attempts=2
+      WHERE id=${fixture.leases[0].id}::uuid
+    `);
+    await expect(settleProgressiveCfdExecution(db, fixture.composed.jobId))
+      .resolves.toMatchObject({ retry: 0, gaps: 1 });
+    expect(await recordProgressiveCfdMaterialDomainRecoveryPlans(db, fixture.composed.jobId)).toBe(1);
+    const [shape] = await db.execute(sql`
+      SELECT unit.attempts,(SELECT count(*)::int FROM progressive_cfd_attempts history WHERE history.unit_id=unit.id) AS history
+      FROM progressive_cfd_units unit WHERE unit.id=${fixture.leases[0].id}::uuid
+    `);
+    expect(shape).toEqual({ attempts: 2, history: 2 });
+    expect(await recoverTerminalProgressiveNoEvidenceGaps(db)).toBe(1);
+    expect(await recoverTerminalProgressiveNoEvidenceGaps(db)).toBe(0);
+    const [claim] = await claimProgressiveCfdBatch(db, {
+      owner: "material-domain-attempt-two",
+      leaseSeconds: 120,
+      solverBudgetVersion: 2,
+      allowedSolverFamilies: ["rhoPimpleFoam"],
+    });
+    expect(claim).toMatchObject({
+      id: fixture.leases[0].id,
+      recipe: { selection: { solver: "rhoPimpleFoam" } },
+    });
+  }, 120_000);
+
   it("does not create a material fallback for another solver family", () => {
     expect(
       progressiveMaterialDomainRecipe(

@@ -5286,7 +5286,7 @@ name = "settlement-campaign-regressions"
 tier = "development"
 timeout_seconds = 1200
 requires = ["seed"]
-command = ["/bin/bash", "-c", "exec /usr/bin/corepack pnpm --filter @aerodb/db exec vitest run test/campaign-profile-enrollment.test.ts -t 'retains exact stopped failed attempts|recovers terminal remote material failure ingestion|delivers an exact physical case beside a retained terminal material diagnostic|reopens an evidence-bearing material-domain gap|progressive remote dispatch pins one exact request|bounded progressive numerical recovery|bounded completion retry eligibility' --reporter=default --reporter=junit --outputFile.junit=\"$DEVCOORDINATOR_DIAGNOSTICS_DIR/report.xml\""]
+command = ["/bin/bash", "-c", "exec /usr/bin/corepack pnpm --filter @aerodb/db exec vitest run test/campaign-profile-enrollment.test.ts -t 'retains exact stopped failed attempts|recovers terminal remote material failure ingestion|delivers an exact physical case beside a retained terminal material diagnostic|reopens an evidence-bearing material-domain gap|reopens an attempt-two material-domain gap|progressive remote dispatch pins one exact request|bounded progressive numerical recovery|bounded completion retry eligibility' --reporter=default --reporter=junit --outputFile.junit=\"$DEVCOORDINATOR_DIAGNOSTICS_DIR/report.xml\""]
 diagnostic_sources = [{ format = "junit", path = "report.xml" }]
 resources = [{ kind = "database", id = "ingestion-recovery-campaign-fixtures", access = "exclusive" }]
 

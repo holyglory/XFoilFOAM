@@ -17,7 +17,7 @@ export function progressiveCfdMaterialGapRecoveryAvailableSql() {
   return sql`(
     work.stage = 3 AND unit.state = 'gap'
     AND unit.error = 'precise evidence remains unresolved'
-    AND unit.attempts = 3
+    AND unit.attempts IN (2, 3)
     AND unit.attempts = (SELECT count(*) FROM progressive_cfd_attempts history WHERE history.unit_id = unit.id)
     AND unit.active_seconds < unit.active_budget_seconds
     AND attempt.outcome = 'failed' AND attempt.finished_at IS NOT NULL
