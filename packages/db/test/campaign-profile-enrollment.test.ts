@@ -186,6 +186,7 @@ import {
   admitProgressiveCfdBudgetExtension,
   recoverProgressiveFastBudgetExtensions,
 } from "../src/progressive-cfd-budget-extension";
+import { progressiveCfdOrdinaryAttemptCountSql } from "../src/progressive-attempt-budget";
 
 import { createClient, type DB } from "../src/client";
 import { databaseUrl } from "../src/env";
@@ -2085,6 +2086,59 @@ function executionStopProof(engineJobId: string): EngineExecutionStopProof {
     error: null,
     fence: "terminal_result",
   };
+}
+
+async function addNeverStartedAttemptHistory(
+  fixture: { composed: { jobId: string } },
+  lease: ProgressiveCfdLease,
+) {
+  const [currentJob] = await db.execute(sql`
+    SELECT airfoil_id, bc_ids, reference_chord_m, campaign_id,
+      simulation_preset_revision_id, request_payload
+    FROM sim_jobs WHERE id = ${fixture.composed.jobId}::uuid
+  `);
+  const [currentEpoch] = await db.execute(sql`
+    SELECT generation.epoch_id
+    FROM progressive_cfd_units unit
+    JOIN progressive_work work ON work.id = unit.work_id
+    JOIN progressive_generations generation ON generation.id = work.generation_id
+    WHERE unit.id = ${lease.id}::uuid
+  `);
+  const priorJobId = randomUUID();
+  const priorToken = randomUUID();
+  const proof = {
+    ...executionStopProof(priorJobId),
+    fence: "cancel_marker" as const,
+    ownership_basis: "never_started_cancellation_fence" as const,
+  };
+  await db.execute(sql`
+    INSERT INTO sim_jobs
+      (id, engine_job_id, airfoil_id, bc_ids, reference_chord_m, campaign_id,
+       simulation_preset_revision_id, status, engine_state, request_payload,
+       "ingestedAt", "finishedAt")
+    VALUES (${priorJobId}::uuid, ${priorJobId}, ${currentJob.airfoil_id},
+      ${JSON.stringify(currentJob.bc_ids)}::jsonb, ${currentJob.reference_chord_m},
+      ${currentJob.campaign_id}, ${currentJob.simulation_preset_revision_id},
+      'cancelled'::sim_job_status, 'cancelled',
+      ${JSON.stringify(currentJob.request_payload)}::jsonb,
+      clock_timestamp(), clock_timestamp())
+  `);
+  await db.execute(sql`
+    INSERT INTO progressive_cfd_attempts
+      (token, unit_id, owner, execution_recipe_id, sim_job_id, started_at,
+       lease_until, outcome, active_seconds, finished_at, error)
+    SELECT ${priorToken}::uuid, unit_id, owner, execution_recipe_id,
+      ${priorJobId}::uuid, started_at - interval '1 second',
+      started_at - interval '1 second', 'cancelled', 0,
+      started_at - interval '1 second', 'never-started fixture history'
+    FROM progressive_cfd_attempts WHERE token = ${lease.token}::uuid
+  `);
+  await db.execute(sql`
+    INSERT INTO progressive_cfd_execution_stops
+      (sim_job_id, engine_job_id, epoch_id, proof, proof_signature, observed_at)
+    VALUES (${priorJobId}::uuid, ${priorJobId}, ${currentEpoch.epoch_id}::uuid,
+      ${JSON.stringify(proof)}::jsonb, ${analysisContentHash(proof)}, clock_timestamp())
+  `);
 }
 
 describe("progressive durable stage transitions", () => {
@@ -7440,6 +7494,7 @@ describe("progressive execution stop and settlement", () => {
         .where(eq(resultAttempts.id, resultAttemptId));
     }
     await fixture.record([eligibleResult, noninformativeResult]);
+    await addNeverStartedAttemptHistory(fixture, eligible);
     await db.execute(sql`
       UPDATE progressive_cfd_attempts
       SET outcome = 'failed', active_seconds = 900, finished_at = clock_timestamp(),
@@ -7448,7 +7503,8 @@ describe("progressive execution stop and settlement", () => {
     `);
     await db.execute(sql`
       UPDATE progressive_cfd_units
-      SET attempts = 2, active_seconds = 900, lease_token = NULL,
+      SET attempts = CASE WHEN id = ${eligible.id}::uuid THEN 3 ELSE 2 END,
+        active_seconds = 900, lease_token = NULL,
         lease_owner = NULL, lease_until = NULL, state = CASE
           WHEN id = ${eligible.id}::uuid THEN 'gap'
           WHEN id = ${noninformative.id}::uuid THEN 'gap'
@@ -7463,6 +7519,12 @@ describe("progressive execution stop and settlement", () => {
       UPDATE progressive_work SET state = 'pending', error = NULL, completed_at = NULL
       WHERE id = ${eligible.workId}::uuid
     `);
+    expect(
+      await db.execute(sql`
+        SELECT attempts, ${progressiveCfdOrdinaryAttemptCountSql()} AS ordinary_attempts
+        FROM progressive_cfd_units WHERE id = ${eligible.id}::uuid
+      `),
+    ).toEqual([{ attempts: 3, ordinary_attempts: 2 }]);
 
     const recovered = await recoverProgressiveFastBudgetExtensions(db, {
       campaignId: fixture.campaignId,
@@ -7505,6 +7567,56 @@ describe("progressive execution stop and settlement", () => {
         state: "pending",
       },
     ]);
+  });
+
+  it("refuses FAST budget extension with three ordinary attempts", async () => {
+    const fixture = await fitFixture(2, false, [0]);
+    const lease = fixture.leases[0];
+    const resultAttemptId = await fixture.save(900, "urans", lease.alpha, {
+      fidelity: "urans_precalc",
+      force_history: { t: [0, 1], cl: [0, 0], cd: [0.02, 0.02], cm: [0, 0] },
+    });
+    await db
+      .update(resultAttempts)
+      .set({
+        engineJobId: fixture.engineJobId,
+        engineCaseSlug: "c0p1_u30/a0",
+        error: "URANS integration stopped by the wall-clock budget guard",
+        qualityWarnings: ["stopped by the wall-clock budget guard"],
+      })
+      .where(eq(resultAttempts.id, resultAttemptId));
+    await fixture.record([resultAttemptId]);
+    await db.execute(sql`UPDATE progressive_cfd_attempts
+      SET outcome = 'failed', active_seconds = 900, finished_at = clock_timestamp(),
+        error = 'active compute budget exhausted'
+      WHERE token = ${lease.token}`);
+    await db.execute(sql`UPDATE progressive_cfd_units
+      SET attempts = 3, active_seconds = 900, state = 'gap',
+        lease_token = NULL, lease_owner = NULL, lease_until = NULL,
+        error = 'active compute budget exhausted'
+      WHERE id = ${lease.id}`);
+    await db.execute(sql`UPDATE progressive_work SET state = 'pending', error = NULL,
+      completed_at = NULL WHERE id = ${lease.workId}`);
+    expect(
+      await db.execute(sql`
+        SELECT attempts, ${progressiveCfdOrdinaryAttemptCountSql()} AS ordinary_attempts
+        FROM progressive_cfd_units WHERE id = ${lease.id}::uuid
+      `),
+    ).toEqual([{ attempts: 3, ordinary_attempts: 3 }]);
+    await expect(
+      admitProgressiveCfdBudgetExtension(db, {
+        unitId: lease.id,
+        attemptToken: lease.token,
+      }),
+    ).resolves.toBe(false);
+    await expect(
+      recoverProgressiveFastBudgetExtensions(db, {
+        campaignId: fixture.campaignId,
+        expectedCount: 1,
+      }),
+    ).rejects.toThrow(
+      "FAST budget recovery candidate count changed: expected 1, found 0",
+    );
   });
 
   it("quarantines conflicting execution identities without touching the foreign engine job", async () => {

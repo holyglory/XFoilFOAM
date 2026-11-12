@@ -1,6 +1,7 @@
 import { sql, type SQL } from "drizzle-orm";
 import { PROGRESSIVE_COMPUTE_POLICY } from "@aerodb/core";
 import type { DB } from "./client";
+import { progressiveCfdOrdinaryAttemptCountSql } from "./progressive-attempt-budget";
 
 export const PROGRESSIVE_FAST_BUDGET_EXTENSION_POLICY =
   "progressive-fast-budget-extension-v1" as const;
@@ -75,7 +76,8 @@ export async function admitProgressiveCfdBudgetExtension(
       AND generation.status = 'active'
       AND source_attempt.outcome IN ('running', 'failed')
       AND source_attempt.active_seconds > 0
-      AND unit.attempts = 2
+      AND unit.attempts BETWEEN 2 AND 3
+      AND ${progressiveCfdOrdinaryAttemptCountSql()} = 2
       AND unit.active_seconds >= unit.active_budget_seconds
       AND raw.engine_job_id IS NOT NULL
       AND raw.engine_case_slug IS NOT NULL
@@ -181,7 +183,8 @@ export async function recoverProgressiveFastBudgetExtensions(
         AND unit.error = 'active compute budget exhausted'
         AND source.outcome IN ('running', 'failed')
         AND source.attempt_active_seconds > 0
-        AND unit.attempts = 2
+        AND unit.attempts BETWEEN 2 AND 3
+        AND ${progressiveCfdOrdinaryAttemptCountSql()} = 2
         AND unit.active_seconds >= unit.active_budget_seconds
         AND source.engine_job_id IS NOT NULL
         AND source.engine_case_slug IS NOT NULL
