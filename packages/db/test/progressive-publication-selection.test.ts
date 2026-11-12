@@ -317,11 +317,24 @@ it("prioritizes active exact-owned reports before stale pending backlog", async 
               Number(node["Rows Removed by Filter"] ?? 0)),
         0,
       );
+      const jobScans = nodes.filter(
+        (node) => node["Relation Name"] === "sim_jobs",
+      );
+      const examinedJobs = jobScans.reduce(
+        (total, node) =>
+          total +
+          Number(node["Actual Loops"]) *
+            (Number(node["Actual Rows"]) +
+              Number(node["Rows Removed by Filter"] ?? 0)),
+        0,
+      );
       console.info(
         JSON.stringify({
           name,
           scannedRows,
+          examinedJobs,
           publicationPlan: scans,
+          jobPlan: jobScans,
           reportSelectionMs: plan["Execution Time"],
         }),
       );
@@ -346,16 +359,6 @@ it("prioritizes active exact-owned reports before stale pending backlog", async 
         ),
       ).toBe(false);
       expect(scannedRows).toBeLessThan(32);
-      const examinedJobs = nodes
-        .filter((node) => node["Relation Name"] === "sim_jobs")
-        .reduce(
-          (total, node) =>
-            total +
-            Number(node["Actual Loops"]) *
-              (Number(node["Actual Rows"]) +
-                Number(node["Rows Removed by Filter"] ?? 0)),
-          0,
-        );
       expect(examinedJobs).toBeLessThan(32);
       expect(scans.some((node) => node["Node Type"] === "Seq Scan")).toBe(
         false,

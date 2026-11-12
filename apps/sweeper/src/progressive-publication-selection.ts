@@ -38,16 +38,27 @@ function progressivePublicationHeadsSql() {
 }
 
 function progressivePublicationEligibleSql(lane: number, laneCount: number) {
-  // Keep ownership outside the exact head lookup. Otherwise the planner can
-  // scan every report for this solver before joining the pending job heads.
+  // Keep every metadata lookup correlated to the pending head. Without these
+  // barriers the planner can scan retained jobs or every report for this
+  // solver before joining the heads, even though only a few jobs have work.
   return sql`
     SELECT report.sim_job_id, report.created_at, report.sequence,
       (promise.status = 'active' AND promise."expiresAt" > clock_timestamp()
         AND job.status IN ('pending', 'submitted', 'running', 'ingesting')) AS active_lease
     FROM pending_heads head
-    JOIN sim_jobs job ON job.id = head.sim_job_id
-    JOIN sync_sweep_promises promise
-      ON promise.id::text = job.request_payload->>'syncPromiseId'
+    JOIN LATERAL (
+      SELECT stored_job.status, stored_job.request_payload
+      FROM sim_jobs stored_job
+      WHERE stored_job.id = head.sim_job_id
+      OFFSET 0
+    ) job ON true
+    JOIN LATERAL (
+      SELECT stored_promise.status, stored_promise."expiresAt",
+        stored_promise.registered_solver_id, stored_promise.source_base_url
+      FROM sync_sweep_promises stored_promise
+      WHERE stored_promise.id::text = job.request_payload->>'syncPromiseId'
+      OFFSET 0
+    ) promise ON true
     CROSS JOIN settings
     JOIN LATERAL (
       SELECT stored.sim_job_id, stored.created_at, stored.sequence,
