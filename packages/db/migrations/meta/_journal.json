@@ -1380,6 +1380,13 @@
       "when": 1794377049277,
       "tag": "0196_restore_remote_worker_identity_index",
       "breakpoints": true
+    },
+    {
+      "idx": 197,
+      "version": "7",
+      "when": 1794496011000,
+      "tag": "0197_progressive_cancelled_no_result_final_stop",
+      "breakpoints": true
     }
   ]
 }

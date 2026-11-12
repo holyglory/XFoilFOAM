@@ -112,6 +112,11 @@ export function resolveProgressiveReportedPoint(
 export function isFinalProgressiveRemoteReport(
   report: ProgressiveRemoteReport,
 ): boolean {
+  const cancelledWithoutResult =
+    report.result === null &&
+    report.status.state === "cancelled" &&
+    report.status.completed_cases === 0 &&
+    report.stopProof !== null;
   return (
     report.stopProof !== null &&
     ["completed", "failed", "cancelled"].includes(report.status.state) &&
@@ -123,6 +128,7 @@ export function isFinalProgressiveRemoteReport(
         (["deterministic_mesh", "infrastructure"].includes(
           String(report.status.failure_disposition),
         ) || hasPermanentContinuationFailure(report.status))) ||
+      cancelledWithoutResult ||
       (report.result !== null &&
         ["completed", "failed", "cancelled"].includes(report.result.state)))
   );

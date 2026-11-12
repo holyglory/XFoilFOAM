@@ -148,8 +148,16 @@ export async function readProgressiveRemoteSourceClassifications(
 export function terminalReportHasNoPhysicalEvidence(
   report: ProgressiveRemoteReport,
 ): boolean {
-  if (!report.result || !["failed", "cancelled"].includes(report.result.state))
-    return false;
+  if (!report.result) {
+    // A worker may terminate before it has a polar object to serialize. A
+    // terminal zero-case report is still truthful no-evidence evidence; it
+    // must not wait forever for raw evidence that cannot exist.
+    return (
+      ["failed", "cancelled"].includes(report.status.state) &&
+      report.status.completed_cases === 0
+    );
+  }
+  if (!["failed", "cancelled"].includes(report.result.state)) return false;
   const polars = report.result.polars ?? [];
   const points = polars.flatMap((polar) => polar.points ?? []);
   const attempts = polars.flatMap((polar) => polar.attempts ?? []);

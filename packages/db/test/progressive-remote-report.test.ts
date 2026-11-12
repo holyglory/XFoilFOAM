@@ -146,6 +146,39 @@ it("recognizes terminal infrastructure reports with no physical evidence", () =>
   expect(terminalReportHasNoPhysicalEvidence(input.report)).toBe(false);
 });
 
+it("recognizes a zero-case terminal cancellation without a serialized result", () => {
+  const input = fixture();
+  input.report.status.state = "cancelled";
+  input.report.status.completed_cases = 0;
+  input.report.result = null;
+  expect(terminalReportHasNoPhysicalEvidence(input.report)).toBe(true);
+
+  input.report.status.completed_cases = 1;
+  expect(terminalReportHasNoPhysicalEvidence(input.report)).toBe(false);
+});
+
+it("finishes an authenticated cancelled execution with no serialized result", () => {
+  const { assignment, report } = fixture();
+  report.status.state = "cancelled";
+  report.status.total_cases = assignment.scope.units.length;
+  report.status.completed_cases = 0;
+  report.result = null;
+  report.stopProof = {
+    version: 1,
+    job_id: report.executionId,
+    execution_stopped: true,
+    producer_stopped: true,
+    namespace_verified: true,
+    remaining: [],
+    observed_at: "2026-09-07T09:00:00Z",
+    error: null,
+    fence: "terminal_result",
+    ownership_basis: "recorded_execution_namespace",
+  };
+  expect(validateProgressiveRemoteReport(report, assignment).report).toEqual(report);
+  expect(isFinalProgressiveRemoteReport(report)).toBe(true);
+});
+
 it("classifies only artifact-free failed points in a mixed terminal report", () => {
   const input = fixture();
   input.report.status.state = "failed";
@@ -450,6 +483,7 @@ describe("remote progressive incremental report validation", () => {
       completed_cases: 0,
       failure_disposition: "infrastructure",
     });
+    expect(isFinalProgressiveRemoteReport(report)).toBe(true);
     report.stopProof.namespace_verified = false;
     expect(() => validateProgressiveRemoteReport(report, assignment)).toThrow(
       "verified execution-stop proof",

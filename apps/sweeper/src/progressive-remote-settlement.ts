@@ -542,7 +542,8 @@ async function ingestTerminalRemoteFailureAttempts(
   );
   if (
     validated.contentSignature !== latest.content_signature ||
-    !terminalReportHasNoPhysicalEvidence(validated.report)
+    !terminalReportHasNoPhysicalEvidence(validated.report) ||
+    !validated.report.result
   )
     return false;
   // This compatibility path only imports material-domain diagnostics. Other

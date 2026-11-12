@@ -8202,6 +8202,9 @@ export const progressiveWorkerReports = pgTable(
           AND (${table.report}#>>'{status,failure_disposition}' IN ('deterministic_mesh', 'infrastructure')
             OR ${table.report}#>>'{status,continuation_failure_kind}' = 'permanent'
             OR ${table.report}#>>'{status,message}' LIKE '%continuation_source_permanent:%'))
+        OR (${table.report}->'result' = 'null'::jsonb
+          AND ${table.report}#>>'{status,state}' = 'cancelled'
+          AND ${table.report}#>>'{status,completed_cases}' = '0')
       )`),
     sequenceCheck: check(
       "progressive_worker_reports_sequence_check",

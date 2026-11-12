@@ -161,11 +161,16 @@ export async function reconcileProgressiveRemoteWorker(
           AND report.stopped_engine_job_id = job.id::text
           AND (report.report#>>'{stopProof,ownership_basis}' = 'never_started_cancellation_fence'
             OR report.report#>>'{result,state}' IN ('completed', 'failed', 'cancelled')
-            OR (report.report->'result' = 'null'::jsonb AND report.report#>>'{status,state}' = 'failed'
-              AND report.report#>>'{status,total_cases}' = '0' AND report.report#>>'{status,completed_cases}' = '0'
+            OR (report.report->'result' = 'null'::jsonb
+              AND report.report#>>'{status,state}' = 'failed'
+              AND report.report#>>'{status,total_cases}' = '0'
+              AND report.report#>>'{status,completed_cases}' = '0'
               AND (report.report#>>'{status,failure_disposition}' IN ('deterministic_mesh', 'infrastructure')
                 OR report.report#>>'{status,continuation_failure_kind}' = 'permanent'
-                OR report.report#>>'{status,message}' LIKE '%continuation_source_permanent:%')))
+                OR report.report#>>'{status,message}' LIKE '%continuation_source_permanent:%'))
+            OR (report.report->'result' = 'null'::jsonb
+              AND report.report#>>'{status,state}' = 'cancelled'
+              AND report.report#>>'{status,completed_cases}' = '0')))
           AND report.assignment_signature = coalesce(intent.assignment_signature, job.request_payload#>>'{remoteProgressiveExecution,contentSignature}')))
       ${
         options.jobIds
