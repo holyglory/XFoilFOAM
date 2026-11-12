@@ -88,7 +88,12 @@ from .models import (
     urans_budget_seconds,
     urans_point_fidelity,
 )
-from .openfoam.budget import begin_case_budget, case_solver_seconds, case_solver_budget
+from .openfoam.budget import (
+    begin_case_budget,
+    case_solver_seconds,
+    case_solver_budget,
+    case_solver_remaining_seconds,
+)
 from .openfoam.execution import is_compressible, is_density_based
 from .openfoam.acoustic_startup import acoustic_startup_step
 from .openfoam.potential_initialization import (
@@ -5537,10 +5542,16 @@ def _run_transient_attempt(
             _set_control_dict_entries(tcase / "system" / "controlDict", {"deltaT": startup_delta_t})
         # Arm the heartbeat march-rate watchdog for this chunk: it projects
         # trailing simulated-time progress against the bounded tier budget.
+        physical_budget = case_solver_remaining_seconds(runner, spec)
+        march_budget = (
+            remaining
+            if physical_budget is None
+            else min(remaining, physical_budget)
+        )
         write_march_budget_marker(
             tcase,
             end_t=end_t,
-            budget_s=remaining,
+            budget_s=march_budget,
             wall_start=time.time(),
         )
         solve_started = time.monotonic()

@@ -6,7 +6,14 @@ import pytest
 from pydantic import ValidationError
 
 from airfoilfoam.models import CaseSpec, PolarRequest, ResourceParams, SolverCaseAllocation
-from airfoilfoam.openfoam.budget import BudgetedRunner, begin_case_budget, case_solver_seconds, case_solver_budget, register_case_budget
+from airfoilfoam.openfoam.budget import (
+    BudgetedRunner,
+    begin_case_budget,
+    case_solver_seconds,
+    case_solver_remaining_seconds,
+    case_solver_budget,
+    register_case_budget,
+)
 from airfoilfoam.openfoam.runner import InfrastructureError, InsufficientMpiSlotsError, RunResult, Runner
 
 
@@ -104,6 +111,15 @@ def test_budget_acknowledgement_comes_only_from_actual_case_enforcement(budget, 
     assert runner.solver(tmp_path, "simpleFoam", 1).ok
     assert not case_solver_budget(runner, case(2)).exhausted
     assert case_solver_budget(runner, case()).exhausted
+
+
+def test_remaining_case_budget_tracks_the_budgeted_solver_not_outer_timeout(budget, tmp_path):
+    runner, _inner = budget
+    runner.begin_case(case())
+    assert case_solver_remaining_seconds(runner, case()) == 10
+    runner.solver(tmp_path, "simpleFoam", 1)
+    assert case_solver_remaining_seconds(runner, case()) == 6
+    assert case_solver_remaining_seconds(_inner, case()) is None
 
 
 def test_live_measurement_does_not_wait_for_the_active_solver(monkeypatch, tmp_path):

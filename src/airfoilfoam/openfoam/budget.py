@@ -159,6 +159,23 @@ def case_solver_seconds(runner, spec) -> float | None:
     return runner.consumed(spec) if isinstance(runner, BudgetedRunner) else None
 
 
+def case_solver_remaining_seconds(runner, spec) -> float | None:
+    """Return the exact physical-case budget still available before launch.
+
+    The outer task timeout may be much larger than the per-case allocation.
+    Runtime watchdogs that project solver progress must use this remaining
+    physical budget or they can wait past the point where ``BudgetedRunner``
+    will terminate the case.
+    """
+    if not isinstance(runner, BudgetedRunner):
+        return None
+    limit = runner.limit(spec)
+    consumed = runner.consumed(spec)
+    if limit is None or consumed is None:
+        return None
+    return max(0.0, float(limit) - float(consumed))
+
+
 def case_solver_budget(runner, spec) -> CaseSolverBudget | None:
     if not isinstance(runner, BudgetedRunner):
         return None
