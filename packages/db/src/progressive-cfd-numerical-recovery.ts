@@ -30,8 +30,8 @@ export function progressiveMaterialDomainRecipe(
     ...solver,
     momentumScheme: "upwind",
     transientMaxCourant: Number.isFinite(configuredCourant)
-      ? Math.min(configuredCourant, 1)
-      : 1,
+      ? Math.min(configuredCourant, 0.2)
+      : 0.2,
   };
   if (Object.hasOwn(solver, "momentum_scheme"))
     stabilizedSolver.momentum_scheme = "upwind";
@@ -71,8 +71,8 @@ export function normalizeProgressiveMaterialDomainRecoveryRecipe(
       ...solver,
       momentumScheme: "upwind",
       transientMaxCourant: Number.isFinite(configuredCourant)
-        ? Math.min(configuredCourant, 1)
-        : 1,
+      ? Math.min(configuredCourant, 0.2)
+      : 0.2,
     },
   };
   if (Object.hasOwn(solver, "momentum_scheme"))
@@ -93,8 +93,8 @@ export function normalizeProgressiveMaterialDomainRecoveryRecipeSql(
       '{solver,transientMaxCourant}', to_jsonb(least(coalesce(
         (${recipe}->'solver'->>'transientMaxCourant')::double precision,
         (${recipe}->'solver'->>'transient_max_courant')::double precision,
-        1
-      ), 1))
+        0.2
+      ), 0.2))
     ) ELSE ${recipe} END`;
 }
 
