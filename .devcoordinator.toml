@@ -276,8 +276,14 @@ database = "aerodb"
 user = "aerodb"
 
 [[test.cfd-source-geometry.check]]
+name = "workspace"
+tier = "development"
+command = ["/usr/bin/corepack", "pnpm", "install", "--frozen-lockfile", "--ignore-scripts"]
+
+[[test.cfd-source-geometry.check]]
 name = "schema"
 tier = "development"
+requires = ["workspace"]
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "migrate"]
 
 [[test.cfd-source-geometry.check]]
