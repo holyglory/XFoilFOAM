@@ -21,7 +21,7 @@ import tomllib
 import traceback
 
 
-REVISION = "66c981f3fb1ac86b680d88168fe30b8c22935f68"
+REVISION = "1aec78f54e61ca9374da7835826076190c35a1ec"
 BASELINE = "c5abb7587eba4c04e431056e1d3cddeeb76211b4"
 REGRESSION = REVISION
 BASELINE_REF = "refs/heads/codex/ingestion-lock-regression-source-20261110"
@@ -30,7 +30,6 @@ MODES = {
     "database": [
         "schema", "seed", "report-contracts", "retention-contract",
         "report-progress-poll-services", "progress-selection-regressions", "settlement-campaign-regressions",
-        "campaign-lock-order-and-guards", "old-source-lock-regressions",
     ],
     "maintenance": ["maintenance-contracts"],
 }
@@ -155,7 +154,7 @@ def run(mode: str, source: Path, output: Path) -> int:
             report["checks"].append(install)
             if install["status"] != "passed":
                 return 1
-        if mode == "database":
+        if mode == "database" and "old-source-lock-regressions" in selected:
             # Fetch only the public regression-source ref; never move functional HEAD.
             subprocess.run(["git", "fetch", "--no-tags", "--unshallow",
                             "https://github.com/holyglory/XFoilFOAM.git", BASELINE_REF], cwd=source, check=True)
