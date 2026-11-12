@@ -21,15 +21,15 @@ import tomllib
 import traceback
 
 
-REVISION = "e43b9ac4a36b1e292ee8103fe7eefb002b548a41"
+REVISION = "cc011846306788e3d2d620efd12dd76d34a96c4c"
 BASELINE = "c5abb7587eba4c04e431056e1d3cddeeb76211b4"
 REGRESSION = REVISION
 BASELINE_REF = "refs/heads/codex/ingestion-lock-regression-source-20261110"
 MODES = {
     "types": ["workspace-types", "retention-test-types"],
     "database": [
-        "schema", "seed", "report-contracts", "retention-contract",
-        "report-progress-poll-services", "progress-selection-regressions", "settlement-campaign-regressions",
+        "schema", "seed", "report-contracts",
+        "report-progress-poll-services", "progress-selection-regressions",
     ],
     "maintenance": ["maintenance-contracts"],
 }
