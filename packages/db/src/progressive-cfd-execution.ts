@@ -14,6 +14,10 @@ import type { DB } from "./client";
 import { effectiveProgressiveStageSql } from "./progressive-execution-policy";
 import { localStepRecipeSql } from "./campaign-local-step-policy";
 import { progressiveCfdEffectiveBudgetSql } from "./progressive-cfd-budget-extension";
+import {
+  normalizeProgressiveMaterialDomainRecoveryRecipe,
+  normalizeProgressiveMaterialDomainRecoveryRecipeSql,
+} from "./progressive-cfd-numerical-recovery";
 import type { ProgressiveCfdLease } from "./progressive-cfd";
 import {
   boundaryConditions,
@@ -67,7 +71,7 @@ export async function lockProgressiveCfdExecution(
   if (!campaign || !["active", "attention"].includes(String(campaign.status)))
     throw new Error("Campaign does not admit new CFD execution");
   const [unit] = await db.execute(sql`
-    SELECT coalesce(recovery.recipe, CASE WHEN local_policy.id IS NOT NULL
+    SELECT coalesce(${normalizeProgressiveMaterialDomainRecoveryRecipeSql(sql`recovery.recipe`)}, CASE WHEN local_policy.id IS NOT NULL
       THEN ${localStepRecipeSql(sql`unit.recipe`, sql`local_policy.smoothing`)} END, unit.recipe) AS recipe,
       local_policy.id AS local_step_policy_id, recovery.id AS recovery_plan_id,
       recovery.parent_job_id AS recovery_parent_job_id, target.physical, scope.revision_id, attempt.sim_job_id, attempt.execution_recipe_id,
@@ -114,8 +118,12 @@ export async function lockProgressiveCfdExecution(
     (unit.local_step_policy_id ?? null) !== (lease.localStepPolicyId ?? null) ||
     (unit.recovery_parent_job_id ?? null) !==
       (lease.recoveryParentJobId ?? null) ||
-    canonicalAnalysisJson(unit.recipe) !==
-      canonicalAnalysisJson(lease.recipe) ||
+    canonicalAnalysisJson(
+      normalizeProgressiveMaterialDomainRecoveryRecipe(unit.recipe),
+    ) !==
+      canonicalAnalysisJson(
+        normalizeProgressiveMaterialDomainRecoveryRecipe(lease.recipe),
+      ) ||
     canonicalAnalysisJson(unit.physical) !==
       canonicalAnalysisJson(lease.physical)
   )
