@@ -26,7 +26,7 @@ export function progressiveMaterialDomainRecipe(
   const configuredCourant = Number(
     solver.transientMaxCourant ?? solver.transient_max_courant,
   );
-  const stabilizedSolver = {
+  const stabilizedSolver: Record<string, unknown> = {
     ...solver,
     momentumScheme: "upwind",
     transientMaxCourant: Number.isFinite(configuredCourant)
