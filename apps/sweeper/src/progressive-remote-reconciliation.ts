@@ -170,7 +170,7 @@ export async function reconcileProgressiveRemoteWorker(
                 OR report.report#>>'{status,message}' LIKE '%continuation_source_permanent:%'))
             OR (report.report->'result' = 'null'::jsonb
               AND report.report#>>'{status,state}' = 'cancelled'
-              AND report.report#>>'{status,completed_cases}' = '0')))
+              AND report.report#>>'{status,completed_cases}' = '0'))
           AND report.assignment_signature = coalesce(intent.assignment_signature, job.request_payload#>>'{remoteProgressiveExecution,contentSignature}')))
       ${
         options.jobIds
