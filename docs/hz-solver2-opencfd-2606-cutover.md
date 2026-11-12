@@ -103,6 +103,25 @@ and the writers stopped. Re-run the same build ID; the phase marker either
 resumes the build/recreate or re-proves the retained receipt without submitting
 replacement canary work.
 
+For a live remote-solver campaign, use the explicit drain mode instead of
+waiting for the scheduler to become idle by chance:
+
+```bash
+cd /opt/airfoils-pro/app
+sudo scripts/deploy/rebuild-remote-solver-engine.sh \
+  --drain hz-solver2-opencfd2606-YYYYMMDD-N
+```
+
+Drain mode records the exact pool, writer, and transfer-fence state, raises the
+remote transfer fence so HZ cannot mirror another assignment, and closes the
+OpenCFD pools. Existing engine cases are allowed to finish. Terminal worker
+reports and their case/evidence bytes remain on the remote volume; queued
+publication and evidence staging resume after the rebuilt worker is healthy.
+The durable drain marker makes interruption restartable and keeps admission
+closed until the same build ID resumes the operation. The script restores the
+captured pool, writer, and transfer-fence state only after the engine identity,
+volume contract, and worker limits pass verification.
+
 ## Post-cutover verification
 
 Archive upload concurrency is separate from solver CPU capacity. Set

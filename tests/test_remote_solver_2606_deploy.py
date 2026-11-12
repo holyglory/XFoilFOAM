@@ -611,7 +611,8 @@ def test_completed_remote_cutover_uses_guarded_engine_maintenance_path() -> None
     assert "state = 'pushing'" in maintenance_db
     assert "unsettled_cancellations" in maintenance_db
     assert "running_media_repairs" in maintenance_db
-    assert 'if [[ "$state" == "complete" ]]; then\n    perform_complete_runtime_maintenance' in source
+    complete_branch = source.index('if [[ "$state" == "complete" ]]; then')
+    assert source.index("perform_complete_runtime_maintenance", complete_branch) > complete_branch
 
 
 @pytest.mark.parametrize("runtime_valid", [True, False])
@@ -622,6 +623,7 @@ def test_completed_remote_maintenance_moves_source_label_with_build_ids(tmp_path
     script = """
 set -euo pipefail
 ACTION=test-build
+DRAIN_STATE_ACTIVE=false
 DEPLOY_SOURCE_REVISION=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 OPENCFD_2406_POOL_ID=3f8bc764-09ae-4ff3-8fd2-240600000001
 OPENCFD_2606_POOL_ID=3f8bc764-09ae-4ff3-8fd2-260600000001
@@ -669,6 +671,167 @@ docker() { printf '[{"HostConfig":{"Ulimits":[{"Name":"nofile","Soft":65536,"Har
                           "identity:AIRFOILFOAM_ENABLED_ENGINE_KEYS=openfoam:opencfd:2606:numerics-2:adapter-1"]
     assert lines.index(identities[-1]) < lines.index("recreated") < lines.index("verify:test-build")
     assert lines.index("runtime-proof") < lines.index("restore-corrected-pool") < lines.index("restore-writers")
+
+
+def test_remote_drain_mode_is_explicit_and_reuses_complete_state_path() -> None:
+    source = (DEPLOY / "rebuild-remote-solver-engine.sh").read_text(encoding="utf-8")
+
+    assert 'if [[ "$ACTION" == "--drain" ]]' in source
+    assert 'if [[ "$ACTION" == "--drain-rebind" ]]' in source
+    assert 'Usage: $0 <BUILD_ID> | --drain <BUILD_ID> | --drain-rebind <BUILD_ID> | --rollback' in source
+    drain = source[source.index("perform_drain_and_maintenance()"):source.index("\nmain() {")]
+    assert "wait_remote_solver_drain" in drain
+    assert "perform_complete_runtime_maintenance" in drain
+    assert "clear_drain_state" in drain
+    assert "persist_drain_state maintenance" in drain
+    assert 'DRAIN_REBIND=true' in source
+
+    main = source[source.index("main() {"):]
+    assert '[[ "$DRAIN_MODE" == "true" ]]' in main
+    assert 'A durable HZ drain is pending; resume it with --drain $ACTION.' in main
+
+
+def test_remote_drain_captures_all_original_pool_writer_and_transfer_state() -> None:
+    source = (DEPLOY / "rebuild-remote-solver-engine.sh").read_text(encoding="utf-8")
+    pool_reader = source[
+        source.index("opencfd_pool_state()"):source.index("\nvalidate_drain_boolean()")
+    ]
+    capture = source[source.index("capture_drain_state()"):source.index("\nrequire_drain_admission_closed()")]
+    restore = source[source.index("restore_drain_pool_state()"):source.index("\nremote_solver_drain_transfer_activity()")]
+
+    assert "OPENCFD_2406_POOL_ID" in pool_reader
+    assert "OPENCFD_2606_POOL_ID" in pool_reader
+    assert "NUMERICS2_POOL_ID" in pool_reader
+    assert "writer_state sweeper" in capture
+    assert "writer_state media-repair" in capture
+    assert "remote_transfer_paused" in capture
+    assert "DRAIN_POOL_NUMERICS2_WAS_ENABLED" in restore
+    assert "execution-pool state did not restore exactly" in restore
+
+
+def test_remote_drain_fences_assignment_before_waiting_and_leaves_sweeper_transfer_live() -> None:
+    source = (DEPLOY / "rebuild-remote-solver-engine.sh").read_text(encoding="utf-8")
+    begin = source.index("begin_remote_solver_drain()")
+    end = source.index("\nperform_drain_and_maintenance()", begin)
+    body = source[begin:end]
+
+    fence = source[
+        source.index("close_remote_solver_drain_fence()") : source.index(
+            "\nremote_solver_drain_activity()"
+        )
+    ]
+    assert body.index("persist_drain_state prepared") < body.index(
+        "disable_all_opencfd_pools"
+    ) < body.index("persist_drain_state draining")
+    assert "close_remote_solver_drain_fence" in source
+    assert fence.index('set_remote_transfer_paused "true"') < fence.index(
+        "wait_remote_transfer_quiescence"
+    ) < fence.index("disable_all_opencfd_pools")
+    assert "stop_writers" not in body
+    assert "set_remote_transfer_paused" not in body
+
+    drain_activity = source[
+        source.index("remote_solver_drain_activity()"):source.index(
+            "\nwait_remote_transfer_quiescence()"
+        )
+    ]
+    assert "require_drain_admission_closed" in drain_activity
+    assert "maintenance_database_activity" in drain_activity
+    assert "active_promises" not in drain_activity
+    maintenance_db = source[
+        source.index("maintenance_database_activity()"):source.index(
+            "\nremote_transfer_paused()"
+        )
+    ]
+    assert "job.engine_state IN ('completed','failed','cancelled')" in maintenance_db
+
+
+def test_remote_drain_waits_for_two_empty_controller_samples_without_pausing_writers(
+    tmp_path: Path,
+) -> None:
+    source = (DEPLOY / "rebuild-remote-solver-engine.sh").read_text(encoding="utf-8")
+    start = source.index("remote_solver_drain_activity()")
+    end = source.index("\nwait_remote_transfer_quiescence()", start)
+    functions = source[start:end]
+    counter = tmp_path / "transfer-samples"
+    counter.write_text("0\n", encoding="utf-8")
+    trace = tmp_path / "trace"
+    script = f"""
+set -euo pipefail
+REMOTE_SOLVER_DRAIN_TIMEOUT_SECONDS=10
+REMOTE_SOLVER_DRAIN_POLL_SECONDS=1
+DRAIN_TRANSFER_PAUSED=false
+COUNT={counter}
+TRACE={trace}
+require_drain_admission_closed() {{ echo admission >>"$TRACE"; }}
+    remote_transfer_paused() {{ echo false; }}
+openfoam_processes() {{ :; }}
+queue_activity() {{ :; }}
+maintenance_database_activity() {{ :; }}
+redis_queue_activity() {{ :; }}
+    remote_solver_drain_transfer_activity() {{
+  local n
+  n=$(cat "$COUNT")
+  n=$((n + 1))
+  printf '%s\\n' "$n" >"$COUNT"
+  if (( n < 2 )); then echo '{{"result_deliveries":1}}'; fi
+}}
+sleep() {{ :; }}
+{functions}
+wait_remote_solver_drain
+printf 'set-transfer-called\\n' >>"$TRACE" || true
+"""
+    result = subprocess.run(
+        ["bash", "-c", script],
+        cwd=tmp_path,
+        text=True,
+        capture_output=True,
+        timeout=10,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "HZ remote-solver engine work and progress reports are drained" in result.stdout
+    assert "set-transfer-called" in trace.read_text(encoding="utf-8")
+    assert counter.read_text(encoding="utf-8").strip() == "3"
+
+
+def test_remote_drain_failure_keeps_admission_closed_without_stopping_sweeper(
+    tmp_path: Path,
+) -> None:
+    source = (DEPLOY / "rebuild-remote-solver-engine.sh").read_text(encoding="utf-8")
+    start = source.index("fail_safe() {")
+    end = source.index("\ntrap fail_safe EXIT", start)
+    fail_safe = source[start:end]
+    trace = tmp_path / "trace"
+    script = f"""
+set -u
+DRAIN_MODE=true
+REMOTE_SOLVER2606_DRAIN_PENDING=1
+CANARY_TEMP_FILE=""
+PREPARE_RESTORE_WRITERS=false
+MAINTENANCE_QUIESCE_ARMED=false
+FAIL_SAFE_ARMED=false
+TRACE={trace}
+read_env_var() {{ echo 1; }}
+disable_all_opencfd_pools() {{ echo admission >>"$TRACE"; }}
+stop_writers() {{ echo stopped >>"$TRACE"; }}
+restore_writers() {{ echo restored >>"$TRACE"; }}
+set_remote_transfer_paused() {{ echo transfer >>"$TRACE"; }}
+{fail_safe}
+fail_once() {{ return 17; }}
+set +e
+fail_once
+fail_safe
+"""
+    result = subprocess.run(
+        ["bash", "-c", script],
+        cwd=tmp_path,
+        text=True,
+        capture_output=True,
+        timeout=10,
+    )
+    assert result.returncode == 17
+    assert trace.read_text(encoding="utf-8").splitlines() == ["transfer", "admission"]
+    assert "writers in their prior state" in result.stderr
 
 
 @pytest.mark.parametrize("fault", [
@@ -827,6 +990,7 @@ def test_maintenance_waits_only_for_live_progressive_archive_claims(function_nam
             CREATE TABLE progressive_worker_archive_reclaims (claim_expires_at timestamptz, completed_at timestamptz);
             CREATE TABLE progressive_worker_reports (
                 sim_job_id uuid,
+                sequence bigint,
                 stopped_engine_job_id text,
                 acknowledged_at timestamptz,
                 report jsonb
@@ -862,10 +1026,14 @@ def test_maintenance_waits_only_for_live_progressive_archive_claims(function_nam
             executable = subprocess.run(["bash", "-c", probe], env=environment, check=True, text=True, capture_output=True)
             assert json.loads(executable.stdout)["live_jobs"] == 1
             query("INSERT INTO sim_jobs VALUES ('00000000-0000-0000-0000-000000000002', 'submitted', '{\"remoteProgressiveExecution\": {}}'::jsonb, '00000000-0000-0000-0000-000000000002', NULL)")
-            query("INSERT INTO progressive_worker_reports VALUES ('00000000-0000-0000-0000-000000000002', '00000000-0000-0000-0000-000000000002', now(), '{\"stopProof\": {\"execution_stopped\": true}}'::jsonb)")
+            query("INSERT INTO progressive_worker_reports VALUES ('00000000-0000-0000-0000-000000000002', 1, '00000000-0000-0000-0000-000000000002', now(), '{\"stopProof\": {\"execution_stopped\": true}}'::jsonb)")
             query("DELETE FROM sim_jobs WHERE id='00000000-0000-0000-0000-000000000001'")
             retained = subprocess.run(["bash", "-c", probe], env=environment, check=True, text=True, capture_output=True)
             assert retained.stdout.strip() == ""
+            query("INSERT INTO sim_jobs VALUES ('00000000-0000-0000-0000-000000000003', 'running', '{\"remoteProgressiveExecution\": {}}'::jsonb, '00000000-0000-0000-0000-000000000003', NULL)")
+            query("INSERT INTO progressive_worker_reports VALUES ('00000000-0000-0000-0000-000000000003', 1, NULL, NULL, '{\"status\": {\"state\": \"completed\"}}'::jsonb)")
+            terminal = subprocess.run(["bash", "-c", probe], env=environment, check=True, text=True, capture_output=True)
+            assert terminal.stdout.strip() == ""
     finally:
         query(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
 

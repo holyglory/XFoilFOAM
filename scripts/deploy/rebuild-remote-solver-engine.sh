@@ -6,8 +6,25 @@
 set -Eeuo pipefail
 
 ACTION="${1:-}"
+DRAIN_MODE=false
+DRAIN_REBIND=false
 NUMERICS2_TRANSITION=false
-if [[ "$ACTION" == "--numerics-2" ]]; then
+if [[ "$ACTION" == "--drain" ]]; then
+  DRAIN_MODE=true
+  ACTION="${2:-}"
+  if (($# != 2)); then
+    echo "Usage: $0 --drain <BUILD_ID>" >&2
+    exit 2
+  fi
+elif [[ "$ACTION" == "--drain-rebind" ]]; then
+  DRAIN_MODE=true
+  DRAIN_REBIND=true
+  ACTION="${2:-}"
+  if (($# != 2)); then
+    echo "Usage: $0 --drain-rebind <BUILD_ID>" >&2
+    exit 2
+  fi
+elif [[ "$ACTION" == "--numerics-2" ]]; then
   NUMERICS2_TRANSITION=true
   ACTION="${2:-}"
   if (($# != 2)); then
@@ -16,7 +33,7 @@ if [[ "$ACTION" == "--numerics-2" ]]; then
   fi
 fi
 if [[ -z "$ACTION" ]]; then
-  echo "Usage: $0 <BUILD_ID> | --rollback" >&2
+  echo "Usage: $0 <BUILD_ID> | --drain <BUILD_ID> | --drain-rebind <BUILD_ID> | --rollback" >&2
   exit 2
 fi
 if [[ "$ACTION" != "--rollback" && ! "$ACTION" =~ ^[A-Za-z0-9._-]+$ ]]; then
@@ -54,6 +71,22 @@ PREPARE_SWEEPER_WAS_RUNNING=0
 PREPARE_MEDIA_WAS_RUNNING=0
 CANARY_TEMP_FILE=""
 REMOTE_TRANSFER_QUIESCE_TIMEOUT_SECONDS="${REMOTE_TRANSFER_QUIESCE_TIMEOUT_SECONDS:-21900}"
+REMOTE_SOLVER_DRAIN_TIMEOUT_SECONDS="${REMOTE_SOLVER_DRAIN_TIMEOUT_SECONDS:-86400}"
+REMOTE_SOLVER_DRAIN_POLL_SECONDS="${REMOTE_SOLVER_DRAIN_POLL_SECONDS:-5}"
+if [[ ! "$REMOTE_SOLVER_DRAIN_TIMEOUT_SECONDS" =~ ^[1-9][0-9]*$ || ! "$REMOTE_SOLVER_DRAIN_POLL_SECONDS" =~ ^[1-9][0-9]*$ ]]; then
+  echo "Remote-solver drain timeout and poll interval must be positive integers." >&2
+  exit 2
+fi
+
+DRAIN_STATE_ACTIVE=false
+DRAIN_ADMISSION_CLOSED=false
+DRAIN_POOL_2406_WAS_ENABLED=""
+DRAIN_POOL_2606_WAS_ENABLED=""
+DRAIN_POOL_NUMERICS2_WAS_ENABLED=""
+DRAIN_SWEEPER_WAS_RUNNING=""
+DRAIN_MEDIA_REPAIR_WAS_RUNNING=""
+DRAIN_TRANSFER_PAUSED=""
+DRAIN_PHASE=""
 
 cd "$APP_DIR"
 python3 "$DEPLOY_SCRIPT_DIR/deployment-env-preflight.py" \
@@ -247,25 +280,45 @@ if any(row.values()):
 }
 
 maintenance_database_activity() {
-  # A stopped progressive remote execution with an acknowledged stop proof is
-  # retained evidence, not executable work. It must survive maintenance while
-  # the normal controller resumes its delivery/recovery path afterwards.
+  # A stopped progressive remote execution with an acknowledged stop proof,
+  # or a remote execution whose latest immutable worker report is terminal,
+  # is retained evidence, not executable work. It must survive maintenance
+  # while the normal controller resumes its delivery/recovery path afterwards.
   compose exec -T postgres psql -X -qAt -v ON_ERROR_STOP=1 -U aerodb -d aerodb -c "
 WITH executable_jobs AS (
   SELECT job.id
   FROM sim_jobs job
   WHERE job.status IN ('pending','submitted','running','ingesting')
     AND NOT (
+      (
+        job.engine_state IN ('completed','failed','cancelled')
+      )
+      OR (
       job.request_payload ? 'remoteProgressiveExecution'
       AND job.engine_job_id = job.id::text
       AND (job.ingest_lease_expires_at IS NULL OR job.ingest_lease_expires_at <= clock_timestamp())
-      AND EXISTS (
-        SELECT 1
-        FROM progressive_worker_reports report
-        WHERE report.sim_job_id = job.id
-          AND report.stopped_engine_job_id = job.engine_job_id
-          AND report.acknowledged_at IS NOT NULL
-          AND report.report#>>'{stopProof,execution_stopped}' = 'true'
+      AND (
+        EXISTS (
+          SELECT 1
+          FROM progressive_worker_reports report
+          WHERE report.sim_job_id = job.id
+            AND report.stopped_engine_job_id = job.engine_job_id
+            AND report.acknowledged_at IS NOT NULL
+            AND report.report#>>'{stopProof,execution_stopped}' = 'true'
+        )
+        OR EXISTS (
+          SELECT 1
+          FROM progressive_worker_reports report
+          WHERE report.sim_job_id = job.id
+            AND report.report#>>'{status,state}' IN ('completed','failed','cancelled')
+            AND NOT EXISTS (
+              SELECT 1
+              FROM progressive_worker_reports newer
+              WHERE newer.sim_job_id = report.sim_job_id
+                AND newer.sequence > report.sequence
+            )
+        )
+      )
       )
     )
 ), activity AS (
@@ -342,6 +395,241 @@ if any(type(value) is not int for value in row.values()):
 if any(row.values()):
     print(json.dumps(row, sort_keys=True))
 '
+}
+
+opencfd_pool_state() {
+  compose exec -T postgres psql -X -qAt -v ON_ERROR_STOP=1 -U aerodb -d aerodb -c "
+SELECT concat_ws('|',
+  coalesce((SELECT enabled::text FROM solver_execution_pools WHERE id='$OPENCFD_2406_POOL_ID'),'missing'),
+  coalesce((SELECT enabled::text FROM solver_execution_pools WHERE id='$OPENCFD_2606_POOL_ID'),'missing'),
+  coalesce((SELECT enabled::text FROM solver_execution_pools WHERE id='$NUMERICS2_POOL_ID'),'missing')
+);"
+}
+
+validate_drain_boolean() {
+  [[ "$1" == "true" || "$1" == "false" ]]
+}
+
+validate_drain_bit() {
+  [[ "$1" == "0" || "$1" == "1" ]]
+}
+
+load_drain_state() {
+  local pending target source tree phase
+  pending="$(read_env_var REMOTE_SOLVER2606_DRAIN_PENDING)"
+  [[ "$pending" == "1" ]] || {
+    echo "No durable HZ remote-solver drain is pending." >&2
+    return 14
+  }
+  phase="$(read_env_var REMOTE_SOLVER2606_DRAIN_PHASE)"
+  case "$phase" in
+    prepared|draining|drained|maintenance) ;;
+    *)
+      echo "Unsupported durable HZ remote-solver drain phase: $phase" >&2
+      return 14
+      ;;
+  esac
+  target="$(read_env_var REMOTE_SOLVER2606_DRAIN_TARGET_BUILD_ID)"
+  source="$(read_env_var REMOTE_SOLVER2606_DRAIN_SOURCE_REVISION)"
+  tree="$(read_env_var REMOTE_SOLVER2606_DRAIN_SOURCE_TREE_SHA256)"
+  [[ "$target" == "$ACTION" ]] || {
+    echo "Durable HZ drain is bound to build $target; refusing substitution with $ACTION." >&2
+    return 14
+  }
+  if [[ "$source" != "$DEPLOY_SOURCE_REVISION" || "$tree" != "$DEPLOY_SOURCE_TREE_SHA256" ]]; then
+    if [[ "$DRAIN_REBIND" == "true" && "$phase" == "draining" ]]; then
+      echo "Rebinding the still-draining HZ marker to the verified continuation source."
+      set_env_vars_atomic \
+        "REMOTE_SOLVER2606_DRAIN_SOURCE_REVISION=$DEPLOY_SOURCE_REVISION" \
+        "REMOTE_SOLVER2606_DRAIN_SOURCE_TREE_SHA256=$DEPLOY_SOURCE_TREE_SHA256"
+    else
+      echo "Durable HZ drain is bound to a different verified source." >&2
+      return 14
+    fi
+  fi
+
+  DRAIN_POOL_2406_WAS_ENABLED="$(read_env_var REMOTE_SOLVER2606_DRAIN_POOL_2406_WAS_ENABLED)"
+  DRAIN_POOL_2606_WAS_ENABLED="$(read_env_var REMOTE_SOLVER2606_DRAIN_POOL_2606_WAS_ENABLED)"
+  DRAIN_POOL_NUMERICS2_WAS_ENABLED="$(read_env_var REMOTE_SOLVER2606_DRAIN_POOL_NUMERICS2_WAS_ENABLED)"
+  DRAIN_SWEEPER_WAS_RUNNING="$(read_env_var REMOTE_SOLVER2606_DRAIN_SWEEPER_WAS_RUNNING)"
+  DRAIN_MEDIA_REPAIR_WAS_RUNNING="$(read_env_var REMOTE_SOLVER2606_DRAIN_MEDIA_REPAIR_WAS_RUNNING)"
+  DRAIN_TRANSFER_PAUSED="$(read_env_var REMOTE_SOLVER2606_DRAIN_TRANSFER_PAUSED)"
+  for value in "$DRAIN_POOL_2406_WAS_ENABLED" "$DRAIN_POOL_2606_WAS_ENABLED" "$DRAIN_POOL_NUMERICS2_WAS_ENABLED"; do
+    validate_drain_boolean "$value" || {
+      echo "Durable HZ drain has an invalid execution-pool state." >&2
+      return 14
+    }
+  done
+  for value in "$DRAIN_SWEEPER_WAS_RUNNING" "$DRAIN_MEDIA_REPAIR_WAS_RUNNING"; do
+    validate_drain_bit "$value" || {
+      echo "Durable HZ drain has an invalid writer state." >&2
+      return 14
+    }
+  done
+  validate_drain_boolean "$DRAIN_TRANSFER_PAUSED" || {
+    echo "Durable HZ drain has an invalid transfer-fence state." >&2
+    return 14
+  }
+  DRAIN_PHASE="$phase"
+  DRAIN_STATE_ACTIVE=true
+  [[ "$phase" == "prepared" ]] && DRAIN_ADMISSION_CLOSED=false || DRAIN_ADMISSION_CLOSED=true
+}
+
+persist_drain_state() {
+  local phase="$1"
+  set_env_vars_atomic \
+    "REMOTE_SOLVER2606_DRAIN_PENDING=1" \
+    "REMOTE_SOLVER2606_DRAIN_PHASE=$phase" \
+    "REMOTE_SOLVER2606_DRAIN_TARGET_BUILD_ID=$ACTION" \
+    "REMOTE_SOLVER2606_DRAIN_SOURCE_REVISION=$DEPLOY_SOURCE_REVISION" \
+    "REMOTE_SOLVER2606_DRAIN_SOURCE_TREE_SHA256=$DEPLOY_SOURCE_TREE_SHA256" \
+    "REMOTE_SOLVER2606_DRAIN_POOL_2406_WAS_ENABLED=$DRAIN_POOL_2406_WAS_ENABLED" \
+    "REMOTE_SOLVER2606_DRAIN_POOL_2606_WAS_ENABLED=$DRAIN_POOL_2606_WAS_ENABLED" \
+    "REMOTE_SOLVER2606_DRAIN_POOL_NUMERICS2_WAS_ENABLED=$DRAIN_POOL_NUMERICS2_WAS_ENABLED" \
+    "REMOTE_SOLVER2606_DRAIN_SWEEPER_WAS_RUNNING=$DRAIN_SWEEPER_WAS_RUNNING" \
+    "REMOTE_SOLVER2606_DRAIN_MEDIA_REPAIR_WAS_RUNNING=$DRAIN_MEDIA_REPAIR_WAS_RUNNING" \
+    "REMOTE_SOLVER2606_DRAIN_TRANSFER_PAUSED=$DRAIN_TRANSFER_PAUSED"
+  DRAIN_PHASE="$phase"
+}
+
+clear_drain_state() {
+  set_env_vars_atomic \
+    "REMOTE_SOLVER2606_DRAIN_PENDING=0" \
+    "REMOTE_SOLVER2606_DRAIN_PHASE=" \
+    "REMOTE_SOLVER2606_DRAIN_TARGET_BUILD_ID=" \
+    "REMOTE_SOLVER2606_DRAIN_SOURCE_REVISION=" \
+    "REMOTE_SOLVER2606_DRAIN_SOURCE_TREE_SHA256=" \
+    "REMOTE_SOLVER2606_DRAIN_POOL_2406_WAS_ENABLED=" \
+    "REMOTE_SOLVER2606_DRAIN_POOL_2606_WAS_ENABLED=" \
+    "REMOTE_SOLVER2606_DRAIN_POOL_NUMERICS2_WAS_ENABLED=" \
+    "REMOTE_SOLVER2606_DRAIN_SWEEPER_WAS_RUNNING=" \
+    "REMOTE_SOLVER2606_DRAIN_MEDIA_REPAIR_WAS_RUNNING=" \
+    "REMOTE_SOLVER2606_DRAIN_TRANSFER_PAUSED="
+  DRAIN_STATE_ACTIVE=false
+  DRAIN_ADMISSION_CLOSED=false
+}
+
+capture_drain_state() {
+  local pool_state
+  pool_state="$(opencfd_pool_state)" || return 12
+  IFS='|' read -r DRAIN_POOL_2406_WAS_ENABLED DRAIN_POOL_2606_WAS_ENABLED DRAIN_POOL_NUMERICS2_WAS_ENABLED <<<"$pool_state"
+  for value in "$DRAIN_POOL_2406_WAS_ENABLED" "$DRAIN_POOL_2606_WAS_ENABLED" "$DRAIN_POOL_NUMERICS2_WAS_ENABLED"; do
+    [[ "$value" == "true" || "$value" == "false" ]] || {
+      echo "Could not capture the exact HZ OpenCFD execution-pool state." >&2
+      return 13
+    }
+  done
+  DRAIN_SWEEPER_WAS_RUNNING="$(writer_state sweeper)" || return 12
+  DRAIN_MEDIA_REPAIR_WAS_RUNNING="$(writer_state media-repair)" || return 12
+  validate_drain_bit "$DRAIN_SWEEPER_WAS_RUNNING" || return 12
+  validate_drain_bit "$DRAIN_MEDIA_REPAIR_WAS_RUNNING" || return 12
+  DRAIN_TRANSFER_PAUSED="$(remote_transfer_paused)" || return 12
+  validate_drain_boolean "$DRAIN_TRANSFER_PAUSED" || return 12
+  echo "Captured HZ drain state: pools=$pool_state sweeper=$DRAIN_SWEEPER_WAS_RUNNING media-repair=$DRAIN_MEDIA_REPAIR_WAS_RUNNING transfer-paused=$DRAIN_TRANSFER_PAUSED"
+}
+
+require_drain_admission_closed() {
+  local enabled
+  enabled="$(compose exec -T postgres psql -X -qAt -v ON_ERROR_STOP=1 -U aerodb -d aerodb -c "
+SELECT count(*)::text FROM solver_execution_pools
+WHERE id IN ('$OPENCFD_2406_POOL_ID','$OPENCFD_2606_POOL_ID','$NUMERICS2_POOL_ID')
+  AND enabled;")" || return 12
+  [[ "$enabled" == "0" ]] || {
+    echo "HZ OpenCFD admission is not closed; enabled pool count=$enabled" >&2
+    return 12
+  }
+}
+
+restore_drain_pool_state() {
+  for value in "$DRAIN_POOL_2406_WAS_ENABLED" "$DRAIN_POOL_2606_WAS_ENABLED" "$DRAIN_POOL_NUMERICS2_WAS_ENABLED"; do
+    validate_drain_boolean "$value" || return 14
+  done
+  compose exec -T postgres psql -X -qAt -v ON_ERROR_STOP=1 -U aerodb -d aerodb -c "
+UPDATE solver_execution_pools
+SET enabled=CASE id
+  WHEN '$OPENCFD_2406_POOL_ID' THEN $DRAIN_POOL_2406_WAS_ENABLED
+  WHEN '$OPENCFD_2606_POOL_ID' THEN $DRAIN_POOL_2606_WAS_ENABLED
+  WHEN '$NUMERICS2_POOL_ID' THEN $DRAIN_POOL_NUMERICS2_WAS_ENABLED
+  ELSE enabled END,
+  \"updatedAt\"=now()
+WHERE id IN ('$OPENCFD_2406_POOL_ID','$OPENCFD_2606_POOL_ID','$NUMERICS2_POOL_ID');" >/dev/null || return 12
+  [[ "$(opencfd_pool_state)" == "$DRAIN_POOL_2406_WAS_ENABLED|$DRAIN_POOL_2606_WAS_ENABLED|$DRAIN_POOL_NUMERICS2_WAS_ENABLED" ]] || {
+    echo "HZ execution-pool state did not restore exactly." >&2
+    return 13
+  }
+}
+
+remote_solver_drain_transfer_activity() {
+  # Evidence/report transfer must remain live during the engine drain. The
+  # ordinary maintenance phase raises the transfer fence after this function
+  # returns and waits for already-claimed outbox work before stopping writers.
+  return 0
+}
+
+close_remote_solver_drain_fence() {
+  # The transfer fence stops HZ from mirroring another assignment while the
+  # existing engine jobs finish. Progress reports remain durable locally;
+  # publication and evidence staging resume after the worker is healthy again.
+  set_remote_transfer_paused "true"
+  wait_remote_transfer_quiescence "before HZ admission fence"
+  disable_all_opencfd_pools
+  require_drain_admission_closed
+  DRAIN_ADMISSION_CLOSED=true
+}
+
+remote_solver_drain_activity() {
+  local processes queue db redis transfer observed_pause
+  require_drain_admission_closed || return 12
+  if ! processes="$(openfoam_processes 2>&1)"; then
+    echo "OpenFOAM process probe failed during HZ drain: $processes" >&2
+    return 12
+  fi
+  if ! queue="$(queue_activity 2>&1)"; then
+    echo "Queue probe failed during HZ drain: $queue" >&2
+    return 12
+  fi
+  if ! db="$(maintenance_database_activity 2>&1)"; then
+    echo "Database drain probe failed: $db" >&2
+    return 12
+  fi
+  if ! redis="$(redis_queue_activity 2>&1)"; then
+    echo "Redis drain probe failed: $redis" >&2
+    return 12
+  fi
+  if ! transfer="$(remote_solver_drain_transfer_activity 2>&1)"; then
+    echo "Transfer drain probe failed: $transfer" >&2
+    return 12
+  fi
+  [[ -z "$processes$queue$db$redis$transfer" ]] || {
+    printf '%s\n' "${processes:+openfoam=$processes}" "${queue:+queue=$queue}" "${db:+database=$db}" "${redis:+redis=$redis}" "${transfer:+transfer=$transfer}" | sed '/^$/d'
+  }
+}
+
+wait_remote_solver_drain() {
+  local started now activity empty_samples=0
+  started="$(date +%s)"
+  while true; do
+    if ! activity="$(remote_solver_drain_activity 2>&1)"; then
+      echo "HZ remote-solver drain failed closed: $activity" >&2
+      return 12
+    fi
+    if [[ -z "$activity" ]]; then
+      empty_samples=$((empty_samples + 1))
+      if (( empty_samples >= 2 )); then
+        echo "HZ remote-solver engine work and progress reports are drained; queued evidence remains durable."
+        return 0
+      fi
+    else
+      empty_samples=0
+      echo "Waiting for HZ remote-solver drain: $activity"
+    fi
+    now="$(date +%s)"
+    if (( now - started >= REMOTE_SOLVER_DRAIN_TIMEOUT_SECONDS )); then
+      echo "HZ remote-solver drain timed out: $activity" >&2
+      return 12
+    fi
+    sleep "$REMOTE_SOLVER_DRAIN_POLL_SECONDS"
+  done
 }
 
 wait_remote_transfer_quiescence() {
@@ -941,8 +1229,31 @@ fail_safe() {
   if [[ "$MAINTENANCE_QUIESCE_ARMED" == "true" && $rc -ne 0 ]]; then
     trap - EXIT
     echo "Remote transfer quiescence failed before writer stop; restoring the prior transfer-pause state." >&2
-    set_remote_transfer_paused "$MAINTENANCE_TRANSFER_PAUSE_WAS" || true
+    if [[ "$DRAIN_MODE" == "true" && "$(read_env_var REMOTE_SOLVER2606_DRAIN_PENDING)" == "1" ]]; then
+      set_remote_transfer_paused "true" || true
+    else
+      set_remote_transfer_paused "$MAINTENANCE_TRANSFER_PAUSE_WAS" || true
+    fi
     exit "$rc"
+  fi
+  if [[ "$DRAIN_MODE" == "true" && $rc -ne 0 && "$(read_env_var REMOTE_SOLVER2606_DRAIN_PENDING)" == "1" ]]; then
+    trap - EXIT
+    # A durable drain marker is fail-closed: even an interruption before the
+    # phase transition must leave new HZ OpenCFD assignments disabled. The
+    # sweeper stays alive while the drain is waiting or has timed out.
+    if [[ "$(read_env_var REMOTE_SOLVER2606_DRAIN_PHASE)" == "maintenance" || "$(read_env_var REMOTE_SOLVER2606_DRAIN_PHASE)" == "drained" ]]; then
+      set_remote_transfer_paused "true" >/dev/null 2>&1 || true
+    else
+      set_remote_transfer_paused "$(read_env_var REMOTE_SOLVER2606_DRAIN_TRANSFER_PAUSED)" >/dev/null 2>&1 || true
+    fi
+    disable_all_opencfd_pools >/dev/null 2>&1 || true
+    if [[ "$FAIL_SAFE_ARMED" != "true" ]]; then
+      echo "HZ remote-solver drain stopped before maintenance; keeping OpenCFD admission closed and writers in their prior state." >&2
+      exit "$rc"
+    fi
+    # Maintenance has its own fail-safe below; it must stop writers before an
+    # engine recreate can be retried.
+    trap fail_safe EXIT
   fi
   if [[ "$FAIL_SAFE_ARMED" != "true" || $rc -eq 0 ]]; then return; fi
   trap - EXIT
@@ -1059,26 +1370,49 @@ perform_complete_runtime_maintenance() {
     return 13
   fi
   validate_live_2606_volume_runtime "$old_build"
-  pool_state="$(compose exec -T postgres psql -X -qAt -v ON_ERROR_STOP=1 -U aerodb -d aerodb -c "
+  if [[ "$DRAIN_STATE_ACTIVE" == "true" ]]; then
+    old_2406_enabled="$DRAIN_POOL_2406_WAS_ENABLED"
+    old_2606_enabled="$DRAIN_POOL_2606_WAS_ENABLED"
+    sweeper_was_running="$DRAIN_SWEEPER_WAS_RUNNING"
+    media_was_running="$DRAIN_MEDIA_REPAIR_WAS_RUNNING"
+    transfer_pause_was="$DRAIN_TRANSFER_PAUSED"
+    validate_drain_boolean "$old_2406_enabled" || return 13
+    validate_drain_boolean "$old_2606_enabled" || return 13
+    validate_drain_bit "$sweeper_was_running" || return 13
+    validate_drain_bit "$media_was_running" || return 13
+    validate_drain_boolean "$transfer_pause_was" || return 13
+    [[ "$(remote_transfer_paused)" == "$transfer_pause_was" ]] || {
+      echo "The HZ transfer-fence state differs from the durable drain snapshot." >&2
+      return 13
+    }
+    echo "Using the durable HZ drain snapshot: pools=$old_2406_enabled|$old_2606_enabled|$DRAIN_POOL_NUMERICS2_WAS_ENABLED sweeper=$sweeper_was_running media-repair=$media_was_running transfer-paused=$transfer_pause_was"
+  else
+    pool_state="$(compose exec -T postgres psql -X -qAt -v ON_ERROR_STOP=1 -U aerodb -d aerodb -c "
 SELECT concat_ws('|',
   coalesce((SELECT enabled::text FROM solver_execution_pools WHERE id='$OPENCFD_2406_POOL_ID'),'missing'),
   coalesce((SELECT enabled::text FROM solver_execution_pools WHERE id='$OPENCFD_2606_POOL_ID'),'missing')
 );")"
-  IFS='|' read -r old_2406_enabled old_2606_enabled <<<"$pool_state"
-  if [[ ! "$old_2406_enabled" =~ ^(true|false)$ || ! "$old_2606_enabled" =~ ^(true|false)$ ]]; then
-    echo "Could not capture the exact OpenCFD execution-pool state before maintenance." >&2
-    return 13
-  fi
-  sweeper_was_running="$(writer_state sweeper)"
-  media_was_running="$(writer_state media-repair)"
-  echo "Remote writer state before engine maintenance: sweeper=$sweeper_was_running media-repair=$media_was_running"
+    IFS='|' read -r old_2406_enabled old_2606_enabled <<<"$pool_state"
+    if [[ ! "$old_2406_enabled" =~ ^(true|false)$ || ! "$old_2606_enabled" =~ ^(true|false)$ ]]; then
+      echo "Could not capture the exact OpenCFD execution-pool state before maintenance." >&2
+      return 13
+    fi
+    sweeper_was_running="$(writer_state sweeper)"
+    media_was_running="$(writer_state media-repair)"
+    echo "Remote writer state before engine maintenance: sweeper=$sweeper_was_running media-repair=$media_was_running"
 
-  # Raise a durable transfer fence while the writer is still alive. The one
-  # single-flight pass that already owns a delivery may finish normally; every
-  # later pass observes the fence and declines to claim another row. Only then
-  # stop the process. This closes the claim-after-probe race that otherwise
-  # strands a valid GCS upload behind a fresh 30-minute lease on every rebuild.
-  transfer_pause_was="$(remote_transfer_paused)"
+    # Raise a durable transfer fence while the writer is still alive. The one
+    # single-flight pass that already owns a delivery may finish normally; every
+    # later pass observes the fence and declines to claim another row. Only then
+    # stop the process. This closes the claim-after-probe race that otherwise
+    # strands a valid GCS upload behind a fresh 30-minute lease on every rebuild.
+    transfer_pause_was="$(remote_transfer_paused)"
+  fi
+
+  # The drain mode intentionally leaves this fence at its captured value while
+  # existing jobs and result publication finish. The ordinary maintenance
+  # fence is raised only after the drain is empty and immediately before the
+  # writers stop.
   MAINTENANCE_TRANSFER_PAUSE_WAS="$transfer_pause_was"
   MAINTENANCE_QUIESCE_ARMED=true
   set_remote_transfer_paused "true"
@@ -1133,14 +1467,81 @@ if limits.get("nofile") != (65536, 524288):
     raise SystemExit(f"live worker nofile limit differs: {limits.get('"'"'nofile'"'"')!r}")
 '
 
-  compose exec -T postgres psql -X -qAt -v ON_ERROR_STOP=1 -U aerodb -d aerodb -c \
-    "UPDATE solver_execution_pools SET enabled=$old_2406_enabled, \"updatedAt\"=now() WHERE id='$OPENCFD_2406_POOL_ID';" >/dev/null
-  numerics2_restore_pool
+  if [[ "$DRAIN_STATE_ACTIVE" == "true" ]]; then
+    restore_drain_pool_state
+  else
+    compose exec -T postgres psql -X -qAt -v ON_ERROR_STOP=1 -U aerodb -d aerodb -c \
+      "UPDATE solver_execution_pools SET enabled=$old_2406_enabled, \"updatedAt\"=now() WHERE id='$OPENCFD_2406_POOL_ID';" >/dev/null
+    numerics2_restore_pool
+  fi
   restore_writers "$sweeper_was_running" "$media_was_running"
   set_remote_transfer_paused "$transfer_pause_was"
   FAIL_SAFE_ARMED=false
   echo "hz-solver2 ordinary engine maintenance installed build $ACTION without consuming or cancelling active promise leases."
   compose ps
+}
+
+begin_remote_solver_drain() {
+  local old_build old_expected
+  numerics2_preflight
+  [[ "$(current_engine_version)" == "2606" ]] || {
+    echo "HZ drain mode requires the already-attested OpenCFD 2606 runtime." >&2
+    return 13
+  }
+  old_build="$(read_env_var AIRFOILFOAM_BUILD_ID)"
+  old_expected="$(read_env_var ENGINE_EXPECTED_BUILD_ID)"
+  [[ -n "$old_build" && "$old_expected" == "$old_build" ]] || {
+    echo "HZ runtime build-id expectations are inconsistent before drain." >&2
+    return 13
+  }
+  validate_live_2606_volume_runtime "$old_build"
+  capture_drain_state
+  DRAIN_STATE_ACTIVE=true
+  persist_drain_state prepared
+
+  # Persist the snapshot before changing admission. Once this marker exists,
+  # every interruption is fail-closed and a rerun can resume from the exact
+  # captured pool/writer/transfer state.
+  disable_all_opencfd_pools
+  require_drain_admission_closed
+  DRAIN_ADMISSION_CLOSED=true
+  persist_drain_state draining
+  echo "HZ OpenCFD execution-pool admission is fenced; report and evidence transfer remains live while existing engine work drains."
+}
+
+perform_drain_and_maintenance() {
+  local pending
+  pending="$(read_env_var REMOTE_SOLVER2606_DRAIN_PENDING)"
+  if [[ "$pending" != "1" ]]; then
+    begin_remote_solver_drain
+  else
+    load_drain_state
+  fi
+
+  if [[ "$DRAIN_PHASE" == "prepared" ]]; then
+    disable_all_opencfd_pools
+    require_drain_admission_closed
+    DRAIN_ADMISSION_CLOSED=true
+    persist_drain_state draining
+  fi
+  if [[ "$DRAIN_PHASE" == "draining" ]]; then
+    # A previous interrupted implementation may have left the transfer fence
+    # raised after the admission pool was closed. Restore the captured fence
+    # state before waiting so terminal reports and evidence can settle.
+    set_remote_transfer_paused "$DRAIN_TRANSFER_PAUSED"
+    DRAIN_ADMISSION_CLOSED=true
+    wait_remote_solver_drain
+    persist_drain_state drained
+  fi
+  if [[ "$DRAIN_PHASE" == "drained" ]]; then
+    persist_drain_state maintenance
+  fi
+  if [[ "$DRAIN_PHASE" == "maintenance" ]]; then
+    DRAIN_STATE_ACTIVE=true
+    perform_complete_runtime_maintenance
+    clear_drain_state
+    echo "HZ drain-and-rebuild restored the durable pool, writer, and transfer state."
+  fi
 }
 
 main() {
@@ -1154,7 +1555,19 @@ main() {
     --env-file "$ENV_FILE" --receipt-file "$RECEIPT_FILE" --attestation-file "$ATTESTATION_FILE" \
     --current-source-revision "$DEPLOY_SOURCE_REVISION" --current-source-tree-sha256 "$DEPLOY_SOURCE_TREE_SHA256" \
     --require-state any)" || exit $?
+  if [[ "$DRAIN_MODE" == "true" ]]; then
+    [[ "$state" == "complete" ]] || {
+      echo "HZ drain mode requires a completed, attested OpenCFD 2606 cutover." >&2
+      exit 14
+    }
+    perform_drain_and_maintenance
+    return
+  fi
   if [[ "$state" == "complete" ]]; then
+    if [[ "$(read_env_var REMOTE_SOLVER2606_DRAIN_PENDING)" == "1" ]]; then
+      echo "A durable HZ drain is pending; resume it with --drain $ACTION." >&2
+      exit 14
+    fi
     perform_complete_runtime_maintenance
     return
   fi
