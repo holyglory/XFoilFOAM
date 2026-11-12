@@ -13,8 +13,14 @@ afterAll(() => client.sql.end());
 
 it("avoids bulky HUB job scans while retaining disabled-worker publication custody", async () => {
   await verifyRemoteWorkerIdentityIndex(client.db, false, [
-    { name: "publication-active-lane", query: (lane) => progressivePublicationSelectionSql(lane, 4, "active") },
-    { name: "publication-backlog-lane", query: (lane) => progressivePublicationSelectionSql(lane, 4, "backlog") },
+    {
+      name: "publication-active-lane",
+      query: (lane) => progressivePublicationSelectionSql(lane, 4, "active"),
+    },
+    {
+      name: "publication-backlog-lane",
+      query: (lane) => progressivePublicationSelectionSql(lane, 4, "backlog"),
+    },
   ]);
 }, 120_000);
 
@@ -78,6 +84,7 @@ it("prioritizes active exact-owned reports before stale pending backlog", async 
       pass: ProgressivePublicationPass = "active",
       lane = 0,
       laneCount = 1,
+      limit = 1,
     ) =>
       transaction.execute(sql`
       SELECT report.sim_job_id FROM progressive_worker_reports report
@@ -99,7 +106,7 @@ it("prioritizes active exact-owned reports before stale pending backlog", async 
         AND mod((hashtext(report.sim_job_id::text)::bigint & 2147483647), ${laneCount}) = ${lane}
       ORDER BY (${pass === "active"} AND promise.status = 'active' AND promise."expiresAt" > clock_timestamp()
         AND job.status IN ('pending', 'submitted', 'running', 'ingesting')) DESC,
-        report.created_at,report.sim_job_id,report.sequence LIMIT 1`);
+        report.created_at,report.sim_job_id,report.sequence LIMIT ${limit}`);
     const [eligible] = await transaction.execute(
       sql`SELECT id FROM fixture_jobs WHERE variant='eligible'`,
     );
@@ -236,6 +243,18 @@ it("prioritizes active exact-owned reports before stale pending backlog", async 
       SELECT md5('done-job-active-promise')::uuid,sequence,NULL::timestamptz,
         jsonb_build_object('solverId',md5('solver')::uuid),
         timestamptz '2026-01-01T00:00:00Z'+sequence*interval '1 second' FROM generate_series(3,4000) sequence`);
+    // Retained worker assignments greatly outnumber jobs with pending reports.
+    // Selecting one report must not revisit that entire assignment history.
+    await transaction.execute(sql`INSERT INTO sim_jobs(id,request_payload,status)
+      SELECT md5('publication-history-'||ordinal)::uuid,
+        jsonb_build_object('remoteSolver',true,
+          'syncPromiseId',md5('publication-history-'||ordinal)::uuid::text,
+          'upstreamBaseUrl','https://fixture.invalid'),'done'
+      FROM generate_series(1,12000) ordinal`);
+    await transaction.execute(sql`INSERT INTO sync_sweep_promises(id,status,"expiresAt",registered_solver_id,source_base_url)
+      SELECT md5('publication-history-'||ordinal)::uuid,'active',
+        clock_timestamp()+interval '1 day',md5('solver')::uuid,'https://fixture.invalid'
+      FROM generate_series(1,12000) ordinal`);
     await transaction.execute(
       sql`ANALYZE progressive_worker_reports,sim_jobs,sync_sweep_promises,sync_api_settings`,
     );
@@ -251,29 +270,85 @@ it("prioritizes active exact-owned reports before stale pending backlog", async 
     );
     const [eligibleLane] = await transaction.execute(sql`SELECT
       mod((hashtext(${eligible.id}::text)::bigint & 2147483647), 4)::int AS lane`);
+    const queries: Array<{
+      name: string;
+      query: ReturnType<typeof progressivePublicationSelectionSql>;
+      expected: () => PromiseLike<unknown>;
+    }> = [
+      {
+        name: "batch",
+        query: progressivePublicationBatchSelectionSql(6),
+        expected: () => expected("active", 0, 1, 6),
+      },
+    ];
     for (const laneCount of [1, 4]) {
       const lane = laneCount === 1 ? 0 : Number(eligibleLane.lane);
-      for (const pass of ["active", "backlog"] as const) {
-        const query = progressivePublicationSelectionSql(lane, laneCount, pass);
-        const [explained] = await transaction.execute(
-          sql`EXPLAIN (ANALYZE,BUFFERS,FORMAT JSON) ${query}`,
-        );
-        const plan = (
-          explained["QUERY PLAN"] as Array<Record<string, unknown>>
-        )[0];
-        const nodes: Array<Record<string, unknown>> = [];
-        const visit = (node: Record<string, unknown>) => {
-          nodes.push(node);
-          for (const child of (node.Plans ?? []) as Array<
-            Record<string, unknown>
-          >)
-            visit(child);
-        };
-        visit(plan.Plan as Record<string, unknown>);
-        const scans = nodes.filter(
-          (node) => node["Relation Name"] === "progressive_worker_reports",
-        );
-        const scannedRows = scans.reduce(
+      for (const pass of ["active", "backlog"] as const)
+        queries.push({
+          name: `${pass}-${lane}-${laneCount}`,
+          query: progressivePublicationSelectionSql(lane, laneCount, pass),
+          expected: () => expected(pass, lane, laneCount),
+        });
+    }
+    for (const { name, query, expected: expectedRows } of queries) {
+      const [explained] = await transaction.execute(
+        sql`EXPLAIN (ANALYZE,BUFFERS,FORMAT JSON) ${query}`,
+      );
+      const plan = (
+        explained["QUERY PLAN"] as Array<Record<string, unknown>>
+      )[0];
+      const nodes: Array<Record<string, unknown>> = [];
+      const visit = (node: Record<string, unknown>) => {
+        nodes.push(node);
+        for (const child of (node.Plans ?? []) as Array<
+          Record<string, unknown>
+        >)
+          visit(child);
+      };
+      visit(plan.Plan as Record<string, unknown>);
+      const scans = nodes.filter(
+        (node) => node["Relation Name"] === "progressive_worker_reports",
+      );
+      const scannedRows = scans.reduce(
+        (total, node) =>
+          total +
+          Number(node["Actual Loops"]) *
+            (Number(node["Actual Rows"]) +
+              Number(node["Rows Removed by Filter"] ?? 0)),
+        0,
+      );
+      console.info(
+        JSON.stringify({
+          name,
+          scannedRows,
+          publicationPlan: scans,
+          reportSelectionMs: plan["Execution Time"],
+        }),
+      );
+      // The selector resolves the unacknowledged head through the pending
+      // index, then may fetch that exact row through the primary key. Both
+      // paths stay bounded; the report-order index would re-scan a job's
+      // entire unacknowledged history before checking its head sequence.
+      const expectedIndexes = new Set([
+        "fixture_publication_pending_idx",
+        "progressive_worker_reports_pkey",
+      ]);
+      expect(
+        scans.some(
+          (node) =>
+            expectedIndexes.has(String(node["Index Name"] ?? "")) &&
+            Number(node["Actual Loops"]) > 0,
+        ),
+      ).toBe(true);
+      expect(
+        scans.some(
+          (node) => node["Index Name"] === "fixture_publication_order_idx",
+        ),
+      ).toBe(false);
+      expect(scannedRows).toBeLessThan(32);
+      const examinedJobs = nodes
+        .filter((node) => node["Relation Name"] === "sim_jobs")
+        .reduce(
           (total, node) =>
             total +
             Number(node["Actual Loops"]) *
@@ -281,42 +356,11 @@ it("prioritizes active exact-owned reports before stale pending backlog", async 
                 Number(node["Rows Removed by Filter"] ?? 0)),
           0,
         );
-        console.info(
-          JSON.stringify({
-            pass,
-            lane,
-            laneCount,
-            scannedRows,
-            publicationPlan: scans,
-            reportSelectionMs: plan["Execution Time"],
-          }),
-        );
-        // The selector resolves the unacknowledged head through the pending
-        // index, then may fetch that exact row through the primary key. Both
-        // paths stay bounded; the report-order index would re-scan a job's
-        // entire unacknowledged history before checking its head sequence.
-        const expectedIndexes = new Set([
-          "fixture_publication_pending_idx",
-          "progressive_worker_reports_pkey",
-        ]);
-        expect(
-          scans.some(
-            (node) =>
-              expectedIndexes.has(String(node["Index Name"] ?? "")) &&
-              Number(node["Actual Loops"]) > 0,
-          ),
-        ).toBe(true);
-        expect(
-          scans.some((node) => node["Index Name"] === "fixture_publication_order_idx"),
-        ).toBe(false);
-        expect(scannedRows).toBeLessThan(32);
-        expect(scans.some((node) => node["Node Type"] === "Seq Scan")).toBe(
-          false,
-        );
-        expect(await transaction.execute(query)).toEqual(
-          await expected(pass, lane, laneCount),
-        );
-      }
+      expect(examinedJobs).toBeLessThan(32);
+      expect(scans.some((node) => node["Node Type"] === "Seq Scan")).toBe(
+        false,
+      );
+      expect(await transaction.execute(query)).toEqual(await expectedRows());
     }
   });
 }, 120000);

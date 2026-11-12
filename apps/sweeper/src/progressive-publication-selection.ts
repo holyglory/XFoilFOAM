@@ -2,25 +2,53 @@ import { sql } from "drizzle-orm";
 
 export type ProgressivePublicationPass = "active" | "backlog";
 
+function progressivePublicationHeadsSql() {
+  // Probe worker custody first so a HUB with no worker jobs avoids the walk.
+  // Then seek once per pending job in the (sim_job_id, sequence) index. Starting
+  // from sim_jobs revisits every historical assignment on every publication;
+  // DISTINCT ON reports instead walks every pending sequence of a large job.
+  // Resolve the head before any ownership filter so a foreign head cannot be
+  // skipped in favor of a later sequence.
+  return sql`
+    publication_worker AS MATERIALIZED (
+      SELECT job.id FROM sim_jobs job CROSS JOIN settings
+      WHERE job.request_payload->>'remoteSolver' = 'true'
+        AND job.request_payload->>'upstreamBaseUrl' = settings.upstream_base_url
+      LIMIT 1
+    ), pending_heads AS (
+      (
+        SELECT head.sim_job_id, head.sequence
+        FROM progressive_worker_reports head
+        WHERE head.acknowledged_at IS NULL
+          AND EXISTS (SELECT 1 FROM publication_worker)
+        ORDER BY head.sim_job_id, head.sequence LIMIT 1
+      )
+      UNION ALL
+      SELECT next_head.sim_job_id, next_head.sequence
+      FROM pending_heads previous
+      CROSS JOIN LATERAL (
+        SELECT head.sim_job_id, head.sequence
+        FROM progressive_worker_reports head
+        WHERE head.acknowledged_at IS NULL
+          AND head.sim_job_id > previous.sim_job_id
+        ORDER BY head.sim_job_id, head.sequence LIMIT 1
+      ) next_head
+    )
+  `;
+}
+
 function progressivePublicationEligibleSql(lane: number, laneCount: number) {
   return sql`
     SELECT report.sim_job_id, report.created_at, report.sequence,
       (promise.status = 'active' AND promise."expiresAt" > clock_timestamp()
         AND job.status IN ('pending', 'submitted', 'running', 'ingesting')) AS active_lease
-    FROM sim_jobs job
+    FROM pending_heads head
+    JOIN sim_jobs job ON job.id = head.sim_job_id
     JOIN sync_sweep_promises promise
       ON promise.id::text = job.request_payload->>'syncPromiseId'
     CROSS JOIN settings
-    JOIN LATERAL (
-      SELECT head.sequence
-      FROM progressive_worker_reports head
-      WHERE head.sim_job_id = job.id
-        AND head.acknowledged_at IS NULL
-      ORDER BY head.sequence
-      LIMIT 1
-    ) head ON true
     JOIN progressive_worker_reports report
-      ON report.sim_job_id = job.id
+      ON report.sim_job_id = head.sim_job_id
       AND report.sequence = head.sequence
       AND report.acknowledged_at IS NULL
       AND report.report->>'solverId' = settings.remote_solver_registered_id::text
@@ -29,9 +57,11 @@ function progressivePublicationEligibleSql(lane: number, laneCount: number) {
       AND promise.source_base_url = settings.upstream_base_url
       AND job.request_payload->>'upstreamBaseUrl' = settings.upstream_base_url
       AND job.request_payload->>'remoteSolver' = 'true'
-      AND ${laneCount === 1
-        ? sql`TRUE`
-        : sql`mod((hashtext(report.sim_job_id::text)::bigint & 2147483647), ${laneCount}) = ${lane}`}
+      AND ${
+        laneCount === 1
+          ? sql`TRUE`
+          : sql`mod((hashtext(head.sim_job_id::text)::bigint & 2147483647), ${laneCount}) = ${lane}`
+      }
   `;
 }
 
@@ -49,11 +79,11 @@ export function progressivePublicationSelectionSql(
   )
     throw new Error("Progressive publication lane is out of range");
   return sql`
-    WITH settings AS MATERIALIZED (
+    WITH RECURSIVE settings AS MATERIALIZED (
       SELECT remote_solver_registered_id,upstream_base_url FROM sync_api_settings
       WHERE id = 1 AND NOT remote_solver_transfer_paused
         AND remote_solver_auth_token <> '' AND upstream_base_url IS NOT NULL
-    ), eligible AS MATERIALIZED (
+    ), ${progressivePublicationHeadsSql()}, eligible AS MATERIALIZED (
       ${progressivePublicationEligibleSql(lane, laneCount)}
     )
     SELECT sim_job_id FROM eligible
@@ -67,33 +97,12 @@ export function progressivePublicationBatchSelectionSql(limit = 32) {
   if (!Number.isSafeInteger(limit) || limit < 1 || limit > 32)
     throw new Error("Progressive publication batch limit is out of range");
   return sql`
-    WITH settings AS MATERIALIZED (
+    WITH RECURSIVE settings AS MATERIALIZED (
       SELECT remote_solver_registered_id,upstream_base_url FROM sync_api_settings
       WHERE id = 1 AND NOT remote_solver_transfer_paused
         AND remote_solver_auth_token <> '' AND upstream_base_url IS NOT NULL
-    ), eligible AS MATERIALIZED (
-      SELECT DISTINCT ON (report.sim_job_id)
-        report.sim_job_id,
-        report.created_at,
-        (promise.status = 'active' AND promise."expiresAt" > clock_timestamp()
-          AND job.status IN ('pending', 'submitted', 'running', 'ingesting')) AS active_lease
-      FROM progressive_worker_reports report
-      JOIN sim_jobs job ON job.id = report.sim_job_id
-      JOIN sync_sweep_promises promise
-        ON promise.id::text = job.request_payload->>'syncPromiseId'
-      CROSS JOIN settings
-      WHERE report.acknowledged_at IS NULL
-        AND report.report->>'solverId' = settings.remote_solver_registered_id::text
-        AND report.sequence = (
-          SELECT head.sequence FROM progressive_worker_reports head
-          WHERE head.sim_job_id = report.sim_job_id AND head.acknowledged_at IS NULL
-          ORDER BY head.sequence LIMIT 1
-        )
-        AND promise.registered_solver_id = settings.remote_solver_registered_id
-        AND promise.source_base_url = settings.upstream_base_url
-        AND job.request_payload->>'upstreamBaseUrl' = settings.upstream_base_url
-        AND job.request_payload->>'remoteSolver' = 'true'
-      ORDER BY report.sim_job_id, report.sequence
+    ), ${progressivePublicationHeadsSql()}, eligible AS MATERIALIZED (
+      ${progressivePublicationEligibleSql(0, 1)}
     )
     SELECT sim_job_id FROM eligible
     ORDER BY active_lease DESC, created_at, sim_job_id
