@@ -38,6 +38,8 @@ function progressivePublicationHeadsSql() {
 }
 
 function progressivePublicationEligibleSql(lane: number, laneCount: number) {
+  // Keep ownership outside the exact head lookup. Otherwise the planner can
+  // scan every report for this solver before joining the pending job heads.
   return sql`
     SELECT report.sim_job_id, report.created_at, report.sequence,
       (promise.status = 'active' AND promise."expiresAt" > clock_timestamp()
@@ -47,13 +49,16 @@ function progressivePublicationEligibleSql(lane: number, laneCount: number) {
     JOIN sync_sweep_promises promise
       ON promise.id::text = job.request_payload->>'syncPromiseId'
     CROSS JOIN settings
-    JOIN progressive_worker_reports report
-      ON report.sim_job_id = head.sim_job_id
-      AND report.sequence = head.sequence
-      AND report.acknowledged_at IS NULL
-      AND report.report->>'solverId' = settings.remote_solver_registered_id::text
-    WHERE report.acknowledged_at IS NULL
-      AND promise.registered_solver_id = settings.remote_solver_registered_id
+    JOIN LATERAL (
+      SELECT stored.sim_job_id, stored.created_at, stored.sequence,
+        stored.report->>'solverId' AS solver_id
+      FROM progressive_worker_reports stored
+      WHERE stored.sim_job_id = head.sim_job_id
+        AND stored.sequence = head.sequence
+        AND stored.acknowledged_at IS NULL
+      OFFSET 0
+    ) report ON report.solver_id = settings.remote_solver_registered_id::text
+    WHERE promise.registered_solver_id = settings.remote_solver_registered_id
       AND promise.source_base_url = settings.upstream_base_url
       AND job.request_payload->>'upstreamBaseUrl' = settings.upstream_base_url
       AND job.request_payload->>'remoteSolver' = 'true'
