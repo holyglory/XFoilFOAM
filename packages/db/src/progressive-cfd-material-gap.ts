@@ -2,7 +2,10 @@ import { sql } from "drizzle-orm";
 import type { DB } from "./client";
 import { analysisContentHash, canonicalAnalysisJson } from "./analysis-target";
 import { progressiveCfdMaterialDomainRecoveryAvailableSql } from "./progressive-attempt-budget";
-import { progressiveMaterialDomainRecipe } from "./progressive-cfd-numerical-recovery";
+import {
+  normalizeProgressiveMaterialDomainRecoveryRecipe,
+  progressiveMaterialDomainRecipe,
+} from "./progressive-cfd-numerical-recovery";
 import { validateProgressiveExecutionStopProof } from "./progressive-cfd-settlement";
 import { assertProgressiveExecutionIdentity } from "./progressive-execution-identity";
 import { verifyProgressiveRemoteExecution } from "./progressive-remote-execution";
@@ -86,7 +89,10 @@ export async function verifyProgressiveCfdMaterialGap(db: DB, unitId: string, at
       canonicalAnalysisJson(row.recipe) !== canonicalAnalysisJson(row.unit_recipe) ||
       analysisContentHash({ sourceRevisionId: row.source_revision_id, recipe: row.recipe }) !== row.execution_recipe_id ||
       analysisContentHash(row.evidence_payload) !== row.evidence_signature ||
-      row.evidence_signature !== row.diagnostic_signature || analysisContentHash(row.proof) !== row.proof_signature)
+      row.evidence_signature !== row.diagnostic_signature ||
+      canonicalAnalysisJson(expected) !== canonicalAnalysisJson(
+        normalizeProgressiveMaterialDomainRecoveryRecipe(row.recovery_recipe as Record<string, unknown>),
+      ) || analysisContentHash(row.proof) !== row.proof_signature)
       return false;
     assertProgressiveExecutionIdentity(String(row.job_id), String(row.engine_job_id), row.request_payload);
     const proof = row.proof as EngineExecutionStopProof;

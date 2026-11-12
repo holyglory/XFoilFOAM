@@ -49,6 +49,40 @@ export function progressiveMaterialDomainRecipe(
   };
 }
 
+/** Normalize recovery plans created before the canonical transient numerics
+ * fields were added. The immutable plan remains unchanged; execution uses the
+ * same bounded material fallback semantics for both representations. */
+export function normalizeProgressiveMaterialDomainRecoveryRecipe(
+  recipe: Record<string, unknown>,
+): Record<string, unknown> {
+  const selection = recipe.selection as Record<string, unknown> | undefined;
+  if (
+    selection?.solver !== "rhoPimpleFoam" ||
+    selection.reason !== "bounded_material_domain_recovery"
+  )
+    return recipe;
+  const solver = { ...(recipe.solver as Record<string, unknown> | undefined) };
+  const configuredCourant = Number(
+    solver.transientMaxCourant ?? solver.transient_max_courant,
+  );
+  const normalized: Record<string, unknown> = {
+    ...recipe,
+    solver: {
+      ...solver,
+      momentumScheme: "upwind",
+      transientMaxCourant: Number.isFinite(configuredCourant)
+        ? Math.min(configuredCourant, 1)
+        : 1,
+    },
+  };
+  if (Object.hasOwn(solver, "momentum_scheme"))
+    (normalized.solver as Record<string, unknown>).momentum_scheme = "upwind";
+  if (Object.hasOwn(solver, "transient_max_courant"))
+    (normalized.solver as Record<string, unknown>).transient_max_courant =
+      (normalized.solver as Record<string, unknown>).transientMaxCourant;
+  return normalized;
+}
+
 interface RecoveryUnit {
   id: string;
   token: string;

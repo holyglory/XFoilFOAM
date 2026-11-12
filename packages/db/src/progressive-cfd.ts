@@ -273,7 +273,17 @@ export async function claimProgressiveCfdUnit(
     );
     if (!epoch) throw new Error("Calculation epoch is missing");
     const localStepPolicy = currentLocalStepPolicySql();
-    const effectiveRecipe = sql`coalesce((SELECT recovery.recipe FROM progressive_cfd_recovery_plans recovery WHERE recovery.unit_id = unit.id ORDER BY recovery.ordinal DESC LIMIT 1),
+    const effectiveRecipe = sql`coalesce((SELECT CASE WHEN recovery.reason = 'material_domain'
+        AND recovery.recipe->'selection'->>'reason' = 'bounded_material_domain_recovery'
+      THEN jsonb_set(
+        jsonb_set(recovery.recipe, '{solver,momentumScheme}', '"upwind"'::jsonb),
+        '{solver,transientMaxCourant}', to_jsonb(least(coalesce(
+          (recovery.recipe->'solver'->>'transientMaxCourant')::double precision,
+          (recovery.recipe->'solver'->>'transient_max_courant')::double precision,
+          1
+        ), 1))
+      ) ELSE recovery.recipe END
+      FROM progressive_cfd_recovery_plans recovery WHERE recovery.unit_id = unit.id ORDER BY recovery.ordinal DESC LIMIT 1),
       (SELECT ${localStepRecipeSql(sql`unit.recipe`, sql`policy.smoothing`)} FROM campaign_local_step_policies policy WHERE policy.id=(${localStepPolicy})), unit.recipe)`;
     const effectiveBudget = progressiveCfdEffectiveBudgetSql(sql`unit`);
     const pendingBudgetExtension = progressiveCfdBudgetExtensionPendingSql(
