@@ -11,7 +11,7 @@ permissions:
   contents: read
 
 env:
-  FUNCTIONAL_REF: 29eb2c6b83cc9da2c5624a51f5fff1ace52abee9
+  FUNCTIONAL_REF: 37d89656c28585fb30bf96e0967944c232de22d0
   CI: 'true'
   COREPACK_ENABLE_DOWNLOAD_PROMPT: '0'
 
