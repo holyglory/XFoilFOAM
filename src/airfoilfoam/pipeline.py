@@ -438,10 +438,11 @@ def _last_log_delta_t(log_text: str) -> Optional[float]:
 
 
 class TransientTimeoutError(CommandTimeoutError):
-    """A transient solver run killed by the wall-clock timeout that left no
-    gradable coefficient window in the CURRENT chunk. Distinct from a crash:
-    the case dir keeps its last written fields, so the saved state stays
-    restartable (continuation catch sites mark the grade continuable)."""
+    """An incomplete transient window, with explicit checkpoint availability."""
+
+    def __init__(self, message: str, *, restartable: bool = True):
+        super().__init__(message)
+        self.restartable = restartable
 
 
 def _transient_timeout_message(
@@ -865,15 +866,25 @@ MARCH_BUDGET_MARKER_FILENAME = "march_budget.json"
 #: the grading path to grade the partial window as a continuable budget stop.
 MARCH_STOP_MARKER_FILENAME = "march_stopped.json"
 
+# OpenCFD 2606 sigStopAtWriteNow.cxx: the handler is one-shot and Time.C
+# propagates its write-and-stop request across MPI ranks at the next iteration.
+MARCH_WRITE_STOP_SIGNAL = int(signal.SIGUSR2)
 
-def write_march_budget_marker(case_dir: Path, end_t: float, budget_s: float, wall_start: float) -> None:
+
+def write_march_budget_marker(
+    case_dir: Path, end_t: float, budget_s: float, wall_start: float,
+    *, native_write_stop: bool = False,
+) -> None:
     """Arm the march-rate watchdog for the chunk about to launch."""
     case_dir.mkdir(parents=True, exist_ok=True)
     path = case_dir / MARCH_BUDGET_MARKER_FILENAME
     tmp = path.with_name(f".{path.name}.tmp")
+    payload = {"end_t": float(end_t), "budget_s": float(budget_s), "wall_start": float(wall_start)}
+    if native_write_stop:
+        payload["write_stop_signal"] = MARCH_WRITE_STOP_SIGNAL
     tmp.write_text(
         json.dumps(
-            {"end_t": float(end_t), "budget_s": float(budget_s), "wall_start": float(wall_start)},
+            payload,
             indent=2,
         )
         + "\n"
@@ -899,6 +910,7 @@ def update_march_budget_target(case_dir: Path, end_t: float) -> bool:
         end_t=float(end_t),
         budget_s=marker["budget_s"],
         wall_start=marker["wall_start"],
+        native_write_stop=marker.get("write_stop_signal") == MARCH_WRITE_STOP_SIGNAL,
     )
     return True
 
@@ -917,24 +929,35 @@ def read_march_budget_marker(case_dir: Path) -> Optional[dict]:
         if not isinstance(value, (int, float)) or not math.isfinite(float(value)):
             return None
         out[key] = float(value)
+    if payload.get("write_stop_signal") == MARCH_WRITE_STOP_SIGNAL:
+        out["write_stop_signal"] = MARCH_WRITE_STOP_SIGNAL
     return out
 
 
-def write_march_stop(case_dir: Path, reason: str) -> None:
+def write_march_stop(case_dir: Path, reason: str, *, write_stop: dict | None = None) -> None:
     """Persist the march-rate watchdog's truthful early-stop for grading."""
     case_dir.mkdir(parents=True, exist_ok=True)
-    (case_dir / MARCH_STOP_MARKER_FILENAME).write_text(
-        json.dumps({"reason": reason, "stopped_at": time.time()}, indent=2) + "\n"
-    )
+    payload = {"reason": reason, "stopped_at": time.time()}
+    if write_stop is not None:
+        payload["write_stop"] = write_stop
+    path = case_dir / MARCH_STOP_MARKER_FILENAME
+    tmp = path.with_name(f".{path.name}.tmp")
+    tmp.write_text(json.dumps(payload, indent=2) + "\n")
+    os.replace(tmp, path)
 
 
-def read_march_stop(case_dir: Path) -> Optional[str]:
-    """The march-rate watchdog's early-stop reason for this case, or None."""
+def read_march_stop_record(case_dir: Path) -> dict | None:
     try:
         payload = json.loads((case_dir / MARCH_STOP_MARKER_FILENAME).read_text())
     except (OSError, ValueError):
         return None
-    reason = payload.get("reason") if isinstance(payload, dict) else None
+    return payload if isinstance(payload, dict) else None
+
+
+def read_march_stop(case_dir: Path) -> Optional[str]:
+    """The march-rate watchdog's early-stop reason for this case, or None."""
+    payload = read_march_stop_record(case_dir)
+    reason = payload.get("reason") if payload else None
     return str(reason) if reason else None
 
 
@@ -5433,6 +5456,43 @@ def _isolate_failed_steady_initialization(tcase: Path) -> None:
         os.replace(source, times_dir / name)
 
 
+def _complete_march_field(path: Path, name: str) -> bool:
+    """Require a whole native field write, including gzip EOF/CRC when compressed."""
+    try:
+        with (gzip.open(path, "rb") if path.suffix == ".gz" else path.open("rb")) as stream:
+            header = stream.read(4096)
+            tail = header[-256:]
+            while chunk := stream.read(1024 * 1024):
+                tail = (tail + chunk)[-256:]
+        return (
+            b"FoamFile" in header
+            and re.search(rb"\bclass\s+\w*Field\s*;", header) is not None
+            and re.search(rb'\bobject\s+"?' + re.escape(name.encode()) + rb'"?\s*;', header) is not None
+            and tail.rstrip().endswith(b"// ************************************************************************* //")
+        )
+    except (OSError, EOFError):
+        return False
+
+
+def _march_checkpoint_times(
+    case_dir: Path, start_t: float, fields: tuple[str, ...], *, complete: bool = False,
+) -> set[float]:
+    """Saved evolved times with every restart field; initial conditions do not count."""
+    times = set()
+    for child in case_dir.iterdir() if case_dir.is_dir() else ():
+        try:
+            value = float(child.name)
+            if not child.is_dir() or not math.isfinite(value) or value <= start_t:
+                continue
+            if all(any((child / suffix).is_file() and (child / suffix).stat().st_size > 0
+                       and (not complete or _complete_march_field(child / suffix, name))
+                       for suffix in (name, f"{name}.gz")) for name in fields):
+                times.add(value)
+        except (OSError, ValueError):
+            continue
+    return times
+
+
 def _run_transient_attempt(
     tcase: Path,
     airfoil,
@@ -5487,6 +5547,12 @@ def _run_transient_attempt(
             "the next same-case chunk could start"
         )
     checkpoint = _create_transient_recovery_checkpoint(tcase)
+    launch_time_dir = _latest_time_dir(tcase)
+    launch_fields = {
+        path.name.removesuffix(".gz")
+        for path in launch_time_dir.iterdir()
+        if path.is_file() and not path.name.startswith(".")
+    } if launch_time_dir is not None else set()
     wall_seconds = 0.0
 
     def run_solver_pass(
@@ -5548,16 +5614,28 @@ def _run_transient_attempt(
             if physical_budget is None
             else min(remaining, physical_budget)
         )
+        native_write_stop = (
+            n_proc > 1
+            and physical_budget is not None
+            and pass_params.urans_fidelity == UransFidelity.precalc
+            and dialect.identity.distribution == "opencfd"
+            and dialect.identity.version == "2606"
+            and dialect.transient_solver_command == "rhoPimpleFoam"
+        )
         write_march_budget_marker(
             tcase,
             end_t=end_t,
             budget_s=march_budget,
             wall_start=time.time(),
+            native_write_stop=native_write_stop,
         )
+        solver_command = dialect.transient_solver_command
+        if native_write_stop:
+            solver_command += f" -opt-switch stopAtWriteNowSignal={MARCH_WRITE_STOP_SIGNAL}"
         solve_started = time.monotonic()
         pass_result = runner.solver(
             tcase,
-            dialect.transient_solver_command,
+            solver_command,
             n_proc,
             timeout=remaining,
             restart=True,
@@ -5698,6 +5776,28 @@ def _run_transient_attempt(
                 ) from retry_failure
             raise retry_failure
 
+    checkpoint_times: set[float] = set()
+    checkpoint_fields = ("U", "p", "T") if is_compressible(runner) else ("U", "p")
+    marker = read_march_budget_marker(tcase)
+    native_checkpoint = bool(marker and marker.get("write_stop_signal") == MARCH_WRITE_STOP_SIGNAL)
+    if native_checkpoint:
+        # Preserve all launch fields, including the selected turbulence model's
+        # state. rhoPimpleFoam also AUTO_WRITEs rho and the face flux phi even
+        # when those two fields were calculated rather than supplied in 0/.
+        checkpoint_fields = tuple(sorted(launch_fields | {"U", "p", "T", "rho", "phi"}))
+    if march_stop:
+        roots = [tcase / f"processor{i}" for i in range(n_proc)] if n_proc > 1 else [tcase]
+        checkpoint_times = set.intersection(*(
+            _march_checkpoint_times(root, start_t, checkpoint_fields, complete=native_checkpoint) for root in roots
+        ))
+        if not checkpoint_times:
+            _remove_transient_recovery_checkpoint(checkpoint)
+            raise TransientTimeoutError(
+                f"URANS {march_stop}; no evolved checkpoint was saved on every solver rank; "
+                "continuation is unavailable (initial fields are not a restart of this trajectory)",
+                restartable=False,
+            )
+
     if n_proc > 1:
         reconstruct_timeout = remaining_timeout
         if deadline is not None:
@@ -5719,6 +5819,15 @@ def _run_transient_attempt(
                 "reconstructPar -newTimes",
                 timeout=reconstruct_timeout,
             )
+            # Keep the native command output even on failure. A generic exception
+            # must not replace the evidence needed to distinguish a parse error,
+            # a timeout and an absent checkpoint.
+            with (tcase / "log.reconstructPar").open("a", encoding="utf-8") as log:
+                log.write(
+                    f"\ncommand: reconstructPar -newTimes\n"
+                    f"returncode: {getattr(reconstruction, 'returncode', None)}\n"
+                    + str(getattr(reconstruction, "stdout", "")) + "\n"
+                )
             reconstruction_timed_out = (
                 bool(getattr(reconstruction, "timed_out", False))
                 or (
@@ -5743,6 +5852,14 @@ def _run_transient_attempt(
                     "field state was not published and is not safely continuable"
                 )
         _check_cancel(cancel_check)
+    if march_stop and not checkpoint_times.intersection(
+        _march_checkpoint_times(tcase, start_t, checkpoint_fields, complete=native_checkpoint)
+    ):
+        _remove_transient_recovery_checkpoint(checkpoint)
+        raise TransientTimeoutError(
+            f"URANS {march_stop}; no evolved reconstructed checkpoint was verified; "
+            "continuation is unavailable", restartable=False,
+        )
     _remove_transient_recovery_checkpoint(checkpoint)
 
     def _timeout_error() -> OpenFOAMError:
@@ -6537,6 +6654,8 @@ def _extend_transient_until_periods(
                 deadline=deadline,
             )
         except TransientTimeoutError as exc:
+            if not exc.restartable:
+                raise
             # A chunk that timed out without gradable data must not discard the
             # already-graded window; the point keeps its honest partial grade.
             # A TIMEOUT (unlike a crash/divergence) leaves the previous chunk's
@@ -6941,7 +7060,9 @@ def _run_transient(
             cancel_check=cancel_check,
             deadline=tier_deadline,
         )
-    except TransientTimeoutError:
+    except TransientTimeoutError as exc:
+        if not exc.restartable:
+            raise
         # A refined pass that timed out without gradable data must not discard
         # the completed base pass — fall back to the base result below.
         refined = None

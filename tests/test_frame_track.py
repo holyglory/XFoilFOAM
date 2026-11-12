@@ -3432,7 +3432,8 @@ def test_precalc_same_case_continuation_is_bounded_without_copied_refine(
     )
 
 
-def test_continuation_chunk_timeout_keeps_grade_and_marks_continuable(tmp_path, monkeypatch):
+@pytest.mark.parametrize("restartable", [True, False])
+def test_continuation_chunk_timeout_keeps_grade_and_marks_continuable(tmp_path, monkeypatch, restartable):
     # Real breakage shape (amendment C recall): the second chunk is killed by
     # the wall clock with nothing gradable IN THAT CHUNK. The already-graded
     # window must survive, and — because a timeout (unlike a crash) leaves the
@@ -3447,11 +3448,19 @@ def test_continuation_chunk_timeout_keeps_grade_and_marks_continuable(tmp_path, 
     def timeout_on_chunk(*args, **kwargs):
         if calls:
             raise pipeline.TransientTimeoutError(
-                "URANS transient timed out after 7200s at t=1.6 of 4.8s (dt collapsed to 1e-06)"
+                "URANS transient timed out; no verified checkpoint" if not restartable else
+                "URANS transient timed out after 7200s at t=1.6 of 4.8s (dt collapsed to 1e-06)",
+                restartable=restartable,
             )
         return fake(*args, **kwargs)
 
     monkeypatch.setattr(pipeline, "_run_transient_attempt", timeout_on_chunk)
+    if not restartable:
+        with pytest.raises(pipeline.TransientTimeoutError) as caught:
+            _run_transient_for_test(tmp_path / "case", SolverParams(), timeout=7200)
+        assert caught.value.restartable is False
+        assert pipeline.URANS_BUDGET_STOP_MARKER not in str(caught.value)
+        return
     result = _run_transient_for_test(tmp_path / "case", SolverParams(), timeout=7200)
 
     assert result is not None

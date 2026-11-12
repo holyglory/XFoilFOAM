@@ -1339,7 +1339,8 @@ def test_ambiguous_non_timeout_solver_failure_is_infrastructure(tmp_path, monkey
         _timeout_attempt(tcase, FakeRunner())
 
 
-def test_refined_pass_timeout_falls_back_to_base_result(tmp_path, monkeypatch):
+@pytest.mark.parametrize("restartable", [True, False])
+def test_refined_pass_timeout_falls_back_to_base_result(tmp_path, monkeypatch, restartable):
     """A refined pass that times out with nothing gradable must not discard the
     completed base pass."""
     from airfoilfoam.pipeline import TransientResult, UransQuality
@@ -1355,8 +1356,9 @@ def test_refined_pass_timeout_falls_back_to_base_result(tmp_path, monkeypatch):
         attempts.append(refined)
         if refined:
             raise pipeline.TransientTimeoutError(
-                "URANS transient timed out after 7200s at t=0.31 of 3s "
-                "(dt collapsed to 1e-06)"
+                "URANS transient timed out; no verified checkpoint" if not restartable else
+                "URANS transient timed out after 7200s at t=0.31 of 3s (dt collapsed to 1e-06)",
+                restartable=restartable,
             )
         (tcase / "0.3").mkdir(exist_ok=True)
         return TransientResult(
@@ -1373,18 +1375,27 @@ def test_refined_pass_timeout_falls_back_to_base_result(tmp_path, monkeypatch):
     monkeypatch.setattr(pipeline, "_prepare_transient_case", fake_prepare)
     monkeypatch.setattr(pipeline, "_run_transient_attempt", fake_attempt)
 
-    result = pipeline._run_transient(
-        tmp_path,
-        airfoil=None,
-        resolved=None,
-        spec=CaseSpec(chord=1.0, speed=7.3, aoa_deg=0.0),
-        fluid=None,
-        roughness=None,
-        solver_params=SolverParams(),
-        runner=None,
-        n_proc=1,
-        timeout=7200,
-    )
+    def call():
+        return pipeline._run_transient(
+            tmp_path,
+            airfoil=None,
+            resolved=None,
+            spec=CaseSpec(chord=1.0, speed=7.3, aoa_deg=0.0),
+            fluid=None,
+            roughness=None,
+            solver_params=SolverParams(),
+            runner=None,
+            n_proc=1,
+            timeout=7200,
+        )
+
+    if not restartable:
+        with pytest.raises(pipeline.TransientTimeoutError) as caught:
+            call()
+        assert caught.value.restartable is False
+        assert pipeline.URANS_BUDGET_STOP_MARKER not in str(caught.value)
+        return
+    result = call()
 
     assert attempts == [False, True]
     assert result is not None

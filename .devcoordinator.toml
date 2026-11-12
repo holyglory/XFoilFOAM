@@ -52,7 +52,7 @@ command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "node"
 name = "publication-jumbo-backlog"
 tier = "development"
 requires = ["schema"]
-command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/progressive-publication-selection.test.ts", "-t", "prioritizes active exact-owned reports before stale pending backlog"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/progressive-publication-selection.test.ts"]
 
 [test.exact-completion-retry]
 timeout_seconds = 1200
@@ -5316,3 +5316,63 @@ timeout_seconds = 1800
 command = ["/bin/bash", "-c", "exec /home/holyglory/XFoilFOAM/.venv/bin/python -m pytest tests/test_deploy_sweeper_state.py tests/test_deployment_env_preflight.py tests/test_deployment_source_promotion.py tests/test_deployment_storage_prune.py -q --junitxml=\"$DEVCOORDINATOR_DIAGNOSTICS_DIR/maintenance.xml\""]
 env = { PYTHONPATH = "src:.", PYTHONDONTWRITEBYTECODE = "1" }
 diagnostic_sources = [{ format = "junit", path = "maintenance.xml" }]
+
+[test.march-checkpoint]
+timeout_seconds = 600
+env = { PYTHONPATH = ".", PYTHONDONTWRITEBYTECODE = "1" }
+
+[[test.march-checkpoint.check]]
+name = "contracts"
+tier = "development"
+timeout_seconds = 120
+command = ["/bin/bash", "-c", "exec .venv/bin/python -m pytest tests/test_march_guard.py tests/test_solver_budget.py tests/test_targeted_urans_warmstart.py tests/test_frame_track.py -q --junitxml=\"$DEVCOORDINATOR_DIAGNOSTICS_DIR/march.xml\""]
+env = { PYTHONPATH = "src:." }
+diagnostic_sources = [{ format = "junit", path = "march.xml" }]
+
+[[test.march-checkpoint.check]]
+name = "inputs"
+tier = "development"
+phase = "fixture"
+timeout_seconds = 60
+command = ["/usr/bin/python3", "-m", "scripts.materials.march_checkpoint_control", "prepare"]
+resources = [{ kind = "directory", id = ".codex-artifacts/march-checkpoint-native", access = "exclusive" }]
+
+[[test.march-checkpoint.check]]
+name = "native"
+tier = "development"
+requires = ["inputs", "contracts"]
+timeout_seconds = 360
+command = ["/usr/bin/python3", "-m", "scripts.materials.march_checkpoint_control", "apply"]
+retained_artifacts = [{ name = "native-checkpoint", path = ".codex-artifacts/march-checkpoint-native/output", max_bytes = 268435456 }]
+
+[[test.march-checkpoint.check]]
+name = "verification"
+tier = "development"
+requires = ["native"]
+timeout_seconds = 30
+command = ["/usr/bin/python3", "-m", "scripts.materials.march_checkpoint_control", "verify"]
+
+[[test.march-checkpoint.check]]
+name = "cleanup"
+tier = "development"
+phase = "cleanup"
+after = ["contracts", "inputs", "native", "verification"]
+timeout_seconds = 120
+command = ["/usr/bin/python3", "-m", "scripts.materials.march_checkpoint_control", "cleanup"]
+retained_artifacts = [{ name = "checkpoint-receipts", path = ".codex-artifacts/march-checkpoint-native/receipt", max_bytes = 16777216 }]
+
+[deployment.march-checkpoint]
+source = ["worktree"]
+components = ["native"]
+public = false
+ttl_seconds = 600
+
+[deployment.march-checkpoint.component.native]
+type = "compose"
+files = ["compose.march-checkpoint.yml"]
+services = ["native"]
+finite_services = ["native"]
+build = false
+port = false
+route = false
+timeout_seconds = 300

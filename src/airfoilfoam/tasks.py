@@ -5,6 +5,7 @@ import fcntl
 import logging
 import math
 import os
+import shlex
 import signal
 import threading
 import time
@@ -39,9 +40,12 @@ from .openfoam.runner import (
     install_subprocess_signal_handlers,
 )
 from .pipeline import (
+    MARCH_STOP_MARKER_FILENAME,
+    MARCH_WRITE_STOP_SIGNAL,
     read_divergence_condemnation,
     read_march_budget_marker,
     read_march_stop,
+    read_march_stop_record,
     write_divergence_condemnation,
     write_march_stop,
 )
@@ -532,6 +536,10 @@ MARCH_TRAIL_MIN_SPAN_S = 600.0
 #: finishes it; 3x+ means even one full continuation cannot.
 MARCH_HOPELESS_FACTOR = 3.0
 
+# One native write request, then bounded direct-rank TERM/KILL escalation.
+MARCH_WRITE_STOP_GRACE_S = 60.0
+MARCH_TERM_GRACE_S = 10.0
+
 
 @dataclass
 class _MarchSegmentState:
@@ -636,7 +644,7 @@ class MarchRateWatchdog:
             f"{elapsed / 60.0:.0f} min, the trailing simulated-time rate "
             f"{rate:.3g} s/s projects ~{projected_total_s / 3600.0:.1f}h total wall "
             f"vs the {budget_s / 3600.0:.1f}h budget (>{self.factor:g}x) — "
-            f"stopping the hopeless march early with restartable state"
+            f"stopping the hopeless march early; checkpoint status is unverified"
         )
         return state.stopped_reason
 
@@ -656,11 +664,103 @@ def _case_solver_pids(store: JobStore, job_id: str, case_root: Path) -> list[int
     return case_pids
 
 
-def _stop_hopeless_case(store: JobStore, job_id: str, case_root: Path, reason: str) -> None:
-    """Kill the hopeless case's solver process group and leave the truthful
-    march-stop marker: the pipeline grades the partial window through the
-    honest timeout path (continuable budget stop). Same TERM->KILL escalation
-    ladder as the divergence condemnation; the job's other cases keep running."""
+def _native_march_solver_pids(store: JobStore, job_id: str, case_root: Path) -> list[int]:
+    """Exact solver ranks, excluding mpirun, shells, writers and reconstruction."""
+    pids = []
+    for process in store.job_process_details(job_id):
+        try:
+            argv = shlex.split(process.get("command", ""))
+            if (argv and Path(argv[0]).name == "rhoPimpleFoam"
+                    and Path(process["cwd"]).resolve() == case_root.resolve()):
+                pids.append(int(process["pid"]))
+        except (KeyError, OSError, ValueError):
+            continue
+    return sorted(set(pids))
+
+
+def _signal_march_solver(pid: int, case_root: Path, sig: int) -> bool:
+    """Pin the process before rechecking identity; never signal a process group.
+
+    pidfd prevents PID reuse from retargeting an escalation. SIGUSR2 additionally
+    requires the launch opt-in and an installed handler: its default is fatal.
+    """
+    descriptor = None
+    try:
+        descriptor = os.pidfd_open(pid)
+        proc = Path("/proc") / str(pid)
+        argv = [arg.decode() for arg in (proc / "cmdline").read_bytes().split(b"\0") if arg]
+        if (not argv or Path(argv[0]).name != "rhoPimpleFoam"
+                or (proc / "cwd").resolve(strict=True) != case_root.resolve()):
+            return False
+        if sig == MARCH_WRITE_STOP_SIGNAL:
+            opted_in = any(
+                first == "-opt-switch" and second == f"stopAtWriteNowSignal={sig}"
+                for first, second in zip(argv, argv[1:])
+            )
+            status = dict(line.split(":", 1) for line in (proc / "status").read_text().splitlines() if ":" in line)
+            caught = int(status.get("SigCgt", "0").strip(), 16)
+            if not opted_in or not (caught & (1 << (sig - 1))):
+                return False
+        signal.pidfd_send_signal(descriptor, sig)
+        return True
+    except (AttributeError, OSError, UnicodeError, ValueError):
+        # Unsupported pidfd/handler observation fails closed. The ordinary solver
+        # wall timeout still bounds execution; do not risk a default SIGUSR2.
+        return False
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def _stop_hopeless_case(
+    store: JobStore, job_id: str, case_root: Path, reason: str, *, now: float | None = None,
+) -> None:
+    """Request one native checkpoint, or retain the legacy TERM/KILL path.
+
+    A stop request never proves restartability; the pipeline verifies the saved
+    fields after all ranks exit and reconstruction completes.
+    """
+    budget = read_march_budget_marker(case_root)
+    if budget and budget.get("write_stop_signal") == MARCH_WRITE_STOP_SIGNAL:
+        now = time.time() if now is None else now
+        pids = _native_march_solver_pids(store, job_id, case_root)
+        if not pids:
+            return  # The solver exited; reconstruction/writers must run untouched.
+        record = read_march_stop_record(case_root)
+        request = record.get("write_stop") if record else None
+        if record is None:
+            if (case_root / MARCH_STOP_MARKER_FILENAME).exists():
+                # An unreadable existing record cannot authorize repeating the
+                # one-shot signal. The ordinary solver timeout remains active.
+                return
+            request = {
+                "wall_start": budget["wall_start"], "requested_at": now,
+                "grace_until": min(now + MARCH_WRITE_STOP_GRACE_S, budget["wall_start"] + budget["budget_s"]),
+                "phase": "write_requested", "rank_pid": pids[0],
+            }
+            # Persist BEFORE signalling: the native handler resets itself, so a
+            # duplicate signal would terminate the rank instead of writing.
+            write_march_stop(case_root, reason, write_stop=request)
+            if not _signal_march_solver(pids[0], case_root, MARCH_WRITE_STOP_SIGNAL):
+                logger.warning(
+                    "march-rate guard: job %s rank %s could not verify/send the native "
+                    "write request; checkpoint remains unavailable until verified",
+                    job_id, pids[0],
+                )
+            return
+        if not isinstance(request, dict) or request.get("wall_start") != budget["wall_start"]:
+            return  # Never repeat an unproven one-shot signal after recovery.
+        if request.get("phase") == "write_requested" and now >= request["grace_until"]:
+            request = {**request, "phase": "term_requested", "term_at": now}
+            write_march_stop(case_root, reason, write_stop=request)
+            for pid in pids:
+                _signal_march_solver(pid, case_root, signal.SIGTERM)
+        elif request.get("phase") == "term_requested" and now >= request["term_at"] + MARCH_TERM_GRACE_S:
+            write_march_stop(case_root, reason, write_stop={**request, "phase": "kill_requested"})
+            for pid in pids:
+                _signal_march_solver(pid, case_root, signal.SIGKILL)
+        return
+
     already = read_march_stop(case_root) is not None
     case_pids = _case_solver_pids(store, job_id, case_root)
     if already:
@@ -687,11 +787,28 @@ def _check_and_stop_hopeless_march(
         return
     now = time.time() if now is None else now
     processes = store.job_process_details(job_id)
+    stopping = set()
+    for process in processes:
+        raw_cwd = process.get("cwd")
+        if not raw_cwd:
+            continue
+        case_root = Path(raw_cwd).resolve()
+        if case_root in stopping:
+            continue
+        budget = read_march_budget_marker(case_root)
+        reason = read_march_stop(case_root)
+        if budget and budget.get("write_stop_signal") == MARCH_WRITE_STOP_SIGNAL and reason:
+            # Escalation must not depend on fresh coefficients: a rank may be
+            # stuck inside a write or MPI collective after the stop request.
+            _stop_hopeless_case(store, job_id, case_root, reason, now=now)
+            stopping.add(case_root)
     for case_root, coeff in _live_coefficient_segments(
         processes,
         now,
         solver_modes=frozenset({"urans"}),
     ):
+        if case_root in stopping:
+            continue
         budget = read_march_budget_marker(case_root)
         if budget is None:
             continue  # not an armed transient chunk (e.g. a steady solve)
@@ -708,7 +825,7 @@ def _check_and_stop_hopeless_march(
             stop_marker_present=read_march_stop(case_root) is not None,
         )
         if reason is not None:
-            _stop_hopeless_case(store, job_id, case_root, reason)
+            _stop_hopeless_case(store, job_id, case_root, reason, now=now)
 
 
 # Captured at import time in the worker's main process, i.e. strictly before
@@ -888,8 +1005,8 @@ def _start_runtime_heartbeat(
             try:
                 # In-run march-rate guard: a transient chunk whose trailing
                 # simulated-time rate projects provably hopeless total wall
-                # (>3x its budget) is stopped early per-CASE with restartable
-                # state and graded as an honest continuable budget stop.
+                # (>3x its budget) is stopped early per case. Only verified
+                # saved fields can make its rejected partial grade continuable.
                 _check_and_stop_hopeless_march(store, job_id, march_watchdog)
             except Exception:
                 pass

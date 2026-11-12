@@ -17,8 +17,10 @@ FALSE-POSITIVE guards: warmup, dt-ramp-then-recovery, feasible-but-slow runs
 from __future__ import annotations
 
 import math
+import gzip
 import signal
 import time as time_mod
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 import pytest
@@ -49,7 +51,7 @@ from airfoilfoam.pipeline import (
 from airfoilfoam.storage import JobStore
 from airfoilfoam.openfoam.budget import BudgetedRunner, begin_case_budget
 from airfoilfoam.openfoam.dialects import OPENCFD_2606_IDENTITY
-from airfoilfoam.openfoam.runner import InfrastructureError
+from airfoilfoam.openfoam.runner import InfrastructureError, RunResult, Runner
 from airfoilfoam.tasks import (
     MARCH_HOPELESS_FACTOR,
     MARCH_TRAIL_MIN_SPAN_S,
@@ -94,8 +96,13 @@ def _coeff_rows_text(t_start: float, t_end: float, dt: float = 0.0005) -> str:
 def _write_time_dir(case: Path, name: str) -> None:
     d = case / name
     d.mkdir(parents=True, exist_ok=True)
-    for f in ("U", "p", "k", "omega", "nut"):
-        (d / f).write_text(f"saved {f} at {name}")
+    for f in ("U", "p", "T", "k", "omega", "nut", "alphat", "rho", "phi"):
+        field_class = "volVectorField" if f == "U" else "surfaceScalarField" if f == "phi" else "volScalarField"
+        (d / f).write_text(
+            f"FoamFile {{ version 2.0; format ascii; class {field_class}; object {f}; }}\n"
+            "dimensions [0 0 0 0 0 0 0];\ninternalField uniform 0;\nboundaryField {}\n"
+            "// ************************************************************************* //\n"
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -131,7 +138,7 @@ def test_must_catch_prod_shaped_hopeless_march_is_stopped():
     # nowhere near the 4 h budget wall.
     assert first_fire_wall <= MARCH_WARMUP_WALL_S + MARCH_TRAIL_MIN_SPAN_S + 300.0
     assert "march-rate guard" in fired[0]
-    assert "restartable state" in fired[0]
+    assert "checkpoint status is unverified" in fired[0]
     assert f">{MARCH_HOPELESS_FACTOR:g}x" in fired[0]
 
 
@@ -395,7 +402,16 @@ def test_must_catch_march_stopped_chunk_grades_continuable(tmp_path, monkeypatch
     assert not (staged / MARCH_STOP_MARKER_FILENAME).exists()
 
 
-def test_pipeline_march_marker_uses_remaining_physical_case_budget(tmp_path, monkeypatch):
+@pytest.mark.parametrize("family,fidelity,n_proc,native,budgeted", [
+    ("pimpleFoam", "precalc", 2, False, True),
+    ("rhoPimpleFoam", "full", 2, False, True),
+    ("rhoPimpleFoam", "precalc", 1, False, True),
+    ("rhoPimpleFoam", "precalc", 2, True, True),
+    ("rhoPimpleFoam", "precalc", 2, False, False),
+])
+def test_pipeline_march_marker_uses_remaining_physical_case_budget(
+    tmp_path, monkeypatch, family, fidelity, n_proc, native, budgeted,
+):
     """The marker must track BudgetedRunner's case allowance, not the outer
     task timeout, or the heartbeat warmup can outlive the real solver budget."""
 
@@ -413,13 +429,25 @@ def test_pipeline_march_marker_uses_remaining_physical_case_budget(tmp_path, mon
             resolved_worker_cpu_budget=lambda: 4,
         )
 
-        def solver(self, case_dir, *_args, **_kwargs):
+        def solver(self, case_dir, app, *_args, **_kwargs):
+            commands.append(app)
+            raise InfrastructureError("budget-marker launch probe")
+
+        def application(self, case_dir, command, **_kwargs):
+            assert command == "decomposePar -latestTime -force"
+            return RunResult(command, 0, "decomposed initial state")
+
+        def run(self, case_dir, command, **_kwargs):
+            commands.append(command)
             raise InfrastructureError("budget-marker launch probe")
 
     monkeypatch.setattr(pipeline, "CaseBuilder", FakeCaseBuilder)
     _case_dir, tcase = _transient_case(tmp_path)
     spec = CaseSpec(chord=1.0, speed=50.0, aoa_deg=25.0)
-    runner = BudgetedRunner(InnerRunner(), 10.0)
+    commands = []
+    inner = InnerRunner()
+    inner.flow_dialect = replace(pipeline.dialect_for_runner(inner), transient_solver_command=family)
+    runner = BudgetedRunner(inner, 10.0) if budgeted else inner
     begin_case_budget(runner, spec)
 
     with pytest.raises(InfrastructureError, match="budget-marker launch probe"):
@@ -428,9 +456,9 @@ def test_pipeline_march_marker_uses_remaining_physical_case_budget(tmp_path, mon
             airfoil=None, tmesh=None, patches={},
             spec=spec,
             fluid=FLUID, roughness=RoughnessParams(),
-            solver_params=SolverParams(force_transient=True, urans_min_periods=3),
+            solver_params=SolverParams(force_transient=True, urans_fidelity=fidelity, urans_min_periods=3),
             runner=runner,
-            n_proc=1,
+            n_proc=n_proc,
             timeout=100.0,
             run_time=0.3,
             delta_t=1e-5,
@@ -438,7 +466,240 @@ def test_pipeline_march_marker_uses_remaining_physical_case_budget(tmp_path, mon
         )
     marker = read_march_budget_marker(tcase)
     assert marker is not None
-    assert marker["budget_s"] == pytest.approx(10.0)
+    assert marker["budget_s"] == pytest.approx(10.0 if budgeted else 100.0)
+    assert (marker.get("write_stop_signal") == pipeline.MARCH_WRITE_STOP_SIGNAL) is native
+    expected = family + (f" -opt-switch stopAtWriteNowSignal={pipeline.MARCH_WRITE_STOP_SIGNAL}" if native else "")
+    if budgeted and n_proc > 1:
+        expected = f"mpirun --allow-run-as-root --bind-to none --use-hwthread-cpus -np {n_proc} {expected} -parallel"
+    assert commands == [expected]
+    assert pipeline.update_march_budget_target(tcase, 0.5)
+    updated = read_march_budget_marker(tcase)
+    assert updated == {**marker, "end_t": 0.5}
+
+
+@pytest.fixture
+def native_march_stop(tmp_path, monkeypatch):
+    store = JobStore(Settings(data_dir=tmp_path / "data"))
+    job_id = "native-march"
+    store.write_status(_running(job_id, JobPhase.solving_urans))
+    case = store.job_dir(job_id) / "cases" / "slow" / "transient"
+    sibling = store.job_dir(job_id) / "cases" / "healthy" / "transient"
+    write_march_budget_marker(case, END_T, 900, 0, native_write_stop=True)
+    command = "rhoPimpleFoam -opt-switch stopAtWriteNowSignal=12 -parallel"
+    processes = [
+        {"pid": pid, "cwd": str(root), "command": app, "solver_mode": "urans"}
+        for pid, root, app in [
+            (10, case, f"mpirun -np 2 {command}"), (11, case, command),
+            (12, case, command), (13, case, "foamToVTK"),
+            (21, sibling, command),
+        ]
+    ]
+    signals = []
+    monkeypatch.setattr(JobStore, "job_process_details", lambda *_args: list(processes))
+    monkeypatch.setattr(tasks, "_signal_march_solver", lambda pid, root, sig: signals.append((pid, sig)) or True)
+    monkeypatch.setattr(tasks, "_kill_pids", lambda *_args: pytest.fail("native stop used a process-group kill"))
+    return store, job_id, case, processes, signals
+
+
+def test_native_stop_is_one_shot_and_never_kills_reconstruction_or_sibling(native_march_stop):
+    store, job_id, case, processes, signals = native_march_stop
+    reason = "march-rate guard: checkpoint status is unverified"
+    tasks._stop_hopeless_case(store, job_id, case, reason, now=225)
+    tasks._stop_hopeless_case(store, job_id, case, reason, now=235)
+    assert signals == [(11, signal.SIGUSR2)]
+    record = pipeline.read_march_stop_record(case)
+    assert record["write_stop"]["phase"] == "write_requested"
+    # A heartbeat may have seen the solver just before it exited. Its fresh
+    # inventory now contains reconstruction in the same cwd, plus a sibling.
+    processes[:] = [p for p in processes if p["pid"] not in (10, 11, 12)]
+    processes.append({"pid": 14, "cwd": str(case), "command": "reconstructPar -newTimes", "solver_mode": "urans"})
+    tasks._check_and_stop_hopeless_march(store, job_id, MarchRateWatchdog(), now=400)
+    assert signals == [(11, signal.SIGUSR2)]
+    assert pipeline.read_march_stop_record(case) == record
+
+
+@pytest.mark.parametrize("handler_ready", [True, False])
+def test_native_write_stop_escalates_without_fresh_coefficients(native_march_stop, monkeypatch, handler_ready):
+    store, job_id, case, _processes, signals = native_march_stop
+    monkeypatch.setattr(tasks, "_signal_march_solver", lambda pid, root, sig: signals.append((pid, sig)) or handler_ready)
+    tasks._stop_hopeless_case(store, job_id, case, "march-rate guard", now=225)
+    watchdog = MarchRateWatchdog()
+    # No coefficient file exists: a stuck write/collective must still be bounded.
+    for now in (284, 285, 294, 295, 400):
+        tasks._check_and_stop_hopeless_march(store, job_id, watchdog, now=now)
+    assert signals == [
+        (11, signal.SIGUSR2), (11, signal.SIGTERM), (12, signal.SIGTERM),
+        (11, signal.SIGKILL), (12, signal.SIGKILL),
+    ]
+    assert pipeline.read_march_stop_record(case)["write_stop"]["phase"] == "kill_requested"
+
+
+@pytest.mark.parametrize("command,caught,allowed", [
+    ("rhoPimpleFoam -opt-switch stopAtWriteNowSignal=12 -parallel", 1 << 11, True),
+    ("rhoPimpleFoam -opt-switch stopAtWriteNowSignal=12 -parallel", 0, False),
+    ("rhoPimpleFoam -parallel", 1 << 11, False),
+    ("mpirun rhoPimpleFoam -opt-switch stopAtWriteNowSignal=12", 1 << 11, False),
+    ("reconstructPar -newTimes", 1 << 11, False),
+])
+def test_native_signal_requires_actual_opted_rank_and_installed_handler(
+    tmp_path, monkeypatch, command, caught, allowed,
+):
+    case = tmp_path / "case"
+    case.mkdir()
+    proc = tmp_path / "proc" / "11"
+    proc.mkdir(parents=True)
+    (proc / "cwd").symlink_to(case, target_is_directory=True)
+    (proc / "cmdline").write_bytes(command.replace(" ", "\0").encode() + b"\0")
+    (proc / "status").write_text(f"SigCgt:\t{caught:016x}\n")
+    monkeypatch.setattr(tasks, "Path", lambda path: tmp_path / "proc" if str(path) == "/proc" else Path(path))
+    monkeypatch.setattr(tasks.os, "pidfd_open", lambda pid: 99)
+    sent, closed = [], []
+    monkeypatch.setattr(tasks.signal, "pidfd_send_signal", lambda fd, sig: sent.append((fd, sig)))
+    monkeypatch.setattr(tasks.os, "close", closed.append)
+    assert tasks._signal_march_solver(11, case, signal.SIGUSR2) is allowed
+    assert sent == ([(99, signal.SIGUSR2)] if allowed else [])
+    assert closed == [99]
+
+
+def test_native_signal_fails_closed_when_pidfd_is_unavailable(tmp_path, monkeypatch):
+    def unavailable(_pid):
+        raise OSError("pidfd is unavailable")
+
+    monkeypatch.setattr(tasks.os, "pidfd_open", unavailable)
+    monkeypatch.setattr(tasks.signal, "pidfd_send_signal", lambda *_args: pytest.fail("unverified native signal"))
+    assert not tasks._signal_march_solver(11, tmp_path, signal.SIGUSR2)
+
+
+@pytest.mark.parametrize("mode", [
+    "saved", "saved-interrupted", "absent", "partial-ranks", "missing-root", "incomplete-root",
+    "missing-omega", "missing-phi", "missing-rho", "incomplete-write", "incomplete-gzip",
+    "bad-reconstruction", "reconstruction-timeout",
+])
+def test_short_mpi_march_stop_before_first_scheduled_write_requires_real_checkpoint(
+    tmp_path, monkeypatch, mode,
+):
+    case_dir, tcase = _transient_case(tmp_path)
+    control = tcase / "system" / "controlDict"
+    control.write_text(control.read_text() + "writeInterval 0.0037037037;\n")
+    original_control = control.read_bytes()
+    saved_time = "0.00280369"  # Real incident: before the first scheduled write.
+    commands, signals = [], []
+
+    class FakeCaseBuilder:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def write_transient(self, *_args, **_kwargs):
+            pass
+
+    command = "rhoPimpleFoam -opt-switch stopAtWriteNowSignal=12 -parallel"
+    mpi_command = f"mpirun --allow-run-as-root --bind-to none --use-hwthread-cpus -np 4 {command}"
+    store = SimpleNamespace(job_process_details=lambda _job: [
+        {"pid": 100 + rank, "cwd": str(tcase), "command": command}
+        for rank in range(4)
+    ])
+
+    def save_and_stop(pid, root, sig):
+        signals.append((pid, sig))
+        assert read_march_stop(root) is not None  # Durable before one-shot signal.
+        if mode != "absent":
+            for rank in range(3 if mode == "partial-ranks" else 4):
+                _write_time_dir(root / f"processor{rank}", saved_time)
+            damaged = root / "processor2" / saved_time
+            if mode.startswith("missing-") and mode != "missing-root":
+                (damaged / mode.removeprefix("missing-")).unlink()
+            elif mode == "incomplete-write":
+                field = damaged / "nut"
+                field.write_bytes(field.read_bytes()[:-30])
+            elif mode == "incomplete-gzip":
+                field = damaged / "omega"
+                (damaged / "omega.gz").write_bytes(gzip.compress(field.read_bytes())[:-8])
+                field.unlink()
+        return True
+
+    class InnerRunner:
+        external_paths_visible = False
+        settings = SimpleNamespace(
+            engine_identity=lambda: OPENCFD_2606_IDENTITY,
+            resolved_worker_cpu_budget=lambda: 4,
+        )
+
+        # Both inner applications and BudgetedRunner's inherited application()
+        # dispatch through run(). Reuse the real adapter so reconstruction takes
+        # the same route as it does with LocalRunner.
+        application = Runner.application
+
+        def run(self, root, app, **_kwargs):
+            commands.append(app)
+            if app == "decomposePar -latestTime -force":
+                for rank in range(4):
+                    _write_time_dir(root / f"processor{rank}", "0")
+                return RunResult(app, 0, "decomposed initial conditions")
+            if app in {"reconstructPar -latestTime", "reconstructPar -newTimes"}:
+                if mode == "bad-reconstruction":
+                    return RunResult(app, 1, "native reconstructPar parse failure")
+                if mode == "reconstruction-timeout":
+                    return RunResult(app, 124, "native reconstruction timed out", timed_out=True)
+                if mode != "missing-root":
+                    _write_time_dir(root, saved_time)
+                    if mode == "incomplete-root":
+                        (root / saved_time / "omega").unlink()
+                return RunResult(app, 0, f"native reconstructed time {saved_time}")
+            assert app == mpi_command
+            assert "-opt-switch stopAtWriteNowSignal=12" in app
+            assert read_march_budget_marker(root)["write_stop_signal"] == signal.SIGUSR2
+            assert all({p.name for p in (root / f"processor{rank}").iterdir()} == {"0"} for rank in range(4))
+            _write_coeff(root / "postProcessing/forceCoeffs1/0/coefficient.dat",
+                         [i * 0.00005 for i in range(57)] + [float(saved_time)])
+            armed = read_march_budget_marker(root)
+            tasks._stop_hopeless_case(store, "native", root, "march-rate guard: checkpoint status is unverified", now=armed["wall_start"] + 225)
+            return RunResult(app, 0 if mode == "saved" else 143, f"Time = {saved_time}\nEnd\n")
+
+    monkeypatch.setattr(pipeline, "CaseBuilder", FakeCaseBuilder)
+    monkeypatch.setattr(tasks, "_signal_march_solver", save_and_stop)
+    inner = InnerRunner()
+    inner.flow_dialect = replace(pipeline.dialect_for_runner(inner), transient_solver_command="rhoPimpleFoam")
+    runner = BudgetedRunner(inner, 900)
+    begin_case_budget(runner, SPEC)
+
+    def call():
+        return _run_transient_attempt(
+            tcase, airfoil=None, tmesh=None, patches={}, spec=SPEC, fluid=FLUID,
+            roughness=RoughnessParams(), solver_params=SolverParams(force_transient=True, urans_fidelity="precalc"),
+            runner=runner, n_proc=4, timeout=7200, run_time=0.0666667,
+            delta_t=1e-5, write_interval=0.0037037037, coeff_start_time=0,
+        )
+
+    if mode in {"saved", "saved-interrupted"}:
+        result = call()
+        assert result is not None and not result.quality.ok and not result.quality.can_refine
+        assert URANS_BUDGET_STOP_MARKER in result.quality.reason
+        staged = stage_continuation_case(case_dir, tmp_path / "staged")
+        assert staged.resume_from == pytest.approx(float(saved_time))
+    else:
+        error = InfrastructureError if mode in {"bad-reconstruction", "reconstruction-timeout"} else pipeline.TransientTimeoutError
+        with pytest.raises(error) as caught:
+            call()
+        assert URANS_BUDGET_STOP_MARKER not in str(caught.value)
+        if mode in {"absent", "partial-ranks", "missing-omega", "missing-phi", "missing-rho", "incomplete-write", "incomplete-gzip"}:
+            assert "no evolved checkpoint" in str(caught.value)
+            assert caught.value.restartable is False
+            assert not any(app.startswith("reconstructPar") for app in commands)
+        elif mode in {"missing-root", "incomplete-root"}:
+            assert "no evolved reconstructed checkpoint" in str(caught.value)
+            assert caught.value.restartable is False
+        else:
+            log = (tcase / "log.reconstructPar").read_text()
+            assert "native reconstruct" in log
+            assert "MPI reconstruction" in str(caught.value)
+    assert signals == [(100, signal.SIGUSR2)]
+    assert control.read_bytes() == original_control
+    expected_commands = ["decomposePar -latestTime -force", mpi_command]
+    if mode == "saved":
+        expected_commands.append("reconstructPar -latestTime")
+    if mode in {"saved", "saved-interrupted", "missing-root", "incomplete-root", "bad-reconstruction", "reconstruction-timeout"}:
+        expected_commands.append("reconstructPar -newTimes")
+    assert commands == expected_commands
 
 
 def test_clean_run_grades_normally_despite_stale_stop_marker(tmp_path, monkeypatch):

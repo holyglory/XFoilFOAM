@@ -1,0 +1,31 @@
+services:
+  native:
+    # Existing dependency-complete image uses the approved 2606 base. Candidate
+    # application source and the original production thermophysics library override it.
+    image: xfoilfoam-progressive-worker:local
+    pull_policy: never
+    network_mode: none
+    cpus: 4
+    user: "1000:1003"
+    working_dir: /output
+    environment:
+      HOME: /tmp
+      PYTHONPATH: /input/src
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONUNBUFFERED: "1"
+      AIRFOILFOAM_OPENFOAM_RUNNER: local
+      AIRFOILFOAM_REDIS_URL: redis://127.0.0.1:1/0
+      AIRFOILFOAM_DATA_DIR: /output/data
+      AIRFOILFOAM_CACHE_DIR: /output/cache
+      AIRFOILFOAM_EVIDENCE_BUCKET: ""
+      AIRFOILFOAM_CONTROL_PLANE_TOKEN: ""
+      DC2_DEPLOYMENT: "${DC2_DEPLOYMENT}"
+      DC2_COMPONENT: "${DC2_COMPONENT}"
+      DC2_GENERATION: "${DC2_GENERATION}"
+    volumes:
+      - ./.codex-artifacts/march-checkpoint-native/input:/input:ro
+      - ./.codex-artifacts/march-checkpoint-native/output:/output
+      - ./.codex-artifacts/march-checkpoint-native/input/opt/xfoilfoam-thermophysics/lib:/opt/xfoilfoam-thermophysics/lib:ro
+    entrypoint: ["bash", "-lc"]
+    command:
+      - source /usr/lib/openfoam/openfoam2606/etc/bashrc >/dev/null 2>&1 && exec python /input/driver/march_checkpoint.py native
