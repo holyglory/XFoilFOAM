@@ -119,7 +119,9 @@ export async function lockProgressiveCfdExecution(
     (unit.recovery_parent_job_id ?? null) !==
       (lease.recoveryParentJobId ?? null) ||
     canonicalAnalysisJson(
-      normalizeProgressiveMaterialDomainRecoveryRecipe(unit.recipe),
+      normalizeProgressiveMaterialDomainRecoveryRecipe(
+        unit.recipe as Record<string, unknown>,
+      ),
     ) !==
       canonicalAnalysisJson(
         normalizeProgressiveMaterialDomainRecoveryRecipe(lease.recipe),
