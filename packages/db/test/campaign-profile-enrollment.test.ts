@@ -9628,6 +9628,10 @@ describe("bounded progressive numerical recovery", () => {
       aoa_deg: 0,
       recipe: {
         uransFidelity: stage === 3 ? "full" : "precalc",
+        solver: {
+          momentum_scheme: "upwind",
+          transient_max_courant: 1,
+        },
         selection: {
           solver: "rhoPimpleFoam",
           reason: "bounded_material_domain_recovery",
@@ -9675,6 +9679,10 @@ describe("bounded progressive numerical recovery", () => {
       recoveryPlanId: expect.any(String),
       recipe: {
         uransFidelity: stage === 3 ? "full" : "precalc",
+        solver: {
+          momentum_scheme: "upwind",
+          transient_max_courant: 1,
+        },
         selection: { solver: "rhoPimpleFoam" },
       },
     });

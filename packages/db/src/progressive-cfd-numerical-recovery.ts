@@ -22,9 +22,18 @@ export function progressiveMaterialDomainRecipe(
 ): Record<string, unknown> | null {
   const selection = recipe.selection as Record<string, unknown> | undefined;
   if (selection?.solver !== "rhoSimpleFoam") return null;
+  const solver = { ...(recipe.solver as Record<string, unknown> | undefined) };
+  const configuredCourant = Number(solver.transient_max_courant);
   return {
     ...recipe,
     uransFidelity: stage === 2 ? "precalc" : "full",
+    solver: {
+      ...solver,
+      momentum_scheme: "upwind",
+      transient_max_courant: Number.isFinite(configuredCourant)
+        ? Math.min(configuredCourant, 1)
+        : 1,
+    },
     selection: {
       ...selection,
       solver: "rhoPimpleFoam",
