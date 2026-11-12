@@ -23,17 +23,24 @@ export function progressiveMaterialDomainRecipe(
   const selection = recipe.selection as Record<string, unknown> | undefined;
   if (selection?.solver !== "rhoSimpleFoam") return null;
   const solver = { ...(recipe.solver as Record<string, unknown> | undefined) };
-  const configuredCourant = Number(solver.transient_max_courant);
+  const configuredCourant = Number(
+    solver.transientMaxCourant ?? solver.transient_max_courant,
+  );
+  const stabilizedSolver = {
+    ...solver,
+    momentumScheme: "upwind",
+    transientMaxCourant: Number.isFinite(configuredCourant)
+      ? Math.min(configuredCourant, 1)
+      : 1,
+  };
+  if (Object.hasOwn(solver, "momentum_scheme"))
+    stabilizedSolver.momentum_scheme = "upwind";
+  if (Object.hasOwn(solver, "transient_max_courant"))
+    stabilizedSolver.transient_max_courant = stabilizedSolver.transientMaxCourant;
   return {
     ...recipe,
     uransFidelity: stage === 2 ? "precalc" : "full",
-    solver: {
-      ...solver,
-      momentum_scheme: "upwind",
-      transient_max_courant: Number.isFinite(configuredCourant)
-        ? Math.min(configuredCourant, 1)
-        : 1,
-    },
+    solver: stabilizedSolver,
     selection: {
       ...selection,
       solver: "rhoPimpleFoam",

@@ -9629,8 +9629,8 @@ describe("bounded progressive numerical recovery", () => {
       recipe: {
         uransFidelity: stage === 3 ? "full" : "precalc",
         solver: {
-          momentum_scheme: "upwind",
-          transient_max_courant: 1,
+          momentumScheme: "upwind",
+          transientMaxCourant: 1,
         },
         selection: {
           solver: "rhoPimpleFoam",
@@ -9680,8 +9680,8 @@ describe("bounded progressive numerical recovery", () => {
       recipe: {
         uransFidelity: stage === 3 ? "full" : "precalc",
         solver: {
-          momentum_scheme: "upwind",
-          transient_max_courant: 1,
+          momentumScheme: "upwind",
+          transientMaxCourant: 1,
         },
         selection: { solver: "rhoPimpleFoam" },
       },
