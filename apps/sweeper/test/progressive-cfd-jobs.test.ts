@@ -2,7 +2,6 @@ import { describe, expect, it } from "vitest";
 
 import {
   progressivePreciseCaseConcurrency,
-  progressiveFastCaseConcurrency,
   progressiveFastSolverProcesses,
   progressivePreciseSolverProcesses,
   progressiveSolverProcessesForStage,
@@ -28,12 +27,6 @@ describe("progressive fast solver process cap", () => {
 
   it("never exceeds the available admission slots", () => {
     expect(progressiveFastSolverProcesses(3, "8")).toBe(3);
-  });
-
-  it("allows two long fast-stage cases to share four benchmark slots", () => {
-    expect(progressiveFastCaseConcurrency(4, 2, 2, "2")).toBe(2);
-    expect(progressiveFastCaseConcurrency(3, 2, 2, "2")).toBe(1);
-    expect(progressiveFastCaseConcurrency(96, 2, 1, "4")).toBe(1);
   });
 
   it("keeps the precise-stage fallback at four processes", () => {

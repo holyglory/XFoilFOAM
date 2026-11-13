@@ -1696,6 +1696,7 @@ async function cfdEvidenceFixture(
   maximumUnits?: number,
   deferSubmission = false,
   historicalRansSweep = false,
+  cpuSlots = 1,
 ) {
   const campaignId = prepared?.campaignId ?? await campaign("active", [speed, ...extraSpeeds], angles, physical);
   let retriedUnitId: string | undefined;
@@ -1824,7 +1825,7 @@ async function cfdEvidenceFixture(
   let composed: Awaited<ReturnType<typeof composeProgressiveCfdJob>>;
   try {
     composed = await composeProgressiveCfdJob(db, leases, {
-      cpuSlots: 1,
+      cpuSlots,
       meshRecoveryVersion: 1,
       solverBudgetVersion: 2,
       localTimeStepVersion: 1,
@@ -8810,6 +8811,129 @@ describe("bounded progressive numerical recovery", () => {
     const { verifyDiagnosticMixedPromotionRecovery } = await import("./progressive-stopped-failed-delivery-fixture");
     await withFreshDiagnosticExecution(34.1946, [0, 1], (envelope) =>
       verifyDiagnosticMixedPromotionRecovery(db, envelope));
+  }, 240_000);
+
+  it("composes a sequential stage-2 marched multi-AoA remote execution", async () => {
+    vi.stubEnv("SWEEPER_PROGRESSIVE_FAST_SOLVER_PROCESSES", "2");
+    vi.stubEnv("SWEEPER_PROGRESSIVE_FAST_CASE_CONCURRENCY", "2");
+    const angles = [0, 2];
+    const solverId = randomUUID();
+    const promiseId = randomUUID();
+    let jobId: string | null = null;
+    let admissionEnabled: boolean | null = null;
+    let poolId: string | null = null;
+    let poolEnabled: boolean | null = null;
+    try {
+      const fixture = await cfdEvidenceFixture(
+        500.1947,
+        2,
+        [],
+        angles,
+        false,
+        undefined,
+        { chordM: 1.19403 },
+        angles.length,
+        true,
+        false,
+        4,
+      );
+      expect(fixture.leases.map((lease) => lease.alpha).sort((a, b) => a - b)).toEqual(
+        angles,
+      );
+      const [job] = await db
+        .select()
+        .from(simJobs)
+        .where(eq(simJobs.id, fixture.composed.jobId));
+      jobId = job.id;
+      const [admission] = await db
+        .select({ enabled: sweeperState.enabled })
+        .from(sweeperState)
+        .where(eq(sweeperState.id, 1));
+      admissionEnabled = admission.enabled;
+      const [pool] = await db
+        .select({ id: solverExecutionPools.id, enabled: solverExecutionPools.enabled })
+        .from(solverExecutionPools)
+        .where(eq(solverExecutionPools.solverImplementationId, fixture.execution.revision.solverImplementationId))
+        .limit(1);
+      poolId = pool.id;
+      poolEnabled = pool.enabled;
+      await db
+        .update(solverExecutionPools)
+        .set({ enabled: true })
+        .where(eq(solverExecutionPools.id, pool.id));
+      await db.execute(sql`
+        INSERT INTO registered_remote_solvers
+          (id, instance_id, instance_name, cpu_capacity, cpu_budget, max_active_polar_promises)
+        VALUES
+          (${solverId}::uuid, ${randomUUID()}, 'isolated marched worker', 4, 4, 8)
+      `);
+      await db.update(sweeperState).set({ enabled: true }).where(eq(sweeperState.id, 1));
+      await db.execute(sql`
+        INSERT INTO sync_sweep_promises
+          (id, registered_solver_id, airfoil_id, simulation_preset_revision_id, aoa_count, "expiresAt")
+        VALUES
+          (${promiseId}::uuid, ${solverId}::uuid, ${job.airfoilId}::uuid,
+           ${job.simulationPresetRevisionId}::uuid, ${angles.length},
+           clock_timestamp() + interval '1 hour')
+      `);
+      for (const alpha of angles)
+        await db.execute(sql`
+          INSERT INTO sync_sweep_promise_points
+            (promise_id, airfoil_id, simulation_preset_revision_id, aoa_deg)
+          VALUES
+            (${promiseId}::uuid, ${job.airfoilId}::uuid,
+             ${job.simulationPresetRevisionId}::uuid, ${alpha})
+        `);
+
+      const { envelope } = await bindProgressiveRemoteDispatch(db, {
+        simJobId: job.id,
+        solverId,
+        promiseId,
+      });
+      expect(envelope.request.aoa?.angles).toEqual(angles);
+      expect(envelope.request.solver).toMatchObject({
+        force_transient: true,
+        urans_fidelity: "precalc",
+        warm_start: true,
+      });
+      expect(envelope.request.resources).toMatchObject({
+        case_concurrency: 1,
+        solver_processes: 2,
+        cpu_budget: 2,
+      });
+      expect(envelope.scope.units).toHaveLength(angles.length);
+      const [dispatch] = await db.execute(sql`
+        SELECT cpu_slots FROM progressive_remote_dispatches
+        WHERE sim_job_id = ${job.id}::uuid
+      `);
+      expect(dispatch.cpu_slots).toBe(2);
+
+      await verifyProgressiveWorkerJobMirror(
+        db,
+        envelope,
+        executionStopProof,
+        "timeout",
+        false,
+        2,
+      );
+    } finally {
+      if (admissionEnabled != null)
+        await db.update(sweeperState).set({ enabled: admissionEnabled }).where(eq(sweeperState.id, 1));
+      if (poolId != null && poolEnabled != null)
+        await db.update(solverExecutionPools).set({ enabled: poolEnabled }).where(eq(solverExecutionPools.id, poolId));
+      if (jobId)
+        await db.execute(sql`
+          DELETE FROM progressive_remote_dispatches
+          WHERE sim_job_id = ${jobId}::uuid
+        `);
+      await db.execute(sql`
+        DELETE FROM sync_sweep_promises WHERE id = ${promiseId}::uuid
+      `);
+      await db.execute(sql`
+        DELETE FROM registered_remote_solvers WHERE id = ${solverId}::uuid
+      `);
+      vi.unstubAllEnvs();
+    }
   }, 240_000);
 
   async function composeRecovery(

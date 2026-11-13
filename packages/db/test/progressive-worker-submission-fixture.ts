@@ -26,6 +26,7 @@ export async function verifyProgressiveWorkerSubmission(
   stopProof: (executionId: string) => EngineExecutionStopProof,
   mode: "timeout" | "success",
   includeInvalidUnicodeDiagnostics = false,
+  remoteCpuBudget = 1,
 ) {
   const executionId = envelope.scope.executionId;
   const [settings] = await db.execute(
@@ -99,7 +100,7 @@ export async function verifyProgressiveWorkerSubmission(
     );
     expect(unreserved.count).toBe(0);
     await db.execute(
-      sql`UPDATE sync_api_settings SET remote_solver_cpu_budget = 1 WHERE id = 1`,
+      sql`UPDATE sync_api_settings SET remote_solver_cpu_budget = ${remoteCpuBudget} WHERE id = 1`,
     );
     const expiredAuthorization: typeof fetch = async (url, options) => {
       const response = await authorization(url, options);
@@ -180,7 +181,9 @@ export async function verifyProgressiveWorkerSubmission(
     }
     expect(engineSubmit).toHaveBeenCalledTimes(1);
     expect(engineSubmit.mock.calls[0]?.[0]).toEqual(envelope.request);
-    expect(await solverQueuePressure(db, { jobIds: [executionId] })).toBe(1);
+    expect(await solverQueuePressure(db, { jobIds: [executionId] })).toBe(
+      remoteCpuBudget,
+    );
     expect(
       (await loadDiskAdmissionExposure(db)).activeLocalJobCount,
     ).toBeGreaterThanOrEqual(1);
@@ -195,7 +198,9 @@ export async function verifyProgressiveWorkerSubmission(
     await db.execute(
       sql`UPDATE sync_sweep_promises SET status = 'expired', "expiresAt" = clock_timestamp() - interval '1 second' WHERE id = ${envelope.promiseId}::uuid`,
     );
-    expect(await solverQueuePressure(db, { jobIds: [executionId] })).toBe(1);
+    expect(await solverQueuePressure(db, { jobIds: [executionId] })).toBe(
+      remoteCpuBudget,
+    );
     await expect(
       db.execute(
         sql`UPDATE progressive_worker_submission_intents SET token = ${randomUUID()}::uuid WHERE sim_job_id = ${executionId}::uuid`,
@@ -214,6 +219,7 @@ export async function verifyProgressiveWorkerSubmission(
       stopProof,
       mode,
       includeInvalidUnicodeDiagnostics,
+      remoteCpuBudget,
     );
   } finally {
     await db.execute(

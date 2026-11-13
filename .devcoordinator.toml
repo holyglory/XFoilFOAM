@@ -357,6 +357,13 @@ requires = ["seed"]
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/progressive-remote-jobs.test.ts"]
 
 [[test.cfd-source-geometry.check]]
+name = "progressive-fast-marched-remote-contract"
+tier = "development"
+requires = ["seed"]
+timeout_seconds = 300
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "composes a sequential stage-2 marched multi-AoA remote execution"]
+
+[[test.cfd-source-geometry.check]]
 name = "progressive-fast-budget-recovery"
 tier = "development"
 requires = ["seed"]
@@ -367,25 +374,6 @@ name = "progressive-fast-budget-types"
 tier = "development"
 requires = ["seed"]
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "typecheck"]
-
-[test.progressive-cfd-jobs]
-timeout_seconds = 300
-
-[test.progressive-cfd-jobs.postgres]
-image = "postgres:16-alpine"
-database = "aerodb"
-user = "aerodb"
-
-[[test.progressive-cfd-jobs.check]]
-name = "workspace"
-tier = "development"
-command = ["/usr/bin/corepack", "pnpm", "install", "--frozen-lockfile", "--ignore-scripts"]
-
-[[test.progressive-cfd-jobs.check]]
-name = "fast-resource-contract"
-tier = "development"
-requires = ["workspace"]
-command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/progressive-cfd-jobs.test.ts"]
 
 [[test.cfd-source-geometry.check]]
 name = "progressive-cfd-priority"

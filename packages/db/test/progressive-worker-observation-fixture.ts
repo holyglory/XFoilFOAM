@@ -31,6 +31,7 @@ export async function verifyProgressiveWorkerObservation(
   proofFactory: (executionId: string) => EngineExecutionStopProof,
   mode: "timeout" | "success",
   includeInvalidUnicodeDiagnostics = false,
+  remoteCpuBudget = 1,
 ) {
   const executionId = envelope.scope.executionId;
   const runtime = {
@@ -142,7 +143,9 @@ export async function verifyProgressiveWorkerObservation(
   await expect(
     observeProgressiveRemoteJob(db, engine, executionId),
   ).rejects.toThrow("engine job is missing");
-  expect(await solverQueuePressure(db, { jobIds: [executionId] })).toBe(1);
+  expect(await solverQueuePressure(db, { jobIds: [executionId] })).toBe(
+    remoteCpuBudget,
+  );
   if (mode === "success") {
     const rollback = new Error("isolated status-only observation rollback");
     await expect(
@@ -180,7 +183,7 @@ export async function verifyProgressiveWorkerObservation(
         });
         expect(
           await solverQueuePressure(connection, { jobIds: [executionId] }),
-        ).toBe(1);
+        ).toBe(remoteCpuBudget);
         throw rollback;
       }),
     ).rejects.toBe(rollback);
@@ -352,7 +355,9 @@ export async function verifyProgressiveWorkerObservation(
         sql`DELETE FROM sim_jobs WHERE id = ${ordinaryId}::uuid`,
       );
     }
-    expect(await solverQueuePressure(db, { jobIds: [executionId] })).toBe(1);
+    expect(await solverQueuePressure(db, { jobIds: [executionId] })).toBe(
+      remoteCpuBudget,
+    );
     await db.execute(
       sql`UPDATE sync_api_settings SET remote_solver_enabled = true WHERE id = 1`,
     );
@@ -409,7 +414,9 @@ export async function verifyProgressiveWorkerObservation(
       errors: [{ executionId, error: "isolated hub unavailable" }],
     });
     expect(engine.cancelJob).not.toHaveBeenCalled();
-    expect(await solverQueuePressure(db, { jobIds: [executionId] })).toBe(1);
+    expect(await solverQueuePressure(db, { jobIds: [executionId] })).toBe(
+      remoteCpuBudget,
+    );
     await db.execute(
       sql`UPDATE sync_api_settings SET remote_solver_enabled = false WHERE id = 1`,
     );
@@ -483,7 +490,9 @@ export async function verifyProgressiveWorkerObservation(
   await expect(
     observeProgressiveRemoteJob(db, engine, executionId, { stop: true }),
   ).rejects.toThrow("foreign execution-stop");
-  expect(await solverQueuePressure(db, { jobIds: [executionId] })).toBe(1);
+  expect(await solverQueuePressure(db, { jobIds: [executionId] })).toBe(
+    remoteCpuBudget,
+  );
   engine.getExecutionStopProof.mockResolvedValueOnce({
     ...proof,
     namespace_verified: false,
@@ -491,7 +500,9 @@ export async function verifyProgressiveWorkerObservation(
   await expect(
     observeProgressiveRemoteJob(db, engine, executionId, { stop: true }),
   ).rejects.toThrow("verified execution-stop proof");
-  expect(await solverQueuePressure(db, { jobIds: [executionId] })).toBe(1);
+  expect(await solverQueuePressure(db, { jobIds: [executionId] })).toBe(
+    remoteCpuBudget,
+  );
   engine.getExecutionStopProof.mockResolvedValueOnce({
     ...proof,
     execution_stopped: false,
@@ -671,5 +682,7 @@ export async function verifyProgressiveWorkerObservation(
   ).rejects.toThrow("Foreign engine identity");
   expect(engine.getJob).not.toHaveBeenCalled();
   expect(engine.cancelJob).not.toHaveBeenCalled();
-  expect(await solverQueuePressure(db, { jobIds: [executionId] })).toBe(1);
+  expect(await solverQueuePressure(db, { jobIds: [executionId] })).toBe(
+    remoteCpuBudget,
+  );
 }
