@@ -14709,6 +14709,63 @@ describe("durable progressive CFD units", () => {
     ]);
   });
 
+  it("prioritizes a pending bounded continuation before fresh work at the same low Mach frontier", async () => {
+    const fixture = await cfdEvidenceFixture(
+      32.173,
+      2,
+      [42.173],
+      [-2, 0, 2],
+      false,
+      undefined,
+      {},
+      1,
+    );
+    const lease = fixture.leases[0];
+    const resultAttemptId = await fixture.save(900, "urans", lease.alpha, {
+      fidelity: "urans_precalc",
+      force_history: { t: [0, 1], cl: [0, 0], cd: [0.02, 0.02], cm: [0, 0] },
+    });
+    await db
+      .update(resultAttempts)
+      .set({
+        engineJobId: fixture.engineJobId,
+        engineCaseSlug: "c0p1_u30/a0",
+        error: "URANS integration stopped by the wall-clock budget guard",
+        qualityWarnings: ["stopped by the wall-clock budget guard"],
+      })
+      .where(eq(resultAttempts.id, resultAttemptId));
+    await fixture.record([resultAttemptId]);
+    await db.execute(sql`UPDATE progressive_cfd_attempts
+      SET outcome = 'failed', active_seconds = 900, finished_at = clock_timestamp(),
+        error = 'active compute budget exhausted'
+      WHERE token = ${lease.token}`);
+    await db.execute(sql`UPDATE progressive_cfd_units
+      SET attempts = 2, active_seconds = 900, state = 'gap',
+        lease_token = NULL, lease_owner = NULL, lease_until = NULL,
+        error = 'active compute budget exhausted'
+      WHERE id = ${lease.id}`);
+    await db.execute(sql`UPDATE progressive_work SET state = 'pending', error = NULL,
+      completed_at = NULL WHERE id = ${lease.workId}`);
+    expect(await admitProgressiveCfdBudgetExtension(db, {
+      unitId: lease.id,
+      attemptToken: lease.token,
+    })).toBe(true);
+
+    const claimed = await claimProgressiveCfdUnit(db, {
+      owner: "bounded-continuation-priority-test",
+      leaseSeconds: 120,
+      solverBudgetVersion: 2,
+      localTimeStepVersion: 1,
+    });
+    expect(claimed).toMatchObject({
+      id: lease.id,
+      budgetExtension: {
+        sourceResultAttemptId: resultAttemptId,
+        extensionSeconds: 900,
+      },
+    });
+  });
+
   it("waits for complete cohort initialization before selecting a CFD candidate", async () => {
     const { generationId } = await fastCfdGeneration(true);
     expect(await initializeProgressiveCfdWork(db)).toBe(4);

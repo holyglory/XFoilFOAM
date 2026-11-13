@@ -368,6 +368,12 @@ tier = "development"
 requires = ["seed"]
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "typecheck"]
 
+[[test.cfd-source-geometry.check]]
+name = "progressive-cfd-priority"
+tier = "development"
+requires = ["seed"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "prioritizes subsonic CFD targets|prioritizes a pending bounded continuation"]
+
 [test.mach3-cartesian-diagnosis]
 timeout_seconds = 300
 
