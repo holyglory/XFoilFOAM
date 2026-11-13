@@ -154,6 +154,45 @@ describe("production disk admission wiring", () => {
         );
     },
   );
+
+  it.each([undefined, "9"])(
+    "passes the unknown-job reserve %s only to the sweeper",
+    (configured) => {
+      const environment = {
+        PATH: process.env.PATH,
+        HOME: process.env.HOME,
+        ...(configured ? { SWEEPER_DISK_JOB_RESERVE_GIB: configured } : {}),
+      };
+      const compose = JSON.parse(
+        execFileSync(
+          "docker",
+          [
+            "compose",
+            "--env-file",
+            "/dev/null",
+            "-f",
+            "docker-compose.deploy.yml",
+            "config",
+            "--format",
+            "json",
+          ],
+          {
+            cwd: repoRoot,
+            env: environment,
+            encoding: "utf8",
+            stdio: ["ignore", "pipe", "pipe"],
+          },
+        ),
+      );
+      expect(
+        compose.services.sweeper.environment.SWEEPER_DISK_JOB_RESERVE_GIB,
+      ).toBe(configured ?? "40");
+      for (const name of ["node-api", "api", "worker", "web", "media-repair"])
+        expect(compose.services[name].environment).not.toHaveProperty(
+          "SWEEPER_DISK_JOB_RESERVE_GIB",
+        );
+    },
+  );
 });
 
 describe("production archive lane wiring", () => {
@@ -281,6 +320,7 @@ describe("remote-only evidence cleanup deployment wiring", () => {
       expect(block).not.toContain("CONTROL_PLANE_TOKEN");
     }
   });
+
 });
 
 describe("production worker capacity wiring", () => {
