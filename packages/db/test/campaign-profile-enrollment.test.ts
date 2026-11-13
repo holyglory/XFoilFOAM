@@ -7522,7 +7522,7 @@ describe("progressive execution stop and settlement", () => {
     expect(
       await db.execute(sql`
         SELECT attempts, ${progressiveCfdOrdinaryAttemptCountSql()} AS ordinary_attempts
-        FROM progressive_cfd_units WHERE id = ${eligible.id}::uuid
+        FROM progressive_cfd_units unit WHERE unit.id = ${eligible.id}::uuid
       `),
     ).toEqual([{ attempts: 3, ordinary_attempts: 2 }]);
 
@@ -7600,7 +7600,7 @@ describe("progressive execution stop and settlement", () => {
     expect(
       await db.execute(sql`
         SELECT attempts, ${progressiveCfdOrdinaryAttemptCountSql()} AS ordinary_attempts
-        FROM progressive_cfd_units WHERE id = ${lease.id}::uuid
+        FROM progressive_cfd_units unit WHERE unit.id = ${lease.id}::uuid
       `),
     ).toEqual([{ attempts: 3, ordinary_attempts: 3 }]);
     await expect(
