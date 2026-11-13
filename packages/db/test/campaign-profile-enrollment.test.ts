@@ -14740,7 +14740,7 @@ describe("durable progressive CFD units", () => {
         error = 'active compute budget exhausted'
       WHERE token = ${lease.token}`);
     await db.execute(sql`UPDATE progressive_cfd_units
-      SET attempts = 2, active_seconds = 900, state = 'gap',
+      SET attempts = 2, active_seconds = 900, state = 'pending',
         lease_token = NULL, lease_owner = NULL, lease_until = NULL,
         error = 'active compute budget exhausted'
       WHERE id = ${lease.id}`);
@@ -14750,7 +14750,6 @@ describe("durable progressive CFD units", () => {
       unitId: lease.id,
       attemptToken: lease.token,
     })).toBe(true);
-
     const claimed = await claimProgressiveCfdUnit(db, {
       owner: "bounded-continuation-priority-test",
       leaseSeconds: 120,
