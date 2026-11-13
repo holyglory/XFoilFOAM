@@ -368,6 +368,25 @@ tier = "development"
 requires = ["seed"]
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "typecheck"]
 
+[test.progressive-cfd-jobs]
+timeout_seconds = 300
+
+[test.progressive-cfd-jobs.postgres]
+image = "postgres:16-alpine"
+database = "aerodb"
+user = "aerodb"
+
+[[test.progressive-cfd-jobs.check]]
+name = "workspace"
+tier = "development"
+command = ["/usr/bin/corepack", "pnpm", "install", "--frozen-lockfile", "--ignore-scripts"]
+
+[[test.progressive-cfd-jobs.check]]
+name = "fast-resource-contract"
+tier = "development"
+requires = ["workspace"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/progressive-cfd-jobs.test.ts"]
+
 [[test.cfd-source-geometry.check]]
 name = "progressive-cfd-priority"
 tier = "development"

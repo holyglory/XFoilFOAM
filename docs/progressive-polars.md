@@ -1324,8 +1324,13 @@ precise-stage jobs unchanged. A separate benchmark may set
 also capped at eight and applies only when the immutable setup does not specify
 a process count. `SWEEPER_PROGRESSIVE_PRECISE_CASE_CONCURRENCY` may be set from
 one through four for the same unconfigured precise jobs; its CPU allocation is
-the product of process count and case concurrency. Both settings affect only
-newly admitted jobs.
+the product of process count and case concurrency. These settings affect only
+newly admitted jobs. The precise fallback remains `case_concurrency=1` unless
+its separate benchmark setting is explicitly enabled.
+`SWEEPER_PROGRESSIVE_FAST_CASE_CONCURRENCY` may be set from one through four
+for unconfigured transient fast jobs. When paired with a lower fast solver
+process count, it runs independent AoA cases concurrently while preserving the
+same total CPU allocation; it affects only newly admitted stage-2 jobs.
 `case_concurrency=1` plus the precise-stage fallback unchanged. Compare
 accepted points per hour, solver seconds per accepted point, CPU utilization,
 and failure dispositions before adopting a higher value.
