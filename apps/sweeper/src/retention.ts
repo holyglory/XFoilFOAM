@@ -116,61 +116,30 @@ function remoteProgressiveCandidateRetentionSql(alias = "sim_jobs") {
       WHERE live_attempt.sim_job_id = ${job}.id
         AND live_attempt.outcome = 'running'
     )
-    AND (
-      (
-        EXISTS (
-          SELECT 1
-          FROM progressive_worker_archive_receipts custody
-          WHERE custody.sim_job_id = ${job}.id
+    AND EXISTS (
+      SELECT 1
+      FROM progressive_worker_archive_receipts custody
+      WHERE custody.sim_job_id = ${job}.id
+    )
+    AND NOT EXISTS (
+      SELECT 1
+      FROM progressive_worker_archive_receipts custody
+      WHERE custody.sim_job_id = ${job}.id
+        AND (
+          NOT EXISTS (
+            SELECT 1
+            FROM progressive_worker_hub_receipts retained
+            WHERE retained.sim_job_id = custody.sim_job_id
+              AND retained.point_content_signature = custody.point_content_signature
+          )
+          OR NOT EXISTS (
+            SELECT 1
+            FROM progressive_worker_archive_reclaims reclaim
+            WHERE reclaim.sim_job_id = custody.sim_job_id
+              AND reclaim.point_content_signature = custody.point_content_signature
+              AND reclaim.completed_at IS NOT NULL
+          )
         )
-        AND NOT EXISTS (
-          SELECT 1
-          FROM progressive_worker_archive_receipts custody
-          WHERE custody.sim_job_id = ${job}.id
-            AND (
-              NOT EXISTS (
-                SELECT 1
-                FROM progressive_worker_hub_receipts retained
-                WHERE retained.sim_job_id = custody.sim_job_id
-                  AND retained.point_content_signature = custody.point_content_signature
-              )
-              OR NOT EXISTS (
-                SELECT 1
-                FROM progressive_worker_archive_reclaims reclaim
-                WHERE reclaim.sim_job_id = custody.sim_job_id
-                  AND reclaim.point_content_signature = custody.point_content_signature
-                  AND reclaim.completed_at IS NOT NULL
-              )
-            )
-        )
-      )
-      OR (
-        NOT EXISTS (
-          SELECT 1
-          FROM progressive_worker_archive_receipts custody
-          WHERE custody.sim_job_id = ${job}.id
-        )
-        AND NOT EXISTS (
-          SELECT 1
-          FROM result_attempts unpublished_attempt
-          WHERE unpublished_attempt.sim_job_id = ${job}.id
-            AND (
-              unpublished_attempt.valid_for_polar
-              OR EXISTS (
-                SELECT 1
-                FROM result_classifications classification
-                WHERE classification.result_attempt_id = unpublished_attempt.id
-                  AND classification.state IN ('accepted', 'needs_urans')
-              )
-              OR EXISTS (
-                SELECT 1
-                FROM solver_evidence_artifacts artifact
-                WHERE artifact.result_attempt_id = unpublished_attempt.id
-                  AND artifact.kind = 'engine_bundle'
-              )
-            )
-        )
-      )
     )
   )`;
 }
