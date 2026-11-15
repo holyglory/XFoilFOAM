@@ -239,29 +239,34 @@ export async function stripTerminalJobs(
             )
           )
         UNION ALL
-        SELECT terminal.id,
-          COALESCE(terminal."finishedAt", terminal."ingestedAt", terminal."updatedAt", terminal."createdAt") AS terminal_at
-        FROM sim_jobs terminal
-        JOIN remote_custody custody ON custody.sim_job_id = terminal.id
-        LEFT JOIN remote_live_children child ON child.job_id = terminal.id
-        LEFT JOIN remote_live_attempts attempt ON attempt.job_id = terminal.id
-        LEFT JOIN remote_pending_reports pending ON pending.job_id = terminal.id
-        WHERE terminal.status IN ('done', 'failed', 'cancelled')
-          AND COALESCE(terminal.request_payload, '{}'::jsonb) ? 'remoteProgressiveExecution'
-          AND terminal.engine_job_id = terminal.id::text
-          AND COALESCE(terminal."finishedAt", terminal."ingestedAt", terminal."updatedAt", terminal."createdAt") <=
-            ${now.toISOString()}::timestamptz - (${config.stripMinAgeMs}::double precision * interval '1 millisecond')
-          AND pending.job_id IS NULL
-          AND child.job_id IS NULL
-          AND NOT EXISTS (
-            SELECT 1
-            FROM sim_jobs continuation_child
-            WHERE continuation_child.status IN ('pending', 'submitted', 'running', 'ingesting')
-              AND continuation_child.request_payload#>>'{engineRequest,continue_from,engine_job_id}' = terminal.id::text
-          )
-          AND attempt.job_id IS NULL
-          AND custody.custody_count = custody.hub_count
-          AND custody.custody_count = custody.reclaim_count
+        SELECT remote_batch.id, remote_batch.terminal_at
+        FROM (
+          SELECT terminal.id,
+            COALESCE(terminal."finishedAt", terminal."ingestedAt", terminal."updatedAt", terminal."createdAt") AS terminal_at
+          FROM sim_jobs terminal
+          JOIN remote_custody custody ON custody.sim_job_id = terminal.id
+          LEFT JOIN remote_live_children child ON child.job_id = terminal.id
+          LEFT JOIN remote_live_attempts attempt ON attempt.job_id = terminal.id
+          LEFT JOIN remote_pending_reports pending ON pending.job_id = terminal.id
+          WHERE terminal.status IN ('done', 'failed', 'cancelled')
+            AND COALESCE(terminal.request_payload, '{}'::jsonb) ? 'remoteProgressiveExecution'
+            AND terminal.engine_job_id = terminal.id::text
+            AND COALESCE(terminal."finishedAt", terminal."ingestedAt", terminal."updatedAt", terminal."createdAt") <=
+              ${now.toISOString()}::timestamptz - (${config.stripMinAgeMs}::double precision * interval '1 millisecond')
+            AND pending.job_id IS NULL
+            AND child.job_id IS NULL
+            AND NOT EXISTS (
+              SELECT 1
+              FROM sim_jobs continuation_child
+              WHERE continuation_child.status IN ('pending', 'submitted', 'running', 'ingesting')
+                AND continuation_child.request_payload#>>'{engineRequest,continue_from,engine_job_id}' = terminal.id::text
+            )
+            AND attempt.job_id IS NULL
+            AND custody.custody_count = custody.hub_count
+            AND custody.custody_count = custody.reclaim_count
+          ORDER BY terminal."finishedAt", terminal.id
+          LIMIT ${Math.min(8, candidateScanLimit)}
+        ) remote_batch
       ) queued
       ORDER BY queued.terminal_at, queued.id
       LIMIT ${candidateScanLimit}
