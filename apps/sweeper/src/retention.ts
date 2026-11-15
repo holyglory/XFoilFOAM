@@ -187,17 +187,6 @@ export async function stripTerminalJobs(
         AND j.engine_job_id = j.id::text
         AND COALESCE(j."finishedAt", j."ingestedAt", j."updatedAt", j."createdAt") <=
           ${now.toISOString()}::timestamptz - (${config.stripMinAgeMs}::double precision * interval '1 millisecond')
-    ), remote_terminal_reports AS MATERIALIZED (
-      SELECT report.sim_job_id,
-        bool_or(
-          report.stopped_engine_job_id = report.sim_job_id::text
-          AND report.acknowledged_at IS NOT NULL
-          AND jsonb_typeof(report.report->'result') = 'object'
-        ) AS has_terminal_report,
-        bool_or(report.acknowledged_at IS NULL) AS has_pending_report
-      FROM progressive_worker_reports report
-      JOIN remote_terminal terminal ON terminal.id = report.sim_job_id
-      GROUP BY report.sim_job_id
     ), remote_live_children AS MATERIALIZED (
       SELECT child.parent_job_id AS job_id
       FROM sim_jobs child
@@ -265,12 +254,23 @@ export async function stripTerminalJobs(
         UNION ALL
         SELECT terminal.id, terminal.terminal_at
         FROM remote_terminal terminal
-        JOIN remote_terminal_reports reports ON reports.sim_job_id = terminal.id
         JOIN remote_custody custody ON custody.sim_job_id = terminal.id
         LEFT JOIN remote_live_children child ON child.job_id = terminal.id
         LEFT JOIN remote_live_attempts attempt ON attempt.job_id = terminal.id
-        WHERE reports.has_terminal_report
-          AND NOT reports.has_pending_report
+        WHERE EXISTS (
+            SELECT 1
+            FROM progressive_worker_reports terminal_report
+            WHERE terminal_report.sim_job_id = terminal.id
+              AND terminal_report.stopped_engine_job_id = terminal.id::text
+              AND terminal_report.acknowledged_at IS NOT NULL
+              AND jsonb_typeof(terminal_report.report->'result') = 'object'
+          )
+          AND NOT EXISTS (
+            SELECT 1
+            FROM progressive_worker_reports pending_report
+            WHERE pending_report.sim_job_id = terminal.id
+              AND pending_report.acknowledged_at IS NULL
+          )
           AND child.job_id IS NULL
           AND attempt.job_id IS NULL
           AND custody.custody_count = custody.hub_count
