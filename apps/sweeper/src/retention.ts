@@ -77,73 +77,6 @@ export interface SyncImportGcOptions {
   deleteBatchSize?: number;
 }
 
-/**
- * Cheap admission predicate for the bounded remote candidate scan. Expensive
- * local-media checks remain in the bounded retention batch and are applied
- * only after this scan has reduced the set to the retention batch.
- */
-function remoteProgressiveCandidateRetentionSql(alias = "sim_jobs") {
-  const job = sql.identifier(alias);
-  return sql`(
-    COALESCE(${job}.request_payload, '{}'::jsonb) ? 'remoteProgressiveExecution'
-    AND ${job}.engine_job_id = ${job}.id::text
-    AND EXISTS (
-      SELECT 1
-      FROM progressive_worker_reports terminal_report
-      WHERE terminal_report.sim_job_id = ${job}.id
-        AND terminal_report.stopped_engine_job_id = ${job}.id::text
-        AND terminal_report.acknowledged_at IS NOT NULL
-        AND jsonb_typeof(terminal_report.report->'result') = 'object'
-    )
-    AND NOT EXISTS (
-      SELECT 1
-      FROM progressive_worker_reports pending_report
-      WHERE pending_report.sim_job_id = ${job}.id
-        AND pending_report.acknowledged_at IS NULL
-    )
-    AND NOT EXISTS (
-      SELECT 1
-      FROM sim_jobs child
-      WHERE child.status IN ('pending', 'submitted', 'running', 'ingesting')
-        AND (
-          child.parent_job_id = ${job}.id
-          OR child.request_payload#>>'{engineRequest,continue_from,engine_job_id}' = ${job}.id::text
-        )
-    )
-    AND NOT EXISTS (
-      SELECT 1
-      FROM progressive_cfd_attempts live_attempt
-      WHERE live_attempt.sim_job_id = ${job}.id
-        AND live_attempt.outcome = 'running'
-    )
-    AND EXISTS (
-      SELECT 1
-      FROM progressive_worker_archive_receipts custody
-      WHERE custody.sim_job_id = ${job}.id
-    )
-    AND NOT EXISTS (
-      SELECT 1
-      FROM progressive_worker_archive_receipts custody
-      WHERE custody.sim_job_id = ${job}.id
-        AND (
-          NOT EXISTS (
-            SELECT 1
-            FROM progressive_worker_hub_receipts retained
-            WHERE retained.sim_job_id = custody.sim_job_id
-              AND retained.point_content_signature = custody.point_content_signature
-          )
-          OR NOT EXISTS (
-            SELECT 1
-            FROM progressive_worker_archive_reclaims reclaim
-            WHERE reclaim.sim_job_id = custody.sim_job_id
-              AND reclaim.point_content_signature = custody.point_content_signature
-              AND reclaim.completed_at IS NOT NULL
-          )
-        )
-    )
-  )`;
-}
-
 function envNumber(name: string, fallback: number): number {
   const raw = process.env[name];
   if (raw == null || raw.trim() === "") return fallback;
@@ -245,7 +178,58 @@ export async function stripTerminalJobs(
       sql`SET LOCAL statement_timeout = ${sql.raw(String(queryTimeoutMs))}`,
     );
     return transaction.execute(sql`
-    WITH candidate_jobs AS MATERIALIZED (
+    WITH remote_terminal AS MATERIALIZED (
+      SELECT j.id,
+        COALESCE(j."finishedAt", j."ingestedAt", j."updatedAt", j."createdAt") AS terminal_at
+      FROM sim_jobs j
+      WHERE j.status IN ('done', 'failed', 'cancelled')
+        AND COALESCE(j.request_payload, '{}'::jsonb) ? 'remoteProgressiveExecution'
+        AND j.engine_job_id = j.id::text
+        AND COALESCE(j."finishedAt", j."ingestedAt", j."updatedAt", j."createdAt") <=
+          ${now.toISOString()}::timestamptz - (${config.stripMinAgeMs}::double precision * interval '1 millisecond')
+    ), remote_terminal_reports AS MATERIALIZED (
+      SELECT report.sim_job_id,
+        bool_or(
+          report.stopped_engine_job_id = report.sim_job_id::text
+          AND report.acknowledged_at IS NOT NULL
+          AND jsonb_typeof(report.report->'result') = 'object'
+        ) AS has_terminal_report,
+        bool_or(report.acknowledged_at IS NULL) AS has_pending_report
+      FROM progressive_worker_reports report
+      JOIN remote_terminal terminal ON terminal.id = report.sim_job_id
+      GROUP BY report.sim_job_id
+    ), remote_live_children AS MATERIALIZED (
+      SELECT child.parent_job_id AS job_id
+      FROM sim_jobs child
+      JOIN remote_terminal terminal ON terminal.id = child.parent_job_id
+      WHERE child.status IN ('pending', 'submitted', 'running', 'ingesting')
+      UNION
+      SELECT terminal.id AS job_id
+      FROM sim_jobs child
+      JOIN remote_terminal terminal
+        ON child.request_payload#>>'{engineRequest,continue_from,engine_job_id}' = terminal.id::text
+      WHERE child.status IN ('pending', 'submitted', 'running', 'ingesting')
+    ), remote_live_attempts AS MATERIALIZED (
+      SELECT DISTINCT attempt.sim_job_id AS job_id
+      FROM progressive_cfd_attempts attempt
+      JOIN remote_terminal terminal ON terminal.id = attempt.sim_job_id
+      WHERE attempt.outcome = 'running'
+    ), remote_custody AS MATERIALIZED (
+      SELECT custody.sim_job_id,
+        count(DISTINCT custody.point_content_signature) AS custody_count,
+        count(DISTINCT retained.point_content_signature) AS hub_count,
+        count(DISTINCT reclaim.point_content_signature)
+          FILTER (WHERE reclaim.completed_at IS NOT NULL) AS reclaim_count
+      FROM progressive_worker_archive_receipts custody
+      JOIN remote_terminal terminal ON terminal.id = custody.sim_job_id
+      LEFT JOIN progressive_worker_hub_receipts retained
+        ON retained.sim_job_id = custody.sim_job_id
+       AND retained.point_content_signature = custody.point_content_signature
+      LEFT JOIN progressive_worker_archive_reclaims reclaim
+        ON reclaim.sim_job_id = custody.sim_job_id
+       AND reclaim.point_content_signature = custody.point_content_signature
+      GROUP BY custody.sim_job_id
+    ), candidate_jobs AS MATERIALIZED (
       SELECT queued.id
       FROM (
         SELECT j.id,
@@ -279,15 +263,18 @@ export async function stripTerminalJobs(
             )
           )
         UNION ALL
-        SELECT j.id,
-          COALESCE(j."finishedAt", j."ingestedAt", j."updatedAt", j."createdAt") AS terminal_at
-        FROM sim_jobs j
-        WHERE j.status IN ('done', 'failed', 'cancelled')
-          AND COALESCE(j.request_payload, '{}'::jsonb) ? 'remoteProgressiveExecution'
-          AND ${remoteProgressiveCandidateRetentionSql("j")}
-          AND j.engine_job_id IS NOT NULL
-          AND COALESCE(j."finishedAt", j."ingestedAt", j."updatedAt", j."createdAt") <=
-            ${now.toISOString()}::timestamptz - (${config.stripMinAgeMs}::double precision * interval '1 millisecond')
+        SELECT terminal.id, terminal.terminal_at
+        FROM remote_terminal terminal
+        JOIN remote_terminal_reports reports ON reports.sim_job_id = terminal.id
+        JOIN remote_custody custody ON custody.sim_job_id = terminal.id
+        LEFT JOIN remote_live_children child ON child.job_id = terminal.id
+        LEFT JOIN remote_live_attempts attempt ON attempt.job_id = terminal.id
+        WHERE reports.has_terminal_report
+          AND NOT reports.has_pending_report
+          AND child.job_id IS NULL
+          AND attempt.job_id IS NULL
+          AND custody.custody_count = custody.hub_count
+          AND custody.custody_count = custody.reclaim_count
       ) queued
       ORDER BY queued.terminal_at, queued.id
       LIMIT ${candidateScanLimit}
