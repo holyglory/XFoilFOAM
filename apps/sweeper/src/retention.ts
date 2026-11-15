@@ -78,137 +78,8 @@ export interface SyncImportGcOptions {
 }
 
 /**
- * Terminal remote-progressive jobs use a different custody path from direct
- * local jobs. Their engine directory can be removed only after the worker has
- * acknowledged a terminal report, all accepted evidence has a hub custody
- * receipt whose local archive reclaim is complete, and no live continuation or
- * unacknowledged media remains. Failed jobs with no published evidence are
- * disposable after the same terminal fences.
- */
-function terminalRetentionLifecycleSql(alias = "sim_jobs") {
-  const job = sql.identifier(alias);
-  return sql`(
-    ${solverDirectLifecycleSql(alias)}
-    OR (
-      COALESCE(${job}.request_payload, '{}'::jsonb) ? 'remoteProgressiveExecution'
-      AND ${job}.engine_job_id = ${job}.id::text
-      AND EXISTS (
-        SELECT 1
-        FROM progressive_worker_reports terminal_report
-        WHERE terminal_report.sim_job_id = ${job}.id
-          AND terminal_report.stopped_engine_job_id = ${job}.id::text
-          AND terminal_report.acknowledged_at IS NOT NULL
-          AND jsonb_typeof(terminal_report.report->'result') = 'object'
-      )
-      AND NOT EXISTS (
-        SELECT 1
-        FROM progressive_worker_reports pending_report
-        WHERE pending_report.sim_job_id = ${job}.id
-          AND pending_report.acknowledged_at IS NULL
-      )
-      AND NOT EXISTS (
-        SELECT 1
-        FROM sim_jobs child
-        WHERE child.status IN ('pending', 'submitted', 'running', 'ingesting')
-          AND (
-            child.parent_job_id = ${job}.id
-            OR child.request_payload#>>'{engineRequest,continue_from,engine_job_id}' = ${job}.id::text
-          )
-      )
-      AND NOT EXISTS (
-        SELECT 1
-        FROM progressive_cfd_attempts live_attempt
-        WHERE live_attempt.sim_job_id = ${job}.id
-          AND live_attempt.outcome = 'running'
-      )
-      AND NOT EXISTS (
-        SELECT 1
-        FROM progressive_worker_archive_reclaims open_reclaim
-        WHERE open_reclaim.sim_job_id = ${job}.id
-          AND open_reclaim.completed_at IS NULL
-      )
-      AND NOT EXISTS (
-        SELECT 1
-        FROM result_attempts media_attempt
-        JOIN result_media media
-          ON media.result_attempt_id = media_attempt.id
-         AND media.result_id = media_attempt.result_id
-        LEFT JOIN result_media_storage_bindings media_binding
-          ON media_binding.result_media_id = media.id
-        WHERE (
-            media_attempt.sim_job_id = ${job}.id
-            OR (
-              ${job}.engine_job_id IS NOT NULL
-              AND media_attempt.engine_job_id = ${job}.engine_job_id
-            )
-          )
-          AND media.sha256 ~ '^[0-9a-fA-F]{64}$'
-          AND media.byte_size > 0
-          AND media_binding.result_media_id IS NULL
-      )
-      AND (
-        (
-          EXISTS (
-            SELECT 1
-            FROM progressive_worker_archive_receipts custody
-            WHERE custody.sim_job_id = ${job}.id
-          )
-          AND NOT EXISTS (
-            SELECT 1
-            FROM progressive_worker_archive_receipts custody
-            WHERE custody.sim_job_id = ${job}.id
-              AND (
-                NOT EXISTS (
-                  SELECT 1
-                  FROM progressive_worker_hub_receipts retained
-                  WHERE retained.sim_job_id = custody.sim_job_id
-                    AND retained.point_content_signature = custody.point_content_signature
-                )
-                OR NOT EXISTS (
-                  SELECT 1
-                  FROM progressive_worker_archive_reclaims reclaim
-                  WHERE reclaim.sim_job_id = custody.sim_job_id
-                    AND reclaim.point_content_signature = custody.point_content_signature
-                    AND reclaim.completed_at IS NOT NULL
-                )
-              )
-          )
-        )
-        OR (
-          NOT EXISTS (
-            SELECT 1
-            FROM progressive_worker_archive_receipts custody
-            WHERE custody.sim_job_id = ${job}.id
-          )
-          AND NOT EXISTS (
-            SELECT 1
-            FROM result_attempts unpublished_attempt
-            WHERE unpublished_attempt.sim_job_id = ${job}.id
-              AND (
-                unpublished_attempt.valid_for_polar
-                OR EXISTS (
-                  SELECT 1
-                  FROM result_classifications classification
-                  WHERE classification.result_attempt_id = unpublished_attempt.id
-                    AND classification.state IN ('accepted', 'needs_urans')
-                )
-                OR EXISTS (
-                  SELECT 1
-                  FROM solver_evidence_artifacts artifact
-                  WHERE artifact.result_attempt_id = unpublished_attempt.id
-                    AND artifact.kind = 'engine_bundle'
-                )
-              )
-          )
-        )
-      )
-    )
-  )`;
-}
-
-/**
  * Cheap admission predicate for the bounded remote candidate scan. Expensive
- * local-media checks remain in terminalRetentionLifecycleSql and are applied
+ * local-media checks remain in the bounded retention batch and are applied
  * only after this scan has reduced the set to the retention batch.
  */
 function remoteProgressiveCandidateRetentionSql(alias = "sim_jobs") {
@@ -458,6 +329,7 @@ export async function stripTerminalJobs(
         j.error,
         j.stripped_at,
         j.strip_report,
+        j.request_payload,
         COALESCE(j."finishedAt", j."ingestedAt", j."updatedAt", j."createdAt") AS terminal_at,
         EXISTS (
           SELECT 1
@@ -639,7 +511,10 @@ export async function stripTerminalJobs(
       FROM sim_jobs j
       JOIN candidate_jobs selected ON selected.id = j.id
       WHERE j.status IN ('done', 'failed', 'cancelled')
-        AND ${terminalRetentionLifecycleSql("j")}
+        AND (
+          ${solverDirectLifecycleSql("j")}
+          OR COALESCE(j.request_payload, '{}'::jsonb) ? 'remoteProgressiveExecution'
+        )
         AND j.engine_job_id IS NOT NULL
         -- A remote-solver job owns upload source bytes until the hub has
         -- acknowledged every exact generation and the delivery loop has
@@ -735,9 +610,18 @@ export async function stripTerminalJobs(
         )
       )
       AND (
-        NOT ${requireDurableMediaBinding}
-        OR NOT has_unbound_result_media
-        OR error = ${DISK_PRESSURE_CANCELLATION_MARKER}
+        (
+          COALESCE(request_payload, '{}'::jsonb) ? 'remoteProgressiveExecution'
+          AND NOT has_unbound_result_media
+        )
+        OR (
+          NOT (COALESCE(request_payload, '{}'::jsonb) ? 'remoteProgressiveExecution')
+          AND (
+            NOT ${requireDurableMediaBinding}
+            OR NOT has_unbound_result_media
+            OR error = ${DISK_PRESSURE_CANCELLATION_MARKER}
+          )
+        )
       )
     ORDER BY terminal_at ASC, id ASC
     LIMIT ${config.stripMaxPerTick}
