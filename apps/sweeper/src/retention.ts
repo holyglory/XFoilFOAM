@@ -206,6 +206,104 @@ function terminalRetentionLifecycleSql(alias = "sim_jobs") {
   )`;
 }
 
+/**
+ * Cheap admission predicate for the bounded remote candidate scan. Expensive
+ * local-media checks remain in terminalRetentionLifecycleSql and are applied
+ * only after this scan has reduced the set to the retention batch.
+ */
+function remoteProgressiveCandidateRetentionSql(alias = "sim_jobs") {
+  const job = sql.identifier(alias);
+  return sql`(
+    COALESCE(${job}.request_payload, '{}'::jsonb) ? 'remoteProgressiveExecution'
+    AND ${job}.engine_job_id = ${job}.id::text
+    AND EXISTS (
+      SELECT 1
+      FROM progressive_worker_reports terminal_report
+      WHERE terminal_report.sim_job_id = ${job}.id
+        AND terminal_report.stopped_engine_job_id = ${job}.id::text
+        AND terminal_report.acknowledged_at IS NOT NULL
+        AND jsonb_typeof(terminal_report.report->'result') = 'object'
+    )
+    AND NOT EXISTS (
+      SELECT 1
+      FROM progressive_worker_reports pending_report
+      WHERE pending_report.sim_job_id = ${job}.id
+        AND pending_report.acknowledged_at IS NULL
+    )
+    AND NOT EXISTS (
+      SELECT 1
+      FROM sim_jobs child
+      WHERE child.status IN ('pending', 'submitted', 'running', 'ingesting')
+        AND (
+          child.parent_job_id = ${job}.id
+          OR child.request_payload#>>'{engineRequest,continue_from,engine_job_id}' = ${job}.id::text
+        )
+    )
+    AND NOT EXISTS (
+      SELECT 1
+      FROM progressive_cfd_attempts live_attempt
+      WHERE live_attempt.sim_job_id = ${job}.id
+        AND live_attempt.outcome = 'running'
+    )
+    AND (
+      (
+        EXISTS (
+          SELECT 1
+          FROM progressive_worker_archive_receipts custody
+          WHERE custody.sim_job_id = ${job}.id
+        )
+        AND NOT EXISTS (
+          SELECT 1
+          FROM progressive_worker_archive_receipts custody
+          WHERE custody.sim_job_id = ${job}.id
+            AND (
+              NOT EXISTS (
+                SELECT 1
+                FROM progressive_worker_hub_receipts retained
+                WHERE retained.sim_job_id = custody.sim_job_id
+                  AND retained.point_content_signature = custody.point_content_signature
+              )
+              OR NOT EXISTS (
+                SELECT 1
+                FROM progressive_worker_archive_reclaims reclaim
+                WHERE reclaim.sim_job_id = custody.sim_job_id
+                  AND reclaim.point_content_signature = custody.point_content_signature
+                  AND reclaim.completed_at IS NOT NULL
+              )
+            )
+        )
+      )
+      OR (
+        NOT EXISTS (
+          SELECT 1
+          FROM progressive_worker_archive_receipts custody
+          WHERE custody.sim_job_id = ${job}.id
+        )
+        AND NOT EXISTS (
+          SELECT 1
+          FROM result_attempts unpublished_attempt
+          WHERE unpublished_attempt.sim_job_id = ${job}.id
+            AND (
+              unpublished_attempt.valid_for_polar
+              OR EXISTS (
+                SELECT 1
+                FROM result_classifications classification
+                WHERE classification.result_attempt_id = unpublished_attempt.id
+                  AND classification.state IN ('accepted', 'needs_urans')
+              )
+              OR EXISTS (
+                SELECT 1
+                FROM solver_evidence_artifacts artifact
+                WHERE artifact.result_attempt_id = unpublished_attempt.id
+                  AND artifact.kind = 'engine_bundle'
+              )
+            )
+        )
+      )
+    )
+  )`;
+}
+
 function envNumber(name: string, fallback: number): number {
   const raw = process.env[name];
   if (raw == null || raw.trim() === "") return fallback;
@@ -346,7 +444,7 @@ export async function stripTerminalJobs(
         FROM sim_jobs j
         WHERE j.status IN ('done', 'failed', 'cancelled')
           AND COALESCE(j.request_payload, '{}'::jsonb) ? 'remoteProgressiveExecution'
-          AND ${terminalRetentionLifecycleSql("j")}
+          AND ${remoteProgressiveCandidateRetentionSql("j")}
           AND j.engine_job_id IS NOT NULL
           AND COALESCE(j."finishedAt", j."ingestedAt", j."updatedAt", j."createdAt") <=
             ${now.toISOString()}::timestamptz - (${config.stripMinAgeMs}::double precision * interval '1 millisecond')
