@@ -8174,6 +8174,9 @@ export const progressiveWorkerReports = pgTable(
     terminalStagingOrderIdx: index("progressive_worker_reports_terminal_staging_order_idx")
       .on(table.createdAt, table.simJobId, table.sequence)
       .where(sql`${table.acknowledgedAt} IS NOT NULL AND jsonb_typeof(${table.report}->'result')='object' AND ${table.stoppedEngineJobId} IS NOT NULL`),
+    terminalJobLookupIdx: index("progressive_worker_reports_terminal_job_lookup_idx")
+      .on(table.simJobId, table.stoppedEngineJobId, table.sequence)
+      .where(sql`${table.acknowledgedAt} IS NOT NULL AND jsonb_typeof(${table.report}->'result')='object' AND ${table.stoppedEngineJobId} IS NOT NULL`),
     stagingCandidateIdx: index("progressive_worker_reports_staging_candidate_idx")
       .on(table.simJobId, table.sequence, table.createdAt)
       .where(sql`${table.acknowledgedAt} IS NOT NULL AND jsonb_typeof(${table.report}->'result')='object'`),
