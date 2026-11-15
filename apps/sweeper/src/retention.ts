@@ -263,7 +263,7 @@ export async function stripTerminalJobs(
             WHERE terminal_report.sim_job_id = terminal.id
               AND terminal_report.stopped_engine_job_id = terminal.id::text
               AND terminal_report.acknowledged_at IS NOT NULL
-              AND jsonb_typeof(terminal_report.report->'result') = 'object'
+              AND terminal_report.report#>>'{result,state}' IN ('completed', 'failed', 'cancelled')
           )
           AND NOT EXISTS (
             SELECT 1
