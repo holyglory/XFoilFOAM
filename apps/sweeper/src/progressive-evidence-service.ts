@@ -14,6 +14,20 @@ const SERVICE_MAX_SEQUENTIAL_EVIDENCE_DELIVERIES = 32;
 const DEFAULT_PARALLEL_EVIDENCE_LANES = 4;
 const MAX_PARALLEL_EVIDENCE_LANES = 32;
 
+function configuredBacklogStageLanes(
+  total: number,
+  env: NodeJS.ProcessEnv = process.env,
+): number | null {
+  const raw = env.REMOTE_EVIDENCE_STAGE_BACKLOG_LANES;
+  if (raw == null || raw.trim() === "") return null;
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value) || value < 0 || value > total)
+    throw new Error(
+      `REMOTE_EVIDENCE_STAGE_BACKLOG_LANES must be an integer from 0 through ${total}`,
+    );
+  return value;
+}
+
 function configuredEvidenceLanes(
   name: string,
   env: NodeJS.ProcessEnv = process.env,
@@ -94,6 +108,7 @@ export async function runProgressiveEvidenceService(
   const deliveryLanes = configuredEvidenceLanes(
     "REMOTE_EVIDENCE_DELIVERY_LANES",
   );
+  const backlogStageLanes = configuredBacklogStageLanes(stagingLanes);
   const stage =
     options.stage ??
     ((preferActive: boolean) =>
@@ -124,7 +139,8 @@ export async function runProgressiveEvidenceService(
   const service = (scope: "staging" | "delivery", lane: number) => ({
     name: `progressive-evidence-${scope}-${lane}`,
     run: async (childSignal: AbortSignal) => {
-      let preferActive = lane % 2 === 0;
+      let preferActive =
+        backlogStageLanes == null ? lane % 2 === 0 : lane >= backlogStageLanes;
       await runNotificationDrain(
         notifications,
         "progressive_worker_evidence_changed",
@@ -132,7 +148,8 @@ export async function runProgressiveEvidenceService(
         {
           drain: async () => {
             const preference = preferActive;
-            preferActive = !preferActive;
+            if (scope !== "staging" || backlogStageLanes == null)
+              preferActive = !preferActive;
             return scope === "staging"
               ? stage(preference)
               : drainProgressiveWorkerEvidencePass(

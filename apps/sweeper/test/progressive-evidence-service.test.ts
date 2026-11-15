@@ -76,13 +76,10 @@ it("renews a delayed ingest without overlap and cleans up its timer", async () =
     }
   });
   let settled = false;
-  const running = withPeriodicIngestLeaseRenewal(
-    async () => {
-      await stagePoint();
-      return "staged";
-    },
-    renew,
-  ).then((result) => {
+  const running = withPeriodicIngestLeaseRenewal(async () => {
+    await stagePoint();
+    return "staged";
+  }, renew).then((result) => {
     settled = true;
     return result;
   });
@@ -178,14 +175,16 @@ it("refills a free staging slot while other imports and delivery remain pending"
 it("uses bounded configured staging and delivery lane counts", async () => {
   vi.useFakeTimers();
   const previousStageLanes = process.env.REMOTE_EVIDENCE_STAGE_LANES;
+  const previousBacklogLanes = process.env.REMOTE_EVIDENCE_STAGE_BACKLOG_LANES;
   const previousDeliveryLanes = process.env.REMOTE_EVIDENCE_DELIVERY_LANES;
   process.env.REMOTE_EVIDENCE_STAGE_LANES = "2";
+  process.env.REMOTE_EVIDENCE_STAGE_BACKLOG_LANES = "1";
   process.env.REMOTE_EVIDENCE_DELIVERY_LANES = "3";
   const channel = notifications();
   const owner = new AbortController();
   const imports = Array.from({ length: 2 }, gate);
   const network = gate();
-  const stage = vi.fn(async () => {
+  const stage = vi.fn(async (_preferActive: boolean) => {
     await imports[0].pending;
     return false;
   });
@@ -203,6 +202,7 @@ it("uses bounded configured staging and delivery lane counts", async () => {
   try {
     await vi.advanceTimersByTimeAsync(0);
     expect(stage).toHaveBeenCalledTimes(2);
+    expect(stage.mock.calls.map((call) => call[0])).toEqual([false, true]);
     expect(deliver).toHaveBeenCalledTimes(3);
   } finally {
     owner.abort();
@@ -212,6 +212,9 @@ it("uses bounded configured staging and delivery lane counts", async () => {
     if (previousStageLanes === undefined)
       delete process.env.REMOTE_EVIDENCE_STAGE_LANES;
     else process.env.REMOTE_EVIDENCE_STAGE_LANES = previousStageLanes;
+    if (previousBacklogLanes === undefined)
+      delete process.env.REMOTE_EVIDENCE_STAGE_BACKLOG_LANES;
+    else process.env.REMOTE_EVIDENCE_STAGE_BACKLOG_LANES = previousBacklogLanes;
     if (previousDeliveryLanes === undefined)
       delete process.env.REMOTE_EVIDENCE_DELIVERY_LANES;
     else process.env.REMOTE_EVIDENCE_DELIVERY_LANES = previousDeliveryLanes;
