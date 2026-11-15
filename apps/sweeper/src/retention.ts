@@ -147,6 +147,137 @@ async function stampStrip(
     .where(eq(simJobs.id, jobId));
 }
 
+async function stripClosedProgressiveJobs(
+  db: DB,
+  engine: EngineClient,
+  now: Date,
+  config: RetentionConfig,
+): Promise<number> {
+  const queryTimeoutMs = Math.max(
+    1_000,
+    Math.floor(
+      envNumber(
+        "SWEEPER_RETENTION_QUERY_TIMEOUT_MS",
+        DEFAULT_RETENTION_QUERY_TIMEOUT_MS,
+      ),
+    ),
+  );
+  const candidates = (await db.transaction(async (rawTransaction) => {
+    const transaction = rawTransaction as unknown as DB;
+    await transaction.execute(
+      sql`SET LOCAL statement_timeout = ${sql.raw(String(queryTimeoutMs))}`,
+    );
+    return transaction.execute(sql`
+      WITH live_children AS MATERIALIZED (
+        SELECT parent_job_id AS job_id
+        FROM sim_jobs
+        WHERE status IN ('pending', 'submitted', 'running', 'ingesting')
+          AND parent_job_id IS NOT NULL
+      ), live_attempts AS MATERIALIZED (
+        SELECT DISTINCT sim_job_id AS job_id
+        FROM progressive_cfd_attempts
+        WHERE outcome = 'running'
+      ), pending_reports AS MATERIALIZED (
+        SELECT DISTINCT sim_job_id AS job_id
+        FROM progressive_worker_reports
+        WHERE acknowledged_at IS NULL
+      ), custody AS MATERIALIZED (
+        SELECT
+          source.sim_job_id,
+          count(DISTINCT source.point_content_signature) AS custody_count,
+          count(DISTINCT hub.point_content_signature) AS hub_count,
+          count(DISTINCT reclaim.point_content_signature)
+            FILTER (WHERE reclaim.completed_at IS NOT NULL) AS reclaim_count
+        FROM progressive_worker_archive_receipts source
+        LEFT JOIN progressive_worker_hub_receipts hub
+          ON hub.sim_job_id = source.sim_job_id
+         AND hub.point_content_signature = source.point_content_signature
+        LEFT JOIN progressive_worker_archive_reclaims reclaim
+          ON reclaim.sim_job_id = source.sim_job_id
+         AND reclaim.point_content_signature = source.point_content_signature
+        GROUP BY source.sim_job_id
+      )
+      SELECT job.id, job.engine_job_id
+      FROM sim_jobs job
+      JOIN custody
+        ON custody.sim_job_id = job.id
+      LEFT JOIN live_children
+        ON live_children.job_id = job.id
+      LEFT JOIN live_attempts
+        ON live_attempts.job_id = job.id
+      LEFT JOIN pending_reports
+        ON pending_reports.job_id = job.id
+      WHERE job.status IN ('done', 'failed', 'cancelled')
+        AND COALESCE(job.request_payload, '{}'::jsonb) ? 'remoteProgressiveExecution'
+        AND job.engine_job_id = job.id::text
+        AND COALESCE(job."finishedAt", job."ingestedAt", job."updatedAt", job."createdAt") <=
+          ${now.toISOString()}::timestamptz - (${config.stripMinAgeMs}::double precision * interval '1 millisecond')
+        AND live_children.job_id IS NULL
+        AND live_attempts.job_id IS NULL
+        AND pending_reports.job_id IS NULL
+        AND custody.custody_count = custody.hub_count
+        AND custody.custody_count = custody.reclaim_count
+        AND NOT EXISTS (
+          SELECT 1
+          FROM sim_jobs continuation_child
+          WHERE continuation_child.status IN ('pending', 'submitted', 'running', 'ingesting')
+            AND continuation_child.request_payload#>>'{engineRequest,continue_from,engine_job_id}' = job.id::text
+        )
+      ORDER BY job."finishedAt", job.id
+      LIMIT ${Math.min(8, config.stripMaxPerTick)}
+    `);
+  })) as unknown as Array<{ id: string; engine_job_id: string }>;
+
+  let stripped = 0;
+  for (const candidate of candidates) {
+    const [media] = (await db.execute(sql`
+      SELECT EXISTS (
+        SELECT 1
+        FROM result_attempts attempt
+        JOIN result_media media
+          ON media.result_attempt_id = attempt.id
+         AND media.result_id = attempt.result_id
+        LEFT JOIN result_media_storage_bindings binding
+          ON binding.result_media_id = media.id
+        WHERE (attempt.sim_job_id = ${candidate.id}::uuid OR attempt.engine_job_id = ${candidate.engine_job_id})
+          AND media.sha256 ~ '^[0-9a-fA-F]{64}$'
+          AND media.byte_size > 0
+          AND binding.result_media_id IS NULL
+      ) AS has_unbound_media
+    `)) as unknown as Array<{ has_unbound_media: boolean }>;
+    if (media?.has_unbound_media) continue;
+    try {
+      const response = await engine.deleteJob(candidate.engine_job_id);
+      await stampStrip(db, candidate.id, now, {
+        bytes_freed: response.bytes_freed,
+        files_removed: 0,
+        kept_case_state: false,
+        note: "engine job directory deleted after remote custody reclaim",
+      });
+      stripped++;
+      console.log(
+        `[sweeper] RETENTION: deleted closed progressive job ${candidate.engine_job_id} freed ${mb(response.bytes_freed)} MB`,
+      );
+    } catch (error) {
+      if (error instanceof EngineError && error.status === 404) {
+        await stampStrip(db, candidate.id, now, {
+          bytes_freed: 0,
+          files_removed: 0,
+          kept_case_state: false,
+          note: "engine job not found",
+        });
+        stripped++;
+        continue;
+      }
+      if (!(error instanceof EngineError && error.status === 409))
+        console.error(
+          `[sweeper] RETENTION: progressive delete failed for ${candidate.engine_job_id}: ${error instanceof Error ? error.message : String(error)}`,
+        );
+    }
+  }
+  return stripped;
+}
+
 export async function stripTerminalJobs(
   db: DB,
   engine: EngineClient,
@@ -155,6 +286,14 @@ export async function stripTerminalJobs(
   const config = retentionConfigFromEnv(options);
   if (config.stripMaxPerTick <= 0) return 0;
   const now = options.now ?? new Date();
+  const progressiveStripped = await stripClosedProgressiveJobs(
+    db,
+    engine,
+    now,
+    config,
+  );
+  const remainingStripMax = config.stripMaxPerTick - progressiveStripped;
+  if (remainingStripMax <= 0) return progressiveStripped;
   const reclaimOptionalCaseState = options.reclaimOptionalCaseState === true;
   const requireDurableMediaBinding =
     options.requireDurableMediaBinding ??
@@ -168,44 +307,14 @@ export async function stripTerminalJobs(
       ),
     ),
   );
-  const candidateScanLimit = Math.min(
-    64,
-    Math.max(8, config.stripMaxPerTick * 4),
-  );
+  const candidateScanLimit = Math.min(64, Math.max(8, remainingStripMax * 4));
   const candidates = (await db.transaction(async (rawTransaction) => {
     const transaction = rawTransaction as unknown as DB;
     await transaction.execute(
       sql`SET LOCAL statement_timeout = ${sql.raw(String(queryTimeoutMs))}`,
     );
     return transaction.execute(sql`
-    WITH remote_live_children AS MATERIALIZED (
-      SELECT child.parent_job_id AS job_id
-      FROM sim_jobs child
-      WHERE child.status IN ('pending', 'submitted', 'running', 'ingesting')
-        AND child.parent_job_id IS NOT NULL
-    ), remote_live_attempts AS MATERIALIZED (
-      SELECT DISTINCT attempt.sim_job_id AS job_id
-      FROM progressive_cfd_attempts attempt
-      WHERE attempt.outcome = 'running'
-    ), remote_pending_reports AS MATERIALIZED (
-      SELECT DISTINCT report.sim_job_id AS job_id
-      FROM progressive_worker_reports report
-      WHERE report.acknowledged_at IS NULL
-    ), remote_custody AS MATERIALIZED (
-      SELECT custody.sim_job_id,
-        count(DISTINCT custody.point_content_signature) AS custody_count,
-        count(DISTINCT retained.point_content_signature) AS hub_count,
-        count(DISTINCT reclaim.point_content_signature)
-          FILTER (WHERE reclaim.completed_at IS NOT NULL) AS reclaim_count
-      FROM progressive_worker_archive_receipts custody
-      LEFT JOIN progressive_worker_hub_receipts retained
-        ON retained.sim_job_id = custody.sim_job_id
-       AND retained.point_content_signature = custody.point_content_signature
-      LEFT JOIN progressive_worker_archive_reclaims reclaim
-        ON reclaim.sim_job_id = custody.sim_job_id
-       AND reclaim.point_content_signature = custody.point_content_signature
-      GROUP BY custody.sim_job_id
-    ), candidate_jobs AS MATERIALIZED (
+    WITH candidate_jobs AS MATERIALIZED (
       SELECT queued.id
       FROM (
         SELECT j.id,
@@ -238,35 +347,6 @@ export async function stripTerminalJobs(
                 ${now.toISOString()}::timestamptz - (${config.stripMinAgeMs}::double precision * interval '1 millisecond')
             )
           )
-        UNION ALL
-        SELECT remote_batch.id, remote_batch.terminal_at
-        FROM (
-          SELECT terminal.id,
-            COALESCE(terminal."finishedAt", terminal."ingestedAt", terminal."updatedAt", terminal."createdAt") AS terminal_at
-          FROM sim_jobs terminal
-          JOIN remote_custody custody ON custody.sim_job_id = terminal.id
-          LEFT JOIN remote_live_children child ON child.job_id = terminal.id
-          LEFT JOIN remote_live_attempts attempt ON attempt.job_id = terminal.id
-          LEFT JOIN remote_pending_reports pending ON pending.job_id = terminal.id
-          WHERE terminal.status IN ('done', 'failed', 'cancelled')
-            AND COALESCE(terminal.request_payload, '{}'::jsonb) ? 'remoteProgressiveExecution'
-            AND terminal.engine_job_id = terminal.id::text
-            AND COALESCE(terminal."finishedAt", terminal."ingestedAt", terminal."updatedAt", terminal."createdAt") <=
-              ${now.toISOString()}::timestamptz - (${config.stripMinAgeMs}::double precision * interval '1 millisecond')
-            AND pending.job_id IS NULL
-            AND child.job_id IS NULL
-            AND NOT EXISTS (
-              SELECT 1
-              FROM sim_jobs continuation_child
-              WHERE continuation_child.status IN ('pending', 'submitted', 'running', 'ingesting')
-                AND continuation_child.request_payload#>>'{engineRequest,continue_from,engine_job_id}' = terminal.id::text
-            )
-            AND attempt.job_id IS NULL
-            AND custody.custody_count = custody.hub_count
-            AND custody.custody_count = custody.reclaim_count
-          ORDER BY terminal."finishedAt", terminal.id
-          LIMIT ${Math.min(8, candidateScanLimit)}
-        ) remote_batch
       ) queued
       ORDER BY queued.terminal_at, queued.id
       LIMIT ${candidateScanLimit}
@@ -471,10 +551,7 @@ export async function stripTerminalJobs(
       FROM sim_jobs j
       JOIN candidate_jobs selected ON selected.id = j.id
       WHERE j.status IN ('done', 'failed', 'cancelled')
-        AND (
-          ${solverDirectLifecycleSql("j")}
-          OR COALESCE(j.request_payload, '{}'::jsonb) ? 'remoteProgressiveExecution'
-        )
+        AND ${solverDirectLifecycleSql("j")}
         AND j.engine_job_id IS NOT NULL
         -- A remote-solver job owns upload source bytes until the hub has
         -- acknowledged every exact generation and the delivery loop has
@@ -482,37 +559,27 @@ export async function stripTerminalJobs(
         -- retains packaged evidence too, but this explicit fence prevents a
         -- future retention expansion from racing the federation ACK.
         AND (
-          (
-            COALESCE(j.request_payload, '{}'::jsonb) ? 'remoteProgressiveExecution'
-            AND COALESCE(j."finishedAt", j."ingestedAt", j."updatedAt", j."createdAt") <=
-              ${now.toISOString()}::timestamptz - (${config.stripMinAgeMs}::double precision * interval '1 millisecond')
-          )
+          j.error = ${DISK_PRESSURE_CANCELLATION_MARKER}
           OR (
-            NOT (COALESCE(j.request_payload, '{}'::jsonb) ? 'remoteProgressiveExecution')
-            AND (
-              j.error = ${DISK_PRESSURE_CANCELLATION_MARKER}
-              OR (
-                (
-                  NOT (COALESCE(j.request_payload, '{}'::jsonb) ? 'syncPromiseId')
-                  OR EXISTS (
-                    SELECT 1
-                    FROM sync_remote_result_deliveries remote_delivery
-                    WHERE remote_delivery.sim_job_id = j.id
-                      AND remote_delivery.result_id IS NULL
-                      AND remote_delivery.state IN ('delivered', 'superseded')
-                  )
-                  OR EXISTS (
-                    SELECT 1
-                    FROM sync_sweep_promises closed_promise
-                    WHERE closed_promise.id::text =
-                        COALESCE(j.request_payload, '{}'::jsonb) ->> 'syncPromiseId'
-                      AND closed_promise.status = 'cancelled'
-                  )
-                )
-                AND COALESCE(j."finishedAt", j."ingestedAt", j."updatedAt", j."createdAt") <=
-                  ${now.toISOString()}::timestamptz - (${config.stripMinAgeMs}::double precision * interval '1 millisecond')
+            (
+              NOT (COALESCE(j.request_payload, '{}'::jsonb) ? 'syncPromiseId')
+              OR EXISTS (
+                SELECT 1
+                FROM sync_remote_result_deliveries remote_delivery
+                WHERE remote_delivery.sim_job_id = j.id
+                  AND remote_delivery.result_id IS NULL
+                  AND remote_delivery.state IN ('delivered', 'superseded')
+              )
+              OR EXISTS (
+                SELECT 1
+                FROM sync_sweep_promises closed_promise
+                WHERE closed_promise.id::text =
+                    COALESCE(j.request_payload, '{}'::jsonb) ->> 'syncPromiseId'
+                  AND closed_promise.status = 'cancelled'
               )
             )
+            AND COALESCE(j."finishedAt", j."ingestedAt", j."updatedAt", j."createdAt") <=
+              ${now.toISOString()}::timestamptz - (${config.stripMinAgeMs}::double precision * interval '1 millisecond')
           )
         )
     )
@@ -584,7 +651,7 @@ export async function stripTerminalJobs(
         )
       )
     ORDER BY terminal_at ASC, id ASC
-    LIMIT ${config.stripMaxPerTick}
+    LIMIT ${remainingStripMax}
   `);
   })) as unknown as StripCandidate[];
 
@@ -633,7 +700,7 @@ export async function stripTerminalJobs(
       );
     }
   }
-  return stripped;
+  return progressiveStripped + stripped;
 }
 
 export async function runOrphanSweep(

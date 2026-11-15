@@ -5293,6 +5293,14 @@ command = ["/bin/bash", "-c", "exec /usr/bin/corepack pnpm --filter @aerodb/swee
 diagnostic_sources = [{ format = "junit", path = "report.xml" }]
 
 [[test.ingestion-recovery-final.check]]
+name = "sweeper-retention"
+tier = "development"
+timeout_seconds = 900
+requires = ["schema"]
+command = ["/bin/bash", "-c", "exec /usr/bin/corepack pnpm --filter @aerodb/sweeper exec vitest run test/retention.test.ts --reporter=default --reporter=junit --outputFile.junit=\"$DEVCOORDINATOR_DIAGNOSTICS_DIR/report.xml\""]
+diagnostic_sources = [{ format = "junit", path = "report.xml" }]
+
+[[test.ingestion-recovery-final.check]]
 name = "progress-selection-regressions"
 tier = "development"
 timeout_seconds = 300
