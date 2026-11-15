@@ -33,9 +33,9 @@ const PROGRESSIVE_REMOTE_CONTROL_TIMEOUT_MS = Number(
   process.env.SWEEPER_PROGRESSIVE_REMOTE_CONTROL_TIMEOUT_MS ?? 30_000,
 );
 
-const staleRemoteExecutionSql = (jobId: unknown) => sql`EXISTS (
+export const staleRemoteExecutionSql = (jobId: unknown) => sql`EXISTS (
   SELECT 1
-  FROM progressive_remote_reports stale_report
+  FROM progressive_worker_reports stale_report
   WHERE stale_report.sim_job_id = ${jobId}
     AND stale_report.report #>> '{status,state}' = 'running'
     AND jsonb_array_length(
@@ -50,7 +50,7 @@ const staleRemoteExecutionSql = (jobId: unknown) => sql`EXISTS (
         WHEN COALESCE(stale_report.report #>> '{status,last_progress_at}', '') ~
           '^[0-9]{4}-[0-9]{2}-[0-9]{2}T'
           THEN (stale_report.report #>> '{status,last_progress_at}')::timestamptz
-        ELSE stale_report.received_at
+        ELSE stale_report.created_at
       END
     ) <= clock_timestamp() -
       (${PROGRESSIVE_REMOTE_STALE_GRACE_MS}::double precision * interval '1 millisecond')
