@@ -192,12 +192,6 @@ export async function stripTerminalJobs(
       FROM sim_jobs child
       JOIN remote_terminal terminal ON terminal.id = child.parent_job_id
       WHERE child.status IN ('pending', 'submitted', 'running', 'ingesting')
-      UNION
-      SELECT terminal.id AS job_id
-      FROM sim_jobs child
-      JOIN remote_terminal terminal
-        ON child.request_payload#>>'{engineRequest,continue_from,engine_job_id}' = terminal.id::text
-      WHERE child.status IN ('pending', 'submitted', 'running', 'ingesting')
     ), remote_live_attempts AS MATERIALIZED (
       SELECT DISTINCT attempt.sim_job_id AS job_id
       FROM progressive_cfd_attempts attempt
@@ -272,6 +266,12 @@ export async function stripTerminalJobs(
               AND pending_report.acknowledged_at IS NULL
           )
           AND child.job_id IS NULL
+          AND NOT EXISTS (
+            SELECT 1
+            FROM sim_jobs continuation_child
+            WHERE continuation_child.status IN ('pending', 'submitted', 'running', 'ingesting')
+              AND continuation_child.request_payload#>>'{engineRequest,continue_from,engine_job_id}' = terminal.id::text
+          )
           AND attempt.job_id IS NULL
           AND custody.custody_count = custody.hub_count
           AND custody.custody_count = custody.reclaim_count
