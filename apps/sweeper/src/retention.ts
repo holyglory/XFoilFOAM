@@ -168,7 +168,12 @@ async function stripClosedProgressiveJobs(
       sql`SET LOCAL statement_timeout = ${sql.raw(String(queryTimeoutMs))}`,
     );
     return transaction.execute(sql`
-      WITH live_children AS MATERIALIZED (
+      WITH live_continuations AS MATERIALIZED (
+        SELECT DISTINCT request_payload#>>'{engineRequest,continue_from,engine_job_id}' AS job_id
+        FROM sim_jobs
+        WHERE status IN ('pending', 'submitted', 'running', 'ingesting')
+          AND request_payload#>>'{engineRequest,continue_from,engine_job_id}' IS NOT NULL
+      ), live_children AS MATERIALIZED (
         SELECT parent_job_id AS job_id
         FROM sim_jobs
         WHERE status IN ('pending', 'submitted', 'running', 'ingesting')
@@ -207,6 +212,8 @@ async function stripClosedProgressiveJobs(
         ON live_attempts.job_id = job.id
       LEFT JOIN pending_reports
         ON pending_reports.job_id = job.id
+      LEFT JOIN live_continuations continuation
+        ON continuation.job_id = job.id::text
       WHERE job.status IN ('done', 'failed', 'cancelled')
         AND COALESCE(job.request_payload, '{}'::jsonb) ? 'remoteProgressiveExecution'
         AND job.engine_job_id = job.id::text
@@ -215,14 +222,9 @@ async function stripClosedProgressiveJobs(
         AND live_children.job_id IS NULL
         AND live_attempts.job_id IS NULL
         AND pending_reports.job_id IS NULL
+        AND continuation.job_id IS NULL
         AND custody.custody_count = custody.hub_count
         AND custody.custody_count = custody.reclaim_count
-        AND NOT EXISTS (
-          SELECT 1
-          FROM sim_jobs continuation_child
-          WHERE continuation_child.status IN ('pending', 'submitted', 'running', 'ingesting')
-            AND continuation_child.request_payload#>>'{engineRequest,continue_from,engine_job_id}' = job.id::text
-        )
       ORDER BY job."finishedAt", job.id
       LIMIT ${Math.min(8, config.stripMaxPerTick)}
     `);
