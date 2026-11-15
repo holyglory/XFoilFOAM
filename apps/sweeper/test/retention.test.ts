@@ -484,7 +484,14 @@ describe("retention schema", () => {
       });
       ownedIds.push(progressive.id);
       let selection: Parameters<DB["execute"]>[0] | undefined;
-      const inspect = { execute: async (query: Parameters<DB["execute"]>[0]) => { selection=query; return []; } } as unknown as DB;
+      const inspect = {
+        execute: async (query: Parameters<DB["execute"]>[0]) => {
+          selection = query;
+          return [];
+        },
+        transaction: async (callback: (transaction: unknown) => unknown) =>
+          callback(inspect),
+      } as unknown as DB;
       await stripTerminalJobs(inspect, fakeEngine(), { now: NOW, stripMinAgeMs: THIRTY_MIN, stripMaxPerTick: 500 });
       expect(selection).toBeDefined();
       const restore = new Error("Restore direct retention planner flags");
@@ -1035,6 +1042,88 @@ describe("terminal strip reaper", () => {
       kept_case_state: false,
       note: "engine job directory deleted",
     });
+  });
+
+  it("deletes only remote-progressive jobs with complete hub custody", async () => {
+    const safe = await insertTerminalJob(`${PREFIX}-progressive-safe`, {
+      requestPayload: { remoteProgressiveExecution: { fixture: true } },
+    });
+    const unsafe = await insertTerminalJob(`${PREFIX}-progressive-unsafe`, {
+      requestPayload: { remoteProgressiveExecution: { fixture: true } },
+    });
+    const ownedIds = [safe.id, unsafe.id];
+    try {
+      for (const job of [safe, unsafe]) {
+        await db
+          .update(simJobs)
+          .set({ engineJobId: job.id })
+          .where(eq(simJobs.id, job.id));
+        job.engineJobId = job.id;
+        const result = await insertClassifiedResult(job, {
+          state: "accepted",
+          fidelity: "urans_full",
+        });
+        const [attempt] = await db
+          .select({ id: resultAttempts.id })
+          .from(resultAttempts)
+          .where(eq(resultAttempts.resultId, result.id))
+          .limit(1);
+        if (!attempt?.id) throw new Error("progressive fixture has no attempt");
+        const pointSignature = (job === safe ? "a" : "b").repeat(64);
+        const reportSignature = (job === safe ? "c" : "d").repeat(64);
+        const report = {
+          version: "1",
+          executionId: job.id,
+          sequence: "1",
+          result: { state: "completed" },
+          stopProof: { execution_stopped: true, job_id: job.id },
+        };
+        await db.execute(dsql`
+          INSERT INTO progressive_worker_reports
+            (sim_job_id, sequence, content_signature, report, acknowledged_at)
+          VALUES (${job.id}::uuid, 1, ${reportSignature}, ${JSON.stringify(report)}::jsonb, clock_timestamp())
+        `);
+        if (job === safe) {
+          await db.execute(dsql`
+            INSERT INTO progressive_worker_evidence_receipts
+              (sim_job_id, sequence, content_signature)
+            VALUES (${job.id}::uuid, 1, ${reportSignature})
+          `);
+          await db.execute(dsql`
+            INSERT INTO progressive_worker_evidence_attempts
+              (sim_job_id, sequence, result_attempt_id, point_content_signature)
+            VALUES (${job.id}::uuid, 1, ${attempt.id}::uuid, ${pointSignature})
+          `);
+          await db.execute(dsql`
+            INSERT INTO progressive_worker_hub_receipts
+              (sim_job_id, sequence, result_attempt_id, point_content_signature, receipt)
+            VALUES (${job.id}::uuid, 1, ${attempt.id}::uuid, ${pointSignature}, '{}'::jsonb)
+          `);
+          await db.execute(dsql`
+            INSERT INTO progressive_worker_archive_receipts
+              (sim_job_id, point_content_signature, brokered_upload_id, receipt)
+            VALUES (${job.id}::uuid, ${pointSignature}, ${job.id}::uuid, '{}'::jsonb)
+          `);
+          await db.execute(dsql`
+            INSERT INTO progressive_worker_archive_reclaims
+              (sim_job_id, point_content_signature, attempt_count, completed_at, reclaimed_bytes)
+            VALUES (${job.id}::uuid, ${pointSignature}, 1, clock_timestamp(), 1)
+          `);
+        }
+      }
+
+      const engine = fakeEngine();
+      await stripTerminalJobs(db, engine, {
+        now: NOW,
+        stripMinAgeMs: THIRTY_MIN,
+        stripMaxPerTick: 500,
+      });
+
+      expect(engine.deleteCalls).toEqual([safe.id]);
+      expect((await readJob(unsafe.id)).strippedAt).toBeNull();
+    } finally {
+      await db.delete(simJobs).where(inArray(simJobs.id, ownedIds));
+    }
   });
 
   it("keeps case state for a budget-stop continuable row, then fully strips after supersession", async () => {
