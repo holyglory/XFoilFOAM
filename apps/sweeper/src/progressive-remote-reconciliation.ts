@@ -56,7 +56,7 @@ export const staleRemoteExecutionSql = (jobId: unknown) => sql`EXISTS (
       (${PROGRESSIVE_REMOTE_STALE_GRACE_MS}::double precision * interval '1 millisecond')
     AND NOT EXISTS (
       SELECT 1
-      FROM progressive_remote_reports newer_report
+      FROM progressive_worker_reports newer_report
       WHERE newer_report.sim_job_id = stale_report.sim_job_id
         AND newer_report.sequence > stale_report.sequence
     )
