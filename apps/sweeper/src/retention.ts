@@ -279,14 +279,18 @@ export async function stripTerminalJobs(
         j.strip_report,
         j.request_payload,
         COALESCE(j."finishedAt", j."ingestedAt", j."updatedAt", j."createdAt") AS terminal_at,
-        EXISTS (
+        CASE WHEN COALESCE(j.request_payload, '{}'::jsonb) ? 'remoteProgressiveExecution'
+          THEN false
+          ELSE EXISTS (
           SELECT 1
           FROM results r
           LEFT JOIN result_classifications rc ON rc.result_id = r.id
           WHERE (r.sim_job_id = j.id OR (j.engine_job_id IS NOT NULL AND r.engine_job_id = j.engine_job_id))
             AND ${CONTINUABLE_SQL}
-        ) AS has_continuable,
-        EXISTS (
+          ) END AS has_continuable,
+        CASE WHEN COALESCE(j.request_payload, '{}'::jsonb) ? 'remoteProgressiveExecution'
+          THEN false
+          ELSE EXISTS (
           SELECT 1
           FROM sim_urans_requests req
           JOIN results r ON r.id = req.continue_from_result_id
@@ -295,8 +299,10 @@ export async function stripTerminalJobs(
             sql`, `,
           )})
             AND (r.sim_job_id = j.id OR (j.engine_job_id IS NOT NULL AND r.engine_job_id = j.engine_job_id))
-        ) AS has_live_continuation,
-        EXISTS (
+          ) END AS has_live_continuation,
+        CASE WHEN COALESCE(j.request_payload, '{}'::jsonb) ? 'remoteProgressiveExecution'
+          THEN false
+          ELSE EXISTS (
           SELECT 1
           FROM sim_precalc_obligation_attempts obligation_attempt
           JOIN sim_precalc_obligations obligation
@@ -317,9 +323,11 @@ export async function stripTerminalJobs(
               attempt.sim_job_id = j.id
               OR (j.engine_job_id IS NOT NULL AND attempt.engine_job_id = j.engine_job_id)
             )
-        ) AS has_live_precalc_continuation
+          ) END AS has_live_precalc_continuation
         ,
-        EXISTS (
+        CASE WHEN COALESCE(j.request_payload, '{}'::jsonb) ? 'remoteProgressiveExecution'
+          THEN false
+          ELSE EXISTS (
           SELECT 1
           FROM sim_precalc_obligation_attempts obligation_attempt
           JOIN sim_precalc_obligations obligation
@@ -340,9 +348,11 @@ export async function stripTerminalJobs(
               attempt.sim_job_id = j.id
               OR (j.engine_job_id IS NOT NULL AND attempt.engine_job_id = j.engine_job_id)
             )
-        ) AS has_running_precalc_continuation
+          ) END AS has_running_precalc_continuation
         ,
-        EXISTS (
+        CASE WHEN COALESCE(j.request_payload, '{}'::jsonb) ? 'remoteProgressiveExecution'
+          THEN false
+          ELSE EXISTS (
           SELECT 1
           FROM sim_urans_verify_queue verify
           JOIN result_attempts attempt
@@ -362,8 +372,10 @@ export async function stripTerminalJobs(
                 AND attempt.engine_job_id = j.engine_job_id
               )
             )
-        ) AS has_live_final_continuation,
-        EXISTS (
+          ) END AS has_live_final_continuation,
+        CASE WHEN COALESCE(j.request_payload, '{}'::jsonb) ? 'remoteProgressiveExecution'
+          THEN false
+          ELSE EXISTS (
           SELECT 1
           FROM result_attempts attempt
           JOIN result_classifications attempt_classification
@@ -411,7 +423,7 @@ export async function stripTerminalJobs(
                 AND attempt.engine_job_id = j.engine_job_id
               )
             )
-        ) AS has_attempt_continuable
+          ) END AS has_attempt_continuable
         ,
         EXISTS (
           SELECT 1
