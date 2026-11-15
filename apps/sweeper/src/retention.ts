@@ -197,6 +197,10 @@ export async function stripTerminalJobs(
       FROM progressive_cfd_attempts attempt
       JOIN remote_terminal terminal ON terminal.id = attempt.sim_job_id
       WHERE attempt.outcome = 'running'
+    ), remote_pending_reports AS MATERIALIZED (
+      SELECT DISTINCT report.sim_job_id AS job_id
+      FROM progressive_worker_reports report
+      WHERE report.acknowledged_at IS NULL
     ), remote_custody AS MATERIALIZED (
       SELECT custody.sim_job_id,
         count(DISTINCT custody.point_content_signature) AS custody_count,
@@ -251,12 +255,8 @@ export async function stripTerminalJobs(
         JOIN remote_custody custody ON custody.sim_job_id = terminal.id
         LEFT JOIN remote_live_children child ON child.job_id = terminal.id
         LEFT JOIN remote_live_attempts attempt ON attempt.job_id = terminal.id
-        WHERE NOT EXISTS (
-            SELECT 1
-            FROM progressive_worker_reports pending_report
-            WHERE pending_report.sim_job_id = terminal.id
-              AND pending_report.acknowledged_at IS NULL
-          )
+        LEFT JOIN remote_pending_reports pending ON pending.job_id = terminal.id
+        WHERE pending.job_id IS NULL
           AND child.job_id IS NULL
           AND NOT EXISTS (
             SELECT 1
