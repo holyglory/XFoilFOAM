@@ -251,15 +251,7 @@ export async function stripTerminalJobs(
         JOIN remote_custody custody ON custody.sim_job_id = terminal.id
         LEFT JOIN remote_live_children child ON child.job_id = terminal.id
         LEFT JOIN remote_live_attempts attempt ON attempt.job_id = terminal.id
-        WHERE EXISTS (
-            SELECT 1
-            FROM progressive_worker_reports terminal_report
-            WHERE terminal_report.sim_job_id = terminal.id
-              AND terminal_report.stopped_engine_job_id = terminal.id::text
-              AND terminal_report.acknowledged_at IS NOT NULL
-              AND terminal_report.report#>>'{result,state}' IN ('completed', 'failed', 'cancelled')
-          )
-          AND NOT EXISTS (
+        WHERE NOT EXISTS (
             SELECT 1
             FROM progressive_worker_reports pending_report
             WHERE pending_report.sim_job_id = terminal.id
