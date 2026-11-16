@@ -35,9 +35,14 @@ const PROGRESSIVE_REMOTE_CONTROL_TIMEOUT_MS = Number(
 
 export const staleRemoteExecutionSql = (jobId: unknown) => sql`EXISTS (
   SELECT 1
-  FROM progressive_worker_reports stale_report
-  WHERE stale_report.sim_job_id = ${jobId}
-    AND stale_report.report #>> '{status,state}' = 'running'
+  FROM (
+    SELECT report.report, report.created_at
+    FROM progressive_worker_reports report
+    WHERE report.sim_job_id = ${jobId}
+    ORDER BY report.sequence DESC
+    LIMIT 1
+  ) stale_report
+  WHERE stale_report.report #>> '{status,state}' = 'running'
     AND jsonb_array_length(
       CASE
         WHEN jsonb_typeof(stale_report.report #> '{status,active_pids}') = 'array'
@@ -54,12 +59,6 @@ export const staleRemoteExecutionSql = (jobId: unknown) => sql`EXISTS (
       END
     ) <= clock_timestamp() -
       (${PROGRESSIVE_REMOTE_STALE_GRACE_MS}::double precision * interval '1 millisecond')
-    AND NOT EXISTS (
-      SELECT 1
-      FROM progressive_worker_reports newer_report
-      WHERE newer_report.sim_job_id = stale_report.sim_job_id
-        AND newer_report.sequence > stale_report.sequence
-    )
 )`;
 
 export async function reconcileProgressiveRemoteWorker(
