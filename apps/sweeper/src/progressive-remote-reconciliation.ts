@@ -140,7 +140,8 @@ export async function reconcileProgressiveRemoteWorker(
       promise.source_base_url,
       (NOT settings.remote_solver_enabled OR job.status = 'cancelled'
         OR promise.status <> 'active' OR promise."expiresAt" <= clock_timestamp()
-        OR ${staleRemoteExecutionSql(sql`job.id`)}) AS stop_required
+      ) AS stop_required,
+      ${staleRemoteExecutionSql(sql`job.id`)} AS stale_worker_report
     FROM sim_jobs job LEFT JOIN progressive_worker_submission_intents intent ON intent.sim_job_id = job.id
     JOIN sync_sweep_promises promise ON promise.id::text = job.request_payload->>'syncPromiseId'
     JOIN sync_api_settings settings ON settings.id = 1
@@ -181,6 +182,30 @@ export async function reconcileProgressiveRemoteWorker(
       }
     ORDER BY job."updatedAt", job.id LIMIT ${limit}
   `);
+  const staleIds = candidates
+    .filter((candidate) => candidate.stale_worker_report === true)
+    .map((candidate) => String(candidate.id));
+  const staleRuntimeById = new Map<
+    string,
+    {
+      process_count: number;
+      runtime_heartbeat_age_sec?: number | null;
+      status_state?: string | null;
+    }
+  >();
+  if (staleIds.length) {
+    try {
+      const runtime = await engine.getJobRuntimes(staleIds);
+      for (const row of runtime.jobs) {
+        staleRuntimeById.set(String(row.job_id), row);
+      }
+    } catch (error) {
+      receipt.errors.push({
+        executionId: "",
+        error: `stale runtime probe failed: ${error instanceof Error ? error.message : String(error)}`,
+      });
+    }
+  }
   await runWithConcurrency(candidates, concurrency, async (candidate) => {
     const executionId = String(candidate.id);
     receipt.inspected += 1;
@@ -203,7 +228,15 @@ export async function reconcileProgressiveRemoteWorker(
         throw new Error(
           "Progressive observation upstream differs from the registered assignment",
         );
-      let stop = Boolean(candidate.stop_required);
+      const runtime = staleRuntimeById.get(executionId);
+      const staleRuntimeConfirmed =
+        candidate.stale_worker_report === true &&
+        runtime != null &&
+        runtime.status_state === "running" &&
+        runtime.process_count === 0 &&
+        (runtime.runtime_heartbeat_age_sec == null ||
+          Number(runtime.runtime_heartbeat_age_sec) > 120);
+      let stop = Boolean(candidate.stop_required) || staleRuntimeConfirmed;
       if (!stop) {
         try {
           if (!candidate.auth_token)
