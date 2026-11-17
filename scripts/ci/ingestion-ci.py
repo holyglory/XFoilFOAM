@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import signal
 import subprocess
@@ -28,6 +29,22 @@ MODES = {
     "catalog": "public-metrics",
 }
 SCALE_CASE = "keeps full campaign catalog reads within their time budget"
+APPROVED_ACTIONS = {
+    "actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803",
+    "actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38",
+    "actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1",
+    "actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f",
+}
+
+
+def validate_harness_files() -> None:
+    workflow = Path(__file__).resolve().parents[2] / ".github/workflows/ingestion-ci.yml"
+    text = workflow.read_text()
+    actions = re.findall(r"(?m)^\s+- uses: (\S+)", text)
+    if not actions or set(actions) != APPROVED_ACTIONS:
+        raise ValueError("Workflow action pins differ from the approved CI template")
+    if f"  FUNCTIONAL_REF: {REVISION}\n" not in text:
+        raise ValueError("Workflow functional revision differs from the harness")
 
 
 def junit_summary(directory: Path) -> dict:
@@ -178,6 +195,7 @@ def execute(source: Path, output: Path, name: str, command: list[str], timeout: 
 
 
 def run(mode: str, source: Path, output: Path) -> int:
+    validate_harness_files()
     if os.environ.get("GITHUB_ACTIONS") != "true":
         raise ValueError("This harness runs only on GitHub's ephemeral Actions runner")
     if os.environ.get("FUNCTIONAL_REF") != REVISION:
