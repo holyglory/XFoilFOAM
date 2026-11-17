@@ -271,7 +271,7 @@ export async function reclaimProgressiveRestartState(
             AND verification.last_outcome IN ('continuation_pending','continuation_retry_wait'))
       ORDER BY job."updatedAt",job.id LIMIT 1 FOR UPDATE OF job SKIP LOCKED)
       SELECT selected.id,report.sequence,report.report FROM selected
-      JOIN LATERAL (SELECT sequence,report FROM progressive_worker_reports
+      JOIN LATERAL (SELECT sequence,public.resolve_progressive_report(to_jsonb(progressive_worker_reports.*)) AS report FROM progressive_worker_reports
         WHERE sim_job_id=selected.id ORDER BY sequence DESC LIMIT 1) report ON true`);
     if (!candidates.length) return { stripped: 0, bytesFreed: 0 };
     const candidate = candidates[0];

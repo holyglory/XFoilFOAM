@@ -8747,6 +8747,9 @@ export const progressivePolarModels = pgTable("progressive_polar_models", {
   catalogCompositePresent: boolean(
     "catalog_composite_present",
   ).generatedAlwaysAs(sql`response#>'{estimate,curves,composite}' IS NOT NULL`),
+  catalogPrimaryMethod: text("catalog_primary_method").generatedAlwaysAs(
+    sql`coalesce(response#>>'{estimate,publication,primary_method}', 'composite')`,
+  ),
   createdAt: timestamp("created_at", { withTimezone: true })
     .notNull()
     .default(sql`clock_timestamp()`),
