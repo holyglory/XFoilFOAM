@@ -143,7 +143,7 @@ export async function verifyProgressiveRestartRetention(
         receiptHmac: string;
       };
       const [latest] =
-        await connection.execute(sql`SELECT report FROM progressive_worker_reports
+        await connection.execute(sql`SELECT public.resolve_progressive_report(to_jsonb(progressive_worker_reports.*)) AS report FROM progressive_worker_reports
         WHERE sim_job_id=${executionId}::uuid ORDER BY sequence DESC LIMIT 1`);
       const report = latest.report as unknown as ProgressiveRemoteReport;
       const point = report
