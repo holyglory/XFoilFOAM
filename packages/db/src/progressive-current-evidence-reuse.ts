@@ -171,7 +171,7 @@ async function reuseCurrentUnit(db: DB, candidate: Candidate): Promise<"reused" 
         requireProof(row.outcome === "cancelled" && Number(row.active_seconds) === 0 && row.has_evidence === false &&
           row.execution_recipe_id === scope.execution_recipe_id && row.simulation_preset_revision_id === scope.execution_revision_id &&
           proof.ownership_basis === "never_started_cancellation_fence", "successor contains work or different numerical authority");
-        const [reported] = await connection.execute(sql`SELECT report,content_signature FROM progressive_remote_reports
+        const [reported] = await connection.execute(sql`SELECT resolve_progressive_report(to_jsonb(progressive_remote_reports.*)) AS report,content_signature FROM progressive_remote_reports
           WHERE sim_job_id=${row.job_id}::uuid ORDER BY sequence DESC LIMIT 1`);
         requireProof(reported, "successor cancellation report missing");
         const validated = await authenticate(() => validateProgressiveRemoteReport(reported.report, envelope));

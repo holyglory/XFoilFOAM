@@ -38,12 +38,9 @@ async function verifyParallelStagingClaims(
     .select()
     .from(syncSweepPromises)
     .where(eq(syncSweepPromises.id, source.promiseId));
-  const [originalReport] = await db
-    .select()
-    .from(progressiveWorkerReports)
-    .where(eq(progressiveWorkerReports.simJobId, source.scope.executionId))
-    .orderBy(progressiveWorkerReports.sequence)
-    .limit(1);
+  const [originalReport] = await db.execute(sql`SELECT public.resolve_progressive_report(to_jsonb(stored.*)) AS report
+    FROM progressive_worker_reports stored WHERE sim_job_id=${source.scope.executionId}::uuid
+    ORDER BY sequence LIMIT 1`);
   const jobIds: string[] = [];
   const promiseIds: string[] = [];
   try {

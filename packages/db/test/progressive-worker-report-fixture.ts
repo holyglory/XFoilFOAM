@@ -1,3 +1,4 @@
+import { proveProgressiveReportsInline } from "../src/progressive-report-payloads";
 import { randomUUID } from "node:crypto";
 import { sql } from "drizzle-orm";
 import { expect, vi } from "vitest";
@@ -147,7 +148,7 @@ export async function verifyProgressiveWorkerReportDelivery(
           ),
         ).toMatchObject([{ status: "cancelled", ingestedAt: null }]);
         const before =
-          await connection.execute(sql`SELECT report,content_signature FROM progressive_worker_reports
+          await connection.execute(sql`SELECT public.resolve_progressive_report(to_jsonb(progressive_worker_reports.*)) AS report,content_signature FROM progressive_worker_reports
         WHERE sim_job_id=${executionId}::uuid AND sequence=1`);
         expect(
           isFinalProgressiveRemoteReport(
@@ -192,11 +193,11 @@ export async function verifyProgressiveWorkerReportDelivery(
           reason: "raw_evidence",
         });
         expect(
-          await connection.execute(sql`SELECT report,content_signature FROM progressive_worker_reports
+          await connection.execute(sql`SELECT public.resolve_progressive_report(to_jsonb(progressive_worker_reports.*)) AS report,content_signature FROM progressive_worker_reports
         WHERE sim_job_id=${executionId}::uuid AND sequence=1`),
         ).toEqual(before);
         expect(
-          await connection.execute(sql`SELECT report,content_signature FROM progressive_remote_reports
+          await connection.execute(sql`SELECT public.resolve_progressive_report(to_jsonb(progressive_remote_reports.*)) AS report,content_signature FROM progressive_remote_reports
         WHERE sim_job_id=${executionId}::uuid AND sequence=1`),
         ).toEqual(before);
         await expect(enqueue(partial)).rejects.toThrow(
@@ -405,6 +406,12 @@ export async function verifyProgressiveWorkerReportDelivery(
         solverId: envelope.solverId,
       });
     expect((await pending())?.sequence).toBe(1);
+    const rollbackProof = await proveProgressiveReportsInline(db);
+    if (rollbackProof.normalizationEnabled) {
+      expect(rollbackProof.oldReaderRollbackSafe).toBe(false);
+      expect(Number(rollbackProof.counts.find((row) => row.table === "progressive_worker_reports")?.normalizedReports)).toBeGreaterThan(0);
+    }
+
     expect(
       await readPendingProgressiveWorkerReport(db, {
         executionId,

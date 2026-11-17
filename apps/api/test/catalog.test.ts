@@ -13,7 +13,6 @@ import {
   polarFitSets,
   referenceGeometryProfiles,
   registeredRemoteSolvers,
-  progressiveRemoteReports,
   refreshPolarCacheForRevision,
   resultClassifications,
   resultMedia,
@@ -902,10 +901,8 @@ describe("catalog solved-metric evidence", () => {
             },
           });
           expect(changed.statusCode).toBe(409);
-          const persisted = await db
-            .select()
-            .from(progressiveRemoteReports)
-            .where(eq(progressiveRemoteReports.simJobId, fixture.executionId));
+          const persisted = await db.execute(sql`SELECT public.resolve_progressive_report(to_jsonb(stored.*)) AS report
+            FROM progressive_remote_reports stored WHERE sim_job_id=${fixture.executionId}::uuid`);
           expect(persisted).toHaveLength(1);
           expect(persisted[0].report).toEqual(fixture.report);
           const afterReport = await app.inject({

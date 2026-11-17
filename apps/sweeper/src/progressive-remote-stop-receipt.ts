@@ -46,7 +46,7 @@ export async function acknowledgeLatestProgressiveRemoteStop(
         "Remote stop conflicts with immutable hub execution ownership",
       );
     const [stored] = await connection.execute(sql`
-      SELECT report, content_signature FROM progressive_remote_reports WHERE sim_job_id = ${executionId}::uuid
+      SELECT resolve_progressive_report(to_jsonb(progressive_remote_reports.*)) AS report, content_signature FROM progressive_remote_reports WHERE sim_job_id = ${executionId}::uuid
       ORDER BY sequence DESC LIMIT 1
     `);
     if (!stored) return false;

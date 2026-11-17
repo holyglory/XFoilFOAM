@@ -28,7 +28,8 @@
     "reset": "tsx src/reset.ts && corepack pnpm run migrate && corepack pnpm run seed",
     "studio": "drizzle-kit studio",
     "test": "vitest run",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "backfill:progressive-report-payloads": "tsx src/backfill-progressive-report-payloads.ts"
   },
   "dependencies": {
     "@aerodb/core": "workspace:*",

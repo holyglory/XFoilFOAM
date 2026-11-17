@@ -1387,6 +1387,13 @@
       "when": 1794496011000,
       "tag": "0197_progressive_cancelled_no_result_final_stop",
       "breakpoints": true
+    },
+    {
+      "idx": 198,
+      "version": "7",
+      "when": 1794902400000,
+      "tag": "0198_progressive_report_result_payloads",
+      "breakpoints": true
     }
   ]
 }

@@ -32,6 +32,7 @@ catalog_profile_events campaign_catalog_boundaries campaign_profile_expansions
 campaign_condition_scopes campaign_catalog_snapshot
 campaign_local_step_policies
 campaign_progressive_execution_policies
+progressive_report_storage_policy
 """.split())
 
 SOLVER_TABLES = frozenset("""
@@ -83,6 +84,7 @@ progressive_cfd_recovery_claims
 progressive_cfd_recovery_plans
 progressive_remote_dispatches
 progressive_remote_reports
+progressive_report_result_payloads
 progressive_remote_report_inventories
 progressive_remote_report_sources
 progressive_remote_progress_receipts

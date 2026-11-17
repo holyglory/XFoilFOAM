@@ -353,7 +353,7 @@ export async function recoverProgressiveIngestionOwnership(
         "foreign physical stop",
       );
       const [latest] = await connection.execute(sql`
-      SELECT sequence, content_signature, report FROM progressive_remote_reports
+      SELECT sequence, content_signature, resolve_progressive_report(to_jsonb(progressive_remote_reports.*)) AS report FROM progressive_remote_reports
       WHERE sim_job_id = ${selection.jobId}::uuid ORDER BY sequence DESC LIMIT 1 FOR SHARE
     `);
       requireRecovery(latest, "final report is missing");

@@ -25,7 +25,7 @@ export async function verifyProgressiveEvidenceReuse(
     db.transaction(async (transaction) => {
       const connection = transaction as unknown as DB;
       const [source] =
-        await connection.execute(sql`SELECT report.report,job.request_payload,
+        await connection.execute(sql`SELECT public.resolve_progressive_report(to_jsonb(report.*)) AS report,job.request_payload,
       (SELECT max(sequence)+1 FROM progressive_worker_reports WHERE sim_job_id=${executionId}::uuid) AS next_sequence
       FROM progressive_worker_reports report JOIN sim_jobs job ON job.id=report.sim_job_id
       JOIN progressive_worker_evidence_receipts receipt ON receipt.sim_job_id=report.sim_job_id AND receipt.sequence=report.sequence

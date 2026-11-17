@@ -258,7 +258,7 @@ async function verifyDiagnosticOnlyRemoteSettlement(db: DB, envelope: Progressiv
             WHERE parent_job_id=${executionId}::uuid`)).toHaveLength(0);
           if (retired === "leased") await verifyDiagnosticWorkerDrain(connection, envelope, report);
         }
-        const [stored] = await connection.execute(sql`SELECT report,content_signature FROM progressive_remote_reports
+        const [stored] = await connection.execute(sql`SELECT public.resolve_progressive_report(to_jsonb(progressive_remote_reports.*)) AS report,content_signature FROM progressive_remote_reports
           WHERE sim_job_id=${executionId}::uuid AND sequence=1`);
         expect(stored).toMatchObject({ report, content_signature: analysisContentHash(report) });
         throw restore;
@@ -509,7 +509,7 @@ export async function verifyDiagnosticMixedPromotionRecovery(db: DB, envelope: P
     expect(retry.map((unit) => unit.alpha).sort((a, b) => a - b)).toEqual(angles);
     expect(retry.every((unit) => unit.recoveryParentJobId === executionId && unit.recoveryPlanId)).toBe(true);
     expect(await connection.execute(sql`SELECT raw.id FROM result_attempts raw WHERE raw.sim_job_id=${executionId}::uuid AND raw.aoa_deg<>0`)).toHaveLength(0);
-    const [original] = await connection.execute(sql`SELECT report,content_signature FROM progressive_remote_reports
+    const [original] = await connection.execute(sql`SELECT public.resolve_progressive_report(to_jsonb(progressive_remote_reports.*)) AS report,content_signature FROM progressive_remote_reports
       WHERE sim_job_id=${executionId}::uuid AND sequence=${early.sequence}`);
     expect(original).toMatchObject({ report: early, content_signature: analysisContentHash(early) });
     throw restore;

@@ -69,7 +69,7 @@ export async function resolveProgressiveRemoteEvidence(
     contentSignature: String(assigned.content_signature),
   });
   const [stored] =
-    await db.execute(sql`SELECT report, content_signature FROM progressive_remote_reports
+    await db.execute(sql`SELECT resolve_progressive_report(to_jsonb(progressive_remote_reports.*)) AS report, content_signature FROM progressive_remote_reports
     WHERE sim_job_id = ${input.engineJobId}::uuid AND sequence = ${reference.sequence}`);
   if (!stored)
     throw new ProgressiveRemoteEvidenceConflict(

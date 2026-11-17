@@ -79,7 +79,7 @@ export async function existingProgressiveReportAttempts(
       ORDER BY candidate.point_content_signature,candidate.sequence DESC
     )
     SELECT chosen.point_content_signature,chosen.result_attempt_id,
-      original.report,chosen.content_signature,to_jsonb(attempt) AS attempt
+      resolve_progressive_report(to_jsonb(original.*)) AS report,chosen.content_signature,to_jsonb(attempt) AS attempt
     FROM chosen
     JOIN progressive_worker_reports original ON original.sim_job_id=chosen.sim_job_id
       AND original.sequence=chosen.sequence AND original.content_signature=chosen.content_signature

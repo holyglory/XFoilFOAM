@@ -64,7 +64,7 @@ export async function recoverProgressivePublicationLosses(
         contentSignature: String(job.content_signature),
       });
       const [latest] =
-        await connection.execute(sql`SELECT report,sequence,content_signature FROM progressive_remote_reports
+        await connection.execute(sql`SELECT resolve_progressive_report(to_jsonb(progressive_remote_reports.*)) AS report,sequence,content_signature FROM progressive_remote_reports
         WHERE sim_job_id=${executionId}::uuid ORDER BY sequence DESC LIMIT 1`);
       const [stopped] = await connection.execute(
         sql`SELECT proof FROM progressive_cfd_execution_stops WHERE sim_job_id=${executionId}::uuid`,

@@ -186,7 +186,7 @@ export async function retainedSolverReportDownload(
       "Invalid exact retained-report reference",
     );
   const [stored] =
-    await db.execute(sql`SELECT report.report,report.content_signature,inventory.inventory_signature,inventory.source_count,
+    await db.execute(sql`SELECT resolve_progressive_report(to_jsonb(report.*)) AS report,report.content_signature,inventory.inventory_signature,inventory.source_count,
     dispatch.solver_id,dispatch.promise_id,dispatch.content_signature AS assignment_signature,dispatch.envelope,airfoil.slug
     FROM progressive_remote_reports report JOIN progressive_remote_report_inventories inventory USING(sim_job_id,sequence)
     JOIN progressive_remote_dispatches dispatch ON dispatch.sim_job_id=report.sim_job_id

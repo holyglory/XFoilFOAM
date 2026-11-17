@@ -51,7 +51,7 @@ export async function assertStoppedProgressiveStorageAdmission(
     JOIN sync_sweep_promises promise ON promise.id=${delivery.promiseId}::uuid
     JOIN progressive_remote_dispatches dispatch ON dispatch.sim_job_id=job.id AND dispatch.promise_id=promise.id
     JOIN progressive_cfd_execution_stops stop ON stop.sim_job_id=job.id AND stop.engine_job_id=job.engine_job_id
-    JOIN LATERAL (SELECT report,content_signature FROM progressive_remote_reports
+    JOIN LATERAL (SELECT resolve_progressive_report(to_jsonb(progressive_remote_reports.*)) AS report,content_signature FROM progressive_remote_reports
       WHERE sim_job_id=job.id ORDER BY sequence DESC LIMIT 1) latest ON true
     WHERE job.id=${delivery.engineJobId}::uuid
       AND (

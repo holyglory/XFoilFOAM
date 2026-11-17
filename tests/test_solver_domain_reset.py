@@ -30,7 +30,8 @@ def test_reset_never_truncates_configuration_or_uses_cascade():
 def test_reset_allowlists_are_disjoint_and_preserve_campaign_membership():
     assert not RESET["CONFIGURATION_TABLES"] & RESET["SOLVER_TABLES"]
     assert {"sim_campaign_airfoils", "sim_campaign_plan_revisions", "sim_campaign_conditions",
-            "registered_remote_solvers", "sync_api_settings", "campaign_progressive_execution_policies"} <= RESET["CONFIGURATION_TABLES"]
+            "registered_remote_solvers", "sync_api_settings", "campaign_progressive_execution_policies",
+            "progressive_report_storage_policy"} <= RESET["CONFIGURATION_TABLES"]
     assert {"results", "result_attempts", "force_history", "sim_jobs",
             "sync_sweep_promises", "polar_fit_sets", "solver_evidence_incomplete_quarantines",
             "solver_evidence_orphan_quarantines", "progressive_cfd_units", "progressive_cfd_attempts",
@@ -39,7 +40,7 @@ def test_reset_allowlists_are_disjoint_and_preserve_campaign_membership():
             "progressive_publication_recoveries", "progressive_publication_recovery_claims",
             "progressive_worker_archive_reclaims", "progressive_polar_geometry_verifications",
             "progressive_worker_evidence_delivery_claims", "progressive_generation_cohorts",
-            "progressive_generation_cohort_targets"} <= RESET["SOLVER_TABLES"]
+            "progressive_generation_cohort_targets", "progressive_report_result_payloads"} <= RESET["SOLVER_TABLES"]
 
 
 def test_archive_reclaim_queue_is_disposable_without_widening_configuration_deletion():

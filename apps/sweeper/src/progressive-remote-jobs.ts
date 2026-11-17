@@ -90,7 +90,7 @@ export async function assertProgressiveWorkerEvidenceJob(
       "Worker evidence request differs from its immutable assignment",
     );
   const [stored] =
-    await db.execute(sql`SELECT report, content_signature FROM progressive_worker_reports
+    await db.execute(sql`SELECT resolve_progressive_report(to_jsonb(progressive_worker_reports.*)) AS report, content_signature FROM progressive_worker_reports
     WHERE sim_job_id = ${input.simJobId}::uuid AND sequence = ${input.reportSequence!}`);
   if (!stored) throw new Error("Worker evidence report is missing");
   const validated = validateProgressiveRemoteReport(stored.report, envelope);

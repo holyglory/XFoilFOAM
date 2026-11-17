@@ -8005,6 +8005,54 @@ export const progressiveRemoteDispatches = pgTable(
   }),
 );
 
+// Disabled until every report consumer has been upgraded to lossless reads.
+export const progressiveReportStoragePolicy = pgTable(
+  "progressive_report_storage_policy",
+  {
+    id: integer("id").primaryKey(),
+    normalizationEnabled: boolean("normalization_enabled")
+      .notNull()
+      .default(false),
+  },
+  (table) => ({
+    singleton: check(
+      "progressive_report_storage_policy_id_check",
+      sql`${table.id} = 1`,
+    ),
+  }),
+);
+
+// Immutable transport payloads shared by report history on both sides of a sync.
+export const progressiveReportResultPayloads = pgTable(
+  "progressive_report_result_payloads",
+  {
+    contentHash: text("content_hash").primaryKey(),
+    result: jsonb("result").$type<Record<string, unknown>>().notNull(),
+    byteSize: bigint("byte_size", { mode: "number" }).notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .default(sql`clock_timestamp()`),
+  },
+  (table) => ({
+    hashCheck: check(
+      "progressive_report_result_payloads_content_hash_check",
+      sql`${table.contentHash} ~ '^[a-f0-9]{64}$'`,
+    ),
+    objectCheck: check(
+      "progressive_report_result_payloads_result_check",
+      sql`jsonb_typeof(${table.result}) = 'object'`,
+    ),
+    sizeCheck: check(
+      "progressive_report_result_payloads_byte_size_check",
+      sql`${table.byteSize} = octet_length(${table.result}::text)`,
+    ),
+    digestCheck: check(
+      "progressive_report_result_payloads_check",
+      sql`${table.contentHash} = encode(sha256(convert_to(${table.result}::text, 'UTF8')), 'hex')`,
+    ),
+  }),
+);
+
 export const progressiveRemoteReports = pgTable(
   "progressive_remote_reports",
   {
@@ -8015,6 +8063,9 @@ export const progressiveRemoteReports = pgTable(
       }),
     sequence: bigint("sequence", { mode: "number" }).notNull(),
     contentSignature: text("content_signature").notNull(),
+    resultPayloadHash: text("result_payload_hash").references(
+      () => progressiveReportResultPayloads.contentHash, { onDelete: "restrict" },
+    ),
     report: jsonb("report").$type<Record<string, unknown>>().notNull(),
     receivedAt: timestamp("received_at", { withTimezone: true })
       .notNull()
@@ -8154,6 +8205,9 @@ export const progressiveWorkerReports = pgTable(
       .references(() => simJobs.id, { onDelete: "cascade" }),
     sequence: bigint("sequence", { mode: "number" }).notNull(),
     contentSignature: text("content_signature").notNull(),
+    resultPayloadHash: text("result_payload_hash").references(
+      () => progressiveReportResultPayloads.contentHash, { onDelete: "restrict" },
+    ),
     report: jsonb("report").$type<Record<string, unknown>>().notNull(),
     assignmentSignature: text("assignment_signature").generatedAlwaysAs(
       sql`report->>'assignmentSignature'`,

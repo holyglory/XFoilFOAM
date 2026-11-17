@@ -69,7 +69,7 @@ async function claimProgressiveWorkerEvidence(
   return db.transaction(async (transaction) => {
     const connection = transaction as unknown as DB;
     const [candidate] = await connection.execute(sql`
-      SELECT job.id, report.sequence, report.content_signature, report.report
+      SELECT job.id, report.sequence, report.content_signature, resolve_progressive_report(to_jsonb(report.*)) AS report
       FROM sim_jobs job JOIN sync_api_settings settings ON settings.id = 1
       JOIN progressive_worker_reports report ON report.sim_job_id = job.id
       WHERE job.id = ${executionId}::uuid AND NOT settings.remote_solver_transfer_paused

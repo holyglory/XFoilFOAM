@@ -96,7 +96,7 @@ export function progressiveDeliverySelectionSql(
       SELECT * FROM active UNION ALL SELECT * FROM fallback`
     : sql`${candidate(false)}`;
   const selectedCandidate = sql`SELECT selected.sim_job_id, selected.sequence, selected.result_attempt_id, selected.point_content_signature,
-      report.content_signature AS report_signature, report.report, attempt.result_id, attempt.aoa_deg,
+      report.content_signature AS report_signature, resolve_progressive_report(to_jsonb(report.*)) AS report, attempt.result_id, attempt.aoa_deg,
       attempt.engine_case_slug, attempt.evidence_payload, selected.request_payload, selected.upstream_base_url,
       selected.remote_solver_auth_token, selected.remote_solver_registered_id, selected.instance_id, selected.instance_name,
       selected.promise_id

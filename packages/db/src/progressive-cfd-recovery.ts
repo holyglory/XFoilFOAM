@@ -217,7 +217,7 @@ export async function recoverTerminalProgressiveNoEvidenceGaps(
             SELECT 1
             FROM progressive_remote_dispatches dispatch
             JOIN LATERAL (
-              SELECT report.sequence, report.content_signature, report.report
+              SELECT report.sequence, report.content_signature, report.report, report.result_payload_hash
               FROM progressive_remote_reports report
               WHERE report.sim_job_id = dispatch.sim_job_id
               ORDER BY report.sequence DESC LIMIT 1
@@ -238,7 +238,7 @@ export async function recoverTerminalProgressiveNoEvidenceGaps(
               AND latest.report#>>'{result,state}' IN ('completed', 'failed', 'cancelled')
               AND EXISTS (
                 SELECT 1
-                FROM jsonb_array_elements(latest.report#>'{result,polars}') polar(value)
+                FROM jsonb_array_elements(public.resolve_progressive_report(latest.report, latest.result_payload_hash)#>'{result,polars}') polar(value)
                 CROSS JOIN LATERAL jsonb_array_elements(
                   coalesce(polar.value->'points', '[]'::jsonb)
                   || coalesce(polar.value->'attempts', '[]'::jsonb)

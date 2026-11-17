@@ -66,7 +66,7 @@ async function exerciseProgressiveArchiveCustody(
     reason: "final_report",
   });
   const [latest] =
-    await db.execute(sql`SELECT report FROM progressive_remote_reports
+    await db.execute(sql`SELECT public.resolve_progressive_report(to_jsonb(progressive_remote_reports.*)) AS report FROM progressive_remote_reports
     WHERE sim_job_id = ${source.engineJobId}::uuid ORDER BY sequence DESC LIMIT 1`);
   const terminal = structuredClone(latest.report) as ProgressiveRemoteReport;
   const [requested] =

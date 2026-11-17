@@ -36,6 +36,8 @@ it("checks HZ worker reports when detecting a lost remote execution", () => {
   expect(query).toContain("active_pids");
   expect(query).not.toContain("progressive_remote_reports");
   expect(query).not.toContain("received_at");
+  expect(query).not.toContain("resolve_progressive_report");
+  expect(query).not.toContain("result_payload");
 });
 
 it("rotates failed closed-settlement polls without weakening their proof or blocking healthy siblings", async () => {

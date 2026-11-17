@@ -93,7 +93,7 @@ async function applyProgressiveRemoteProgressInTransaction(
         "Remote progress conflicts with immutable hub execution ownership",
       );
     let [stored] =
-      await connection.execute(sql`SELECT report.sequence, report.content_signature, report.report,
+      await connection.execute(sql`SELECT report.sequence, report.content_signature, resolve_progressive_report(to_jsonb(report.*)) AS report,
         EXISTS (SELECT 1 FROM progressive_remote_progress_receipts receipt
           WHERE receipt.sim_job_id = report.sim_job_id AND receipt.sequence = report.sequence) AS progress_applied,
         EXISTS (SELECT 1 FROM progressive_remote_report_inventories inventory
@@ -106,7 +106,7 @@ async function applyProgressiveRemoteProgressInTransaction(
       ORDER BY report.sequence LIMIT 1`);
     if (!stored && job.engine_job_id === null && job.status === "pending") {
       [stored] =
-        await connection.execute(sql`SELECT report.sequence, report.content_signature, report.report,
+        await connection.execute(sql`SELECT report.sequence, report.content_signature, resolve_progressive_report(to_jsonb(report.*)) AS report,
         TRUE AS progress_applied, TRUE AS progress_indexed
       FROM progressive_remote_reports report
       WHERE report.sim_job_id = ${executionId}::uuid

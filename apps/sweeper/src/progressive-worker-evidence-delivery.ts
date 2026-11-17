@@ -90,7 +90,7 @@ export async function recordProgressiveWorkerEvidenceReceipt(
   await db.transaction(async (transaction) => {
     const connection = transaction as unknown as DB;
     const [source] = await connection.execute(sql`
-      SELECT association.sequence,report.report,report.content_signature,attempt.evidence_payload,job.request_payload,
+      SELECT association.sequence,resolve_progressive_report(to_jsonb(report.*)) AS report,report.content_signature,attempt.evidence_payload,job.request_payload,
         EXISTS (SELECT 1 FROM progressive_worker_reports stopped
           WHERE stopped.sim_job_id=job.id AND stopped.stopped_engine_job_id=job.id::text
             AND stopped.assignment_signature=report.assignment_signature AND stopped.acknowledged_at IS NOT NULL) AS stopped
@@ -122,7 +122,7 @@ export async function recordProgressiveWorkerEvidenceReceipt(
         contentSignature: report.assignmentSignature,
       });
       const point = progressiveReportedPointSources(report.result!).find((entry) => entry.contentSignature === expected.pointContentSignature);
-      const [anchor] = await connection.execute(sql`SELECT report,content_signature FROM progressive_worker_reports
+      const [anchor] = await connection.execute(sql`SELECT resolve_progressive_report(to_jsonb(progressive_worker_reports.*)) AS report,content_signature FROM progressive_worker_reports
         WHERE sim_job_id=${expected.executionId}::uuid AND sequence=${sequence} AND acknowledged_at IS NOT NULL`);
       if (!anchor) throw new Error("Hub diagnostic receipt has no acknowledged source report");
       await assertProgressiveWorkerEvidenceJob(connection, {
@@ -427,7 +427,7 @@ export async function progressiveWorkerEvidenceReference(
       "Progressive source requires a positive exact report sequence",
     );
   const [source] = await db.execute(sql`
-    SELECT association.sequence, association.point_content_signature, report.content_signature, report.report
+    SELECT association.sequence, association.point_content_signature, report.content_signature, resolve_progressive_report(to_jsonb(report.*)) AS report
     FROM progressive_worker_evidence_attempts association
     JOIN progressive_worker_reports report ON report.sim_job_id = association.sim_job_id AND report.sequence = association.sequence
     JOIN result_attempts attempt ON attempt.id = association.result_attempt_id

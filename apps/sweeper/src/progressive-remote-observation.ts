@@ -34,7 +34,7 @@ export async function observeProgressiveRemoteJob(
   const [owned] = await db.execute(sql`
     SELECT job.engine_job_id, job.request_payload,
       coalesce(intent.assignment_signature, job.request_payload#>>'{remoteProgressiveExecution,contentSignature}') AS assignment_signature,
-      (SELECT report.report FROM progressive_worker_reports report
+      (SELECT resolve_progressive_report(to_jsonb(report.*)) AS report FROM progressive_worker_reports report
         WHERE report.sim_job_id = job.id
           AND report.acknowledged_at IS NOT NULL
           AND report.assignment_signature = coalesce(intent.assignment_signature, job.request_payload#>>'{remoteProgressiveExecution,contentSignature}')

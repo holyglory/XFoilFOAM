@@ -52,7 +52,7 @@ export async function readProgressiveRemoteSourceClassifications(
     latest.report,latest.content_signature,latest.sequence,
     stopped.proof,stopped.proof_signature,stopped.engine_job_id AS stopped_engine_job_id
     FROM progressive_remote_dispatches dispatch JOIN sim_jobs job ON job.id=dispatch.sim_job_id
-    JOIN LATERAL (SELECT report,content_signature,sequence FROM progressive_remote_reports
+    JOIN LATERAL (SELECT resolve_progressive_report(to_jsonb(progressive_remote_reports.*)) AS report,content_signature,sequence FROM progressive_remote_reports
       WHERE sim_job_id=dispatch.sim_job_id ORDER BY sequence DESC LIMIT 1) latest ON true
     LEFT JOIN progressive_cfd_execution_stops stopped ON stopped.sim_job_id=dispatch.sim_job_id
     WHERE dispatch.sim_job_id=${executionId}::uuid`);
@@ -96,7 +96,7 @@ export async function readProgressiveRemoteSourceClassifications(
   if (sources.length > 2048) throw new Error("Remote diagnostic history exceeds its bounded source inventory");
   if (!sources.length) return [];
   const sequences = [...new Set(sources.map((source) => Number(source.sequence)))];
-  const reports = await db.execute(sql`SELECT report.sequence,report.report,report.content_signature,
+  const reports = await db.execute(sql`SELECT report.sequence,resolve_progressive_report(to_jsonb(report.*)) AS report,report.content_signature,
     inventory.inventory_signature,inventory.source_count
     FROM progressive_remote_reports report JOIN progressive_remote_report_inventories inventory USING (sim_job_id,sequence)
     WHERE report.sim_job_id=${executionId}::uuid AND report.sequence IN (
@@ -205,7 +205,7 @@ export async function readProgressiveRemoteRetention(
   const [latest] =
     await db.execute(sql`SELECT report.report, report.sequence, report.content_signature,
       dispatch.envelope FROM progressive_remote_dispatches dispatch
-    JOIN LATERAL (SELECT report, sequence, content_signature FROM progressive_remote_reports
+    JOIN LATERAL (SELECT resolve_progressive_report(to_jsonb(progressive_remote_reports.*)) AS report, sequence, content_signature FROM progressive_remote_reports
       WHERE sim_job_id = dispatch.sim_job_id ORDER BY sequence DESC LIMIT 1) report ON true
     WHERE dispatch.sim_job_id = ${executionId}::uuid`);
   if (!latest)

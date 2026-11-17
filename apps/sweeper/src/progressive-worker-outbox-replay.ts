@@ -223,7 +223,7 @@ export async function replayProgressiveWorkerOutbox(
     })[] = [];
     for (const point of input.points) {
       const [source] = await connection.execute(sql`
-        SELECT report.report, report.content_signature,
+        SELECT resolve_progressive_report(to_jsonb(report.*)) AS report, report.content_signature,
           staged.content_signature AS staged_signature,
           to_jsonb(attempt) AS attempt, to_jsonb(result) AS result
         FROM progressive_worker_evidence_attempts association

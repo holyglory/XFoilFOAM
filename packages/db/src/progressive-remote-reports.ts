@@ -89,7 +89,7 @@ export async function storeProgressiveRemoteReport(
     const replayedAfterLock = await replayExisting();
     if (replayedAfterLock) return replayedAfterLock;
     const [latest] = await connection.execute(sql`
-      SELECT sequence, report FROM progressive_remote_reports WHERE sim_job_id = ${input.executionId}::uuid
+      SELECT sequence, resolve_progressive_report(to_jsonb(progressive_remote_reports.*)) AS report FROM progressive_remote_reports WHERE sim_job_id = ${input.executionId}::uuid
       ORDER BY sequence DESC LIMIT 1
     `);
     try {

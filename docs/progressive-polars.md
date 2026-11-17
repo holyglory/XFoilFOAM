@@ -1436,6 +1436,76 @@ canonical deployment wrappers. Restore their deployment roles and verified capac
 prove real distributed work, incremental evidence ingestion and public curve updates,
 and do not call the implementation complete based on unit tests alone.
 
+### Lossless report storage rollout and recovery
+
+This procedure preserves report history, solver results, signatures, sequence,
+acknowledgements and source inventories. Migration `0198` adds shared immutable
+result payloads; its storage switch defaults to disabled, so applying the schema
+leaves existing writers inline. Upgrade and prove every full-result reader on
+both hosts before activation, including worker publication, hub ingestion,
+terminal settlement, evidence downloads and the separately owned
+restart-retention reader. Keep cheap status/identity predicates on raw envelopes.
+The [storage design and caller audit](progressive-report-payload-storage.md)
+lists the exact reader integration boundary.
+
+After retaining that reader/deployment proof, explicitly enable the typed switch:
+
+```bash
+corepack pnpm --filter @aerodb/db backfill:progressive-report-payloads --apply --enable-writes --readers-ready --stats-only
+corepack pnpm --filter @aerodb/db backfill:progressive-report-payloads --table=worker --verify-execution=EXECUTION_UUID --rows=16
+```
+
+Use `--table=remote` on the hub. `--verify-execution` checks bounded recent full
+reports against their immutable execution envelope and original transport
+signature; a zero-row sample is not verification. It never substitutes the stored
+compact result header for the full result.
+
+Review a dry run (the default), then convert bounded transactions:
+
+```bash
+corepack pnpm --filter @aerodb/db backfill:progressive-report-payloads --table=worker --rows=16
+corepack pnpm --filter @aerodb/db backfill:progressive-report-payloads --table=worker --apply --rows=16 --batches=100 --max-bytes=67108864
+```
+
+Each receipt contains exact SQL equality/digest proofs and `resumeAfter`. Resume
+using `--after-worker=UUID:SEQUENCE` or `--after-remote=UUID:SEQUENCE`. A locked
+row is skipped without advancing the cursor past that hole; retry the printed
+cursor after the lock clears. Rows and logical input bytes both bound each
+transaction. Oversized rows refuse the batch rather than disappear from it.
+
+The command prints bounded before/after logical payload/envelope bytes and real
+`pg_total_relation_size` measurements. For an explicitly scheduled full audit:
+
+```bash
+corepack pnpm --filter @aerodb/db backfill:progressive-report-payloads --stats-only --full-stats
+```
+
+Retain before/after outputs and batch proofs. `inline_result_reports=0` on both
+tables proves all eligible historical bodies were converted; null and absent
+root results intentionally remain inline. UPDATE can free pages for PostgreSQL
+reuse without returning disk space to the OS. Any guarded offline compaction is
+a separate parent operation. This procedure issues no report/payload DELETE and
+never automatically runs VACUUM FULL.
+
+Disabling normalization alone leaves existing normalized rows dependent on the
+new readers. To prepare an old-reader rollback, keep the new readers installed,
+disable normalization, and restore exact inline bodies in bounded transactions:
+
+```bash
+corepack pnpm --filter @aerodb/db backfill:progressive-report-payloads --apply --disable-writes
+corepack pnpm --filter @aerodb/db backfill:progressive-report-payloads --restore-inline --rows=16
+corepack pnpm --filter @aerodb/db backfill:progressive-report-payloads --restore-inline --apply --rows=16 --batches=100
+corepack pnpm --filter @aerodb/db backfill:progressive-report-payloads --prove-inline
+```
+
+Reverse batches use the same per-table cursors and logical-byte limits. The
+guard permits only exact reconstructed equality, clears only the reference, and
+preserves payload rows and every report identity/timestamp/acknowledgement.
+`--prove-inline` counts references in both canonical tables without loading
+payload bodies; it succeeds only with normalization disabled and both counts
+zero. Only `oldReaderRollbackSafe=true` permits old readers. Otherwise retain the
+new readers and continue restoration, allowing space for expanded inline bodies.
+
 ## Verification
 
 Mesh recovery version 3 keeps the source contour under rigid chord alignment and

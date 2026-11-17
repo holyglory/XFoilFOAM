@@ -94,7 +94,7 @@ export async function settleProgressiveWorkerFinalReport(
       FROM sim_jobs job
       JOIN sync_sweep_promises promise ON promise.id::text = job.request_payload->>'syncPromiseId'
       JOIN sync_api_settings settings ON settings.id = 1
-      JOIN LATERAL (SELECT report, content_signature FROM progressive_worker_reports
+      JOIN LATERAL (SELECT resolve_progressive_report(to_jsonb(progressive_worker_reports.*)) AS report, content_signature FROM progressive_worker_reports
         WHERE sim_job_id = job.id ORDER BY sequence DESC LIMIT 1) latest ON true
       WHERE job.id = ${executionId}::uuid AND job.request_payload->>'remoteSolver' = 'true'
         AND promise.registered_solver_id = settings.remote_solver_registered_id
@@ -182,7 +182,7 @@ export async function enqueueProgressiveWorkerReport(
         "Worker report request differs from its assigned execution",
       );
     const [latest] = await connection.execute(sql`
-      SELECT sequence, content_signature, report FROM progressive_worker_reports
+      SELECT sequence, content_signature, resolve_progressive_report(to_jsonb(progressive_worker_reports.*)) AS report FROM progressive_worker_reports
       WHERE sim_job_id = ${input.executionId}::uuid ORDER BY sequence DESC LIMIT 1
     `);
     const content = normalizeProgressiveRemoteReportJson({
@@ -268,7 +268,7 @@ export async function readPendingProgressiveWorkerReport(
   input: { executionId: string; solverId: string },
 ) {
   const [row] = await db.execute(sql`
-    SELECT report.sequence, report.content_signature, report.report FROM progressive_worker_reports report
+    SELECT report.sequence, report.content_signature, resolve_progressive_report(to_jsonb(report.*)) AS report FROM progressive_worker_reports report
     WHERE report.sim_job_id = ${input.executionId}::uuid AND report.report->>'solverId' = ${input.solverId}
       AND report.acknowledged_at IS NULL ORDER BY report.sequence LIMIT 1
   `);
@@ -332,7 +332,7 @@ export async function quarantineProgressiveWorkerReportConflict(
       sql`SELECT id FROM sim_jobs WHERE id = ${input.executionId}::uuid FOR UPDATE`,
     );
     const [row] = await connection.execute(sql`
-      SELECT report, content_signature
+      SELECT resolve_progressive_report(to_jsonb(progressive_worker_reports.*)) AS report, content_signature
       FROM progressive_worker_reports
       WHERE sim_job_id = ${input.executionId}::uuid
         AND sequence = ${input.sequence}
@@ -403,7 +403,7 @@ export async function quarantineProgressiveWorkerReportConflicts(
     await connection.execute(sql`
       INSERT INTO progressive_worker_report_conflicts
         (sim_job_id, sequence, content_signature, report, reason)
-      SELECT report.sim_job_id, report.sequence, report.content_signature, report.report, ${input.reason}
+      SELECT report.sim_job_id, report.sequence, report.content_signature, resolve_progressive_report(to_jsonb(report.*)) AS report, ${input.reason}
       FROM progressive_worker_reports report
       WHERE report.sim_job_id = ${input.executionId}::uuid
         AND report.report->>'solverId' = ${input.solverId}

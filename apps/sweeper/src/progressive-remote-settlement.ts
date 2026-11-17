@@ -444,12 +444,23 @@ async function recoveryPromotions(
   retained: RetainedExecution,
 ): Promise<ProgressiveRansPromotion[] | null> {
   const reports =
-    await db.execute(sql`SELECT DISTINCT ON (report#>'{result,polars,0,rans_precalc_promotion}')
-      report, content_signature, sequence FROM progressive_remote_reports
-    WHERE sim_job_id = ${envelope.scope.executionId}::uuid
-      AND report#>'{result,polars,0,rans_precalc_promotion}' IS NOT NULL
-      AND report#>'{result,polars,0,rans_precalc_promotion}' <> 'null'::jsonb
-    ORDER BY report#>'{result,polars,0,rans_precalc_promotion}', sequence LIMIT 2`);
+    await db.execute(sql`WITH payload_owners AS MATERIALIZED (
+      SELECT DISTINCT ON (coalesce(stored.result_payload_hash, stored.content_signature))
+        stored.sim_job_id, stored.sequence, stored.content_signature, stored.result_payload_hash
+      FROM progressive_remote_reports stored
+      WHERE stored.sim_job_id = ${envelope.scope.executionId}::uuid
+      ORDER BY coalesce(stored.result_payload_hash, stored.content_signature), stored.sequence
+    ), promotions AS MATERIALIZED (
+      SELECT owner.sim_job_id, owner.sequence,
+        public.resolve_progressive_report(stored.report, stored.result_payload_hash)#>'{result,polars,0,rans_precalc_promotion}' AS promotion
+      FROM payload_owners owner JOIN progressive_remote_reports stored
+        ON stored.sim_job_id=owner.sim_job_id AND stored.sequence=owner.sequence
+    ), selected AS MATERIALIZED (
+      SELECT DISTINCT ON (promotion) sim_job_id,sequence
+      FROM promotions WHERE promotion IS NOT NULL AND promotion <> 'null'::jsonb
+      ORDER BY promotion,sequence LIMIT 2
+    ) SELECT public.resolve_progressive_report(to_jsonb(stored.*)) AS report, stored.content_signature, stored.sequence
+      FROM selected JOIN progressive_remote_reports stored USING (sim_job_id,sequence)`);
   if (reports.length > 1)
     throw new Error("Remote execution has competing RANS promotion scopes");
   if (!reports.length) return [];
@@ -527,7 +538,7 @@ async function ingestTerminalRemoteFailureAttempts(
       dispatch.envelope
     FROM progressive_remote_dispatches dispatch
     JOIN LATERAL (
-      SELECT report, sequence, content_signature
+      SELECT resolve_progressive_report(to_jsonb(progressive_remote_reports.*)) AS report, sequence, content_signature
       FROM progressive_remote_reports
       WHERE sim_job_id = dispatch.sim_job_id
       ORDER BY sequence DESC LIMIT 1
