@@ -551,6 +551,11 @@ it("backfills immutable catalog publication metadata without changing model resp
   } catch (error) { if (error !== rollback) throw error; }
 });
 
+// GH 44078458610 reached the model INSERT at 34.735s and was still constructing
+// it at the old 120s deadline. Fixture construction gets its own bounded
+// allowance; measured reads retain their 3s assertions plus SQL/HTTP hang caps.
+const CATALOG_SCALE_SETUP_MS = 600_000;
+
 async function verifyPublicCatalog(fullScale: boolean) {
   const journeyStarted = performance.now();
   let previousPhase = journeyStarted;
@@ -567,6 +572,7 @@ async function verifyPublicCatalog(fullScale: boolean) {
     await db.transaction(async (transaction) => {
         const connection = transaction as unknown as DB;
         isolated.connection = connection;
+        if (fullScale) await connection.execute(sql`SET LOCAL statement_timeout='600s'`);
         const prefix = `public-metrics-${randomUUID()}`;
         const fixture = await createMinimalSolverFixture(
           connection,
@@ -1169,6 +1175,10 @@ async function verifyPublicCatalog(fullScale: boolean) {
           sql`ANALYZE neuralfoil_predictions, polar_analysis_targets, progressive_generation_targets, simulation_preset_revisions, airfoils, progressive_polar_models, progressive_polar_geometry_verifications, progressive_polar_fit_work`,
         );
         phase("analyze:done");
+        const setupElapsed = performance.now() - journeyStarted;
+        phase("setup:complete", { setupMs: setupElapsed, budgetMs: CATALOG_SCALE_SETUP_MS });
+        expect(setupElapsed).toBeLessThan(CATALOG_SCALE_SETUP_MS);
+        await connection.execute(sql`SET LOCAL statement_timeout='3s'`);
         phase("query:start");
         const started = performance.now();
         const scaled = await publicProgressiveCatalog(
@@ -1209,6 +1219,7 @@ async function verifyPublicCatalog(fullScale: boolean) {
           const available = await app.inject({
             method: "GET",
             url: "/api/polar-conditions",
+            signal: AbortSignal.timeout(3000),
           });
           const conditionsElapsed = performance.now() - conditionsStarted;
           phase("conditions-api:done", { readMs: conditionsElapsed });
@@ -1219,6 +1230,7 @@ async function verifyPublicCatalog(fullScale: boolean) {
           const ranked = await app.inject({
             method: "GET",
             url: `/api/airfoils?q=${scalePrefix}&sort=ldmax&dir=desc&includeSubcategories=true&includePoints=false&limit=2`,
+            signal: AbortSignal.timeout(3000),
           });
           const rankedElapsed = performance.now() - rankedStarted;
           phase("ranked-api:done", { readMs: rankedElapsed });
@@ -1240,6 +1252,7 @@ async function verifyPublicCatalog(fullScale: boolean) {
             const response = await app.inject({
               method: "GET",
               url: `/api/airfoils?q=${scalePrefix}&sort=ldmax&dir=desc&metricConditionKey=${condition.key}&includePoints=false&limit=1`,
+              signal: AbortSignal.timeout(3000),
             });
             phase("selected-api:done", { speed });
             expect(response.statusCode).toBe(200);
@@ -1252,6 +1265,7 @@ async function verifyPublicCatalog(fullScale: boolean) {
             const detail = await app.inject({
               method: "GET",
               url: `/api/airfoils/${item.slug}?view=curves`,
+              signal: AbortSignal.timeout(3000),
             });
             phase("detail-api:done", { speed });
             expect(detail.statusCode).toBe(200);
@@ -1305,5 +1319,5 @@ it("uses available prediction or composite curves for catalog metrics and exact 
 it.skipIf(process.env.RUN_CATALOG_SCALE !== "1")(
   "keeps full campaign catalog reads within their time budget",
   () => verifyPublicCatalog(true),
-  120000,
+  CATALOG_SCALE_SETUP_MS + 120_000,
 );
