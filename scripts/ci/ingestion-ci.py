@@ -40,7 +40,7 @@ APPROVED_ACTIONS = {
 def validate_harness_files() -> None:
     workflow = Path(__file__).resolve().parents[2] / ".github/workflows/ingestion-ci.yml"
     text = workflow.read_text()
-    actions = re.findall(r"(?m)^\s+- uses: (\S+)", text)
+    actions = re.findall(r"(?m)^\s+(?:-\s+)?uses: (\S+)", text)
     if not actions or set(actions) != APPROVED_ACTIONS:
         raise ValueError("Workflow action pins differ from the approved CI template")
     if f"  FUNCTIONAL_REF: {REVISION}\n" not in text:
