@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
+import Fastify from "fastify";
 import { afterAll, expect, it, vi } from "vitest";
 import { eq, sql } from "drizzle-orm";
 import { progressiveCurveMetrics } from "@aerodb/core";
@@ -69,6 +70,7 @@ vi.mock("../src/db", () => ({
 }));
 import { listAirfoils } from "../src/services/catalog";
 import { assembleDetail } from "../src/services/detail";
+import { registerRoutes } from "../src/routes";
 
 const { db, sql: client } = createClient({ max: 1 });
 afterAll(() => client.end({ timeout: 5 }));
@@ -527,15 +529,40 @@ it("keeps stored catalog summaries equivalent to curve metrics and rejects malfo
   }
 });
 
+it("backfills immutable catalog publication metadata without changing model responses", async () => {
+  const rollback = new Error("catalog metadata migration fixture");
+  try {
+    await db.transaction(async (transaction) => {
+      await transaction.execute(sql`CREATE TEMP TABLE progressive_polar_models(id text PRIMARY KEY,response jsonb) ON COMMIT DROP`);
+      const cases = [
+        { id: "missing", response: {}, expected: "composite" },
+        ...[null, "neuralfoil", "composite", ""].map((method, index) => ({
+          id: String(index), response: { estimate: { publication: { primary_method: method } } }, expected: method ?? "composite",
+        })),
+      ];
+      for (const item of cases) await transaction.execute(sql`INSERT INTO progressive_polar_models VALUES(${item.id},${JSON.stringify(item.response)}::jsonb)`);
+      await transaction.execute(sql.raw(readFileSync(new URL("../../../packages/db/migrations/0199_progressive_catalog_primary_method.sql", import.meta.url), "utf8")));
+      const rows = await transaction.execute(sql`SELECT id,response,catalog_primary_method FROM progressive_polar_models`);
+      for (const item of cases) expect(rows.find((row) => row.id === item.id)).toEqual({ id: item.id, response: item.response, catalog_primary_method: item.expected });
+      const [column] = await transaction.execute(sql`SELECT attgenerated FROM pg_attribute WHERE attrelid='pg_temp.progressive_polar_models'::regclass AND attname='catalog_primary_method'`);
+      expect(column.attgenerated).toBe("s");
+      throw rollback;
+    });
+  } catch (error) { if (error !== rollback) throw error; }
+});
+
 async function verifyPublicCatalog(fullScale: boolean) {
   const rollback = new Error("isolated public catalog proof");
   try {
-    await expect(
-      db.transaction(async (transaction) => {
+    await db.transaction(async (transaction) => {
         const connection = transaction as unknown as DB;
         isolated.connection = connection;
         const prefix = `public-metrics-${randomUUID()}`;
-        const fixture = await createMinimalSolverFixture(connection, prefix, "air");
+        const fixture = await createMinimalSolverFixture(
+          connection,
+          prefix,
+          "air",
+        );
         await connection.execute(
           sql`UPDATE simulation_preset_revisions SET snapshot=jsonb_set(snapshot,'{flowState,mediumSlug}','"air"') WHERE id=${fixture.revisionId}`,
         );
@@ -842,15 +869,18 @@ async function verifyPublicCatalog(fullScale: boolean) {
           )
         ).metrics.get(profiles[0])!;
         expect(baselineMetrics.source).toBe("prediction");
+        expect(baseline.curves[0].metrics).not.toBeNull();
         expect(baselineMetrics.ldmax).toBe(
-          baseline.curves[0].metrics.liftToDragMaximum,
+          baseline.curves[0].metrics!.liftToDragMaximum,
         );
         await connection.execute(sql`UPDATE progressive_polar_fit_work
           SET state='pending',model_id=NULL,policy_refresh_model_id=NULL,policy_refresh_policy_id=NULL
           WHERE prediction_id=${second.predictionId}`);
-        expect(await connection.execute(sql`SELECT prediction_id FROM progressive_polar_fit_work
+        expect(
+          await connection.execute(sql`SELECT prediction_id FROM progressive_polar_fit_work
           WHERE prediction_id IN (${first.predictionId},${second.predictionId})
-            AND state='ready' AND model_id IS NOT NULL`)).toEqual([{ prediction_id: first.predictionId }]);
+            AND state='ready' AND model_id IS NOT NULL`),
+        ).toEqual([{ prediction_id: first.predictionId }]);
         expect(
           await invalidateProgressiveFitPolicy(
             connection,
@@ -975,7 +1005,8 @@ async function verifyPublicCatalog(fullScale: boolean) {
         const scalePrefix = `${prefix}-scale-`;
         await connection.execute(sql`
           INSERT INTO airfoils(slug,name,category_id,points)
-          SELECT ${scalePrefix} || profile_index, ${scalePrefix} || profile_index, ${category.id}, '[]'
+          SELECT ${scalePrefix} || profile_index, ${scalePrefix} || profile_index, ${category.id},
+            '[{"x":1,"y":0},{"x":0,"y":0.1},{"x":1,"y":0}]'::jsonb
           FROM generate_series(1,1600) profile_index
         `);
         await connection.execute(sql`
@@ -998,20 +1029,68 @@ async function verifyPublicCatalog(fullScale: boolean) {
           INSERT INTO neuralfoil_predictions(id,epoch_id,target_id,payload)
           SELECT target.id, ${epoch.id}, target.id, jsonb_build_object(
             'kind','prediction','method','neuralfoil','cfd_evidence',false,
-            'alpha', curve.alpha, 'coefficients', curve.coefficients)
+            'alpha', curve.alpha, 'coefficients', curve.coefficients,
+            'model',jsonb_build_object('neuralfoil','isolated-scale'),
+            'geometry_fit',jsonb_build_object('rms_chord',0,'maximum_chord',0))
           FROM polar_analysis_targets target JOIN airfoils profile ON profile.id = target.airfoil_id
           CROSS JOIN (SELECT jsonb_agg(sample_index * 0.25 ORDER BY sample_index) AS alpha,
             jsonb_agg(jsonb_build_array(0.5 + sample_index * 0.01, 0.01, -0.02) ORDER BY sample_index) AS coefficients
             FROM generate_series(0,120) sample_index) curve
           WHERE profile.slug LIKE ${scalePrefix + "%"}
         `);
+        // Production has a fitted response for most targets. Predictions alone
+        // never exercise the publication selector or its large toasted payload.
+        await connection.execute(sql`
+          INSERT INTO progressive_polar_models(id,prediction_id,source_signature,request,response)
+          SELECT encode(sha256(convert_to('catalog-scale-model:' || prediction.id,'UTF8')),'hex'),
+            prediction.id, prediction.id, '{}',
+            jsonb_build_object('estimate', jsonb_build_object(
+              'alpha', prediction.payload->'alpha',
+              'curves', jsonb_build_object('composite', jsonb_build_object(
+                'coefficients', curve.coefficients, 'lower', curve.coefficients, 'upper', curve.coefficients)),
+              'publication', jsonb_build_object('primary_method',
+                CASE WHEN (target.physical#>>'{flow,speedMps}')::integer % 60 = 0 THEN 'neuralfoil' ELSE 'composite' END),
+              'calibration_status', 'unvalidated', 'version', 'isolated-test',
+              'signature', prediction.id, 'contributors', '[]'::jsonb, 'excluded', '[]'::jsonb),
+              'diagnostic_history', repeat(padding.value,16))
+          FROM neuralfoil_predictions prediction
+          JOIN polar_analysis_targets target ON target.id=prediction.target_id
+          JOIN airfoils profile ON profile.id=target.airfoil_id
+          CROSS JOIN (SELECT jsonb_agg(jsonb_build_array(0.25 + sample_index * 0.005, 0.01, -0.02) ORDER BY sample_index) AS coefficients
+            FROM generate_series(0,120) sample_index) curve
+          CROSS JOIN (SELECT string_agg(md5(sample_index::text),'') AS value FROM generate_series(1,256) sample_index) padding
+          WHERE profile.slug LIKE ${scalePrefix + "%"}
+        `);
+        await connection.execute(sql`
+          INSERT INTO progressive_polar_geometry_verifications(model_id,source_geometry_compatible)
+          SELECT model.id,true FROM progressive_polar_models model
+          JOIN neuralfoil_predictions prediction ON prediction.id=model.prediction_id
+          JOIN polar_analysis_targets target ON target.id=prediction.target_id
+          JOIN airfoils profile ON profile.id=target.airfoil_id
+          WHERE profile.slug LIKE ${scalePrefix + "%"}
+        `);
+        await connection.execute(sql`
+          INSERT INTO progressive_polar_fit_work(prediction_id,state,model_id)
+          SELECT model.prediction_id,'ready',model.id FROM progressive_polar_models model
+          JOIN neuralfoil_predictions prediction ON prediction.id=model.prediction_id
+          JOIN polar_analysis_targets target ON target.id=prediction.target_id
+          JOIN airfoils profile ON profile.id=target.airfoil_id
+          WHERE profile.slug LIKE ${scalePrefix + "%"}
+        `);
+        const [modelSize] = await connection.execute(sql`
+          SELECT min(pg_column_size(model.response)) AS stored_bytes
+          FROM progressive_polar_models model JOIN neuralfoil_predictions prediction ON prediction.id=model.prediction_id
+          JOIN polar_analysis_targets target ON target.id=prediction.target_id
+          JOIN airfoils profile ON profile.id=target.airfoil_id WHERE profile.slug LIKE ${scalePrefix + "%"}
+        `);
+        expect(Number(modelSize.stored_bytes)).toBeGreaterThan(2048);
         const scaleProfiles = (
           await connection.execute(
             sql`SELECT id FROM airfoils WHERE slug LIKE ${scalePrefix + "%"}`,
           )
         ).map((row) => String(row.id));
         await connection.execute(
-          sql`ANALYZE neuralfoil_predictions, polar_analysis_targets, progressive_generation_targets, simulation_preset_revisions, airfoils`,
+          sql`ANALYZE neuralfoil_predictions, polar_analysis_targets, progressive_generation_targets, simulation_preset_revisions, airfoils, progressive_polar_models, progressive_polar_geometry_verifications, progressive_polar_fit_work`,
         );
         const started = performance.now();
         const scaled = await publicProgressiveCatalog(
@@ -1023,7 +1102,10 @@ async function verifyPublicCatalog(fullScale: boolean) {
         expect(scaled.conditions).toHaveLength(20);
         expect(
           [...scaled.metrics.values()].every(
-            (metric) => metric.polarCount === 20 && metric.ldmax === 170,
+            (metric) =>
+              metric.polarCount === 20 &&
+              metric.ldmax === 170 &&
+              metric.source === "prediction",
           ),
         ).toBe(true);
         console.info(
@@ -1032,14 +1114,97 @@ async function verifyPublicCatalog(fullScale: boolean) {
               profiles: 1600,
               curves: 32000,
               samplesPerCurve: 121,
+              fittedModels: 32000,
+              diagnosticBytesPerModel: 131072,
+              minimumStoredResponseBytes: Number(modelSize.stored_bytes),
               elapsedMs: elapsed,
             },
           }),
         );
         expect(elapsed).toBeLessThan(3000);
+        const app = Fastify({ logger: false });
+        await registerRoutes(app);
+        try {
+          const conditionsStarted = performance.now();
+          const available = await app.inject({
+            method: "GET",
+            url: "/api/polar-conditions",
+          });
+          const conditionsElapsed = performance.now() - conditionsStarted;
+          expect(available.statusCode).toBe(200);
+          expect(available.json().items).toHaveLength(20);
+          const rankedStarted = performance.now();
+          const ranked = await app.inject({
+            method: "GET",
+            url: `/api/airfoils?q=${scalePrefix}&sort=ldmax&dir=desc&includeSubcategories=true&includePoints=false&limit=2`,
+          });
+          const rankedElapsed = performance.now() - rankedStarted;
+          expect(ranked.statusCode).toBe(200);
+          expect(ranked.json().items).toHaveLength(2);
+          for (const item of ranked.json().items) {
+            expect(item).toMatchObject({
+              ldmax: 170,
+              metricsSource: "prediction",
+              polarCount: 20,
+              points: [],
+            });
+          }
+          for (const speed of [30, 60]) {
+            const condition = scaled.conditions.find(
+              (condition) => condition.speedMps === speed,
+            )!;
+            const response = await app.inject({
+              method: "GET",
+              url: `/api/airfoils?q=${scalePrefix}&sort=ldmax&dir=desc&metricConditionKey=${condition.key}&includePoints=false&limit=1`,
+            });
+            expect(response.statusCode).toBe(200);
+            const item = response.json().items[0];
+            expect(item.metricsSource).toBe(
+              speed === 30 ? "estimate" : "prediction",
+            );
+            expect(item.ldmax).toBeCloseTo(speed === 30 ? 85 : 170, 10);
+            const detail = await app.inject({
+              method: "GET",
+              url: `/api/airfoils/${item.slug}?view=curves`,
+            });
+            expect(detail.statusCode).toBe(200);
+            const polar = detail
+              .json()
+              .progressivePolars.find(
+                (polar: { conditionKey: string }) =>
+                  polar.conditionKey === condition.key,
+              );
+            const curve = polar.curves.find(
+              (curve: { method: string }) =>
+                curve.method === polar.primaryMethod,
+            );
+            expect(item).toMatchObject({
+              metricTargetId: polar.targetId,
+              // Scale predictions use their target ID as the prediction ID.
+              metricModelId: polar.primaryMethod === "neuralfoil" ? polar.targetId : polar.modelId,
+              ldmax: curve.metrics.liftToDragMaximum,
+              clmax: curve.metrics.liftMaximum,
+              cdmin: curve.metrics.dragMinimum,
+            });
+          }
+          console.info(
+            JSON.stringify({
+              catalogEndpoints: {
+                conditionsMs: conditionsElapsed,
+                rankedMs: rankedElapsed,
+              },
+            }),
+          );
+          expect(conditionsElapsed).toBeLessThan(3000);
+          expect(rankedElapsed).toBeLessThan(3000);
+        } finally {
+          await app.close();
+        }
         throw rollback;
-      }),
-    ).rejects.toBe(rollback);
+      });
+    throw new Error("Catalog fixture did not roll back");
+  } catch (error) {
+    if (error !== rollback) throw error;
   } finally {
     isolated.connection = null;
   }
