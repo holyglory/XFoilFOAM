@@ -1,9 +1,9 @@
-name: Pinned publication selector CI
+name: Pinned storage recovery CI
 
 on:
   push:
     branches:
-      - codex/publication-index-ci-20261112
+      - codex/storage-recovery-ci-20261117
 
 # Confirmed security-assumptions.md boundaries: no upstream/admin/OAuth secrets,
 # no new trust principal or public service, and no solver evidence publication.
@@ -11,42 +11,13 @@ permissions:
   contents: read
 
 env:
-  FUNCTIONAL_REF: cc011846306788e3d2d620efd12dd76d34a96c4c
+  FUNCTIONAL_REF: b4b5f0c0d1285796c9b211ea35dde144314a7819
   CI: 'true'
   COREPACK_ENABLE_DOWNLOAD_PROMPT: '0'
 
 jobs:
-  types:
-    name: Types on pinned source
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-        with:
-          path: harness
-          persist-credentials: false
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-        with:
-          ref: ${{ env.FUNCTIONAL_REF }}
-          path: source
-          persist-credentials: false
-      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
-        with:
-          node-version: '22'
-          package-manager-cache: false
-      - name: Run both declared type checks
-        run: python3 harness/scripts/ci/ingestion-ci.py types --source source --output "$RUNNER_TEMP/ingestion-ci-types"
-      - name: Retain identity, results and complete command logs
-        if: always()
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
-        with:
-          name: ingestion-ci-types-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/ingestion-ci-types
-          if-no-files-found: error
-          retention-days: 14
-
-  database:
-    name: PostgreSQL protocols and serialized campaign fixtures
+  report-payloads:
+    name: Report payload protocols and normalized integration
     runs-on: ubuntu-24.04
     timeout-minutes: 75
     services:
@@ -82,22 +53,67 @@ jobs:
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: '3.12'
-      - name: Install the locked Python fixture dependencies
-        run: python -m pip install --require-hashes -r source/docker/requirements.lock
-      - name: Migrate, seed and run the relevant publication graph checks
-        run: python3 harness/scripts/ci/ingestion-ci.py database --source source --output "$RUNNER_TEMP/ingestion-ci-database"
-      - name: Retain JUnit, source identity and complete logs
+      - name: Run every declared report-payload check and restore-inline proof
+        run: python3 harness/scripts/ci/ingestion-ci.py reports --source source --output "$RUNNER_TEMP/storage-ci-reports"
+      - name: Retain JUnit, identity, results and complete command logs
         if: always()
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
-          name: ingestion-ci-database-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/ingestion-ci-database
+          name: storage-ci-reports-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/storage-ci-reports
+          if-no-files-found: error
+          retention-days: 14
+
+  catalog:
+    name: Isolated 32000-curve catalog and API metrics
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    # A separate job/service prevents report normalization and its singleton
+    # fixtures from sharing the catalog scale database or runner resources.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: aerodb
+          POSTGRES_PASSWORD: aerodb-ci-disposable
+          POSTGRES_DB: aerodb
+        ports:
+          - '127.0.0.1:5432:5432'
+        options: >-
+          --health-cmd "pg_isready -U aerodb -d aerodb"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      DATABASE_URL: postgresql://aerodb:aerodb-ci-disposable@127.0.0.1:5432/aerodb
+    steps:
+      - uses: actions/checkout@d23441a48e516b6b34aea4fa41551a30e30af803 # v6
+        with:
+          path: harness
+          persist-credentials: false
+      - uses: actions/checkout@d23441a48e516b6b34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ env.FUNCTIONAL_REF }}
+          path: source
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '22'
+          package-manager-cache: false
+      - name: Run every declared public-metrics check with unchanged scale budget
+        run: python3 harness/scripts/ci/ingestion-ci.py catalog --source source --output "$RUNNER_TEMP/storage-ci-catalog"
+      - name: Retain JUnit, identity, results and complete command logs
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: storage-ci-catalog-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/storage-ci-catalog
           if-no-files-found: error
           retention-days: 14
 
   required-result:
     name: Aggregate every required CI result
-    needs: [types, database]
+    needs: [report-payloads, catalog]
     if: always()
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -116,13 +132,14 @@ jobs:
                     'github_run_id': os.environ['GITHUB_RUN_ID'], 'jobs': results}
           Path('required-result.json').write_text(json.dumps(report, indent=2) + '\n')
           print(json.dumps(report))
-          raise SystemExit(0 if all(row['result'] == 'success' for row in results.values()) else 1)
+          passed = set(results) == {'report-payloads', 'catalog'} and all(row['result'] == 'success' for row in results.values())
+          raise SystemExit(0 if passed else 1)
           PY
       - name: Retain aggregate result even when a job failed or was cancelled
         if: always()
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
-          name: ingestion-ci-required-result-${{ github.run_attempt }}
+          name: storage-ci-required-result-${{ github.run_attempt }}
           path: required-result.json
           if-no-files-found: error
           retention-days: 14
