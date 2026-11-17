@@ -28,7 +28,7 @@ import {
   sweepDefinitions,
 } from "@aerodb/db";
 import { ensureSimulationPresetRevision } from "@aerodb/db/simulation-setup";
-import { eq, inArray } from "drizzle-orm";
+import { eq, inArray, sql as query } from "drizzle-orm";
 import { afterAll, describe, expect, it } from "vitest";
 
 import { db, sql } from "../src/db";
@@ -714,22 +714,38 @@ describe("catalog solved-metric evidence", () => {
             contentSignature: fixture.envelope.contentSignature,
             continuation: { kind: "stop", reason: expect.any(String) },
           });
+          const [storedDispatch] = await db.execute(query`
+            SELECT date_trunc('milliseconds',created_at) AS created_at
+            FROM progressive_remote_dispatches WHERE sim_job_id=${fixture.executionId}::uuid
+          `);
+          const createdAt = new Date(storedDispatch.created_at as string | Date).toISOString();
+          const cycleBefore = Date.now();
           const assignments = await app.inject({
             method: "GET",
             url: assignmentsUrl,
             headers: reportHeaders,
           });
+          const cycleAfter = Date.now();
           expect(assignments.statusCode).toBe(200);
-          expect(assignments.json()).toEqual({
+          const assignmentPage = assignments.json();
+          const cycleStartedAt = assignmentPage.cycleStartedAt;
+          expect(new Date(cycleStartedAt).toISOString()).toBe(cycleStartedAt);
+          expect(Date.parse(cycleStartedAt)).toBeGreaterThanOrEqual(cycleBefore);
+          expect(Date.parse(cycleStartedAt)).toBeLessThanOrEqual(cycleAfter);
+          expect(Date.parse(createdAt)).toBeLessThanOrEqual(Date.parse(cycleStartedAt));
+          expect(assignmentPage).toEqual({
             items: [
               {
                 executionId: fixture.executionId,
                 promiseId: body.promise.id,
                 contentSignature: fixture.envelope.contentSignature,
                 cpuSlots: 1,
+                createdAt,
               },
             ],
             nextCursor: null,
+            nextCreatedAt: null,
+            cycleStartedAt,
           });
           expect(
             (
@@ -758,15 +774,10 @@ describe("catalog solved-metric evidence", () => {
               })
             ).statusCode,
           ).toBe(404);
-          expect(
-            (
-              await app.inject({
-                method: "GET",
-                url: `${assignmentsUrl}?after=${fixture.executionId}`,
-                headers: reportHeaders,
-              })
-            ).json(),
-          ).toEqual({ items: [], nextCursor: null });
+          const after = new URLSearchParams({ after: fixture.executionId, afterCreatedAt: createdAt, beforeCreatedAt: cycleStartedAt });
+          const exhaustedPage = await app.inject({ method: "GET", url: `${assignmentsUrl}?${after}`, headers: reportHeaders });
+          expect(exhaustedPage.statusCode).toBe(200);
+          expect(exhaustedPage.json()).toEqual({ items: [], nextCursor: null, nextCreatedAt: null, cycleStartedAt });
           const assignment = await app.inject({
             method: "GET",
             url: assignmentUrl,
@@ -901,7 +912,7 @@ describe("catalog solved-metric evidence", () => {
             },
           });
           expect(changed.statusCode).toBe(409);
-          const persisted = await db.execute(sql`SELECT public.resolve_progressive_report(to_jsonb(stored.*)) AS report
+          const persisted = await db.execute(query`SELECT public.resolve_progressive_report(to_jsonb(stored.*)) AS report
             FROM progressive_remote_reports stored WHERE sim_job_id=${fixture.executionId}::uuid`);
           expect(persisted).toHaveLength(1);
           expect(persisted[0].report).toEqual(fixture.report);
@@ -933,11 +944,14 @@ describe("catalog solved-metric evidence", () => {
                 headers: reportHeaders,
               })
             ).json().items,
-          ).toHaveLength(1);
+          ).toHaveLength(0);
           await db
             .update(syncSweepPromises)
             .set({ expiresAt: new Date(Date.now() + 3600000) })
             .where(eq(syncSweepPromises.id, body.promise.id));
+          const renewedAssignments = await app.inject({ method: "GET", url: assignmentsUrl, headers: reportHeaders });
+          expect(renewedAssignments.statusCode).toBe(200);
+          expect(renewedAssignments.json().items).toEqual(assignmentPage.items);
           const [unchanged] = await db
             .select()
             .from(simJobs)
