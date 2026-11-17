@@ -29,6 +29,7 @@ vi.mock("node:timers/promises", () => ({
 afterEach(() => {
   vi.restoreAllMocks();
   vi.useRealTimers();
+  retention.resetRetentionMemory();
 });
 
 it("serializes an emergency pass behind existing cleanup without dropping its options", async () => {
@@ -43,7 +44,16 @@ it("serializes an emergency pass behind existing cleanup without dropping its op
         }),
     )
     .mockResolvedValue([]);
-  const db = { execute } as unknown as DB;
+  const dialect = new PgDialect();
+  const db = {
+    transaction: async (run: (connection: DB) => unknown) =>
+      run({
+        execute: (query: SQL<unknown>) =>
+          dialect.sqlToQuery(query).sql.startsWith("SET LOCAL")
+            ? Promise.resolve([])
+            : execute(query),
+      } as unknown as DB),
+  } as unknown as DB;
   const engine = {} as EngineClient;
   const first = retention.retentionTick(db, engine, { now: new Date(0) });
   const emergency = retention.retentionTick(db, engine, {
@@ -54,10 +64,9 @@ it("serializes an emergency pass behind existing cleanup without dropping its op
   expect(execute).toHaveBeenCalledOnce();
   release([]);
   await Promise.all([first, emergency]);
-  expect(execute).toHaveBeenCalledTimes(2);
-  const dialect = new PgDialect();
-  const original = dialect.sqlToQuery(execute.mock.calls[0][0]);
-  const requested = dialect.sqlToQuery(execute.mock.calls[1][0]);
+  expect(execute).toHaveBeenCalledTimes(4);
+  const original = dialect.sqlToQuery(execute.mock.calls[1][0]);
+  const requested = dialect.sqlToQuery(execute.mock.calls[3][0]);
   expect(original.sql).toBe(requested.sql);
   expect(requested.params).not.toEqual(original.params);
 });
@@ -125,38 +134,41 @@ it("does not overlap slow cleanup and drains it when the service stops", async (
   expect(cleanup).toHaveBeenCalledOnce();
 });
 
-it("uses the existing cleanup batch and stops when pressure reclamation is exhausted", async () => {
-  vi.useFakeTimers();
-  vi.spyOn(retention, "retentionTick").mockResolvedValue();
-  vi.spyOn(retention, "retentionConfigFromEnv").mockReturnValue({
-    ...retention.retentionConfigFromEnv(),
-    stripMaxPerTick: 2,
-  });
-  const reclaim = vi
-    .spyOn(progressiveRetention, "reclaimProgressiveRestartState")
-    .mockResolvedValueOnce({ stripped: 1, bytesFreed: 8192 })
-    .mockResolvedValue({ stripped: 0, bytesFreed: 0 });
-  const db = {
-    execute: vi.fn().mockResolvedValue([{ disk_admission_blocked: true }]),
-  } as unknown as DB;
-  const owner = new AbortController();
-  const running = runRetentionService(db, {} as EngineClient, owner.signal);
-  try {
-    await vi.advanceTimersByTimeAsync(0);
-    expect(reclaim).toHaveBeenCalledTimes(2);
-    await vi.advanceTimersByTimeAsync(5000);
-    expect(reclaim).toHaveBeenCalledTimes(3);
-  } finally {
-    owner.abort();
-    await running;
-  }
-});
+it.each([0, 8192])(
+  "continues after completed work freeing %i bytes and stops when exhausted",
+  async (bytesFreed) => {
+    vi.useFakeTimers();
+    vi.spyOn(retention, "retentionTick").mockResolvedValue();
+    vi.spyOn(retention, "retentionConfigFromEnv").mockReturnValue({
+      ...retention.retentionConfigFromEnv(),
+      stripMaxPerTick: 2,
+    });
+    const reclaim = vi
+      .spyOn(progressiveRetention, "reclaimProgressiveRestartState")
+      .mockResolvedValueOnce({ stripped: 1, bytesFreed })
+      .mockResolvedValue({ stripped: 0, bytesFreed: 0 });
+    const db = {
+      execute: vi.fn().mockResolvedValue([{ disk_admission_blocked: true }]),
+    } as unknown as DB;
+    const owner = new AbortController();
+    const running = runRetentionService(db, {} as EngineClient, owner.signal);
+    try {
+      await vi.advanceTimersByTimeAsync(0);
+      expect(reclaim).toHaveBeenCalledTimes(2);
+      await vi.advanceTimersByTimeAsync(5000);
+      expect(reclaim).toHaveBeenCalledTimes(3);
+    } finally {
+      owner.abort();
+      await running;
+    }
+  },
+);
 
 it("bounds the terminal cleanup query before evaluating evidence guards", async () => {
   const dialect = new PgDialect();
-  const statements: string[] = [];
+  const statements: ReturnType<PgDialect["sqlToQuery"]>[] = [];
   const execute = vi.fn(async (query: Parameters<DB["execute"]>[0]) => {
-    statements.push(dialect.sqlToQuery(query as SQL<unknown>).sql);
+    statements.push(dialect.sqlToQuery(query as SQL<unknown>));
     return [];
   });
   const db = {
@@ -170,8 +182,11 @@ it("bounds the terminal cleanup query before evaluating evidence guards", async 
     now: new Date(0),
   });
 
-  expect(statements[0]).toContain("SET LOCAL statement_timeout");
-  expect(statements[1]).toContain("candidate_jobs AS MATERIALIZED");
-  expect(statements[1]).toContain("LIMIT 32");
-  expect(statements[1]).toContain("JOIN candidate_jobs selected");
+  expect(statements[0].sql).toContain("SET LOCAL statement_timeout");
+  const selection = statements.find((statement) =>
+    statement.sql.includes("candidate_jobs AS MATERIALIZED"),
+  )!;
+  const limit = selection.sql.match(/LIMIT \$(\d+)/)!;
+  expect(selection.params[Number(limit[1]) - 1]).toBe(8);
+  expect(selection.sql).toContain("JOIN candidate_jobs selected");
 });

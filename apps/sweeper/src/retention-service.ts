@@ -31,7 +31,7 @@ export async function runRetentionService(
                 ...reclaimed,
               }),
             );
-          if (!reclaimed.bytesFreed) break;
+          if (!reclaimed.bytesFreed && !reclaimed.stripped) break;
         }
       }
       await retentionTick(db, engine, {

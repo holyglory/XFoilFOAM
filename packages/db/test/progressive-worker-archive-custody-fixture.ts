@@ -16,6 +16,10 @@ import {
   progressiveWorkerEvidenceReference,
   recordProgressiveWorkerEvidenceReceipt,
 } from "../../../apps/sweeper/src/progressive-worker-evidence-delivery";
+import {
+  progressiveArchiveManifestBytes,
+  progressiveArchiveManifestSha256,
+} from "./progressive-archive-data";
 
 export async function verifyProgressiveWorkerArchiveCustody(
   db: DB,
@@ -158,8 +162,8 @@ export async function verifyProgressiveWorkerArchiveCustody(
       storedByteSize: 500,
       tarSha256: "d".repeat(64),
       tarByteSize: 1500,
-      manifestSha256: "a".repeat(64),
-      manifestByteSize: 100,
+      manifestSha256: progressiveArchiveManifestSha256,
+      manifestByteSize: progressiveArchiveManifestBytes.byteLength,
       zstdLevel: 3,
       bundledFileCount: 1,
     },
