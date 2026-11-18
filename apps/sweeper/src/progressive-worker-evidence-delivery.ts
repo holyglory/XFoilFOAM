@@ -24,8 +24,12 @@ import { progressiveReportedDiagnosticFailureKind } from "@aerodb/db/progressive
 const REMOTE_EVIDENCE_DELIVERY_TIMEOUT_MS = Number(
   process.env.REMOTE_EVIDENCE_DELIVERY_TIMEOUT_MS ?? 120_000,
 );
-const STALE_REMOTE_OWNER_ERROR =
-  "remote solver does not own this exact promise payload";
+const STALE_REMOTE_OWNER_ERRORS = new Set([
+  "remote solver does not own this exact promise payload",
+  // Progressive diagnostic reports use the report endpoint, whose ownership
+  // rejection has the shorter legacy wording.
+  "remote solver does not own this execution",
+]);
 
 const DELIVERY_CLAIM_TIMEOUT_MS = 30_000;
 
@@ -382,13 +386,15 @@ export async function deliverNextProgressiveWorkerEvidence(
     const transientResponseFailure = /aborted|timeout|timed out/i.test(
       responseFailureText,
     );
+    const staleRemoteOwner =
+      responseStatus === 403 &&
+      STALE_REMOTE_OWNER_ERRORS.has(String(rejected?.error ?? ""));
     const conflict =
       (responseStatus === 409 &&
         !retryStoppedStorage &&
         !transientTransportFailure &&
         !transientResponseFailure) ||
-      (responseStatus === 403 &&
-        rejected?.error === STALE_REMOTE_OWNER_ERROR) ||
+      staleRemoteOwner ||
       importConflictIds.length > 0;
     await db.execute(sql`
       INSERT INTO progressive_worker_delivery_failures

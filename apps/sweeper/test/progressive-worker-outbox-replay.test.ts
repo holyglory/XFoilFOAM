@@ -966,20 +966,23 @@ it("does not fall back to a cancelled scope when an exact failed source does not
   );
 });
 
-it("quarantines an exact stale remote-owner rejection instead of retrying forever", async () => {
+it.each([
+  "remote solver does not own this exact promise payload",
+  "remote solver does not own this execution",
+])("quarantines stale remote-owner rejection %s instead of retrying forever", async (errorMessage) => {
   await withFixture(async ({ connection, input }) => {
     input.points = input.points.slice(0, 1);
     input.expectedCount = 1;
     await replayProgressiveWorkerOutbox(connection, input, { apply: true });
     const fetcher = vi.fn<typeof fetch>(async () =>
       Response.json(
-        { error: "remote solver does not own this exact promise payload" },
+        { error: errorMessage },
         { status: 403 },
       ),
     );
     await expect(
       deliverNextProgressiveWorkerEvidence(connection, fetcher),
-    ).rejects.toThrow("remote solver does not own this exact promise payload");
+    ).rejects.toThrow(errorMessage);
     const [failure] = await connection.execute(sql`
       SELECT state, attempt_count, retry_after
       FROM progressive_worker_delivery_failures
