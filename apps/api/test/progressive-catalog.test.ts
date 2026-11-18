@@ -1136,6 +1136,10 @@ async function verifyPublicCatalog(fullScale: boolean) {
           JOIN polar_analysis_targets target ON target.id=prediction.target_id
           JOIN airfoils profile ON profile.id=target.airfoil_id
           WHERE profile.slug LIKE ${scalePrefix + "%"}
+          ON CONFLICT (prediction_id) DO UPDATE
+          SET state = EXCLUDED.state,
+              model_id = EXCLUDED.model_id,
+              updated_at = clock_timestamp()
         `);
         phase("fit-work:done");
         phase("storage-sample:start");
