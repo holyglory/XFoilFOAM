@@ -20,6 +20,7 @@ import { fileURLToPath } from "node:url";
 import { afterAll, afterEach, beforeEach, expect, it, vi } from "vitest";
 import { progressiveDeliverySelectionSql } from "../src/progressive-delivery-selection";
 import { progressiveStoppedStorageEligible } from "../src/progressive-stopped-storage";
+import { reconcileProgressiveRemoteWorker } from "../src/progressive-remote-reconciliation";
 import { deliverNextProgressiveWorkerEvidence } from "../src/progressive-worker-evidence-delivery";
 import {
   replayProgressiveWorkerOutbox,
@@ -90,7 +91,8 @@ async function withFixture(
       id uuid PRIMARY KEY, registered_solver_id uuid, source_base_url text, airfoil_id uuid,
       simulation_preset_revision_id uuid, status text, "expiresAt" timestamptz, response_payload jsonb) ON COMMIT DROP`);
     await connection.execute(sql`CREATE TEMP TABLE progressive_worker_submission_intents (
-      sim_job_id uuid PRIMARY KEY, assignment_signature text, "authorization" jsonb) ON COMMIT DROP`);
+      sim_job_id uuid PRIMARY KEY, assignment_signature text, "authorization" jsonb,
+      created_at timestamptz DEFAULT clock_timestamp()) ON COMMIT DROP`);
     await connection.execute(sql`CREATE TEMP TABLE progressive_worker_reports (
       sim_job_id uuid, sequence bigint, content_signature text, report jsonb, acknowledged_at timestamptz,
       created_at timestamptz DEFAULT clock_timestamp(),
@@ -1013,6 +1015,32 @@ it("releases an expired terminal worker scope only after every evidence point is
     expect(job.ingestedAt).not.toBeNull();
     expect(job.ingest_lease_token).toBeNull();
     expect(await settleProgressiveWorkerExpiredFinalReport(connection, input.executionId)).toBe(false);
+  });
+});
+
+it("reconciliation reaches terminal worker mirrors after final projection", async () => {
+  await withFixture(async ({ connection, input }) => {
+    await connection.execute(sql`UPDATE sync_sweep_promises
+      SET status='expired', "expiresAt"=clock_timestamp()-interval '1 second'`);
+    await connection.execute(sql`UPDATE sim_jobs SET status='failed', engine_state='failed',
+      "ingestedAt"=NULL, "finishedAt"=clock_timestamp() WHERE id=${input.executionId}::uuid`);
+    const engine = {
+      getJob: vi.fn(),
+      getResult: vi.fn(),
+      cancelJob: vi.fn(),
+      getExecutionStopProof: vi.fn(),
+    };
+    const result = await reconcileProgressiveRemoteWorker(
+      connection,
+      engine as never,
+      {jobIds:[input.executionId]},
+    );
+    expect(result).toMatchObject({inspected:1, stopped:1, errors:[]});
+    const [job] = await connection.execute(sql`SELECT status,"ingestedAt"
+      FROM sim_jobs WHERE id=${input.executionId}::uuid`);
+    expect(job.status).toBe("cancelled");
+    expect(job.ingestedAt).not.toBeNull();
+    for (const operation of Object.values(engine)) expect(operation).not.toHaveBeenCalled();
   });
 });
 

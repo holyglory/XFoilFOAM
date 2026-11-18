@@ -96,6 +96,7 @@ export async function reconcileProgressiveRemoteWorker(
     WITH active_jobs AS MATERIALIZED (
       SELECT id, request_payload, "updatedAt" FROM sim_jobs
       WHERE status IN ('pending', 'submitted', 'running', 'ingesting')
+        OR (status IN ('done', 'failed', 'cancelled') AND "ingestedAt" IS NULL)
         OR engine_state IN ('cancelling', 'cancel_pending')
     )
     SELECT job.id FROM active_jobs job
