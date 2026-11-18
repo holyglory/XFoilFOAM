@@ -4,6 +4,7 @@ import {
   progressiveRemotePointProjection,
   resolveProgressiveReportedPoint,
   sealProgressiveRemoteExecution,
+  settleProgressiveWorkerExpiredFinalReport,
   type DB,
   type ProgressiveRemoteReport,
 } from "@aerodb/db";
@@ -996,6 +997,22 @@ it.each([
       await deliverNextProgressiveWorkerEvidence(connection, fetcher),
     ).toBe(false);
     expect(fetcher).toHaveBeenCalledOnce();
+  });
+});
+
+it("releases an expired terminal worker scope only after every evidence point is accounted for", async () => {
+  await withFixture(async ({ connection, input }) => {
+    await connection.execute(sql`UPDATE sync_sweep_promises
+      SET status='expired', "expiresAt"=clock_timestamp()-interval '1 second'`);
+    await connection.execute(sql`UPDATE sim_jobs SET status='ingesting', engine_state='failed'
+      WHERE id=${input.executionId}::uuid`);
+    expect(await settleProgressiveWorkerExpiredFinalReport(connection, input.executionId)).toBe(true);
+    const [job] = await connection.execute(sql`SELECT status,"ingestedAt",ingest_lease_token
+      FROM sim_jobs WHERE id=${input.executionId}::uuid`);
+    expect(job.status).toBe("cancelled");
+    expect(job.ingestedAt).not.toBeNull();
+    expect(job.ingest_lease_token).toBeNull();
+    expect(await settleProgressiveWorkerExpiredFinalReport(connection, input.executionId)).toBe(false);
   });
 });
 

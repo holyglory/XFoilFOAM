@@ -3,6 +3,7 @@ import { canonicalRemoteHubBaseUrl } from "@aerodb/core";
 import {
   PROGRESSIVE_REMOTE_START_AUTHORIZATION_MS,
   settleProgressiveWorkerFinalReport,
+  settleProgressiveWorkerExpiredFinalReport,
   type DB,
 } from "@aerodb/db";
 import {
@@ -125,6 +126,7 @@ export async function reconcileProgressiveRemoteWorker(
       if (await settleProgressiveWorkerFinalReport(db, executionId)) {
         receipt.inspected += 1;
         receipt.stopped += 1;
+        await settleProgressiveWorkerExpiredFinalReport(db, executionId);
       }
     } catch (error) {
       receipt.errors.push({

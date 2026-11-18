@@ -138,6 +138,90 @@ export async function settleProgressiveWorkerFinalReport(
   });
 }
 
+/**
+ * Release a worker execution whose scheduling promise closed after a terminal
+ * report was durably received. Every produced evidence point must already be
+ * represented by a hub receipt or a terminal delivery conflict; unresolved
+ * points keep the execution ingesting so evidence cannot be silently lost.
+ */
+export async function settleProgressiveWorkerExpiredFinalReport(
+  db: DB,
+  executionId: string,
+): Promise<boolean> {
+  return db.transaction(async (transaction) => {
+    const connection = transaction as unknown as DB;
+    const [candidate] = await connection.execute(sql`
+      SELECT job.id, latest.report
+      FROM sim_jobs job
+      JOIN sync_sweep_promises promise
+        ON promise.id::text = job.request_payload->>'syncPromiseId'
+      JOIN sync_api_settings settings ON settings.id = 1
+      JOIN LATERAL (
+        SELECT resolve_progressive_report(to_jsonb(progressive_worker_reports.*)) AS report
+        FROM progressive_worker_reports
+        WHERE progressive_worker_reports.sim_job_id = job.id
+          AND progressive_worker_reports.acknowledged_at IS NOT NULL
+          AND progressive_worker_reports.stopped_engine_job_id = job.id::text
+        ORDER BY progressive_worker_reports.sequence DESC
+        LIMIT 1
+      ) latest ON true
+      WHERE job.id = ${executionId}::uuid
+        AND job.request_payload->>'remoteSolver' = 'true'
+        AND promise.registered_solver_id = settings.remote_solver_registered_id
+        AND promise.source_base_url = job.request_payload->>'upstreamBaseUrl'
+        AND promise.status IN ('expired', 'cancelled')
+        AND job.status IN ('ingesting', 'done', 'failed', 'cancelled')
+        AND job."ingestedAt" IS NULL
+        AND (job.ingest_lease_token IS NULL OR job.ingest_lease_expires_at <= clock_timestamp())
+        AND latest.report#>>'{stopProof,execution_stopped}' = 'true'
+        AND latest.report#>>'{status,state}' IN ('completed', 'failed', 'cancelled')
+        AND NOT EXISTS (
+          SELECT 1 FROM progressive_worker_reports pending
+          WHERE pending.sim_job_id = job.id AND pending.acknowledged_at IS NULL
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM progressive_worker_delivery_failures retry
+          WHERE retry.sim_job_id = job.id AND retry.state = 'retry'
+        )
+        AND NOT EXISTS (
+          SELECT 1
+          FROM progressive_worker_evidence_attempts source
+          WHERE source.sim_job_id = job.id
+            AND NOT EXISTS (
+              SELECT 1 FROM progressive_worker_hub_receipts delivered
+              WHERE delivered.sim_job_id = source.sim_job_id
+                AND delivered.point_content_signature = source.point_content_signature
+            )
+            AND NOT EXISTS (
+              SELECT 1 FROM progressive_worker_delivery_failures conflict
+              WHERE conflict.sim_job_id = source.sim_job_id
+                AND conflict.point_content_signature = source.point_content_signature
+                AND conflict.state = 'conflict'
+            )
+        )
+      FOR UPDATE OF job
+    `);
+    if (!candidate) return false;
+    const [released] = await connection.execute(sql`
+      UPDATE sim_jobs SET
+        status = 'cancelled',
+        "ingestedAt" = coalesce("ingestedAt", clock_timestamp()),
+        "finishedAt" = coalesce("finishedAt", clock_timestamp()),
+        "updatedAt" = clock_timestamp(),
+        error = coalesce(error, 'Remote scope closed after terminal evidence; unresolved evidence conflicts retained'),
+        ingest_lease_token = NULL,
+        ingest_lease_previous_status = NULL,
+        ingest_lease_claimed_at = NULL,
+        ingest_lease_expires_at = NULL
+      WHERE id = ${executionId}::uuid
+        AND "ingestedAt" IS NULL
+        AND (ingest_lease_token IS NULL OR ingest_lease_expires_at <= clock_timestamp())
+      RETURNING id
+    `);
+    return Boolean(released);
+  });
+}
+
 export async function enqueueProgressiveWorkerReport(
   db: DB,
   input: {
