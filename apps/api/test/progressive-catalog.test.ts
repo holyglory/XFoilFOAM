@@ -1228,7 +1228,11 @@ async function verifyPublicCatalog(fullScale: boolean) {
           const conditionsElapsed = performance.now() - conditionsStarted;
           phase("conditions-api:done", { readMs: conditionsElapsed });
           expect(available.statusCode).toBe(200);
-          expect(available.json().items).toHaveLength(20);
+          const availableConditions = available.json().items as Array<{ key: string }>;
+          const availableKeys = new Set(availableConditions.map((condition) => condition.key));
+          expect(availableConditions.length).toBeGreaterThanOrEqual(scaled.conditions.length);
+          for (const condition of scaled.conditions)
+            expect(availableKeys).toContain(condition.key);
           phase("ranked-api:start");
           const rankedStarted = performance.now();
           const ranked = await app.inject({
