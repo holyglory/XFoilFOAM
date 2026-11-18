@@ -23,7 +23,7 @@ import traceback
 import xml.etree.ElementTree as ET
 
 
-REVISION = "9dd61bd3f9ac00e1e9217adc6bc09249493916b8"
+REVISION = "a9942f5b35808416fd83a5fa72c92387488b6eec"
 MODES = {
     "reports": "progressive-report-payloads",
     "catalog": "public-metrics",
