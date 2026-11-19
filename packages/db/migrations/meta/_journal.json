@@ -1415,6 +1415,48 @@
       "when": 1795110000000,
       "tag": "0201_progressive_report_compaction_idx",
       "breakpoints": true
+    },
+    {
+      "idx": 202,
+      "version": "7",
+      "when": 1795113000000,
+      "tag": "0202_report_archive_custody",
+      "breakpoints": true
+    },
+    {
+      "idx": 203,
+      "version": "7",
+      "when": 1795113000001,
+      "tag": "0203_redundant_report_conflicts",
+      "breakpoints": true
+    },
+    {
+      "idx": 204,
+      "version": "7",
+      "when": 1795113000002,
+      "tag": "0204_solver_history_storage",
+      "breakpoints": true
+    },
+    {
+      "idx": 205,
+      "version": "7",
+      "when": 1795113000003,
+      "tag": "0205_legacy_report_archive_members",
+      "breakpoints": true
+    },
+    {
+      "idx": 206,
+      "version": "7",
+      "when": 1795113000004,
+      "tag": "0206_result_history_storage",
+      "breakpoints": true
+    },
+    {
+      "idx": 207,
+      "version": "7",
+      "when": 1795115576343,
+      "tag": "0207_attempt_evidence_archives",
+      "breakpoints": true
     }
   ]
 }

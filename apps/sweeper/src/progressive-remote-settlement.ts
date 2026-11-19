@@ -1,3 +1,4 @@
+import { resolveStoredProgressiveReport } from "@aerodb/db/progressive-report-reader";
 import { randomUUID } from "node:crypto";
 import { sql } from "drizzle-orm";
 import { effectiveProgressiveStageSql } from "@aerodb/db/progressive-execution-policy";
@@ -449,6 +450,9 @@ async function recoveryPromotions(
         stored.sim_job_id, stored.sequence, stored.content_signature, stored.result_payload_hash
       FROM progressive_remote_reports stored
       WHERE stored.sim_job_id = ${envelope.scope.executionId}::uuid
+        AND to_jsonb(stored.*)->>'archived_at' IS NULL
+        AND to_jsonb(stored.*)->>'archive_bundle_id' IS NULL
+        AND stored.report->>'archivedReport' IS DISTINCT FROM 'true'
       ORDER BY coalesce(stored.result_payload_hash, stored.content_signature), stored.sequence
     ), promotions AS MATERIALIZED (
       SELECT owner.sim_job_id, owner.sequence,
@@ -461,14 +465,44 @@ async function recoveryPromotions(
       ORDER BY promotion,sequence LIMIT 2
     ) SELECT public.resolve_progressive_report(to_jsonb(stored.*)) AS report, stored.content_signature, stored.sequence
       FROM selected JOIN progressive_remote_reports stored USING (sim_job_id,sequence)`);
-  if (reports.length > 1)
+  // Compacted result headers cannot answer whether a promotion was present.
+  // Scan archived identities in bounded pages, reading one exact member at a
+  // time. Never infer an absent promotion from SQL's missing polars projection.
+  let after = 0;
+  const promotions = new Map<string, { report: unknown; content_signature: unknown }>();
+  for (const stored of reports) {
+    const report = await resolveStoredProgressiveReport(db, "remote", stored, envelope.scope.executionId);
+    promotions.set(canonicalAnalysisJson(report.result!.polars[0].rans_precalc_promotion), { report, content_signature: stored.content_signature });
+  }
+  while (true) {
+    const archived = await db.execute(sql`
+      SELECT sequence,content_signature,report FROM progressive_remote_reports
+      WHERE sim_job_id=${envelope.scope.executionId}::uuid AND sequence>${after}
+        AND (to_jsonb(progressive_remote_reports.*)->>'archived_at' IS NOT NULL
+          OR to_jsonb(progressive_remote_reports.*)->>'archive_bundle_id' IS NOT NULL
+          OR report->>'archivedReport'='true')
+      ORDER BY sequence LIMIT 32
+    `);
+    for (const stored of archived) {
+      const report = await resolveStoredProgressiveReport(db, "remote", stored, envelope.scope.executionId);
+      const checked = validateProgressiveRemoteReport(report, envelope);
+      if (checked.contentSignature !== stored.content_signature)
+        throw new Error("Remote RANS promotion has changed archived report bytes");
+      const promotion = checked.report.result?.polars[0]?.rans_precalc_promotion;
+      if (promotion != null)
+        promotions.set(canonicalAnalysisJson(promotion), { report: checked.report, content_signature: stored.content_signature });
+      after = Number(stored.sequence);
+    }
+    if (promotions.size > 1)
+      throw new Error("Remote execution has competing RANS promotion scopes");
+    if (archived.length < 32) break;
+  }
+  if (promotions.size > 1)
     throw new Error("Remote execution has competing RANS promotion scopes");
-  if (!reports.length) return [];
-  const validated = validateProgressiveRemoteReport(
-    reports[0].report,
-    envelope,
-  );
-  if (validated.contentSignature !== reports[0].content_signature)
+  const selected = [...promotions.values()][0];
+  if (!selected) return [];
+  const validated = validateProgressiveRemoteReport(selected.report, envelope);
+  if (validated.contentSignature !== selected.content_signature)
     throw new Error("Remote RANS promotion has changed report bytes");
   const polar = validated.report.result!.polars[0];
   const promotion = polar.rans_precalc_promotion!;
@@ -499,7 +533,7 @@ async function recoveryPromotions(
   // trigger is retained. An accepted sibling cannot stand in for that source.
   if (!receipt) {
     const diagnostic = await readProgressiveDiagnosticRecoveryTrigger(db, envelope.scope.executionId, {
-      sequence: Number(reports[0].sequence), reportContentSignature: String(reports[0].content_signature),
+      sequence: validated.report.sequence, reportContentSignature: validated.contentSignature,
       pointContentSignature: source.contentSignature,
     });
     if (!diagnostic) return null;
@@ -548,7 +582,7 @@ async function ingestTerminalRemoteFailureAttempts(
   if (!latest) return false;
   const envelope = latest.envelope as ProgressiveRemoteExecutionEnvelope;
   const validated = validateProgressiveRemoteReport(
-    latest.report,
+    await resolveStoredProgressiveReport(db, "remote", latest, executionId),
     envelope,
   );
   if (

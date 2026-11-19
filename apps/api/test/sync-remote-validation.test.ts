@@ -12,6 +12,10 @@ import { join } from "node:path";
 import { and, eq, inArray, sql as query } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { sourceAirModel } from "../../../packages/core/test/fixtures/source-air-model";
+import { SolverHistoryGcsStore } from "@aerodb/core/solver-history-gcs";
+import { decodeSolverHistory, encodeSolverHistory, type SolverHistoryArchiveIdentity } from "@aerodb/core/solver-history-storage";
+import { loadSolverHistorySource } from "@aerodb/db/solver-history-storage";
+import { archiveSolverHistory } from "../../sweeper/src/solver-history-archive";
 
 const statfsControl = vi.hoisted(() => ({
   availableBytes: null as bigint | null,
@@ -2585,6 +2589,42 @@ describe("remote solver sync validation regressions", () => {
     expect(storedAttempts).toHaveLength(1);
   });
 
+  it("replays an offloaded force history without changing evidence or creating an immutable-value conflict", async () => {
+    const aoaDeg = 703.121;
+    const point = makePoint(aoaDeg, { forceHistory: {
+      t: [0, 1, 2, 3], cl: [0.4, 0.5, 0.4, 0.5], cd: [0.02, 0.03, 0.02, 0.03], cm: null,
+      clMean: 0.45, clRms: 0.05, cdMean: 0.025, cdRms: 0.005, strouhal: null, sheddingFreqHz: null, sampleCount: 4,
+    } });
+    const payload = polarPayload([point]);
+    const first = await postPolars(payload);
+    expect(first.statusCode, first.body).toBe(200);
+    expect(first.json()).toMatchObject({ imported: 1, attempts: 1, conflictIds: [] });
+    const canonical = await resultAt(aoaDeg);
+    const [history] = await db.select().from(forceHistory).where(eq(forceHistory.resultId, canonical!.id)).limit(1);
+    const source = await loadSolverHistorySource(db, "force_history", history.id);
+    const encoded = encodeSolverHistory("sync-history-fixture", source);
+    const identity: SolverHistoryArchiveIdentity = {
+      ...source, ...encoded, sourceInstance: "sync-history-fixture", bucket: "fixture-evidence",
+      objectKey: `solver-histories/v1/${history.id}/${encoded.storedSha256}.json.gz`, generation: "1", crc32c: "AAAAAA==",
+    };
+    const store = { put: async () => identity, read: async (pointer: SolverHistoryArchiveIdentity) => decodeSolverHistory(encoded.stored, pointer) };
+    const read = vi.spyOn(SolverHistoryGcsStore.prototype, "read").mockImplementation(store.read);
+    try {
+      expect((await archiveSolverHistory(db, store, { bucket: identity.bucket, sourceInstance: identity.sourceInstance,
+        sourceKind: "force_history", sourceId: history.id })).offloaded).toBe(true);
+      const replay = await postPolars(payload);
+      expect(replay.statusCode, replay.body).toBe(200);
+      expect(replay.json()).toMatchObject({ imported: 0, attempts: 0, conflictIds: [] });
+      expect(read).toHaveBeenCalled();
+      const [stored] = await db.select().from(forceHistory).where(eq(forceHistory.id, history.id));
+      expect([stored.t, stored.cl, stored.cd, stored.cm]).toEqual([null, null, null, null]);
+      expect(await resultAt(aoaDeg)).toMatchObject({ id: canonical!.id, cl: canonical!.cl, cd: canonical!.cd });
+    } finally {
+      await db.update(forceHistory).set({ t: history.t, cl: history.cl, cd: history.cd, cm: history.cm }).where(eq(forceHistory.id, history.id));
+      read.mockRestore();
+    }
+  });
+
   it("conflicts an exact-attempt replay that rebinds the sole manifest to another storage identity", async () => {
     const aoaDeg = 703.151;
     const manifest = artifactItem("polar-replay-manifest-storage");
@@ -2841,7 +2881,6 @@ describe("remote solver sync validation regressions", () => {
         status: "done",
         source: "solved",
         regime: "urans",
-        fidelity: "urans_precalc",
         cl: 0.64,
         cd: 0.041,
         cm: -0.08,
@@ -3043,7 +3082,6 @@ describe("remote solver sync validation regressions", () => {
         status: "done",
         source: "solved",
         regime: "rans",
-        fidelity: "rans",
         cl: 0.64,
         cd: 0.041,
         cm: -0.08,

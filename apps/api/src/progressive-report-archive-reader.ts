@@ -1,53 +1,43 @@
 import { Storage } from "@google-cloud/storage";
-import { createHash } from "node:crypto";
-import { createGunzip } from "node:zlib";
-import { createInterface } from "node:readline";
+import {
+  assertProgressiveReportArchiveIdentity,
+  readProgressiveReportArchiveText,
+  type ProgressiveReportArchiveReadIdentity,
+} from "@aerodb/db/progressive-report-archive";
 import { env } from "./env";
-
-const SHA256 = /^[a-f0-9]{64}$/;
-const GENERATION = /^[1-9][0-9]{0,19}$/;
-const CRC32C = /^[A-Za-z0-9+/]{6}==$/;
 
 let storage: Storage | null = null;
 
-export async function readProgressiveReportArchive(identity: {
-  bucket: string;
-  objectKey: string;
-  generation: string;
-  mimeType: string;
-  compression: string;
-  archiveFormat: string;
-  storedSha256: string;
-  storedByteSize: number;
-  crc32c: string;
-  executionId: string;
-  sequence: number;
-  signature: string;
-}): Promise<unknown> {
+export async function readProgressiveReportArchive(
+  identity: ProgressiveReportArchiveReadIdentity,
+): Promise<string> {
   const configuredBucket = env.evidenceBucket?.trim();
   if (!configuredBucket || identity.bucket !== configuredBucket)
     throw new Error("Progressive report archive bucket is not configured");
-  if (
-    identity.mimeType !== "application/gzip" ||
-    identity.compression !== "gzip" ||
-    identity.archiveFormat !== "jsonl" ||
-    !GENERATION.test(identity.generation) ||
-    !SHA256.test(identity.storedSha256) ||
-    !CRC32C.test(identity.crc32c) ||
-    !Number.isSafeInteger(identity.storedByteSize) ||
-    identity.storedByteSize <= 0
-  )
-    throw new Error("Progressive report archive identity is invalid");
+  assertProgressiveReportArchiveIdentity(identity);
 
   storage ??= new Storage();
   const file = storage
     .bucket(identity.bucket)
-    .file(identity.objectKey, {generation: identity.generation});
+    .file(identity.objectKey, { generation: identity.generation });
+  // Storage 7.16 rounds FileOptions.generation internally; the final request
+  // interceptor keeps metadata and media requests pinned to the exact string.
+  file.interceptors.push({
+    request: (options) => {
+      if (!("uri" in options) || typeof options.uri !== "string")
+        throw new Error("Report archive request has no string URI");
+      return {
+        ...options,
+        uri: options.uri,
+        qs: { ...options.qs, generation: identity.generation },
+      };
+    },
+  });
   const [metadata] = await file.getMetadata();
   const custom = (metadata.metadata ?? {}) as Record<string, unknown>;
   if (
-    metadata.generation !== identity.generation ||
-    Number(metadata.size) !== identity.storedByteSize ||
+    String(metadata.generation) !== identity.generation ||
+    String(metadata.size) !== String(identity.storedByteSize) ||
     metadata.crc32c !== identity.crc32c ||
     metadata.contentType !== identity.mimeType ||
     custom.sha256 !== identity.storedSha256 ||
@@ -55,32 +45,8 @@ export async function readProgressiveReportArchive(identity: {
   )
     throw new Error("Progressive report archive metadata changed");
 
-  const raw = file.createReadStream({validation: true});
-  const hash = createHash("sha256");
-  let byteSize = 0;
-  raw.on("data", (chunk: Buffer | string) => {
-    const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-    byteSize += bytes.byteLength;
-    hash.update(bytes);
-  });
-  const gunzip = raw.pipe(createGunzip());
-  const lines = createInterface({input: gunzip, crlfDelay: Infinity});
-  let found: unknown = null;
-  for await (const line of lines) {
-    if (!line.trim()) continue;
-    const entry = JSON.parse(line) as Record<string, unknown>;
-    if (
-      entry.kind === "report" &&
-      entry.sourceKind === "remote" &&
-      entry.executionId === identity.executionId &&
-      Number(entry.sequence) === identity.sequence &&
-      entry.contentSignature === identity.signature
-    ) {
-      found = entry.report;
-    }
-  }
-  if (byteSize !== identity.storedByteSize || hash.digest("hex") !== identity.storedSha256)
-    throw new Error("Progressive report archive failed full readback verification");
-  if (!found) throw new Error("Progressive report archive member was not found");
-  return found;
+  return readProgressiveReportArchiveText(
+    file.createReadStream({ validation: "crc32c", decompress: false }),
+    identity,
+  );
 }

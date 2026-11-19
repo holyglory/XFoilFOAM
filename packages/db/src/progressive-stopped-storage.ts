@@ -1,3 +1,4 @@
+import { resolveStoredProgressiveReport } from "./progressive-report-reader";
 import { sql } from "drizzle-orm";
 import type { DB } from "./client";
 import { analysisContentHash } from "./analysis-target";
@@ -86,7 +87,7 @@ export async function assertStoppedProgressiveStorageAdmission(
     );
   const proof = stopped.proof as EngineExecutionStopProof;
   const latest = validateProgressiveRemoteReport(
-    stopped.report,
+    await resolveStoredProgressiveReport(db, "remote", stopped, delivery.engineJobId),
     source.envelope,
   );
   if (

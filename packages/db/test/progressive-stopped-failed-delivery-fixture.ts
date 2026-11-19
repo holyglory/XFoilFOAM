@@ -1,3 +1,5 @@
+import { installProgressiveReportArchiveReader } from "../src/progressive-report-reader";
+import { archiveReportFixture } from "../test-support/progressive-report-archive-fixture";
 import { createHash, randomUUID } from "node:crypto";
 import { eq, sql } from "drizzle-orm";
 import { expect } from "vitest";
@@ -272,7 +274,11 @@ async function verifyDiagnosticOnlyRemoteSettlement(db: DB, envelope: Progressiv
   }
 }
 
-export async function verifyDiagnosticMixedPromotionRecovery(db: DB, envelope: ProgressiveRemoteExecutionEnvelope) {
+export async function verifyDiagnosticMixedPromotionRecovery(
+  db: DB,
+  envelope: ProgressiveRemoteExecutionEnvelope,
+  options: { archivedEarlyReport?: boolean } = {},
+) {
   const restore = new Error("Restore remote promotion trigger custody");
   try {
     await db.transaction(async (transaction) => {
@@ -469,6 +475,31 @@ export async function verifyDiagnosticMixedPromotionRecovery(db: DB, envelope: P
     expect(await connection.execute(sql`SELECT attempt.token,attempt.outcome,unit.state,unit.lease_token
       FROM progressive_cfd_attempts attempt JOIN progressive_cfd_units unit ON unit.id=attempt.unit_id
       WHERE attempt.sim_job_id=${executionId}::uuid ORDER BY attempt.token`)).toEqual(before);
+    if (options.archivedEarlyReport) {
+      // Only the earlier report carries this transition; the terminal report
+      // deliberately omits it. Missing polars in a header must not erase scope.
+      await connection.execute(sql`CREATE TEMP TABLE progressive_remote_reports ON COMMIT DROP AS
+        SELECT * FROM public.progressive_remote_reports WHERE sim_job_id=${executionId}::uuid`);
+      const archived = await archiveReportFixture(connection, "remote", executionId, early.sequence);
+      try {
+        installProgressiveReportArchiveReader(null);
+        await expect(settleProgressiveRemoteJob(connection, executionId)).rejects.toThrow("not installed");
+        expect(await connection.execute(sql`SELECT "ingestedAt" FROM sim_jobs WHERE id=${executionId}::uuid`))
+          .toEqual([{ ingestedAt: null }]);
+        let reads = 0;
+        installProgressiveReportArchiveReader({ read: async () => { reads++; return archived.text; } });
+        expect(await settleProgressiveRemoteJob(connection, executionId)).toMatchObject({ kind: "settled" });
+        expect(reads).toBeGreaterThan(0);
+        const recovered = await connection.execute(sql`SELECT scope,diagnostic_point_content_signature
+          FROM progressive_cfd_recovery_plans WHERE parent_job_id=${executionId}::uuid`);
+        expect(recovered).toHaveLength(angles.length);
+        expect(recovered.every((plan) => plan.scope === "original_sweep" &&
+          plan.diagnostic_point_content_signature === triggerSource.contentSignature)).toBe(true);
+      } finally {
+        installProgressiveReportArchiveReader(null);
+      }
+      throw restore;
+    }
     expect(await recordProgressiveCfdRecoveryPlans(connection, executionId, [promotion])).toBe(angles.length);
     expect(await recordProgressiveCfdRecoveryPlans(connection, executionId, [promotion])).toBe(0);
     const plans = await connection.execute(sql`SELECT plan.*,unit.aoa_deg,unit.recipe AS original_recipe

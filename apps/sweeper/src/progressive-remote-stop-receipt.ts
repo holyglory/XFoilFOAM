@@ -1,3 +1,4 @@
+import { resolveStoredProgressiveReport } from "@aerodb/db/progressive-report-reader";
 import {
   acknowledgeProgressiveCfdExecutionStop,
   canonicalAnalysisJson,
@@ -50,7 +51,7 @@ export async function acknowledgeLatestProgressiveRemoteStop(
       ORDER BY sequence DESC LIMIT 1
     `);
     if (!stored) return false;
-    const validated = validateProgressiveRemoteReport(stored.report, envelope);
+    const validated = validateProgressiveRemoteReport(await resolveStoredProgressiveReport(connection, "remote", stored, executionId), envelope);
     if (validated.contentSignature !== stored.content_signature)
       throw new Error(
         "Remote stop report bytes differ from their immutable receipt",
@@ -69,6 +70,30 @@ export async function acknowledgeLatestProgressiveRemoteStop(
         throw new Error(
           "Never-started stop conflicts with retained active-time reports",
         );
+      // Archived headers omit live accounting. A missing cases array in one
+      // cannot prove that an execution never consumed solver time.
+      let after = 0;
+      while (true) {
+        const archived = await connection.execute(sql`
+          SELECT sequence,content_signature,report FROM progressive_remote_reports
+          WHERE sim_job_id=${executionId}::uuid AND sequence>${after}
+            AND (report->>'archivedReport'='true'
+              OR to_jsonb(progressive_remote_reports.*)->>'archived_at' IS NOT NULL
+              OR to_jsonb(progressive_remote_reports.*)->>'archive_bundle_id' IS NOT NULL)
+          ORDER BY sequence LIMIT 32
+        `);
+        for (const entry of archived) {
+          const full = validateProgressiveRemoteReport(
+            await resolveStoredProgressiveReport(connection, "remote", entry, executionId), envelope,
+          );
+          if (full.contentSignature !== entry.content_signature)
+            throw new Error("Remote stop history changed its immutable report bytes");
+          if (full.report.status.solver_budget_progress?.cases.some((sample) => sample.solver_active_seconds > 0))
+            throw new Error("Never-started stop conflicts with retained active-time reports");
+          after = Number(entry.sequence);
+        }
+        if (archived.length < 32) break;
+      }
     }
     await connection.execute(
       sql`UPDATE sim_jobs SET engine_job_id = ${executionId} WHERE id = ${executionId}::uuid AND engine_job_id IS NULL`,

@@ -1,9 +1,18 @@
-import { Storage, type File } from "@google-cloud/storage";
+import { Storage } from "@google-cloud/storage";
+import {
+  assertProgressiveReportArchiveIdentity,
+  readProgressiveReportArchiveBundle,
+  readProgressiveReportArchiveText,
+  validatedProgressiveReportArchiveLines,
+  verifyProgressiveReportArchive,
+  type ProgressiveReportArchiveReadIdentity,
+} from "@aerodb/db/progressive-report-archive";
 import { createHash, randomUUID } from "node:crypto";
 import { createGzip } from "node:zlib";
 import { createReadStream, createWriteStream } from "node:fs";
-import { mkdir, unlink } from "node:fs/promises";
-import { finished } from "node:stream/promises";
+import { unlink } from "node:fs/promises";
+import { Readable } from "node:stream";
+import { pipeline } from "node:stream/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -35,16 +44,7 @@ export interface ProgressiveReportArchiveMember {
 }
 
 function assertIdentity(identity: ProgressiveReportArchiveIdentity): void {
-  if (
-    !identity.bucket.trim() ||
-    !identity.objectKey.trim() ||
-    !GENERATION.test(identity.generation) ||
-    !SHA256.test(identity.storedSha256) ||
-    !CRC32C.test(identity.crc32c) ||
-    !Number.isSafeInteger(identity.storedByteSize) ||
-    identity.storedByteSize <= 0
-  )
-    throw new Error("Invalid progressive report archive identity");
+  assertProgressiveReportArchiveIdentity(identity);
 }
 
 async function sha256File(path: string): Promise<{
@@ -58,32 +58,20 @@ async function sha256File(path: string): Promise<{
     hash.update(chunk);
     byteSize += chunk.byteLength;
   }
-  return {sha256: hash.digest("hex"), byteSize};
+  return { sha256: hash.digest("hex"), byteSize };
 }
 
-async function writeGzipJsonLines(
+/** No Storage client or credentials are needed; the caller owns directory cleanup. */
+export async function writeProgressiveReportBundle(
   path: string,
   lines: AsyncIterable<string>,
-): Promise<void> {
-  const output = createWriteStream(path, {mode: 0o600});
-  const gzip = createGzip({level: 9});
-  gzip.pipe(output);
-  try {
-    for await (const line of lines) {
-      if (!gzip.write(`${line}\n`)) {
-        await new Promise<void>((resolve, reject) => {
-          gzip.once("drain", resolve);
-          gzip.once("error", reject);
-        });
-      }
-    }
-    gzip.end();
-    await finished(output);
-  } catch (error) {
-    gzip.destroy();
-    output.destroy();
-    throw error;
-  }
+): Promise<{ sha256: string; byteSize: number }> {
+  await pipeline(
+    Readable.from(validatedProgressiveReportArchiveLines(lines)),
+    createGzip({ level: 9 }),
+    createWriteStream(path, { mode: 0o600, flags: "wx" }),
+  );
+  return sha256File(path);
 }
 
 export class ProgressiveReportArchiveStore {
@@ -96,15 +84,22 @@ export class ProgressiveReportArchiveStore {
       "progressive-reports/v1",
     storage = new Storage(),
   ) {
-    if (!bucketName.trim()) throw new Error("Report archive bucket is required");
+    if (!bucketName.trim())
+      throw new Error("Report archive bucket is required");
     this.storage = storage;
     this.prefix = prefix.replace(/^\/+|\/+$/g, "");
-    if (!this.prefix || this.prefix.split("/").some((part) => part === "." || part === ".."))
+    if (
+      !this.prefix ||
+      this.prefix.split("/").some((part) => part === "." || part === "..")
+    )
       throw new Error("Report archive prefix is invalid");
   }
 
   temporaryPath(): string {
-    return join(tmpdir(), `xfoilfoam-progressive-reports-${randomUUID()}.jsonl.gz`);
+    return join(
+      tmpdir(),
+      `xfoilfoam-progressive-reports-${randomUUID()}.jsonl.gz`,
+    );
   }
 
   async removeTemporary(path: string): Promise<void> {
@@ -114,22 +109,21 @@ export class ProgressiveReportArchiveStore {
   async writeBundle(
     path: string,
     lines: AsyncIterable<string>,
-  ): Promise<{sha256: string; byteSize: number}> {
-    await mkdir(tmpdir(), {recursive: true});
-    await writeGzipJsonLines(path, lines);
-    const identity = await sha256File(path);
-    if (!SHA256.test(identity.sha256) || identity.byteSize <= 0)
-      throw new Error("Progressive report archive failed local identity proof");
-    return identity;
+  ): Promise<{ sha256: string; byteSize: number }> {
+    return writeProgressiveReportBundle(path, lines);
   }
 
   async putFile(
     path: string,
-    identity: {sha256: string; byteSize: number},
+    identity: { sha256: string; byteSize: number },
     sourceKind: "remote" | "worker",
     executionId: string,
   ): Promise<ProgressiveReportArchiveIdentity> {
-    if (!SHA256.test(identity.sha256) || !Number.isSafeInteger(identity.byteSize) || identity.byteSize <= 0)
+    if (
+      !SHA256.test(identity.sha256) ||
+      !Number.isSafeInteger(identity.byteSize) ||
+      identity.byteSize <= 0
+    )
       throw new Error("Invalid local report archive identity");
     const objectKey = `${this.prefix}/${sourceKind}/${executionId}/${identity.sha256}.jsonl.gz`;
     const bucket = this.storage.bucket(this.bucketName);
@@ -139,7 +133,7 @@ export class ProgressiveReportArchiveStore {
         destination: objectKey,
         resumable: true,
         validation: "crc32c",
-        preconditionOpts: {ifGenerationMatch: 0},
+        preconditionOpts: { ifGenerationMatch: 0 },
         metadata: {
           cacheControl: "private, max-age=31536000, immutable",
           contentType: "application/gzip",
@@ -153,7 +147,7 @@ export class ProgressiveReportArchiveStore {
         },
       });
     } catch (error) {
-      const code = Number((error as {code?: unknown})?.code);
+      const code = Number((error as { code?: unknown })?.code);
       if (code !== 412) throw error;
       created = false;
     }
@@ -173,11 +167,10 @@ export class ProgressiveReportArchiveStore {
       custom.executionId !== executionId ||
       custom.archiveFormat !== "jsonl"
     ) {
-      throw new Error(`Report archive ${created ? "upload" : "existing object"} metadata changed`);
+      throw new Error(
+        `Report archive ${created ? "upload" : "existing object"} metadata changed`,
+      );
     }
-    const remote = await sha256FileFromGcs(file);
-    if (remote.sha256 !== identity.sha256 || remote.byteSize !== identity.byteSize)
-      throw new Error("Report archive GCS readback failed exact SHA-256 verification");
     const result: ProgressiveReportArchiveIdentity = {
       bucket: this.bucketName,
       objectKey,
@@ -191,38 +184,66 @@ export class ProgressiveReportArchiveStore {
       verifiedAt: new Date(),
     };
     assertIdentity(result);
+    // Never hash a live/latest object or GCS's transparent decompression. The
+    // metadata and bytes must identify the same immutable compressed generation.
+    const pinned = this.pinnedFile(result);
+    const [pinnedMetadata] = await pinned.getMetadata();
+    if (
+      String(pinnedMetadata.generation) !== generation ||
+      String(pinnedMetadata.size) !== String(identity.byteSize) ||
+      pinnedMetadata.crc32c !== crc32c ||
+      pinnedMetadata.contentType !== result.mimeType
+    )
+      throw new Error("Report archive generation metadata changed");
+    await verifyProgressiveReportArchive(
+      pinned.createReadStream({ validation: "crc32c", decompress: false }),
+      result,
+    );
+    result.verifiedAt = new Date();
     return result;
   }
 
-  async readBundle(identity: ProgressiveReportArchiveIdentity): Promise<string> {
+  async readBundle(
+    identity: ProgressiveReportArchiveIdentity,
+  ): Promise<string> {
     assertIdentity(identity);
+    const file = this.pinnedFile(identity);
+    return readProgressiveReportArchiveBundle(
+      file.createReadStream({ validation: "crc32c", decompress: false }),
+      identity,
+    );
+  }
+
+  async read(identity: ProgressiveReportArchiveReadIdentity): Promise<string> {
+    assertProgressiveReportArchiveIdentity(identity);
+    const file = this.pinnedFile(identity);
+    return readProgressiveReportArchiveText(
+      file.createReadStream({ validation: "crc32c", decompress: false }),
+      identity,
+    );
+  }
+
+  private pinnedFile(identity: {
+    bucket: string;
+    objectKey: string;
+    generation: string;
+  }) {
     const file = this.storage
       .bucket(identity.bucket)
-      .file(identity.objectKey, {generation: identity.generation});
-    const chunks: Buffer[] = [];
-    const hash = createHash("sha256");
-    let size = 0;
-    for await (const raw of file.createReadStream({validation: true})) {
-      const chunk = Buffer.isBuffer(raw) ? raw : Buffer.from(raw);
-      hash.update(chunk);
-      size += chunk.byteLength;
-      chunks.push(chunk);
-    }
-    if (size !== identity.storedByteSize || hash.digest("hex") !== identity.storedSha256)
-      throw new Error("Report archive readback failed its immutable identity check");
-    return Buffer.concat(chunks).toString("utf8");
+      .file(identity.objectKey, { generation: identity.generation });
+    // Storage 7.16 converts FileOptions.generation to Number. Override the final
+    // metadata/media query through its public interceptor, keeping every digit.
+    file.interceptors.push({
+      request: (options) => {
+        if (!("uri" in options) || typeof options.uri !== "string")
+          throw new Error("Report archive request has no string URI");
+        return {
+          ...options,
+          uri: options.uri,
+          qs: { ...options.qs, generation: identity.generation },
+        };
+      },
+    });
+    return file;
   }
-}
-
-async function sha256FileFromGcs(
-  file: File,
-): Promise<{sha256: string; byteSize: number}> {
-  const hash = createHash("sha256");
-  let byteSize = 0;
-  for await (const raw of file.createReadStream({validation: true})) {
-    const chunk = Buffer.isBuffer(raw) ? raw : Buffer.from(raw);
-    hash.update(chunk);
-    byteSize += chunk.byteLength;
-  }
-  return {sha256: hash.digest("hex"), byteSize};
 }

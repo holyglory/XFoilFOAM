@@ -1,3 +1,4 @@
+import { resolveStoredProgressiveReport } from "./progressive-report-reader";
 import { sql as query } from "drizzle-orm";
 import { createClient } from "./client";
 import { validateProgressiveRemoteReport } from "./progressive-remote-report";
@@ -130,7 +131,7 @@ try {
         WHERE report.sim_job_id = ${verifyExecution}::uuid ORDER BY report.sequence DESC LIMIT ${rows}`);
       for (const stored of reports) {
         const validated = validateProgressiveRemoteReport(
-          stored.report,
+          await resolveStoredProgressiveReport(db, side, stored, verifyExecution),
           stored.envelope as ProgressiveRemoteExecutionEnvelope,
         );
         if (validated.contentSignature !== stored.content_signature)

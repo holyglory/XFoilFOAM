@@ -1,3 +1,4 @@
+import { resolveStoredProgressiveReport } from "@aerodb/db/progressive-report-reader";
 import { randomUUID } from "node:crypto";
 import { eq, sql } from "drizzle-orm";
 import {
@@ -83,7 +84,7 @@ async function claimProgressiveWorkerEvidence(
       ORDER BY report.sequence LIMIT 1 FOR UPDATE OF job SKIP LOCKED
     `);
     if (!candidate) return null;
-    const report = candidate.report as unknown as ProgressiveRemoteReport;
+    const report = await resolveStoredProgressiveReport(connection, "worker", candidate, executionId);
     const sequence = Number(candidate.sequence);
     const result = report.result as JobResult;
     await assertProgressiveWorkerEvidenceJob(connection, {

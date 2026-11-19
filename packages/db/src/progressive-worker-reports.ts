@@ -1,4 +1,6 @@
+import { resolveStoredProgressiveReport } from "./progressive-report-reader";
 import { sql } from "drizzle-orm";
+import { isDeepStrictEqual } from "node:util";
 import { canonicalRemoteHubBaseUrl } from "@aerodb/core";
 import type { DB } from "./client";
 import { canonicalAnalysisJson } from "./analysis-target";
@@ -13,6 +15,40 @@ import {
 } from "./progressive-remote-report";
 
 const STALE_REPORT_QUARANTINE_BATCH_SIZE = 128;
+
+export function workerEvidenceDeliverySettled(jobId: ReturnType<typeof sql>) {
+  return sql`NOT EXISTS (
+  SELECT 1 FROM progressive_worker_reports pending
+  WHERE pending.sim_job_id = ${jobId} AND pending.acknowledged_at IS NULL
+)
+AND NOT EXISTS (
+  SELECT 1 FROM progressive_worker_delivery_failures retry
+  WHERE retry.sim_job_id = ${jobId} AND retry.state = 'retry'
+)
+AND NOT EXISTS (
+  SELECT 1
+  FROM progressive_worker_evidence_attempts source
+  WHERE source.sim_job_id = ${jobId}
+    AND NOT EXISTS (
+      SELECT 1 FROM progressive_worker_hub_receipts delivered
+      WHERE delivered.sim_job_id = source.sim_job_id
+        AND delivered.point_content_signature = source.point_content_signature
+    )
+    AND NOT EXISTS (
+      SELECT 1 FROM progressive_worker_delivery_failures conflict
+      WHERE conflict.sim_job_id = source.sim_job_id
+        AND conflict.point_content_signature = source.point_content_signature
+        AND conflict.state = 'conflict'
+    )
+)`;
+}
+
+function liveMeasurements(report: ProgressiveRemoteReport) {
+  const { updated_at, solver_budget_progress, ...status } = report.status;
+  if (!solver_budget_progress) return { ...report, status: { ...status, solver_budget_progress } };
+  const { observed_at, ...budget } = solver_budget_progress;
+  return { ...report, status: { ...status, solver_budget_progress: budget } };
+}
 
 async function projectRunningWorkerReport(
   db: DB,
@@ -108,7 +144,7 @@ export async function settleProgressiveWorkerFinalReport(
       payload.upstreamBaseUrl
     )
       return false;
-    const report = owned.report as unknown as ProgressiveRemoteReport;
+    const report = await resolveStoredProgressiveReport(connection, "worker", owned, executionId);
     const envelope = verifyProgressiveRemoteExecution(
       payload.remoteProgressiveExecution,
       {
@@ -151,13 +187,13 @@ export async function settleProgressiveWorkerExpiredFinalReport(
   return db.transaction(async (transaction) => {
     const connection = transaction as unknown as DB;
     const [candidate] = await connection.execute(sql`
-      SELECT job.id, latest.report
+      SELECT job.id
       FROM sim_jobs job
       JOIN sync_sweep_promises promise
         ON promise.id::text = job.request_payload->>'syncPromiseId'
       JOIN sync_api_settings settings ON settings.id = 1
       JOIN LATERAL (
-        SELECT resolve_progressive_report(to_jsonb(progressive_worker_reports.*)) AS report
+        SELECT report
         FROM progressive_worker_reports
         WHERE progressive_worker_reports.sim_job_id = job.id
           AND progressive_worker_reports.acknowledged_at IS NOT NULL
@@ -175,30 +211,7 @@ export async function settleProgressiveWorkerExpiredFinalReport(
         AND (job.ingest_lease_token IS NULL OR job.ingest_lease_expires_at <= clock_timestamp())
         AND latest.report#>>'{stopProof,execution_stopped}' = 'true'
         AND latest.report#>>'{status,state}' IN ('completed', 'failed', 'cancelled')
-        AND NOT EXISTS (
-          SELECT 1 FROM progressive_worker_reports pending
-          WHERE pending.sim_job_id = job.id AND pending.acknowledged_at IS NULL
-        )
-        AND NOT EXISTS (
-          SELECT 1 FROM progressive_worker_delivery_failures retry
-          WHERE retry.sim_job_id = job.id AND retry.state = 'retry'
-        )
-        AND NOT EXISTS (
-          SELECT 1
-          FROM progressive_worker_evidence_attempts source
-          WHERE source.sim_job_id = job.id
-            AND NOT EXISTS (
-              SELECT 1 FROM progressive_worker_hub_receipts delivered
-              WHERE delivered.sim_job_id = source.sim_job_id
-                AND delivered.point_content_signature = source.point_content_signature
-            )
-            AND NOT EXISTS (
-              SELECT 1 FROM progressive_worker_delivery_failures conflict
-              WHERE conflict.sim_job_id = source.sim_job_id
-                AND conflict.point_content_signature = source.point_content_signature
-                AND conflict.state = 'conflict'
-            )
-        )
+        AND ${workerEvidenceDeliverySettled(sql`job.id`)}
       FOR UPDATE OF job
     `);
     if (!candidate) return false;
@@ -269,6 +282,8 @@ export async function enqueueProgressiveWorkerReport(
       SELECT sequence, content_signature, resolve_progressive_report(to_jsonb(progressive_worker_reports.*)) AS report FROM progressive_worker_reports
       WHERE sim_job_id = ${input.executionId}::uuid ORDER BY sequence DESC LIMIT 1
     `);
+    if (latest)
+      latest.report = await resolveStoredProgressiveReport(connection, "worker", latest, input.executionId);
     const content = normalizeProgressiveRemoteReportJson({
       ...input,
       version: 1 as const,
@@ -278,6 +293,17 @@ export async function enqueueProgressiveWorkerReport(
         { ...content, sequence: Number(latest.sequence) },
         envelope,
       );
+      const previous = latest.report as unknown as ProgressiveRemoteReport;
+      if (replay.contentSignature !== latest.content_signature &&
+          (previous.status.state === "running" || previous.status.state === "pending") &&
+          previous.stopProof === null && replay.report.stopProof === null &&
+          isDeepStrictEqual(liveMeasurements(previous), liveMeasurements(replay.report))) {
+        // A later observation clock by itself carries no new solver measurement.
+        // Project the live heartbeat and preserve the prior report's identity.
+        await projectRunningWorkerReport(connection,replay.report);
+        return {executionId:input.executionId, sequence:previous.sequence,
+          contentSignature:String(latest.content_signature),replayed:true};
+      }
       if (replay.contentSignature === latest.content_signature) {
         await projectRunningWorkerReport(
           connection,
@@ -361,7 +387,7 @@ export async function readPendingProgressiveWorkerReport(
         executionId: input.executionId,
         sequence: Number(row.sequence),
         contentSignature: String(row.content_signature),
-        report: row.report as unknown as ProgressiveRemoteReport,
+        report: await resolveStoredProgressiveReport(db, "worker", row, input.executionId),
       }
     : null;
 }
@@ -425,12 +451,13 @@ export async function quarantineProgressiveWorkerReportConflict(
         AND acknowledged_at IS NULL
     `);
     if (!row) return false;
+    const report = await resolveStoredProgressiveReport(connection, "worker", row, input.executionId);
     await connection.execute(sql`
       INSERT INTO progressive_worker_report_conflicts
         (sim_job_id, sequence, content_signature, report, reason)
       VALUES
         (${input.executionId}::uuid, ${input.sequence}, ${input.contentSignature},
-         ${JSON.stringify(row.report)}::jsonb, ${input.reason})
+         ${JSON.stringify(report)}::jsonb, ${input.reason})
       ON CONFLICT (sim_job_id, sequence) DO NOTHING
     `);
     const [acknowledged] = await connection.execute(sql`
@@ -471,7 +498,7 @@ export async function quarantineProgressiveWorkerReportConflicts(
       sql`SELECT id FROM sim_jobs WHERE id = ${input.executionId}::uuid FOR UPDATE`,
     );
     const pending = await connection.execute(sql`
-      SELECT sequence
+      SELECT sequence,content_signature,resolve_progressive_report(to_jsonb(progressive_worker_reports.*)) AS report
       FROM progressive_worker_reports
       WHERE sim_job_id = ${input.executionId}::uuid
         AND report->>'solverId' = ${input.solverId}
@@ -484,17 +511,15 @@ export async function quarantineProgressiveWorkerReportConflicts(
       pending.map((row) => sql`${String(row.sequence)}::bigint`),
       sql`, `,
     );
-    await connection.execute(sql`
-      INSERT INTO progressive_worker_report_conflicts
-        (sim_job_id, sequence, content_signature, report, reason)
-      SELECT report.sim_job_id, report.sequence, report.content_signature, resolve_progressive_report(to_jsonb(report.*)) AS report, ${input.reason}
-      FROM progressive_worker_reports report
-      WHERE report.sim_job_id = ${input.executionId}::uuid
-        AND report.report->>'solverId' = ${input.solverId}
-        AND report.sequence IN (${sequences})
-        AND report.acknowledged_at IS NULL
-      ON CONFLICT (sim_job_id, sequence) DO NOTHING
-    `);
+    for (const row of pending) {
+      const report = await resolveStoredProgressiveReport(connection, "worker", row, input.executionId);
+      await connection.execute(sql`
+        INSERT INTO progressive_worker_report_conflicts
+          (sim_job_id,sequence,content_signature,report,reason)
+        VALUES (${input.executionId}::uuid,${row.sequence},${row.content_signature},${JSON.stringify(report)}::jsonb,${input.reason})
+        ON CONFLICT (sim_job_id,sequence) DO NOTHING
+      `);
+    }
     const acknowledged = await connection.execute(sql`
       UPDATE progressive_worker_reports
       SET acknowledged_at = coalesce(acknowledged_at, clock_timestamp())

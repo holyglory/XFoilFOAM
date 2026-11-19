@@ -65,10 +65,11 @@ export async function registerRetainedReportRoutes(app: FastifyInstance) {
           .code(400)
           .send({ error: "Invalid exact retained-report reference" });
       try {
-        const report = await retainedSolverReportDownload(db, {
-          ...params.data,
-          ...query.data,
-        }, {archiveReader: {read: readProgressiveReportArchive}});
+        const report = await retainedSolverReportDownload(
+          db,
+          { ...params.data, ...query.data },
+          { archiveReader: { read: readProgressiveReportArchive } },
+        );
         return reply
           .header("cache-control", "private, no-store")
           .header(
@@ -78,7 +79,7 @@ export async function registerRetainedReportRoutes(app: FastifyInstance) {
           .header("x-content-sha256", report.signature)
           .header("access-control-expose-headers", "x-content-sha256")
           .type("application/json; charset=utf-8")
-          .send(report.content);
+          .send(Buffer.from(report.content, "utf8"));
       } catch (error) {
         return failure(reply, error);
       }

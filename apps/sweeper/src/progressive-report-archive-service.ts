@@ -1,324 +1,469 @@
-import { canonicalAnalysisJson } from "@aerodb/db";
 import type { DB } from "@aerodb/db";
 import { sql } from "drizzle-orm";
-import { setTimeout as delay } from "node:timers/promises";
 import { createHash } from "node:crypto";
-import { ProgressiveReportArchiveStore, type ProgressiveReportArchiveMember } from "./progressive-report-archive-store";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
+import { configuredDeploymentRole } from "./config";
+import {
+  putWorkerReportBundle,
+  readWorkerReportArchiveText,
+  WorkerReportFetchDisabled,
+} from "./report-archive-broker-client";
+import { retainWorkerReportVolume } from "./worker-report-volume";
+import {
+  ProgressiveReportArchiveStore,
+  writeProgressiveReportBundle,
+  type ProgressiveReportArchiveIdentity,
+} from "./progressive-report-archive-store";
 
-const PAGE_SIZE = 128;
-const COMPACTION_REPORT_LIMIT = 512;
-const COMPACTION_CANDIDATE_LIMIT = COMPACTION_REPORT_LIMIT * 8;
-const COMPACTION_CONFLICT_LIMIT = 256;
-
-type SourceKind = "remote" | "worker";
-
-function deploymentRole(): "hub" | "remote-solver" {
-  return process.env.AIRFOILFOAM_DEPLOYMENT_ROLE?.trim() === "remote-solver"
-    ? "remote-solver"
-    : "hub";
-}
-
-function bucketFromEnv(): string | null {
-  const value = process.env.AIRFOILFOAM_EVIDENCE_BUCKET?.trim();
-  return value || null;
-}
-
-function reportHash(report: unknown): {sha256: string; byteSize: number} {
-  const text = canonicalAnalysisJson(report);
-  const bytes = Buffer.from(text, "utf8");
-  const hash = createHash("sha256");
-  hash.update(bytes);
-  return {sha256: hash.digest("hex"), byteSize: bytes.byteLength};
-}
-
-async function* remoteArchiveLines(
-  db: DB,
+type Source = "remote" | "worker";
+type Kind = "report" | "conflict";
+type PutFile = (
+  path: string,
+  identity: { sha256: string; byteSize: number },
+  source: Source,
   executionId: string,
-  members: ProgressiveReportArchiveMember[],
-): AsyncGenerator<string> {
-  let after = 0;
-  while (true) {
-    const rows = await db.execute(sql`
-      SELECT sequence, content_signature,
-        public.resolve_progressive_report(to_jsonb(progressive_remote_reports.*)) AS report
-      FROM progressive_remote_reports
-      WHERE sim_job_id = ${executionId}::uuid
-        AND sequence > ${after}
-      ORDER BY sequence
-      LIMIT ${PAGE_SIZE}
-    `);
-    if (!rows.length) break;
-    for (const row of rows) {
-      const sequence = Number(row.sequence);
-      const report = row.report as Record<string, unknown>;
-      const serialized = canonicalAnalysisJson({
-        kind: "report",
-        sourceKind: "remote",
+  probe: Member,
+) => Promise<ProgressiveReportArchiveIdentity>;
+const maxMembers = 128;
+const encodedByteTarget = 24 * 1024 * 1024;
+const restoredByteTarget = 128 * 1024 * 1024;
+
+interface Member {
+  sequence: number;
+  kind: Kind;
+  signature: string;
+  sha256: string;
+  bytes: number;
+  payload: string | null;
+}
+
+function reportTable(source: Source) {
+  return sql.identifier(
+    source === "remote"
+      ? "progressive_remote_reports"
+      : "progressive_worker_reports",
+  );
+}
+
+function owner(source: Source) {
+  return source === "remote"
+    ? sql`FROM sim_jobs job JOIN progressive_remote_dispatches dispatch ON dispatch.sim_job_id=job.id
+          JOIN sync_sweep_promises promise ON promise.id=dispatch.promise_id`
+    : sql`FROM sim_jobs job JOIN sync_sweep_promises promise ON promise.id=(job.request_payload->>'syncPromiseId')::uuid`;
+}
+
+function closedScope(source: Source) {
+  const stopped =
+    source === "remote"
+      ? sql`EXISTS (SELECT 1 FROM progressive_cfd_execution_stops stop
+          WHERE stop.sim_job_id=job.id AND stop.engine_job_id=job.engine_job_id)`
+      : sql`job.request_payload->>'remoteSolver'='true'
+         AND EXISTS (SELECT 1 FROM progressive_worker_reports stopped
+           WHERE stopped.sim_job_id=job.id AND stopped.stopped_engine_job_id=job.engine_job_id)
+         AND NOT EXISTS (SELECT 1 FROM progressive_worker_reports pending
+           WHERE pending.sim_job_id=job.id AND pending.acknowledged_at IS NULL)`;
+  return sql`job.status IN ('done','failed','cancelled') AND job."ingestedAt" IS NOT NULL
+    AND (job.ingest_lease_token IS NULL OR job.ingest_lease_expires_at<=clock_timestamp())
+    AND promise.status IN ('fulfilled','cancelled','expired') AND ${stopped}`;
+}
+
+// A mixed-angle report stays online while any of its reported points still
+// needs its first delivery. A rejected outbox report has a separate identity.
+function settledReport(source: Source) {
+  return source === "remote"
+    ? sql`EXISTS (SELECT 1 FROM progressive_remote_report_inventories inventory
+           WHERE inventory.sim_job_id=r.sim_job_id AND inventory.sequence=r.sequence
+             AND inventory.report_content_signature=r.content_signature)
+         AND NOT EXISTS (SELECT 1 FROM progressive_remote_report_sources s
+           WHERE s.sim_job_id=r.sim_job_id AND s.sequence=r.sequence
+             AND NOT EXISTS (SELECT 1 FROM progressive_remote_evidence_receipts e
+               WHERE e.sim_job_id=s.sim_job_id AND e.point_content_signature=s.point_content_signature)
+             AND NOT EXISTS (SELECT 1 FROM progressive_remote_diagnostic_receipts d
+               WHERE d.sim_job_id=s.sim_job_id AND d.point_content_signature=s.point_content_signature))`
+    : sql`r.acknowledged_at IS NOT NULL AND (
+           EXISTS (SELECT 1 FROM progressive_worker_evidence_receipts staged
+             WHERE staged.sim_job_id=r.sim_job_id AND staged.sequence=r.sequence AND staged.content_signature=r.content_signature)
+           OR EXISTS (SELECT 1 FROM progressive_worker_report_conflicts c
+             WHERE c.sim_job_id=r.sim_job_id AND c.sequence=r.sequence AND c.content_signature=r.content_signature)
+           OR (r.result_payload_hash IS NULL AND jsonb_typeof(r.report->'result') IS DISTINCT FROM 'object'))
+         AND progressive_worker_report_evidence_settled(r.sim_job_id,r.sequence)`;
+}
+
+function memberKeys(source: Source, executionId: string) {
+  const conflicts =
+    source === "worker"
+      ? sql`UNION ALL SELECT c.sequence, 'conflict' AS kind
+      FROM progressive_worker_report_conflicts c WHERE c.sim_job_id=${executionId}::uuid
+        AND c.archived_at IS NULL AND c.body_source_sequence IS NULL
+        AND NOT EXISTS (SELECT 1 FROM progressive_worker_reports w WHERE w.sim_job_id=c.sim_job_id
+          AND w.sequence=c.sequence AND w.content_signature=c.content_signature
+          AND progressive_worker_conflict_body_matches(c.sim_job_id,c.sequence,c.content_signature,c.report))`
+      : sql``;
+  return sql`SELECT sequence, kind FROM (
+    SELECT r.sequence,'report' AS kind FROM ${reportTable(source)} r
+    WHERE r.sim_job_id=${executionId}::uuid AND r.archived_at IS NULL AND ${settledReport(source)}
+    ${conflicts}
+  ) keys ORDER BY sequence, kind DESC LIMIT ${maxMembers}`;
+}
+
+// Repeated snapshots usually differ only at the sequence or a status timestamp.
+// Offsets refer to UTF-16 code units so even a split surrogate pair is reversible.
+function archiveLine(
+  metadata: object,
+  current: string,
+  previous?: string,
+): string {
+  const inline = () =>
+    JSON.stringify(metadata).slice(0, -1) + ',"report":' + current + "}";
+  if (!previous) return inline();
+  const limit = Math.min(previous.length, current.length);
+  let prefix = 0;
+  while (
+    prefix < limit &&
+    previous.charCodeAt(prefix) === current.charCodeAt(prefix)
+  )
+    prefix++;
+  let suffix = 0;
+  while (
+    suffix < limit - prefix &&
+    previous.charCodeAt(previous.length - 1 - suffix) ===
+      current.charCodeAt(current.length - 1 - suffix)
+  )
+    suffix++;
+  if (prefix + suffix < 128) return inline();
+  const delta = JSON.stringify({
+    ...metadata,
+    reportDelta: {
+      prefix,
+      suffix,
+      middle: current.slice(prefix, current.length - suffix),
+    },
+  });
+  return delta.length < current.length ? delta : inline();
+}
+
+async function* archiveLines(
+  db: DB,
+  source: Source,
+  executionId: string,
+  keys: { sequence: unknown; kind: unknown }[],
+  members: Member[],
+) {
+  let logicalBytes = 0;
+  let encodedBytes = 0;
+  let previous: string | undefined;
+  for (const key of keys) {
+    const sequence = Number(key.sequence);
+    const kind = key.kind as Kind;
+    const conflict = kind === "conflict";
+    const table = conflict
+      ? sql.identifier("progressive_worker_report_conflicts")
+      : reportTable(source);
+    // postgres-js would otherwise parse jsonb NUMERIC values as JS doubles.
+    const body = conflict
+      ? sql`report::text`
+      : sql`public.resolve_progressive_report(report,result_payload_hash)::text`;
+    const [row] =
+      await db.execute(sql`SELECT content_signature, ${body} AS body,
+      ${conflict ? sql`NULL::text` : sql`result_payload_hash`} AS payload FROM ${table}
+      WHERE sim_job_id=${executionId}::uuid AND sequence=${sequence} AND archived_at IS NULL`);
+    if (!row)
+      throw new Error("Report was already archived while preparing its bundle");
+    const raw = String(row.body);
+    const bytes = Buffer.byteLength(raw);
+    const sha256 = createHash("sha256").update(raw).digest("hex");
+    const signature = String(row.content_signature);
+    members.push({
+      sequence,
+      kind,
+      signature,
+      bytes,
+      sha256,
+      payload: row.payload == null ? null : String(row.payload),
+    });
+    const line = archiveLine(
+      {
+        kind,
+        sourceKind: source,
         executionId,
         sequence,
-        contentSignature: String(row.content_signature),
-        report,
-      });
-      const identity = reportHash(report);
-      members.push({
-        sourceKind: "remote",
-        executionId,
-        sequence,
-        memberKind: "report",
-        contentSignature: String(row.content_signature),
-        reportSha256: identity.sha256,
-        reportByteSize: identity.byteSize,
-      });
-      yield serialized;
-      after = sequence;
-    }
+        contentSignature: signature,
+        reportSha256: sha256,
+        reportByteSize: bytes,
+      },
+      raw,
+      previous,
+    );
+    yield line;
+    previous = raw;
+    logicalBytes += bytes;
+    encodedBytes += Buffer.byteLength(line) + 1;
+    if (encodedBytes >= encodedByteTarget || logicalBytes >= restoredByteTarget)
+      break;
   }
 }
 
-async function archiveRemoteExecution(
+export async function archiveProgressiveReportBatch(
   db: DB,
-  store: ProgressiveReportArchiveStore,
+  source: Source,
   executionId: string,
-): Promise<boolean> {
-  const [candidate] = await db.execute(sql`
-    SELECT job.id
-    FROM sim_jobs job
-    JOIN progressive_remote_dispatches dispatch ON dispatch.sim_job_id = job.id
-    JOIN sync_sweep_promises promise ON promise.id = dispatch.promise_id
-    WHERE job.id = ${executionId}::uuid
-      AND job.request_payload->>'remoteSolver' = 'true'
-      AND job.status IN ('done', 'failed', 'cancelled')
-      AND job."ingestedAt" IS NOT NULL
-      AND (job.ingest_lease_token IS NULL OR job.ingest_lease_expires_at <= clock_timestamp())
-      AND promise.status <> 'active'
-      AND EXISTS (
-        SELECT 1 FROM progressive_cfd_execution_stops stop
-        WHERE stop.sim_job_id = job.id AND stop.engine_job_id = job.engine_job_id
-      )
-      AND EXISTS (
-        SELECT 1 FROM progressive_remote_reports report
-        WHERE report.sim_job_id = job.id AND report.archive_bundle_id IS NULL
-      )
-      AND NOT EXISTS (
-        SELECT 1 FROM progressive_remote_reports report
-        WHERE report.sim_job_id = job.id AND report.archive_bundle_id IS NOT NULL
-      )
-  `);
-  if (!candidate) return false;
-
-  const members: ProgressiveReportArchiveMember[] = [];
-  const tempPath = store.temporaryPath();
+  putFile: PutFile,
+): Promise<number> {
+  const scope = sql`SELECT job.id ${owner(source)} WHERE job.id=${executionId}::uuid AND ${closedScope(source)}`;
+  if (!(await db.execute(scope)).length) return 0;
+  const keys = (await db.execute(memberKeys(source, executionId))).map(
+    ({ sequence, kind }) => ({ sequence, kind }),
+  );
+  if (!keys.length) return 0;
+  const dir = await mkdtemp(join(tmpdir(), "progressive-reports-"));
+  const members: Member[] = [];
   try {
-    const local = await store.writeBundle(
-      tempPath,
-      remoteArchiveLines(db, executionId, members),
+    const path = join(dir, "reports.jsonl.gz");
+    const local = await writeProgressiveReportBundle(
+      path,
+      archiveLines(db, source, executionId, keys, members),
     );
-    if (!members.length) return false;
-    const remote = await store.putFile(tempPath, local, "remote", executionId);
-    await db.transaction(async (transaction) => {
-      const connection = transaction as unknown as DB;
-      const [locked] = await connection.execute(sql`
-        SELECT job.id FROM sim_jobs job
-        JOIN sync_sweep_promises promise ON promise.id::text = job.request_payload->>'syncPromiseId'
-        WHERE job.id = ${executionId}::uuid
-          AND job.status IN ('done', 'failed', 'cancelled')
-          AND job."ingestedAt" IS NOT NULL
-          AND (job.ingest_lease_token IS NULL OR job.ingest_lease_expires_at <= clock_timestamp())
-          AND promise.status <> 'active'
-        FOR UPDATE OF job
-      `);
-      if (!locked) throw new Error("remote report archive scope changed before commit");
-      const [reportCount] = await connection.execute(sql`
-        SELECT count(*)::integer AS count
-        FROM progressive_remote_reports
-        WHERE sim_job_id=${executionId}::uuid AND archive_bundle_id IS NULL
-      `);
-      if (Number(reportCount?.count ?? 0) !== members.length)
-        throw new Error("remote report archive scope changed after GCS upload");
-      const [bundle] = await connection.execute(sql`
-        INSERT INTO progressive_report_archive_bundles
-          (source_kind,sim_job_id,bucket,object_key,generation,mime_type,compression,archive_format,
-           stored_sha256,stored_byte_size,crc32c,member_count,first_sequence,last_sequence,verified_at)
-        VALUES ('remote',${executionId}::uuid,${remote.bucket},${remote.objectKey},${remote.generation},
-          ${remote.mimeType},${remote.compression},${remote.archiveFormat},${remote.storedSha256},
-          ${remote.storedByteSize},${remote.crc32c},${members.length},${members[0]!.sequence},
-          ${members[members.length-1]!.sequence},${remote.verifiedAt.toISOString()}::timestamptz)
-        ON CONFLICT (source_kind,sim_job_id) DO NOTHING
-        RETURNING id
-      `);
-      const resolvedBundle = bundle ?? (await connection.execute(sql`
-        SELECT id,bucket,object_key,generation,stored_sha256,stored_byte_size,crc32c
-        FROM progressive_report_archive_bundles
-        WHERE source_kind='remote' AND sim_job_id=${executionId}::uuid
-        FOR UPDATE
-      `))[0];
-      if (!resolvedBundle) throw new Error("report archive bundle was not registered");
-      if (
-        String(resolvedBundle.bucket) !== remote.bucket ||
-        String(resolvedBundle.object_key) !== remote.objectKey ||
-        String(resolvedBundle.generation) !== remote.generation ||
-        String(resolvedBundle.stored_sha256) !== remote.storedSha256 ||
-        Number(resolvedBundle.stored_byte_size) !== remote.storedByteSize ||
-        String(resolvedBundle.crc32c) !== remote.crc32c
-      )
-        throw new Error("existing report archive bundle has a different GCS identity");
-      const memberJson = JSON.stringify(
-        members.map((member) => ({
-          source_kind: member.sourceKind,
-          execution_id: member.executionId,
-          sequence: member.sequence,
-          member_kind: member.memberKind,
-          content_signature: member.contentSignature,
-          report_sha256: member.reportSha256,
-          report_byte_size: member.reportByteSize,
+    if (!members.length) return 0;
+    const remote = await putFile(path, local, source, executionId, members[0]!);
+    if (
+      remote.storedSha256 !== local.sha256 ||
+      remote.storedByteSize !== local.byteSize ||
+      remote.mimeType !== "application/gzip" ||
+      remote.compression !== "gzip" ||
+      remote.archiveFormat !== "jsonl" ||
+      !remote.bucket ||
+      !remote.objectKey ||
+      !Number.isFinite(remote.verifiedAt.getTime())
+    )
+      throw new Error("Archive readback differs from the uploaded bundle");
+
+    return await db.transaction(async (tx) => {
+      const conn = tx as unknown as DB;
+      if (!(await conn.execute(sql`${scope} FOR UPDATE OF job,promise`)).length)
+        return 0;
+      const [inserted] =
+        await conn.execute(sql`INSERT INTO progressive_report_archive_bundles
+        (source_kind,sim_job_id,bucket,object_key,generation,mime_type,compression,archive_format,
+         stored_sha256,stored_byte_size,crc32c,member_count,first_sequence,last_sequence,verified_at)
+        VALUES (${source},${executionId}::uuid,${remote.bucket},${remote.objectKey},${remote.generation},'application/gzip',
+          'gzip','jsonl',${local.sha256},${local.byteSize},${remote.crc32c},${members.length},
+          ${members[0]!.sequence},${members[members.length - 1]!.sequence},${remote.verifiedAt.toISOString()}::timestamptz)
+        ON CONFLICT (bucket,object_key,generation,sim_job_id) DO NOTHING RETURNING id`);
+      if (!inserted) {
+        const [replay] =
+          await conn.execute(sql`SELECT count(m.sequence)::int AS n
+          FROM progressive_report_archive_bundles b JOIN progressive_report_archive_members m ON m.bundle_id=b.id
+          WHERE b.bucket=${remote.bucket} AND b.object_key=${remote.objectKey} AND b.generation=${remote.generation}
+            AND b.source_kind=${source} AND b.sim_job_id=${executionId}::uuid AND b.stored_sha256=${local.sha256}
+            AND b.stored_byte_size=${local.byteSize} AND b.crc32c=${remote.crc32c}`);
+        if (Number(replay?.n) !== members.length)
+          throw new Error("Archive replay differs from its committed members");
+        return 0;
+      }
+      const entries = JSON.stringify(
+        members.map(({ sequence, kind, signature, bytes, sha256 }) => ({
+          sequence,
+          kind,
+          signature,
+          bytes,
+          sha256,
         })),
       );
-      await connection.execute(sql`
-        INSERT INTO progressive_report_archive_members
-          (bundle_id,source_kind,sim_job_id,sequence,member_kind,content_signature,report_sha256,report_byte_size)
-        SELECT ${resolvedBundle.id}::uuid, member.source_kind, member.execution_id::uuid, member.sequence,
-          member.member_kind, member.content_signature, member.report_sha256, member.report_byte_size
-        FROM jsonb_to_recordset(${memberJson}::jsonb) AS member(
-          source_kind text, execution_id text, sequence bigint, member_kind text,
-          content_signature text, report_sha256 text, report_byte_size bigint)
-        ON CONFLICT (source_kind,sim_job_id,member_kind,sequence) DO NOTHING
-      `);
-      const compacted = await connection.execute(sql`
-        UPDATE progressive_remote_reports report SET
-          archive_bundle_id=${resolvedBundle.id}::uuid,
-          archived_at=clock_timestamp(),
-          result_payload_hash=NULL,
-          report=progressive_report_compact_header(report.report)
-        WHERE report.sim_job_id=${executionId}::uuid
-          AND report.archive_bundle_id IS NULL
-        RETURNING report.sequence
-      `);
-      if (compacted.length !== members.length)
-        throw new Error("report archive member count changed during compaction");
-      await connection.execute(sql`
-        DELETE FROM progressive_report_result_payloads payload
-        WHERE NOT EXISTS (SELECT 1 FROM progressive_worker_reports worker WHERE worker.result_payload_hash=payload.content_hash)
-          AND NOT EXISTS (SELECT 1 FROM progressive_remote_reports remote WHERE remote.result_payload_hash=payload.content_hash)
-      `);
+      await conn.execute(sql`INSERT INTO progressive_report_archive_members
+        (bundle_id,source_kind,sim_job_id,sequence,member_kind,content_signature,report_sha256,report_byte_size)
+        SELECT ${inserted.id}::uuid,${source},${executionId}::uuid,s.sequence,s.kind,s.signature,s.sha256,s.bytes
+        FROM jsonb_to_recordset(${entries}::jsonb) s(sequence bigint,kind text,signature text,sha256 text,bytes bigint)`);
+      for (const kind of new Set(members.map((member) => member.kind))) {
+        const conflict = kind === "conflict";
+        const table = conflict
+          ? sql.identifier("progressive_worker_report_conflicts")
+          : reportTable(source);
+        const changed =
+          await conn.execute(sql`UPDATE ${table} r SET archive_bundle_id=${inserted.id}::uuid,
+          archived_at=clock_timestamp(),${conflict ? sql`` : sql`result_payload_hash=NULL,`}
+          report=progressive_report_compact_header(r.report)
+          FROM progressive_report_archive_members m WHERE m.bundle_id=${inserted.id}::uuid
+            AND m.member_kind=${kind} AND r.sim_job_id=m.sim_job_id AND r.sequence=m.sequence
+            AND r.content_signature=m.content_signature AND r.archived_at IS NULL
+            ${conflict ? sql`` : sql`AND ${settledReport(source)}`} RETURNING r.sequence`);
+        if (changed.length !== members.filter((m) => m.kind === kind).length)
+          throw new Error(
+            "Report or evidence status changed before archive commit",
+          );
+      }
+      const hashes = [
+        ...new Set(members.flatMap((m) => (m.payload ? [m.payload] : []))),
+      ];
+      if (hashes.length)
+        await conn.execute(sql`DELETE FROM progressive_report_result_payloads p
+        WHERE p.content_hash IN (${sql.join(
+          hashes.map((h) => sql`${h}`),
+          sql`,`,
+        )})
+        AND NOT EXISTS (SELECT FROM progressive_worker_reports w WHERE w.result_payload_hash=p.content_hash)
+        AND NOT EXISTS (SELECT FROM progressive_remote_reports r WHERE r.result_payload_hash=p.content_hash)`);
+      return members.length;
     });
-    return true;
   } finally {
-    await store.removeTemporary(tempPath);
+    await rm(dir, { recursive: true, force: true });
   }
-}
-
-async function compactWorkerReports(db: DB): Promise<number> {
-  const rows = await db.execute(sql`
-    WITH eligible_jobs AS MATERIALIZED (
-      SELECT job.id
-      FROM sim_jobs job
-      WHERE job.status IN ('done', 'failed', 'cancelled')
-        AND job."ingestedAt" IS NOT NULL
-        AND (job.ingest_lease_token IS NULL OR job.ingest_lease_expires_at <= clock_timestamp())
-        AND NOT EXISTS (
-          SELECT 1
-          FROM progressive_worker_reports pending
-          WHERE pending.sim_job_id = job.id
-            AND pending.acknowledged_at IS NULL
-        )
-    ),
-    candidate_pool AS MATERIALIZED (
-      SELECT report.sim_job_id, report.sequence
-      FROM progressive_worker_reports report
-      JOIN eligible_jobs job ON job.id = report.sim_job_id
-      WHERE report.archive_bundle_id IS NULL
-        AND report.archived_at IS NULL
-        AND report.acknowledged_at IS NOT NULL
-        AND jsonb_typeof(report.report->'result') = 'object'
-      ORDER BY report.created_at, report.sim_job_id, report.sequence
-      LIMIT ${COMPACTION_CANDIDATE_LIMIT}
-    ),
-    candidates AS MATERIALIZED (
-      SELECT pool.sim_job_id, pool.sequence
-      FROM candidate_pool pool
-      WHERE progressive_worker_report_compaction_safe(pool.sim_job_id, pool.sequence)
-      LIMIT ${COMPACTION_REPORT_LIMIT}
-    )
-    UPDATE progressive_worker_reports report SET
-      archived_at=clock_timestamp(),
-      result_payload_hash=NULL,
-      report=progressive_report_compact_header(report.report)
-    FROM candidates
-    WHERE report.sim_job_id=candidates.sim_job_id AND report.sequence=candidates.sequence
-    RETURNING report.sim_job_id
-  `);
-  await db.execute(sql`
-    WITH candidates AS MATERIALIZED (
-      SELECT conflict.sim_job_id, conflict.sequence
-      FROM progressive_worker_report_conflicts conflict
-      JOIN sim_jobs job ON job.id = conflict.sim_job_id
-      WHERE conflict.archived_at IS NULL
-        AND job.status IN ('done', 'failed', 'cancelled')
-        AND job."ingestedAt" IS NOT NULL
-        AND (job.ingest_lease_token IS NULL OR job.ingest_lease_expires_at <= clock_timestamp())
-        AND NOT EXISTS (
-          SELECT 1
-          FROM progressive_worker_reports report
-          WHERE report.sim_job_id = conflict.sim_job_id
-            AND report.archived_at IS NULL
-        )
-      ORDER BY conflict.created_at, conflict.sim_job_id, conflict.sequence
-      LIMIT 256
-    )
-    UPDATE progressive_worker_report_conflicts conflict SET
-      archived_at=clock_timestamp(),
-      report=progressive_report_compact_header(conflict.report)
-    FROM candidates
-    WHERE conflict.sim_job_id = candidates.sim_job_id
-      AND conflict.sequence = candidates.sequence
-  `);
-  await db.execute(sql`
-    DELETE FROM progressive_report_result_payloads payload
-    WHERE NOT EXISTS (SELECT 1 FROM progressive_worker_reports worker WHERE worker.result_payload_hash=payload.content_hash)
-      AND NOT EXISTS (SELECT 1 FROM progressive_remote_reports remote WHERE remote.result_payload_hash=payload.content_hash)
-  `);
-  return rows.length;
 }
 
 export async function runProgressiveReportArchiveService(
   db: DB,
   signal: AbortSignal,
 ): Promise<void> {
-  const role = deploymentRole();
-  const bucket = bucketFromEnv();
-  const store = role === "hub" && bucket
-    ? new ProgressiveReportArchiveStore(bucket)
-    : null;
+  const source: Source =
+    configuredDeploymentRole() === "remote-solver" ? "worker" : "remote";
+  const bucket = process.env.AIRFOILFOAM_EVIDENCE_BUCKET?.trim();
+  const store =
+    source === "remote" && bucket
+      ? new ProgressiveReportArchiveStore(bucket)
+      : null;
+  if (source === "remote" && !store) {
+    // Standalone installations without cloud storage leave full reports inline.
+    if (!signal.aborted)
+      await new Promise<void>((resolve) =>
+        signal.addEventListener("abort", () => resolve(), { once: true }),
+      );
+    return;
+  }
+  const upload: PutFile = store
+    ? store.putFile.bind(store)
+    : async (path, identity, _source, id, member) => {
+        const remote = await putWorkerReportBundle(db, path, identity, id);
+        const probe = {
+          ...remote,
+          sourceKind: "worker" as const,
+          memberKind: member.kind,
+          executionId: id,
+          sequence: member.sequence,
+          signature: member.signature,
+          reportSha256: member.sha256,
+          reportByteSize: member.bytes,
+        };
+        try {
+          await readWorkerReportArchiveText(db, probe, { upstreamOnly: true });
+        } catch (error) {
+          if (!(error instanceof WorkerReportFetchDisabled)) throw error;
+          await retainWorkerReportVolume(path, remote);
+          await readWorkerReportArchiveText(db, probe);
+        }
+        return remote;
+      };
+  let after: string | null = null;
   while (!signal.aborted) {
+    let waitMs = 30000;
+    let current: string | null = null;
     try {
-      if (store) {
-        const [candidate] = await db.execute(sql`
-          SELECT job.id
-          FROM sim_jobs job
-          JOIN progressive_remote_dispatches dispatch ON dispatch.sim_job_id=job.id
-          JOIN sync_sweep_promises promise ON promise.id=dispatch.promise_id
-          WHERE job.status IN ('done','failed','cancelled')
-            AND job."ingestedAt" IS NOT NULL
-            AND (job.ingest_lease_token IS NULL OR job.ingest_lease_expires_at<=clock_timestamp())
-            AND promise.status <> 'active'
-            AND NOT EXISTS (SELECT 1 FROM progressive_report_archive_bundles bundle
-              WHERE bundle.source_kind='remote' AND bundle.sim_job_id=job.id)
-            AND EXISTS (SELECT 1 FROM progressive_remote_reports report
-              WHERE report.sim_job_id=job.id AND report.archive_bundle_id IS NULL)
-          ORDER BY coalesce(job."finishedAt",job."updatedAt"),job.id LIMIT 1
-        `);
-        if (candidate && await archiveRemoteExecution(db, store, String(candidate.id)))
-          console.log(JSON.stringify({component:"progressive-report-archive", executionId:String(candidate.id), source:"remote"}));
+      const jobs: { id: string | null; last_id: string | null }[] =
+        await db.execute<{
+          id: string | null;
+          last_id: string | null;
+        }>(sql`WITH batch AS MATERIALIZED (
+        SELECT j.id FROM sim_jobs j WHERE j.status IN ('done','failed','cancelled') AND j."ingestedAt" IS NOT NULL
+          ${after ? sql`AND j.id>${after}::uuid` : sql``} ORDER BY j.id LIMIT 64
+      ), eligible AS (SELECT job.id ${owner(source)} JOIN batch ON batch.id=job.id WHERE ${closedScope(source)}
+        AND (EXISTS (SELECT 1 FROM ${reportTable(source)} r
+          WHERE r.sim_job_id=job.id AND r.archived_at IS NULL)
+          ${
+            source === "worker"
+              ? sql`OR EXISTS (SELECT 1 FROM progressive_worker_report_conflicts c
+            WHERE c.sim_job_id=job.id AND c.archived_at IS NULL AND c.body_source_sequence IS NULL)`
+              : sql``
+          })
+        ORDER BY job.id LIMIT 1)
+        SELECT (SELECT id FROM eligible) AS id, (SELECT id FROM batch ORDER BY id DESC LIMIT 1) AS last_id`);
+      const job = jobs[0];
+      if (job?.id) {
+        current = String(job.id);
+        after = current;
+        const n = await archiveProgressiveReportBatch(
+          db,
+          source,
+          current,
+          upload,
+        );
+        if (n)
+          console.info(
+            JSON.stringify({
+              component: "progressive-report-archive",
+              source,
+              executionId: current,
+              members: n,
+            }),
+          );
+        waitMs = 100;
       } else {
-        const compacted = await compactWorkerReports(db);
-        if (compacted)
-          console.log(JSON.stringify({component:"progressive-report-compaction", compacted}));
+        after = job?.last_id ?? null;
+        if (after) waitMs = 100;
       }
     } catch (error) {
-      console.error("[sweeper] progressive report archive/compaction failed:", error instanceof Error ? error.message : String(error));
+      console.error(
+        "[sweeper] report archive",
+        source,
+        current,
+        error instanceof Error ? error.message : String(error),
+      );
+      if (current) waitMs = 1500;
     }
     try {
-      await delay(30_000, undefined, {signal});
+      await delay(waitMs, undefined, { signal });
+    } catch (error) {
+      if (!signal.aborted) throw error;
+    }
+  }
+}
+
+// Older rejected deliveries contain two independent copies of the same JSON.
+// The DB trigger compares exact bytes before it replaces either with a pointer.
+export async function runDuplicateReportCleanup(
+  db: DB,
+  signal: AbortSignal,
+): Promise<void> {
+  let cursor: { job: string; sequence: number } | undefined;
+  while (!signal.aborted) {
+    let pause = 60_000;
+    try {
+      const [page] = await db.execute(sql`
+        WITH selected AS MATERIALIZED (
+          SELECT c.sim_job_id,c.sequence FROM progressive_worker_report_conflicts c
+          WHERE c.body_source_sequence IS NULL AND c.archived_at IS NULL
+            ${cursor ? sql`AND (c.sim_job_id,c.sequence)>(${cursor.job}::uuid,${cursor.sequence})` : sql``}
+          ORDER BY c.sim_job_id,c.sequence LIMIT 12 FOR UPDATE SKIP LOCKED
+        ), changed AS (
+          UPDATE progressive_worker_report_conflicts c SET body_source_sequence=c.sequence
+          FROM selected WHERE c.sim_job_id=selected.sim_job_id AND c.sequence=selected.sequence
+            AND c.body_source_sequence IS NULL AND c.archived_at IS NULL RETURNING c.sequence
+        )
+        SELECT selected.sim_job_id,selected.sequence,(SELECT count(*) FROM changed) AS linked
+        FROM selected ORDER BY selected.sim_job_id DESC,selected.sequence DESC LIMIT 1
+      `);
+      if (page) {
+        cursor = {
+          job: String(page.sim_job_id),
+          sequence: Number(page.sequence),
+        };
+        pause = 100;
+        if (Number(page.linked))
+          console.info(
+            JSON.stringify({
+              component: "progressive-duplicate-reports",
+              linked: Number(page.linked),
+            }),
+          );
+      } else cursor = undefined;
+    } catch (error) {
+      console.error(
+        "[sweeper] duplicate report cleanup failed:",
+        error instanceof Error ? error.message : String(error),
+      );
+    }
+    try {
+      await delay(pause, undefined, { signal });
     } catch (error) {
       if (!signal.aborted) throw error;
     }

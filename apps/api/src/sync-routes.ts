@@ -133,6 +133,12 @@ import {
 import { env } from "./env";
 import { makeEngineClient } from "./engine-client";
 import { mediaStore } from "./media-store";
+import { readStoredForceHistory } from "./solver-history-reader";
+import { readStoredResultHistories } from "./result-history-reader";
+import {
+  hasArchivedResultHistory,
+  resultHistoriesMatch,
+} from "@aerodb/db/result-history-storage";
 import {
   parseRemoteSolverHealth,
   remoteSolverHealthSchema,
@@ -143,6 +149,8 @@ import {
   revokeSolverEvidenceUploads,
   verifyBrokeredEvidenceUpload,
 } from "./remote-evidence-broker";
+import { registerReportArchiveBrokerRoutes } from "./report-archive-broker";
+import { registerLegacyWorkerReportReadRoutes } from "./legacy-worker-report-read";
 import {
   SYNC_POLAR_MULTIPART_MAX_FIELDS,
   SYNC_POLAR_MULTIPART_MAX_FILES,
@@ -2734,10 +2742,11 @@ async function prepareBrokeredArchiveRegistration(
   return { upload, evidenceBase, memberSet: parsed.memberSet };
 }
 
-function equivalentResult(
+async function equivalentResult(
+  tx: DB,
   row: typeof results.$inferSelect,
   point: z.infer<typeof polarPointSchema>,
-): boolean {
+): Promise<boolean> {
   const cmp = (a: number | null | undefined, b: number | null | undefined) => {
     if (a == null && b == null) return true;
     if (a == null || b == null) return false;
@@ -2748,6 +2757,12 @@ function equivalentResult(
     stableHash(a ?? null) === stableHash(b ?? null);
   const normalizedSource = point.status === "done" ? "solved" : point.source;
   const normalizedRegime = point.regime ?? (point.unsteady ? "urans" : "rans");
+  const archiveBacked = Boolean(
+    row.frameTrackArchiveId ||
+      row.steadyHistoryArchiveId ||
+      hasArchivedResultHistory(row.frameTrack) ||
+      hasArchivedResultHistory(row.steadyHistory),
+  );
   return (
     row.status === point.status &&
     row.source === normalizedSource &&
@@ -2772,8 +2787,13 @@ function equivalentResult(
     cmp(row.strouhal, point.strouhal) &&
     row.error === (point.error ?? null) &&
     sameJson(row.qualityWarnings, point.qualityWarnings) &&
-    sameJson(row.frameTrack, point.frameTrack) &&
-    sameJson(row.steadyHistory, point.steadyHistory)
+    (archiveBacked
+      ? await resultHistoriesMatch(tx, row.id, {
+          frameTrack: point.frameTrack ?? null,
+          steadyHistory: point.steadyHistory ?? null,
+        })
+      : sameJson(row.frameTrack, point.frameTrack) &&
+        sameJson(row.steadyHistory, point.steadyHistory))
   );
 }
 
@@ -5072,7 +5092,10 @@ export async function importPolarPush(
         await acquireResultEvidenceLocks(tx, [existing.id]);
       } else if (progressivePoint) {
         kind = "equivalent";
-      } else if (exactStorageOnlyReplay || equivalentResult(existing, point)) {
+      } else if (
+        exactStorageOnlyReplay ||
+        (await equivalentResult(tx, existing, point))
+      ) {
         if (!ownedContinuation && !exactReplayAttempt) {
           return { kind: "conflict" as const, existing };
         }
@@ -5552,11 +5575,12 @@ export async function importPolarPush(
           .onConflictDoNothing()
           .returning({ id: forceHistory.id });
         if (!insertedAssociation) {
-          const [replayed] = await tx
+          const [storedForceHistory] = await tx
             .select()
             .from(forceHistory)
             .where(eq(forceHistory.resultAttemptId, attempt.id))
             .limit(1);
+          const replayed = storedForceHistory ? await readStoredForceHistory(tx as unknown as DB, storedForceHistory) : undefined;
           const comparable = (row: typeof association) => ({
             t: row.t,
             cl: row.cl,
@@ -7066,6 +7090,30 @@ async function runUpstreamSync(
 
 export async function registerSyncRoutes(app: FastifyInstance): Promise<void> {
   await ensureSyncRows();
+  await registerLegacyWorkerReportReadRoutes(app, {
+    authenticate: requireRegisteredRemoteSolver,
+    permit: async () => {
+      const context = await getSettings();
+      return (
+        context.settings.enabled &&
+        Boolean(context.permissions.find((row) => row.dataType === "evidence_artifacts")?.canFetch)
+      );
+    },
+  });
+  await registerReportArchiveBrokerRoutes(app, {
+    db,
+    authenticate: requireRegisteredRemoteSolver,
+    permit: async (direction) => {
+      const context = await getSettings();
+      const permission = context.permissions.find(
+        (row) => row.dataType === "evidence_artifacts",
+      );
+      return (
+        context.settings.enabled &&
+        Boolean(direction === "push" ? permission?.canPush : permission?.canFetch)
+      );
+    },
+  });
   app.get("/api/sync/v1/progressive-executions", async (req, reply) => {
     const solver = await requireRegisteredRemoteSolver(req, reply);
     if (!solver) return;
@@ -8422,10 +8470,16 @@ export async function registerSyncRoutes(app: FastifyInstance): Promise<void> {
         const revisionSignatureById = new Map(
           revisionRows.map((row) => [row.id, row.signatureHash]),
         );
-        items.push(
-          ...rows.map((row) =>
+        for (const row of rows) {
+          const hydrated = await readStoredResultHistories(db, row);
+          const {
+            steadyHistoryArchiveId: _steadyArchive,
+            frameTrackArchiveId: _frameArchive,
+            ...exported
+          } = hydrated;
+          items.push(
             exportRow(type, {
-              ...row,
+              ...exported,
               remoteResultId: row.id,
               airfoilSlug: airfoilSlugById.get(row.airfoilId) ?? null,
               simulationPresetSignatureHash: row.simulationPresetRevisionId
@@ -8433,8 +8487,8 @@ export async function registerSyncRoutes(app: FastifyInstance): Promise<void> {
                   null)
                 : null,
             }),
-          ),
-        );
+          );
+        }
       } else if (type === "evidence_artifacts") {
         const rows = await db
           .select()

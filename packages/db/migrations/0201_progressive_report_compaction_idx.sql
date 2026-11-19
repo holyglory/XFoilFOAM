@@ -1,6 +1,4 @@
-CREATE INDEX IF NOT EXISTS progressive_worker_reports_compaction_order_idx
-  ON progressive_worker_reports(created_at, sim_job_id, sequence)
-  WHERE acknowledged_at IS NOT NULL
-    AND archive_bundle_id IS NULL
-    AND archived_at IS NULL
-    AND jsonb_typeof(report->'result') = 'object';
+-- Withdrawn during rollout. Evaluating the JSON predicate reads hundreds of GB
+-- of TOAST data while holding a writer-blocking lock. Migration 0202 removes
+-- the index on installations that already built it and uses metadata keys.
+SELECT 1;

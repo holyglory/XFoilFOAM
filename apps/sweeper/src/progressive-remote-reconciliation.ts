@@ -4,6 +4,7 @@ import {
   PROGRESSIVE_REMOTE_START_AUTHORIZATION_MS,
   settleProgressiveWorkerFinalReport,
   settleProgressiveWorkerExpiredFinalReport,
+  workerEvidenceDeliverySettled,
   type DB,
 } from "@aerodb/db";
 import {
@@ -94,12 +95,13 @@ export async function reconcileProgressiveRemoteWorker(
   if (options.jobIds?.length === 0) return receipt;
   const finalMirrors = await db.execute(sql`
     WITH active_jobs AS MATERIALIZED (
-      SELECT id, request_payload, "updatedAt" FROM sim_jobs
+      SELECT id, request_payload, "updatedAt",
+        status IN ('done','failed','cancelled') AND "ingestedAt" IS NULL AS terminal_uningested FROM sim_jobs
       WHERE status IN ('pending', 'submitted', 'running', 'ingesting')
         OR (status IN ('done', 'failed', 'cancelled') AND "ingestedAt" IS NULL)
         OR engine_state IN ('cancelling', 'cancel_pending')
     )
-    SELECT job.id FROM active_jobs job
+    SELECT job.id,job.terminal_uningested FROM active_jobs job
     JOIN sync_sweep_promises promise ON promise.id::text = job.request_payload->>'syncPromiseId'
     JOIN sync_api_settings settings ON settings.id = 1
     WHERE job.request_payload->>'remoteSolver' = 'true' AND job.request_payload ? 'remoteProgressiveExecution'
@@ -109,6 +111,9 @@ export async function reconcileProgressiveRemoteWorker(
       )
       AND promise.registered_solver_id = settings.remote_solver_registered_id
       AND promise.source_base_url = job.request_payload->>'upstreamBaseUrl'
+      AND (NOT job.terminal_uningested OR (
+        promise.status IN ('expired','cancelled') AND ${workerEvidenceDeliverySettled(sql`job.id`)}
+      ))
       AND EXISTS (SELECT 1 FROM progressive_worker_reports report WHERE report.sim_job_id = job.id
         AND report.stopped_engine_job_id = job.id::text)
       ${
@@ -124,6 +129,13 @@ export async function reconcileProgressiveRemoteWorker(
   await runWithConcurrency(finalMirrors, concurrency, async (job) => {
     const executionId = String(job.id);
     try {
+      if (job.terminal_uningested === true) {
+        if (await settleProgressiveWorkerExpiredFinalReport(db, executionId)) {
+          receipt.inspected += 1;
+          receipt.stopped += 1;
+        }
+        return;
+      }
       if (await settleProgressiveWorkerFinalReport(db, executionId)) {
         receipt.inspected += 1;
         receipt.stopped += 1;

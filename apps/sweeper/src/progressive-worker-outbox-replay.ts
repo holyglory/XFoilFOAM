@@ -1,3 +1,4 @@
+import { resolveStoredProgressiveReport } from "@aerodb/db/progressive-report-reader";
 import { canonicalRemoteHubBaseUrl } from "@aerodb/core";
 import {
   analysisContentHash,
@@ -247,7 +248,7 @@ export async function replayProgressiveWorkerOutbox(
           "Replay has no acknowledged exact stored source association",
         );
       const validated = validateProgressiveRemoteReport(
-        source.report,
+        await resolveStoredProgressiveReport(connection, "worker", source, input.executionId),
         envelope,
       );
       const report = validated.report;

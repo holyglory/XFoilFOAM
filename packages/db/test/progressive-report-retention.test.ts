@@ -78,6 +78,9 @@ async function fixture(
     (id uuid PRIMARY KEY, evidence_payload jsonb) ON COMMIT DROP`);
   await db.execute(sql`CREATE TEMP TABLE progressive_cfd_evidence
     (result_attempt_id uuid PRIMARY KEY, evidence_signature text) ON COMMIT DROP`);
+  // The cloned report FKs below reference the local archive catalog too.
+  await db.execute(sql`CREATE TEMP TABLE progressive_report_archive_bundles
+    (LIKE public.progressive_report_archive_bundles INCLUDING ALL) ON COMMIT DROP`);
   for (const table of historyTables) {
     await db.execute(sql`CREATE TEMP TABLE ${sql.identifier(table)}
       (LIKE ${sql.identifier("public")}.${sql.identifier(table)} INCLUDING ALL) ON COMMIT DROP`);

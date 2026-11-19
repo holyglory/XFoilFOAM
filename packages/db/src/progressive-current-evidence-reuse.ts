@@ -1,3 +1,4 @@
+import { resolveStoredProgressiveReport } from "./progressive-report-reader";
 import { sql } from "drizzle-orm";
 import type { DB } from "./client";
 import { analysisContentHash, canonicalAnalysisJson } from "./analysis-target";
@@ -174,7 +175,7 @@ async function reuseCurrentUnit(db: DB, candidate: Candidate): Promise<"reused" 
         const [reported] = await connection.execute(sql`SELECT resolve_progressive_report(to_jsonb(progressive_remote_reports.*)) AS report,content_signature FROM progressive_remote_reports
           WHERE sim_job_id=${row.job_id}::uuid ORDER BY sequence DESC LIMIT 1`);
         requireProof(reported, "successor cancellation report missing");
-        const validated = await authenticate(() => validateProgressiveRemoteReport(reported.report, envelope));
+        const validated = await authenticate(async () => validateProgressiveRemoteReport(await resolveStoredProgressiveReport(connection, "remote", reported, String(row.job_id)), envelope));
         requireProof(validated.contentSignature === reported.content_signature && isFinalProgressiveRemoteReport(validated.report) &&
           validated.report.stopProof?.ownership_basis === "never_started_cancellation_fence", "successor cancellation was not authenticated");
       }

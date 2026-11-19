@@ -1,3 +1,4 @@
+import { resolveStoredProgressiveReport } from "@aerodb/db/progressive-report-reader";
 import {
   analysisContentHash,
   progressiveReportedPointSources,
@@ -99,7 +100,7 @@ export async function existingProgressiveReportAttempts(
       return null;
     const candidate = candidates[0];
     const previous = validateProgressiveRemoteReport(
-      candidate.report,
+      await resolveStoredProgressiveReport(db, "worker", candidate, report.executionId),
       envelope,
     );
     if (

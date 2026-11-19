@@ -1,0 +1,917 @@
+import { randomUUID } from "node:crypto";
+import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { createClient } from "@aerodb/db/client";
+import {
+  legacyInventorySql,
+  legacyNormalizeSql,
+  type LegacyReportScope,
+} from "@aerodb/db/legacy-report-storage";
+import {
+  LegacyHubGcsStore,
+  legacySha256,
+  type LegacyBackupObject,
+  type LegacyBackupStore,
+} from "../src/legacy-report-storage-gcs";
+import {
+  decodeLegacyPage,
+  encodeLegacyPage,
+  inspectLegacyPage,
+  exportLegacyReports,
+  LegacySshReader,
+  readLegacyPage,
+  type LegacySqlReader,
+  type LegacyBackupReceipt,
+} from "../src/legacy-report-storage";
+import { legacyReportStorageCli } from "../src/legacy-report-storage-cli";
+import {
+  applyVerifiedLegacyPage,
+  migrateLegacyReceipts,
+  legacyNormalizationTelemetry,
+  type LegacyPageNormalizer,
+} from "../src/legacy-report-storage-migration";
+import { readLegacyPageMember } from "@aerodb/db/legacy-report-storage-codec";
+
+// Dedicated operator integration: existing report tests exercise dispatched work,
+// not an SSH copy with NO dispatch, full conflict backup and local-only restore.
+// No production DB, SSH, metadata service, GCS account or solver is contacted.
+class MemoryBackup implements LegacyBackupStore {
+  objects = new Map<string, Buffer>();
+  corrupt = false;
+  failAfterPut = false;
+  async put(objectKey: string, bytes: Buffer): Promise<LegacyBackupObject> {
+    const existing = this.objects.get(objectKey);
+    if (existing && !existing.equals(bytes))
+      throw new Error("immutable conflict");
+    this.objects.set(objectKey, Buffer.from(bytes));
+    if (this.failAfterPut)
+      throw new Error("interrupted after immutable upload");
+    return {
+      bucket: "backup-test",
+      objectKey,
+      generation: "90071992547409931",
+      sha256: legacySha256(bytes),
+      byteSize: bytes.length,
+      crc32c: "AAAAAA==",
+      verifiedAt: "2026-11-19T00:00:00Z",
+    };
+  }
+  async read(object: LegacyBackupObject) {
+    return this.corrupt
+      ? Buffer.from("corrupt")
+      : Buffer.from(this.objects.get(object.objectKey)!);
+  }
+}
+
+let client: ReturnType<typeof createClient>;
+const paths: string[] = [];
+beforeAll(async () => {
+  if (
+    process.env.LEGACY_REPORT_STORAGE_DISPOSABLE_DB !== "1" ||
+    !process.env.DATABASE_URL
+  )
+    throw new Error(
+      "Use a governed check with LEGACY_REPORT_STORAGE_DISPOSABLE_DB=1 and a dedicated empty PostgreSQL",
+    );
+  client = createClient({ max: 1 });
+  const [existing] =
+    await client.sql`SELECT to_regclass('public.progressive_worker_reports') AS present`;
+  if (existing.present)
+    throw new Error(
+      "Legacy fixture refuses a database with existing report tables",
+    );
+  await client.sql
+    .unsafe(
+      `
+    CREATE FUNCTION reject_progressive_artifact_update() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'immutable'; END $$;
+    CREATE FUNCTION protect_progressive_worker_report() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$;
+    CREATE TABLE progressive_worker_reports(sim_job_id uuid NOT NULL, sequence bigint NOT NULL, content_signature text NOT NULL,
+      report jsonb NOT NULL, created_at timestamptz DEFAULT clock_timestamp(), acknowledged_at timestamptz,
+      archived_at timestamptz, archive_bundle_id uuid, PRIMARY KEY(sim_job_id,sequence));
+    CREATE TRIGGER progressive_worker_report_immutable BEFORE UPDATE ON progressive_worker_reports
+      FOR EACH ROW EXECUTE FUNCTION protect_progressive_worker_report();
+    CREATE TABLE progressive_remote_reports(sim_job_id uuid NOT NULL, sequence bigint NOT NULL, content_signature text NOT NULL,
+      report jsonb NOT NULL, received_at timestamptz DEFAULT clock_timestamp(), PRIMARY KEY(sim_job_id,sequence));
+    CREATE TRIGGER progressive_remote_reports_immutable BEFORE UPDATE ON progressive_remote_reports
+      FOR EACH ROW EXECUTE FUNCTION reject_progressive_artifact_update();
+    CREATE TABLE progressive_worker_report_conflicts(sim_job_id uuid NOT NULL, sequence bigint NOT NULL,
+      content_signature text NOT NULL, report jsonb NOT NULL, reason text, created_at timestamptz DEFAULT clock_timestamp(),
+      archived_at timestamptz,archive_bundle_id uuid,PRIMARY KEY(sim_job_id,sequence));
+    CREATE TABLE progressive_remote_dispatches(sim_job_id uuid PRIMARY KEY,solver_id uuid);
+  `,
+    )
+    .simple();
+  // Real versioned 0198 functions, checks and immutable representation guards.
+  await client.sql
+    .unsafe(
+      await readFile(
+        fileURLToPath(
+          new URL(
+            "../../../packages/db/migrations/0198_progressive_report_result_payloads.sql",
+            import.meta.url,
+          ),
+        ),
+        "utf8",
+      ),
+    )
+    .simple();
+  const aliasMigration = await readFile(
+    fileURLToPath(
+      new URL(
+        "../../../packages/db/migrations/0203_redundant_report_conflicts.sql",
+        import.meta.url,
+      ),
+    ),
+    "utf8",
+  );
+  await client.sql.unsafe(
+    "ALTER TABLE public.progressive_worker_report_conflicts ADD COLUMN body_source_sequence bigint",
+  );
+  // Use the real source-resolution view. Its alias mutation guards are covered
+  // by the existing 0203 suite; this operator never changes an alias.
+  await client.sql
+    .unsafe(
+      aliasMigration.slice(
+        aliasMigration.indexOf(
+          "CREATE VIEW progressive_worker_conflict_storage",
+        ),
+      ),
+    )
+    .simple();
+}, 30000);
+afterAll(async () => {
+  await client?.sql.end();
+  for (const path of paths) await rm(path, { recursive: true, force: true });
+});
+
+const source: LegacySqlReader = {
+  async query(query, maxBytes) {
+    try {
+      const result = await client.sql.unsafe(query).simple();
+      const statements = Array.from(result) as unknown[];
+      const rows = statements.flatMap((item) =>
+        Array.isArray(item) ? item : [item],
+      );
+      const texts = rows
+        .map((row) => Object.values(row as Record<string, unknown>)[0])
+        .filter((v): v is string => typeof v === "string");
+      if (Buffer.byteLength(texts.join("\n")) > maxBytes)
+        throw new Error("bounded source output");
+      return texts.map((value) => JSON.parse(value));
+    } catch (error) {
+      await client.sql.unsafe("ROLLBACK");
+      throw error;
+    }
+  },
+};
+async function fixture(conflicts = true): Promise<LegacyReportScope> {
+  await client.sql`UPDATE public.progressive_report_storage_policy SET normalization_enabled=false`;
+  const executionId = randomUUID();
+  const solverId = randomUUID();
+  const common = `"version":1,"executionId":"${executionId}","solverId":"${solverId}","status":{"state":"failed","unknown":"retained"}`;
+  // Sparse sequences, absent versus null, huge integer, scale and unknown fields.
+  for (const sequence of [1, 3, 8, 9, 10]) {
+    const result =
+      sequence === 9
+        ? ',"result":null'
+        : sequence === 10
+          ? ""
+          : ',"result":{"state":"failed","large":900719925474099312345678901234567890,"precise":0.100000000000000000001,"unknown":"' +
+            "retained".repeat(20000) +
+            '"}';
+    await client.sql`INSERT INTO public.progressive_worker_reports(sim_job_id,sequence,content_signature,report)
+      VALUES (${executionId},${sequence},${String(sequence).padStart(64, "a")},${`{${common},"sequence":${sequence}${result}}`}::jsonb)`;
+  }
+  if (conflicts)
+    await client.sql`INSERT INTO public.progressive_worker_report_conflicts(sim_job_id,sequence,content_signature,report,reason)
+    VALUES (${executionId},3,${"f".repeat(64)},${`{${common},"sequence":3,"result":{"untrusted":true,"number":999999999999999999999.0001}}`}::jsonb,'original conflict')`;
+  return {
+    version: 1,
+    sourceInstance: "hz-fixture",
+    solverId,
+    measuredAt: "2026-11-19T00:00:00Z",
+    executions: [
+      {
+        executionId,
+        reports: 5,
+        reportHighWater: 10,
+        conflicts: conflicts ? 1 : 0,
+        conflictHighWater: conflicts ? 3 : 0,
+      },
+    ],
+  };
+}
+async function directory() {
+  const path = await mkdtemp(join(tmpdir(), "legacy-reports-"));
+  paths.push(path);
+  return path;
+}
+async function execute(query: string) {
+  try {
+    return await client.sql.unsafe(query).simple();
+  } catch (error) {
+    await client.sql.unsafe("ROLLBACK");
+    throw error;
+  }
+}
+async function logical(executionId: string) {
+  return client.sql`SELECT sequence,content_signature,to_jsonb(r.*)-'report'-'result_payload_hash' AS metadata,
+    public.resolve_progressive_report(to_jsonb(r.*))::text AS text FROM public.progressive_worker_reports r
+    WHERE sim_job_id=${executionId} ORDER BY sequence`;
+}
+
+describe.sequential("worker-only legacy backup and 0198 representation", () => {
+  it("reports copy, newly normalized rows, retained bodies, idempotent replay and unknown hooks distinctly", async () => {
+    const scope = await fixture(false),
+      store = new MemoryBackup();
+    const base = {
+      scope,
+      store,
+      source,
+      sourceBinding: "telemetry",
+      rows: 16,
+      pages: 1,
+    };
+    const copied = await exportLegacyReports({
+      ...base,
+      directory: await directory(),
+    });
+    expect(copied).toMatchObject({
+      reportRowsVerified: 5,
+      archiveMembersVerified: 5,
+      sourceDatabaseWrites: false,
+      rowsNewlyNormalized: 0,
+      archiveMembersReleased: 0,
+      migrationTransactionsCommitted: 0,
+    });
+    await client.sql`UPDATE public.progressive_report_storage_policy SET normalization_enabled=true`;
+    const applyVerifiedPage = async (
+      page: import("../src/legacy-report-storage").LegacyBackupPage,
+    ) => {
+      await client.sql.unsafe(
+        "DROP TABLE IF EXISTS pg_temp.legacy_report_storage_changes",
+      );
+      await execute(
+        legacyNormalizeSql(page.members, {
+          apply: true,
+          readersReady: true,
+          trackChanges: true,
+        }),
+      );
+      const [changes] =
+        await client.sql`SELECT coalesce(sum(newly_normalized),0)::int AS n FROM pg_temp.legacy_report_storage_changes`;
+      return legacyNormalizationTelemetry(
+        {
+          verifiedReports: page.members.length,
+          normalizedReports: 3,
+          rowProofs: [],
+          newlyNormalizedReports: changes.n,
+          transactionCommitted: true,
+        },
+        page.members.length,
+      );
+    };
+    const migrated = await exportLegacyReports({
+      ...base,
+      directory: await directory(),
+      applyVerifiedPage,
+    });
+    expect(migrated).toMatchObject({
+      reportRowsVerified: 5,
+      sourceReportRowsVerified: 5,
+      sourceReportBodiesRetained: 5,
+      sourceDatabaseWrites: true,
+      rowsNewlyNormalized: 3,
+      archiveMembersReleased: 0,
+      migrationTransactionsCommitted: 1,
+    });
+    const replay = await exportLegacyReports({
+      ...base,
+      directory: await directory(),
+      applyVerifiedPage,
+    });
+    expect(replay).toMatchObject({
+      reportRowsVerified: 5,
+      sourceReportRowsVerified: 5,
+      sourceReportBodiesRetained: 5,
+      sourceDatabaseWrites: false,
+      rowsNewlyNormalized: 0,
+      archiveMembersReleased: 0,
+      migrationTransactionsCommitted: 1,
+    });
+    const unknown = await exportLegacyReports({
+      ...base,
+      directory: await directory(),
+      applyVerifiedPage: async () => undefined,
+    });
+    expect(unknown).toMatchObject({
+      reportRowsVerified: 5,
+      sourceDatabaseWrites: null,
+      rowsNewlyNormalized: null,
+      archiveMembersReleased: null,
+    });
+  });
+
+  it("adopts copy-only receipts before its saved cursor, normalizes new pages, and retries a lost post-commit acknowledgement", async () => {
+    const scope = await fixture(false),
+      path = await directory(),
+      store = new MemoryBackup();
+    const before = await logical(scope.executions[0].executionId);
+    const copy = {
+      scope,
+      directory: path,
+      store,
+      source,
+      sourceBinding: "copy-mode",
+      rows: 2,
+      pages: 1,
+    };
+    await exportLegacyReports(copy);
+    const copiedState = await readFile(join(path, "checkpoint.json"), "utf8");
+    await expect(
+      exportLegacyReports({ ...copy, sourceBinding: "migrate-mode" }),
+    ).rejects.toThrow(/binding/);
+    expect(await readFile(join(path, "checkpoint.json"), "utf8")).toBe(
+      copiedState,
+    );
+    await client.sql`UPDATE public.progressive_report_storage_policy SET normalization_enabled=true`;
+    const normalizer: LegacyPageNormalizer = {
+      binding: "isolated-pg",
+      async apply(page) {
+        if (page.members.length)
+          await execute(
+            legacyNormalizeSql(page.members, {
+              apply: true,
+              readersReady: true,
+            }),
+          );
+        const [row] =
+          await client.sql`SELECT count(result_payload_hash)::int AS n FROM public.progressive_worker_reports WHERE sim_job_id=${scope.executions[0].executionId}`;
+        return {
+          verifiedReports: page.members.filter((m) => m.kind === "report")
+            .length,
+          normalizedReports: row.n,
+          rowProofs: [],
+        };
+      },
+    };
+    let lost = true;
+    const migrate = {
+      ...copy,
+      sourceBinding: "migrate-mode",
+      adoptCopy: {
+        sourceBinding: "copy-mode",
+        applyReceipts: async (
+          through: import("../src/legacy-report-storage").LegacyCursor,
+        ) => {
+          const result = await migrateLegacyReceipts({
+            scope,
+            directory: path,
+            store,
+            normalizer,
+            apply: true,
+            through,
+          });
+          expect(result.complete).toBe(true);
+        },
+      },
+      applyVerifiedPage: async (
+        page: import("../src/legacy-report-storage").LegacyBackupPage,
+        receipt: LegacyBackupReceipt,
+        receiptFile: string,
+      ) => {
+        await applyVerifiedLegacyPage({
+          page,
+          receipt,
+          receiptFile,
+          directory: path,
+          normalizer,
+        });
+        if (lost) {
+          lost = false;
+          throw new Error("lost acknowledgement after commit");
+        }
+      },
+    };
+    await expect(exportLegacyReports(migrate)).rejects.toThrow(
+      /lost acknowledgement/,
+    );
+    expect(
+      JSON.parse(await readFile(join(path, "checkpoint.json"), "utf8")).next
+        .after,
+    ).toBe(3);
+    expect(
+      (await readdir(path)).filter((name) => name.endsWith(".gz")),
+    ).toEqual(["pending.jsonl.gz"]);
+    expect(
+      (
+        await client.sql`SELECT count(result_payload_hash)::int AS n FROM public.progressive_worker_reports WHERE sim_job_id=${scope.executions[0].executionId}`
+      )[0].n,
+    ).toBe(3);
+    for (let page = 0; page < 8; page++)
+      if ((await exportLegacyReports(migrate)).complete) break;
+    expect(await logical(scope.executions[0].executionId)).toEqual(before);
+    expect(
+      (await readdir(path)).filter((name) => name.endsWith(".gz")),
+    ).toEqual([]);
+    expect(
+      (
+        await migrateLegacyReceipts({
+          scope,
+          directory: path,
+          store,
+          normalizer,
+          apply: true,
+        })
+      ).remaining,
+    ).toBe(0);
+  });
+
+  it("refuses adoption with a missing prefix receipt and authenticates exactly one member for custody readers", async () => {
+    const scope = await fixture(false),
+      path = await directory(),
+      store = new MemoryBackup();
+    const copy = {
+      scope,
+      directory: path,
+      store,
+      source,
+      sourceBinding: "copy",
+      rows: 2,
+      pages: 1,
+    };
+    const result = await exportLegacyReports(copy);
+    const name = result.receipts[0];
+    const receipt = JSON.parse(
+      await readFile(join(path, name), "utf8"),
+    ) as LegacyBackupReceipt;
+    const bytes = await store.read(receipt.object),
+      page = decodeLegacyPage(bytes, receipt),
+      first = page.members[0];
+    const identity = {
+      storedSha256: receipt.object.sha256,
+      storedByteSize: bytes.length,
+      scopeSha256: receipt.scopeSha256,
+      sourceInstance: scope.sourceInstance,
+      solverId: scope.solverId,
+      executionId: first.executionId,
+      sequence: first.sequence,
+      kind: first.kind,
+      contentSignature: first.contentSignature,
+      reportSha256: first.reportSha256,
+      reportByteSize: first.reportByteSize,
+    };
+    expect(readLegacyPageMember(bytes, identity)).toEqual(first);
+    expect(() =>
+      readLegacyPageMember(bytes, { ...identity, solverId: randomUUID() }),
+    ).toThrow(/identity/);
+    expect(() =>
+      readLegacyPageMember(bytes, { ...identity, sequence: 2 }),
+    ).toThrow(/missing/);
+    const state = await readFile(join(path, "checkpoint.json"), "utf8");
+    await rm(join(path, name));
+    const normalizer: LegacyPageNormalizer = {
+      binding: "pg",
+      apply: async () => {
+        throw new Error("must not normalize without coverage");
+      },
+    };
+    await expect(
+      exportLegacyReports({
+        ...copy,
+        sourceBinding: "migrate",
+        adoptCopy: {
+          sourceBinding: "copy",
+          applyReceipts: async (through) => {
+            await migrateLegacyReceipts({
+              scope,
+              directory: path,
+              store,
+              normalizer,
+              apply: true,
+              through,
+            });
+          },
+        },
+      }),
+    ).rejects.toThrow(/cover/);
+    expect(await readFile(join(path, "checkpoint.json"), "utf8")).toBe(state);
+  });
+
+  it("exports conflict alias source bytes before and after worker normalization and refuses missing/cold sources", async () => {
+    const scope = await fixture(false);
+    const executionId = scope.executions[0].executionId;
+    const [worker] =
+      await client.sql`SELECT report::text AS body,content_signature FROM public.progressive_worker_reports WHERE sim_job_id=${executionId} AND sequence=3`;
+    await client.sql`INSERT INTO public.progressive_worker_report_conflicts(sim_job_id,sequence,content_signature,report,reason,body_source_sequence)
+      SELECT sim_job_id,sequence,content_signature,jsonb_set(report,'{result}',public.progressive_report_result_header(report->'result'),false),'aliased original',sequence
+      FROM public.progressive_worker_reports WHERE sim_job_id=${executionId} AND sequence=3`;
+    scope.executions[0].conflicts = 1;
+    scope.executions[0].conflictHighWater = 3;
+    const page = await readLegacyPage(source, scope);
+    const conflict = page.members.find((m) => m.kind === "conflict")!;
+    expect(conflict.reportText).toBe(worker.body);
+    expect(conflict.rowText).toContain('"body_source_sequence": 3');
+    expect(conflict.rowText).not.toContain("retainedretained");
+    await client.sql`UPDATE public.progressive_report_storage_policy SET normalization_enabled=true`;
+    await execute(
+      legacyNormalizeSql(page.members, { apply: true, readersReady: true }),
+    );
+    expect(
+      (await readLegacyPage(source, scope)).members.find(
+        (m) => m.kind === "conflict",
+      )!.reportText,
+    ).toBe(worker.body);
+    await client.sql`UPDATE public.progressive_worker_report_conflicts SET body_source_sequence=2 WHERE sim_job_id=${executionId}`;
+    await expect(readLegacyPage(source, scope)).rejects.toThrow(
+      /missing source/,
+    );
+    await client.sql`UPDATE public.progressive_worker_report_conflicts SET body_source_sequence=3 WHERE sim_job_id=${executionId}`;
+    await client.sql`UPDATE public.progressive_worker_reports SET archive_bundle_id=${randomUUID()} WHERE sim_job_id=${executionId} AND sequence=3`;
+    await expect(readLegacyPage(source, scope)).rejects.toThrow(
+      /cold or missing/,
+    );
+  });
+
+  it("copies every sparse report/conflict, resumes after failure and preserves exact queries without a dispatch or cloud reader", async () => {
+    const scope = await fixture();
+    const path = await directory();
+    const store = new MemoryBackup();
+    const input = {
+      source,
+      store,
+      scope,
+      directory: path,
+      sourceBinding: "existing-ssh-fixture",
+      rows: 2,
+      maxBytes: 2_000_000,
+      pages: 1,
+    };
+    const before = await logical(scope.executions[0].executionId);
+    store.failAfterPut = true;
+    await expect(exportLegacyReports(input)).rejects.toThrow(/interrupted/);
+    expect(
+      JSON.parse(await readFile(join(path, "checkpoint.json"), "utf8")).next
+        .after,
+    ).toBe(0);
+    const pending = await readFile(join(path, "pending.jsonl.gz"));
+    expect(
+      (await readdir(path)).filter((name) => name.endsWith(".gz")),
+    ).toEqual(["pending.jsonl.gz"]);
+    // Process stopped after upload; an operator may normalize before resumption.
+    // Resumption must use the frozen transfer bytes, not reread changed storage.
+    await client.sql`UPDATE public.progressive_report_storage_policy SET normalization_enabled=true`;
+    await execute(
+      legacyNormalizeSql(inspectLegacyPage(pending).page.members, {
+        apply: true,
+        readersReady: true,
+      }),
+    );
+    store.failAfterPut = false;
+    const receipts: LegacyBackupReceipt[] = [];
+    const noSource: LegacySqlReader = {
+      query: async () => {
+        throw new Error("source is offline");
+      },
+    };
+    const resumed = await exportLegacyReports({ ...input, source: noSource });
+    for (const name of resumed.receipts)
+      receipts.push(JSON.parse(await readFile(join(path, name), "utf8")));
+    expect(
+      (await readdir(path)).filter((name) => name.endsWith(".gz")),
+    ).toEqual([]);
+    // Simulate death after durable checkpoint but before the pending-page drop.
+    await writeFile(join(path, "pending.jsonl.gz"), pending);
+    store.corrupt = true;
+    await expect(
+      exportLegacyReports({ ...input, source: noSource }),
+    ).rejects.toThrow(/proof/);
+    expect(
+      (await readFile(join(path, "pending.jsonl.gz"))).equals(pending),
+    ).toBe(true);
+    store.corrupt = false;
+    await exportLegacyReports({ ...input, source: noSource });
+    expect(
+      (await readdir(path)).filter((name) => name.endsWith(".gz")),
+    ).toEqual([]);
+    for (let page = 0; page < 12; page++) {
+      const result = await exportLegacyReports(input);
+      for (const name of result.receipts)
+        receipts.push(JSON.parse(await readFile(join(path, name), "utf8")));
+      if (result.complete) break;
+    }
+    expect(
+      JSON.parse(await readFile(join(path, "checkpoint.json"), "utf8")).next
+        .execution,
+    ).toBe(1);
+    const members = [];
+    for (const receipt of receipts)
+      members.push(
+        ...decodeLegacyPage(await store.read(receipt.object), receipt).members,
+      );
+    expect(members.map((m) => `${m.kind}:${m.sequence}`)).toEqual([
+      "report:1",
+      "report:3",
+      "report:8",
+      "report:9",
+      "report:10",
+      "conflict:3",
+    ]);
+    expect(members[0].reportText).toContain(
+      "900719925474099312345678901234567890",
+    );
+    expect(members[0].reportText).toContain("0.100000000000000000001");
+    expect(members[0].rowText).toContain("created_at");
+    expect(
+      (
+        await client.sql`SELECT count(*)::int AS n FROM public.progressive_remote_dispatches`
+      )[0].n,
+    ).toBe(0);
+    await client.sql`UPDATE public.progressive_report_storage_policy SET normalization_enabled=true`;
+    for (const receipt of receipts) {
+      const page = decodeLegacyPage(await store.read(receipt.object), receipt);
+      if (page.members.length)
+        await execute(
+          legacyNormalizeSql(page.members, { apply: true, readersReady: true }),
+        );
+    }
+    // The normal broker remains unavailable. Existing SQL reconstruction is sufficient.
+    store.corrupt = true;
+    expect(await logical(scope.executions[0].executionId)).toEqual(before);
+    const [dedup] =
+      await client.sql`SELECT count(*)::int AS n,count(DISTINCT result_payload_hash)::int AS payloads,
+      count(result_payload_hash)::int AS normalized,bool_and(archived_at IS NULL AND archive_bundle_id IS NULL) AS local
+      FROM public.progressive_worker_reports WHERE sim_job_id=${scope.executions[0].executionId}`;
+    expect(dedup).toEqual({ n: 5, payloads: 1, normalized: 3, local: true });
+    for (const member of members.filter((m) => m.kind === "report")) {
+      // Exact reapplication/readback remains idempotent, including absent/null.
+      await execute(
+        legacyNormalizeSql([member], { apply: true, readersReady: true }),
+      );
+    }
+    const [conflict] =
+      await client.sql`SELECT report::text AS text,reason FROM public.progressive_worker_report_conflicts WHERE sim_job_id=${scope.executions[0].executionId}`;
+    expect(conflict.text).toBe(
+      members.find((m) => m.kind === "conflict")!.reportText,
+    );
+    expect(conflict.reason).toBe("original conflict");
+    await client.sql`UPDATE public.progressive_report_storage_policy SET normalization_enabled=false`;
+    await execute(
+      legacyNormalizeSql(members, {
+        apply: true,
+        readersReady: true,
+        restoreInline: true,
+      }),
+    );
+    expect(await logical(scope.executions[0].executionId)).toEqual(before);
+    expect(
+      (
+        await client.sql`SELECT count(result_payload_hash)::int AS n FROM public.progressive_worker_reports WHERE sim_job_id=${scope.executions[0].executionId}`
+      )[0].n,
+    ).toBe(0);
+  });
+
+  it("refuses corruption, count drift, wrong solver, oversized rows, source rebinding and unsafe input", async () => {
+    const scope = await fixture(false);
+    const store = new MemoryBackup();
+    const path = await directory();
+    const input = {
+      source,
+      store,
+      scope,
+      directory: path,
+      sourceBinding: "owner-ssh",
+      rows: 16,
+    };
+    store.corrupt = true;
+    await expect(exportLegacyReports(input)).rejects.toThrow(/proof/);
+    expect(
+      JSON.parse(await readFile(join(path, "checkpoint.json"), "utf8")).next
+        .after,
+    ).toBe(0);
+    expect(
+      (await readdir(path)).filter((name) => name.endsWith(".gz")),
+    ).toEqual(["pending.jsonl.gz"]);
+    store.corrupt = false;
+    await expect(
+      readLegacyPage(source, scope, undefined, 2, 1),
+    ).rejects.toThrow(/budget/);
+    await expect(
+      readLegacyPage(source, { ...scope, solverId: randomUUID() }),
+    ).rejects.toThrow(/identity/);
+    await expect(
+      readLegacyPage(source, {
+        ...scope,
+        executions: [{ ...scope.executions[0], reports: 4 }],
+      }),
+    ).rejects.toThrow(/grew/);
+    const result = await exportLegacyReports(input);
+    expect(result.complete).toBe(true);
+    await expect(
+      exportLegacyReports({ ...input, sourceBinding: "another-host" }),
+    ).rejects.toThrow(/binding/);
+    expect(() => new LegacySshReader("-oProxyCommand=bad", "pg")).toThrow();
+    expect(() => new LegacySshReader("owner", "pg;evil")).toThrow();
+    expect(
+      (await readdir(path)).filter((name) => name.endsWith(".gz")),
+    ).toEqual([]);
+  });
+
+  it("rolls back the whole exact page on a changed/missing member, enforces policy and leaves acknowledgements alone", async () => {
+    const scope = await fixture(false);
+    const page = await readLegacyPage(source, scope);
+    expect(page.members).toHaveLength(5);
+    const executionId = scope.executions[0].executionId;
+    const before = await logical(executionId);
+    await expect(
+      execute(
+        legacyNormalizeSql(page.members, { apply: true, readersReady: true }),
+      ),
+    ).rejects.toThrow(/prerequisite/);
+    await client.sql`UPDATE public.progressive_report_storage_policy SET normalization_enabled=true`;
+    const changed = page.members.map((m, index) =>
+      index === 1 ? { ...m, reportSha256: "0".repeat(64) } : m,
+    );
+    await expect(
+      execute(legacyNormalizeSql(changed, { apply: true, readersReady: true })),
+    ).rejects.toThrow(/differs/);
+    expect(await logical(executionId)).toEqual(before);
+    await expect(
+      execute(
+        legacyNormalizeSql([{ ...page.members[0], sequence: 2 }], {
+          apply: true,
+          readersReady: true,
+        }),
+      ),
+    ).rejects.toThrow(/no rows/);
+    await execute(legacyNormalizeSql(page.members)); // ROLLBACK default
+    expect(
+      (
+        await client.sql`SELECT count(result_payload_hash)::int AS n FROM public.progressive_worker_reports WHERE sim_job_id=${executionId}`
+      )[0].n,
+    ).toBe(0);
+    await client.sql`UPDATE public.progressive_worker_reports SET acknowledged_at=clock_timestamp() WHERE sim_job_id=${executionId} AND sequence=1`;
+    const current = await logical(executionId);
+    await execute(
+      legacyNormalizeSql(page.members, { apply: true, readersReady: true }),
+    );
+    expect(await logical(executionId)).toEqual(current);
+  });
+
+  it("keeps short byte pages resumable and detects a missing source row without skipping it", async () => {
+    const scope = await fixture(false);
+    const first = await readLegacyPage(source, scope, undefined, 1);
+    const cost =
+      Buffer.byteLength(first.members[0].rowText) +
+      first.members[0].reportByteSize;
+    const page = await readLegacyPage(source, scope, undefined, 16, cost + 10);
+    expect(page.members).toHaveLength(1);
+    expect(page.next.after).toBe(1);
+    const second = await readLegacyPage(source, scope, page.next, 1);
+    expect(second.members[0].sequence).toBe(3);
+    const missing: LegacySqlReader = {
+      async query(sql, max) {
+        return sql.includes("WITH selected") ? [] : source.query(sql, max);
+      },
+    };
+    await expect(readLegacyPage(missing, scope)).rejects.toThrow(/missing/);
+    const packed = encodeLegacyPage(first);
+    expect(packed.bytes.length).toBeLessThan(cost);
+    const all = await readLegacyPage(source, scope);
+    const dictionary = inspectLegacyPage(encodeLegacyPage(all).bytes);
+    expect(dictionary.page.members).toEqual(all.members);
+    expect(dictionary.uniqueChunkBytes).toBeLessThan(
+      dictionary.decodedBytes * 0.7,
+    );
+    const sliced = {
+      ...scope,
+      executions: [
+        {
+          ...scope.executions[0],
+          reportAfter: 2,
+          reports: 2,
+          reportHighWater: 8,
+        },
+      ],
+    };
+    expect(
+      (await readLegacyPage(source, sliced)).members.map((m) => m.sequence),
+    ).toEqual([3, 8]);
+    expect(legacyInventorySql("worker")).toContain("READ ONLY");
+    expect(legacyInventorySql("hub")).toContain("hasDispatch");
+  });
+});
+
+describe("canonical hub identity and immutable object REST contract", () => {
+  it("creates only absent objects, pins generations and refuses corrupt/redirected/wrong-account reads", async () => {
+    const oldRole = process.env.DEPLOYMENT_ROLE;
+    process.env.DEPLOYMENT_ROLE = "hub";
+    const account = "canonical@test-project.iam.gserviceaccount.com";
+    const bytes = Buffer.from("exact gzip object bytes");
+    const key = `legacy-worker-reports/v1/hz/${randomUUID()}/${"a".repeat(64)}/${legacySha256(bytes)}.jsonl.gz`;
+    let present = false;
+    let badBytes = false;
+    let wrongAccount = false;
+    const requests: { url: string; init: RequestInit }[] = [];
+    const fetcher = (async (
+      input: string | URL | Request,
+      init: RequestInit = {},
+    ) => {
+      const url = String(input);
+      requests.push({ url, init });
+      expect(init.redirect).toBe("error");
+      if (url.endsWith("/email"))
+        return new Response(wrongAccount ? "other" : account, {
+          headers: { "Metadata-Flavor": "Google" },
+        });
+      if (url.endsWith("/token"))
+        return new Response(
+          JSON.stringify({
+            token_type: "Bearer",
+            access_token: "private-test-token",
+          }),
+          { headers: { "Metadata-Flavor": "Google" } },
+        );
+      if (url.includes("uploadType=media")) {
+        expect(url).toContain("ifGenerationMatch=0");
+        const status = present ? 412 : 200;
+        present = true;
+        return new Response("", { status });
+      }
+      if (url.includes("alt=media")) {
+        expect(url).toContain("generation=90071992547409931");
+        return new Response(
+          new Uint8Array(badBytes ? Buffer.from("bad") : bytes),
+        );
+      }
+      return new Response(
+        JSON.stringify({
+          generation: "90071992547409931",
+          size: String(bytes.length),
+          crc32c: "AAAAAA==",
+          contentType: "application/gzip",
+        }),
+      );
+    }) as typeof fetch;
+    try {
+      const store = new LegacyHubGcsStore("backup-test", account, fetcher);
+      const object = await store.put(key, bytes);
+      expect((await store.put(key, bytes)).generation).toBe(object.generation);
+      expect(requests.filter((r) => r.url.includes("alt=media")).length).toBe(
+        2,
+      );
+      badBytes = true;
+      await expect(store.read(object)).rejects.toThrow(/SHA256/);
+      badBytes = false;
+      wrongAccount = true;
+      await expect(store.read(object)).rejects.toThrow(/identity mismatch/);
+      await expect(
+        store.read({ ...object, bucket: "another-bucket" }),
+      ).rejects.toThrow(/bucket mismatch/);
+      expect(
+        requests
+          .filter((r) => r.url.includes("storage.googleapis.com"))
+          .every(
+            (r) =>
+              (r.init.headers as Record<string, string>).Authorization ===
+              "Bearer private-test-token",
+          ),
+      ).toBe(true);
+    } finally {
+      if (oldRole === undefined) delete process.env.DEPLOYMENT_ROLE;
+      else process.env.DEPLOYMENT_ROLE = oldRole;
+    }
+  });
+  it("plans without contacting SSH/GCS or creating a checkpoint and rejects unknown mutation switches", async () => {
+    const scope = await fixture(false);
+    const path = await directory();
+    const { writeFile } = await import("node:fs/promises");
+    await writeFile(join(path, "scope.json"), JSON.stringify(scope));
+    const output = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    try {
+      await legacyReportStorageCli([
+        "plan",
+        `--scope=${path}/scope.json`,
+        `--directory=${path}/not-created`,
+        "--ssh-host=existing-owner-hz",
+        "--container=existing-pg",
+        "--hub-ssh-host=existing-hub",
+        "--hub-container=existing-sweeper",
+        "--bucket=backup-test",
+        "--hub-service-account=canonical@test-project.iam.gserviceaccount.com",
+      ]);
+      const plan = JSON.parse(output.mock.calls[0][0]);
+      expect(plan.source.readOnly).toBe(true);
+      expect(plan.writes).toContain("none in plan");
+      expect(await readdir(path)).toEqual(["scope.json"]);
+      await expect(
+        legacyReportStorageCli(["copy", "--grant-dispatch"]),
+      ).rejects.toThrow();
+    } finally {
+      output.mockRestore();
+    }
+  });
+});

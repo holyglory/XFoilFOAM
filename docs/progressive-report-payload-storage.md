@@ -1,44 +1,20 @@
 # Lossless progressive report payload storage
 
-## Full report history and automatic compaction
+## Stored reports and automatic cleanup
 
-Migration `0200` adds immutable report archive bundles and members. On the hub,
-the sweeper writes completed remote report histories as gzip JSONL bundles to
-the configured `AIRFOILFOAM_EVIDENCE_BUCKET`. It verifies the generation,
-metadata, compressed byte size and SHA-256 by reading the object back before
-compacting the PostgreSQL report body.
+PostgreSQL keeps polar coefficients, report sequence numbers, signatures, rejection reasons and the records that tie a measured angle to its source. A completed execution can contain several angles. Cleanup checks each report's evidence before removing its full body from the database.
 
-The PostgreSQL row retains the execution id, sequence, signature, report
-identity, inventory, source rows, custody rows and the GCS archive pointer. The
-full report is removed from the row only after the archive member catalog is
-durable. Worker copies on `hz-solver2` are compacted after their report has been
-acknowledged by the hub and every evidence point is represented by a hub receipt
-or a terminal delivery conflict. The remote solver has no GCS credentials and
-does not receive any.
+The hub archives reports from its own dispatch records. HZ uploads through the registered solver's authenticated connection to the hub. The hub owns the Google Cloud Storage credentials. An outbox acknowledgement can also mean the hub rejected a delivery. Each compacted report therefore has its own archive member, exact body digest and immutable object generation.
 
-The sweeper report-storage service runs this process continuously. It selects only terminal
-executions with a completed ingestion stamp, an expired or cancelled promise,
-no live ingest lease and a verified stop report. Active reports and unresolved
-evidence remain inline. Report result payloads are deleted only after no report
-row references them.
+The sweeper processes bounded batches. It reads the full PostgreSQL JSON text, including explicit nulls and full-precision numbers. Consecutive snapshots with a long identical prefix or suffix store the shared text once in their gzip JSONL bundle. The writer reads the uploaded generation through to the end and verifies its compressed digest and member contents. A database transaction compares the original body to the verified archive member before replacing the body with its lookup metadata. Transient storage errors leave the original available for retry.
 
-Rejected worker-report conflicts retain their sequence, signature, reason and
-compact status header. Their oversized report bodies are compacted after every
-worker report for the same terminal execution has been compacted, because those
-conflicts are not solver results and are not needed by the delivery scheduler.
+HZ also reopens the report through its own reader. When the hub disables evidence downloads, HZ keeps one compressed working copy per object on its persistent results volume. The sweeper flushes the file and its directory to disk, reads it back and verifies it against the cloud receipt before shortening the database row. Both the worker API and the sweeper can then read the original samples. GCS credentials stay on the hub.
 
-The existing retained-report download route reads archived members from the
-generation-pinned GCS bundle, so compaction does not remove the exact report
-download or its signature verification. PostgreSQL `VACUUM FULL` is a separate
-operator action after the archive backlog is drained. The archive process never
-deletes solver result attempts, accepted polar points, evidence archives or
-custody metadata.
+A rejected delivery that contains the exact worker report can share that report's body immediately. The database compares their bytes, keeps the separate reason for rejection, and protects the reference to the original. Existing duplicate rejections are processed in batches. A rejection with different content retains its own body.
 
-Report history remains intact: sequence numbers, content signatures, creation and
-receipt timestamps, acknowledgements, inventories, source associations, and their
-foreign keys retain their existing identities. This implements architecture
-decision `nc641c0a4dcbe8649`; the prohibition on report-history deletion in
-`ne4afd84a6954d73a` still applies.
+Retained-report downloads and historical solver reads use the execution ID, sequence and signature to restore the selected report. Live jobs and reports still needed for evidence delivery remain available during the transfer. Result or campaign resets have separate operator workflows. PostgreSQL can reuse pages freed by an update. Measure relation sizes and filesystem free space separately when returning space to the host.
+
+Repeated live polls reuse the previous report when only the observation timestamp changes. A change in solver progress, coefficients, histories or stop evidence creates a new report.
 
 Migration `0198` adds an immutable, content-addressed
 `public.progressive_report_result_payloads` table and a nullable
@@ -119,28 +95,26 @@ These source files use only scalar envelope/identity/receipt state and stay raw:
 API retained-report downloads call the reconstructed DB reader; artifact serving
 uses stable evidence identities and stored artifacts.
 
-**Parent integration required before activation:** in the separately owned
-`apps/sweeper/src/progressive-restart-retention.ts`, replace the bounded lateral
-projection `SELECT sequence, report FROM progressive_worker_reports` with
-`SELECT sequence, public.resolve_progressive_report(to_jsonb(progressive_worker_reports.*)) AS report FROM progressive_worker_reports`.
-Keep its scalar selection predicates raw. This patch intentionally leaves that
-file, `retention-service.ts`, `retention.ts`, and their tests untouched. The
-existing `retention.ts` report query uses only pending acknowledgement identity.
+Restart-retention reads of complete worker reports use
+`public.resolve_progressive_report(to_jsonb(progressive_worker_reports.*))` and
+the installed archive reader for archived bodies. Scalar selection predicates
+remain raw. The `retention.ts` report query uses only pending acknowledgement
+identity.
 
 Deployment scripts' report-index completion, remote-engine maintenance guards,
 and the backpressure diagnostic use only metadata. The reset classifier treats
 payloads as solver/transport evidence and preserves the storage switch as
-execution metadata. No reset is part of this change. The legacy report-pruning
+execution metadata. Storage normalization does not require a reset. The legacy report-pruning
 function and CLI remain disabled.
 
 ## Staged rollout and rollback
 
 1. Apply `0198`. `progressive_report_storage_policy.normalization_enabled`
    defaults to false. Existing inline writers remain valid and unchanged.
-2. Upgrade **every** reader, including the parent-owned restart-retention read
+2. Upgrade **every** reader, including the restart-retention read
    above, across the hub and remote workers. Verify mixed reads, transport
    signatures, evidence delivery, terminal settlement and retained downloads.
-   The parent may stop writers to make this cutover atomic.
+   Stop writers when needed to make this cutover atomic.
 3. Only after that proof, explicitly activate normalized writes. There is one
    switch, shared by both report tables:
 
@@ -157,6 +131,7 @@ function and CLI remain disabled.
    Use `--table=remote` on the hub. The command reconstructs and validates each
    full report against its immutable execution envelope and original signature.
    It reports checked/normalized counts; an empty sample is not signature proof.
+
 5. Review a dry-run batch, then apply bounded batches:
 
    ```bash
@@ -218,5 +193,5 @@ requires `inline_result_reports` to be zero on both tables; root null and absent
 results are intentionally excluded from that count. These are logical storage
 measurements, not a claim of OS disk space released. PostgreSQL can reuse pages
 freed by UPDATE while the physical relation remains large. Any offline compaction
-is a separate guarded parent operation after full migration proof; this CLI never
+is a separate guarded maintenance operation after full migration proof; this CLI never
 runs VACUUM FULL.

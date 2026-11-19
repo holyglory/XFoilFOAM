@@ -3006,6 +3006,7 @@ describe("progressive durable stage transitions", () => {
     { state: "failed", sources: "metadata" },
     { state: "failed", sources: "diagnostics" },
     { state: "completed", sources: "other-angle" },
+    { state: "failed", sources: "archived" },
   ] as const)("terminal evidence inventory preserves exact ownership only for physical sources ($state/$sources)", async ({ state, sources }) => {
     const angles = [-4, -2, 0, 2, 4, 6, 8, 10];
     const campaignId = await campaign("active", [32.173 + (sequence + 1) / 100], angles);
@@ -3168,11 +3169,24 @@ describe("progressive durable stage transitions", () => {
         published: 0,
       }]);
       const ownershipBefore = await readOwnership();
+      if (sources === "archived") {
+        // Exercise damaged/reopened ownership without mutating canonical report
+        // custody. A compact header cannot justify a new no-evidence retry.
+        await connection.execute(sql`CREATE TEMP TABLE progressive_remote_reports ON COMMIT DROP AS
+          SELECT * FROM public.progressive_remote_reports WHERE sim_job_id=${executionId}::uuid`);
+        await connection.execute(sql`UPDATE progressive_remote_reports SET
+          report=public.progressive_report_compact_header(report)||'{"archivedReport":true}'::jsonb,
+          result_payload_hash=NULL,archived_at=clock_timestamp(),archive_bundle_id=${randomUUID()}::uuid`);
+      }
       expect(await recoverTerminalProgressiveNoEvidenceGaps(connection)).toBe(
-        sources === "physical" ? 0 : sources === "other-angle" ? 1 : 8,
+        sources === "physical" || sources === "archived" ? 0 : sources === "other-angle" ? 1 : 8,
       );
       expect(await readEvidence()).toEqual(evidenceBefore);
       expect(await recoverTerminalProgressiveNoEvidenceGaps(connection)).toBe(0);
+      if (sources === "archived") {
+        expect(await readOwnership()).toEqual(ownershipBefore);
+        throw rollback;
+      }
       if (sources === "physical") {
         expect(await readOwnership()).toEqual(ownershipBefore);
         const previousRole = process.env.AIRFOILFOAM_DEPLOYMENT_ROLE;
@@ -8807,10 +8821,10 @@ describe("bounded progressive numerical recovery", () => {
       verifyDiagnosticOnlyPromotionRecovery(db, envelope, triggerAoaDeg, earlyState));
   }, 240_000);
 
-  it("recovers an authenticated mixed RANS promotion from a fresh stage-2 execution", async () => {
+  it.each([false, true])("recovers an authenticated mixed RANS promotion from a fresh stage-2 execution (archived=%s)", async (archivedEarlyReport) => {
     const { verifyDiagnosticMixedPromotionRecovery } = await import("./progressive-stopped-failed-delivery-fixture");
-    await withFreshDiagnosticExecution(34.1946, [0, 1], (envelope) =>
-      verifyDiagnosticMixedPromotionRecovery(db, envelope));
+    await withFreshDiagnosticExecution(archivedEarlyReport ? 34.19461 : 34.1946, [0, 1], (envelope) =>
+      verifyDiagnosticMixedPromotionRecovery(db, envelope, { archivedEarlyReport }));
   }, 240_000);
 
   it("composes a sequential stage-2 marched multi-AoA remote execution", async () => {

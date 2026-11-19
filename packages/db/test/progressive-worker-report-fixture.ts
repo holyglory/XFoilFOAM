@@ -219,6 +219,12 @@ export async function verifyProgressiveWorkerReportDelivery(
       false,
     );
     const second = await capture(reports[1]);
+    const nextPoll = structuredClone(reports[1]);
+    nextPoll.status.updated_at = "2026-11-19T12:55:05.000Z";
+    if (nextPoll.status.solver_budget_progress)
+      nextPoll.status.solver_budget_progress.observed_at = nextPoll.status.updated_at;
+    expect(await capture(nextPoll)).toMatchObject({sequence: second.sequence,
+      contentSignature: second.contentSignature,replayed:true});
     await db.execute(
       sql`UPDATE sync_api_settings SET remote_solver_enabled = false WHERE id = 1`,
     );

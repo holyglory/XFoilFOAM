@@ -1,3 +1,4 @@
+import { resolveStoredProgressiveReport } from "./progressive-report-reader";
 import { sql } from "drizzle-orm";
 import type { DB } from "./client";
 import { verifyProgressiveRemoteExecution } from "./progressive-remote-execution";
@@ -75,7 +76,7 @@ export async function resolveProgressiveRemoteEvidence(
     throw new ProgressiveRemoteEvidenceConflict(
       "Progressive evidence report has not reached the hub",
     );
-  const validated = validateProgressiveRemoteReport(stored.report, envelope);
+  const validated = validateProgressiveRemoteReport(await resolveStoredProgressiveReport(db, "remote", stored, input.engineJobId), envelope);
   if (
     validated.contentSignature !== stored.content_signature ||
     validated.contentSignature !== reference.reportContentSignature ||

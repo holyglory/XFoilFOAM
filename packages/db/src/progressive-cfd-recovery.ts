@@ -209,6 +209,15 @@ export async function recoverTerminalProgressiveNoEvidenceGaps(
           AND job.status IN ('ingesting', 'done', 'failed', 'cancelled')
           AND job.engine_state IN ('completed', 'failed', 'cancelled')
           AND job."updatedAt" <= clock_timestamp() - interval '15 minutes'
+          -- Compaction is never proof that physical evidence was absent. These
+          -- terminal jobs must use the exact report/evidence recovery readers.
+          AND NOT EXISTS (
+            SELECT 1 FROM progressive_remote_reports archived
+            WHERE archived.sim_job_id=job.id
+              AND (to_jsonb(archived.*)->>'archived_at' IS NOT NULL
+                OR to_jsonb(archived.*)->>'archive_bundle_id' IS NOT NULL
+                OR archived.report->>'archivedReport'='true')
+          )
           AND NOT EXISTS (
             SELECT 1 FROM progressive_cfd_evidence evidence
             WHERE evidence.attempt_token = attempt.token

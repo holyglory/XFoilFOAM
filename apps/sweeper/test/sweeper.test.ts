@@ -1926,7 +1926,7 @@ describe("sweeper: gap → claim → ingest", () => {
       .from(forceHistory)
       .where(eq(forceHistory.resultId, r16.id));
     expect(fh.length).toBe(1);
-    expect(fh[0].cl.length).toBe(4);
+    expect(fh[0].cl?.length).toBe(4);
     expect(fh[0].strouhal).toBeCloseTo(0.21, 5);
     const extents = await db
       .select()

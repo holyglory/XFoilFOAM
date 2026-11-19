@@ -19,6 +19,8 @@ import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 import { afterAll, afterEach, beforeEach, expect, it, vi } from "vitest";
 import { progressiveDeliverySelectionSql } from "../src/progressive-delivery-selection";
+import { installProgressiveReportArchiveReader } from "@aerodb/db/progressive-report-reader";
+import { archiveReportFixture } from "../../../packages/db/test-support/progressive-report-archive-fixture";
 import { progressiveStoppedStorageEligible } from "../src/progressive-stopped-storage";
 import { reconcileProgressiveRemoteWorker } from "../src/progressive-remote-reconciliation";
 import { deliverNextProgressiveWorkerEvidence } from "../src/progressive-worker-evidence-delivery";
@@ -30,7 +32,10 @@ import {
 const client = createClient({ max: 1 });
 afterAll(() => client.sql.end());
 beforeEach(() => vi.stubEnv("AIRFOILFOAM_DEPLOYMENT_ROLE", "remote-solver"));
-afterEach(() => vi.unstubAllEnvs());
+afterEach(() => {
+  vi.unstubAllEnvs();
+  installProgressiveReportArchiveReader(null);
+});
 
 const TABLES = [
   "sync_api_settings",
@@ -508,6 +513,41 @@ it("dry-runs by default, then requeues exactly one selected source without alter
     await expect(
       replayProgressiveWorkerOutbox(connection, input, { apply: true }),
     ).rejects.toThrow("exact 409");
+  });
+});
+
+it("replays an archived closed-scope source from exact PostgreSQL text without changing its evidence", async () => {
+  await withFixture(async ({ connection, input }) => {
+    input.points = input.points.slice(0, 1);
+    input.expectedCount = 1;
+    const rollback = new Error("rollback immutable archived replay catalog");
+    try {
+      await connection.transaction(async (transaction) => {
+        const scoped = transaction as unknown as DB;
+        const archived = await archiveReportFixture(scoped, "worker", input.executionId, input.points[0].sequence);
+        const read = vi.fn(async () => archived.text);
+        installProgressiveReportArchiveReader({ read });
+        try {
+          const before = await snapshot(scoped);
+          const preview = await replayProgressiveWorkerOutbox(scoped, input);
+          expect(preview.points[0].outcome).toBe("would_requeue");
+          expect(await snapshot(scoped)).toEqual(before);
+          const applied = await replayProgressiveWorkerOutbox(scoped, {
+            ...input, expectedCount: undefined, manifestSignature: preview.manifestSignature,
+          }, { apply: true });
+          expect(applied.requeuedCount).toBe(1);
+          expect(await snapshot(scoped, TABLES.filter((table) => table !== "progressive_worker_delivery_failures")))
+            .toEqual(Object.fromEntries(Object.entries(before).filter(([table]) => table !== "progressive_worker_delivery_failures")));
+          expect(read).toHaveBeenCalled();
+          expect(read.mock.calls.length).toBeGreaterThanOrEqual(2);
+        } finally {
+          installProgressiveReportArchiveReader(null);
+        }
+        throw rollback;
+      });
+    } catch (error) {
+      if (error !== rollback) throw error;
+    }
   });
 });
 

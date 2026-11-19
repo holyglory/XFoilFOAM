@@ -1,3 +1,4 @@
+import { resolveStoredProgressiveReport } from "./progressive-report-reader";
 import { sql } from "drizzle-orm";
 import type { DB } from "./client";
 import { analysisContentHash, canonicalAnalysisJson } from "./analysis-target";
@@ -358,7 +359,7 @@ export async function recoverProgressiveIngestionOwnership(
     `);
       requireRecovery(latest, "final report is missing");
       const validated = validateProgressiveRemoteReport(
-        latest.report,
+        await resolveStoredProgressiveReport(connection, "remote", latest, selection.jobId),
         envelope,
       );
       const report = validated.report;

@@ -1,3 +1,4 @@
+import { resolveStoredProgressiveReport } from "@aerodb/db/progressive-report-reader";
 import { sql } from "drizzle-orm";
 import {
   canonicalAnalysisJson,
@@ -85,7 +86,7 @@ export async function observeProgressiveRemoteJob(
     );
   if (options.stop && owned.durable_final_report) {
     const durable = validateProgressiveRemoteReport(
-      owned.durable_final_report,
+      await resolveStoredProgressiveReport(db, "worker", { report: owned.durable_final_report, content_signature: owned.durable_final_content_signature }, executionId),
       envelope,
     );
     if (

@@ -40,7 +40,9 @@ def test_reset_allowlists_are_disjoint_and_preserve_campaign_membership():
             "progressive_publication_recoveries", "progressive_publication_recovery_claims",
             "progressive_worker_archive_reclaims", "progressive_polar_geometry_verifications",
             "progressive_worker_evidence_delivery_claims", "progressive_generation_cohorts",
-            "progressive_generation_cohort_targets", "progressive_report_result_payloads"} <= RESET["SOLVER_TABLES"]
+            "progressive_generation_cohort_targets", "progressive_report_result_payloads",
+            "progressive_report_archive_bundles", "progressive_report_archive_members", "solver_history_archives",
+            "attempt_evidence_archives"} <= RESET["SOLVER_TABLES"]
 
 
 def test_archive_reclaim_queue_is_disposable_without_widening_configuration_deletion():

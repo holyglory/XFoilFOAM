@@ -1,10 +1,18 @@
 import type { RetainedSolverReportPage } from "@aerodb/core";
 import { sql } from "drizzle-orm";
 import type { DB } from "./client";
-import { analysisContentHash, canonicalAnalysisJson } from "./analysis-target";
+import { analysisContentHash } from "./analysis-target";
 import { verifyProgressiveRemoteExecution } from "./progressive-remote-execution";
 import { validateProgressiveRemoteReport } from "./progressive-remote-report";
-import { progressiveRemoteReportInventory } from "./progressive-remote-inventory";
+import {
+  canonicalReportJson,
+  parseReportJson,
+  reportJsonObject,
+  reportTextIdentity,
+  reportValidationValue,
+  type ProgressiveReportArchiveReadIdentity,
+  type ReportJson,
+} from "./progressive-report-archive";
 
 const UUID = /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i;
 const SIGNATURE = /^[a-f0-9]{64}$/;
@@ -19,20 +27,62 @@ export class RetainedReportReadError extends Error {
 }
 
 export interface RetainedReportArchiveReader {
-  read(identity: {
-    bucket: string;
-    objectKey: string;
-    generation: string;
-    mimeType: string;
-    compression: string;
-    archiveFormat: string;
-    storedSha256: string;
-    storedByteSize: number;
-    crc32c: string;
-    executionId: string;
-    sequence: number;
-    signature: string;
-  }): Promise<unknown>;
+  /** Return exact PostgreSQL JSONB text, never a parsed JavaScript report. */
+  read(identity: ProgressiveReportArchiveReadIdentity): Promise<string>;
+}
+
+function reportHash(value: ReportJson): string {
+  return reportTextIdentity(canonicalReportJson(value)).sha256;
+}
+
+// Same inventory contract as progressiveRemoteReportInventory. The token tree
+// retains numbers in point evidence that cannot survive a JS JSON round trip.
+function retainedReportInventory(
+  report: { [key: string]: ReportJson },
+  signature: string,
+) {
+  const sources = new Map<string, { [key: string]: ReportJson }>();
+  if (report.result !== null) {
+    const result = reportJsonObject(report.result!);
+    for (const item of result.polars as ReportJson[]) {
+      const polar = reportJsonObject(item);
+      for (const item of [
+        ...(polar.points as ReportJson[]),
+        ...((polar.attempts as ReportJson[]) ?? []),
+      ]) {
+        const point = reportJsonObject(item);
+        const contentSignature = reportHash({
+          kind: "progressive-reported-point-v1",
+          executionId: result.job_id!,
+          chord: polar.chord!,
+          speed: polar.speed!,
+          reynolds: polar.reynolds!,
+          mach: polar.mach ?? null,
+          point,
+        });
+        sources.set(contentSignature, {
+          point_content_signature: contentSignature,
+          aoa_deg: point.aoa_deg!,
+          case_slug: point.case_slug ?? null,
+        });
+      }
+    }
+  }
+  const sorted = [...sources.values()].sort((a, b) =>
+    String(a.point_content_signature).localeCompare(
+      String(b.point_content_signature),
+    ),
+  );
+  return {
+    sourceCount: sources.size,
+    signature: reportHash({
+      kind: "progressive-remote-report-inventory-v1",
+      executionId: report.executionId!,
+      sequence: report.sequence!,
+      reportContentSignature: signature,
+      sources: sorted,
+    }),
+  };
 }
 
 interface ReportCursor {
@@ -204,24 +254,30 @@ export async function retainedSolverReportDownload(
       "Invalid exact retained-report reference",
     );
   const [stored] =
-    await db.execute(sql`SELECT report.report,report.archive_bundle_id,archive.bucket AS archive_bucket,
+    await db.execute(sql`SELECT report.archive_bundle_id,archive.bucket AS archive_bucket,
     archive.object_key AS archive_object_key,archive.generation AS archive_generation,
     archive.mime_type AS archive_mime_type,archive.compression AS archive_compression,
     archive.archive_format AS archive_format,archive.stored_sha256 AS archive_stored_sha256,
     archive.stored_byte_size AS archive_stored_byte_size,archive.crc32c AS archive_crc32c,
-    resolve_progressive_report(to_jsonb(report.*)) AS resolved_report,report.content_signature,inventory.inventory_signature,inventory.source_count,
+    archive.member_count AS archive_member_count,archive.first_sequence AS archive_first_sequence,archive.last_sequence AS archive_last_sequence,
+    member.report_sha256 AS archive_report_sha256,member.report_byte_size AS archive_report_byte_size,
+    resolve_progressive_report(to_jsonb(report.*))::text AS resolved_report_text,report.content_signature,inventory.inventory_signature,inventory.source_count,
     dispatch.solver_id,dispatch.promise_id,dispatch.content_signature AS assignment_signature,dispatch.envelope,airfoil.slug
     FROM progressive_remote_reports report JOIN progressive_remote_report_inventories inventory USING(sim_job_id,sequence)
     JOIN progressive_remote_dispatches dispatch ON dispatch.sim_job_id=report.sim_job_id
     JOIN sim_jobs job ON job.id=report.sim_job_id JOIN airfoils airfoil ON airfoil.id=job.airfoil_id
     LEFT JOIN progressive_report_archive_bundles archive ON archive.id=report.archive_bundle_id
+      AND archive.source_kind='remote' AND archive.sim_job_id=report.sim_job_id
+    LEFT JOIN progressive_report_archive_members member ON member.bundle_id=archive.id
+      AND member.source_kind='remote' AND member.sim_job_id=report.sim_job_id AND member.member_kind='report'
+      AND member.sequence=report.sequence AND member.content_signature=report.content_signature
     WHERE report.sim_job_id=${reference.executionId}::uuid AND report.sequence=${reference.sequence}
       AND report.content_signature=${reference.signature} AND inventory.source_count>0
       AND EXISTS(SELECT 1 FROM progressive_cfd_execution_stops stopped WHERE stopped.sim_job_id=job.id AND stopped.engine_job_id=job.engine_job_id)`);
   if (!stored)
     throw new RetainedReportReadError(404, "Stored solver report not found");
   try {
-    const report = stored.archive_bundle_id
+    const text = stored.archive_bundle_id
       ? await (async () => {
           if (!options.archiveReader)
             throw new RetainedReportReadError(
@@ -238,30 +294,55 @@ export async function retainedSolverReportDownload(
             storedSha256: String(stored.archive_stored_sha256),
             storedByteSize: Number(stored.archive_stored_byte_size),
             crc32c: String(stored.archive_crc32c),
+            memberCount: Number(stored.archive_member_count),
+            firstSequence: Number(stored.archive_first_sequence),
+            lastSequence: Number(stored.archive_last_sequence),
+            sourceKind: "remote",
+            memberKind: "report",
             executionId: reference.executionId,
             sequence: reference.sequence,
             signature: reference.signature,
+            reportSha256: String(stored.archive_report_sha256),
+            reportByteSize: Number(stored.archive_report_byte_size),
           });
         })()
-      : stored.resolved_report;
+      : stored.resolved_report_text;
+    if (typeof text !== "string")
+      throw new Error("Stored report has no exact JSONB text");
+    if (stored.archive_bundle_id) {
+      const proof = reportTextIdentity(text);
+      if (
+        proof.sha256 !== stored.archive_report_sha256 ||
+        proof.byteSize !== Number(stored.archive_report_byte_size)
+      )
+        throw new Error("Stored report differs from its exact archive member");
+    }
+    const report = reportJsonObject(parseReportJson(text));
     const envelope = verifyProgressiveRemoteExecution(stored.envelope, {
       executionId: reference.executionId,
       solverId: String(stored.solver_id),
       promiseId: String(stored.promise_id),
       contentSignature: String(stored.assignment_signature),
     });
-    const validated = validateProgressiveRemoteReport(report, envelope);
-    const inventory = progressiveRemoteReportInventory(validated.report);
+    const validated = validateProgressiveRemoteReport(
+      reportValidationValue(report),
+      envelope,
+    );
+    const content = canonicalReportJson(report);
+    const signature = reportTextIdentity(content).sha256;
+    const inventory = retainedReportInventory(report, signature);
     if (
-      validated.contentSignature !== reference.signature ||
+      signature !== reference.signature ||
+      canonicalReportJson(report.version!) !== "1" ||
+      canonicalReportJson(report.sequence!) !== String(reference.sequence) ||
       validated.report.sequence !== reference.sequence ||
-      inventory.inventorySignature !== stored.inventory_signature ||
-      inventory.sources.length !== Number(stored.source_count)
+      inventory.signature !== stored.inventory_signature ||
+      inventory.sourceCount !== Number(stored.source_count)
     )
       throw new Error("Stored report differs from its immutable inventory");
     return {
-      content: canonicalAnalysisJson(validated.report),
-      signature: validated.contentSignature,
+      content,
+      signature,
       filename: `${String(stored.slug).replace(/[^a-zA-Z0-9._-]/g, "-")}-solver-report-${reference.sequence}.json`,
     };
   } catch (error) {

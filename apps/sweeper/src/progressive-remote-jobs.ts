@@ -1,3 +1,4 @@
+import { resolveStoredProgressiveReport } from "@aerodb/db/progressive-report-reader";
 import {
   canonicalRemoteHubBaseUrl,
   progressiveSolverIsTransient,
@@ -93,7 +94,7 @@ export async function assertProgressiveWorkerEvidenceJob(
     await db.execute(sql`SELECT resolve_progressive_report(to_jsonb(progressive_worker_reports.*)) AS report, content_signature FROM progressive_worker_reports
     WHERE sim_job_id = ${input.simJobId}::uuid AND sequence = ${input.reportSequence!}`);
   if (!stored) throw new Error("Worker evidence report is missing");
-  const validated = validateProgressiveRemoteReport(stored.report, envelope);
+  const validated = validateProgressiveRemoteReport(await resolveStoredProgressiveReport(db, "worker", stored, input.simJobId), envelope);
   if (
     validated.contentSignature !== stored.content_signature ||
     validated.report.result === null ||

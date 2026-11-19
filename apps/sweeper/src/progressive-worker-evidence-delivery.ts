@@ -1,3 +1,4 @@
+import { resolveStoredProgressiveReport } from "@aerodb/db/progressive-report-reader";
 import { canonicalRemoteHubBaseUrl } from "@aerodb/core";
 import {
   analysisContentHash,
@@ -113,6 +114,7 @@ export async function recordProgressiveWorkerEvidenceReceipt(
       throw new Error(
         "Hub receipt has no acknowledged exact source association",
       );
+    source.report = await resolveStoredProgressiveReport(connection, "worker", source, expected.executionId);
     await assertProgressiveWorkerEvidenceJob(connection, {
       simJobId: expected.executionId,
       engineJobId: expected.executionId,
@@ -129,6 +131,7 @@ export async function recordProgressiveWorkerEvidenceReceipt(
       const [anchor] = await connection.execute(sql`SELECT resolve_progressive_report(to_jsonb(progressive_worker_reports.*)) AS report,content_signature FROM progressive_worker_reports
         WHERE sim_job_id=${expected.executionId}::uuid AND sequence=${sequence} AND acknowledged_at IS NOT NULL`);
       if (!anchor) throw new Error("Hub diagnostic receipt has no acknowledged source report");
+      anchor.report = await resolveStoredProgressiveReport(connection, "worker", anchor, expected.executionId);
       await assertProgressiveWorkerEvidenceJob(connection, {
         simJobId: expected.executionId, engineJobId: expected.executionId, reportSequence: sequence,
         result: (anchor.report as unknown as ProgressiveRemoteReport).result!,
@@ -186,13 +189,14 @@ export async function deliverNextProgressiveWorkerEvidence(
   if (!pending) return false;
   const executionId = String(pending.sim_job_id);
   const sequence = Number(pending.sequence);
-  const report = pending.report as unknown as ProgressiveRemoteReport;
+
   let responseStatus: number | null = null;
   let importConflictIds: string[] = [];
   let stoppedStorage = false;
   let retryStoppedStorage = false;
   let rejected: { code?: unknown; error?: unknown } | null = null;
   try {
+    const report = await resolveStoredProgressiveReport(db, "worker", { report: pending.report, content_signature: pending.report_signature }, executionId);
     await assertProgressiveWorkerEvidenceJob(db, {
       simJobId: executionId,
       engineJobId: executionId,
@@ -449,7 +453,7 @@ export async function progressiveWorkerEvidenceReference(
     throw new Error(
       "Progressive archive has no acknowledged exact report association",
     );
-  const report = source.report as unknown as ProgressiveRemoteReport;
+  const report = await resolveStoredProgressiveReport(db, "worker", source, executionId);
   await assertProgressiveWorkerEvidenceJob(db, {
     simJobId: executionId,
     engineJobId: executionId,

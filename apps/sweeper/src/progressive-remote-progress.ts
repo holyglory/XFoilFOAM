@@ -1,3 +1,4 @@
+import { resolveStoredProgressiveReport } from "@aerodb/db/progressive-report-reader";
 import {
   acknowledgeProgressiveCfdExecutionStop,
   canonicalAnalysisJson,
@@ -117,7 +118,7 @@ async function applyProgressiveRemoteProgressInTransaction(
       ORDER BY report.sequence DESC LIMIT 1`);
     }
     if (!stored) return { kind: "idle" as const };
-    const validated = validateProgressiveRemoteReport(stored.report, envelope);
+    const validated = validateProgressiveRemoteReport(await resolveStoredProgressiveReport(connection, "remote", stored, executionId), envelope);
     if (validated.contentSignature !== stored.content_signature)
       throw new Error(
         "Remote progress bytes differ from their immutable receipt",

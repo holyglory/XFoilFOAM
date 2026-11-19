@@ -1,3 +1,4 @@
+import { resolveStoredProgressiveReport } from "@aerodb/db/progressive-report-reader";
 import { sql } from "drizzle-orm";
 import { createHash } from "node:crypto";
 import {
@@ -270,13 +271,13 @@ export async function reclaimProgressiveRestartState(
           WHERE attempt.sim_job_id=job.id AND verification.state IN ('pending','running')
             AND verification.last_outcome IN ('continuation_pending','continuation_retry_wait'))
       ORDER BY job."updatedAt",job.id LIMIT 1 FOR UPDATE OF job SKIP LOCKED)
-      SELECT selected.id,report.sequence,report.report FROM selected
-      JOIN LATERAL (SELECT sequence,public.resolve_progressive_report(to_jsonb(progressive_worker_reports.*)) AS report FROM progressive_worker_reports
+      SELECT selected.id,report.sequence,report.report,report.content_signature FROM selected
+      JOIN LATERAL (SELECT sequence,content_signature,public.resolve_progressive_report(to_jsonb(progressive_worker_reports.*)) AS report FROM progressive_worker_reports
         WHERE sim_job_id=selected.id ORDER BY sequence DESC LIMIT 1) report ON true`);
     if (!candidates.length) return { stripped: 0, bytesFreed: 0 };
     const candidate = candidates[0];
     const id = String(candidate.id);
-    const report = candidate.report as unknown as ProgressiveRemoteReport;
+    const report = await resolveStoredProgressiveReport(connection, "worker", candidate, id);
     if (!isFinalProgressiveRemoteReport(report) || report.result === null) {
       await connection.execute(
         sql`UPDATE sim_jobs SET "updatedAt"=clock_timestamp() WHERE id=${id}::uuid`,

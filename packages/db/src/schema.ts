@@ -1333,6 +1333,9 @@ export const results = pgTable(
      *  evidence — the classifier's stationarity gate applies only to non-NULL
      *  values, so history is never mass-rejected by deploy. */
     frameTrack: jsonb("frame_track"),
+    /** Migration 0206: a pointer means frameTrack retains compact metadata;
+     * canonical row readers restore the exact original generation first. */
+    frameTrackArchiveId: uuid("frame_track_archive_id"),
     /** Fidelity ladder tier this row's evidence was solved at (contract 3,
      *  migration 0034): 'rans' | 'urans_precalc' | 'urans_full'. Echoed by the
      *  engine on PolarPoint.fidelity; backfill graded pre-ladder urans rows
@@ -1344,6 +1347,7 @@ export const results = pgTable(
      *  classic pointwise convergence or legacy pre-contract evidence.
      *  result_attempts carry it inside evidence_payload (whole PolarPoint). */
     steadyHistory: jsonb("steady_history"),
+    steadyHistoryArchiveId: uuid("steady_history_archive_id"),
     /** Auto-retry-once marker (migration 0036): set when the sweeper's
      *  crash-class auto-retry requeued this cell after a failed ingest. A row
      *  that fails AGAIN with this set stays terminal/unavailable instead of a
@@ -1397,6 +1401,12 @@ export const results = pgTable(
     currentAttemptIdx: index("results_current_attempt_idx").on(
       t.currentResultAttemptId,
     ),
+    // Migration 0206 owns the two reverse composite archive-owner FKs. Keep
+    // those migration-only to avoid a results <-> archive inference cycle.
+    resultHistoryInlineScanIdx: index("result_history_inline_scan_idx")
+      .on(t.id)
+      .where(sql`(${t.steadyHistory} IS NOT NULL AND ${t.steadyHistoryArchiveId} IS NULL)
+        OR (${t.frameTrack} IS NOT NULL AND ${t.frameTrackArchiveId} IS NULL)`),
     // Migration 0096 owns the composite current-interpretation/current-
     // selection FKs.  Keeping those two reverse FKs migration-only avoids a
     // recursive Drizzle table inference cycle (`results` <- interpretations
@@ -3644,9 +3654,15 @@ export const forceHistory = pgTable(
       .notNull()
       .references(() => results.id, { onDelete: "cascade" }),
     resultAttemptId: uuid("result_attempt_id"),
-    t: jsonb("t").$type<number[]>().notNull(),
-    cl: jsonb("cl").$type<number[]>().notNull(),
-    cd: jsonb("cd").$type<number[]>().notNull(),
+    // 0204: all four arrays are NULL together only after exact GCS restore.
+    // The reverse composite (history_archive_id,id) FK is migration-owned to
+    // avoid a recursive Drizzle inference cycle with solverHistoryArchives.
+    historyArchiveId: uuid("history_archive_id").references(
+      (): AnyPgColumn => solverHistoryArchives.id,
+    ),
+    t: jsonb("t").$type<number[]>(),
+    cl: jsonb("cl").$type<number[]>(),
+    cd: jsonb("cd").$type<number[]>(),
     cm: jsonb("cm").$type<number[]>(),
     clMean: doublePrecision("cl_mean"),
     clRms: doublePrecision("cl_rms"),
@@ -3670,8 +3686,100 @@ export const forceHistory = pgTable(
     legacyResultUq: uniqueIndex("force_history_legacy_result_uq")
       .on(t.resultId)
       .where(sql`${t.resultAttemptId} IS NULL`),
+    inlineBackfillIdx: index("force_history_inline_backfill_idx").on(t.id)
+      .where(sql`${t.historyArchiveId} IS NULL`),
+    storageShapeCheck: check("force_history_storage_shape", sql`
+      (${t.t} IS NOT NULL AND ${t.cl} IS NOT NULL AND ${t.cd} IS NOT NULL AND ${t.historyArchiveId} IS NULL)
+      OR (${t.t} IS NULL AND ${t.cl} IS NULL AND ${t.cd} IS NULL AND ${t.cm} IS NULL AND ${t.historyArchiveId} IS NOT NULL)
+    `),
   }),
 );
+
+// Immutable physical force-history array objects, independent of report
+// archives. Scalar history metadata and all attempt payloads remain inline.
+export const solverHistoryArchives = pgTable("solver_history_archives", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  sourceInstance: text("source_instance").notNull(),
+  sourceKind: text("source_kind").notNull().$type<"force_history">(),
+  sourceId: uuid("source_id").notNull().references((): AnyPgColumn => forceHistory.id, { onDelete: "cascade" }),
+  resultId: uuid("result_id").notNull().references((): AnyPgColumn => results.id, { onDelete: "cascade" }),
+  resultAttemptId: uuid("result_attempt_id").references((): AnyPgColumn => resultAttempts.id, { onDelete: "cascade" }),
+  sourceSha256: text("source_sha256").notNull(),
+  sourceByteSize: bigint("source_byte_size", { mode: "number" }).notNull(),
+  envelopeSha256: text("envelope_sha256").notNull(),
+  envelopeByteSize: bigint("envelope_byte_size", { mode: "number" }).notNull(),
+  storedSha256: text("stored_sha256").notNull(),
+  storedByteSize: bigint("stored_byte_size", { mode: "number" }).notNull(),
+  bucket: text("bucket").notNull(),
+  objectKey: text("object_key").notNull(),
+  generation: text("generation").notNull(),
+  crc32c: text("crc32c").notNull(),
+  verifiedAt: timestamp("verified_at", { withTimezone: true }).notNull().defaultNow(),
+}, (t) => ({
+  sourceUq: unique("solver_history_archives_source_uq").on(t.sourceInstance, t.sourceKind, t.sourceId, t.sourceSha256),
+  objectUq: unique("solver_history_archives_object_uq").on(t.bucket, t.objectKey, t.generation),
+  ownerUq: unique("solver_history_archives_owner_uq").on(t.id, t.sourceId),
+  resultIdx: index("solver_history_archives_result_idx").on(t.resultId, t.resultAttemptId),
+  attemptOwnerFk: foreignKey({ columns: [t.resultAttemptId, t.resultId], foreignColumns: [resultAttempts.id, resultAttempts.resultId],
+    name: "solver_history_archives_attempt_owner_fk" }).onDelete("cascade"),
+  sourceKindCheck: check("solver_history_archives_source_kind_check", sql`${t.sourceKind} = 'force_history'`),
+  sourceInstanceCheck: check("solver_history_archives_source_instance_check", sql`${t.sourceInstance} ~ '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$'`),
+  sourceShaCheck: check("solver_history_archives_source_sha256_check", sql`${t.sourceSha256} ~ '^[a-f0-9]{64}$'`),
+  sourceSizeCheck: check("solver_history_archives_source_byte_size_check", sql`${t.sourceByteSize} BETWEEN 1 AND 33554432`),
+  envelopeShaCheck: check("solver_history_archives_envelope_sha256_check", sql`${t.envelopeSha256} ~ '^[a-f0-9]{64}$'`),
+  envelopeSizeCheck: check("solver_history_archives_envelope_byte_size_check", sql`${t.envelopeByteSize} BETWEEN 1 AND 67112960`),
+  storedShaCheck: check("solver_history_archives_stored_sha256_check", sql`${t.storedSha256} ~ '^[a-f0-9]{64}$'`),
+  storedSizeCheck: check("solver_history_archives_stored_byte_size_check", sql`${t.storedByteSize} BETWEEN 1 AND 67178496`),
+  bucketCheck: check("solver_history_archives_bucket_check", sql`btrim(${t.bucket}) <> '' AND position('/' in ${t.bucket}) = 0`),
+  objectKeyCheck: check("solver_history_archives_object_key_check", sql`btrim(${t.objectKey}) <> '' AND ${t.objectKey} !~ '^/|(^|/)[.]{1,2}(/|$)|//'`),
+  generationCheck: check("solver_history_archives_generation_check", sql`${t.generation} ~ '^[1-9][0-9]{0,19}$'`),
+  crc32cCheck: check("solver_history_archives_crc32c_check", sql`${t.crc32c} ~ '^[A-Za-z0-9+/]{6}==$'`),
+}));
+
+/** Canonical history representation only. Force history and attempt payloads
+ * retain their separate owners and storage contracts. */
+export const resultHistoryArchives = pgTable("result_history_archives", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  sourceInstance: text("source_instance").notNull(),
+  sourceKind: text("source_kind").notNull().$type<"steady_history" | "frame_track">(),
+  resultId: uuid("result_id").notNull().references((): AnyPgColumn => results.id, { onDelete: "cascade" }),
+  resultAttemptId: uuid("result_attempt_id"),
+  sourceSha256: text("source_sha256").notNull(),
+  valueSha256: text("value_sha256").notNull(),
+  sourceByteSize: bigint("source_byte_size", { mode: "number" }).notNull(),
+  inlineMetadata: jsonb("inline_metadata").notNull(),
+  envelopeSha256: text("envelope_sha256").notNull(),
+  envelopeByteSize: bigint("envelope_byte_size", { mode: "number" }).notNull(),
+  storedSha256: text("stored_sha256").notNull(),
+  storedByteSize: bigint("stored_byte_size", { mode: "number" }).notNull(),
+  bucket: text("bucket").notNull(),
+  objectKey: text("object_key").notNull(),
+  generation: text("generation").notNull(),
+  crc32c: text("crc32c").notNull(),
+  verifiedAt: timestamp("verified_at", { withTimezone: true }).notNull(),
+}, (t) => ({
+  sourceUq: uniqueIndex("result_history_archives_source_uq").on(
+    t.sourceInstance, t.sourceKind, t.resultId, sql`coalesce(${t.resultAttemptId}::text, 'legacy')`, t.sourceSha256,
+  ),
+  objectUq: unique("result_history_archives_object_uq").on(t.bucket, t.objectKey, t.generation),
+  ownerUq: unique("result_history_archives_owner_uq").on(t.id, t.resultId),
+  attemptOwnerFk: foreignKey({ columns: [t.resultAttemptId, t.resultId],
+    foreignColumns: [resultAttempts.id, resultAttempts.resultId],
+    name: "result_history_archives_attempt_owner_fk" }).onDelete("cascade"),
+  sourceKindCheck: check("result_history_archives_source_kind_check", sql`${t.sourceKind} IN ('steady_history', 'frame_track')`),
+  sourceInstanceCheck: check("result_history_archives_source_instance_check", sql`${t.sourceInstance} ~ '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$'`),
+  sourceShaCheck: check("result_history_archives_source_sha256_check", sql`${t.sourceSha256} ~ '^[a-f0-9]{64}$'`),
+  valueShaCheck: check("result_history_archives_value_sha256_check", sql`${t.valueSha256} ~ '^[a-f0-9]{64}$'`),
+  sourceSizeCheck: check("result_history_archives_source_byte_size_check", sql`${t.sourceByteSize} BETWEEN 1 AND 33554432`),
+  envelopeShaCheck: check("result_history_archives_envelope_sha256_check", sql`${t.envelopeSha256} ~ '^[a-f0-9]{64}$'`),
+  envelopeSizeCheck: check("result_history_archives_envelope_byte_size_check", sql`${t.envelopeByteSize} BETWEEN 1 AND 67112960`),
+  storedShaCheck: check("result_history_archives_stored_sha256_check", sql`${t.storedSha256} ~ '^[a-f0-9]{64}$'`),
+  storedSizeCheck: check("result_history_archives_stored_byte_size_check", sql`${t.storedByteSize} BETWEEN 1 AND 67178496`),
+  bucketCheck: check("result_history_archives_bucket_check", sql`btrim(${t.bucket}) <> '' AND position('/' in ${t.bucket}) = 0`),
+  objectKeyCheck: check("result_history_archives_object_key_check", sql`btrim(${t.objectKey}) <> '' AND ${t.objectKey} !~ '^/|(^|/)[.]{1,2}(/|$)|//'`),
+  generationCheck: check("result_history_archives_generation_check", sql`${t.generation} ~ '^[1-9][0-9]{0,19}$'`),
+  crc32cCheck: check("result_history_archives_crc32c_check", sql`${t.crc32c} ~ '^[A-Za-z0-9+/]{6}==$'`),
+}));
 
 // ---------------------------------------------------------------------------
 // 10. Result classifications and fitted polar cache — solver evidence stays
@@ -8024,20 +8132,30 @@ export const progressiveReportArchiveBundles = pgTable(
     firstSequence: bigint("first_sequence", { mode: "number" }).notNull(),
     lastSequence: bigint("last_sequence", { mode: "number" }).notNull(),
     verifiedAt: timestamp("verified_at", { withTimezone: true }).notNull(),
+    legacyInstanceId: uuid("legacy_instance_id"),
+    legacySolverId: uuid("legacy_solver_id"),
+    legacyScopeSha256: text("legacy_scope_sha256"),
+    legacyPageMemberCount: integer("legacy_page_member_count"),
+    legacyReadMode: text("legacy_read_mode"),
+    legacyLocalStorageKey: text("legacy_local_storage_key"),
+    legacyLocalVerifiedAt: timestamp("legacy_local_verified_at", { withTimezone: true }),
     createdAt: timestamp("created_at", { withTimezone: true })
       .notNull()
       .default(sql`clock_timestamp()`),
   },
   (table) => ({
-    sourceJobUq: unique("progressive_report_archive_bundles_source_job_uq").on(
+    executionIdx: index("progressive_report_archive_bundles_execution_idx").on(
       table.sourceKind,
       table.simJobId,
+      table.firstSequence,
     ),
-    objectUq: unique("progressive_report_archive_bundles_object_uq").on(
-      table.bucket,
-      table.objectKey,
-      table.generation,
+    objectJobUq: unique("progressive_report_archive_bundles_object_job_uq").on(
+      table.bucket, table.objectKey, table.generation, table.simJobId,
     ),
+    workerVolumeIdx: index("progressive_report_archive_worker_volume_idx").on(table.storedSha256)
+      .where(sql`${table.sourceKind}='worker'`),
+    canonicalObjectUq: uniqueIndex("progressive_report_archive_bundles_canonical_object_uq")
+      .on(table.bucket, table.objectKey, table.generation).where(sql`${table.archiveFormat} = 'jsonl'`),
     sourceCheck: check(
       "progressive_report_archive_bundles_source_check",
       sql`${table.sourceKind} IN ('remote', 'worker')`,
@@ -8048,8 +8166,25 @@ export const progressiveReportArchiveBundles = pgTable(
     ),
     compressionCheck: check(
       "progressive_report_archive_bundles_compression_check",
-      sql`${table.compression} = 'gzip' AND ${table.archiveFormat} = 'jsonl'`,
+      sql`${table.compression} = 'gzip'`,
     ),
+    archiveFormatCheck: check("progressive_report_archive_bundles_archive_format_check",
+      sql`${table.archiveFormat} IN ('jsonl','legacy-jsonl')`),
+    legacyCheck: check("progressive_report_archive_bundles_legacy_check", sql`
+      (${table.archiveFormat}='jsonl' AND ${table.legacyInstanceId} IS NULL AND ${table.legacySolverId} IS NULL
+        AND ${table.legacyScopeSha256} IS NULL AND ${table.legacyPageMemberCount} IS NULL
+        AND ${table.legacyReadMode} IS NULL AND ${table.legacyLocalStorageKey} IS NULL AND ${table.legacyLocalVerifiedAt} IS NULL)
+      OR (${table.archiveFormat}='legacy-jsonl' AND ${table.sourceKind}='worker' AND ${table.mimeType}='application/gzip'
+        AND ${table.legacyInstanceId} IS NOT NULL AND ${table.legacySolverId} IS NOT NULL
+        AND ${table.legacyScopeSha256} IS NOT NULL AND ${table.legacyScopeSha256} ~ '^[a-f0-9]{64}$'
+        AND ${table.legacyPageMemberCount} IS NOT NULL AND ${table.legacyPageMemberCount} BETWEEN ${table.memberCount} AND 128
+        AND ${table.objectKey}='legacy-worker-reports/v1/'||${table.legacyInstanceId}::text||'/'||${table.legacySolverId}::text
+          ||'/'||${table.legacyScopeSha256}||'/'||${table.storedSha256}||'.jsonl.gz'
+        AND ${table.legacyReadMode} IS NOT NULL AND (
+          (${table.legacyReadMode}='registered-get' AND ${table.legacyLocalStorageKey} IS NULL AND ${table.legacyLocalVerifiedAt} IS NULL)
+          OR (${table.legacyReadMode}='hub-local-reader' AND ${table.legacyLocalStorageKey} IS NOT NULL
+            AND ${table.legacyLocalStorageKey}<>'' AND ${table.legacyLocalVerifiedAt} IS NOT NULL)))
+    `),
     hashCheck: check(
       "progressive_report_archive_bundles_hash_check",
       sql`${table.storedSha256} ~ '^[a-f0-9]{64}$'`,
@@ -8076,6 +8211,8 @@ export const progressiveReportArchiveMembers = pgTable(
     contentSignature: text("content_signature").notNull(),
     reportSha256: text("report_sha256").notNull(),
     reportByteSize: bigint("report_byte_size", { mode: "number" }).notNull(),
+    legacyRowSha256: text("legacy_row_sha256"),
+    legacyRowByteSize: bigint("legacy_row_byte_size", { mode: "number" }),
     createdAt: timestamp("created_at", { withTimezone: true })
       .notNull()
       .default(sql`clock_timestamp()`),
@@ -8106,6 +8243,11 @@ export const progressiveReportArchiveMembers = pgTable(
       "progressive_report_archive_members_signature_check",
       sql`${table.contentSignature} ~ '^[a-f0-9]{64}$' AND ${table.reportSha256} ~ '^[a-f0-9]{64}$'`,
     ),
+    legacyRowCheck: check("progressive_report_archive_members_legacy_row_check", sql`
+      (${table.legacyRowSha256} IS NULL AND ${table.legacyRowByteSize} IS NULL)
+      OR (${table.legacyRowSha256} IS NOT NULL AND ${table.legacyRowSha256} ~ '^[a-f0-9]{64}$'
+        AND ${table.legacyRowByteSize} IS NOT NULL AND ${table.legacyRowByteSize}>0)
+    `),
     sizeCheck: check(
       "progressive_report_archive_members_size_check",
       sql`${table.sequence} > 0 AND ${table.reportByteSize} > 0`,
@@ -8189,6 +8331,9 @@ export const progressiveRemoteReports = pgTable(
     stopCandidateIdx: index("progressive_remote_reports_stop_candidate_idx")
       .on(table.simJobId)
       .where(sql`${table.report}#>>'{stopProof,execution_stopped}'='true'`),
+    waitingArchiveIdx: index("progressive_remote_reports_waiting_archive_idx")
+      .on(table.simJobId, table.sequence)
+      .where(sql`${table.archivedAt} IS NULL`),
     receivedOrderIdx: index("progressive_remote_reports_received_order_idx")
       .on(table.receivedAt, table.simJobId, table.sequence),
     sequenceCheck: check(
@@ -8352,12 +8497,9 @@ export const progressiveWorkerReports = pgTable(
     stagingJobOrderIdx: index("progressive_worker_reports_staging_job_order_idx")
       .on(table.simJobId, table.createdAt, table.sequence)
       .where(sql`${table.acknowledgedAt} IS NOT NULL AND jsonb_typeof(${table.report}->'result')='object'`),
-    compactionOrderIdx: index("progressive_worker_reports_compaction_order_idx")
-      .on(table.createdAt, table.simJobId, table.sequence)
-      .where(sql`${table.acknowledgedAt} IS NOT NULL
-        AND ${table.archiveBundleId} IS NULL
-        AND ${table.archivedAt} IS NULL
-        AND jsonb_typeof(${table.report}->'result')='object'`),
+    waitingArchiveIdx: index("progressive_worker_reports_waiting_archive_idx")
+      .on(table.simJobId, table.sequence)
+      .where(sql`${table.archivedAt} IS NULL`),
     primary: primaryKey({ columns: [table.simJobId, table.sequence] }),
     pendingIdx: index("progressive_worker_reports_pending_idx")
       .on(table.simJobId, table.sequence)
@@ -8417,12 +8559,18 @@ export const progressiveWorkerReportConflicts = pgTable(
     archivedAt: timestamp("archived_at", { withTimezone: true }),
     report: jsonb("report").$type<Record<string, unknown>>().notNull(),
     reason: text("reason").notNull(),
+    bodySourceSequence: bigint("body_source_sequence", { mode: "number" }),
     createdAt: timestamp("created_at", { withTimezone: true })
       .notNull()
       .default(sql`clock_timestamp()`),
   },
   (table) => ({
     primary: primaryKey({ columns: [table.simJobId, table.sequence] }),
+    bodySourceCheck: check("progressive_worker_report_conflicts_body_source_sequence_check",
+      sql`${table.bodySourceSequence} = ${table.sequence}`),
+    bodySource: foreignKey({ name: "progressive_worker_conflict_body_fk",
+      columns: [table.simJobId, table.bodySourceSequence],
+      foreignColumns: [progressiveWorkerReports.simJobId, progressiveWorkerReports.sequence] }),
     signatureCheck: check(
       "progressive_worker_report_conflicts_content_signature_check",
       sql`${table.contentSignature} ~ '^[a-f0-9]{64}$'`,

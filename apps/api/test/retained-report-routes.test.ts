@@ -9,6 +9,7 @@ import {
 } from "@aerodb/db";
 import { COOKIE_NAME, signSession } from "../src/admin-auth";
 import { registerRetainedReportRoutes } from "../src/retained-report-routes";
+import { readProgressiveReportArchive } from "../src/progressive-report-archive-reader";
 
 vi.mock("../src/db", () => ({ db: {} }));
 vi.mock("@aerodb/db", async (original) => ({
@@ -103,11 +104,7 @@ it("parses bounded filters without treating false as true", async () => {
 it("downloads exact stored bytes and surfaces missing or corrupt evidence without synthesis", async () => {
   const { app, headers } = await server();
   const executionId = randomUUID();
-  const content = JSON.stringify({
-    executionId,
-    sequence: 2,
-    result: { state: "failed" },
-  });
+  const content = `{"executionId":"${executionId}","sequence":2,"result":{"state":"failed","n":9007199254740993123456789,"decimal":0.123456789012345678901}}`;
   const signature = createHash("sha256").update(content).digest("hex");
   vi.mocked(retainedSolverReportDownload).mockResolvedValue({
     content,
@@ -129,8 +126,9 @@ it("downloads exact stored bytes and surfaces missing or corrupt evidence withou
     expect(retainedSolverReportDownload).toHaveBeenCalledWith(
       {},
       { executionId, sequence: 2, signature },
+      { archiveReader: { read: readProgressiveReportArchive } },
     );
-    for (const status of [404, 409] as const) {
+    for (const status of [404, 409, 503] as const) {
       vi.mocked(retainedSolverReportDownload).mockRejectedValue(
         new RetainedReportReadError(status, "Stored report unavailable"),
       );

@@ -1,3 +1,4 @@
+import { resolveStoredProgressiveReport } from "./progressive-report-reader";
 import { sql } from "drizzle-orm";
 import type { DB } from "./client";
 import { analysisContentHash, canonicalAnalysisJson } from "./analysis-target";
@@ -67,7 +68,7 @@ export async function readProgressiveRemoteSourceClassifications(
   if (canonicalAnalysisJson(payload.engineRequest) !== canonicalAnalysisJson(envelope.request) ||
     canonicalAnalysisJson(payload.progressive) !== canonicalAnalysisJson(envelope.scope))
     throw new ProgressiveRemoteEvidenceConflict("Remote diagnostic history differs from immutable execution ownership");
-  const latest = validateProgressiveRemoteReport(stored.report, envelope);
+  const latest = validateProgressiveRemoteReport(await resolveStoredProgressiveReport(db, "remote", stored, executionId), envelope);
   if (latest.contentSignature !== stored.content_signature)
     throw new Error("Remote diagnostic history changed its final report bytes");
   if (!isFinalProgressiveRemoteReport(latest.report) || !stored.proof) return [];
@@ -108,7 +109,7 @@ export async function readProgressiveRemoteSourceClassifications(
     failureKinds: Map<string, ProgressiveDiagnosticFailureKind | null>;
   }>();
   for (const entry of reports) {
-    const validated = validateProgressiveRemoteReport(entry.report, envelope);
+    const validated = validateProgressiveRemoteReport(await resolveStoredProgressiveReport(db, "remote", entry, executionId), envelope);
     const inventory = progressiveRemoteReportInventory(validated.report);
     if (validated.contentSignature !== entry.content_signature ||
       inventory.inventorySignature !== entry.inventory_signature ||
@@ -211,7 +212,7 @@ export async function readProgressiveRemoteRetention(
   if (!latest)
     return { kind: "waiting" as const, reason: "final_report" as const };
   const { report, contentSignature } = validateProgressiveRemoteReport(
-    latest.report,
+    await resolveStoredProgressiveReport(db, "remote", latest, executionId),
     latest.envelope as ProgressiveRemoteExecutionEnvelope,
   );
   if (contentSignature !== latest.content_signature)

@@ -32,6 +32,10 @@ import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 
 import { db } from "../src/db";
 import { buildServer } from "../src/server";
+import { loadSolverHistorySource } from "@aerodb/db/solver-history-storage";
+import { decodeSolverHistory, encodeSolverHistory, type SolverHistoryArchiveIdentity } from "@aerodb/core/solver-history-storage";
+import { SolverHistoryGcsStore } from "@aerodb/core/solver-history-gcs";
+import { archiveSolverHistory } from "../../sweeper/src/solver-history-archive";
 
 const PREFIX = `api-exact-${process.pid}-${Date.now().toString(36)}`;
 const sha = (value: string): string =>
@@ -478,6 +482,47 @@ describe("public exact-generation reads", () => {
     });
   });
 
+  it("serves the same selected coefficients and history after its arrays move out of PostgreSQL", async () => {
+    const [history] = await db.select().from(forceHistory).where(eq(forceHistory.resultAttemptId, currentAttemptId)).limit(1);
+    const source = await loadSolverHistorySource(db, "force_history", history.id);
+    const encoded = encodeSolverHistory("api-history-fixture", source);
+    const identity: SolverHistoryArchiveIdentity = {
+      sourceInstance: "api-history-fixture", ...source, ...encoded,
+      bucket: "fixture-evidence", objectKey: `solver-histories/v1/${history.id}/${encoded.storedSha256}.json.gz`,
+      generation: "1", crc32c: "AAAAAA==",
+    };
+    const store = {
+      put: async () => identity,
+      read: async (pointer: SolverHistoryArchiveIdentity) => decodeSolverHistory(encoded.stored, pointer),
+    };
+    const read = vi.spyOn(SolverHistoryGcsStore.prototype, "read").mockImplementation(store.read);
+    try {
+      const archived = await archiveSolverHistory(db, store, {
+        bucket: identity.bucket, sourceInstance: identity.sourceInstance, sourceKind: "force_history", sourceId: history.id,
+      });
+      expect(archived.offloaded).toBe(true);
+      const [stored] = await db.select().from(forceHistory).where(eq(forceHistory.id, history.id));
+      expect([stored.t, stored.cl, stored.cd, stored.cm]).toEqual([null, null, null, null]);
+      expect(stored.historyArchiveId).toBe(archived.archive.id);
+      const sim = await app.inject({ method: "GET", url: `/api/airfoils/${PREFIX}-foil/sim?resultId=${resultId}` });
+      expect(sim.statusCode).toBe(200);
+      expect(sim.json()).toMatchObject({ cl: 0.63, cd: 0.014, ld: 45,
+        history: { t: [10, 11], cl: [0.62, 0.63], cd: [0.013, 0.014] } });
+      expect(read).toHaveBeenCalled();
+      const evidence = await app.inject({ method: "GET", url: `/api/results/${resultId}/evidence` });
+      expect(evidence.statusCode).toBe(200);
+      expect(evidence.json().artifacts[0].sha256).toBe(currentManifestSha);
+      const [point] = await db.select().from(results).where(eq(results.id, resultId));
+      expect(point.currentResultAttemptId).toBe(currentAttemptId);
+      expect(point.cl).toBe(0.63);
+    } finally {
+      // Normal ingestion restores inline arrays and clears the pointer via
+      // 0204's trigger. Other cases continue to prove their own boundaries.
+      await db.update(forceHistory).set({ t: history.t, cl: history.cl, cd: history.cd, cm: history.cm }).where(eq(forceHistory.id, history.id));
+      read.mockRestore();
+    }
+  });
+
   it("returns a truthful temporary failure while missing local media is queued for reconstruction", async () => {
     const [media] = await db
       .select()
@@ -700,7 +745,6 @@ describe("public exact-generation reads", () => {
       if (savedPermission) {
         const {
           dataType: _dataType,
-          createdAt: _createdAt,
           ...restore
         } = savedPermission;
         await db

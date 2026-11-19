@@ -1,3 +1,4 @@
+import { resolveStoredProgressiveReport } from "./progressive-report-reader";
 import { sql } from "drizzle-orm";
 import type { DB } from "./client";
 import { effectiveProgressiveStageSql } from "./progressive-execution-policy";
@@ -85,7 +86,7 @@ export async function recoverProgressivePublicationLosses(
         continue;
       }
       const validated = validateProgressiveRemoteReport(
-        latest.report,
+        await resolveStoredProgressiveReport(connection, "remote", latest, executionId),
         envelope,
       );
       if (

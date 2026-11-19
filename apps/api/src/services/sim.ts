@@ -39,6 +39,7 @@ import { and, desc, eq, inArray, isNull, sql } from "drizzle-orm";
 
 import { db } from "../db";
 import { mediaStore, resultMediaUrl } from "../media-store";
+import { readStoredForceHistory } from "../solver-history-reader";
 
 type ReviewDisclosure = {
   verdict: "exclude";
@@ -407,7 +408,7 @@ async function solvedDetail(
       )
       .orderBy(desc(solverEvidenceArtifacts.createdAt)),
   ]);
-  const [hist] = await db
+  const [storedHist] = await db
     .select()
     .from(forceHistory)
     .where(
@@ -417,6 +418,7 @@ async function solvedDetail(
       ),
     )
     .limit(1);
+  const hist = storedHist ? await readStoredForceHistory(db, storedHist) : undefined;
   const [revision] = r.simulationPresetRevisionId
     ? await db
         .select()

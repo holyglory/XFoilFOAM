@@ -93,7 +93,8 @@ export async function backfillProgressiveReportPayloads(
     // find a batch, and never infer completion from an empty SKIP LOCKED result.
     const candidates =
       await connection.execute(sql`SELECT sim_job_id, sequence FROM ${table}
-      ${input.after ? sql`WHERE (sim_job_id, sequence) > (${input.after.executionId}::uuid, ${input.after.sequence})` : sql``}
+      WHERE archived_at IS NULL
+      ${input.after ? sql`AND (sim_job_id, sequence) > (${input.after.executionId}::uuid, ${input.after.sequence})` : sql``}
       ORDER BY sim_job_id, sequence LIMIT ${rows}`);
     let cursor: ProgressiveReportCursor | null = input.after ?? null;
     let pinned = false;
@@ -114,7 +115,7 @@ export async function backfillProgressiveReportPayloads(
         octet_length((${logicalReport})::text)::bigint AS logical_bytes,
         encode(sha256(convert_to((${logicalReport})::text, 'UTF8')), 'hex') AS digest
         FROM ${table} WHERE sim_job_id = ${candidate.sim_job_id}::uuid AND sequence = ${candidate.sequence}
-        FOR UPDATE SKIP LOCKED`);
+        AND archived_at IS NULL FOR UPDATE SKIP LOCKED`);
       if (!row) {
         locked++;
         pinned = true;
@@ -220,7 +221,8 @@ export async function progressiveReportStorageSample(
     shared_payload_relation_bytes: string;
   }>(sql`WITH selected AS MATERIALIZED (
     SELECT * FROM ${source}
-    ${input.after ? sql`WHERE (sim_job_id,sequence)>(${input.after.executionId}::uuid,${input.after.sequence})` : sql``}
+    WHERE archived_at IS NULL
+    ${input.after ? sql`AND (sim_job_id,sequence)>(${input.after.executionId}::uuid,${input.after.sequence})` : sql``}
     ORDER BY sim_job_id,sequence LIMIT ${rows}
   ) SELECT count(*)::integer AS sampled_reports,
     count(result_payload_hash)::integer AS normalized_reports,
@@ -251,7 +253,7 @@ export async function progressiveReportStorageTotals(
     pg_total_relation_size(${table}::regclass)::text AS report_relation_bytes,
     pg_total_relation_size('public.progressive_report_result_payloads'::regclass)::text AS shared_payload_relation_bytes
     FROM ${source} report LEFT JOIN public.progressive_report_result_payloads payload
-      ON payload.content_hash = report.result_payload_hash`);
+      ON payload.content_hash = report.result_payload_hash WHERE report.archived_at IS NULL`);
   return { table, fullScan: true, ...totals };
 }
 
@@ -267,9 +269,10 @@ export async function proveProgressiveReportsInline(db: DB) {
     const counts = [];
     for (const table of progressiveReportTables) {
       const [row] =
-        await connection.execute(sql`SELECT count(*)::text AS normalized_reports
-        FROM public.${sql.identifier(table)} WHERE result_payload_hash IS NOT NULL`);
-      counts.push({ table, normalizedReports: String(row.normalized_reports) });
+        await connection.execute(sql`SELECT count(result_payload_hash)::text AS normalized_reports,
+          count(archived_at)::text AS archived_reports FROM public.${sql.identifier(table)}
+          WHERE result_payload_hash IS NOT NULL OR archived_at IS NOT NULL`);
+      counts.push({ table, normalizedReports: String(row.normalized_reports), archivedReports: String(row.archived_reports) });
     }
     const [checked] = await connection.execute(
       sql`SELECT clock_timestamp()::text AS checked_at`,
@@ -280,7 +283,7 @@ export async function proveProgressiveReportsInline(db: DB) {
       counts,
       oldReaderRollbackSafe:
         policy?.normalization_enabled === false &&
-        counts.every((row) => row.normalizedReports === "0"),
+        counts.every((row) => row.normalizedReports === "0" && row.archivedReports === "0"),
     };
   });
 }
