@@ -31,9 +31,7 @@ export function configuredDeploymentRole(
 ): "hub" | "remote-solver" {
   const role = env.AIRFOILFOAM_DEPLOYMENT_ROLE?.trim() || "hub";
   if (role !== "hub" && role !== "remote-solver") {
-    throw new Error(
-      "AIRFOILFOAM_DEPLOYMENT_ROLE must be hub or remote-solver",
-    );
+    throw new Error("AIRFOILFOAM_DEPLOYMENT_ROLE must be hub or remote-solver");
   }
   return role;
 }
@@ -72,10 +70,7 @@ export function assertRemoteSolverNodeEvidenceContract(
   remoteSolverEnabled: boolean,
   env: NodeJS.ProcessEnv = process.env,
 ): void {
-  if (
-    !remoteSolverEnabled ||
-    configuredDeploymentRole(env) !== "remote-solver"
-  )
+  if (!remoteSolverEnabled || configuredDeploymentRole(env) !== "remote-solver")
     return;
   const bucket = env.AIRFOILFOAM_EVIDENCE_BUCKET?.trim() ?? "";
   const remoteOnly = /^(?:1|true|yes|on)$/i.test(
@@ -117,4 +112,18 @@ export function makeContext() {
 
 export function makeIsolatedDatabase(max = 1) {
   return createClient({ max });
+}
+
+export function makeReportStorageDatabase(
+  application: "report-storage" | "report-storage-backfill",
+) {
+  return createClient({
+    max: 3,
+    connection: {
+      application_name: application,
+      statement_timeout: "60s",
+      lock_timeout: "3s",
+      client_connection_check_interval: "2s",
+    },
+  });
 }

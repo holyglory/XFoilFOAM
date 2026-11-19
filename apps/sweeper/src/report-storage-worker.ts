@@ -1,5 +1,5 @@
 import { createClient } from "@aerodb/db/client";
-import { configuredDeploymentRole } from "./config";
+import { configuredDeploymentRole, makeReportStorageDatabase } from "./config";
 import {
   runProgressiveReportArchiveService,
   runDuplicateReportCleanup,
@@ -9,15 +9,7 @@ import { runResultHistoryStorageService } from "./result-history-service";
 import { runWorkerVolumeCleanup } from "./worker-report-volume-cleanup";
 import { runAttemptEvidenceStorageService } from "./attempt-evidence-service";
 
-const client = createClient({
-  max: 3,
-  connection: {
-    application_name: "report-storage-backfill",
-    statement_timeout: "60s",
-    lock_timeout: "3s",
-    check_client_connection_interval: "2s",
-  },
-});
+const client = makeReportStorageDatabase("report-storage-backfill");
 const stop = new AbortController();
 const attemptEvidence = createClient({
   max: 1,

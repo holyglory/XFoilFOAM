@@ -41,6 +41,7 @@ import {
   WorkerReportFetchDisabled,
 } from "../src/report-archive-broker-client";
 import { readWorkerReportVolume } from "../src/worker-report-volume";
+import { makeReportStorageDatabase } from "../src/config";
 import {
   releaseUpstreamReadableVolume,
   runWorkerVolumeCleanup,
@@ -211,6 +212,27 @@ async function expectRoundtrip(
   for (const path of cloud.paths)
     await expect(readFile(path)).rejects.toMatchObject({ code: "ENOENT" });
 }
+
+it("opens the production archive connections with PostgreSQL's bounded session settings", async () => {
+  for (const name of ["report-storage", "report-storage-backfill"] as const) {
+    const pool = makeReportStorageDatabase(name);
+    try {
+      const [row] = await pool.db
+        .execute(sql`SELECT current_setting('application_name') AS name,
+        (SELECT setting::int FROM pg_settings WHERE name='statement_timeout') AS statement_ms,
+        (SELECT setting::int FROM pg_settings WHERE name='lock_timeout') AS lock_ms,
+        (SELECT setting::int FROM pg_settings WHERE name='client_connection_check_interval') AS check_ms`);
+      expect(row).toEqual({
+        name,
+        statement_ms: 60_000,
+        lock_ms: 3_000,
+        check_ms: 2_000,
+      });
+    } finally {
+      await pool.sql.end();
+    }
+  }
+});
 
 async function expectSqlRefusal(
   db: DB,
@@ -401,10 +423,15 @@ describe.each<ArchiveSource>(["remote", "worker"])(
             }
             expect(fixture.reports[1]!.payloadHash !== null).toBe(normalized);
             if (normalized) {
-              await expectSqlRefusal(fixture.db, (connection) => connection.execute(sql`
+              await expectSqlRefusal(
+                fixture.db,
+                (connection) =>
+                  connection.execute(sql`
                 DELETE FROM public.progressive_report_result_payloads
                 WHERE content_hash=${fixture.reports[1]!.payloadHash}
-              `), /still referenced|foreign key/i);
+              `),
+                /still referenced|foreign key/i,
+              );
             }
             const cloud = cloudFixture();
             expect(

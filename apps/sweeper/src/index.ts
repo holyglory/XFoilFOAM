@@ -1,4 +1,4 @@
-import { createClient, syncApiSettings } from "@aerodb/db";
+import { syncApiSettings } from "@aerodb/db";
 import { installProgressiveReportArchiveReader } from "@aerodb/db/progressive-report-reader";
 import { ProgressiveReportArchiveStore } from "./progressive-report-archive-store";
 import { readStoredWorkerArchiveText } from "./report-archive-broker-client";
@@ -9,6 +9,7 @@ import {
   configuredDeploymentRole,
   makeContext,
   makeIsolatedDatabase,
+  makeReportStorageDatabase,
 } from "./config";
 import { startHeartbeatTimer } from "./heartbeat";
 import { runLoop } from "./loop";
@@ -33,15 +34,7 @@ const retention = makeIsolatedDatabase(1);
 const evidence = makeIsolatedDatabase(8);
 const reports = makeIsolatedDatabase(8);
 const archive = makeIsolatedDatabase(2);
-const reportStorage = createClient({
-  max: 3,
-  connection: {
-    application_name: "report-storage",
-    statement_timeout: "60s",
-    lock_timeout: "3s",
-    check_client_connection_interval: "2s",
-  },
-});
+const reportStorage = makeReportStorageDatabase("report-storage");
 if (configuredDeploymentRole() === "remote-solver") {
   installProgressiveReportArchiveReader({
     read: (identity) => readStoredWorkerArchiveText(reportStorage.db, identity),
