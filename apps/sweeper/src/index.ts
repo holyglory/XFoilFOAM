@@ -1,8 +1,9 @@
-import { syncApiSettings } from "@aerodb/db";
+import { createClient, syncApiSettings } from "@aerodb/db";
 
 import {
   assertRemoteSolverHubUrlContract,
   assertRemoteSolverNodeEvidenceContract,
+  configuredDeploymentRole,
   makeContext,
   makeIsolatedDatabase,
 } from "./config";
@@ -12,7 +13,7 @@ import { runProgressiveBaselineService } from "./progressive-service";
 import { runProgressiveReportService } from "./progressive-report-service";
 import { runProgressiveEvidenceService } from "./progressive-evidence-service";
 import { runProgressiveArchiveService } from "./progressive-archive-service";
-import { runProgressiveReportArchiveService } from "./progressive-report-archive-service";
+import { runDuplicateReportCleanup } from "./progressive-report-archive-service";
 import { runArchiveReclaimService } from "./archive-reclaim-service";
 import { runProgressiveWorkerCapabilityService } from "./progressive-worker-capabilities";
 import { runRetentionService } from "./retention-service";
@@ -29,7 +30,15 @@ const retention = makeIsolatedDatabase(1);
 const evidence = makeIsolatedDatabase(8);
 const reports = makeIsolatedDatabase(8);
 const archive = makeIsolatedDatabase(2);
-const reportStorage = makeIsolatedDatabase(2);
+const reportStorage = createClient({
+  max: 1,
+  connection: {
+    application_name: "report-storage",
+    statement_timeout: "60s",
+    lock_timeout: "3s",
+    check_client_connection_interval: "2s",
+  },
+});
 try {
   const [syncSettings] = await db
     .select({
@@ -138,10 +147,15 @@ try {
       run: (signal) =>
         runArchiveReclaimService(archive.db, archive.sql, engine, signal),
     },
-    {
-      name: "progressive-report-archive",
-      run: (signal) => runProgressiveReportArchiveService(reportStorage.db, signal),
-    },
+    ...(configuredDeploymentRole() === "remote-solver"
+      ? [
+          {
+            name: "duplicate-worker-reports",
+            run: (signal: AbortSignal) =>
+              runDuplicateReportCleanup(reportStorage.db, signal),
+          },
+        ]
+      : []),
   ]);
 } finally {
   stopRemoteFleetHeartbeat();

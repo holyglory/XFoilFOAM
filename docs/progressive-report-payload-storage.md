@@ -1,44 +1,12 @@
 # Lossless progressive report payload storage
 
-## Full report history and automatic compaction
+## Duplicate rejected worker reports
 
-Migration `0200` adds immutable report archive bundles and members. On the hub,
-the sweeper writes completed remote report histories as gzip JSONL bundles to
-the configured `AIRFOILFOAM_EVIDENCE_BUCKET`. It verifies the generation,
-metadata, compressed byte size and SHA-256 by reading the object back before
-compacting the PostgreSQL report body.
+HZ keeps a rejection's reason, original sequence and content signature. PostgreSQL compares the rejected report to the immutable worker report for that exact execution and sequence. When their bytes match, the rejection refers to the original body. New rejections use this representation on insertion. The sweeper checks existing rows in small batches. A different body keeps its own storage.
 
-The PostgreSQL row retains the execution id, sequence, signature, report
-identity, inventory, source rows, custody rows and the GCS archive pointer. The
-full report is removed from the row only after the archive member catalog is
-durable. Worker copies on `hz-solver2` are compacted after their report has been
-acknowledged by the hub and every evidence point is represented by a hub receipt
-or a terminal delivery conflict. The remote solver has no GCS credentials and
-does not receive any.
+Migration `0202` requires a verified archive member before a full report can be replaced with a cloud pointer. An acknowledgement can also mean a delivery was rejected locally. Migration `0203` makes byte-identical rejection copies eligible for immediate cleanup while keeping the source readable. The `progressive_worker_conflict_storage` view resolves the correct source.
 
-The sweeper report-storage service runs this process continuously. It selects only terminal
-executions with a completed ingestion stamp, an expired or cancelled promise,
-no live ingest lease and a verified stop report. Active reports and unresolved
-evidence remain inline. Report result payloads are deleted only after no report
-row references them.
-
-Rejected worker-report conflicts retain their sequence, signature, reason and
-compact status header. Their oversized report bodies are compacted after every
-worker report for the same terminal execution has been compacted, because those
-conflicts are not solver results and are not needed by the delivery scheduler.
-
-The existing retained-report download route reads archived members from the
-generation-pinned GCS bundle, so compaction does not remove the exact report
-download or its signature verification. PostgreSQL `VACUUM FULL` is a separate
-operator action after the archive backlog is drained. The archive process never
-deletes solver result attempts, accepted polar points, evidence archives or
-custody metadata.
-
-Report history remains intact: sequence numbers, content signatures, creation and
-receipt timestamps, acknowledgements, inventories, source associations, and their
-foreign keys retain their existing identities. This implements architecture
-decision `nc641c0a4dcbe8649`; the prohibition on report-history deletion in
-`ne4afd84a6954d73a` still applies.
+PostgreSQL can reuse the space from these updates. Measure the relation before and after a table rewrite to determine the space returned to the host.
 
 Migration `0198` adds an immutable, content-addressed
 `public.progressive_report_result_payloads` table and a nullable

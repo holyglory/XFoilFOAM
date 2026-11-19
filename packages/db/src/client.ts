@@ -7,11 +7,15 @@ import * as schema from "./schema";
 export interface ClientOptions {
   url?: string;
   max?: number;
+  connection?: Record<string, string>;
 }
 
 /** Create a postgres-js pool + Drizzle client. Caller owns `sql.end()`. */
 export function createClient(opts: ClientOptions = {}) {
-  const sql = postgres(opts.url ?? databaseUrl(), { max: opts.max ?? 10 });
+  const sql = postgres(opts.url ?? databaseUrl(), {
+    max: opts.max ?? 10,
+    connection: opts.connection,
+  });
   const db = drizzle(sql, { schema });
   return { db, sql };
 }

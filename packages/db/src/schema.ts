@@ -8029,9 +8029,10 @@ export const progressiveReportArchiveBundles = pgTable(
       .default(sql`clock_timestamp()`),
   },
   (table) => ({
-    sourceJobUq: unique("progressive_report_archive_bundles_source_job_uq").on(
+    executionIdx: index("progressive_report_archive_bundles_execution_idx").on(
       table.sourceKind,
       table.simJobId,
+      table.firstSequence,
     ),
     objectUq: unique("progressive_report_archive_bundles_object_uq").on(
       table.bucket,
@@ -8189,6 +8190,8 @@ export const progressiveRemoteReports = pgTable(
     stopCandidateIdx: index("progressive_remote_reports_stop_candidate_idx")
       .on(table.simJobId)
       .where(sql`${table.report}#>>'{stopProof,execution_stopped}'='true'`),
+    waitingArchiveIdx: index("progressive_remote_reports_waiting_archive_idx")
+      .on(table.simJobId, table.sequence).where(sql`${table.archivedAt} IS NULL`),
     receivedOrderIdx: index("progressive_remote_reports_received_order_idx")
       .on(table.receivedAt, table.simJobId, table.sequence),
     sequenceCheck: check(
@@ -8352,12 +8355,8 @@ export const progressiveWorkerReports = pgTable(
     stagingJobOrderIdx: index("progressive_worker_reports_staging_job_order_idx")
       .on(table.simJobId, table.createdAt, table.sequence)
       .where(sql`${table.acknowledgedAt} IS NOT NULL AND jsonb_typeof(${table.report}->'result')='object'`),
-    compactionOrderIdx: index("progressive_worker_reports_compaction_order_idx")
-      .on(table.createdAt, table.simJobId, table.sequence)
-      .where(sql`${table.acknowledgedAt} IS NOT NULL
-        AND ${table.archiveBundleId} IS NULL
-        AND ${table.archivedAt} IS NULL
-        AND jsonb_typeof(${table.report}->'result')='object'`),
+    waitingArchiveIdx: index("progressive_worker_reports_waiting_archive_idx")
+      .on(table.simJobId, table.sequence).where(sql`${table.archivedAt} IS NULL`),
     primary: primaryKey({ columns: [table.simJobId, table.sequence] }),
     pendingIdx: index("progressive_worker_reports_pending_idx")
       .on(table.simJobId, table.sequence)
@@ -8417,12 +8416,17 @@ export const progressiveWorkerReportConflicts = pgTable(
     archivedAt: timestamp("archived_at", { withTimezone: true }),
     report: jsonb("report").$type<Record<string, unknown>>().notNull(),
     reason: text("reason").notNull(),
+    bodySourceSequence: bigint("body_source_sequence", {mode:"number"}),
     createdAt: timestamp("created_at", { withTimezone: true })
       .notNull()
       .default(sql`clock_timestamp()`),
   },
   (table) => ({
     primary: primaryKey({ columns: [table.simJobId, table.sequence] }),
+    bodySourceCheck: check("progressive_worker_report_conflicts_body_source_sequence_check",
+      sql`${table.bodySourceSequence}=${table.sequence}`),
+    bodySource: foreignKey({name:"progressive_worker_conflict_body_fk",
+      columns:[table.simJobId,table.bodySourceSequence],foreignColumns:[progressiveWorkerReports.simJobId,progressiveWorkerReports.sequence]}),
     signatureCheck: check(
       "progressive_worker_report_conflicts_content_signature_check",
       sql`${table.contentSignature} ~ '^[a-f0-9]{64}$'`,
