@@ -7,6 +7,7 @@ import type { FastifyInstance, FastifyReply } from "fastify";
 import { z } from "zod";
 import { requireAdmin } from "./admin-auth";
 import { db } from "./db";
+import { readProgressiveReportArchive } from "./progressive-report-archive-reader";
 
 function failure(reply: FastifyReply, error: unknown) {
   if (error instanceof RetainedReportReadError)
@@ -67,7 +68,7 @@ export async function registerRetainedReportRoutes(app: FastifyInstance) {
         const report = await retainedSolverReportDownload(db, {
           ...params.data,
           ...query.data,
-        });
+        }, {archiveReader: {read: readProgressiveReportArchive}});
         return reply
           .header("cache-control", "private, no-store")
           .header(

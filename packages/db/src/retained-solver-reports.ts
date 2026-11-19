@@ -11,11 +11,28 @@ const SIGNATURE = /^[a-f0-9]{64}$/;
 
 export class RetainedReportReadError extends Error {
   constructor(
-    readonly statusCode: 400 | 404 | 409,
+    readonly statusCode: 400 | 404 | 409 | 503,
     message: string,
   ) {
     super(message);
   }
+}
+
+export interface RetainedReportArchiveReader {
+  read(identity: {
+    bucket: string;
+    objectKey: string;
+    generation: string;
+    mimeType: string;
+    compression: string;
+    archiveFormat: string;
+    storedSha256: string;
+    storedByteSize: number;
+    crc32c: string;
+    executionId: string;
+    sequence: number;
+    signature: string;
+  }): Promise<unknown>;
 }
 
 interface ReportCursor {
@@ -174,6 +191,7 @@ export async function retainedSolverReports(
 export async function retainedSolverReportDownload(
   db: DB,
   reference: { executionId: string; sequence: number; signature: string },
+  options: { archiveReader?: RetainedReportArchiveReader } = {},
 ) {
   if (
     !UUID.test(reference.executionId) ||
@@ -186,24 +204,53 @@ export async function retainedSolverReportDownload(
       "Invalid exact retained-report reference",
     );
   const [stored] =
-    await db.execute(sql`SELECT resolve_progressive_report(to_jsonb(report.*)) AS report,report.content_signature,inventory.inventory_signature,inventory.source_count,
+    await db.execute(sql`SELECT report.report,report.archive_bundle_id,archive.bucket AS archive_bucket,
+    archive.object_key AS archive_object_key,archive.generation AS archive_generation,
+    archive.mime_type AS archive_mime_type,archive.compression AS archive_compression,
+    archive.archive_format AS archive_format,archive.stored_sha256 AS archive_stored_sha256,
+    archive.stored_byte_size AS archive_stored_byte_size,archive.crc32c AS archive_crc32c,
+    resolve_progressive_report(to_jsonb(report.*)) AS resolved_report,report.content_signature,inventory.inventory_signature,inventory.source_count,
     dispatch.solver_id,dispatch.promise_id,dispatch.content_signature AS assignment_signature,dispatch.envelope,airfoil.slug
     FROM progressive_remote_reports report JOIN progressive_remote_report_inventories inventory USING(sim_job_id,sequence)
     JOIN progressive_remote_dispatches dispatch ON dispatch.sim_job_id=report.sim_job_id
     JOIN sim_jobs job ON job.id=report.sim_job_id JOIN airfoils airfoil ON airfoil.id=job.airfoil_id
+    LEFT JOIN progressive_report_archive_bundles archive ON archive.id=report.archive_bundle_id
     WHERE report.sim_job_id=${reference.executionId}::uuid AND report.sequence=${reference.sequence}
       AND report.content_signature=${reference.signature} AND inventory.source_count>0
       AND EXISTS(SELECT 1 FROM progressive_cfd_execution_stops stopped WHERE stopped.sim_job_id=job.id AND stopped.engine_job_id=job.engine_job_id)`);
   if (!stored)
     throw new RetainedReportReadError(404, "Stored solver report not found");
   try {
+    const report = stored.archive_bundle_id
+      ? await (async () => {
+          if (!options.archiveReader)
+            throw new RetainedReportReadError(
+              503,
+              "Archived solver report storage is not configured",
+            );
+          return options.archiveReader.read({
+            bucket: String(stored.archive_bucket),
+            objectKey: String(stored.archive_object_key),
+            generation: String(stored.archive_generation),
+            mimeType: String(stored.archive_mime_type),
+            compression: String(stored.archive_compression),
+            archiveFormat: String(stored.archive_format),
+            storedSha256: String(stored.archive_stored_sha256),
+            storedByteSize: Number(stored.archive_stored_byte_size),
+            crc32c: String(stored.archive_crc32c),
+            executionId: reference.executionId,
+            sequence: reference.sequence,
+            signature: reference.signature,
+          });
+        })()
+      : stored.resolved_report;
     const envelope = verifyProgressiveRemoteExecution(stored.envelope, {
       executionId: reference.executionId,
       solverId: String(stored.solver_id),
       promiseId: String(stored.promise_id),
       contentSignature: String(stored.assignment_signature),
     });
-    const validated = validateProgressiveRemoteReport(stored.report, envelope);
+    const validated = validateProgressiveRemoteReport(report, envelope);
     const inventory = progressiveRemoteReportInventory(validated.report);
     if (
       validated.contentSignature !== reference.signature ||
@@ -217,7 +264,8 @@ export async function retainedSolverReportDownload(
       signature: validated.contentSignature,
       filename: `${String(stored.slug).replace(/[^a-zA-Z0-9._-]/g, "-")}-solver-report-${reference.sequence}.json`,
     };
-  } catch {
+  } catch (error) {
+    if (error instanceof RetainedReportReadError) throw error;
     throw new RetainedReportReadError(
       409,
       "Stored solver report failed integrity verification",

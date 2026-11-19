@@ -1,5 +1,34 @@
 # Lossless progressive report payload storage
 
+## Full report history and automatic compaction
+
+Migration `0200` adds immutable report archive bundles and members. On the hub,
+the sweeper writes completed remote report histories as gzip JSONL bundles to
+the configured `AIRFOILFOAM_EVIDENCE_BUCKET`. It verifies the generation,
+metadata, compressed byte size and SHA-256 by reading the object back before
+compacting the PostgreSQL report body.
+
+The PostgreSQL row retains the execution id, sequence, signature, report
+identity, inventory, source rows, custody rows and the GCS archive pointer. The
+full report is removed from the row only after the archive member catalog is
+durable. Worker copies on `hz-solver2` are compacted after their report has been
+acknowledged by the hub and every evidence point is represented by a hub receipt
+or a terminal delivery conflict. The remote solver has no GCS credentials and
+does not receive any.
+
+The retention service runs this process continuously. It selects only terminal
+executions with a completed ingestion stamp, an expired or cancelled promise,
+no live ingest lease and a verified stop report. Active reports and unresolved
+evidence remain inline. Report result payloads are deleted only after no report
+row references them.
+
+The existing retained-report download route reads archived members from the
+generation-pinned GCS bundle, so compaction does not remove the exact report
+download or its signature verification. PostgreSQL `VACUUM FULL` is a separate
+operator action after the archive backlog is drained. The archive process never
+deletes solver result attempts, accepted polar points, evidence archives or
+custody metadata.
+
 Report history remains intact: sequence numbers, content signatures, creation and
 receipt timestamps, acknowledgements, inventories, source associations, and their
 foreign keys retain their existing identities. This implements architecture

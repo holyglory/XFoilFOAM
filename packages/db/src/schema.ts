@@ -8005,6 +8005,114 @@ export const progressiveRemoteDispatches = pgTable(
   }),
 );
 
+export const progressiveReportArchiveBundles = pgTable(
+  "progressive_report_archive_bundles",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    sourceKind: text("source_kind").notNull(),
+    simJobId: uuid("sim_job_id").notNull(),
+    bucket: text("bucket").notNull(),
+    objectKey: text("object_key").notNull(),
+    generation: text("generation").notNull(),
+    mimeType: text("mime_type").notNull().default("application/gzip"),
+    compression: text("compression").notNull().default("gzip"),
+    archiveFormat: text("archive_format").notNull().default("jsonl"),
+    storedSha256: text("stored_sha256").notNull(),
+    storedByteSize: bigint("stored_byte_size", { mode: "number" }).notNull(),
+    crc32c: text("crc32c").notNull(),
+    memberCount: integer("member_count").notNull(),
+    firstSequence: bigint("first_sequence", { mode: "number" }).notNull(),
+    lastSequence: bigint("last_sequence", { mode: "number" }).notNull(),
+    verifiedAt: timestamp("verified_at", { withTimezone: true }).notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .default(sql`clock_timestamp()`),
+  },
+  (table) => ({
+    sourceJobUq: unique("progressive_report_archive_bundles_source_job_uq").on(
+      table.sourceKind,
+      table.simJobId,
+    ),
+    objectUq: unique("progressive_report_archive_bundles_object_uq").on(
+      table.bucket,
+      table.objectKey,
+      table.generation,
+    ),
+    sourceCheck: check(
+      "progressive_report_archive_bundles_source_check",
+      sql`${table.sourceKind} IN ('remote', 'worker')`,
+    ),
+    generationCheck: check(
+      "progressive_report_archive_bundles_generation_check",
+      sql`${table.generation} ~ '^[1-9][0-9]{0,19}$'`,
+    ),
+    compressionCheck: check(
+      "progressive_report_archive_bundles_compression_check",
+      sql`${table.compression} = 'gzip' AND ${table.archiveFormat} = 'jsonl'`,
+    ),
+    hashCheck: check(
+      "progressive_report_archive_bundles_hash_check",
+      sql`${table.storedSha256} ~ '^[a-f0-9]{64}$'`,
+    ),
+    sizesCheck: check(
+      "progressive_report_archive_bundles_sizes_check",
+      sql`${table.storedByteSize} > 0 AND ${table.memberCount} > 0 AND ${table.firstSequence} > 0 AND ${table.lastSequence} >= ${table.firstSequence}`,
+    ),
+  }),
+);
+
+export const progressiveReportArchiveMembers = pgTable(
+  "progressive_report_archive_members",
+  {
+    bundleId: uuid("bundle_id")
+      .notNull()
+      .references(() => progressiveReportArchiveBundles.id, {
+        onDelete: "restrict",
+      }),
+    sourceKind: text("source_kind").notNull(),
+    simJobId: uuid("sim_job_id").notNull(),
+    sequence: bigint("sequence", { mode: "number" }).notNull(),
+    memberKind: text("member_kind").notNull(),
+    contentSignature: text("content_signature").notNull(),
+    reportSha256: text("report_sha256").notNull(),
+    reportByteSize: bigint("report_byte_size", { mode: "number" }).notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .default(sql`clock_timestamp()`),
+  },
+  (table) => ({
+    primary: primaryKey({
+      columns: [table.sourceKind, table.simJobId, table.memberKind, table.sequence],
+    }),
+    signatureUq: unique("progressive_report_archive_members_signature_uq").on(
+      table.sourceKind,
+      table.simJobId,
+      table.memberKind,
+      table.contentSignature,
+    ),
+    bundleIdx: index("progressive_report_archive_members_bundle_idx").on(
+      table.bundleId,
+      table.sequence,
+    ),
+    sourceCheck: check(
+      "progressive_report_archive_members_source_check",
+      sql`${table.sourceKind} IN ('remote', 'worker')`,
+    ),
+    kindCheck: check(
+      "progressive_report_archive_members_kind_check",
+      sql`${table.memberKind} IN ('report', 'conflict')`,
+    ),
+    signatureCheck: check(
+      "progressive_report_archive_members_signature_check",
+      sql`${table.contentSignature} ~ '^[a-f0-9]{64}$' AND ${table.reportSha256} ~ '^[a-f0-9]{64}$'`,
+    ),
+    sizeCheck: check(
+      "progressive_report_archive_members_size_check",
+      sql`${table.sequence} > 0 AND ${table.reportByteSize} > 0`,
+    ),
+  }),
+);
+
 // Disabled until every report consumer has been upgraded to lossless reads.
 export const progressiveReportStoragePolicy = pgTable(
   "progressive_report_storage_policy",
@@ -8063,6 +8171,11 @@ export const progressiveRemoteReports = pgTable(
       }),
     sequence: bigint("sequence", { mode: "number" }).notNull(),
     contentSignature: text("content_signature").notNull(),
+    archiveBundleId: uuid("archive_bundle_id").references(
+      () => progressiveReportArchiveBundles.id,
+      { onDelete: "restrict" },
+    ),
+    archivedAt: timestamp("archived_at", { withTimezone: true }),
     resultPayloadHash: text("result_payload_hash").references(
       () => progressiveReportResultPayloads.contentHash, { onDelete: "restrict" },
     ),
@@ -8205,6 +8318,11 @@ export const progressiveWorkerReports = pgTable(
       .references(() => simJobs.id, { onDelete: "cascade" }),
     sequence: bigint("sequence", { mode: "number" }).notNull(),
     contentSignature: text("content_signature").notNull(),
+    archiveBundleId: uuid("archive_bundle_id").references(
+      () => progressiveReportArchiveBundles.id,
+      { onDelete: "restrict" },
+    ),
+    archivedAt: timestamp("archived_at", { withTimezone: true }),
     resultPayloadHash: text("result_payload_hash").references(
       () => progressiveReportResultPayloads.contentHash, { onDelete: "restrict" },
     ),
@@ -8286,6 +8404,11 @@ export const progressiveWorkerReportConflicts = pgTable(
       .references(() => simJobs.id, { onDelete: "cascade" }),
     sequence: bigint("sequence", { mode: "number" }).notNull(),
     contentSignature: text("content_signature").notNull(),
+    archiveBundleId: uuid("archive_bundle_id").references(
+      () => progressiveReportArchiveBundles.id,
+      { onDelete: "restrict" },
+    ),
+    archivedAt: timestamp("archived_at", { withTimezone: true }),
     report: jsonb("report").$type<Record<string, unknown>>().notNull(),
     reason: text("reason").notNull(),
     createdAt: timestamp("created_at", { withTimezone: true })

@@ -12,6 +12,7 @@ import { runProgressiveBaselineService } from "./progressive-service";
 import { runProgressiveReportService } from "./progressive-report-service";
 import { runProgressiveEvidenceService } from "./progressive-evidence-service";
 import { runProgressiveArchiveService } from "./progressive-archive-service";
+import { runProgressiveReportArchiveService } from "./progressive-report-archive-service";
 import { runArchiveReclaimService } from "./archive-reclaim-service";
 import { runProgressiveWorkerCapabilityService } from "./progressive-worker-capabilities";
 import { runRetentionService } from "./retention-service";
@@ -28,6 +29,7 @@ const retention = makeIsolatedDatabase(1);
 const evidence = makeIsolatedDatabase(8);
 const reports = makeIsolatedDatabase(8);
 const archive = makeIsolatedDatabase(2);
+const reportStorage = makeIsolatedDatabase(2);
 try {
   const [syncSettings] = await db
     .select({
@@ -49,6 +51,7 @@ try {
     evidence.sql.end(),
     reports.sql.end(),
     archive.sql.end(),
+    reportStorage.sql.end(),
   ]);
   throw error;
 }
@@ -135,6 +138,10 @@ try {
       run: (signal) =>
         runArchiveReclaimService(archive.db, archive.sql, engine, signal),
     },
+    {
+      name: "progressive-report-archive",
+      run: (signal) => runProgressiveReportArchiveService(reportStorage.db, signal),
+    },
   ]);
 } finally {
   stopRemoteFleetHeartbeat();
@@ -146,6 +153,8 @@ try {
     retention.sql.end(),
     evidence.sql.end(),
     reports.sql.end(),
+    archive.sql.end(),
+    reportStorage.sql.end(),
   ]);
 }
 console.log("[sweeper] stopped");
