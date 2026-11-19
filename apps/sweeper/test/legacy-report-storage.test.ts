@@ -13,6 +13,9 @@ import {
 import {
   LegacyHubGcsStore,
   legacySha256,
+  LegacyStorageOperationError,
+  legacySshOperationError,
+  legacyLocalStorageError,
   type LegacyBackupObject,
   type LegacyBackupStore,
 } from "../src/legacy-report-storage-gcs";
@@ -27,6 +30,7 @@ import {
   type LegacyBackupReceipt,
 } from "../src/legacy-report-storage";
 import { legacyReportStorageCli } from "../src/legacy-report-storage-cli";
+import { runLegacyUntilComplete } from "../src/legacy-report-storage-loop";
 import {
   LegacyOperatorPaused,
   legacyOperatorWriteCommand,
@@ -229,6 +233,194 @@ async function logical(executionId: string) {
 }
 
 describe.sequential("worker-only legacy backup and 0198 representation", () => {
+  it("persists custody proof for a real 64.64.generation receipt without exceeding NAME_MAX", async () => {
+    const scope = await fixture(false),
+      path = await directory();
+    const page = await readLegacyPage(source, scope),
+      packed = encodeLegacyPage(page);
+    const hash = legacySha256(packed.bytes);
+    const receipt: LegacyBackupReceipt = {
+      version: 1,
+      scopeSha256: page.scopeSha256,
+      sourceInstance: page.sourceInstance,
+      solverId: page.solverId,
+      start: page.start,
+      next: page.next,
+      memberCount: page.members.length,
+      rawByteSize: packed.rawByteSize,
+      object: {
+        bucket: "legacy-name-limit",
+        objectKey: `legacy-worker-reports/v1/${scope.sourceInstance}/${scope.solverId}/${page.scopeSha256}/${hash}.jsonl.gz`,
+        generation: "18446744073709551615",
+        sha256: hash,
+        byteSize: packed.bytes.length,
+        crc32c: "AAAAAA==",
+        verifiedAt: new Date().toISOString(),
+      },
+    };
+    const bytes = Buffer.from(JSON.stringify(receipt) + "\n"),
+      name = `${legacySha256(bytes)}.${hash}.${receipt.object.generation}.receipt.json`;
+    await writeFile(join(path, name), bytes, { mode: 0o600 });
+    const normalizer: LegacyPageNormalizer = {
+      binding: "filename-fixture",
+      receiptPhase: "custody",
+      phaseBinding: "p".repeat(64),
+      apply: async () => ({
+        verifiedReports: 5,
+        normalizedReports: 0,
+        rowProofs: [],
+        newlyNormalizedReports: 0,
+        transactionCommitted: true,
+        sourceDatabaseWrites: false,
+        archiveMembersReleased: 0,
+        remainingWarmReports: 0,
+        coldReleaseComplete: true,
+        retentionStrategy: "gcs-and-worker-working-volume",
+      }),
+    };
+    await applyVerifiedLegacyPage({
+      page,
+      receipt,
+      receiptFile: name,
+      directory: path,
+      normalizer,
+    });
+    for (const file of await readdir(path)) {
+      expect(Buffer.byteLength(file)).toBeLessThanOrEqual(255);
+      expect(file).not.toContain(".tmp-");
+    }
+    expect(
+      (
+        await migrateLegacyReceipts({
+          scope,
+          directory: path,
+          store: new MemoryBackup(),
+          normalizer,
+          apply: true,
+        })
+      ).complete,
+    ).toBe(true);
+  });
+
+  it("continues beyond six hours by default and only obeys explicit overall ceilings", async () => {
+    let clock = 0,
+      calls = 0;
+    const result = await runLegacyUntilComplete(
+      async () => {
+        clock += 4 * 3600 * 1000;
+        calls++;
+        return { complete: calls === 3, next: { execution: calls } };
+      },
+      {
+        now: () => clock,
+        sleep: async (ms) => {
+          clock += ms;
+        },
+      },
+    );
+    expect(result).toMatchObject({
+      complete: true,
+      passesCompleted: 3,
+      stopReason: "scope_complete",
+    });
+    expect(result.elapsedSeconds).toBeGreaterThan(6 * 3600);
+    calls = 0;
+    const bounded = await runLegacyUntilComplete(
+      async () => ({ complete: false, next: ++calls }),
+      { maxPasses: 2, now: () => 0, sleep: async () => undefined },
+    );
+    expect(bounded).toMatchObject({
+      complete: false,
+      passesCompleted: 2,
+      stopReason: "pass_budget_exhausted",
+    });
+    await expect(
+      runLegacyUntilComplete(async () => ({ complete: false, next: 1 }), {
+        sleep: async () => undefined,
+      }),
+    ).rejects.toThrow(/no progress/);
+  });
+
+  it("retries only typed transport/deploy pauses and keeps retry diagnostics private", async () => {
+    const events: Record<string, unknown>[] = [],
+      waits: number[] = [];
+    let attempt = 0;
+    const result = await runLegacyUntilComplete(
+      async () => {
+        attempt++;
+        if (attempt === 1) throw new LegacyOperatorPaused();
+        if (attempt === 2)
+          throw legacySshOperationError(
+            "hub_put",
+            { code: 255 },
+            "Connection reset by peer",
+            true,
+          );
+        if (attempt === 3)
+          throw new LegacyStorageOperationError({
+            operation: "gcs_upload",
+            category: "gcs_server_error",
+            httpStatus: 503,
+          });
+        return { complete: true, next: 1 };
+      },
+      {
+        sleep: async (ms) => {
+          waits.push(ms);
+        },
+        emit: (event) => events.push(event),
+      },
+    );
+    expect(result).toMatchObject({
+      complete: true,
+      deployPauses: 1,
+      transientRetries: 2,
+    });
+    expect(waits).toEqual([5000, 1000, 2000]);
+    for (const stderr of [
+      "Permission denied (publickey)",
+      "Host key verification failed",
+      "No such container: wrong-input",
+    ]) {
+      const error = legacySshOperationError(
+        "hub_read",
+        { code: 255 },
+        stderr,
+        false,
+      );
+      expect(error.retryable).toBe(false);
+      let calls = 0;
+      await expect(
+        runLegacyUntilComplete(
+          async () => {
+            calls++;
+            throw error;
+          },
+          { sleep: async () => undefined },
+        ),
+      ).rejects.toBe(error);
+      expect(calls).toBe(1);
+    }
+    const sensitive = "owner@example.invalid Bearer secret-token /private/path";
+    for (const [code, category] of [
+      ["ENAMETOOLONG", "local_name_too_long"],
+      ["ENOSPC", "local_space_exhausted"],
+    ] as const) {
+      const failure = legacyLocalStorageError(
+        "save_proof",
+        Object.assign(new Error(sensitive), { code, path: sensitive }),
+      )!;
+      expect(failure).toMatchObject({
+        retryable: false,
+        details: { operation: "save_proof", category, localCode: code },
+      });
+      expect(
+        JSON.stringify({ message: failure.message, ...failure.details }),
+      ).not.toMatch(/example|secret|private\/path/);
+    }
+    expect(JSON.stringify(events)).not.toMatch(/Bearer|@|private\/path/);
+  });
+
   it("pauses writes for deployment without advancing the page and preserves the pre-lock binding", async () => {
     const scope = await fixture(false),
       path = await directory(),
@@ -895,6 +1087,61 @@ describe.sequential("worker-only legacy backup and 0198 representation", () => {
 });
 
 describe("canonical hub identity and immutable object REST contract", () => {
+  it.each([429, 503, 401, 403, 404])(
+    "sanitizes HTTP %s and only retries explicit transient storage status",
+    async (status) => {
+      const account = "fixture@unit-project.iam.gserviceaccount.com",
+        secret = "private@example.invalid Bearer hidden-token error-body";
+      const fetcher = (async (input: string | URL | Request) => {
+        const url = String(input);
+        if (url.endsWith("/email"))
+          return new Response(account, {
+            headers: { "Metadata-Flavor": "Google" },
+          });
+        if (url.endsWith("/token"))
+          return new Response(
+            JSON.stringify({
+              token_type: "Bearer",
+              access_token: "hidden-token",
+            }),
+            { headers: { "Metadata-Flavor": "Google" } },
+          );
+        return new Response(secret, { status });
+      }) as typeof fetch;
+      const object: LegacyBackupObject = {
+        bucket: "backup-test",
+        objectKey: `legacy-worker-reports/v1/unit/${"a".repeat(64)}.jsonl.gz`,
+        generation: "1",
+        sha256: "a".repeat(64),
+        byteSize: 1,
+        crc32c: "AAAAAA==",
+        verifiedAt: new Date().toISOString(),
+      };
+      const error = await new LegacyHubGcsStore("backup-test", account, fetcher)
+        .read(object)
+        .catch((error) => error);
+      expect(error).toBeInstanceOf(LegacyStorageOperationError);
+      expect(error).toMatchObject({
+        retryable: status === 429 || status === 503,
+        details: {
+          operation: "gcs_metadata",
+          httpStatus: status,
+          category:
+            status === 429
+              ? "gcs_rate_limited"
+              : status === 503
+                ? "gcs_server_error"
+                : status === 404
+                  ? "integrity"
+                  : "credentials_denied",
+        },
+      });
+      expect(
+        JSON.stringify({ message: error.message, ...error.details }),
+      ).not.toMatch(/@|Bearer|hidden-token|error-body/);
+    },
+  );
+
   it("creates only absent objects, pins generations and refuses corrupt/redirected/wrong-account reads", async () => {
     const oldRole = process.env.DEPLOYMENT_ROLE;
     process.env.DEPLOYMENT_ROLE = "hub";
@@ -953,13 +1200,22 @@ describe("canonical hub identity and immutable object REST contract", () => {
         2,
       );
       badBytes = true;
-      await expect(store.read(object)).rejects.toThrow(/SHA256/);
+      await expect(store.read(object)).rejects.toMatchObject({
+        details: { operation: "gcs_download", category: "integrity" },
+        retryable: false,
+      });
       badBytes = false;
       wrongAccount = true;
-      await expect(store.read(object)).rejects.toThrow(/identity mismatch/);
+      await expect(store.read(object)).rejects.toMatchObject({
+        details: { operation: "hub_identity", category: "credentials_denied" },
+        retryable: false,
+      });
       await expect(
         store.read({ ...object, bucket: "another-bucket" }),
-      ).rejects.toThrow(/bucket mismatch/);
+      ).rejects.toMatchObject({
+        details: { operation: "gcs_download", category: "bad_input" },
+        retryable: false,
+      });
       expect(
         requests
           .filter((r) => r.url.includes("storage.googleapis.com"))

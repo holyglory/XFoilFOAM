@@ -1,3 +1,7 @@
+import {
+  legacySshOperationError,
+  type LegacyStorageOperation,
+} from "./legacy-report-storage-gcs";
 import { legacyBound } from "@aerodb/db/legacy-report-storage";
 
 export class LegacyOperatorPaused extends Error {
@@ -22,10 +26,13 @@ export function legacyOperatorWriteCommand(
   return `flock -s -w ${waitSeconds} -E 75 /tmp/airfoils-pro-deploy.lock ${command}`;
 }
 
-export function legacyOperatorWriteFailure(error: unknown): Error {
+export function legacyOperatorWriteFailure(
+  error: unknown,
+  stderr: string | Buffer = "",
+  operation: LegacyStorageOperation = "worker_sql",
+  provenTarget = false,
+): Error {
   if (Number((error as { code?: unknown })?.code) === 75)
     return new LegacyOperatorPaused();
-  return new Error(
-    "Guarded operator transaction failed or its acknowledgement was lost; retain receipt/pending page and retry",
-  );
+  return legacySshOperationError(operation, error, stderr, provenTarget);
 }

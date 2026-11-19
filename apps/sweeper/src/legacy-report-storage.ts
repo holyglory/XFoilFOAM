@@ -12,6 +12,7 @@ import {
 } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
+import { LegacyResultTransport } from "./legacy-report-result-transport";
 
 import {
   assertLegacyScope,
@@ -24,6 +25,9 @@ import {
 } from "@aerodb/db/legacy-report-storage";
 import {
   legacySha256,
+  LegacyStorageOperationError,
+  legacySshOperationError,
+  legacyLocalStorageError,
   type LegacyBackupObject,
   type LegacyBackupStore,
 } from "./legacy-report-storage-gcs";
@@ -52,7 +56,14 @@ export type {
 } from "@aerodb/db/legacy-report-storage-codec";
 
 export interface LegacySqlReader {
+  acceptVerifiedTransportHistory?(): void;
   query(sql: string, maxBytes: number): Promise<Record<string, unknown>[]>;
+  readMember?(
+    executionId: string,
+    kind: LegacyReportKind,
+    sequence: number,
+    maxBytes: number,
+  ): Promise<Record<string, unknown>[]>;
 }
 export interface LegacyPageApplyStats {
   sourceDatabaseWrites: boolean | null;
@@ -76,8 +87,18 @@ const initialCursor = (scope: LegacyReportScope): LegacyCursor => ({
 /** Existing SSH principal/config only; no commands, keys or credentials are copied to HZ. */
 export class LegacySshReader implements LegacySqlReader {
   readonly command: string;
+  private provenTarget = false;
+  private stderrText = "";
+  acceptVerifiedTransportHistory() {
+    this.provenTarget = true;
+  }
+  private readonly resultTransport = new LegacyResultTransport(this);
+  get resultTransportStats() {
+    return { ...this.resultTransport.stats };
+  }
   connectionCount = 0;
   queryCount = 0;
+  responseBytes = 0;
   private child: ChildProcessWithoutNullStreams | null = null;
   private active: {
     marker: string;
@@ -126,22 +147,51 @@ export class LegacySshReader implements LegacySqlReader {
     );
     this.child = child;
     this.connectionCount++;
-    child.stderr.on("data", () => undefined); // Do not expose source bodies in diagnostics.
-    child.stdin.on("error", () => this.fail("Read-only SSH input closed"));
-    child.on("error", () =>
-      this.fail("Existing read-only SSH transport unavailable"),
+    this.stderrText = "";
+    child.stderr.on("data", (bytes: Buffer) => {
+      if (this.stderrText.length < 16384)
+        this.stderrText = (this.stderrText + bytes.toString("utf8")).slice(
+          0,
+          16384,
+        );
+    });
+    child.stdin.on("error", () => undefined);
+    child.on("error", (error) =>
+      this.fail(
+        legacySshOperationError(
+          "worker_read",
+          error,
+          this.stderrText,
+          this.provenTarget,
+        ),
+      ),
     );
-    child.on("close", () => {
+    child.on("close", (code, signal) => {
       if (this.child === child) {
         this.child = null;
         this.fail(
-          "Read-only HZ session closed; pending source/checkpoint retained",
+          code === 0
+            ? new LegacyStorageOperationError({
+                operation: "worker_read",
+                category: this.provenTarget
+                  ? "ssh_disconnected"
+                  : "protocol_error",
+                exitCode: code,
+                signal,
+              })
+            : legacySshOperationError(
+                "worker_read",
+                { code, signal },
+                this.stderrText,
+                this.provenTarget,
+              ),
         );
       }
     });
     child.stdout.on("data", (chunk: Buffer) => {
       const active = this.active;
       if (!active) return;
+      this.responseBytes += chunk.length;
       active.bytes += chunk.length;
       if (active.bytes > active.maxBytes + 128) {
         this.fail("Read-only HZ response exceeded byte bound");
@@ -159,6 +209,7 @@ export class LegacySshReader implements LegacySqlReader {
       clearTimeout(active.timer);
       this.active = null;
       try {
+        this.provenTarget = true;
         active.resolve(
           text
             .split("\n")
@@ -167,18 +218,28 @@ export class LegacySshReader implements LegacySqlReader {
         );
       } catch {
         active.reject(
-          new Error("Invalid bounded HZ JSON response; checkpoint retained"),
+          new LegacyStorageOperationError({
+            operation: "worker_read",
+            category: "protocol_error",
+          }),
         );
       }
     });
     return child;
   }
-  private fail(message: string) {
+  private fail(message: string | Error) {
     const active = this.active;
     if (active) {
       clearTimeout(active.timer);
       this.active = null;
-      active.reject(new Error(message));
+      active.reject(
+        message instanceof Error
+          ? message
+          : new LegacyStorageOperationError({
+              operation: "worker_read",
+              category: "integrity",
+            }),
+      );
     }
   }
   async query(
@@ -202,7 +263,11 @@ export class LegacySshReader implements LegacySqlReader {
       const marker = "LEGACY_REPORT_QUERY_" + randomUUID().replace(/-/g, "");
       const timer = setTimeout(() => {
         this.fail(
-          "Read-only HZ query exceeded 45 seconds; checkpoint retained",
+          new LegacyStorageOperationError({
+            operation: "worker_read",
+            category: "ssh_timeout",
+            signal: "SIGTERM",
+          }),
         );
         child.kill("SIGTERM");
       }, 45000);
@@ -220,7 +285,21 @@ export class LegacySshReader implements LegacySqlReader {
       child.stdin.write(sql + "\n\\echo " + marker + "\n");
     });
   }
+  readMember(
+    executionId: string,
+    kind: LegacyReportKind,
+    sequence: number,
+    maxBytes: number,
+  ) {
+    return this.resultTransport.readMember(
+      executionId,
+      kind,
+      sequence,
+      maxBytes,
+    );
+  }
   async close(): Promise<void> {
+    this.resultTransport.clear();
     const child = this.child;
     if (!child) return;
     this.child = null;
@@ -306,15 +385,22 @@ export async function readLegacyPage(
       legacyBound(sequence, highWater, "source sequence");
       if (sequence <= next.after) throw new Error("Source keys out of order");
       queries++;
-      const result = await source.query(
-        legacyMemberSql(
-          item.executionId,
-          next.kind,
-          sequence,
-          maxBytes - bytes,
-        ),
-        (maxBytes - bytes) * 6 + 1024 * 1024,
-      );
+      const result = source.readMember
+        ? await source.readMember(
+            item.executionId,
+            next.kind,
+            sequence,
+            maxBytes - bytes,
+          )
+        : await source.query(
+            legacyMemberSql(
+              item.executionId,
+              next.kind,
+              sequence,
+              maxBytes - bytes,
+            ),
+            (maxBytes - bytes) * 6 + 1024 * 1024,
+          );
       if (result.length !== 1) throw new Error("Frozen source member missing");
       if (result[0].blocked) {
         if (
@@ -466,6 +552,8 @@ export async function exportLegacyReports(input: {
   rows?: number;
   maxBytes?: number;
   keepLocal?: boolean;
+  shouldStop?: () => boolean;
+  onVerifiedHistory?: () => void;
   applyVerifiedPage?: (
     page: LegacyBackupPage,
     receipt: LegacyBackupReceipt,
@@ -559,6 +647,41 @@ export async function exportLegacyReports(input: {
       next = state.next;
       lastReceipt = state.lastReceipt;
       checkCursor(input.scope, next);
+      const oldCopy =
+        input.adoptCopy &&
+        legacySha256(
+          JSON.stringify({
+            scope: input.scope,
+            sourceBinding: input.adoptCopy.sourceBinding,
+          }),
+        );
+      if (
+        (state.binding === binding || state.binding === oldCopy) &&
+        lastReceipt &&
+        /^[a-f0-9]{64}\.[a-f0-9]{64}\.[0-9]+\.receipt\.json$/.test(lastReceipt)
+      ) {
+        let bytes: Buffer;
+        try {
+          bytes = await readFile(join(input.directory, lastReceipt));
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+          const failure = Object.assign(
+            new Error(
+              "Receipt coverage incomplete; cannot resume or adopt this checkpoint",
+            ),
+            {
+              legacyStorageOperation: "checkpoint_read",
+              code: "legacy_receipt_coverage_incomplete",
+            },
+          );
+          throw failure;
+        }
+        if (legacySha256(bytes) !== lastReceipt.split(".")[0])
+          throw new Error("Verified source history receipt changed");
+        input.store.acceptVerifiedTransportHistory?.();
+        input.source.acceptVerifiedTransportHistory?.();
+        input.onVerifiedHistory?.();
+      }
       if (state.binding !== binding) {
         const copyBinding =
           input.adoptCopy &&
@@ -584,6 +707,7 @@ export async function exportLegacyReports(input: {
     } else await saveState();
     const receipts: string[] = [];
     for (let index = 0; index < pages; index++) {
+      if (input.shouldStop?.()) break;
       let packed: { bytes: Buffer; rawByteSize: number },
         page: LegacyBackupPage;
       try {
@@ -697,14 +821,27 @@ export async function exportLegacyReports(input: {
         );
       await syncDirectory(input.directory); // Receipt/optional retained copy BEFORE progress.
       if (input.applyVerifiedPage)
-        applied(
-          await input.applyVerifiedPage(
-            decodeLegacyPage(restored, receipt),
-            receipt,
-            receiptFile,
-            restored,
-          ),
-        );
+        try {
+          applied(
+            await input.applyVerifiedPage(
+              decodeLegacyPage(restored, receipt),
+              receipt,
+              receiptFile,
+              restored,
+            ),
+          );
+        } catch (error) {
+          const local = legacyLocalStorageError("save_proof", error);
+          if (local) throw local;
+          if (error && typeof error === "object")
+            try {
+              Object.defineProperty(error, "legacyStorageOperation", {
+                value: "apply_verified_page",
+                configurable: true,
+              });
+            } catch {}
+          throw error;
+        }
       next = page.next;
       lastReceipt = receiptFile;
       await saveState();

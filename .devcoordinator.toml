@@ -5547,7 +5547,7 @@ tier = "development"
 timeout_seconds = 600
 requires = ["seed"]
 env = { PROGRESSIVE_REPORT_ARCHIVE_DISPOSABLE_DB = "1" }
-command = ["/bin/bash", "-c", "exec /usr/bin/corepack pnpm --filter @aerodb/sweeper exec vitest run test/progressive-report-archive.test.ts --reporter=default --reporter=junit --outputFile.junit=\"$DEVCOORDINATOR_DIAGNOSTICS_DIR/report.xml\""]
+command = ["/bin/bash", "-c", "exec /usr/bin/corepack pnpm --filter @aerodb/sweeper exec vitest run --no-file-parallelism test/progressive-report-archive.test.ts test/legacy-report-storage-custody-worker.test.ts --reporter=default --reporter=junit --outputFile.junit=\"$DEVCOORDINATOR_DIAGNOSTICS_DIR/report.xml\""]
 diagnostic_sources = [{ format = "junit", path = "report.xml" }]
 
 [[test.progressive-report-archive.check]]
@@ -5572,7 +5572,7 @@ tier = "development"
 timeout_seconds = 300
 requires = ["workspace"]
 env = { VITEST_PURE_REDUCER_TEST = "1" }
-command = ["/bin/bash", "-c", "exec /usr/bin/corepack pnpm --filter @aerodb/sweeper exec vitest run test/progressive-report-archive-roundtrip.test.ts test/report-archive-broker-client.test.ts test/attempt-evidence-archive.test.ts test/legacy-worker-report-read.test.ts test/legacy-worker-report-product-read.test.ts --reporter=default --reporter=junit --outputFile.junit=\"$DEVCOORDINATOR_DIAGNOSTICS_DIR/report.xml\""]
+command = ["/bin/bash", "-c", "exec /usr/bin/corepack pnpm --filter @aerodb/sweeper exec vitest run test/progressive-report-archive-roundtrip.test.ts test/report-archive-broker-client.test.ts test/attempt-evidence-archive.test.ts test/legacy-worker-report-read.test.ts test/legacy-worker-report-product-read.test.ts test/legacy-report-result-transport.test.ts --reporter=default --reporter=junit --outputFile.junit=\"$DEVCOORDINATOR_DIAGNOSTICS_DIR/report.xml\""]
 diagnostic_sources = [{ format = "junit", path = "report.xml" }]
 
 [[test.progressive-report-archive.check]]
@@ -5613,6 +5613,24 @@ timeout_seconds = 120
 requires = ["workspace"]
 command = ["/bin/bash", "-c", "repo_git=$(git rev-parse --path-format=absolute --git-common-dir) && exec \"${repo_git%/*}/.venv/bin/python\" -m pytest -q tests/test_remote_solver_2606_deploy.py -k report_archive_readers_share_the_deployed_role --junitxml=\"$DEVCOORDINATOR_DIAGNOSTICS_DIR/report.xml\""]
 diagnostic_sources = [{ format = "junit", path = "report.xml" }]
+
+[[test.progressive-report-archive.check]]
+name = "legacy-result-transport"
+tier = "development"
+timeout_seconds = 600
+requires = ["workspace"]
+env = { LEGACY_REPORT_STORAGE_DISPOSABLE_DB = "1", VITEST_PURE_REDUCER_TEST = "1" }
+case_command = ["/bin/bash", "-c", "exec /usr/bin/corepack pnpm --filter @aerodb/sweeper exec vitest run test/legacy-report-result-transport-db.test.ts --reporter=default --reporter=junit --outputFile.junit=\"$DEVCOORDINATOR_DIAGNOSTICS_DIR/report.xml\""]
+cases = [{ id = "transport-schema", args = [], postgres = "default" }]
+diagnostic_sources = [{ format = "junit", path = "report.xml" }]
+
+[[test.progressive-report-archive.check]]
+name = "worker-report-native-reclamation"
+tier = "development"
+timeout_seconds = 120
+requires = ["workspace"]
+case_command = ["/bin/bash", "-c", "case_db=$(python3 -c 'import os; from urllib.parse import unquote, urlsplit; print(unquote(urlsplit(os.environ[\"DATABASE_URL\"]).path[1:]))') && test -n \"$case_db\" && : \"${PGHOST:?disposable PostgreSQL host required}\" \"${PGPORT:?disposable PostgreSQL port required}\" && exec psql -d \"$case_db\" -X -q -v ON_ERROR_STOP=1 -c \"CREATE TABLE public.progressive_worker_reports (id bigint PRIMARY KEY, report jsonb)\" -f scripts/deploy/reclaim-progressive-worker-reports.sql"]
+cases = [{ id = "disposable-relation", args = [], postgres = "default" }]
 
 [[test.progressive-report-archive.check]]
 name = "report-readers"

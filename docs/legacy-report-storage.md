@@ -1,9 +1,10 @@
 # Legacy worker report migration
 
-This operator tool backs up a frozen set of historical worker reports and
-normalizes their repeated result bodies with migration 0198. It preserves full
-query/replay identities. It never creates a dispatch, claim, scientific result,
-polar, or permission grant. `copy` remains an independent read-only export mode.
+This tool moves a fixed set of historical HZ worker reports to Google Cloud
+Storage. PostgreSQL retains the identity and delivery state of each report.
+Migration 0198 shares repeated result bodies. With migration 0205 and a
+verified worker reader, eligible reports retain only a header and archive
+reference in PostgreSQL. The original report remains available for replay.
 
 The controller uses its existing SSH aliases to the worker and hub. The worker
 export reader uses read-only PostgreSQL transactions over one reused SSH session.
@@ -79,25 +80,31 @@ claim that the whole scope is exhausted. Repeat the command to resume; an exact
 row-count boundary can require a final metadata-only page. Omitting `--apply`
 prints the operation plan without network or disk mutation.
 
-The bulk command applies bounded pages until its invocation limit, saving
-progress after every verified and normalized page:
+For the full migration, run the following command on the operator host with the
+existing SSH identities. It checkpoints each page and exits when it reaches the
+last execution in the frozen scope.
 
 ```bash
 legacy_reports migrate "${legacy_targets[@]}" \
   --scope="$LEGACY_REPORT_SCOPE" --directory="$LEGACY_REPORT_PROGRESS" \
-  --rows=16 --pages=32 --max-bytes=67108864 --readers-ready --apply
+  --worker-sweeper-container="$HZ_SWEEPER_CONTAINER" --until-complete \
+  --rows=128 --pages=16 --max-bytes=134217728 --readers-ready --apply
 ```
 
-Repeat this exact bounded command until `complete: true`. Each repetition is
-safe after a lost connection or process termination. There is no automatic
-unbounded retry loop. A failed operation stops at retained pending material.
+Each pass respects its row, byte and page budgets. With `--until-complete`, a
+deployment or a recognized temporary transport or cloud error triggers a delay
+and retry. Authentication errors and integrity failures stop the transfer with
+the last checkpoint and pending bytes preserved. Restart with the same scope,
+source, destination and progress directory. Optional `--max-passes` and
+`--max-seconds` limit a monitoring run.
 
-Before applying, 0198 and all upgraded full-body readers must be installed and
-its normalization policy must already be enabled. `--readers-ready` records
-that operator prerequisite; it does not bypass the server policy check or turn
-normalization on. The operation performs exact generation-pinned GCS readback,
-syncs an archive receipt, executes guarded 0198 SQL, saves its normalization
-proof, syncs progress, and only then drops its pending transfer bytes.
+Use `--readers-ready` after installing the archive readers on HZ and the hub.
+The worker checks its live storage policy. The operator fetches the exact GCS
+generation and records its checksum. HZ reopens the compressed file on its
+persistent results volume and verifies every member. PostgreSQL checks each
+source row before replacing its full body. Rows still needed for outstanding
+evidence keep their online data. The checkpoint advances after the database
+transaction and proof are durable.
 
 PostgreSQL locks exact report rows and compares the original signature, full
 JSONB digest and size with the verified archive. It reuses
@@ -105,10 +112,11 @@ JSONB digest and size with the verified archive. It reuses
 guards, then verifies the reconstructed body and every other storage column.
 A changed or missing member rolls back the page. Lost acknowledgement after
 commit is safe: the same frozen page is authenticated and reapplied
-idempotently. A second SQL readback records actual report/payload identities. Where registered
-GET is known to be denied, add `--registered-get=denied`; otherwise the receipt
-records `unproven`. This flag records eligibility only. Both cases select local
-0198 sharing and record `coldBodyDeleted: false`; neither grants cold access.
+idempotently. A second SQL readback records actual report/payload identities.
+When HZ's evidence-download permission is disabled, record
+`--registered-get=denied`. HZ then relies on its verified compressed working
+copy. Omitting `--worker-sweeper-container` selects 0198 sharing and leaves the
+full data accessible inside PostgreSQL.
 
 ## Adopt existing copy-only progress
 
@@ -137,12 +145,13 @@ legacy_reports migrate-receipts "${legacy_targets[@]}" \
   --pages=32 --readers-ready --apply
 ```
 
-The companion consumes receipt-only pages, restores the exact GCS generation
-into bounded memory, executes the same guarded SQL, and saves per-receipt
-normalization proof. It does not require local gzip files or manual per-page
-SQL. Completed receipt proofs make further passes restartable. If a later,
-explicit rollback restores inline bodies, use a new normalization operation
-rather than treating old completion receipts as current proof.
+To process a prefix that was already copied or normalized, use the same
+worker-container option with `migrate-receipts`. It restores each page from
+the exact GCS generation. `unappliedRemaining` counts receipts awaiting their
+first application with that reader. `remaining` includes receipts with rows
+still awaiting evidence settlement. The saved proof records each skipped
+row's reason. An idempotent replay reports zero new releases for rows already
+archived. The summary counts reports separately from conflict records.
 
 For backup without source writes, substitute `copy` for `migrate` and omit
 `--readers-ready`. Copy and migrate checkpoints cannot be silently interchanged.
@@ -219,40 +228,24 @@ original content signature, and member digest/size. It checks the entire bundle
 and returns one member. A caller must first authenticate the exact immutable
 object grant and pin its download generation.
 
-The integrated page hook is
-`applyVerifiedPage(restoredPage, receipt, receiptFile, verifiedPackedBytes)`: exact readback and a
-durable archive receipt precede it; checkpoint and pending removal follow it.
-A separately verified custody registration/compaction implementation may use
-this boundary. Before 0205 compaction, stream those exact verified compressed
-bytes through the existing controller-to-worker SSH session into the installed
-worker sweeper command:
+The integrated migration sends the verified compressed page through the
+operator's existing SSH connection to the HZ sweeper. The worker syncs the file
+and directory, reads the complete page through the installed product reader,
+then registers the object and eligible members in one database transaction.
+The node API reads the same volume read-only. Both services receive the
+deployment role from Compose.
 
-```text
-node --import tsx /app/apps/sweeper/src/worker-report-volume-cli.ts store SHA256 BYTE_SIZE
+For an independent read, pass the object identity and complete expected member
+vector as JSON on standard input to the installed worker reader.
+
+```sh
+node --import tsx /app/apps/sweeper/src/legacy-worker-report-product-read-cli.ts < expected-members.json
 ```
 
-The arguments come from the verified packed object identity; stdin is that
-packed byte buffer. Require the volume command's fsync/read/hash receipt, then
-verify every member and replay through the real worker reader before custody
-SQL can compact a source body. Retain the last locally accessible working copy.
-An absent volume CLI, unavailable reader, failed member/replay check, denied
-registered GET without a proven local reader, or missing terminal safety proof
-keeps the operation on 0198. Neither an operator GCS read nor upload permission
-proves registered GET eligibility. No endpoint or permission-config bypass is
-part of this path. Until a permitted worker GET or the existing-volume reader, plus terminal evidence safety, are proven for a
-page, the supported migration path keeps 0198 payloads local. It never marks
-such rows cold, changes archive pointers/acknowledgements, or relies on the
-normal registered broker being able to restore missing-dispatch history.
-Non-aliased conflict bodies remain inline; existing aliases keep resolving.
-
-The 0198 fallback adds no migration or journal entry. Optional 0205 custody
-requires its separately maintained migration and reader rollout before compaction.
-This tool does not edit shared archive services, existing brokers/readers, schema.ts,
-sync permission or dispatch.
-0198 normalization removes live repeated result bodies and lets PostgreSQL
-reuse pages; physical OS reclamation is a separate operation. Bucket retention
-and lifecycle policy are unchanged. Missing remote generations fail explicitly
-while application readers retain their local 0198 data.
+The response includes each original row and report digest, the exact object
+generation, the number of compressed bytes read, and the hash of the installed
+reader. The command opens a read-only database session and leaves the archive
+and its source intact.
 
 ## Verification
 

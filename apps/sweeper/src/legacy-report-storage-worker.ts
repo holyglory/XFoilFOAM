@@ -70,8 +70,12 @@ export async function retainVerifiedLegacyWorkerVolume(input: {
         encoding: "utf8",
         killSignal: "SIGTERM",
       },
-      (error, stdout) =>
-        error ? reject(legacyOperatorWriteFailure(error)) : resolve(stdout),
+      (error, stdout, stderr) =>
+        error
+          ? reject(
+              legacyOperatorWriteFailure(error, stderr, "worker_volume", true),
+            )
+          : resolve(stdout),
     );
     child.stdin!.on("error", () => undefined);
     child.stdin!.end(input.verifiedPackedBytes);

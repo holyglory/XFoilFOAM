@@ -3,6 +3,8 @@ import { readFile } from "node:fs/promises";
 import ts from "typescript";
 import {
   assertLegacyObject,
+  LegacyStorageOperationError,
+  legacySshOperationError,
   legacySha256,
   type LegacyBackupObject,
   type LegacyBackupStore,
@@ -24,6 +26,7 @@ export async function legacyHubHelperSource(): Promise<string> {
   return (
     javascript +
     `
+let operation='hub_read';
 try {
  let header = Buffer.alloc(0), request, parts = [], size = 0;
  for await (const chunk of process.stdin) {
@@ -34,6 +37,7 @@ try {
      if (newline < 0) { if (header.length > 65536) throw Error('Oversized helper request'); continue; }
      if (newline > 65536) throw Error('Oversized helper request');
      request = JSON.parse(header.subarray(0,newline).toString('utf8'));
+     operation=request.operation==='put'?'hub_put':'hub_read';
      if (!['put','read'].includes(request.operation) || !Number.isSafeInteger(request.inputBytes) || request.inputBytes<0 || request.inputBytes>536870912)
        throw Error('Invalid helper request');
      bytes = header.subarray(newline+1); header = Buffer.alloc(0);
@@ -53,7 +57,11 @@ try {
    if (size!==0) throw Error('Read helper cannot accept a body');
    process.stdout.write(await store.read(request.object));
  }
-} catch (error) { console.error('Legacy hub backup helper failed: '+error.message); process.exitCode=1; }
+ } catch(error) {
+ const category=/hash|SHA|mismatch|truncated|exceeds|byte.*bound/i.test(error.message??'')?'integrity':/invalid|required|must/i.test(error.message??'')?'bad_input':'operation_failed';
+ const failure=error instanceof LegacyStorageOperationError ? error : new LegacyStorageOperationError({operation,category});
+ process.stderr.write('LEGACY_STORAGE_FAILURE '+JSON.stringify(failure.details)+'\\n');process.exitCode=74;
+}
 `
   );
 }
@@ -62,6 +70,10 @@ const quote = (value: string) => "'" + value.replace(/'/g, "'\\''") + "'";
 
 /** Production topology: dev owns BOTH SSH sessions. The hub never SSHes to HZ. */
 export class LegacyHubSshStore implements LegacyBackupStore {
+  private provenTarget = false;
+  acceptVerifiedTransportHistory() {
+    this.provenTarget = true;
+  }
   constructor(
     readonly host: string,
     readonly container: string,
@@ -104,17 +116,40 @@ export class LegacyHubSshStore implements LegacyBackupStore {
         },
         (error, stdout, stderr) => {
           if (error) {
-            // Our helper emits only bounded operation failures, never auth responses.
-            const message = stderr
+            const operation =
+              request.operation === "put" ? "hub_put" : "hub_read";
+            const wire = stderr
               .toString("utf8")
+              .slice(0, 16384)
               .split("\n")
-              .find((line) =>
-                line.startsWith("Legacy hub backup helper failed:"),
-              );
+              .find((line) => line.startsWith("LEGACY_STORAGE_FAILURE "));
+            if (wire)
+              try {
+                const details = JSON.parse(
+                  wire.slice("LEGACY_STORAGE_FAILURE ".length),
+                );
+                if (
+                  String(details.operation).startsWith("gcs_") &&
+                  typeof details.httpStatus === "number"
+                )
+                  this.provenTarget = true;
+                reject(
+                  new LegacyStorageOperationError({
+                    ...details,
+                    exitCode: details.exitCode ?? error.code,
+                    signal: details.signal ?? error.signal,
+                  }),
+                );
+                return;
+              } catch {
+                /* Unrecognized protocol fails closed; never print raw output. */
+              }
             reject(
-              new Error(
-                message ??
-                  "Hub SSH backup operation failed; source/checkpoint retained",
+              legacySshOperationError(
+                operation,
+                error,
+                stderr,
+                this.provenTarget,
               ),
             );
           } else resolve(stdout);
@@ -151,6 +186,7 @@ export class LegacyHubSshStore implements LegacyBackupStore {
       object.byteSize !== bytes.length
     )
       throw new Error("Hub returned another backup object");
+    this.provenTarget = true;
     return object;
   }
   async read(object: LegacyBackupObject): Promise<Buffer> {
@@ -167,6 +203,7 @@ export class LegacyHubSshStore implements LegacyBackupStore {
       legacySha256(bytes) !== object.sha256
     )
       throw new Error("Hub readback size/SHA256 mismatch");
+    this.provenTarget = true;
     return bytes;
   }
 }

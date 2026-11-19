@@ -1,3 +1,9 @@
+import {
+  LegacyStorageOperationError,
+  legacyLocalStorageError,
+} from "./legacy-report-storage-gcs";
+import { runLegacyUntilComplete } from "./legacy-report-storage-loop";
+import { LegacyWorkingVolumeNormalizer } from "./legacy-report-storage-custody";
 import { LegacyOperatorPaused } from "./legacy-report-storage-operator";
 import { readFile, stat, open } from "node:fs/promises";
 import { dirname } from "node:path";
@@ -28,7 +34,7 @@ import {
 } from "./legacy-report-storage";
 
 const usage = `legacy-report-storage-cli COMMAND [--name=value] [--apply] [--readers-ready]
-  migrate (copy options) --readers-ready [--adopt-copy] [--registered-get=denied|unproven]
+  migrate (copy options) [--until-complete --max-passes=N --max-seconds=N --yield-ms=N] --readers-ready [--adopt-copy] [--worker-sweeper-container=HZ_SWEEPER] [--registered-get=denied|unproven]
   migrate-receipts --scope=scope.json --directory=RECEIPTS --ssh-host=HZ --container=POSTGRES
                    (hub options) [--pages=32] [--apply --readers-ready]
   inventory-sql --side=worker|hub [--after=UUID] [--rows=256]
@@ -138,6 +144,11 @@ export async function legacyReportStorageCli(args: string[]): Promise<void> {
     "readers-ready",
     "adopt-copy",
     "registered-get",
+    "worker-sweeper-container",
+    "until-complete",
+    "max-passes",
+    "max-seconds",
+    "yield-ms",
   ];
   allowed["migrate-receipts"] = [
     "scope",
@@ -150,6 +161,7 @@ export async function legacyReportStorageCli(args: string[]): Promise<void> {
     "apply",
     "readers-ready",
     "registered-get",
+    "worker-sweeper-container",
     ...hubOptions,
   ];
   allowed.extract = [
@@ -170,6 +182,7 @@ export async function legacyReportStorageCli(args: string[]): Promise<void> {
     "keep-local",
     "row",
     "adopt-copy",
+    "until-complete",
   ];
   if (!allowed[command]) throw new Error(usage);
   for (const arg of raw) {
@@ -272,25 +285,35 @@ export async function legacyReportStorageCli(args: string[]): Promise<void> {
   if (command === "migrate-receipts") {
     if (options.has("apply") && !options.has("readers-ready"))
       throw new Error("migrate-receipts --apply requires --readers-ready");
+    const store = new LegacyHubSshStore(
+      required("hub-ssh-host"),
+      required("hub-container"),
+      required("bucket"),
+      required("hub-service-account"),
+    );
+    const fallback = new LegacySshNormalizer(
+      required("ssh-host"),
+      required("container"),
+      options.has("readers-ready"),
+      options.get("pg-user"),
+      options.get("pg-database"),
+      registeredGet,
+    );
+    const normalizer = options.has("worker-sweeper-container")
+      ? new LegacyWorkingVolumeNormalizer(
+          fallback,
+          store,
+          required("ssh-host"),
+          required("worker-sweeper-container"),
+        )
+      : fallback;
     const result = await migrateLegacyReceipts({
       scope,
       directory: required("directory"),
       pages: number("pages", 32, 32),
       apply: options.has("apply"),
-      store: new LegacyHubSshStore(
-        required("hub-ssh-host"),
-        required("hub-container"),
-        required("bucket"),
-        required("hub-service-account"),
-      ),
-      normalizer: new LegacySshNormalizer(
-        required("ssh-host"),
-        required("container"),
-        options.has("readers-ready"),
-        options.get("pg-user"),
-        options.get("pg-database"),
-        registeredGet,
-      ),
+      store,
+      normalizer,
     });
     console.log(
       JSON.stringify({
@@ -345,6 +368,17 @@ export async function legacyReportStorageCli(args: string[]): Promise<void> {
             rows,
             maxBytes,
             pages,
+            continuation: options.has("until-complete")
+              ? {
+                  maxPasses: options.has("max-passes")
+                    ? number("max-passes", 1, Number.MAX_SAFE_INTEGER)
+                    : undefined,
+                  maxSeconds: options.has("max-seconds")
+                    ? number("max-seconds", 1, Number.MAX_SAFE_INTEGER)
+                    : undefined,
+                  yieldMs: number("yield-ms", 250, 10000),
+                }
+              : null,
             transferRetention: options.has("keep-local")
               ? "retain each verified gzip by explicit request"
               : "one pending page; drop after durable receipt and progress",
@@ -358,7 +392,7 @@ export async function legacyReportStorageCli(args: string[]): Promise<void> {
               bucket,
               hubHost,
               hubContainer,
-              canonicalHubServiceAccount: serviceAccount,
+              canonicalHubWorkloadIdentityPinned: true,
               prefix: "legacy-worker-reports/v1",
               createOnly: true,
               generationPinnedReadback: true,
@@ -386,7 +420,7 @@ export async function legacyReportStorageCli(args: string[]): Promise<void> {
       hubHost,
       hubContainer,
     });
-    const normalizer =
+    const fallback =
       command === "migrate"
         ? new LegacySshNormalizer(
             source.host,
@@ -397,7 +431,26 @@ export async function legacyReportStorageCli(args: string[]): Promise<void> {
             registeredGet,
           )
         : null;
-    try {
+    const normalizer =
+      fallback && options.has("worker-sweeper-container")
+        ? new LegacyWorkingVolumeNormalizer(
+            fallback,
+            store,
+            source.host,
+            required("worker-sweeper-container"),
+          )
+        : fallback;
+    const stopping = new AbortController();
+    let stopSignal: string | null = null;
+    const onTerm = () => {
+      stopSignal = "SIGTERM";
+      stopping.abort();
+    };
+    const onInt = () => {
+      stopSignal = "SIGINT";
+      stopping.abort();
+    };
+    const pass = async () => {
       const result = await exportLegacyReports({
         scope,
         source,
@@ -407,6 +460,8 @@ export async function legacyReportStorageCli(args: string[]): Promise<void> {
         maxBytes,
         pages,
         keepLocal: options.has("keep-local"),
+        shouldStop: () => stopping.signal.aborted,
+        onVerifiedHistory: () => normalizer?.acceptVerifiedTransportHistory?.(),
         sourceBinding: normalizer
           ? JSON.stringify({
               operation: "migrate",
@@ -416,6 +471,7 @@ export async function legacyReportStorageCli(args: string[]): Promise<void> {
           : copyBinding,
         applyVerifiedPage: normalizer
           ? async (page, receipt, receiptFile) => {
+              normalizer.acceptVerifiedTransportHistory?.();
               const proof = await applyVerifiedLegacyPage({
                 page,
                 receipt,
@@ -440,7 +496,7 @@ export async function legacyReportStorageCli(args: string[]): Promise<void> {
                     apply: true,
                     through,
                   });
-                  if (!result.complete)
+                  if (!result.applicationsComplete)
                     throw new Error(
                       "Copy receipt adoption made bounded progress; run migrate-receipts again, then repeat migrate --adopt-copy",
                     );
@@ -449,15 +505,35 @@ export async function legacyReportStorageCli(args: string[]): Promise<void> {
               }
             : undefined,
       });
-      console.log(
-        JSON.stringify({
-          ...result,
-          sourceSshConnections: source.connectionCount,
-          sourceQueries: source.queryCount,
-          operation: command,
-        }),
-      );
+      return {
+        ...result,
+        sourceSshConnections: source.connectionCount,
+        sourceQueries: source.queryCount,
+        operation: command,
+      };
+    };
+    try {
+      if (options.has("until-complete")) {
+        process.on("SIGTERM", onTerm);
+        process.on("SIGINT", onInt);
+        const result = await runLegacyUntilComplete(pass, {
+          maxPasses: options.has("max-passes")
+            ? number("max-passes", 1, Number.MAX_SAFE_INTEGER)
+            : undefined,
+          maxSeconds: options.has("max-seconds")
+            ? number("max-seconds", 1, Number.MAX_SAFE_INTEGER)
+            : undefined,
+          yieldMs: number("yield-ms", 250, 10000),
+          signal: stopping.signal,
+          emit: (event) => console.log(JSON.stringify(event)),
+        });
+        console.log(JSON.stringify(result));
+        if (result.stopReason === "signal")
+          process.exitCode = stopSignal === "SIGINT" ? 130 : 143;
+      } else console.log(JSON.stringify(await pass()));
     } finally {
+      process.off("SIGTERM", onTerm);
+      process.off("SIGINT", onInt);
       await source.close();
     }
     return;
@@ -584,7 +660,24 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href)
       );
       process.exitCode = error.exitCode;
     } else {
-      console.error(error.message);
+      const failure =
+        error instanceof LegacyStorageOperationError
+          ? error
+          : (legacyLocalStorageError("operator_cli", error) ??
+            new LegacyStorageOperationError({
+              operation:
+                (error as Error & { legacyStorageOperation?: string })
+                  .legacyStorageOperation ?? "operator_cli",
+              category:
+                error instanceof SyntaxError ? "bad_input" : "operation_failed",
+            }));
+      console.error(
+        JSON.stringify({
+          event: "failed",
+          ...failure.details,
+          retryable: failure.retryable,
+        }),
+      );
       process.exitCode = 1;
     }
   });
