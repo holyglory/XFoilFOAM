@@ -10,7 +10,7 @@ export class LegacyOperatorPaused extends Error {
   readonly retryable = true;
   constructor() {
     super(
-      "Deployment holds the HZ writer lock; pending bytes and completed progress are retained. Repeat the same bounded command after deployment.",
+      "Deployment holds the host lock. The migration can resume from its saved page after deployment.",
     );
     this.name = "LegacyOperatorPaused";
   }

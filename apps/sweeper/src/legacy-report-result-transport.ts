@@ -42,7 +42,11 @@ function key(input: Key): void {
 }
 
 /** One indexed row, including conflict aliases. No source body is edited. */
-function sourceRow(input: Key, signature?: string): string {
+function sourceRow(
+  input: Key,
+  signature?: string,
+  cached?: LegacyResultReference,
+): string {
   key(input);
   if (signature !== undefined && !LEGACY_HASH.test(signature))
     throw new Error("Invalid legacy result source signature");
@@ -50,10 +54,20 @@ function sourceRow(input: Key, signature?: string): string {
   const body = conflict
     ? "public.resolve_progressive_report(storage.report,storage.result_payload_hash)"
     : "public.resolve_progressive_report(r.report,r.result_payload_hash)";
-  return `SELECT r.sim_job_id,r.sequence,r.content_signature,r.report->>'solverId' AS solver_id,
-    to_jsonb(r.*) AS row_json,${body} AS full_report,
-    ${conflict ? "storage.result_payload_hash" : "r.result_payload_hash"} AS payload_hash,
-    (r.archived_at IS NOT NULL ${conflict ? "OR storage.report IS NULL OR storage.archive_bundle_id IS NOT NULL" : ""}) AS unavailable
+  const payload = conflict
+    ? "storage.result_payload_hash"
+    : "r.result_payload_hash";
+  const unavailable = `(r.archived_at IS NOT NULL ${conflict ? "OR storage.report IS NULL OR storage.archive_bundle_id IS NOT NULL" : ""})`;
+  // A normalized predecessor already has a database-checked exact text hash.
+  // Do not resolve/serialize that multi-MB value merely to rehash it again.
+  const columns = cached
+    ? `${payload} AS payload_hash,
+    CASE WHEN ${payload}='${cached.sha256}' THEN NULL::text ELSE (${body}->'result')::text END AS result_text`
+    : `r.sim_job_id,r.sequence,r.content_signature,r.report->>'solverId' AS solver_id,
+    to_jsonb(r.*) AS row_json,${body} AS full_report,${payload} AS payload_hash,
+    (${conflict ? "r.body_source_sequence IS NULL AND storage.result_payload_hash IS NULL" : "r.result_payload_hash IS NULL"}) AS row_is_full,
+    ${unavailable} AS unavailable`;
+  return `SELECT ${columns}
     FROM public.${conflict ? "progressive_worker_report_conflicts" : "progressive_worker_reports"} r
     ${
       conflict
@@ -62,7 +76,8 @@ function sourceRow(input: Key, signature?: string): string {
         : ""
     }
     WHERE r.sim_job_id='${input.executionId}'::uuid AND r.sequence=${input.sequence}
-    ${signature === undefined ? "" : `AND r.content_signature='${signature}'`}`;
+    ${signature === undefined ? "" : `AND r.content_signature='${signature}'`}
+    ${cached ? `AND NOT ${unavailable}` : ""}`;
 }
 
 function referenceSql(reference: LegacyResultReference): string {
@@ -99,37 +114,42 @@ export function legacyResultMemberSql(
   const marker = `__legacy_result_${nonce}__`;
   const token = JSON.stringify(marker);
   const predecessor = previous
-    ? `SELECT p.full_report->'result' AS result,
-      (p.full_report->'result')::text AS result_text,p.payload_hash
-    FROM (${sourceRow(previous, previous.contentSignature)}) p WHERE NOT p.unavailable`
-    : "SELECT NULL::jsonb AS result,NULL::text AS result_text,NULL::text AS payload_hash WHERE false";
-  const reusable = previous
+    ? sourceRow(previous, previous.contentSignature, previous)
+    : "SELECT NULL::text AS result_text,NULL::text AS payload_hash WHERE false";
+  const shared = previous
     ? `EXISTS (SELECT 1 FROM predecessor p
-    WHERE jsonb_typeof(p.result)='object'
-      AND octet_length(p.result_text)=${previous.byteSize}
-      AND encode(sha256(convert_to(p.result_text,'UTF8')),'hex')='${previous.sha256}'
-      AND ((m.payload_hash IS NOT NULL AND m.payload_hash=p.payload_hash)
-        OR m.result_text COLLATE "C"=p.result_text COLLATE "C"))`
+    WHERE m.payload_hash='${previous.sha256}' AND (m.payload_hash=p.payload_hash OR
+      (p.result_text IS NOT NULL AND octet_length(p.result_text)=${previous.byteSize}
+        AND encode(sha256(convert_to(p.result_text,'UTF8')),'hex')='${previous.sha256}')))`
+    : "false";
+  const reusable = previous
+    ? `m.shared_result OR EXISTS (SELECT 1 FROM predecessor p WHERE
+      (p.payload_hash='${previous.sha256}' AND m.result_sha256='${previous.sha256}' AND m.result_bytes=${previous.byteSize})
+      OR (p.result_text IS NOT NULL AND octet_length(p.result_text)=${previous.byteSize}
+        AND encode(sha256(convert_to(p.result_text,'UTF8')),'hex')='${previous.sha256}'
+        AND m.result_text COLLATE "C"=p.result_text COLLATE "C"))`
     : "false";
   const currentReference = `jsonb_build_object('executionId',sim_job_id::text,'kind','${input.kind}',
     'sequence',sequence,'contentSignature',content_signature,'sha256',result_sha256,'byteSize',result_bytes)`;
   return legacyReadOnlySql(`WITH selected AS MATERIALIZED (${sourceRow(input)}),
   predecessor AS MATERIALIZED (${predecessor}),
-  measured AS MATERIALIZED (
+  shared AS MATERIALIZED (SELECT m.*,${shared} AS shared_result FROM selected m),
+  textual AS MATERIALIZED (
     SELECT *,row_json::text AS row_text,full_report::text AS report_text,
-      (full_report->'result')::text AS result_text,
-      octet_length(row_json::text)::bigint AS row_bytes,octet_length(full_report::text)::bigint AS report_bytes,
-      octet_length((full_report->'result')::text)::bigint AS result_bytes,
-      encode(sha256(convert_to(row_json::text,'UTF8')),'hex') AS row_sha256,
-      encode(sha256(convert_to(full_report::text,'UTF8')),'hex') AS report_sha256,
-      encode(sha256(convert_to((full_report->'result')::text,'UTF8')),'hex') AS result_sha256
-    FROM selected
+      CASE WHEN shared_result THEN NULL::text ELSE (full_report->'result')::text END AS result_text FROM shared
+  ), measured AS MATERIALIZED (
+    SELECT *,octet_length(row_text)::bigint AS row_bytes,octet_length(report_text)::bigint AS report_bytes,
+      CASE WHEN shared_result THEN ${previous?.byteSize ?? 0}::bigint ELSE octet_length(result_text)::bigint END AS result_bytes,
+      encode(sha256(convert_to(row_text,'UTF8')),'hex') AS row_sha256,
+      encode(sha256(convert_to(report_text,'UTF8')),'hex') AS report_sha256,
+      CASE WHEN shared_result THEN ${previous ? `'${previous.sha256}'` : "NULL::text"}
+        ELSE encode(sha256(convert_to(result_text,'UTF8')),'hex') END AS result_sha256 FROM textual
   ), templates AS MATERIALIZED (
     SELECT m.*,${reusable} AS reuse,
       CASE WHEN NOT unavailable AND row_bytes+report_bytes<=${maxBytes} AND jsonb_typeof(full_report->'result')='object'
         THEN jsonb_set(full_report,'{result}',to_jsonb('${marker}'::text),false)::text END AS report_template,
       CASE WHEN NOT unavailable AND row_bytes+report_bytes<=${maxBytes} AND jsonb_typeof(full_report->'result')='object'
-        AND (row_json#>'{report,result}')::text COLLATE "C"=result_text COLLATE "C"
+        AND row_is_full
         THEN jsonb_set(row_json,'{report,result}',to_jsonb('${marker}'::text),false)::text END AS row_template
     FROM measured m
   ), packet AS MATERIALIZED (

@@ -2,9 +2,12 @@ import { execFile } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import ts from "typescript";
 import {
+  legacyOperatorWriteCommand,
+  legacyOperatorWriteFailure,
+} from "./legacy-report-storage-operator";
+import {
   assertLegacyObject,
   LegacyStorageOperationError,
-  legacySshOperationError,
   legacySha256,
   type LegacyBackupObject,
   type LegacyBackupStore,
@@ -95,7 +98,9 @@ export class LegacyHubSshStore implements LegacyBackupStore {
     outputLimit: number,
   ): Promise<Buffer> {
     const helper = await legacyHubHelperSource();
-    const command = `docker exec -i ${this.container} node --input-type=module -e ${quote(helper)}`;
+    const command = legacyOperatorWriteCommand(
+      `docker exec -i ${this.container} node --input-type=module -e ${quote(helper)}`,
+    );
     return new Promise<Buffer>((resolve, reject) => {
       const child = execFile(
         "ssh",
@@ -118,6 +123,17 @@ export class LegacyHubSshStore implements LegacyBackupStore {
           if (error) {
             const operation =
               request.operation === "put" ? "hub_put" : "hub_read";
+            if (Number(error.code) === 75) {
+              reject(
+                legacyOperatorWriteFailure(
+                  error,
+                  stderr,
+                  operation,
+                  this.provenTarget,
+                ),
+              );
+              return;
+            }
             const wire = stderr
               .toString("utf8")
               .slice(0, 16384)
@@ -145,10 +161,10 @@ export class LegacyHubSshStore implements LegacyBackupStore {
                 /* Unrecognized protocol fails closed; never print raw output. */
               }
             reject(
-              legacySshOperationError(
-                operation,
+              legacyOperatorWriteFailure(
                 error,
                 stderr,
+                operation,
                 this.provenTarget,
               ),
             );

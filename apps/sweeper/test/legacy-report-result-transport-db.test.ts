@@ -442,6 +442,60 @@ it("verifies the predecessor again after inline normalization and defines a fres
   );
 });
 
+it("reuses a verified normalized predecessor through its checked hash without resolving the large predecessor body again", async () => {
+  const f = await cohort({
+    normalized: true,
+    sequences: [1, 3],
+    padding: 4096,
+  });
+  const source = reader(),
+    transport = new LegacyResultTransport(source.source);
+  await transport.readMember(f.executionId, "report", 1, 1024 ** 2);
+  await client!.sql
+    .unsafe(
+      `
+    ALTER FUNCTION public.resolve_progressive_report(jsonb,text) RENAME TO legacy_result_transport_original;
+    CREATE FUNCTION public.resolve_progressive_report(envelope jsonb,payload_hash text) RETURNS jsonb
+    LANGUAGE plpgsql VOLATILE SET search_path=pg_catalog,public AS $$ BEGIN
+      IF envelope->>'executionId'='${f.executionId}' AND envelope->>'sequence'='1' THEN
+        RAISE EXCEPTION 'The verified normalized predecessor must not be resolved again';
+      END IF;
+      RETURN public.legacy_result_transport_original(envelope,payload_hash);
+    END $$;
+  `,
+    )
+    .simple();
+  try {
+    // Prove the guard catches the expensive old path; it cannot produce an
+    // accidental success merely because the fixture stopped checking calls.
+    await expect(
+      source.source.query(
+        legacyMemberSql(f.executionId, "report", 1, 1024 ** 2),
+        8 * 1024 ** 2,
+      ),
+    ).rejects.toThrow("predecessor must not be resolved again");
+    const restored = await transport.readMember(
+      f.executionId,
+      "report",
+      3,
+      1024 ** 2,
+    );
+    const original = await source.source.query(
+      legacyMemberSql(f.executionId, "report", 3, 1024 ** 2),
+      8 * 1024 ** 2,
+    );
+    expect(restored).toEqual(original);
+    expect(transport.stats).toMatchObject({ definitions: 1, reuses: 1 });
+  } finally {
+    await client!.sql
+      .unsafe(
+        `DROP FUNCTION public.resolve_progressive_report(jsonb,text);
+      ALTER FUNCTION public.legacy_result_transport_original(jsonb,text) RENAME TO resolve_progressive_report;`,
+      )
+      .simple();
+  }
+});
+
 it("uses the full path when an unrelated value collides with the template marker", async () => {
   const nonce = randomUUID(),
     f = await cohort({

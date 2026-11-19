@@ -30,6 +30,7 @@ import {
   type LegacyBackupReceipt,
 } from "../src/legacy-report-storage";
 import { legacyReportStorageCli } from "../src/legacy-report-storage-cli";
+import { LegacyHubSshStore } from "../src/legacy-report-storage-hub";
 import { runLegacyUntilComplete } from "../src/legacy-report-storage-loop";
 import {
   LegacyOperatorPaused,
@@ -1087,6 +1088,57 @@ describe.sequential("worker-only legacy backup and 0198 representation", () => {
 });
 
 describe("canonical hub identity and immutable object REST contract", () => {
+  it("waits for the hub deployment lock before uploading or reading a generation", async () => {
+    const dir = await directory();
+    const capture = join(dir, "commands");
+    await writeFile(
+      join(dir, "ssh"),
+      `#!/bin/sh
+for arg do command=$arg; done
+printf '%.72s\\n' "$command" >> "$LEGACY_LOCK_TEST_LOG"
+cat >/dev/null
+exit 75
+`,
+      { mode: 0o700 },
+    );
+    const body = Buffer.from("one stored report");
+    const sha256 = legacySha256(body);
+    const object = {
+      bucket: "backup-test",
+      objectKey: `legacy-worker-reports/v1/hz/${randomUUID()}/${"a".repeat(64)}/${sha256}.jsonl.gz`,
+      generation: "12345",
+      sha256,
+      byteSize: body.length,
+      crc32c: "AAAAAA==",
+      verifiedAt: new Date().toISOString(),
+    };
+    const store = new LegacyHubSshStore(
+      "existing-hub",
+      "hub-sweeper",
+      object.bucket,
+      "workload@example.invalid",
+    );
+    vi.stubEnv("PATH", `${dir}:${process.env.PATH}`);
+    vi.stubEnv("LEGACY_LOCK_TEST_LOG", capture);
+    try {
+      await expect(store.put(object.objectKey, body)).rejects.toBeInstanceOf(
+        LegacyOperatorPaused,
+      );
+      await expect(store.read(object)).rejects.toBeInstanceOf(
+        LegacyOperatorPaused,
+      );
+      const commands = (await readFile(capture, "utf8")).trimEnd().split("\n");
+      expect(commands).toHaveLength(2);
+      for (const command of commands) {
+        expect(command).toMatch(
+          /^flock -s -w 15 -E 75 \/tmp\/airfoils-pro-deploy\.lock docker exec/,
+        );
+      }
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
   it.each([429, 503, 401, 403, 404])(
     "sanitizes HTTP %s and only retries explicit transient storage status",
     async (status) => {
