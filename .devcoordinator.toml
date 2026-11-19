@@ -5572,7 +5572,7 @@ tier = "development"
 timeout_seconds = 300
 requires = ["workspace"]
 env = { VITEST_PURE_REDUCER_TEST = "1" }
-command = ["/bin/bash", "-c", "exec /usr/bin/corepack pnpm --filter @aerodb/sweeper exec vitest run test/progressive-report-archive-roundtrip.test.ts test/report-archive-broker-client.test.ts test/attempt-evidence-archive.test.ts test/legacy-worker-report-read.test.ts --reporter=default --reporter=junit --outputFile.junit=\"$DEVCOORDINATOR_DIAGNOSTICS_DIR/report.xml\""]
+command = ["/bin/bash", "-c", "exec /usr/bin/corepack pnpm --filter @aerodb/sweeper exec vitest run test/progressive-report-archive-roundtrip.test.ts test/report-archive-broker-client.test.ts test/attempt-evidence-archive.test.ts test/legacy-worker-report-read.test.ts test/legacy-worker-report-product-read.test.ts --reporter=default --reporter=junit --outputFile.junit=\"$DEVCOORDINATOR_DIAGNOSTICS_DIR/report.xml\""]
 diagnostic_sources = [{ format = "junit", path = "report.xml" }]
 
 [[test.progressive-report-archive.check]]
@@ -5589,7 +5589,7 @@ name = "solver-history-storage"
 tier = "development"
 timeout_seconds = 300
 requires = ["seed"]
-command = ["/bin/bash", "-c", "exec /usr/bin/corepack pnpm --filter @aerodb/sweeper exec vitest run test/solver-history-storage.test.ts test/result-history-storage.test.ts test/attempt-evidence-gcs.test.ts --reporter=default --reporter=junit --outputFile.junit=\"$DEVCOORDINATOR_DIAGNOSTICS_DIR/report.xml\""]
+command = ["/bin/bash", "-c", "exec /usr/bin/corepack pnpm --filter @aerodb/sweeper exec vitest run test/solver-history-storage.test.ts test/result-history-storage.test.ts test/attempt-evidence-gcs.test.ts test/solver-history-service.test.ts test/result-history-service.test.ts --reporter=default --reporter=junit --outputFile.junit=\"$DEVCOORDINATOR_DIAGNOSTICS_DIR/report.xml\""]
 diagnostic_sources = [{ format = "junit", path = "report.xml" }]
 
 # Legacy fixtures install their historical schema in an empty database. The
@@ -5620,7 +5620,7 @@ tier = "development"
 timeout_seconds = 300
 requires = ["seed"]
 env = { PROGRESSIVE_REPORT_ARCHIVE_DISPOSABLE_DB = "1" }
-command = ["/bin/bash", "-c", "exec /usr/bin/corepack pnpm --filter @aerodb/db exec vitest run test/legacy-report-custody.test.ts --reporter=default --reporter=junit --outputFile.junit=\"$DEVCOORDINATOR_DIAGNOSTICS_DIR/report.xml\""]
+command = ["/bin/bash", "-c", "exec /usr/bin/corepack pnpm --filter @aerodb/db exec vitest run test/legacy-report-custody.test.ts test/legacy-report-custody-page.test.ts --reporter=default --reporter=junit --outputFile.junit=\"$DEVCOORDINATOR_DIAGNOSTICS_DIR/report.xml\""]
 diagnostic_sources = [{ format = "junit", path = "report.xml" }]
 
 [[test.progressive-report-archive.check]]

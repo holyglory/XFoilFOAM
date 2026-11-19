@@ -72,9 +72,14 @@ export interface LegacyReportPageReadIdentity {
  * fallback. It returns exact member text only after authenticating the entire
  * pinned object's bytes, including its legacy header and member dictionary. */
 export interface LegacyRegisteredReportReader {
-  read?(identity: LegacyRegisteredReportReadIdentity): Promise<string>;
+  read(identity: LegacyRegisteredReportReadIdentity): Promise<string>;
   /** Fresh registered GET of the entire pinned compressed object, once. */
   readPage?(identity: LegacyReportPageReadIdentity): Promise<Buffer>;
+}
+
+export interface LegacyRegisteredPageReader {
+  readPage(identity: LegacyReportPageReadIdentity): Promise<Buffer>;
+  read?(identity: LegacyRegisteredReportReadIdentity): Promise<string>;
 }
 
 export interface LegacyLocalProductReadback {
@@ -89,19 +94,24 @@ export interface LegacyLocalProductReadback {
 export type LegacyLocalPageProductReadback = Omit<LegacyLocalProductReadback, "reportText">;
 
 export interface LegacyLocalProductReader {
-  read?(identity: LegacyRegisteredReportReadIdentity): Promise<LegacyLocalProductReadback>;
+  read(identity: LegacyRegisteredReportReadIdentity): Promise<LegacyLocalProductReadback>;
   /** Reopen the durable object through the normal worker reader once. The
    * shared consumer reconstructs and authenticates all members from these bytes. */
   readPage?(identity: LegacyReportPageReadIdentity): Promise<LegacyLocalPageProductReadback>;
 }
 
+export interface LegacyLocalPageProductReader {
+  readPage(identity: LegacyReportPageReadIdentity): Promise<LegacyLocalPageProductReadback>;
+  read?(identity: LegacyRegisteredReportReadIdentity): Promise<LegacyLocalProductReadback>;
+}
+
 export type LegacyCustodyProductRead =
-  | { mode: "registered-get"; reader: LegacyRegisteredReportReader }
+  | { mode: "registered-get"; reader: LegacyRegisteredReportReader | LegacyRegisteredPageReader }
   | { mode: "hub-local-reader";
       readHubObject(identity: LegacyCustodyObject, signal: AbortSignal): Promise<Buffer>;
       /** Reopen the durable shared-volume object through the product reader;
        * an operator transfer buffer or a stale decoded cache is insufficient. */
-      reader: LegacyLocalProductReader };
+      reader: LegacyLocalProductReader | LegacyLocalPageProductReader };
 
 export interface VerifiedLegacyReportCustodyPage {
   readonly sourceInstance: string;

@@ -7,6 +7,7 @@ import { createHash } from "node:crypto";
 import type { Readable } from "node:stream";
 import { readLegacyPageMember } from "@aerodb/db/legacy-report-storage-codec";
 import { readWorkerReportVolume } from "./worker-report-volume";
+export { readLegacyWorkerReportArchivePage } from "./legacy-worker-report-product-read";
 
 const UUID = "[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}";
 const HASH = /^[a-f0-9]{64}$/;

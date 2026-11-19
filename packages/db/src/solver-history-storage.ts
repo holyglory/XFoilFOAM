@@ -249,7 +249,7 @@ export async function offloadForceHistoryArrays(db: DB, archive: SolverHistoryAr
 }
 
 /** Bounded fair scan. Failed/oversize sources advance the cursor so one bad
- * row cannot starve its siblings; the service wraps around on the next pass. */
+ * row cannot starve its siblings; wrap only after an empty tail query. */
 export async function forceHistoryOffloadCandidates(db: DB, after: string | null = null, limit = 32) {
   if (after) assertId(after);
   if (!Number.isInteger(limit) || limit < 1 || limit > 128) throw new Error("Force history scan limit must be 1..128");

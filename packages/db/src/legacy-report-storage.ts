@@ -1,6 +1,8 @@
 /** Operator backup SQL only. No dispatch, broker, scientific-result or policy writes. */
 export const LEGACY_UUID = /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/;
 export const LEGACY_HASH = /^[a-f0-9]{64}$/;
+/** Worker operator SQL supports actual per-row mutation counts. */
+export const LEGACY_REPORT_NORMALIZATION_COUNTERS = 1;
 export type LegacyReportKind = "report" | "conflict";
 export interface LegacyReportTarget {
   executionId: string;

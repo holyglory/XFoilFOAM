@@ -10,6 +10,9 @@ import { setTimeout } from "node:timers/promises";
 import { archiveResultHistory } from "./result-history-archive";
 import { ResultHistoryStore } from "./result-history-store";
 
+const PROGRESS_YIELD_MS = 100;
+const IDLE_OR_ERROR_BACKOFF_MS = 30_000;
+
 export async function runResultHistoryOffloadPass(
   db: DB,
   store: ResultHistoryArchiveStore,
@@ -92,6 +95,8 @@ export async function runResultHistoryOffloadPass(
     }
     next = id;
   }
+  // Consuming a full page, even if every row was skipped or failed, is forward
+  // progress. Wrap only when a subsequent query proves the tail is empty.
   if (!candidates.length) next = null;
   return { processed, offloaded, sourceBytes, next, failures };
 }
@@ -119,6 +124,7 @@ export async function runResultHistoryStorageService(
   const store = new ResultHistoryStore();
   let after: string | null = null;
   while (!signal.aborted) {
+    let delayMs = IDLE_OR_ERROR_BACKOFF_MS;
     try {
       const result = await runResultHistoryOffloadPass(db, store, {
         bucket,
@@ -126,6 +132,9 @@ export async function runResultHistoryStorageService(
         after,
         signal,
       });
+      const advanced = result.next !== null && result.next !== after;
+      if (!result.failures.length && (result.offloaded > 0 || advanced))
+        delayMs = PROGRESS_YIELD_MS;
       after = result.next;
       if (result.offloaded || result.failures.length)
         console.info("result-history-storage", result);
@@ -136,7 +145,7 @@ export async function runResultHistoryStorageService(
       );
     }
     try {
-      await setTimeout(30_000, undefined, { signal });
+      await setTimeout(delayMs, undefined, { signal });
     } catch (error) {
       if (!signal.aborted) throw error;
     }

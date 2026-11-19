@@ -692,7 +692,11 @@ export async function assembleSim(
 
   if (resultId) {
     const [selected] = await db
-      .select({ result: results, attempt: resultAttempts })
+      .select({
+        result: results,
+        attempt: resultAttempts,
+        revisionReynolds: simulationPresetRevisions.reynolds,
+      })
       .from(results)
       .innerJoin(
         resultAttempts,
@@ -704,6 +708,10 @@ export async function assembleSim(
       .innerJoin(
         resultClassifications,
         eq(resultClassifications.resultAttemptId, resultAttempts.id),
+      )
+      .leftJoin(
+        simulationPresetRevisions,
+        eq(simulationPresetRevisions.id, resultAttempts.simulationPresetRevisionId),
       )
       .where(
         and(
@@ -717,7 +725,7 @@ export async function assembleSim(
       .limit(1);
     if (!selected) return null;
     const r = selectedResultProjection(selected.result, selected.attempt);
-    const effectiveRe = r.reynolds ?? re;
+    const effectiveRe = r.reynolds ?? selected.revisionReynolds ?? re;
     if (!finiteStored(effectiveRe) || effectiveRe <= 0) return null;
     return solvedDetail(a.name, effectiveRe, r);
   }

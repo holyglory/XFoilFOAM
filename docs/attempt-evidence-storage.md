@@ -12,6 +12,40 @@ arrays. GCS retention therefore does not currently reclaim PostgreSQL payload
 bytes; `onlineBytesRemoved` is zero. It establishes verified remote custody and
 exact restoration without changing physical acceptance or result identity.
 
+## Online bytes retained by this release
+
+The original live `result_attempts.evidence_payload` remains the classification
+source after archival. Its exact text, stored JSONB bytes and history arrays are
+retained. This release removes **zero per-attempt online payload bytes**.
+
+`onlineStoredPayloadBytes` measures the currently stored JSONB values; it is not
+the total relation allocation. `sourceTextBytes` and `historyBytes` measure
+logical UTF-8 JSON text. GCS object sizes and reductions in
+`remainingGcsSourceBytes` do not represent PostgreSQL savings. A successful copy
+reduces the remote-custody backlog while leaving the online-byte counters intact.
+
+For an individual attempt, bind the stable UUID as the `psql` variable
+`attempt_id` and measure the existing value without exporting its contents:
+
+```sql
+BEGIN READ ONLY;
+SET LOCAL statement_timeout = '5s';
+SET LOCAL lock_timeout = '500ms';
+SELECT id AS attempt_id,
+       pg_column_size(evidence_payload) AS online_stored_payload_bytes,
+       octet_length(evidence_payload::text) AS logical_payload_text_bytes
+FROM result_attempts
+WHERE id = :'attempt_id'::uuid;
+ROLLBACK;
+```
+
+Retain a timestamped per-attempt byte export and reconciled totals in a private
+measurement receipt. Reconciling every exported UUID and its stored byte count
+to an exact database total requires the same snapshot for both reads; the paged
+`use-audit` command remains a moving scan. Keep online bytes and outstanding
+GCS-copy bytes separate; copying an object does not make the original payload
+eligible for deletion.
+
 ## Current use and remaining work
 
 `use-audit` reports each distinct combination of current uses:
@@ -131,6 +165,9 @@ PostgreSQL registration guards, unchanged classifier inputs, receipt replay,
 writer races, current-use counts and remaining-copy bytes. Storage doubles prove
 the protocol boundary; operational verification also requires an authenticated
 GCS readback and the normal integrated checks. Retain those results privately.
+The regression also compares the complete live payload and per-attempt stored
+and logical byte counts before and after upload/replay, requires unchanged
+online/history totals, and requires the bounded backfill to copy a real source.
 
 Removing online histories requires a separate representation transition with
 read-through for every full-point consumer and equivalent SQL validity/equality

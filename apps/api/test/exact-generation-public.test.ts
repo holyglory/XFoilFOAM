@@ -18,6 +18,7 @@ import {
   resultMediaStorageUploads,
   results,
   schedulingProfiles,
+  simulationPresetRevisions,
   simulationPresets,
   solverProfiles,
   solverEvidenceArtifacts,
@@ -480,6 +481,36 @@ describe("public exact-generation reads", () => {
       availableFields: ["vorticity"],
       history: { t: [10, 11], cl: [0.62, 0.63], cd: [0.013, 0.014] },
     });
+  });
+
+  it("opens a selected result by ID when Reynolds is stored only on its immutable setup", async () => {
+    const [original] = await db
+      .select({ reynolds: results.reynolds })
+      .from(results)
+      .where(eq(results.id, resultId));
+    const [revision] = await db
+      .select({ reynolds: simulationPresetRevisions.reynolds })
+      .from(simulationPresetRevisions)
+      .where(eq(simulationPresetRevisions.id, revisionId));
+    await db.update(results).set({ reynolds: null }).where(eq(results.id, resultId));
+    try {
+      for (const hint of ["", "&re=1"]) {
+        const response = await app.inject({
+          method: "GET",
+          url: `/api/airfoils/${PREFIX}-foil/sim?resultId=${resultId}${hint}`,
+        });
+        expect(response.statusCode).toBe(200);
+        expect(response.json()).toMatchObject({
+          resultId,
+          re: revision.reynolds,
+          cl: 0.63,
+          cd: 0.014,
+          history: { t: [10, 11], cl: [0.62, 0.63], cd: [0.013, 0.014] },
+        });
+      }
+    } finally {
+      await db.update(results).set({ reynolds: original.reynolds }).where(eq(results.id, resultId));
+    }
   });
 
   it("serves the same selected coefficients and history after its arrays move out of PostgreSQL", async () => {

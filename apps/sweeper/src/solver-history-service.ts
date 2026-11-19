@@ -49,8 +49,16 @@ export async function runForceHistoryOffloadPass(db: DB, store: SolverHistoryArc
       failures.push({ sourceId: candidate.id, error: error instanceof Error ? error.message : String(error) });
     }
   }
-  if (candidates.length === 0 || next === candidates.at(-1)?.id) next = null;
+  // A full page may contain only permanent skips/failures. Reaching its last
+  // item does not prove the scan reached the tail; only an empty query does.
+  if (candidates.length === 0) next = null;
   return { processed, offloaded, removedInlineBytes, next, failures };
+}
+
+export function forceHistoryStorageDelay(
+  result: Pick<Awaited<ReturnType<typeof runForceHistoryOffloadPass>>, "offloaded" | "failures"> | null,
+): number {
+  return result && result.offloaded > 0 && result.failures.length === 0 ? 250 : 30_000;
 }
 
 /** Parent starts this with the normal sweeper supervisor only after detail
@@ -66,14 +74,16 @@ export async function runSolverHistoryStorageService(db: DB, signal: AbortSignal
   const store = new SolverHistoryStore();
   let after: string | null = null;
   while (!signal.aborted) {
+    let delay = forceHistoryStorageDelay(null);
     try {
       const result = await runForceHistoryOffloadPass(db, store, { bucket, sourceInstance, after, signal });
       after = result.next;
+      delay = forceHistoryStorageDelay(result);
       if (result.offloaded || result.failures.length) console.info("force-history-storage", result);
     } catch (error) {
       console.error("force-history-storage", error instanceof Error ? error.message : String(error));
     }
-    try { await setTimeout(30_000, undefined, { signal }); }
+    try { await setTimeout(delay, undefined, { signal }); }
     catch (error) { if (!signal.aborted) throw error; }
   }
 }

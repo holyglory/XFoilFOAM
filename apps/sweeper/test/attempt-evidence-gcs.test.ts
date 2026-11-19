@@ -164,9 +164,12 @@ describe("settled attempt GCS retention and immutable SQL receipts", () => {
       await db.execute(sql.raw(statement));
   });
   afterAll(async () => {
-    if (schemaCreated)
-      await client.db.execute(sql.raw(`DROP SCHEMA ${namespace} CASCADE`));
-    await client.sql.end();
+    try {
+      if (schemaCreated)
+        await client.db.execute(sql.raw(`DROP SCHEMA ${namespace} CASCADE`));
+    } finally {
+      await client.sql.end();
+    }
   });
   async function seed(
     options: {
@@ -214,6 +217,23 @@ describe("settled attempt GCS retention and immutable SQL receipts", () => {
       (sum, g) => sum + BigInt(g.remainingGcsSourceBytes as string),
       0n,
     );
+  const retainedBytes = (
+    page: Awaited<ReturnType<typeof auditAttemptEvidenceUsePage>>,
+    metric: "onlineStoredPayloadBytes" | "historyBytes",
+  ) =>
+    page.groups.reduce(
+      (sum, group) => sum + BigInt(group[metric] as string),
+      0n,
+    );
+  async function onlinePoint(attemptId: string) {
+    const [point] =
+      await db.execute(sql`SELECT a.evidence_payload::text AS text,
+      pg_column_size(a.evidence_payload) AS stored_bytes,
+      octet_length(a.evidence_payload::text) AS logical_bytes,r.cl,r.cd,
+      jsonb_typeof(a.evidence_payload#>'{force_history,t}')='array' AND jsonb_array_length(a.evidence_payload#>'{force_history,t}')>0 AS real_samples
+      FROM result_attempts a JOIN results r ON r.current_result_attempt_id=a.id WHERE a.id=${attemptId}::uuid`);
+    return point;
+  }
   it("uploads actual PG text, restores the exact uint64 generation and records a replay-safe receipt without changing classification inputs", async () => {
     const ids = await seed({ canonical: true, model: true }),
       memory = new MemoryGcs(),
@@ -222,6 +242,7 @@ describe("settled attempt GCS retention and immutable SQL receipts", () => {
     const before = await auditAttemptEvidenceUsePage(db, {
       catalogReady: true,
     });
+    const liveBefore = await onlinePoint(ids.attemptId);
     const result = await archiveAttemptEvidence(db, store, {
       ...ids,
       bucket: "fixture",
@@ -247,17 +268,23 @@ describe("settled attempt GCS retention and immutable SQL receipts", () => {
         .filter((r) => r.generation !== undefined)
         .every((r) => r.generation === "18446744073709551615"),
     ).toBe(true);
-    const [point] =
-      await db.execute(sql`SELECT a.evidence_payload::text AS text,r.cl,r.cd,
-      jsonb_typeof(a.evidence_payload#>'{force_history,t}')='array' AND jsonb_array_length(a.evidence_payload#>'{force_history,t}')>0 AS real_samples
-      FROM result_attempts a JOIN results r ON r.current_result_attempt_id=a.id WHERE a.id=${ids.attemptId}::uuid`);
-    expect(point).toEqual({
+    const point = await onlinePoint(ids.attemptId);
+    expect(point).toEqual(liveBefore);
+    expect(point).toMatchObject({
       text: source.payloadText,
+      logical_bytes: Buffer.byteLength(source.payloadText),
       cl: 0.25,
       cd: 0.03,
       real_samples: true,
     });
+    expect(Number(point.stored_bytes)).toBeGreaterThan(0);
     const after = await auditAttemptEvidenceUsePage(db, { catalogReady: true });
+    expect(retainedBytes(after, "onlineStoredPayloadBytes")).toBe(
+      retainedBytes(before, "onlineStoredPayloadBytes"),
+    );
+    expect(retainedBytes(after, "historyBytes")).toBe(
+      retainedBytes(before, "historyBytes"),
+    );
     expect(remaining(before) - remaining(after)).toBe(
       BigInt(Buffer.byteLength(source.payloadText)),
     );
@@ -393,10 +420,10 @@ describe("settled attempt GCS retention and immutable SQL receipts", () => {
         maxRows: 1,
         maxBytes: 1,
       });
-    expect(result.processed).toBeLessThanOrEqual(1);
-    expect(result.copied).toBe(result.processed);
+    expect(result.processed).toBe(1);
+    expect(result.copied).toBe(1);
     expect(result.onlineBytesRemoved).toBe(0);
     expect(result.next).not.toBeNull();
-    expect(memory.uploads).toBeLessThanOrEqual(1);
+    expect(memory.uploads).toBe(1);
   });
 });

@@ -103,9 +103,11 @@ Each pass scans at most 32 eligible rows and processes at most eight uploads.
 Default exported source budget is 8 MiB per pass, with one larger source
 allowed alone up to the hard 32 MiB bound. Larger or malformed sources stay
 inline. Owned attempts require terminal attempt/job state; active jobs stay
-inline. A fair keyset cursor advances past failed/oversize rows and wraps, so
-one failing archive does not starve later rows. Passes run sequentially every
-30 seconds, never overlap in one service, and stop between items on shutdown.
+inline. A fair keyset cursor advances past failed/oversize rows and wraps only
+after an empty tail query, so a full page of skipped rows cannot starve later
+work. Passes run sequentially with a 250 ms yield after productive passes
+without errors and a 30-second idle/error backoff. They never overlap and stop
+between items on shutdown.
 Repeated uploads and restarts reuse verified catalog/object identities.
 
 ## Operator commands
