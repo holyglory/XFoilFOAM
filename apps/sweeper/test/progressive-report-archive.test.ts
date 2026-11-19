@@ -400,6 +400,12 @@ describe.each<ArchiveSource>(["remote", "worker"])(
               expect(dispatch.n).toBe(0);
             }
             expect(fixture.reports[1]!.payloadHash !== null).toBe(normalized);
+            if (normalized) {
+              await expectSqlRefusal(fixture.db, (connection) => connection.execute(sql`
+                DELETE FROM public.progressive_report_result_payloads
+                WHERE content_hash=${fixture.reports[1]!.payloadHash}
+              `), /still referenced|foreign key/i);
+            }
             const cloud = cloudFixture();
             expect(
               await archiveProgressiveReportBatch(

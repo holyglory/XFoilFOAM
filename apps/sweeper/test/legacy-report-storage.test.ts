@@ -28,10 +28,16 @@ import {
 } from "../src/legacy-report-storage";
 import { legacyReportStorageCli } from "../src/legacy-report-storage-cli";
 import {
+  LegacyOperatorPaused,
+  legacyOperatorWriteCommand,
+  legacyOperatorWriteFailure,
+} from "../src/legacy-report-storage-operator";
+import {
   applyVerifiedLegacyPage,
   migrateLegacyReceipts,
   legacyNormalizationTelemetry,
   type LegacyPageNormalizer,
+  LegacySshNormalizer,
 } from "../src/legacy-report-storage-migration";
 import { readLegacyPageMember } from "@aerodb/db/legacy-report-storage-codec";
 
@@ -132,15 +138,14 @@ beforeAll(async () => {
   );
   // Use the real source-resolution view. Its alias mutation guards are covered
   // by the existing 0203 suite; this operator never changes an alias.
-  await client.sql
-    .unsafe(
-      aliasMigration.slice(
-        aliasMigration.indexOf(
-          "CREATE VIEW progressive_worker_conflict_storage",
-        ),
-      ),
-    )
-    .simple();
+  const view = aliasMigration.match(
+    /CREATE (?:OR REPLACE )?VIEW (?:public\.)?progressive_worker_conflict_storage\b[^;]*;/i,
+  )?.[0];
+  if (!view)
+    throw new Error(
+      "Migration 0203 must define the worker conflict source view",
+    );
+  await client.sql.unsafe(view).simple();
 }, 30000);
 afterAll(async () => {
   await client?.sql.end();
@@ -224,6 +229,90 @@ async function logical(executionId: string) {
 }
 
 describe.sequential("worker-only legacy backup and 0198 representation", () => {
+  it("pauses writes for deployment without advancing the page and preserves the pre-lock binding", async () => {
+    const scope = await fixture(false),
+      path = await directory(),
+      store = new MemoryBackup();
+    const before = await logical(scope.executions[0].executionId);
+    const input = {
+      scope,
+      directory: path,
+      store,
+      source,
+      sourceBinding: "migrate-with-lock",
+      rows: 16,
+      pages: 1,
+    };
+    expect(
+      new LegacySshNormalizer("existing-worker", "existing-postgres", true)
+        .binding,
+    ).toBe(
+      legacySha256(
+        JSON.stringify({
+          host: "existing-worker",
+          command:
+            "docker exec -i existing-postgres psql -X -w -qAt -v ON_ERROR_STOP=1 -U aerodb -d aerodb",
+          operation: "0198-normalize",
+        }),
+      ),
+    );
+    expect(
+      legacyOperatorWriteCommand("docker exec -i existing-postgres psql"),
+    ).toMatch(
+      /^flock -s -w 15 -E 75 \/tmp\/airfoils-pro-deploy\.lock docker exec/,
+    );
+    const paused = legacyOperatorWriteFailure({ code: 75 });
+    expect(paused).toBeInstanceOf(LegacyOperatorPaused);
+    await expect(
+      exportLegacyReports({
+        ...input,
+        applyVerifiedPage: async () => {
+          throw paused;
+        },
+      }),
+    ).rejects.toBe(paused);
+    expect(
+      JSON.parse(await readFile(join(path, "checkpoint.json"), "utf8")).next
+        .after,
+    ).toBe(0);
+    expect(await logical(scope.executions[0].executionId)).toEqual(before);
+    expect(
+      (await readdir(path)).filter((name) => name.endsWith(".gz")),
+    ).toEqual(["pending.jsonl.gz"]);
+    await client.sql`UPDATE public.progressive_report_storage_policy SET normalization_enabled=true`;
+    const resumed = await exportLegacyReports({
+      ...input,
+      source: {
+        query: async () => {
+          throw new Error("must use pending page");
+        },
+      },
+      applyVerifiedPage: async (page) => {
+        await execute(
+          legacyNormalizeSql(page.members, { apply: true, readersReady: true }),
+        );
+        return {
+          sourceDatabaseWrites: true,
+          sourceReportRowsVerified: 5,
+          sourceReportBodiesRetained: 5,
+          rowsNewlyNormalized: 3,
+          archiveMembersReleased: 0,
+          migrationTransactionsCommitted: 1,
+        };
+      },
+    });
+    expect(resumed).toMatchObject({
+      complete: true,
+      sourceDatabaseWrites: true,
+      rowsNewlyNormalized: 3,
+      archiveMembersReleased: 0,
+    });
+    expect(await logical(scope.executions[0].executionId)).toEqual(before);
+    expect(
+      (await readdir(path)).filter((name) => name.endsWith(".gz")),
+    ).toEqual([]);
+  });
+
   it("reports copy, newly normalized rows, retained bodies, idempotent replay and unknown hooks distinctly", async () => {
     const scope = await fixture(false),
       store = new MemoryBackup();

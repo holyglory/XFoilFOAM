@@ -297,6 +297,66 @@ export interface LegacyExactMemberIdentity {
   reportSha256: string;
   reportByteSize: number;
 }
+
+export interface LegacyExactPageMemberIdentity {
+  executionId: string;
+  sequence: number;
+  kind: "report" | "conflict";
+  contentSignature: string;
+  reportSha256: string;
+  reportByteSize: number;
+  rowSha256?: string;
+  rowByteSize?: number;
+}
+
+export interface LegacyExactPageIdentity {
+  storedSha256: string;
+  storedByteSize: number;
+  sourceInstance: string;
+  solverId: string;
+  scopeSha256: string;
+  members: readonly LegacyExactPageMemberIdentity[];
+}
+
+/** Authenticate and reconstruct one complete immutable page once. Its expected
+ * member set is exact, so no missing, duplicate, or unchecked sibling can hide
+ * behind a successful selected-member lookup. Returns original text in the
+ * expected key order; signatures remain independent of PostgreSQL byte hashes. */
+export function readLegacyPageMembers(
+  bytes: Buffer,
+  identity: LegacyExactPageIdentity,
+): LegacyReportMember[] {
+  legacyBound(identity.members.length, 128, "exact page members");
+  legacyBound(identity.storedByteSize, 512 * 1024 ** 2, "exact page stored bytes");
+  if (!LEGACY_HASH.test(identity.scopeSha256) || !LEGACY_UUID.test(identity.solverId) ||
+    !/^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$/.test(identity.sourceInstance))
+    throw new Error("Legacy page source/scope identity mismatch");
+  if (!Buffer.isBuffer(bytes) || !LEGACY_HASH.test(identity.storedSha256) || bytes.length !== identity.storedByteSize ||
+    legacySha256(bytes) !== identity.storedSha256)
+    throw new Error("Legacy page archive identity mismatch");
+  const { page } = inspectLegacyPage(bytes);
+  if (page.sourceInstance !== identity.sourceInstance || page.solverId !== identity.solverId ||
+    page.scopeSha256 !== identity.scopeSha256 || page.members.length !== identity.members.length)
+    throw new Error("Legacy page source/scope or complete member set differs");
+  const key = (member: Pick<LegacyExactPageMemberIdentity, "kind" | "executionId" | "sequence">) =>
+    `${member.kind}:${member.executionId}:${member.sequence}`;
+  const actual = new Map(page.members.map((member) => [key(member), member]));
+  const seen = new Set<string>();
+  return identity.members.map((expected) => {
+    const id = key(expected);
+    const member = actual.get(id);
+    if (seen.has(id)) throw new Error("Duplicate expected legacy page member");
+    seen.add(id);
+    if (!member || member.sequence !== expected.sequence || member.solverId !== identity.solverId ||
+      member.contentSignature !== expected.contentSignature ||
+      member.reportSha256 !== expected.reportSha256 || member.reportByteSize !== expected.reportByteSize ||
+      (expected.rowSha256 !== undefined && member.rowSha256 !== expected.rowSha256) ||
+      (expected.rowByteSize !== undefined && Buffer.byteLength(member.rowText) !== expected.rowByteSize))
+      throw new Error("Exact legacy page member is missing or differs from catalog");
+    return member;
+  });
+}
+
 /** Caller authenticates the exact immutable object grant. Returns one original
  * member only; all sibling and chunk hashes are still checked before returning. */
 export function readLegacyPageMember(

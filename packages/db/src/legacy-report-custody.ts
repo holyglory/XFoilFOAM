@@ -3,6 +3,7 @@ import { sql } from "drizzle-orm";
 import type { DB } from "./client";
 import { LEGACY_HASH, LEGACY_UUID, legacyBound, type LegacyReportMember } from "./legacy-report-storage";
 import { parseReportJson, reportTextIdentity, reportValidationValue, type ProgressiveReportArchiveReadIdentity } from "./progressive-report-archive";
+import { readLegacyPageMembers } from "./legacy-report-storage-codec";
 
 export interface LegacyCustodyObject {
   bucket: string;
@@ -34,11 +35,46 @@ export interface LegacyRegisteredReportReadIdentity extends ProgressiveReportArc
   signal: AbortSignal;
 }
 
+export interface LegacyReportCustodyMemberProof {
+  readonly kind: "report" | "conflict";
+  readonly executionId: string;
+  readonly sequence: number;
+  readonly contentSignature: string;
+  readonly reportSha256: string;
+  readonly reportByteSize: number;
+  readonly rowSha256: string;
+  readonly rowByteSize: number;
+}
+
+/** One immutable object may contain several executions. The member vector is
+ * the complete page, not a selected subset or one execution's local marker. */
+export interface LegacyReportPageReadIdentity {
+  sourceKind: "worker";
+  archiveFormat: "legacy-jsonl";
+  mimeType: "application/gzip";
+  compression: "gzip";
+  bucket: string;
+  objectKey: string;
+  generation: string;
+  storedSha256: string;
+  storedByteSize: number;
+  crc32c: string;
+  legacyInstanceId: string;
+  legacySolverId: string;
+  legacyScopeSha256: string;
+  legacyPageMemberCount: number;
+  legacyReadMode: "registered-get" | "hub-local-reader";
+  members: readonly LegacyReportCustodyMemberProof[];
+  signal: AbortSignal;
+}
+
 /** Must issue a fresh, authenticated registered HZ GET, with no operator/GCS
  * fallback. It returns exact member text only after authenticating the entire
  * pinned object's bytes, including its legacy header and member dictionary. */
 export interface LegacyRegisteredReportReader {
-  read(identity: LegacyRegisteredReportReadIdentity): Promise<string>;
+  read?(identity: LegacyRegisteredReportReadIdentity): Promise<string>;
+  /** Fresh registered GET of the entire pinned compressed object, once. */
+  readPage?(identity: LegacyReportPageReadIdentity): Promise<Buffer>;
 }
 
 export interface LegacyLocalProductReadback {
@@ -50,13 +86,22 @@ export interface LegacyLocalProductReadback {
   durableAt: string;
 }
 
+export type LegacyLocalPageProductReadback = Omit<LegacyLocalProductReadback, "reportText">;
+
+export interface LegacyLocalProductReader {
+  read?(identity: LegacyRegisteredReportReadIdentity): Promise<LegacyLocalProductReadback>;
+  /** Reopen the durable object through the normal worker reader once. The
+   * shared consumer reconstructs and authenticates all members from these bytes. */
+  readPage?(identity: LegacyReportPageReadIdentity): Promise<LegacyLocalPageProductReadback>;
+}
+
 export type LegacyCustodyProductRead =
   | { mode: "registered-get"; reader: LegacyRegisteredReportReader }
   | { mode: "hub-local-reader";
       readHubObject(identity: LegacyCustodyObject, signal: AbortSignal): Promise<Buffer>;
       /** Reopen the durable shared-volume object through the product reader;
        * an operator transfer buffer or a stale decoded cache is insufficient. */
-      reader: { read(identity: LegacyRegisteredReportReadIdentity): Promise<LegacyLocalProductReadback> } };
+      reader: LegacyLocalProductReader };
 
 export interface VerifiedLegacyReportCustodyPage {
   readonly sourceInstance: string;
@@ -66,6 +111,7 @@ export interface VerifiedLegacyReportCustodyPage {
   readonly readMode: "registered-get" | "hub-local-reader";
   readonly localStorageKey: string | null;
   readonly memberCount: number;
+  readonly memberProofs: readonly LegacyReportCustodyMemberProof[];
 }
 
 export class LegacyRegisteredRestoreUnavailable extends Error {
@@ -87,22 +133,28 @@ interface BoundPage {
   localStorageKey: string | null;
   localVerifiedAt: string | null;
   object: Omit<ProgressiveReportArchiveReadIdentity, "executionId" | "sequence" | "memberKind" | "signature" | "reportSha256" | "reportByteSize">;
-  members: Array<{
-    kind: "report" | "conflict";
-    executionId: string;
-    sequence: number;
-    contentSignature: string;
-    reportSha256: string;
-    reportByteSize: number;
-    rowSha256: string;
-    rowByteSize: number;
-  }>;
+  members: readonly LegacyReportCustodyMemberProof[];
 }
 
 const verified = new WeakMap<VerifiedLegacyReportCustodyPage, { page: BoundPage; startedAt: number }>();
 const MAX_PAGE_BYTES = 256 * 1024 * 1024;
 const READ_DEADLINE_MS = 120_000;
 const PROOF_LIFETIME_MS = 300_000;
+
+function verifyLocalProductObject(
+  local: LegacyLocalPageProductReadback,
+  hubBytes: Buffer | null,
+  object: LegacyCustodyObject,
+  priorKey: string | null,
+): void {
+  if (!hubBytes || !Buffer.isBuffer(local.storedBytes) || local.storedBytes.byteLength !== object.byteSize ||
+    !local.storedBytes.equals(hubBytes) || !Number.isFinite(Date.parse(local.durableAt)) ||
+    !/^[A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.-]+)*$/.test(local.storageKey) ||
+    local.storageKey.split("/").some((part) => part === "." || part === "..") ||
+    !local.storageKey.endsWith(`${object.sha256}.jsonl.gz`) ||
+    (priorKey !== null && priorKey !== local.storageKey))
+    throw new Error("Normal worker reader did not reopen the durable identical compressed legacy copy");
+}
 
 /** An operator receipt alone is insufficient. Recheck either the registered GET,
  * or both fresh pinned hub bytes and their durable normal-worker-reader copy. */
@@ -114,9 +166,12 @@ export async function verifyLegacyReportCustodyPage(
   if (!input.page || !Array.isArray(input.page.members)) throw new Error("Invalid legacy custody page");
   const page = { ...input.page, members: input.page.members.map((member) => ({ ...member })) };
   const object = Object.freeze({ ...input.object });
-  const access = Object.freeze({ ...input.access });
-  if (!access || !["registered-get", "hub-local-reader"].includes(access.mode))
+  const sourceAccess = input.access;
+  if (!sourceAccess || !["registered-get", "hub-local-reader"].includes(sourceAccess.mode))
     throw new Error("Legacy custody requires an explicit verified product read mode");
+  const access = sourceAccess.mode === "hub-local-reader"
+    ? Object.freeze({ mode: sourceAccess.mode, reader: sourceAccess.reader, readHubObject: sourceAccess.readHubObject.bind(sourceAccess) })
+    : Object.freeze({ mode: sourceAccess.mode, reader: sourceAccess.reader });
   if (page.version !== 1 || !LEGACY_UUID.test(page.sourceInstance) || !LEGACY_UUID.test(page.solverId) ||
     !LEGACY_HASH.test(page.scopeSha256) || !Array.isArray(page.members))
     throw new Error("Legacy custody requires the registered worker instance UUID, solver UUID and exact scope digest");
@@ -127,7 +182,7 @@ export async function verifyLegacyReportCustodyPage(
     object.objectKey !== `legacy-worker-reports/v1/${page.sourceInstance}/${page.solverId}/${page.scopeSha256}/${object.sha256}.jsonl.gz`)
     throw new Error("Legacy custody object differs from the exact registered worker namespace");
   legacyBound(object.byteSize, 2 * 1024 ** 3, "legacy object bytes");
-  const members: BoundPage["members"] = [];
+  const members: LegacyReportCustodyMemberProof[] = [];
   const keys = new Set<string>();
   let bytes = 0;
   for (const member of page.members) {
@@ -153,6 +208,7 @@ export async function verifyLegacyReportCustodyPage(
       contentSignature: member.contentSignature, reportSha256: body.sha256, reportByteSize: body.byteSize,
       rowSha256: row.sha256, rowByteSize: row.byteSize });
   }
+  const memberProofs = Object.freeze(members.map((member) => Object.freeze(member)));
   const startedAt = Date.now();
   const controller = new AbortController();
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -160,10 +216,48 @@ export async function verifyLegacyReportCustodyPage(
   let localVerifiedAt: string | null = null;
   const readbackAt = await Promise.race([
     (async () => {
+      if (access.reader.readPage) legacyBound(object.byteSize, 512 * 1024 ** 2, "custody page stored bytes");
+      const checkActive = () => {
+        if (controller.signal.aborted || Date.now() - startedAt > READ_DEADLINE_MS)
+          throw new Error("Legacy registered restore page deadline reached");
+      };
       const hubBytes = access.mode === "hub-local-reader" ? await access.readHubObject(object, controller.signal) : null;
+      checkActive();
       if (hubBytes && (!Buffer.isBuffer(hubBytes) || hubBytes.byteLength !== object.byteSize ||
           createHash("sha256").update(hubBytes).digest("hex") !== object.sha256))
         throw new Error("Fresh hub readback differs from the exact compressed object");
+      const pageIdentity: LegacyReportPageReadIdentity = Object.freeze({
+        sourceKind: "worker", archiveFormat: "legacy-jsonl", mimeType: "application/gzip", compression: "gzip",
+        bucket: object.bucket, objectKey: object.objectKey, generation: object.generation,
+        storedSha256: object.sha256, storedByteSize: object.byteSize, crc32c: object.crc32c,
+        legacyInstanceId: page.sourceInstance, legacySolverId: page.solverId, legacyScopeSha256: page.scopeSha256,
+        legacyPageMemberCount: memberProofs.length, legacyReadMode: access.mode, members: memberProofs, signal: controller.signal,
+      });
+      const verifyPage = (storedBytes: Buffer) => {
+        checkActive();
+        const reconstructed = readLegacyPageMembers(storedBytes, {
+          storedSha256: object.sha256, storedByteSize: object.byteSize,
+          sourceInstance: page.sourceInstance, solverId: page.solverId, scopeSha256: page.scopeSha256, members: memberProofs,
+        });
+        for (let index = 0; index < reconstructed.length; index++)
+          if (reconstructed[index].reportText !== page.members[index].reportText || reconstructed[index].rowText !== page.members[index].rowText)
+            throw new Error("Product page reader returned different exact legacy member bytes");
+        checkActive();
+      };
+      if (access.mode === "registered-get" && access.reader.readPage) {
+        verifyPage(await access.reader.readPage(pageIdentity));
+        return new Date().toISOString();
+      }
+      if (access.mode === "hub-local-reader" && access.reader.readPage) {
+        const local = await access.reader.readPage(pageIdentity);
+        verifyLocalProductObject(local, hubBytes, object, null);
+        // One compressed-object hash and one complete reconstruction on this
+        // side. The independently authenticated hub bytes were checked above.
+        verifyPage(local.storedBytes);
+        localStorageKey = local.storageKey;
+        localVerifiedAt = new Date().toISOString();
+        return localVerifiedAt;
+      }
       for (let index = 0; index < members.length; index++) {
         if (controller.signal.aborted) throw new Error("Legacy registered restore page deadline reached");
         const member = members[index];
@@ -177,16 +271,15 @@ export async function verifyLegacyReportCustodyPage(
           legacyPageMemberCount: members.length, legacyReadMode: access.mode, signal: controller.signal,
         };
         let text: string;
-        if (access.mode === "registered-get") text = await access.reader.read(identity);
+        if (access.mode === "registered-get") {
+          if (!access.reader.read) throw new Error("Registered reader has no page or individual read capability");
+          text = await access.reader.read(identity);
+        }
         else {
+          if (!access.reader.read) throw new Error("Worker reader has no page or individual read capability");
           const local = await access.reader.read(identity);
-          if (!hubBytes || !Buffer.isBuffer(local.storedBytes) || local.storedBytes.byteLength !== object.byteSize ||
-            createHash("sha256").update(local.storedBytes).digest("hex") !== object.sha256 || !local.storedBytes.equals(hubBytes) ||
-            !Number.isFinite(Date.parse(local.durableAt)) ||
-            !/^[A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.-]+)*$/.test(local.storageKey) ||
-            local.storageKey.split("/").some((part) => part === "." || part === "..") ||
-            !local.storageKey.endsWith(`${object.sha256}.jsonl.gz`) ||
-            (localStorageKey !== null && localStorageKey !== local.storageKey))
+          verifyLocalProductObject(local, hubBytes, object, localStorageKey);
+          if (createHash("sha256").update(local.storedBytes).digest("hex") !== object.sha256)
             throw new Error("Normal worker reader did not reopen the durable identical compressed legacy copy");
           localStorageKey = local.storageKey;
           localVerifiedAt = new Date().toISOString();
@@ -206,14 +299,14 @@ export async function verifyLegacyReportCustodyPage(
   ]).catch((cause: unknown) => { throw new LegacyRegisteredRestoreUnavailable(cause); })
     .finally(() => { clearTimeout(timer); controller.abort(); });
   const proof = Object.freeze({ sourceInstance: page.sourceInstance, solverId: page.solverId,
-    scopeSha256: page.scopeSha256, readbackAt, readMode: access.mode, localStorageKey, memberCount: members.length });
+    scopeSha256: page.scopeSha256, readbackAt, readMode: access.mode, localStorageKey, memberCount: members.length, memberProofs });
   verified.set(proof, { startedAt, page: {
     version: 1, sourceInstance: page.sourceInstance, solverId: page.solverId, scopeSha256: page.scopeSha256, readbackAt, readbackStartedAt: new Date(startedAt).toISOString(),
     readMode: access.mode, localStorageKey, localVerifiedAt,
     object: { sourceKind: "worker", archiveFormat: "legacy-jsonl", mimeType: "application/gzip", compression: "gzip",
       bucket: object.bucket, objectKey: object.objectKey, generation: object.generation,
       storedSha256: object.sha256, storedByteSize: object.byteSize, crc32c: object.crc32c },
-    members,
+    members: memberProofs,
   } });
   return proof;
 }

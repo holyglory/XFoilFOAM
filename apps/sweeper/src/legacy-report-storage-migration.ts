@@ -1,3 +1,7 @@
+import {
+  legacyOperatorWriteCommand,
+  legacyOperatorWriteFailure,
+} from "./legacy-report-storage-operator";
 import { execFile } from "node:child_process";
 import { open, readFile, readdir, link, unlink } from "node:fs/promises";
 import { join } from "node:path";
@@ -135,7 +139,7 @@ export class LegacySshNormalizer implements LegacyPageNormalizer {
           "-oStrictHostKeyChecking=yes",
           "-oConnectTimeout=10",
           this.host,
-          this.command,
+          legacyOperatorWriteCommand(this.command),
         ],
         {
           timeout: 120000,
@@ -144,13 +148,7 @@ export class LegacySshNormalizer implements LegacyPageNormalizer {
           killSignal: "SIGTERM",
         },
         (error, stdout) =>
-          error
-            ? reject(
-                new Error(
-                  "Guarded 0198 operator transaction failed or its acknowledgement was lost; retain receipt/pending page and retry",
-                ),
-              )
-            : resolve(stdout),
+          error ? reject(legacyOperatorWriteFailure(error)) : resolve(stdout),
       );
       child.stdin!.on("error", () => undefined);
       child.stdin!.end(sql);

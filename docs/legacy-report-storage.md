@@ -279,3 +279,27 @@ unknown values as `null`, never fabricated zero or a fixed copy-only write flag.
 The page hook may return `LegacyPageApplyStats`; `legacyNormalizationTelemetry`
 converts a guarded 0198 proof to that contract. Counts are per invocation and do
 not reset or replace the durable high-water cursor.
+
+Each bounded worker SQL transaction holds the host deployment lock in shared
+mode: `flock -s -w 15 -E 75 /tmp/airfoils-pro-deploy.lock`. Working-volume stores
+use the same wrapper. The lock is taken on the worker host, before Docker/psql,
+and released before the next batch. Deployment's exclusive lock blocks new
+operator writes. A bounded wait expiry returns retryable exit 75 and a paused
+message; completed checkpoints and the pending page remain intact. Repeat the
+same bounded command after deployment. Read-only export queries stay separately
+bounded and committed. The shared-lock execution wrapper is deliberately absent
+from source/normalizer binding hashes, so existing receipts and checkpoints remain
+reusable. Load updated code on the next invocation; it does not hot-patch an
+already-running operator process. Custody writers must use the exported
+`legacyOperatorWriteCommand` wrapper for their bounded host SQL command too.
+
+For one worker read per page, the shared codec also exports
+`readLegacyPageMembers`. Supply the complete expected member set and the packed
+identity, read the retained volume once, and authenticate/inspect that buffer
+once. The returned members preserve the original text and expected key order.
+Return a bounded per-member proof manifest to the controller instead of sending
+the entire packed object over SSH for every member. Missing supporting service,
+database, normal reader, or member proof refuses compaction and keeps local 0198
+access. Metadata-only zero-member cursor pages need no custody registration.
+`retainVerifiedLegacyWorkerVolume` performs the exact packed-byte stream to the
+installed store CLI; its store acknowledgement alone is never compaction proof.

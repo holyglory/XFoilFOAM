@@ -664,11 +664,12 @@ it("preserves JSONB integers, null versus absent, headers and immutable guards, 
       sql`UPDATE public.progressive_report_result_payloads SET result='{}' WHERE content_hash IN (SELECT result_payload_hash FROM progressive_worker_reports)`,
       /immutable/,
     );
-    await rejectsStatement(
-      db,
-      sql`DELETE FROM public.progressive_report_result_payloads WHERE content_hash IN (SELECT result_payload_hash FROM progressive_worker_reports)`,
-      /immutable/,
-    );
+    // Temp reports cannot own a canonical FK. An unused dictionary entry can
+    // be released; the archive integration fixture checks a real reference.
+    const [orphan] = await db.execute(sql`SELECT public.store_progressive_report_result(
+      jsonb_build_object('orphan',${input.executionId}::text)) AS hash`);
+    expect(await db.execute(sql`DELETE FROM public.progressive_report_result_payloads
+      WHERE content_hash=${orphan.hash} RETURNING content_hash`)).toHaveLength(1);
     await rejectsStatement(
       db,
       sql`INSERT INTO progressive_worker_reports(sim_job_id,sequence,content_signature,report,result_payload_hash)

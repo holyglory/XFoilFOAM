@@ -96,7 +96,9 @@ export async function reconcileProgressiveRemoteWorker(
   const finalMirrors = await db.execute(sql`
     WITH active_jobs AS MATERIALIZED (
       SELECT id, request_payload, "updatedAt",
-        status IN ('done','failed','cancelled') AND "ingestedAt" IS NULL AS terminal_uningested FROM sim_jobs
+        status IN ('done','failed','cancelled') AND "ingestedAt" IS NULL
+          AND coalesce(engine_state IN ('completed','failed','cancelled'),false) AS terminal_uningested
+      FROM sim_jobs
       WHERE status IN ('pending', 'submitted', 'running', 'ingesting')
         OR (status IN ('done', 'failed', 'cancelled') AND "ingestedAt" IS NULL)
         OR engine_state IN ('cancelling', 'cancel_pending')

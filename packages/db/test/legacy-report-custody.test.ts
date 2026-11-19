@@ -129,7 +129,7 @@ it("denied registered GET cannot mint custody and leaves verified 0198 normaliza
     const access: LegacyCustodyProductRead = { mode: "registered-get", reader: { read: async () => { throw new Error("403 can_fetch is false"); } } };
     await expect(verifyLegacyReportCustodyPage({ ...input, access })).rejects.toBeInstanceOf(LegacyRegisteredRestoreUnavailable);
     expect(() => legacyReportCustodySql({ sourceInstance: instanceId, solverId, scopeSha256: input.page.scopeSha256,
-      readbackAt: new Date().toISOString(), readMode: "registered-get", localStorageKey: null, memberCount: input.page.members.length },
+      readbackAt: new Date().toISOString(), readMode: "registered-get", localStorageKey: null, memberCount: input.page.members.length, memberProofs: [] },
       { apply: true, readersReady: true })).toThrow("fresh successful product read");
     expect(legacyNormalizeSql(input.page.members, { apply: true, readersReady: true })).toContain(input.page.members[0].reportSha256);
     await setProgressiveReportNormalization(fixture.db, { enabled: true, readersReady: true });

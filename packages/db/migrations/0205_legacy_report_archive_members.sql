@@ -237,7 +237,7 @@ BEGIN
         SELECT * INTO existing_member FROM public.progressive_report_archive_members m
           WHERE m.source_kind='worker' AND m.sim_job_id=job.id AND m.sequence=expected.sequence AND m.member_kind=expected.kind;
         IF NOT FOUND OR existing_member.bundle_id IS DISTINCT FROM
-            CASE WHEN expected.kind='report' THEN source_report.archive_bundle_id ELSE source_conflict.archive_bundle_id END
+            (CASE WHEN expected.kind='report' THEN source_report.archive_bundle_id ELSE source_conflict.archive_bundle_id END)
           OR existing_member.content_signature IS DISTINCT FROM expected."contentSignature"
           OR existing_member.report_sha256 IS DISTINCT FROM expected."reportSha256"
           OR existing_member.report_byte_size IS DISTINCT FROM expected."reportByteSize"

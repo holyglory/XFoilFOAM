@@ -91,6 +91,7 @@ const {
   schedulingProfiles,
   simJobs,
   simulationPresetRevisions,
+  simulationPresetAirfoilTargets,
   simulationPresets,
   solverEvidenceArtifacts,
   solverEvidenceArchives,
@@ -103,6 +104,7 @@ const {
   syncBrokeredEvidenceUploads,
   syncImportConflicts,
   syncRemotePromiseCancellations,
+  syncRemoteResultDeliveries,
   syncSweepPromisePoints,
   syncSweepPromises,
   simUransVerifyQueue,
@@ -1030,194 +1032,306 @@ afterAll(async () => {
 });
 
 describe("remote solver sync validation regressions", () => {
-  it.each(["pending", "running", "ingesting", "done", "failed", "cancelled"] as const)("expires stale remote promises before cap counting but preserves a live job and a %s progressive dispatch", async (progressiveStatus) => {
-    const solverId = randomUUID();
-    const solverToken = `${PREFIX}-stale-promise-token`;
-    const stalePromiseId = randomUUID();
-    const livePromiseId = randomUUID();
-    const progressivePromiseId = randomUUID();
-    let liveJobId: string | null = null;
-    let progressiveFixture: Awaited<ReturnType<typeof createProgressiveReportFixture>> | null = null;
-    await db.insert(registeredRemoteSolvers).values({
-      id: solverId,
-      instanceId: `${PREFIX}-stale-promise-solver`,
-      instanceName: `${PREFIX} stale promise solver`,
-      maxActivePolarPromises: 0,
-      authTokenHash: sha256(Buffer.from(solverToken)),
-      credentialVersion: 1,
-    });
-    try {
-      await db.insert(syncSweepPromises).values([
-        {
-          id: stalePromiseId,
-          sourceInstanceId: `${PREFIX}-stale-promise-solver`,
-          sourceInstanceName: `${PREFIX} stale promise solver`,
-          sourceBaseUrl: `${PREFIX}-hub`,
-          registeredSolverId: solverId,
-          status: "active",
+  it.each([
+    ["pending", "pending"],
+    ["running", "pushing"],
+    ["ingesting", "retry_wait"],
+    ["done", "blocked"],
+    ["failed", "pending"],
+    ["cancelled", "pending"],
+  ] as const)(
+    "expires stale remote promises before cap counting but preserves a live job, a %s progressive dispatch and a %s terminal delivery",
+    async (progressiveStatus, deliveryState) => {
+      const solverId = randomUUID();
+      const solverToken = `${PREFIX}-stale-promise-token`;
+      const stalePromiseId = randomUUID();
+      const livePromiseId = randomUUID();
+      const progressivePromiseId = randomUUID();
+      const terminalPromiseId = randomUUID();
+      let liveJobId: string | null = null;
+      let terminalJobId: string | null = null;
+      let claimPresetId: string | null = null;
+      let progressiveFixture: Awaited<
+        ReturnType<typeof createProgressiveReportFixture>
+      > | null = null;
+      await db.insert(registeredRemoteSolvers).values({
+        id: solverId,
+        instanceId: `${PREFIX}-stale-promise-solver`,
+        instanceName: `${PREFIX} stale promise solver`,
+        maxActivePolarPromises: 0,
+        authTokenHash: sha256(Buffer.from(solverToken)),
+        credentialVersion: 1,
+      });
+      try {
+        // The shared import preset stays disabled. A separate, airfoil-scoped
+        // legacy preset supplies a real gap so claim reaches the cap/expiry
+        // transaction rather than returning early with no candidate.
+        const [claimPreset] = await db
+          .insert(simulationPresets)
+          .values({
+            slug: `${PREFIX}-claim-cap-${progressiveStatus}`,
+            name: `${PREFIX} claim cap ${progressiveStatus}`,
+            flowConditionId: flowId,
+            referenceGeometryProfileId: referenceGeometryId,
+            boundaryProfileId: profileIds.boundary,
+            meshProfileId: profileIds.mesh,
+            solverProfileId: profileIds.solver,
+            schedulingProfileId: profileIds.scheduling,
+            outputProfileId: profileIds.output,
+            sweepDefinitionId: profileIds.sweep,
+            legacyBoundaryConditionId: legacyBcId,
+            targetScope: "airfoils",
+            enabled: true,
+          })
+          .returning({ id: simulationPresets.id });
+        claimPresetId = claimPreset.id;
+        await db.insert(simulationPresetAirfoilTargets).values({
+          presetId: claimPreset.id,
           airfoilId,
-          simulationPresetRevisionId: revisionId,
-          aoaCount: 1,
-          expiresAt: new Date(Date.now() + 3_600_000),
-          createdAt: new Date(Date.now() - 20 * 60_000),
-          lastHeartbeatAt: new Date(Date.now() - 20 * 60_000),
-          requestPayload: {
-            remoteSolver: true,
-            executionContract: "progressive-cfd-v1",
-            progressiveExecutionId: randomUUID(),
+        });
+        await db.insert(syncSweepPromises).values([
+          {
+            id: stalePromiseId,
+            sourceInstanceId: `${PREFIX}-stale-promise-solver`,
+            sourceInstanceName: `${PREFIX} stale promise solver`,
+            sourceBaseUrl: `${PREFIX}-hub`,
+            registeredSolverId: solverId,
+            status: "active",
+            airfoilId,
+            simulationPresetRevisionId: revisionId,
+            aoaCount: 1,
+            expiresAt: new Date(Date.now() + 3_600_000),
+            createdAt: new Date(Date.now() - 20 * 60_000),
+            lastHeartbeatAt: new Date(Date.now() - 20 * 60_000),
+            requestPayload: {
+              remoteSolver: true,
+              executionContract: "progressive-cfd-v1",
+              progressiveExecutionId: randomUUID(),
+            },
           },
-        },
-        {
-          id: livePromiseId,
-          sourceInstanceId: `${PREFIX}-stale-promise-solver`,
-          sourceInstanceName: `${PREFIX} stale promise solver`,
-          sourceBaseUrl: `${PREFIX}-hub`,
-          registeredSolverId: solverId,
-          status: "active",
-          airfoilId,
-          simulationPresetRevisionId: revisionId,
-          aoaCount: 1,
-          expiresAt: new Date(Date.now() + 3_600_000),
-          createdAt: new Date(Date.now() - 20 * 60_000),
-          lastHeartbeatAt: new Date(),
-          requestPayload: { remoteSolver: true },
-        },
-        {
-          id: progressivePromiseId,
-          sourceInstanceId: `${PREFIX}-stale-promise-solver`,
-          sourceInstanceName: `${PREFIX} stale promise solver`,
-          sourceBaseUrl: `${PREFIX}-hub`,
-          registeredSolverId: solverId,
-          status: "active",
-          airfoilId,
-          simulationPresetRevisionId: revisionId,
-          aoaCount: 1,
-          expiresAt: new Date(Date.now() + 3_600_000),
-          createdAt: new Date(Date.now() - 20 * 60_000),
-          lastHeartbeatAt: new Date(),
-          requestPayload: { remoteSolver: true, progressive: true },
-        },
-      ]);
-      await db.insert(syncSweepPromisePoints).values([
-        {
-          promiseId: stalePromiseId,
-          airfoilId,
-          simulationPresetRevisionId: revisionId,
-          aoaDeg: 733.001,
-          status: "active",
-        },
-        {
-          promiseId: livePromiseId,
-          airfoilId,
-          simulationPresetRevisionId: revisionId,
-          aoaDeg: 733.002,
-          status: "active",
-        },
-        {
+          {
+            id: livePromiseId,
+            sourceInstanceId: `${PREFIX}-stale-promise-solver`,
+            sourceInstanceName: `${PREFIX} stale promise solver`,
+            sourceBaseUrl: `${PREFIX}-hub`,
+            registeredSolverId: solverId,
+            status: "active",
+            airfoilId,
+            simulationPresetRevisionId: revisionId,
+            aoaCount: 1,
+            expiresAt: new Date(Date.now() + 3_600_000),
+            createdAt: new Date(Date.now() - 20 * 60_000),
+            lastHeartbeatAt: new Date(),
+            requestPayload: { remoteSolver: true },
+          },
+          {
+            id: progressivePromiseId,
+            sourceInstanceId: `${PREFIX}-stale-promise-solver`,
+            sourceInstanceName: `${PREFIX} stale promise solver`,
+            sourceBaseUrl: `${PREFIX}-hub`,
+            registeredSolverId: solverId,
+            status: "active",
+            airfoilId,
+            simulationPresetRevisionId: revisionId,
+            aoaCount: 1,
+            expiresAt: new Date(Date.now() + 3_600_000),
+            createdAt: new Date(Date.now() - 20 * 60_000),
+            lastHeartbeatAt: new Date(),
+            requestPayload: { remoteSolver: true, progressive: true },
+          },
+          {
+            id: terminalPromiseId,
+            sourceInstanceId: `${PREFIX}-stale-promise-solver`,
+            sourceInstanceName: `${PREFIX} stale promise solver`,
+            sourceBaseUrl: `${PREFIX}-hub`,
+            registeredSolverId: solverId,
+            status: "active",
+            airfoilId,
+            simulationPresetRevisionId: revisionId,
+            aoaCount: 1,
+            expiresAt: new Date(Date.now() + 3_600_000),
+            createdAt: new Date(Date.now() - 20 * 60_000),
+            lastHeartbeatAt: new Date(Date.now() - 20 * 60_000),
+            requestPayload: { remoteSolver: true },
+          },
+        ]);
+        await db.insert(syncSweepPromisePoints).values([
+          {
+            promiseId: stalePromiseId,
+            airfoilId,
+            simulationPresetRevisionId: revisionId,
+            aoaDeg: 733.001,
+            status: "active",
+          },
+          {
+            promiseId: livePromiseId,
+            airfoilId,
+            simulationPresetRevisionId: revisionId,
+            aoaDeg: 733.002,
+            status: "active",
+          },
+          {
+            promiseId: progressivePromiseId,
+            airfoilId,
+            simulationPresetRevisionId: revisionId,
+            aoaDeg: 733.003,
+            status: "active",
+          },
+          {
+            promiseId: terminalPromiseId,
+            airfoilId,
+            simulationPresetRevisionId: revisionId,
+            aoaDeg: 733.004,
+            status: "active",
+          },
+        ]);
+        [{ id: liveJobId }] = await db
+          .insert(simJobs)
+          .values({
+            airfoilId,
+            bcIds: [legacyBcId],
+            simulationPresetRevisionId: revisionId,
+            referenceChordM: CHORD,
+            status: "running",
+            requestPayload: { syncPromiseId: livePromiseId },
+          })
+          .returning({ id: simJobs.id });
+        [{ id: terminalJobId }] = await db
+          .insert(simJobs)
+          .values({
+            airfoilId,
+            bcIds: [legacyBcId],
+            simulationPresetRevisionId: revisionId,
+            referenceChordM: CHORD,
+            status: "done",
+            requestPayload: { syncPromiseId: terminalPromiseId },
+          })
+          .returning({ id: simJobs.id });
+        await db.insert(syncRemoteResultDeliveries).values({
+          promiseId: terminalPromiseId,
+          simJobId: terminalJobId!,
+          generationKey: `${PREFIX}-terminal-lease-${progressiveStatus}`,
+          state: deliveryState,
+          ...(deliveryState === "pushing"
+            ? {
+                claimToken: randomUUID(),
+                claimedAt: new Date(),
+                claimExpiresAt: new Date(Date.now() + 3_600_000),
+              }
+            : {}),
+        });
+        progressiveFixture = await createProgressiveReportFixture({
+          solverId,
           promiseId: progressivePromiseId,
           airfoilId,
-          simulationPresetRevisionId: revisionId,
-          aoaDeg: 733.003,
-          status: "active",
-        },
-      ]);
-      [{ id: liveJobId }] = await db
-        .insert(simJobs)
-        .values({
-          airfoilId,
-          bcIds: [legacyBcId],
-          simulationPresetRevisionId: revisionId,
-          referenceChordM: CHORD,
-          status: "running",
-          requestPayload: { syncPromiseId: livePromiseId },
-        })
-        .returning({ id: simJobs.id });
-      progressiveFixture = await createProgressiveReportFixture({
-        solverId,
-        promiseId: progressivePromiseId,
-        airfoilId,
-        revisionId,
-        bcId: legacyBcId,
-        alpha: 733.003,
-      });
-      await db.update(simJobs).set({ status: progressiveStatus }).where(eq(simJobs.id, progressiveFixture.executionId));
-      const claim = () => app.inject({
-        method: "POST",
-        url: "/api/sync/v1/sweeps/claim",
-        headers: { "x-xfoilfoam-solver-token": solverToken },
-        payload: { solverId, limit: 1 },
-      });
-      const claimed = await claim();
-      expect(claimed.statusCode, claimed.body).toBe(200);
-      expect(await expireStaleRemotePromiseLeases(db, solverId)).toBe(0);
-      const rows = await db
-        .select({ id: syncSweepPromises.id, status: syncSweepPromises.status })
-        .from(syncSweepPromises)
-        .where(
-          inArray(syncSweepPromises.id, [
-            stalePromiseId,
-            livePromiseId,
-            progressivePromiseId,
+          revisionId,
+          bcId: legacyBcId,
+          alpha: 733.003,
+        });
+        await db
+          .update(simJobs)
+          .set({ status: progressiveStatus })
+          .where(eq(simJobs.id, progressiveFixture.executionId));
+        const claim = () =>
+          app.inject({
+            method: "POST",
+            url: "/api/sync/v1/sweeps/claim",
+            headers: { "x-xfoilfoam-solver-token": solverToken },
+            payload: { solverId, limit: 1 },
+          });
+        const claimed = await claim();
+        expect(claimed.statusCode, claimed.body).toBe(200);
+        expect(claimed.json()).toMatchObject({
+          promise: null,
+          admission: { state: "at_cap", active: 3, cap: 0 },
+        });
+        expect(await expireStaleRemotePromiseLeases(db, solverId)).toBe(0);
+        const rows = await db
+          .select({ id: syncSweepPromises.id, status: syncSweepPromises.status })
+          .from(syncSweepPromises)
+          .where(
+            inArray(syncSweepPromises.id, [
+              stalePromiseId,
+              livePromiseId,
+              progressivePromiseId,
+              terminalPromiseId,
+            ]),
+          );
+        const progressive = await db
+          .select({ id: syncSweepPromises.id, status: syncSweepPromises.status })
+          .from(syncSweepPromises)
+          .where(eq(syncSweepPromises.id, progressivePromiseId));
+        expect(progressive).toEqual([
+          { id: progressivePromiseId, status: "active" },
+        ]);
+        expect(rows).toEqual(
+          expect.arrayContaining([
+            { id: stalePromiseId, status: "expired" },
+            { id: livePromiseId, status: "active" },
+            { id: terminalPromiseId, status: "active" },
           ]),
         );
-      const progressive = await db
-        .select({ id: syncSweepPromises.id, status: syncSweepPromises.status })
-        .from(syncSweepPromises)
-        .where(eq(syncSweepPromises.id, progressivePromiseId));
-      expect(progressive).toEqual([
-        { id: progressivePromiseId, status: "active" },
-      ]);
-      expect(rows).toEqual(
-        expect.arrayContaining([
-          { id: stalePromiseId, status: "expired" },
-          { id: livePromiseId, status: "active" },
-        ]),
-      );
-      const points = await db
-        .select({
-          promiseId: syncSweepPromisePoints.promiseId,
-          status: syncSweepPromisePoints.status,
-        })
-        .from(syncSweepPromisePoints)
-        .where(
-          inArray(syncSweepPromisePoints.promiseId, [
-            stalePromiseId,
-            livePromiseId,
-            progressivePromiseId,
+        const points = await db
+          .select({
+            promiseId: syncSweepPromisePoints.promiseId,
+            status: syncSweepPromisePoints.status,
+          })
+          .from(syncSweepPromisePoints)
+          .where(
+            inArray(syncSweepPromisePoints.promiseId, [
+              stalePromiseId,
+              livePromiseId,
+              progressivePromiseId,
+              terminalPromiseId,
+            ]),
+          );
+        expect(points).toEqual(
+          expect.arrayContaining([
+            { promiseId: stalePromiseId, status: "expired" },
+            { promiseId: livePromiseId, status: "active" },
+            { promiseId: progressivePromiseId, status: "active" },
+            { promiseId: terminalPromiseId, status: "active" },
           ]),
         );
-      expect(points).toEqual(
-        expect.arrayContaining([
-          { promiseId: stalePromiseId, status: "expired" },
-          { promiseId: livePromiseId, status: "active" },
-          { promiseId: progressivePromiseId, status: "active" },
-        ]),
-      );
-      await db.update(syncSweepPromises).set({ expiresAt: new Date(Date.now() - 1_000) }).where(eq(syncSweepPromises.id, progressivePromiseId));
-      const expiredClaim = await claim();
-      expect(expiredClaim.statusCode, expiredClaim.body).toBe(200);
-      const expired = await readPromise(progressivePromiseId);
-      expect(expired.promise.status).toBe("expired");
-      expect(expired.promise.expiredAt).not.toBeNull();
-      expect(expired.points).toHaveLength(1);
-      expect(expired.points[0].status).toBe("expired");
-    } finally {
-      if (liveJobId) await db.delete(simJobs).where(eq(simJobs.id, liveJobId));
-      await progressiveFixture?.cleanup();
-      await db
-        .delete(syncSweepPromises)
-        .where(
-          inArray(syncSweepPromises.id, [
-            stalePromiseId,
-            livePromiseId,
-            progressivePromiseId,
-          ]),
+        await db
+          .update(syncSweepPromises)
+          .set({ expiresAt: new Date(Date.now() - 1_000) })
+          .where(eq(syncSweepPromises.id, progressivePromiseId));
+        const expiredClaim = await claim();
+        expect(expiredClaim.statusCode, expiredClaim.body).toBe(200);
+        const expired = await readPromise(progressivePromiseId);
+        expect(expired.promise.status).toBe("expired");
+        expect(expired.promise.expiredAt).not.toBeNull();
+        expect(expired.points).toHaveLength(1);
+        expect(expired.points[0].status).toBe("expired");
+        expect((await readPromise(terminalPromiseId)).promise.status).toBe(
+          "active",
         );
-      await db
-        .delete(registeredRemoteSolvers)
-        .where(eq(registeredRemoteSolvers.id, solverId));
-    }
-  });
+        const [delivery] = await db
+          .select({ state: syncRemoteResultDeliveries.state })
+          .from(syncRemoteResultDeliveries)
+          .where(eq(syncRemoteResultDeliveries.promiseId, terminalPromiseId));
+        expect(delivery.state).toBe(deliveryState);
+      } finally {
+        if (liveJobId) await db.delete(simJobs).where(eq(simJobs.id, liveJobId));
+        if (terminalJobId)
+          await db.delete(simJobs).where(eq(simJobs.id, terminalJobId));
+        await progressiveFixture?.cleanup();
+        await db
+          .delete(syncSweepPromises)
+          // Also clean any lease incorrectly admitted by a cap regression;
+          // this randomly generated solver belongs only to this case.
+          .where(eq(syncSweepPromises.registeredSolverId, solverId));
+        await db
+          .delete(registeredRemoteSolvers)
+          .where(eq(registeredRemoteSolvers.id, solverId));
+        if (claimPresetId)
+          await db
+            .delete(simulationPresets)
+            .where(eq(simulationPresets.id, claimPresetId));
+      }
+    },
+  );
 
   it("preserves explicit gas material through import, export, replay and conflict review", async () => {
     const gas = sourceAirModel();
@@ -3159,7 +3273,12 @@ describe("remote solver sync validation regressions", () => {
     });
     expect(conflictStatus.statusCode, conflictStatus.body).toBe(200);
     expect(conflictStatus.json().conflicts).toEqual([
-      { id: conflict.id, status: "archived", exactGenerationAccepted: true },
+      {
+        id: conflict.id,
+        status: "archived",
+        exactGenerationAccepted: true,
+        retryable: false,
+      },
     ]);
     await db
       .update(syncImportConflicts)
@@ -3173,7 +3292,12 @@ describe("remote solver sync validation regressions", () => {
     });
     expect(manualStatus.statusCode, manualStatus.body).toBe(200);
     expect(manualStatus.json().conflicts).toEqual([
-      { id: conflict.id, status: "archived", exactGenerationAccepted: false },
+      {
+        id: conflict.id,
+        status: "archived",
+        exactGenerationAccepted: false,
+        retryable: false,
+      },
     ]);
   });
 

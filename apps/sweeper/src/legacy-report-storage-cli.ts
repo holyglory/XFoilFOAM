@@ -1,3 +1,4 @@
+import { LegacyOperatorPaused } from "./legacy-report-storage-operator";
 import { readFile, stat, open } from "node:fs/promises";
 import { dirname } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -571,6 +572,19 @@ export async function legacyReportStorageCli(args: string[]): Promise<void> {
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href)
   legacyReportStorageCli(process.argv.slice(2)).catch((error: Error) => {
-    console.error(error.message);
-    process.exitCode = 1;
+    if (error instanceof LegacyOperatorPaused) {
+      console.log(
+        JSON.stringify({
+          paused: true,
+          reason: error.code,
+          retryable: true,
+          resume:
+            "repeat the same bounded command; completed progress and pending bytes remain intact",
+        }),
+      );
+      process.exitCode = error.exitCode;
+    } else {
+      console.error(error.message);
+      process.exitCode = 1;
+    }
   });

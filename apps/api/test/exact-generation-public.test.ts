@@ -483,6 +483,29 @@ describe("public exact-generation reads", () => {
   });
 
   it("serves the same selected coefficients and history after its arrays move out of PostgreSQL", async () => {
+    const [rawBefore] = await db.select().from(results).where(eq(results.id, resultId)).limit(1);
+    const [attemptBefore] = await db.select().from(resultAttempts).where(eq(resultAttempts.id, currentAttemptId)).limit(1);
+    // This fixture intentionally keeps a stale raw cell projection. Detail
+    // selects currentResultAttemptId; archiving must preserve both sources.
+    expect(rawBefore).toMatchObject({
+      currentResultAttemptId: currentAttemptId,
+      cl: 0.41, cd: 0.021, cm: -0.01, clCd: 19.52,
+    });
+    expect(attemptBefore).toMatchObject({
+      id: currentAttemptId, resultId,
+      cl: 0.63, cd: 0.014, cm: -0.025, clCd: 45,
+    });
+    const simBefore = await app.inject({ method: "GET", url: `/api/airfoils/${PREFIX}-foil/sim?resultId=${resultId}` });
+    expect(simBefore.statusCode).toBe(200);
+    const selectedBefore = simBefore.json();
+    const visibleBefore = {
+      cl: selectedBefore.cl, cd: selectedBefore.cd, cm: selectedBefore.cm,
+      ld: selectedBefore.ld, history: selectedBefore.history,
+    };
+    expect(visibleBefore).toEqual({
+      cl: 0.63, cd: 0.014, cm: -0.025, ld: 45,
+      history: { t: [10, 11], cl: [0.62, 0.63], cd: [0.013, 0.014] },
+    });
     const [history] = await db.select().from(forceHistory).where(eq(forceHistory.resultAttemptId, currentAttemptId)).limit(1);
     const source = await loadSolverHistorySource(db, "force_history", history.id);
     const encoded = encodeSolverHistory("api-history-fixture", source);
@@ -506,15 +529,16 @@ describe("public exact-generation reads", () => {
       expect(stored.historyArchiveId).toBe(archived.archive.id);
       const sim = await app.inject({ method: "GET", url: `/api/airfoils/${PREFIX}-foil/sim?resultId=${resultId}` });
       expect(sim.statusCode).toBe(200);
-      expect(sim.json()).toMatchObject({ cl: 0.63, cd: 0.014, ld: 45,
-        history: { t: [10, 11], cl: [0.62, 0.63], cd: [0.013, 0.014] } });
+      expect(sim.json()).toMatchObject(visibleBefore);
       expect(read).toHaveBeenCalled();
       const evidence = await app.inject({ method: "GET", url: `/api/results/${resultId}/evidence` });
       expect(evidence.statusCode).toBe(200);
       expect(evidence.json().artifacts[0].sha256).toBe(currentManifestSha);
-      const [point] = await db.select().from(results).where(eq(results.id, resultId));
-      expect(point.currentResultAttemptId).toBe(currentAttemptId);
-      expect(point.cl).toBe(0.63);
+      const [rawAfter] = await db.select().from(results).where(eq(results.id, resultId));
+      const [attemptAfter] = await db.select().from(resultAttempts).where(eq(resultAttempts.id, currentAttemptId));
+      expect(rawAfter).toMatchObject({ currentResultAttemptId: currentAttemptId, cl: 0.41 });
+      expect(rawAfter).toEqual(rawBefore);
+      expect(attemptAfter).toEqual(attemptBefore);
     } finally {
       // Normal ingestion restores inline arrays and clears the pointer via
       // 0204's trigger. Other cases continue to prove their own boundaries.
