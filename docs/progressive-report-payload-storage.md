@@ -16,11 +16,16 @@ acknowledged by the hub and every evidence point is represented by a hub receipt
 or a terminal delivery conflict. The remote solver has no GCS credentials and
 does not receive any.
 
-The retention service runs this process continuously. It selects only terminal
+The sweeper report-storage service runs this process continuously. It selects only terminal
 executions with a completed ingestion stamp, an expired or cancelled promise,
 no live ingest lease and a verified stop report. Active reports and unresolved
 evidence remain inline. Report result payloads are deleted only after no report
 row references them.
+
+Rejected worker-report conflicts retain their sequence, signature, reason and
+compact status header. Their oversized report bodies are compacted after every
+worker report for the same terminal execution has been compacted, because those
+conflicts are not solver results and are not needed by the delivery scheduler.
 
 The existing retained-report download route reads archived members from the
 generation-pinned GCS bundle, so compaction does not remove the exact report

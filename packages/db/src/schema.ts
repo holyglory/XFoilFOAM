@@ -8352,6 +8352,12 @@ export const progressiveWorkerReports = pgTable(
     stagingJobOrderIdx: index("progressive_worker_reports_staging_job_order_idx")
       .on(table.simJobId, table.createdAt, table.sequence)
       .where(sql`${table.acknowledgedAt} IS NOT NULL AND jsonb_typeof(${table.report}->'result')='object'`),
+    compactionOrderIdx: index("progressive_worker_reports_compaction_order_idx")
+      .on(table.createdAt, table.simJobId, table.sequence)
+      .where(sql`${table.acknowledgedAt} IS NOT NULL
+        AND ${table.archiveBundleId} IS NULL
+        AND ${table.archivedAt} IS NULL
+        AND jsonb_typeof(${table.report}->'result')='object'`),
     primary: primaryKey({ columns: [table.simJobId, table.sequence] }),
     pendingIdx: index("progressive_worker_reports_pending_idx")
       .on(table.simJobId, table.sequence)

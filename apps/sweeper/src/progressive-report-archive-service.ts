@@ -7,6 +7,7 @@ import { ProgressiveReportArchiveStore, type ProgressiveReportArchiveMember } fr
 
 const PAGE_SIZE = 128;
 const COMPACTION_REPORT_LIMIT = 512;
+const COMPACTION_CANDIDATE_LIMIT = COMPACTION_REPORT_LIMIT * 8;
 const COMPACTION_CONFLICT_LIMIT = 256;
 
 type SourceKind = "remote" | "worker";
@@ -208,18 +209,34 @@ async function archiveRemoteExecution(
 
 async function compactWorkerReports(db: DB): Promise<number> {
   const rows = await db.execute(sql`
-    WITH candidates AS MATERIALIZED (
+    WITH eligible_jobs AS MATERIALIZED (
+      SELECT job.id
+      FROM sim_jobs job
+      WHERE job.status IN ('done', 'failed', 'cancelled')
+        AND job."ingestedAt" IS NOT NULL
+        AND (job.ingest_lease_token IS NULL OR job.ingest_lease_expires_at <= clock_timestamp())
+        AND NOT EXISTS (
+          SELECT 1
+          FROM progressive_worker_reports pending
+          WHERE pending.sim_job_id = job.id
+            AND pending.acknowledged_at IS NULL
+        )
+    ),
+    candidate_pool AS MATERIALIZED (
       SELECT report.sim_job_id, report.sequence
       FROM progressive_worker_reports report
-      JOIN sim_jobs job ON job.id = report.sim_job_id
+      JOIN eligible_jobs job ON job.id = report.sim_job_id
       WHERE report.archive_bundle_id IS NULL
         AND report.archived_at IS NULL
         AND report.acknowledged_at IS NOT NULL
-        AND job.status IN ('done', 'failed', 'cancelled')
-        AND job."ingestedAt" IS NOT NULL
-        AND (job.ingest_lease_token IS NULL OR job.ingest_lease_expires_at <= clock_timestamp())
-        AND progressive_worker_report_compaction_safe(report.sim_job_id, report.sequence)
+        AND jsonb_typeof(report.report->'result') = 'object'
       ORDER BY report.created_at, report.sim_job_id, report.sequence
+      LIMIT ${COMPACTION_CANDIDATE_LIMIT}
+    ),
+    candidates AS MATERIALIZED (
+      SELECT pool.sim_job_id, pool.sequence
+      FROM candidate_pool pool
+      WHERE progressive_worker_report_compaction_safe(pool.sim_job_id, pool.sequence)
       LIMIT ${COMPACTION_REPORT_LIMIT}
     )
     UPDATE progressive_worker_reports report SET
@@ -231,21 +248,29 @@ async function compactWorkerReports(db: DB): Promise<number> {
     RETURNING report.sim_job_id
   `);
   await db.execute(sql`
+    WITH candidates AS MATERIALIZED (
+      SELECT conflict.sim_job_id, conflict.sequence
+      FROM progressive_worker_report_conflicts conflict
+      JOIN sim_jobs job ON job.id = conflict.sim_job_id
+      WHERE conflict.archived_at IS NULL
+        AND job.status IN ('done', 'failed', 'cancelled')
+        AND job."ingestedAt" IS NOT NULL
+        AND (job.ingest_lease_token IS NULL OR job.ingest_lease_expires_at <= clock_timestamp())
+        AND NOT EXISTS (
+          SELECT 1
+          FROM progressive_worker_reports report
+          WHERE report.sim_job_id = conflict.sim_job_id
+            AND report.archived_at IS NULL
+        )
+      ORDER BY conflict.created_at, conflict.sim_job_id, conflict.sequence
+      LIMIT 256
+    )
     UPDATE progressive_worker_report_conflicts conflict SET
       archived_at=clock_timestamp(),
       report=progressive_report_compact_header(conflict.report)
-    FROM sim_jobs job
-    WHERE conflict.sim_job_id=job.id
-      AND conflict.archived_at IS NULL
-      AND job.status IN ('done', 'failed', 'cancelled')
-      AND job."ingestedAt" IS NOT NULL
-      AND (job.ingest_lease_token IS NULL OR job.ingest_lease_expires_at <= clock_timestamp())
-      AND conflict.sim_job_id IN (
-        SELECT sim_job_id FROM progressive_worker_reports
-        WHERE archived_at IS NOT NULL
-        GROUP BY sim_job_id
-      )
-      AND conflict.sequence <= ${COMPACTION_REPORT_LIMIT}
+    FROM candidates
+    WHERE conflict.sim_job_id = candidates.sim_job_id
+      AND conflict.sequence = candidates.sequence
   `);
   await db.execute(sql`
     DELETE FROM progressive_report_result_payloads payload
