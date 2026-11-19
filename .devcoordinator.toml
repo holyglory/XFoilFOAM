@@ -5607,6 +5607,14 @@ cases = [{ id = "empty-schema", args = [], postgres = "default" }]
 diagnostic_sources = [{ format = "junit", path = "report.xml" }]
 
 [[test.progressive-report-archive.check]]
+name = "report-reader-deployment-role"
+tier = "development"
+timeout_seconds = 120
+requires = ["workspace"]
+command = ["/bin/bash", "-c", "repo_git=$(git rev-parse --path-format=absolute --git-common-dir) && exec \"${repo_git%/*}/.venv/bin/python\" -m pytest -q tests/test_remote_solver_2606_deploy.py -k report_archive_readers_share_the_deployed_role --junitxml=\"$DEVCOORDINATOR_DIAGNOSTICS_DIR/report.xml\""]
+diagnostic_sources = [{ format = "junit", path = "report.xml" }]
+
+[[test.progressive-report-archive.check]]
 name = "report-readers"
 tier = "development"
 timeout_seconds = 300

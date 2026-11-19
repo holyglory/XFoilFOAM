@@ -181,6 +181,7 @@ services:
     command: sh -c "pnpm --filter @aerodb/db migrate && pnpm --filter @aerodb/db seed && pnpm --filter @aerodb/api start"
     environment:
       DATABASE_URL: ${DATABASE_URL}
+      AIRFOILFOAM_DEPLOYMENT_ROLE: ${AIRFOILFOAM_DEPLOYMENT_ROLE:-hub}
       ENGINE_URL: ${ENGINE_URL}
       ENGINE_EXPECTED_BUILD_ID: ${ENGINE_EXPECTED_BUILD_ID}
       ENGINE_NUMERICS_REVISION: ${OPENCFD2606_NUMERICS_REVISION:-1}

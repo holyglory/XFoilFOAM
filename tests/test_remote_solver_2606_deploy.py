@@ -217,6 +217,26 @@ def _volume_receipt() -> dict[str, object]:
     }
 
 
+@pytest.mark.parametrize("manifest", ["docker-compose.yml", "docker-compose.deploy.yml"])
+@pytest.mark.parametrize("role", [None, "remote-solver"])
+def test_report_archive_readers_share_the_deployed_role(manifest: str, role: str | None) -> None:
+    environment = {"PATH": os.environ["PATH"]}
+    if role:
+        environment["AIRFOILFOAM_DEPLOYMENT_ROLE"] = role
+    render = subprocess.run(
+        ["docker", "compose", "--env-file", "/dev/null", "-p", "archive-reader-test",
+         "-f", str(ROOT / manifest), "config", "--format", "json"],
+        env=environment, capture_output=True, text=True, check=True,
+    )
+    services = json.loads(render.stdout)["services"]
+    for service in ("node-api", "sweeper"):
+        assert services[service]["environment"]["AIRFOILFOAM_DEPLOYMENT_ROLE"] == (role or "hub")
+        mounts = [mount for mount in services[service]["volumes"] if mount["target"] == "/data/airfoilfoam"]
+        assert len(mounts) == 1
+        assert mounts[0]["source"] == "results"
+        assert bool(mounts[0].get("read_only", False)) == (service == "node-api")
+
+
 def test_merged_remote_compose_requires_configured_cpu_and_volume_contracts() -> None:
     module = _module("remote_compose_validator", "validate-remote-solver-compose.py")
     value = _compose_config(64)

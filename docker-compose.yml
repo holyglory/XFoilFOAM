@@ -197,6 +197,7 @@ services:
     command: sh -c "pnpm --filter @aerodb/db migrate && pnpm --filter @aerodb/db seed && pnpm --filter @aerodb/api start"
     environment:
       DATABASE_URL: postgres://aerodb:aerodb@postgres:5432/aerodb
+      AIRFOILFOAM_DEPLOYMENT_ROLE: ${AIRFOILFOAM_DEPLOYMENT_ROLE:-hub}
       ENGINE_URL: http://api:8000
       ENGINE_EXPECTED_BUILD_ID: ${AIRFOILFOAM_BUILD_ID:-dev-20260704-batch-cache}
       ENGINE_CONTROL_PLANE_TOKEN: ${AIRFOILFOAM_CONTROL_PLANE_TOKEN:-}
@@ -250,6 +251,7 @@ services:
     command: sh -c "pnpm --filter @aerodb/sweeper start"
     environment:
       DATABASE_URL: postgres://aerodb:aerodb@postgres:5432/aerodb
+      AIRFOILFOAM_DEPLOYMENT_ROLE: ${AIRFOILFOAM_DEPLOYMENT_ROLE:-hub}
       ENGINE_URL: http://api:8000
       AIRFOILFOAM_EVIDENCE_BUCKET: ${AIRFOILFOAM_EVIDENCE_BUCKET:-}
       AIRFOILFOAM_MEDIA_OBJECT_PREFIX: ${AIRFOILFOAM_MEDIA_OBJECT_PREFIX:-solver-media/v1}
