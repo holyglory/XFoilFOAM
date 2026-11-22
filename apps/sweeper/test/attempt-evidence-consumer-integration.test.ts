@@ -16,6 +16,7 @@ import {
 import {
   readPolarAttemptEvidenceForConsumerProof,
   refreshPolarCacheForRevision,
+  refreshPolarClassificationsForJob,
 } from "@aerodb/db/polar-cache";
 import { attemptEvidenceColdCohortSql } from "@aerodb/db/attempt-evidence-consumers";
 import { readAttemptEvidenceText } from "@aerodb/db/attempt-evidence-reader";
@@ -53,6 +54,8 @@ import {
   readAttemptEvidenceCopy,
 } from "../src/attempt-evidence-archive";
 import { AttemptEvidenceStore } from "../src/attempt-evidence-store";
+import { preparePublicationHistories } from "../src/attempt-publication-history";
+import { promoteRetainedProgressiveAttempts } from "../src/progressive-remote-settlement";
 import {
   createAttemptEvidenceSettlementDependencies,
   settleAttemptEvidenceHistory,
@@ -441,6 +444,34 @@ describe.skipIf(process.env.PROGRESSIVE_REPORT_ARCHIVE_DISPOSABLE_DB !== "1")(
           archiveId: archive.id,
         });
         expect(measurement.payloadBytesReclaimed).toBeGreaterThan(0);
+        if (state === "accepted") {
+          const prepared = await preparePublicationHistories(db, sql`a.id=${attempt.id}::uuid`);
+          expect(prepared).toHaveLength(1);
+          expect(prepared[0].original_text).toBe(source.payloadText);
+          const scenario = async (documents: typeof prepared) => {
+            const rollback = new Error("End retained-publication fixture");
+            await db.transaction(async (transaction) => {
+              const tx = transaction as unknown as DB;
+              await tx.update(results).set({ currentResultAttemptId: null }).where(eq(results.id, attempt.resultId));
+              await refreshPolarClassificationsForJob(tx, own.foil, own.revision, own.historical);
+              const promoted = await promoteRetainedProgressiveAttempts(tx, {
+                executionId: own.historical, airfoilId: own.foil,
+                simulationPresetRevisionId: own.revision, attemptIds: [attempt.id],
+              }, documents);
+              expect(promoted).toBe(true);
+              const [projection] = await tx.execute(sql`SELECT current_result_attempt_id AS selected,
+                steady_history::text=(${source.payloadText}::jsonb->'steady_history')::text AS exact
+                FROM results WHERE id=${attempt.resultId}::uuid`);
+              expect(projection.selected).toBe(attempt.id);
+              expect(projection.exact).toBe(true);
+              throw rollback;
+            });
+          };
+          await expect(scenario([])).rejects.toThrow(/current archive and exact original/);
+          await expect(scenario([{ ...prepared[0], original_text: "{}" }]))
+            .rejects.toThrow(/current archive and exact original/);
+          await expect(scenario(prepared)).rejects.toThrow("End retained-publication fixture");
+        }
         expect(measurement.netValueBytesReclaimed).toBeGreaterThanOrEqual(
           policy!.minNetValueBytes,
         );

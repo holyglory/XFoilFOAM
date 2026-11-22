@@ -3839,6 +3839,7 @@ export const attemptEvidenceStoragePolicy = pgTable(
     id: integer("id").primaryKey(),
     shorteningEnabled: boolean("shortening_enabled").notNull(),
     stoppedProgressiveEnabled: boolean("stopped_progressive_enabled").notNull().default(false),
+    progressiveSourceScope: text("progressive_source_scope").notNull().default("legacy"),
     canaryAttemptId: uuid("canary_attempt_id"),
     consumerContractVersion: integer("consumer_contract_version").notNull(),
     minLogicalBytes: integer("min_logical_bytes").notNull(),

@@ -1,5 +1,6 @@
 import { sql } from "drizzle-orm";
 import { createClient, type DB } from "@aerodb/db";
+import { preparePublicationHistories } from "./attempt-publication-history";
 import { advanceGeneration } from "@aerodb/db/progressive-campaigns";
 import { promoteRetainedProgressiveAttempts } from "./progressive-remote-settlement";
 
@@ -19,10 +20,7 @@ if (
 
 const { db, sql: end } = createClient({ max: 2 });
 const rollback = new Error("accepted progressive gap recovery dry-run rollback");
-try {
-  const result = await db.transaction(async (transaction) => {
-    const connection = transaction as unknown as DB;
-    const candidates = await connection.execute(sql`
+const selectCandidates = sql`
       SELECT DISTINCT ON (unit.id)
         unit.id AS unit_id, work.id AS work_id, generation.id AS generation_id,
         attempt.sim_job_id AS job_id, raw.id AS result_attempt_id,
@@ -60,7 +58,23 @@ try {
           WHERE running.unit_id = unit.id AND running.outcome = 'running')
       ORDER BY unit.id, raw."solvedAt" DESC NULLS LAST, raw.id
       LIMIT ${expectedCount}::int
-    `);
+    `;
+
+try {
+  const observed = mode === "--apply" ? await db.execute(selectCandidates) : null;
+  if (observed && observed.length !== expectedCount) {
+    throw new Error(`Accepted progressive gap candidate count changed: expected ${expectedCount}, found ${observed.length}`);
+  }
+  const expectedIds = observed && new Set(observed.map((row) => String(row.result_attempt_id)));
+  const documents = expectedIds ? await preparePublicationHistories(db, sql`a.id IN (
+    SELECT value::uuid FROM jsonb_array_elements_text(${JSON.stringify([...expectedIds])}::jsonb)
+  )`) : [];
+  const result = await db.transaction(async (transaction) => {
+    const connection = transaction as unknown as DB;
+    const candidates = await connection.execute(selectCandidates);
+    if (expectedIds && candidates.some((row) => !expectedIds.has(String(row.result_attempt_id)))) {
+      throw new Error("Accepted progressive gap candidates changed during archive preparation");
+    }
     if (candidates.length !== expectedCount)
       throw new Error(
         `Accepted progressive gap candidate count changed: expected ${expectedCount}, found ${candidates.length}`,
@@ -84,7 +98,7 @@ try {
         airfoilId: group.airfoilId,
         simulationPresetRevisionId: group.revisionId,
         attemptIds: group.attemptIds,
-      });
+      }, documents.filter((document) => document.sim_job_id === jobId));
     }
     const unitIds = candidates.map((candidate) => sql`${candidate.unit_id}::uuid`);
     const completed = await connection.execute(sql`

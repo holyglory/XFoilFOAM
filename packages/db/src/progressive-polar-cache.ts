@@ -1,7 +1,9 @@
 import { randomUUID } from "node:crypto";
 import { sql } from "drizzle-orm";
 import type {
+  ProgressiveCoefficientVector,
   ProgressivePolarFitRequest,
+  ProgressivePolarHistory,
   ProgressivePolarFitResponse,
   ProgressivePolarObservation,
 } from "../../engine-client/src/progressive-polar";
@@ -11,6 +13,15 @@ import {
   type AnalysisPhysical,
 } from "./analysis-target";
 import type { DB } from "./client";
+import type { AttemptEvidenceArchiveReader } from "./attempt-evidence-reader";
+import { MAX_ATTEMPT_EVIDENCE_BYTES } from "./attempt-evidence-storage";
+import {
+  assertAttemptSourcePins,
+  loadAttemptSourcePins,
+  prepareAttemptSources,
+  type AttemptSourcePin,
+  type PreparedAttemptSource,
+} from "./attempt-receipt-source";
 import { validatePolarConflictDiagnostics } from "./progressive-polar-conflicts";
 import {
   progressiveEvidencePreservesGeometry,
@@ -47,6 +58,8 @@ export interface ProgressiveFitSource {
   physical: AnalysisPhysical;
   prediction: Record<string, unknown>;
   evidence: ProgressiveFitEvidence[];
+  /** Outside the scientific signature. Only used to rebind authenticated bodies at commit. */
+  archivedOriginals?: ReadonlyMap<string, FitOriginal>;
   signature: string;
 }
 
@@ -60,9 +73,135 @@ export interface ProgressiveFitLease {
 
 class ProgressiveFitSourceError extends Error {}
 
+/** The claimed unit has already been returned to its normal bounded retry path. */
+export class ProgressiveFitPreparationError extends Error {}
+
+type FitOriginal = Pick<PreparedAttemptSource, "pin" | "payload">;
+type FitRead =
+  | { reader?: AttemptEvidenceArchiveReader }
+  | { prepared: ReadonlyMap<string, FitOriginal> };
+interface FitAttemptRow extends Record<string, unknown> {
+  result_attempt_id: string;
+  result_id: string;
+  sim_job_id: string | null;
+  attempt_token: string;
+  evidence_signature: string;
+  evidence_archive_id: string | null;
+  evidence_storage_event_id: string | null;
+  evidence_payload: Record<string, unknown> | null;
+}
+
+const fitAttemptColumns = sql`receipt.attempt_token, receipt.result_attempt_id, receipt.evidence_signature,
+  result_attempt.result_id, result_attempt.sim_job_id, result_attempt.evidence_archive_id, result_attempt.evidence_storage_event_id,
+  CASE WHEN result_attempt.evidence_archive_id IS NULL THEN result_attempt.evidence_payload END AS evidence_payload`;
+
+function assertFitOwner(
+  row: FitAttemptRow,
+  pin: AttemptSourcePin | undefined,
+): asserts pin is AttemptSourcePin {
+  if (
+    !pin ||
+    pin.attemptId !== row.result_attempt_id ||
+    pin.resultId !== row.result_id ||
+    pin.simJobId !== row.sim_job_id ||
+    pin.archiveId !== row.evidence_archive_id ||
+    pin.storageEventId !== row.evidence_storage_event_id ||
+    pin.cfdAttemptToken !== row.attempt_token ||
+    pin.cfdEvidenceSignature !== row.evidence_signature ||
+    pin.applicationSha256 !== row.evidence_signature
+  )
+    throw new Error(
+      "Archived fit source binding changed; prepare the fit again",
+    );
+}
+
+async function archivedFitOriginals(
+  db: DB,
+  rows: FitAttemptRow[],
+  read: FitRead,
+): Promise<ReadonlyMap<string, FitOriginal>> {
+  const cold = rows.filter((row) => row.evidence_archive_id !== null);
+  if ("prepared" in read) {
+    if (cold.length !== read.prepared.size)
+      throw new Error("Fit source storage changed during calculation");
+    for (const row of cold)
+      assertFitOwner(row, read.prepared.get(row.result_attempt_id)?.pin);
+    if (cold.length)
+      await assertAttemptSourcePins(
+        db,
+        [...read.prepared.values()].map((item) => item.pin),
+      );
+    return read.prepared;
+  }
+  const originals = new Map<string, FitOriginal>();
+  if (!cold.length) return originals;
+  if (!read.reader || "rollback" in db)
+    throw new Error(
+      "A cold fit requires an archive reader outside a database transaction",
+    );
+  const pins = await loadAttemptSourcePins(
+    db,
+    cold.map((row) => row.result_attempt_id),
+  );
+  const reader = read.reader;
+  let batch: AttemptSourcePin[] = [];
+  let bytes = 0;
+  async function flush() {
+    const prepared = await prepareAttemptSources(db, reader, batch);
+    // Release the full PostgreSQL text after each batch. The fitter uses the authenticated parsed body.
+    for (const [id, { pin, payload }] of prepared)
+      originals.set(id, { pin, payload });
+    batch = [];
+    bytes = 0;
+  }
+  for (const row of cold) {
+    const pin = pins.get(row.result_attempt_id);
+    assertFitOwner(row, pin);
+    const size = pin.sourceByteSize;
+    if (size === null || size <= 0 || size > MAX_ATTEMPT_EVIDENCE_BYTES)
+      throw new Error("Invalid archived fit source size");
+    if (batch.length === 32 || bytes + size > MAX_ATTEMPT_EVIDENCE_BYTES)
+      await flush();
+    batch.push(pin);
+    bytes += size;
+  }
+  await flush();
+  await assertAttemptSourcePins(db, [...originals.values()].map(item => item.pin), { lock: false });
+  return originals;
+}
+
+function originalFitPayload(
+  row: FitAttemptRow,
+  originals: ReadonlyMap<string, FitOriginal>,
+) {
+  const payload =
+    row.evidence_archive_id === null
+      ? row.evidence_payload
+      : originals.get(row.result_attempt_id)?.payload;
+  if (
+    !row.result_id ||
+    !payload ||
+    analysisContentHash(payload) !== row.evidence_signature
+  )
+    throw new ProgressiveFitSourceError(
+      "Progressive fit source differs from its immutable evidence receipt",
+    );
+  return payload;
+}
+
+/** Read the same current scientific source used for a normal fit, without claiming fit work. */
+export function readProgressiveFitSource(
+  db: DB,
+  predictionId: string,
+  reader?: AttemptEvidenceArchiveReader,
+) {
+  return sourceForPrediction(db, predictionId, { reader });
+}
+
 async function sourceForPrediction(
   db: DB,
   predictionId: string,
+  read: FitRead,
 ): Promise<ProgressiveFitSource> {
   const [prediction] = await db.execute(sql`
     SELECT prediction.target_id, prediction.epoch_id, prediction.payload, target.physical
@@ -74,9 +213,8 @@ async function sourceForPrediction(
     throw new ProgressiveFitSourceError(
       "Progressive fit has no current prediction source",
     );
-  const records = await db.execute(sql`
-    SELECT receipt.attempt_token, receipt.result_attempt_id, receipt.evidence_signature,
-      unit.id AS lineage_id, unit.aoa_deg, work.stage, result_attempt.result_id, result_attempt.evidence_payload,
+  const records = await db.execute<FitAttemptRow>(sql`
+    SELECT ${fitAttemptColumns}, unit.id AS lineage_id, unit.aoa_deg, work.stage,
       result_attempt."createdAt" AS evidence_created_at,
       CASE WHEN classification.id IS NOT NULL THEN jsonb_build_object('state', classification.state,
         'reasons', classification.reasons, 'version', classification.classifier_version) END AS classification,
@@ -104,15 +242,9 @@ async function sourceForPrediction(
     throw new ProgressiveFitSourceError(
       "Progressive fit source exceeds its bounded evidence batch",
     );
+  const archivedOriginals = await archivedFitOriginals(db, records, read);
   const evidence = records.map((row): ProgressiveFitEvidence => {
-    const payload = row.evidence_payload as Record<string, unknown>;
-    if (
-      !row.result_id ||
-      analysisContentHash(payload) !== row.evidence_signature
-    )
-      throw new ProgressiveFitSourceError(
-        "Progressive fit source differs from its immutable evidence receipt",
-      );
+    const payload = originalFitPayload(row, archivedOriginals);
     return {
       attemptToken: String(row.attempt_token),
       resultAttemptId: String(row.result_attempt_id),
@@ -143,11 +275,120 @@ async function sourceForPrediction(
   };
   return {
     ...source,
+    ...(archivedOriginals.size ? { archivedOriginals } : {}),
     signature: analysisContentHash({
       predictionId,
       evidence: evidence.map(({ payload, ...identity }) => identity),
     }),
   };
+}
+
+type StoredHistory = Omit<
+  ProgressivePolarHistory,
+  "coordinate" | "coefficients"
+> & { sample_count: number };
+type FitManifest = Omit<ProgressivePolarFitRequest, "histories"> & {
+  kind: string;
+  histories: StoredHistory[];
+};
+
+function historySamples(
+  payload: Record<string, unknown>,
+  history: Pick<ProgressivePolarHistory, "coordinate_kind" | "artifact_sha256">,
+) {
+  const physical = history.coordinate_kind === "physical_time";
+  const raw = payload[physical ? "force_history" : "steady_history"] as Record<
+    string,
+    unknown
+  > | null;
+  const coordinate = raw?.[physical ? "t" : "iterations"];
+  const { cl, cd, cm } = raw ?? {};
+  if (
+    !Array.isArray(coordinate) ||
+    !Array.isArray(cl) ||
+    !Array.isArray(cd) ||
+    !Array.isArray(cm) ||
+    [cl, cd, cm].some((channel) => channel.length !== coordinate.length)
+  )
+    throw new Error("Polar history has no exact stored coefficient samples");
+  if (history.artifact_sha256 !== analysisContentHash(raw))
+    throw new Error("Polar history samples differ from their immutable source");
+  return {
+    coordinate: coordinate as number[],
+    coefficients: coordinate.map(
+      (_, i): ProgressiveCoefficientVector => [cl[i], cd[i], cm[i]],
+    ),
+  };
+}
+
+/** Rebuild the immutable model's request using its own membership, policy and verdicts.
+ * Later reviews or a newer selected attempt belong to a new fit. This lookup has no write lease. */
+export async function readHistoricalProgressiveFit(
+  db: DB,
+  modelId: string,
+  reader?: AttemptEvidenceArchiveReader,
+) {
+  const [model] =
+    await db.execute(sql`SELECT prediction_id, source_signature, request, response
+    FROM progressive_polar_models WHERE id = ${modelId}`);
+  if (!model) throw new Error("Stored progressive fit is missing");
+  const { kind, histories, ...manifest } = model.request as FitManifest;
+  if (
+    kind !== "progressive-fit-replay-manifest-v1" ||
+    manifest.prior.prediction_id !== model.prediction_id
+  )
+    throw new Error(
+      "Stored progressive fit manifest differs from its prediction",
+    );
+  const rows = await db.execute<FitAttemptRow>(sql`
+    SELECT ${fitAttemptColumns} FROM progressive_polar_model_evidence member
+    JOIN progressive_cfd_evidence receipt ON receipt.attempt_token = member.attempt_token AND receipt.result_attempt_id = member.result_attempt_id
+    JOIN result_attempts result_attempt ON result_attempt.id = member.result_attempt_id
+    WHERE member.model_id = ${modelId} ORDER BY member.result_attempt_id LIMIT 257
+  `);
+  const observations = [
+    ...manifest.observations,
+    ...histories.map((history) => history.observation),
+  ];
+  const expected = new Map(
+    observations.map((observation) => [
+      observation.attempt_id,
+      observation.result_id,
+    ]),
+  );
+  if (
+    rows.length > 256 ||
+    rows.length !== expected.size ||
+    rows.some((row) => expected.get(row.result_attempt_id) !== row.result_id)
+  )
+    throw new Error("Stored progressive fit evidence membership changed");
+  const originals = await archivedFitOriginals(db, rows, { reader });
+  const bodies = new Map(
+    rows.map((row) => [
+      row.result_attempt_id,
+      originalFitPayload(row, originals),
+    ]),
+  );
+  const request: ProgressivePolarFitRequest = {
+    ...manifest,
+    histories: histories.map(({ sample_count, ...history }) => {
+      const samples = historySamples(
+        bodies.get(history.observation.attempt_id)!,
+        history,
+      );
+      if (samples.coordinate.length !== sample_count)
+        throw new Error("Stored progressive fit history length changed");
+      return { ...history, ...samples };
+    }),
+  };
+  const response = model.response as ProgressivePolarFitResponse;
+  const sourceSignature = String(model.source_signature);
+  if (
+    analysisContentHash({ source: sourceSignature, request, response }) !==
+    modelId
+  )
+    throw new Error("Historical fit differs from its immutable model identity");
+  return { request, response, sourceSignature };
 }
 
 export async function invalidateProgressiveFitPolicy(
@@ -187,6 +428,7 @@ export async function claimProgressivePolarFit(
     requireCfdEvidence?: boolean;
     currentCampaignEvidenceOnly?: boolean;
     requireSweeperEnabled?: boolean;
+    archiveReader?: AttemptEvidenceArchiveReader;
   },
 ): Promise<ProgressiveFitLease | null> {
   if (
@@ -196,7 +438,7 @@ export async function claimProgressivePolarFit(
     input.leaseSeconds > 3600
   )
     throw new Error("Invalid bounded progressive fit lease");
-  return db.transaction(async (transaction) => {
+  const claim = await db.transaction(async (transaction) => {
     const connection = transaction as unknown as DB;
     const [epoch] = await connection.execute(
       sql`SELECT id FROM calculation_epochs WHERE current FOR SHARE`,
@@ -276,22 +518,6 @@ export async function claimProgressivePolarFit(
       `);
       return null;
     }
-    let source: ProgressiveFitSource;
-    try {
-      source = await sourceForPrediction(
-        connection,
-        String(work.prediction_id),
-      );
-    } catch (error) {
-      if (!(error instanceof ProgressiveFitSourceError)) throw error;
-      await connection.execute(sql`
-        UPDATE progressive_polar_fit_work SET state = 'gap', error = ${error.message},
-          policy_refresh_model_id = NULL, policy_refresh_policy_id = NULL,
-          lease_token = NULL, lease_owner = NULL,
-          lease_until = NULL WHERE prediction_id = ${work.prediction_id}
-      `);
-      return null;
-    }
     const token = randomUUID();
     await connection.execute(sql`
       UPDATE progressive_polar_fit_work SET state = 'leased', lease_token = ${token}, lease_owner = ${input.owner},
@@ -299,13 +525,30 @@ export async function claimProgressivePolarFit(
         error = NULL WHERE prediction_id = ${work.prediction_id}
     `);
     return {
-      predictionId: source.predictionId,
+      predictionId: String(work.prediction_id),
       sourceVersion: Number(work.source_version),
       token,
       owner: input.owner,
-      source,
     };
   });
+  if (!claim) return null;
+  try {
+    const source = await readProgressiveFitSource(db, claim.predictionId, input.archiveReader);
+    return { ...claim, source };
+  } catch (error) {
+    if (error instanceof ProgressiveFitSourceError) {
+      await db.execute(sql`
+        UPDATE progressive_polar_fit_work SET state = 'gap', error = ${error.message},
+          policy_refresh_model_id = NULL, policy_refresh_policy_id = NULL,
+          lease_token = NULL, lease_owner = NULL, lease_until = NULL
+        WHERE prediction_id = ${claim.predictionId} AND state = 'leased' AND lease_token = ${claim.token}
+          AND lease_owner = ${claim.owner} AND source_version = ${claim.sourceVersion}
+      `);
+      return null;
+    }
+    await failProgressivePolarFit(db, claim, String(error));
+    throw new ProgressiveFitPreparationError(String(error), { cause: error });
+  }
 }
 
 function sameJson(left: unknown, right: unknown): boolean {
@@ -418,30 +661,8 @@ function validateFitInput(
       throw new Error(
         "History correlation time has no matching stored interpretation evidence",
       );
-    const payload = evidence.payload[
-      history.coordinate_kind === "physical_time"
-        ? "force_history"
-        : "steady_history"
-    ] as Record<string, unknown> | null;
-    const coordinate =
-      payload?.[
-        history.coordinate_kind === "physical_time" ? "t" : "iterations"
-      ];
-    const channels = [payload?.cl, payload?.cd, payload?.cm];
+    const { coordinate, coefficients } = historySamples(evidence.payload, history);
     if (
-      !payload ||
-      !Array.isArray(coordinate) ||
-      channels.some(
-        (channel) =>
-          !Array.isArray(channel) || channel.length !== coordinate.length,
-      )
-    )
-      throw new Error("Polar history has no exact stored coefficient samples");
-    const coefficients = coordinate.map((_, index) =>
-      channels.map((channel) => (channel as number[])[index]),
-    );
-    if (
-      history.artifact_sha256 !== analysisContentHash(payload) ||
       !sameJson(history.coordinate, coordinate) ||
       !sameJson(history.coefficients, coefficients)
     )
@@ -667,7 +888,9 @@ export async function storeProgressivePolarFit(
       work.policy_refresh_policy_id !== request.policy.policy_id
     )
       throw new Error("Fitted polar does not use its requested refresh policy");
-    const current = await sourceForPrediction(connection, lease.predictionId);
+    const current = await sourceForPrediction(connection, lease.predictionId, {
+      prepared: lease.source.archivedOriginals ?? new Map(),
+    });
     if (current.signature !== lease.source.signature)
       throw new Error("Fitted polar evidence changed during calculation");
     validateFitInput(current, request);
@@ -711,7 +934,7 @@ export async function storeProgressivePolarFit(
 
 export async function failProgressivePolarFit(
   db: DB,
-  lease: ProgressiveFitLease,
+  lease: Omit<ProgressiveFitLease, "source">,
   error: string,
 ): Promise<boolean> {
   const changed = await db.execute(sql`

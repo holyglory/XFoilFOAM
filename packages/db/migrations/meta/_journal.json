@@ -1478,6 +1478,13 @@
       "when": 1795363913041,
       "tag": "0210_stopped_progressive_attempt_history",
       "breakpoints": true
+    },
+    {
+      "idx": 211,
+      "version": "7",
+      "when": 1795363913042,
+      "tag": "0211_progressive_attempt_receipt_sources",
+      "breakpoints": true
     }
   ]
 }

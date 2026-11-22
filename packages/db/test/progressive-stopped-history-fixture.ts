@@ -284,6 +284,8 @@ export async function verifyStoppedAttemptHistory(
         },
       }),
     );
+    const { verifyRemoteReceiptOnlyHistory } = await import("./attempt-receipt-source-fixture");
+    await verifyRemoteReceiptOnlyHistory(db, attemptId, archive.id, original, store);
   } finally {
     read.mockRestore();
     env.evidenceBucket = bucket;
