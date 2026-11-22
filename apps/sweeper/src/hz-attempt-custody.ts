@@ -62,7 +62,7 @@ export function packedBytes(value: unknown) {
     throw Error("Invalid packed attempt");
   return bytes;
 }
-function sameArchive(
+export function sameArchive(
   a: AttemptEvidenceArchiveIdentity,
   b: AttemptEvidenceArchiveIdentity,
 ) {
@@ -147,17 +147,23 @@ export async function prepareHzEnvelope(db: DB, id: string) {
     witness.sha256,
   );
   if (existing) return { archive: existing, cold: false };
+  return {
+    instance: witness.instance,
+    solver: witness.solver,
+    ...(await packHzAttemptSource(source)),
+    cold: false,
+  };
+}
+
+/** The same native 0207 document is used by archive-only and shortening. */
+export async function packHzAttemptSource(
+  source: Awaited<ReturnType<typeof loadSettledAttemptEvidenceCopy>>,
+) {
   const dir = await mkdtemp(join(tmpdir(), "hz-attempt-"));
   try {
     const path = join(dir, "original.gz"),
       proof = await writeAttemptEvidenceCopy(path, source);
-    return {
-      instance: witness.instance,
-      solver: witness.solver,
-      proof,
-      packed: (await readFile(path)).toString("base64"),
-      cold: false,
-    };
+    return { proof, packed: (await readFile(path)).toString("base64") };
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
