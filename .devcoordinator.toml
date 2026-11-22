@@ -5881,3 +5881,50 @@ tier = "development"
 requires = ["seed"]
 timeout_seconds = 600
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/api", "exec", "vitest", "run", "test/exact-generation-public.test.ts", "-t", "HZ point histories|serves the same selected coefficients"]
+
+[test.closed-progressive-retention]
+timeout_seconds = 2100
+[test.closed-progressive-retention.postgres]
+image = "postgres:16-alpine"
+database = "aerodb"
+user = "aerodb"
+
+[[test.closed-progressive-retention.check]]
+name = "workspace"
+tier = "development"
+timeout_seconds = 600
+command = ["/usr/bin/corepack", "pnpm", "install", "--offline", "--frozen-lockfile", "--ignore-scripts"]
+
+[[test.closed-progressive-retention.check]]
+name = "schema"
+tier = "development"
+requires = ["workspace"]
+timeout_seconds = 300
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "migrate"]
+
+[[test.closed-progressive-retention.check]]
+name = "seed"
+tier = "development"
+requires = ["schema"]
+timeout_seconds = 600
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "seed"]
+
+[[test.closed-progressive-retention.check]]
+name = "types"
+tier = "development"
+requires = ["workspace"]
+timeout_seconds = 600
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "--filter", "@aerodb/engine-client", "typecheck"]
+
+[[test.closed-progressive-retention.check]]
+name = "retention"
+tier = "development"
+requires = ["seed"]
+timeout_seconds = 600
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "--no-file-parallelism", "test/retention.test.ts", "test/closed-progressive-retention.test.ts"]
+
+[[test.closed-progressive-retention.check]]
+name = "engine-retention"
+tier = "development"
+timeout_seconds = 300
+command = ["/bin/bash", "-c", "export PYTHONPATH=$PWD/src; exec /home/holyglory/XFoilFOAM/.venv/bin/python -m pytest tests/test_retention.py -q"]

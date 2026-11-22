@@ -18,6 +18,7 @@ import { eq, inArray, sql } from "drizzle-orm";
 import { readdir, stat, unlink } from "node:fs/promises";
 import { join } from "node:path";
 
+import { stripClosedProgressiveJobs as stripVerifiedClosedJobs, type ClosedProgressiveBackend } from "./closed-progressive-retention";
 import { DISK_PRESSURE_CANCELLATION_MARKER } from "./disk-admission";
 
 export const DEFAULT_STRIP_MIN_AGE_MS = 30 * 60 * 1000;
@@ -50,6 +51,7 @@ export interface RetentionConfig {
 
 export interface RetentionTickOptions extends Partial<RetentionConfig> {
   now?: Date;
+  closedProgressiveBackend?: ClosedProgressiveBackend;
   forceOrphanSweep?: boolean;
   /** Forecast pressure evicts unrequested restart caches, never live owners. */
   reclaimOptionalCaseState?: boolean;
@@ -288,18 +290,6 @@ export async function stripTerminalJobs(
   const config = retentionConfigFromEnv(options);
   if (config.stripMaxPerTick <= 0) return 0;
   const now = options.now ?? new Date();
-  const progressiveStripped = await stripClosedProgressiveJobs(
-    db,
-    engine,
-    now,
-    config,
-  );
-  const remainingStripMax = config.stripMaxPerTick - progressiveStripped;
-  if (remainingStripMax <= 0) return progressiveStripped;
-  const reclaimOptionalCaseState = options.reclaimOptionalCaseState === true;
-  const requireDurableMediaBinding =
-    options.requireDurableMediaBinding ??
-    Boolean(process.env.AIRFOILFOAM_EVIDENCE_BUCKET?.trim());
   const queryTimeoutMs = Math.max(
     1_000,
     Math.floor(
@@ -309,6 +299,15 @@ export async function stripTerminalJobs(
       ),
     ),
   );
+  const progressiveStripped = options.closedProgressiveBackend
+    ? await stripVerifiedClosedJobs(db, options.closedProgressiveBackend, now, config.stripMinAgeMs, config.stripMaxPerTick, queryTimeoutMs)
+    : await stripClosedProgressiveJobs(db, engine, now, config);
+  const remainingStripMax = config.stripMaxPerTick - progressiveStripped;
+  if (remainingStripMax <= 0) return progressiveStripped;
+  const reclaimOptionalCaseState = options.reclaimOptionalCaseState === true;
+  const requireDurableMediaBinding =
+    options.requireDurableMediaBinding ??
+    Boolean(process.env.AIRFOILFOAM_EVIDENCE_BUCKET?.trim());
   const candidateScanLimit = Math.min(64, Math.max(8, remainingStripMax * 4));
   const candidates = (await db.transaction(async (rawTransaction) => {
     const transaction = rawTransaction as unknown as DB;

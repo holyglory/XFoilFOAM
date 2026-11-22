@@ -1033,3 +1033,190 @@ def test_api_running_guard_and_delete_status_codes():
     assert deleted.json()["bytes_freed"] > 0
     assert not delete_root.exists()
     assert client.delete("/jobs/retention-api-missing").status_code == 404
+
+
+def test_closed_progressive_exact_duplicates_require_whole_job_proof(tmp_path, monkeypatch):
+    from datetime import datetime, timezone
+    import runpy
+    peer = runpy.run_path(str(Path(__file__).resolve().parents[1] / "scripts/deploy/hz-closed-job-engine.py"))
+    native = (Path(__file__).resolve().parents[1] / "src/airfoilfoam/closed_progressive_retention.py").read_text()
+
+    job = "ddfebc12-aeb9-4d2c-8ef7-794cb27ca0bc"
+    settings = get_settings().model_copy(update={"data_dir": tmp_path, "control_plane_token": "fixture-control"})
+    root = tmp_path / "jobs" / job
+    case = root / "cases" / "foil"
+    post = case / "transient_a0"
+    archived = b"actual saved field"
+    sha = lambda b: hashlib.sha256(b).hexdigest()
+    copies = [_write(post / t / "U", archived) for t in ("1", "2")]
+    _write(post / "2" / "p", b"last pressure")
+    mismatch = _write(post / "1" / "p", b"changed same size")
+    force = _write(post / "postProcessing" / "forceCoeffs" / "0" / "coefficient.dat", archived)
+    other = _write(post / "postProcessing" / "unknown.dat", b"unique archive-independent record")
+    members = [{"path": f"time_directories/{t}/U", "byteSize": len(archived), "sha256": sha(archived)} for t in ("1", "2")]
+    members.append({"path": "time_directories/1/p", "byteSize": len(mismatch.read_bytes()), "sha256": sha(b"other")})
+    members.append({"path": "openfoam/postProcessing/forceCoeffs/0/coefficient.dat", "byteSize": len(archived), "sha256": sha(archived)})
+    members.append({"path": "openfoam/mesh_evidence/log.blockMesh", "byteSize": 3, "sha256": sha(b"log")})
+    proofs, points = [], []
+    for index in (0, 1):
+        base = f"a{index}/evidence"
+        directory = f"cases/foil/{base}"
+        folder = root / directory
+        mf = _write_json(folder / "evidence_manifest.json", {"casePath": str(case), "postPath": str(post),
+                          "files": members if not index else []})
+        mf_sha = sha(mf.read_bytes())
+        upload = f"upload-{index}"
+        proof = {"directory": directory, "manifestSha256": mf_sha, "manifestByteSize": mf.stat().st_size,
+                 "brokeredUploadId": upload, "generation": "18446744073709551614", "receiptHmac": "f" * 64}
+        auth = {"jobId": job, "caseSlug": "foil", "evidenceBase": base, "receiptHmac": proof["receiptHmac"],
+                "receipt": {"brokeredUploadId": upload, "remote": {"generation": proof["generation"], "manifestSha256": mf_sha, "storedSha256": sha(b"gzip"), "storedByteSize": 4}}}
+        _write_json(folder / "brokered_hub_binding.database.json", {"authorization": auth, "schemaVersion": 1, "state": "hub_progressive_custody"})
+        intent = {"authorization": auth, "schemaVersion": 1, "kind": "brokered-local-evidence-reclaim-intent",
+                  "paths": [], "plannedPathCount": 0, "plannedBytes": 0}
+        _write_json(folder / "brokered_local_reclaim.intent.json", intent)
+        _write_json(folder / "brokered_local_reclaim.json", {"authorization": auth, "state": "complete", "schemaVersion": 1, "bytesDeleted": 0, "deletedPaths": [],
+                    "intentSha256": sha(json.dumps(intent, sort_keys=True, separators=(",", ":")).encode())})
+        artifacts = [{"path": f"{base}/evidence_manifest.json", "kind": "manifest", "sha256": mf_sha, "byte_size": mf.stat().st_size},
+                     {"path": f"{base}/engine_evidence.tar.zst", "kind": "engine_bundle", "sha256": sha(b"gzip"), "byte_size": 4}]
+        if not index:
+            artifacts.append({"path": f"{base}/{members[0]['path']}", "kind": "time_directory", "sha256": sha(archived), "byte_size": len(archived)})
+            artifacts.append({"path": f"{base}/openfoam/mesh_evidence/log.blockMesh", "kind": "mesh_evidence", "sha256": sha(b"log"), "byte_size": 3})
+        catalog = sorted(f"{'mesh' if a['kind'] == 'mesh_evidence' else a['kind']}\tjobs/{job}/cases/foil/{a['path']}\t{a['byte_size']}\t{a['sha256']}" for a in artifacts)
+        proof["catalogSha256"] = sha("\n".join(catalog).encode())
+        points.append({"case_slug": "foil", "evidence_artifacts": artifacts})
+        proofs.append(proof)
+    _write_json(root / "result.json", {"job_id": job, "state": "completed", "polars": [{"points": points}]})
+    status = _write_json(root / "status.json", {"job_id": job, "state": "completed"})
+    lockpath = _write(root / ".execute.lock", b"")
+    scope = {"nonce": "test-session", "id": job, "helper": sha(native.encode()), "jobsInode": peer["inode"](root.parent),
+             "jobInode": peer["inode"](root), "lockInode": peer["inode"](lockpath)}
+    readbacks = [dict(brokeredUploadId=p["brokeredUploadId"], generation=p["generation"], storedSha256=sha(b"gzip"),
+                      storedByteSize=4, verifiedAt=datetime.now(timezone.utc).isoformat()) for p in proofs]
+    def request(proof_list=proofs, plan=None, objects=readbacks, mode=None, token="fixture-control", peer_scope=None):
+        mode = mode or ("reclaim" if plan else "proof")
+        ctx = {**scope, "mode": mode, "plan": plan, **(peer_scope or {})}
+        body = json.dumps({"id": job, "step": 2 if plan else 1, "helper": scope["helper"], "mode": mode,
+                           "expectedPlan": plan, "manifests": proof_list, "readbacks": objects if plan else []})
+        packet = {"body": body, "mac": peer["signature"](token, "request", ctx["nonce"], body)}
+        answer = peer["run_engine"](ctx, packet, native, settings)
+        assert answer["mac"] == peer["signature"](token, "response", ctx["nonce"], answer["body"])
+        return json.loads(answer["body"])["result"]
+
+    def refused(*args, **kwargs):
+        with pytest.raises(JobRetentionRefused) as caught:
+            request(*args, **kwargs)
+        return str(caught.value)
+
+    with pytest.raises(ValueError, match="authentication refused"):
+        request(token="wrong")
+    with pytest.raises(ValueError, match="execution locks differ"):
+        request(peer_scope={"lockInode": [0, 0]})
+    with pytest.raises(ValueError, match="authorized plan"):
+        request(mode="proof", plan="0" * 64)
+    refused(proofs[:1])
+    refused([proofs[0], {**proofs[1], "catalogSha256": "0" * 64}])
+    stored_result = json.loads((root / "result.json").read_bytes())
+    missing_frame = {"path": "a0/evidence/frames/frame.png", "kind": "frame_image", "sha256": sha(b"png"), "byte_size": 3}
+    stored_result["polars"][0]["points"][0]["evidence_artifacts"].append(missing_frame)
+    _write_json(root / "result.json", stored_result)
+    refused()
+    assert copies[0].exists()
+    all_artifacts = stored_result["polars"][0]["points"][0]["evidence_artifacts"]
+    lines = sorted(f"{'mesh' if a['kind'] == 'mesh_evidence' else a['kind']}\tjobs/{job}/cases/foil/{a['path']}\t{a['byte_size']}\t{a['sha256']}" for a in all_artifacts)
+    declared_frame = refused([{**proofs[0], "catalogSha256": sha("\n".join(lines).encode())}, proofs[1]])
+    assert "outside authenticated bundle" in declared_frame
+    _write_json(root / "result.json", {"job_id": job, "state": "completed", "polars": [{"points": points}]})
+    plan = request()
+    assert plan["state"] == "planned" and plan["bytes"] == 2 * len(archived) and plan["files"] == 2
+    assert all(p.is_file() for p in copies)
+    refused(plan=plan["plan"], objects=readbacks[:1])
+    refused(plan=plan["plan"], objects=[readbacks[0], {**readbacks[1], "generation": "8"}])
+    assert copies[0].is_file()
+    for rel in ("cases/foil/a1/evidence/incomplete_evidence_quarantine.receipt.json",
+                "cases/foil/a1/images/unregistered.png", "cases/foil/a2/evidence/evidence_manifest.json"):
+        blocker = _write(root / rel, b"must retain")
+        refused(plan=plan["plan"])
+        assert blocker.is_file() and copies[0].is_file()
+        blocker.unlink()
+        if rel.endswith("a2/evidence/evidence_manifest.json"):
+            blocker.parent.rmdir()
+    _write_json(status, {"job_id": job, "state": "running"})
+    refused(plan=plan["plan"])
+    assert copies[0].exists()
+    _write_json(status, {"job_id": job, "state": "completed"})
+    with (root / ".execute.lock").open("a+") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        assert "worker holds" in refused()
+        refused(plan=plan["plan"])
+        assert copies[0].exists()
+    refused(plan="0" * 64)
+    assert copies[0].exists()
+    with monkeypatch.context() as interrupted:
+        unlink = Path.unlink
+        def fail_at_force(path, *args, **kwargs):
+            if path == force:
+                raise OSError("interrupted after first verified duplicate")
+            return unlink(path, *args, **kwargs)
+        interrupted.setattr(Path, "unlink", fail_at_force)
+        refused(plan=plan["plan"])
+    assert not copies[0].exists() and force.is_file() and request() == plan
+    done = request(plan=plan["plan"])
+    measured = done.pop("allocation")
+    assert done == {**plan, "state": "reclaimed"}
+    assert measured["fileAllocatedBytes"] > 0
+    assert measured["netAttributedAllocatedBytes"] == (measured["fileAllocatedBytes"] -
+            measured["receiptAllocatedBytes"] - measured["directoryAllocatedDelta"])
+    assert not copies[0].exists() and copies[1].read_bytes() == archived
+    assert other.is_file() and mismatch.is_file() and (root / "result.json").is_file()
+    replay = request()
+    assert replay.pop("allocation")["fileAllocatedBytes"] == measured["fileAllocatedBytes"]
+    assert replay == {**plan, "replayed": True}
+    retry = request(plan=plan["plan"])
+    retry.pop("allocation")
+    assert retry == {**plan, "state": "reclaimed", "replayed": True}
+    _write(copies[0], archived)
+    refused(plan=plan["plan"])
+    assert copies[0].is_file()
+
+
+def test_closed_storage_inventory_resumes_one_pinned_job_and_preserves_refusals(tmp_path, monkeypatch):
+    import runpy
+    operator = runpy.run_path(str(Path(__file__).resolve().parents[1] / "scripts/deploy/hz-closed-job-maintenance.py"))
+    run = operator["run_inventory"]
+    ids = [f"00000000-0000-4000-8000-{n:012d}" for n in range(3)]
+    inventory = tmp_path / "private.jsonl"
+    inventory.write_text("".join(json.dumps({"id": i, "plan": "a"*64})+"\n" for i in ids))
+    digest = hashlib.sha256(inventory.read_bytes()).hexdigest()
+    state = tmp_path / "state"
+    applied = set()
+    calls = []
+    scientific = "d"*64
+    def remote(_, target):
+        job, mode = target["id"], target["mode"]
+        calls.append((job, mode))
+        if job == ids[1]:
+            return {"job":job, "status":"refused","reason":"held worker execution lock"}
+        allocation={"fileAllocatedBytes":8192,"netAttributedAllocatedBytes":4096}
+        if mode=="reclaim" and job in applied:
+            return {"status":"already-settled","record":{"scientificSha256":scientific,"allocation":allocation}}
+        if mode=="reclaim":
+            applied.add(job)
+            if job==ids[0]:
+                raise RuntimeError("response lost after commit")
+        return {"job":job,"status":"settled" if mode=="reclaim" else "verified", "scientificSha256":scientific,
+                "settled":mode=="reclaim","databaseReadOnly":mode=="verify","plan":{"plan":"a"*64,"files":2,"bytes":5000,
+                "replayed":mode=="verify"}, "allocation":allocation, "points":[{"attemptId":job}],
+                "readbacks":[{"brokeredUploadId":job,"generation":"1","storedSha256":"b"*64,"storedByteSize":120}]}
+    monkeypatch.setitem(run.__globals__, "run_remote", remote)
+    monkeypatch.setitem(run.__globals__, "validate_sources", lambda _: "c"*64)
+    with pytest.raises(RuntimeError, match="lost"):
+        run({"revision":"test"},inventory,digest,state,True)
+    assert run({"revision":"test"},inventory,digest,state,True)==0
+    summary=json.loads((state/"status.json").read_bytes())
+    assert (summary["verified"], summary["deferred"], summary["fileAllocatedBytes"], summary["netAttributedAllocatedBytes"])==(2,1,16384,8192)
+    assert sum(mode=="verify" for _,mode in calls)==2
+    assert len(list((state/"receipts").glob("*.json")))==3
+    count=len(calls)
+    assert run({"revision":"test"},inventory,digest,state,True)==0 and len(calls)==count
+    with pytest.raises(ValueError, match="same pinned helper"):
+        run({"revision":"different"},inventory,digest,state,True)
