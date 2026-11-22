@@ -1128,6 +1128,9 @@ def test_closed_progressive_exact_duplicates_require_whole_job_proof(tmp_path, m
     if keep_media:
         with pytest.raises(ValueError, match="explicitly named"):
             request(peer_scope={"keepMedia":False})
+        bad = [{**proofs[0], "keepMedia": [{**proofs[0]["keepMedia"][0], "path":
+                proofs[0]["keepMedia"][0]["path"].replace("pressure.png", "vorticity.png")}]}, proofs[1]]
+        assert "owner" in refused(bad)
         symlink = next(iter(retained)).parent / "other.png"
         symlink.symlink_to(next(iter(retained)))
         assert "symlink" in refused() or "unaccounted" in refused()

@@ -362,7 +362,9 @@ it("keeps path-owned images unbound and checks all image routes, their legend an
       VALUES(${media},${rid},${item!.attempt},${`jobs/${id}/${scaledPath}`},'image','instantaneous',${field},'image/png',${sha("scaled")},6,${item!.remote.manifestSha256},${scale})`);
     let applied = 0,
       brokenPath = false,
-      wrongLegend = false;
+      wrongLegend = false,
+      swapped = false,
+      missingOriginal = false;
     const routes: string[] = [];
     const native: ClosedProgressiveBackend = {
       async reclaimClosedProgressiveFiles(job, manifests, plan, readbacks) {
@@ -379,7 +381,7 @@ it("keeps path-owned images unbound and checks all image routes, their legend an
           plan: "c".repeat(64),
           files: 1,
           bytes: 32,
-          mediaFiles: locals,
+          mediaFiles: missingOriginal ? locals.slice(1) : locals,
           workingPaths: [candidate],
           plannedAllocatedBytes: 4096,
         };
@@ -404,7 +406,8 @@ it("keeps path-owned images unbound and checks all image routes, their legend an
           return Response.json({
             resultId: rid,
             media: {
-              pressure: {
+              [swapped ? "vorticity" : "pressure"]: {
+                kind: "image",
                 url: `/api/result-media/${media}`,
                 scale: wrongLegend ? { ...legend, vmax: 2 } : legend,
               },
@@ -440,11 +443,21 @@ it("keeps path-owned images unbound and checks all image routes, their legend an
         "/api/airfoils/real-foil/sim",
       ])
         expect(routes).toContain(expected);
+      missingOriginal = true;
+      await expect(closedProgressiveJob(db, native, id, opts)).rejects.toThrow(
+        /inventory is incomplete/,
+      );
+      missingOriginal = false;
       brokenPath = true;
       await expect(closedProgressiveJob(db, native, id, opts)).rejects.toThrow(
         /different bytes/,
       );
       brokenPath = false;
+      swapped = true;
+      await expect(closedProgressiveJob(db, native, id, opts)).rejects.toThrow(
+        /legend|field/,
+      );
+      swapped = false;
       wrongLegend = true;
       await expect(closedProgressiveJob(db, native, id, opts)).rejects.toThrow(
         /legend/,

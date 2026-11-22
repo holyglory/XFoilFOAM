@@ -51,7 +51,7 @@ def _images(job, directory, images):
     for field, name in images.items():
         _require(isinstance(field, str) and isinstance(name, str), "invalid image declaration")
         path = _relative(name[len(prefix):]) if name.startswith(prefix) else case / _relative(name)
-        _require(path.parent == directory.parent / "images" and path.suffix.lower() == ".png",
+        _require(path.parent == directory.parent / "images" and path.name == field + ".png",
                  "image declaration escapes its exact point")
         paths[field] = path.as_posix()
     _require(len(set(paths.values())) == len(paths), "ambiguous image declaration")
@@ -71,7 +71,7 @@ def _kept_images(root, proofs, declared):
             expected[name] = None
         for row in rows:
             path = _relative(row["path"])
-            _require(path.is_relative_to(directory / "scaled_media") and path.suffix.lower() == ".png" and
+            _require(path.is_relative_to(directory / "scaled_media") and path.name == row["field"] + ".png" and
                      path.as_posix() not in expected, "scaled image has a different or duplicate owner")
             expected[path.as_posix()] = (row["byteSize"], row["sha256"])
     _require(0 < len(expected) <= 512, "media inventory exceeds the bounded job proof")

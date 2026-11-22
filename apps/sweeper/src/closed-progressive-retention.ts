@@ -195,6 +195,29 @@ async function readKeptMedia(
     throw Error(
       "Native peer omitted the protected image or working-file inventory",
     );
+  const expectedPaths = new Set<string>();
+  for (const row of media) {
+    const suffix = "/evidence/scaled_media/";
+    const prefixLength = row.path.lastIndexOf(suffix);
+    if (prefixLength < 0)
+      throw Error(
+        "Registered image is outside a signed scaled-media directory",
+      );
+    expectedPaths.add(row.path);
+    expectedPaths.add(
+      row.path.slice(0, prefixLength) + "/images/" + row.field + ".png",
+    );
+  }
+  if (
+    expectedPaths.size !== 2 * media.length ||
+    plan.mediaFiles.length !== expectedPaths.size ||
+    plan.mediaFiles.some((file) => !expectedPaths.has(file.path)) ||
+    new Set(plan.workingPaths).size !== plan.files ||
+    plan.workingPaths.some((path) => expectedPaths.has(path))
+  )
+    throw Error(
+      "Protected image/working-file inventory is incomplete or overlaps",
+    );
   const api = "http://node-api:4000";
   const engine = new URL(process.env.ENGINE_URL ?? "http://api:8000");
   const files = new Map<string, MediaFile>();
@@ -215,7 +238,10 @@ async function readKeptMedia(
   }
   const results = new Map<
     string,
-    Record<string, { url?: string; imageUrl?: string; scale?: unknown }>
+    Record<
+      string,
+      { kind?: string; url?: string; imageUrl?: string; scale?: unknown }
+    >
   >();
   for (const m of media) {
     const file = files.get(m.path);
@@ -266,11 +292,11 @@ async function readKeptMedia(
       displayed = sim.media;
       results.set(m.resultId, displayed);
     }
-    const entry = Object.values(displayed).find(
-      (x) => x.url === stable || x.imageUrl === stable,
-    );
+    const entry = displayed[m.field];
     if (
       !entry ||
+      entry.kind !== "image" ||
+      (entry.url !== stable && entry.imageUrl !== stable) ||
       canonicalAnalysisJson(entry.scale ?? null) !==
         canonicalAnalysisJson(m.legend)
     )
