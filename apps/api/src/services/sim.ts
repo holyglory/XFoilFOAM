@@ -35,12 +35,12 @@ import {
   activeReviewVerdict,
 } from "@aerodb/db";
 import type { SimulationSetupSnapshot } from "@aerodb/db/simulation-setup";
-import { and, desc, eq, inArray, isNull, sql } from "drizzle-orm";
+import { and, desc, eq, getTableColumns, inArray, isNull, sql } from "drizzle-orm";
 
 import { db } from "../db";
 import { mediaStore, resultMediaUrl } from "../media-store";
 import { readStoredForceHistory } from "../solver-history-reader";
-import { readStoredAttemptEvidence } from "../attempt-evidence-reader";
+import { readSelectedAttemptDetailFields } from "../selected-attempt-detail-fields";
 
 type ReviewDisclosure = {
   verdict: "exclude";
@@ -113,23 +113,38 @@ function snapshotParts(snapshot: SimulationSetupSnapshot | undefined) {
   };
 }
 
-/** Build the public/detail projection from the exact selected attempt. The
- * results row owns cell/physical identity; every solver output/provenance
- * value comes from current_result_attempt_id so generations can never mix. */
-function selectedResultProjection(
+// Do not transfer an attempt manifest or a different generation's result
+// histories to the API just to open a point. Preserve the original nested
+// values, including nulls. The projector applies its usual alias precedence.
+type DetailAttempt = Omit<typeof resultAttempts.$inferSelect, "evidencePayload"> & { detailPayload: unknown };
+const { evidencePayload, ...attemptDetailColumns } = getTableColumns(resultAttempts);
+const selectedDetailColumns = {
+  result: {
+    ...getTableColumns(results),
+    frameTrack: sql<null>`NULL`,
+    steadyHistory: sql<null>`NULL`,
+  },
+  attempt: {
+    ...attemptDetailColumns,
+    detailPayload: sql`CASE WHEN ${resultAttempts.evidenceArchiveId} IS NULL THEN jsonb_build_object(
+      'frame_track', ${evidencePayload}->'frame_track',
+      'frameTrack', ${evidencePayload}->'frameTrack',
+      'steady_history', ${evidencePayload}->'steady_history',
+      'steadyHistory', ${evidencePayload}->'steadyHistory',
+      'fidelity', ${evidencePayload}->'fidelity') END`.mapWith(evidencePayload),
+  },
+};
+
+/** The result owns the physical cell. The public or admin selector chooses
+ * the attempt that supplies the solver outputs and provenance. */
+async function selectedResultProjection(
   result: Result,
-  attempt: typeof resultAttempts.$inferSelect,
-): Result {
-  const payload =
-    attempt.evidencePayload && typeof attempt.evidencePayload === "object"
-      ? (attempt.evidencePayload as Record<string, unknown>)
-      : {};
+  attempt: DetailAttempt,
+): Promise<Result> {
+  const payload = await readSelectedAttemptDetailFields(db, attempt);
   return {
     ...result,
-    // The projection is explicitly bound to `attempt`; do not inherit a null
-    // or different selected-generation pointer from the owning cell row.
-    // Public callers still prove ownership by joining through
-    // results.current_result_attempt_id before reaching this helper.
+    // A historical detail response names its own generation.
     currentResultAttemptId: attempt.id,
     status: attempt.status,
     source: attempt.source,
@@ -601,8 +616,7 @@ export async function assembleSim(
   if (resultId && resultAttemptId) {
     const [selected] = await db
       .select({
-        result: results,
-        attempt: resultAttempts,
+        ...selectedDetailColumns,
         classification: resultClassifications.state,
         reynolds: simulationPresetRevisions.reynolds,
       })
@@ -681,7 +695,7 @@ export async function assembleSim(
     return solvedDetail(
       a.name,
       selected.reynolds,
-      selectedResultProjection(selected.result, await readStoredAttemptEvidence(db, selected.attempt)),
+      await selectedResultProjection(selected.result, selected.attempt),
       {
         method: selected.attempt.regime === "urans" ? "URANS" : "RANS",
         classification: selected.classification,
@@ -694,8 +708,7 @@ export async function assembleSim(
   if (resultId) {
     const [selected] = await db
       .select({
-        result: results,
-        attempt: resultAttempts,
+        ...selectedDetailColumns,
         revisionReynolds: simulationPresetRevisions.reynolds,
       })
       .from(results)
@@ -725,7 +738,7 @@ export async function assembleSim(
       )
       .limit(1);
     if (!selected) return null;
-    const r = selectedResultProjection(selected.result, await readStoredAttemptEvidence(db, selected.attempt));
+    const r = await selectedResultProjection(selected.result, selected.attempt);
     const effectiveRe = r.reynolds ?? selected.revisionReynolds ?? re;
     if (!finiteStored(effectiveRe) || effectiveRe <= 0) return null;
     return solvedDetail(a.name, effectiveRe, r);
@@ -769,7 +782,7 @@ export async function assembleSim(
     );
     if (revisionIds.length) {
       const selectedRows = await db
-        .select({ result: results, attempt: resultAttempts })
+        .select(selectedDetailColumns)
         .from(results)
         .innerJoin(
           resultAttempts,
@@ -806,10 +819,7 @@ export async function assembleSim(
               : null);
           return effectiveRe ? { result, attempt, effectiveRe } : null;
         })
-        .filter(
-          (candidate): candidate is { result: Result; attempt: typeof resultAttempts.$inferSelect; effectiveRe: number } =>
-            candidate !== null,
-        )
+        .filter((candidate) => candidate !== null)
         .sort(
           (left, right) =>
             Math.abs(left.effectiveRe - re) - Math.abs(right.effectiveRe - re),
@@ -819,8 +829,7 @@ export async function assembleSim(
         match &&
         Math.abs(match.effectiveRe - re) <= Math.max(1000, Math.abs(re) * 0.02)
       ) {
-        const fullAttempt = await readStoredAttemptEvidence(db, match.attempt);
-        return solvedDetail(a.name, match.effectiveRe, selectedResultProjection(match.result, fullAttempt));
+        return solvedDetail(a.name, match.effectiveRe, await selectedResultProjection(match.result, match.attempt));
       }
     }
   }
@@ -838,8 +847,7 @@ export async function assembleAdminSim(
 ): Promise<SimulationDetail | null> {
   const [selected] = await db
     .select({
-      result: results,
-      attempt: resultAttempts,
+      ...selectedDetailColumns,
       airfoilName: airfoils.name,
       revisionReynolds: simulationPresetRevisions.reynolds,
     })
@@ -870,7 +878,7 @@ export async function assembleAdminSim(
     .where(eq(results.id, resultId))
     .limit(1);
   if (!selected) return null;
-  const projected = selectedResultProjection(selected.result, await readStoredAttemptEvidence(db, selected.attempt));
+  const projected = await selectedResultProjection(selected.result, selected.attempt);
   const effectiveRe = projected.reynolds ?? selected.revisionReynolds;
   if (!finiteStored(effectiveRe) || effectiveRe <= 0) return null;
   return solvedDetail(selected.airfoilName, effectiveRe, projected);

@@ -1,3 +1,4 @@
+import { selectedDetailBaseline, verifySelectedDetailField } from "../../../apps/api/test/selected-attempt-detail-fixture";
 import { randomUUID } from "node:crypto";
 import { sql } from "drizzle-orm";
 import { expect, vi } from "vitest";
@@ -157,7 +158,8 @@ export async function verifyReceiptBearingHistory(
       resultAttemptIds: ids,
     }),
   ).toMatchObject({ linked: 2 });
-  await db.execute(sql`UPDATE results r SET current_result_attempt_id=a.id,status=a.status,source=a.source,regime=a.regime,cl=a.cl,cd=a.cd,cm=a.cm
+  await db.execute(sql`UPDATE results r SET current_result_attempt_id=a.id,status=a.status,source=a.source,regime=a.regime,cl=a.cl,cd=a.cd,cm=a.cm,
+    steady_history=a.evidence_payload->'steady_history'
     FROM result_attempts a WHERE r.id=a.result_id AND a.id=${ids[0]}::uuid`);
   const [prediction] =
     await db.execute(sql`SELECT id FROM neuralfoil_predictions WHERE target_id=${fixture.leases[0]!.targetId}
@@ -268,10 +270,12 @@ export async function verifyReceiptBearingHistory(
         archiveId: ar[0]!.id,
       }),
     ).rejects.toThrow(/proof/i);
+    const publicInline = await selectedDetailBaseline(db, id!);
     const pass = await runAttemptEvidenceSettlementPass(db, deps, {
       maxRows: 2,
     });
     expect(pass).toMatchObject({ shortened: 2, failures: [] });
+    await verifySelectedDetailField(db, publicInline, "steady_history");
     expect(await settleProgressiveCfdExecution(db, job)).toEqual(inlineSettlement);
     expect(
       await attemptEvidenceShorteningCandidates(db, null, "receipt-bearing"),

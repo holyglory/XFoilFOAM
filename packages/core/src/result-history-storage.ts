@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { Readable, addAbortSignal } from "node:stream";
 import { gzipSync, gunzipSync } from "node:zlib";
 import {
   pinExactGcsGeneration,
@@ -281,7 +282,9 @@ export class ResultHistoryGcsStore implements ResultHistoryArchiveStore {
   }
   async read(
     identity: ResultHistoryArchiveIdentity,
+    signal?: AbortSignal,
   ): Promise<ResultHistoryEnvelope> {
+    signal?.throwIfAborted();
     assertResultHistoryArchive(identity);
     const file = pinExactGcsGeneration(
       this.storage
@@ -290,6 +293,7 @@ export class ResultHistoryGcsStore implements ResultHistoryArchiveStore {
       identity.generation,
     );
     const [metadata] = await file.getMetadata();
+    signal?.throwIfAborted();
     if (
       String(metadata.generation) !== identity.generation ||
       Number(metadata.size) !== identity.storedByteSize ||
@@ -302,10 +306,13 @@ export class ResultHistoryGcsStore implements ResultHistoryArchiveStore {
       throw new Error("Result history pinned generation metadata changed");
     const chunks: Buffer[] = [];
     let size = 0;
-    for await (const raw of file.createReadStream({
+    const stream = file.createReadStream({
       validation: "crc32c",
       decompress: false,
-    })) {
+    });
+    if (signal && stream instanceof Readable) addAbortSignal(signal, stream);
+    for await (const raw of stream) {
+      signal?.throwIfAborted();
       const chunk = Buffer.from(raw);
       size += chunk.length;
       if (
@@ -317,6 +324,7 @@ export class ResultHistoryGcsStore implements ResultHistoryArchiveStore {
         );
       chunks.push(chunk);
     }
+    signal?.throwIfAborted();
     const bytes = Buffer.concat(chunks);
     if (crc32c(bytes) !== identity.crc32c)
       throw new Error("Result history archive failed CRC32C verification");
