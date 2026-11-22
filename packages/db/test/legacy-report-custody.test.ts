@@ -245,7 +245,9 @@ it("rolls back the entire bounded page when a later source digest differs", asyn
     const { instanceId, solverId } = await setup(fixture);
     const members = await membersFor(fixture.db, fixture.executionId);
     const last = members[members.length - 1];
-    last.reportText = last.reportText.replace('"diagnosticNull": null', '"diagnosticNull": false');
+    // Same application value/signature, different exact PostgreSQL text. This
+    // reaches the SQL byte guard after earlier page rows have been processed.
+    last.reportText = last.reportText.replace('"sequence": 3', '"sequence": 3.0');
     last.reportSha256 = digest(last.reportText);
     last.reportByteSize = Buffer.byteLength(last.reportText);
     const input = pageFor(instanceId, solverId, members);

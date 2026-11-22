@@ -1,0 +1,659 @@
+import { sql } from "drizzle-orm";
+import { createHash, randomUUID } from "node:crypto";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { Readable } from "node:stream";
+import { createRequire } from "node:module";
+import { afterAll, afterEach, expect, it, vi } from "vitest";
+import { createClient, type DB } from "../src/client";
+import { analysisContentHash } from "../src/analysis-target";
+import {
+  canonicalReportJson,
+  parseReportJson,
+  reportTextIdentity,
+} from "../src/progressive-report-archive";
+import { encodeLegacyPage } from "../src/legacy-report-storage-codec";
+import {
+  verifyLegacyReportCustodyPage,
+  applyLegacyReportCustodyPage,
+  legacyReportCustodySql,
+} from "../src/legacy-report-custody";
+import {
+  installProgressiveReportArchiveReader,
+  readProgressiveReport,
+} from "../src/progressive-report-reader";
+import { type ProgressiveRemoteReport } from "../src/progressive-remote-report";
+import { type ProgressiveRemoteExecutionEnvelope } from "../src/progressive-remote-execution";
+import { type LegacyReportMember } from "../src/legacy-report-storage";
+import { type EngineClient } from "../../engine-client/src";
+import { progressiveRemoteEvidenceResult } from "./progressive-remote-evidence-fixture";
+import { stageProgressiveWorkerEvidence } from "../../../apps/sweeper/src/progressive-worker-evidence";
+import { readStoredWorkerArchiveText } from "../../../apps/sweeper/src/report-archive-broker-client";
+import { readLegacyWorkerReportArchivePage } from "../../../apps/sweeper/src/legacy-worker-report-product-read";
+import { storeWorkerReportVolume } from "../../../apps/sweeper/src/worker-report-volume";
+import {
+  withArchiveFixture,
+  type ArchiveFixture,
+} from "../../../apps/sweeper/test/progressive-report-archive-fixture";
+
+const client = createClient({ max: 1 });
+const { CRC32C } = createRequire(
+  new URL("../../../apps/sweeper/package.json", import.meta.url),
+)("@google-cloud/storage") as {
+  CRC32C: new () => { update(bytes: Buffer): void; toString(): string };
+};
+afterAll(() => client.sql.end());
+afterEach(() => {
+  installProgressiveReportArchiveReader(null);
+  vi.unstubAllEnvs();
+});
+const hash = (value: string | Buffer) =>
+  createHash("sha256").update(value).digest("hex");
+const noEngine = new Proxy(
+  {},
+  {
+    get() {
+      throw new Error(
+        "Stored report staging must not call a solver/render endpoint",
+      );
+    },
+  },
+) as EngineClient;
+type Fixture = Awaited<ReturnType<typeof prepare>>;
+
+async function prepare(base: ArchiveFixture) {
+  const db = base.db,
+    executionId = base.executionId,
+    sourceSequence = 3487;
+  const [job] = await db.execute(
+    sql`SELECT * FROM sim_jobs WHERE id=${executionId}::uuid`,
+  );
+  const envelope = (
+    job.request_payload as {
+      remoteProgressiveExecution: ProgressiveRemoteExecutionEnvelope;
+    }
+  ).remoteProgressiveExecution;
+  const instanceId = randomUUID(),
+    solverId = envelope.solverId,
+    upstream = "https://duplicate-proof.invalid/api/sync/v1";
+  await db.execute(sql`UPDATE sync_api_settings SET instance_id=${instanceId}::uuid,remote_solver_registered_id=${solverId}::uuid,
+    upstream_base_url=${upstream},remote_solver_transfer_paused=false WHERE id=1`);
+  await db.execute(
+    sql`UPDATE sync_sweep_promises SET source_base_url=${upstream} WHERE id=${base.promiseId}::uuid`,
+  );
+  // This real ingestion fixture needs the same immutable setup fields as the
+  // ordinary worker. Create a new revision; never mutate a sealed snapshot.
+  const [revision] =
+    await db.execute(sql`INSERT INTO simulation_preset_revisions
+    (preset_id,revision_number,signature_hash,reynolds,mach,reference_length_m,solver_implementation_id,snapshot)
+    SELECT preset_id,2,${randomUUID()},reynolds,mach,reference_length_m,solver_implementation_id,
+      snapshot||jsonb_build_object('preset',jsonb_build_object('legacyBoundaryConditionId',${(job.bc_ids as string[])[0]}::text))
+    FROM simulation_preset_revisions WHERE id=${job.simulation_preset_revision_id}::uuid RETURNING id`);
+  await db.execute(sql`UPDATE sim_jobs SET simulation_preset_revision_id=${revision.id}::uuid,
+    request_payload=request_payload||jsonb_build_object('upstreamBaseUrl',${upstream}::text,'engineRequest',${JSON.stringify(envelope.request)}::jsonb)
+    WHERE id=${executionId}::uuid`);
+  await db.execute(sql`INSERT INTO progressive_worker_submission_intents(sim_job_id,token,assignment_signature,"authorization")
+    VALUES (${executionId}::uuid,${randomUUID()}::uuid,${envelope.contentSignature},${JSON.stringify({ kind: "authorized", executionId, contentSignature: envelope.contentSignature })}::jsonb)`);
+  const result = progressiveRemoteEvidenceResult(envelope);
+  result.polars[0].attempts![0].evidence_artifacts = [];
+  result.polars[0].attempts![0].error =
+    "diagnostic with quote ' and backslash \\";
+  const scientific: ProgressiveRemoteReport = {
+    version: 1,
+    solverId,
+    promiseId: base.promiseId,
+    executionId,
+    assignmentSignature: envelope.contentSignature,
+    sequence: sourceSequence,
+    status: {
+      job_id: executionId,
+      state: "running",
+      total_cases: 1,
+      completed_cases: 1,
+    },
+    result,
+    stopProof: null,
+  };
+  const [terminal] =
+    await db.execute(sql`SELECT report->'stopProof' AS proof FROM progressive_worker_reports
+    WHERE sim_job_id=${executionId}::uuid ORDER BY sequence DESC LIMIT 1`);
+  const append = async (
+    sequence: number,
+    input: {
+      nullResult?: boolean;
+      headerState?: "running" | "cancelled";
+      mutate?: (report: ProgressiveRemoteReport) => void;
+    } = {},
+  ) => {
+    const report = structuredClone(scientific);
+    report.sequence = sequence;
+    report.status.state = input.headerState ?? "running";
+    if (input.nullResult) {
+      report.result = null;
+      report.status.completed_cases = 0;
+    }
+    if (input.headerState === "cancelled")
+      report.stopProof = terminal.proof as ProgressiveRemoteReport["stopProof"];
+    input.mutate?.(report);
+    const signature = analysisContentHash(report);
+    await db.execute(sql`INSERT INTO progressive_worker_reports(sim_job_id,sequence,content_signature,report,acknowledged_at)
+      VALUES (${executionId}::uuid,${sequence},${signature},${JSON.stringify(report)}::jsonb,clock_timestamp())`);
+    return { report, signature };
+  };
+  for (let sequence = 3465; sequence <= 3509; sequence++)
+    await append(sequence, {
+      nullResult: sequence < 3473,
+      headerState: sequence === 3509 ? "cancelled" : "running",
+    });
+  await db.execute(
+    sql`UPDATE sim_jobs SET status='cancelled',engine_state='cancelled' WHERE id=${executionId}::uuid`,
+  );
+  expect(
+    await stageProgressiveWorkerEvidence(db, noEngine, executionId, {
+      reportSequence: sourceSequence,
+    }),
+  ).toMatchObject({ kind: "staged", sequence: sourceSequence });
+  const associations = await db.execute(
+    sql`SELECT * FROM progressive_worker_evidence_attempts WHERE sim_job_id=${executionId}::uuid AND sequence=${sourceSequence}`,
+  );
+  expect(associations).toHaveLength(1);
+  for (const point of associations)
+    await db.execute(sql`INSERT INTO progressive_worker_hub_receipts
+    (sim_job_id,sequence,result_attempt_id,point_content_signature,receipt)
+    VALUES (${executionId}::uuid,${sourceSequence},${point.result_attempt_id}::uuid,${point.point_content_signature},'{"kind":"retained-progressive-attempt"}'::jsonb)`);
+  const volume = await mkdtemp(join(tmpdir(), "science-duplicate-volume-"));
+  vi.stubEnv("AIRFOILFOAM_REPORT_VOLUME_DIR", volume);
+  vi.stubEnv("AIRFOILFOAM_DEPLOYMENT_ROLE", "remote-solver");
+  installProgressiveReportArchiveReader({
+    read: (identity) => readStoredWorkerArchiveText(db, identity),
+  });
+  return {
+    ...base,
+    instanceId,
+    solverId,
+    sourceSequence,
+    append,
+    volume,
+    scientific,
+  };
+}
+
+async function fixture(run: (f: Fixture) => Promise<void>) {
+  await withArchiveFixture(
+    client,
+    "worker",
+    async (base) => {
+      const f = await prepare(base);
+      try {
+        await run(f);
+      } finally {
+        await rm(f.volume, { force: true, recursive: true });
+      }
+    },
+    { reportCount: 1, normalized: true },
+  );
+}
+
+async function pageFor(f: Fixture, sequences: number[]) {
+  const rows = await f.db
+    .execute(sql`SELECT r.sequence,r.content_signature,to_jsonb(r.*)::text AS row_text,
+    public.resolve_progressive_report(r.report,r.result_payload_hash)::text AS report_text
+    FROM progressive_worker_reports r WHERE r.sim_job_id=${f.executionId}::uuid
+      AND r.sequence IN (${sql.join(
+        sequences.map((s) => sql`${s}`),
+        sql`,`,
+      )}) ORDER BY r.sequence`);
+  const members: LegacyReportMember[] = [];
+  for (const row of rows) {
+    const sequence = Number(row.sequence),
+      signature = String(row.content_signature);
+    // Warm logical bodies remain SQL-owned. Cold bodies are read through the
+    // installed normal product reader, not interpreted from compact headers.
+    let reportText = String(row.report_text);
+    if (JSON.parse(reportText).archivedReport === true) {
+      const [stored] = await f.db
+        .execute(sql`SELECT b.*,m.report_sha256,m.report_byte_size FROM progressive_report_archive_bundles b
+        JOIN progressive_report_archive_members m ON m.bundle_id=b.id WHERE m.sim_job_id=${f.executionId}::uuid AND m.sequence=${sequence}
+          AND m.source_kind='worker' AND m.member_kind='report'`);
+      reportText = await readStoredWorkerArchiveText(f.db, {
+        sourceKind: "worker",
+        memberKind: "report",
+        executionId: f.executionId,
+        sequence,
+        signature,
+        reportSha256: String(stored.report_sha256),
+        reportByteSize: Number(stored.report_byte_size),
+        bucket: String(stored.bucket),
+        objectKey: String(stored.object_key),
+        generation: String(stored.generation),
+        mimeType: String(stored.mime_type),
+        compression: String(stored.compression),
+        archiveFormat: String(stored.archive_format),
+        storedSha256: String(stored.stored_sha256),
+        storedByteSize: Number(stored.stored_byte_size),
+        crc32c: String(stored.crc32c),
+      });
+    }
+    members.push({
+      kind: "report",
+      executionId: f.executionId,
+      sequence,
+      solverId: f.solverId,
+      contentSignature: signature,
+      rowText: String(row.row_text),
+      rowSha256: hash(String(row.row_text)),
+      reportText,
+      reportSha256: hash(reportText),
+      reportByteSize: Buffer.byteLength(reportText),
+    });
+  }
+  const page = {
+    version: 1 as const,
+    sourceInstance: f.instanceId,
+    solverId: f.solverId,
+    scopeSha256: hash(JSON.stringify([f.executionId, sequences])),
+    members,
+  };
+  const packed = encodeLegacyPage({
+    ...page,
+    start: { execution: 0, kind: "report", after: 0, copied: 0 },
+    next: {
+      execution: 1,
+      kind: "report",
+      after: sequences.at(-1)!,
+      copied: sequences.length,
+    },
+  }).bytes;
+  const crc = new CRC32C();
+  crc.update(packed);
+  const object = {
+    bucket: "duplicate-proof-test",
+    objectKey: `legacy-worker-reports/v1/${f.instanceId}/${f.solverId}/${page.scopeSha256}/${hash(packed)}.jsonl.gz`,
+    generation: "1795114887415319",
+    sha256: hash(packed),
+    byteSize: packed.length,
+    crc32c: crc.toString(),
+    verifiedAt: new Date().toISOString(),
+  };
+  await storeWorkerReportVolume(Readable.from([packed]), {
+    storedSha256: object.sha256,
+    storedByteSize: object.byteSize,
+  });
+  const verify = () =>
+    verifyLegacyReportCustodyPage({
+      page,
+      object,
+      access: {
+        mode: "hub-local-reader",
+        readHubObject: async () => Buffer.from(packed),
+        reader: {
+          readPage: (identity) =>
+            readLegacyWorkerReportArchivePage(f.db, identity),
+        },
+      },
+    });
+  return { proof: await verify(), page, verify };
+}
+const apply = (f: Fixture, page: Awaited<ReturnType<typeof pageFor>>) =>
+  applyLegacyReportCustodyPage(f.db, page.proof, {
+    apply: true,
+    readersReady: true,
+  });
+const range = (a: number, b: number) =>
+  Array.from({ length: b - a + 1 }, (_, i) => a + i);
+
+async function protectedState(f: Fixture) {
+  const state: Record<string, unknown> = {};
+  for (const table of [
+    "results",
+    "result_attempts",
+    "progressive_worker_evidence_receipts",
+    "progressive_worker_evidence_attempts",
+    "progressive_worker_hub_receipts",
+    "progressive_worker_evidence_delivery_claims",
+    "progressive_remote_reports",
+    "progressive_remote_dispatches",
+  ]) {
+    state[table] = await f.db
+      .execute(sql`SELECT to_jsonb(t.*)::text AS row FROM ${sql.identifier(table)} t
+      WHERE t.sim_job_id=${f.executionId}::uuid ORDER BY to_jsonb(t.*)::text`);
+  }
+  state.job = await f.db.execute(
+    sql`SELECT to_jsonb(t.*)::text AS row FROM sim_jobs t WHERE t.id=${f.executionId}::uuid`,
+  );
+  state.promise = await f.db.execute(
+    sql`SELECT to_jsonb(t.*)::text AS row FROM sync_sweep_promises t WHERE t.id=${f.promiseId}::uuid`,
+  );
+  return state;
+}
+
+it("reclaims all 36 original-page duplicates using an already-cold genuinely staged source, preserving scientific identities", async () => {
+  await fixture(async (f) => {
+    await f.append(3464); // Another real report still references this exact shared result.
+    const originalPage = await pageFor(f, range(3465, 3509));
+    const duplicates = range(3473, 3509).filter(
+      (sequence) => sequence !== f.sourceSequence,
+    );
+    const oldMigration = await readFile(
+      new URL(
+        "../migrations/0205_legacy_report_archive_members.sql",
+        import.meta.url,
+      ),
+      "utf8",
+    );
+    const newMigration = await readFile(
+      new URL(
+        "../migrations/0209_reconstructible_worker_report_duplicates.sql",
+        import.meta.url,
+      ),
+      "utf8",
+    );
+    await f.db.execute(
+      sql.raw(
+        oldMigration
+          .slice(
+            oldMigration.indexOf(
+              "CREATE FUNCTION register_legacy_report_archive_custody",
+            ),
+          )
+          .replace(
+            "CREATE FUNCTION register_",
+            "CREATE OR REPLACE FUNCTION register_",
+          ),
+      ),
+    );
+    expect(await apply(f, originalPage)).toMatchObject({
+      receipt: {
+        compactedReports: 9,
+        registeredMembers: 9,
+        skipped: duplicates.map((sequence) =>
+          expect.objectContaining({ sequence, reason: "report_not_staged" }),
+        ),
+      },
+    });
+    // Recreate the actual deployed starting state with the real old function.
+    // No immutability trigger is disabled and no proof row is deleted.
+    expect(
+      await f.db
+        .execute(sql`SELECT sequence FROM progressive_worker_report_science_proofs
+      WHERE sim_job_id=${f.executionId}::uuid`),
+    ).toEqual([]);
+    await f.db.execute(
+      sql.raw(
+        newMigration.slice(
+          newMigration.indexOf(
+            "CREATE OR REPLACE FUNCTION register_legacy_report_archive_custody",
+          ),
+        ),
+      ),
+    );
+    originalPage.proof = await originalPage.verify();
+    const before = await protectedState(f);
+    // Exercise the operator's SQL text entry point with the same original page.
+    const operatorSql = legacyReportCustodySql(originalPage.proof, {
+      apply: true,
+      readersReady: true,
+    });
+    const registration = operatorSql
+      .split("\n")
+      .find((line) => line.startsWith("SELECT public.register_"))!;
+    const [outcome] = await f.db.execute(sql.raw(registration));
+    const receipt = JSON.parse(String(Object.values(outcome)[0]));
+    expect(
+      receipt.changedMembers.map((row: { sequence: number }) => row.sequence),
+    ).toEqual(duplicates);
+    expect({ receipt }).toMatchObject({
+      receipt: {
+        duplicateReports: 36,
+        compactedReports: 36,
+        replayedMembers: 9,
+        registeredBundles: 0,
+        registeredMembers: 36,
+        changedMembers: duplicates.map((sequence) =>
+          expect.objectContaining({
+            sequence,
+            scientificSource: expect.objectContaining({
+              stagedSequence: f.sourceSequence,
+            }),
+          }),
+        ),
+        prunedSharedPayloads: 0,
+        prunedSharedPayloadBytes: 0,
+        skipped: [],
+      },
+    });
+    expect(await protectedState(f)).toEqual(before);
+    for (const member of originalPage.page.members) {
+      const restored = await readProgressiveReport(f.db, {
+        sourceKind: "worker",
+        executionId: f.executionId,
+        sequence: member.sequence,
+        contentSignature: member.contentSignature,
+      });
+      expect(
+        hash(canonicalReportJson(parseReportJson(member.reportText))),
+      ).toBe(member.contentSignature);
+      expect(analysisContentHash(restored)).toBe(member.contentSignature);
+      expect(analysisContentHash(restored.result)).toBe(
+        analysisContentHash(JSON.parse(member.reportText).result),
+      );
+    }
+    expect(await apply(f, originalPage)).toMatchObject({
+      receipt: {
+        compactedReports: 0,
+        replayedMembers: 45,
+        prunedSharedPayloads: 0,
+      },
+    });
+  });
+});
+
+it("revisits earlier pages safely once a later page authenticates the genuine staged source", async () => {
+  await fixture(async (f) => {
+    const early = await pageFor(f, range(3473, 3475));
+    const before = await protectedState(f);
+    expect(await apply(f, early)).toMatchObject({
+      receipt: {
+        compactedReports: 0,
+        skipped: range(3473, 3475).map((sequence) =>
+          expect.objectContaining({ sequence, reason: "report_not_staged" }),
+        ),
+      },
+    });
+    await apply(f, await pageFor(f, [f.sourceSequence]));
+    expect(await apply(f, early)).toMatchObject({
+      receipt: {
+        duplicateReports: 3,
+        compactedReports: 3,
+        prunedSharedPayloads: 0,
+        skipped: [],
+      },
+    });
+    expect(await protectedState(f)).toEqual(before);
+  });
+});
+
+it("keeps a payload across pages and deletes only its known last reference; unrelated unreferenced science stays intact", async () => {
+  await fixture(async (f) => {
+    const [payload] = await f.db.execute(
+      sql`SELECT r.result_payload_hash AS hash,p.byte_size FROM progressive_worker_reports r JOIN progressive_report_result_payloads p ON p.content_hash=r.result_payload_hash WHERE r.sim_job_id=${f.executionId}::uuid AND r.sequence=3473`,
+    );
+    const [orphan] = await f.db.execute(
+      sql`SELECT public.store_progressive_report_result(${JSON.stringify({ unrelated: randomUUID(), polars: [] })}::jsonb) AS hash`,
+    );
+    const before = await protectedState(f);
+    await apply(f, await pageFor(f, [f.sourceSequence]));
+    const remaining = range(3473, 3509).filter((s) => s !== f.sourceSequence);
+    let lastPage: Awaited<ReturnType<typeof pageFor>> | undefined;
+    for (let start = 0; start < remaining.length; start += 7) {
+      lastPage = await pageFor(f, remaining.slice(start, start + 7));
+      const last = start + 7 >= remaining.length;
+      expect(await apply(f, lastPage)).toMatchObject({
+        receipt: {
+          duplicateReports: Math.min(7, remaining.length - start),
+          prunedSharedPayloads: last ? 1 : 0,
+          prunedSharedPayloadBytes: last ? Number(payload.byte_size) : 0,
+          skipped: [],
+        },
+      });
+      expect(
+        await f.db.execute(
+          sql`SELECT content_hash FROM progressive_report_result_payloads WHERE content_hash=${payload.hash}`,
+        ),
+      ).toHaveLength(last ? 0 : 1);
+    }
+    expect(
+      await f.db.execute(
+        sql`SELECT content_hash FROM progressive_report_result_payloads WHERE content_hash=${orphan.hash}`,
+      ),
+    ).toHaveLength(1);
+    expect(await apply(f, lastPage!)).toMatchObject({
+      receipt: { prunedSharedPayloads: 0 },
+    });
+    expect(await protectedState(f)).toEqual(before);
+    // Normal future staging of a cold duplicate reuses the same attempt IDs.
+    const scienceBefore = await f.db.execute(
+      sql`SELECT to_jsonb(t.*)::text AS row FROM result_attempts t WHERE t.sim_job_id=${f.executionId}::uuid ORDER BY t.id`,
+    );
+    expect(
+      await stageProgressiveWorkerEvidence(f.db, noEngine, f.executionId, {
+        reportSequence: remaining[0],
+      }),
+    ).toMatchObject({ kind: "staged" });
+    expect(
+      await f.db.execute(
+        sql`SELECT to_jsonb(t.*)::text AS row FROM result_attempts t WHERE t.sim_job_id=${f.executionId}::uuid ORDER BY t.id`,
+      ),
+    ).toEqual(scienceBefore);
+  });
+});
+
+it.each([
+  "changed-point",
+  "different-result-status",
+  "different-envelope",
+  "different-status-owner",
+  "different-older-shape",
+  "missing-source-attempt",
+  "ambiguous-source-attempt",
+  "no-staged-source",
+] as const)(
+  "retains genuinely different or missing evidence: %s",
+  async (reason) => {
+    await fixture(async (f) => {
+      if (reason !== "no-staged-source")
+        await apply(f, await pageFor(f, [f.sourceSequence]));
+      // New immutable snapshots exercise changes; no stored report/result is edited.
+      const changedSnapshot =
+        reason.startsWith("different") || reason === "changed-point";
+      const candidateSequence = changedSnapshot ? 3510 : 3505;
+      if (changedSnapshot) {
+        // Append below a later real final stop, then preserve closed ownership.
+        await f.append(3510, {
+          mutate: (r) => {
+            if (reason === "changed-point")
+              r.result!.polars[0].attempts![0].cl = 0.4001;
+            if (reason === "different-result-status")
+              r.result!.state = "failed";
+            if (reason === "different-status-owner")
+              r.status.job_id = randomUUID();
+            if (reason === "different-older-shape")
+              Reflect.deleteProperty(r.result!, "polars");
+            if (reason === "different-envelope")
+              (r as unknown as Record<string, unknown>).extraIdentity =
+                "changed";
+          },
+        });
+        await f.append(3511, { headerState: "cancelled" });
+      }
+      if (reason === "missing-source-attempt")
+        await f.db.execute(
+          sql`DELETE FROM progressive_worker_evidence_attempts WHERE sim_job_id=${f.executionId}::uuid AND sequence=${f.sourceSequence}`,
+        );
+      if (reason === "ambiguous-source-attempt")
+        await f.db.execute(sql`INSERT INTO progressive_worker_evidence_attempts
+          (sim_job_id,sequence,result_attempt_id,point_content_signature)
+          SELECT sim_job_id,sequence,${f.attemptId}::uuid,point_content_signature
+          FROM progressive_worker_evidence_attempts WHERE sim_job_id=${f.executionId}::uuid AND sequence=${f.sourceSequence}`);
+      const page = await pageFor(f, [candidateSequence]);
+      const before = await protectedState(f);
+      expect(await apply(f, page)).toMatchObject({
+        receipt: {
+          compactedReports: 0,
+          prunedSharedPayloads: 0,
+          skipped: [expect.objectContaining({ reason: "report_not_staged" })],
+        },
+      });
+      expect(await protectedState(f)).toEqual(before);
+    });
+  },
+);
+
+it("recognizes an inline duplicate through its exact result text", async () => {
+  await fixture(async (f) => {
+    await apply(f, await pageFor(f, [f.sourceSequence]));
+    await f.db.execute(
+      sql`UPDATE progressive_report_storage_policy SET normalization_enabled=false WHERE id=1`,
+    );
+    await f.append(3510, { headerState: "cancelled" });
+    const [row] = await f.db
+      .execute(sql`SELECT result_payload_hash FROM progressive_worker_reports
+      WHERE sim_job_id=${f.executionId}::uuid AND sequence=3510`);
+    expect(row.result_payload_hash).toBeNull();
+    expect(await apply(f, await pageFor(f, [3510]))).toMatchObject({
+      receipt: {
+        compactedReports: 1,
+        duplicateReports: 1,
+        prunedSharedPayloads: 0,
+        skipped: [],
+      },
+    });
+  });
+});
+
+it("honors hub report references and does not prune an unrelated or replay-only unreferenced payload", async () => {
+  await fixture(async (f) => {
+    const [source] = await f.db
+      .execute(sql`SELECT public.resolve_progressive_report(report,result_payload_hash) AS report,result_payload_hash
+      FROM progressive_worker_reports WHERE sim_job_id=${f.executionId}::uuid AND sequence=${f.sourceSequence}`);
+    const hubReport = {
+      ...(source.report as Record<string, unknown>),
+      sequence: 9000,
+    };
+    const [job] = await f.db
+      .execute(sql`SELECT request_payload->'remoteProgressiveExecution' AS envelope
+      FROM sim_jobs WHERE id=${f.executionId}::uuid`);
+    const envelope = job.envelope as ProgressiveRemoteExecutionEnvelope;
+    // A hub reference needs its actual transport ownership graph. This local
+    // fixture adds no scientific result or point and rolls back in full.
+    await f.db
+      .execute(sql`INSERT INTO progressive_remote_dispatches(sim_job_id,promise_id,solver_id,cpu_slots,content_signature,envelope)
+      VALUES (${f.executionId}::uuid,${f.promiseId}::uuid,${f.solverId}::uuid,1,${envelope.contentSignature},${JSON.stringify(envelope)}::jsonb)`);
+    await f.db
+      .execute(sql`INSERT INTO progressive_remote_reports(sim_job_id,sequence,content_signature,report)
+      VALUES (${f.executionId}::uuid,9000,${analysisContentHash(hubReport)},${JSON.stringify(hubReport)}::jsonb)`);
+    const page = await pageFor(f, range(3465, 3509));
+    const before = await protectedState(f);
+    expect(await apply(f, page)).toMatchObject({
+      receipt: {
+        duplicateReports: 36,
+        compactedReports: 45,
+        prunedSharedPayloads: 0,
+      },
+    });
+    expect(
+      await f.db.execute(
+        sql`SELECT content_hash FROM progressive_report_result_payloads WHERE content_hash=${source.result_payload_hash}`,
+      ),
+    ).toHaveLength(1);
+    expect(await protectedState(f)).toEqual(before);
+    expect(await apply(f, page)).toMatchObject({
+      receipt: {
+        compactedReports: 0,
+        replayedMembers: 45,
+        prunedSharedPayloads: 0,
+      },
+    });
+  });
+});
