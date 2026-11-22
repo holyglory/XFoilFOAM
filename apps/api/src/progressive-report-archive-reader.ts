@@ -23,8 +23,9 @@ export async function installApiReportArchiveReader(): Promise<void> {
 }
 
 export async function readProgressiveReportArchive(
-  identity: ProgressiveReportArchiveReadIdentity,
+  identity: ProgressiveReportArchiveReadIdentity & { signal?: AbortSignal },
 ): Promise<string> {
+  identity.signal?.throwIfAborted();
   const configuredBucket = env.evidenceBucket?.trim();
   if (!configuredBucket || identity.bucket !== configuredBucket)
     throw new Error("Progressive report archive bucket is not configured");
@@ -48,6 +49,7 @@ export async function readProgressiveReportArchive(
     },
   });
   const [metadata] = await file.getMetadata();
+  identity.signal?.throwIfAborted();
   const custom = (metadata.metadata ?? {}) as Record<string, unknown>;
   if (
     String(metadata.generation) !== identity.generation ||
@@ -62,5 +64,6 @@ export async function readProgressiveReportArchive(
   return readProgressiveReportArchiveText(
     file.createReadStream({ validation: "crc32c", decompress: false }),
     identity,
+    identity.signal,
   );
 }

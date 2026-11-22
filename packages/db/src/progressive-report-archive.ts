@@ -397,8 +397,10 @@ async function consumeBundle(
     report: ReturnType<typeof reportJsonObject>,
   ) => void | Promise<void>,
   limits: ProgressiveReportArchiveLimits = {},
+  signal?: AbortSignal,
 ): Promise<void> {
   try {
+    signal?.throwIfAborted();
     assertProgressiveReportArchiveIdentity(identity);
     if (
       Object.values(limits).some(
@@ -415,19 +417,23 @@ async function consumeBundle(
   let crc = 0xffffffff;
   const decoder = new BundleDecoder(false, limits.maxReportBytes);
   const utf8 = new TextDecoder("utf-8", { fatal: true });
-  let pending = "";
+  // A physical result can occupy one multi-megabyte JSONL line. Inspect each
+  // decoded chunk once and join its pieces only when the line is complete.
+  const pieces: string[] = [];
   let decodedBytes = 0;
   const accept = async (text: string) => {
-    pending += text;
-    let newline: number;
-    while ((newline = pending.indexOf("\n")) >= 0) {
-      const line = pending.slice(0, newline).replace(/\r$/, "");
-      pending = pending.slice(newline + 1);
+    let start = 0;
+    for (let newline = text.indexOf("\n"); newline !== -1; newline = text.indexOf("\n", start)) {
+      pieces.push(text.slice(start, newline));
+      const line = pieces.join("").replace(/\r$/, "");
+      pieces.length = 0;
+      start = newline + 1;
       if (limits.maxMembers !== undefined && decoder.count >= limits.maxMembers)
         throw new Error("Progressive report archive exceeds its member limit");
       const { entry, report } = decoder.line(line);
       await visit(entry, line, report);
     }
+    if (start < text.length) pieces.push(text.slice(start));
   };
   await pipeline(
     source,
@@ -482,7 +488,7 @@ async function consumeBundle(
       final(callback) {
         const finish = async () => {
           await accept(utf8.decode());
-          if (pending || !decoder.count)
+          if (pieces.length || !decoder.count)
             throw new Error(
               "Truncated or empty progressive report archive JSONL",
             );
@@ -504,6 +510,7 @@ async function consumeBundle(
         );
       },
     }),
+    { signal },
   );
 }
 
@@ -543,6 +550,7 @@ export async function verifyProgressiveReportArchive(
 export async function readProgressiveReportArchiveText(
   source: Readable,
   identity: ProgressiveReportArchiveReadIdentity,
+  signal?: AbortSignal,
 ): Promise<string> {
   if (
     !["remote", "worker"].includes(identity.sourceKind) ||
@@ -575,7 +583,7 @@ export async function readProgressiveReportArchiveText(
         );
       found = entry.reportText;
     }
-  });
+  }, {}, signal);
   if (found === null)
     throw new Error("Progressive report archive member was not found");
   return found;

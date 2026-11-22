@@ -4,7 +4,7 @@ import {
   type ProgressiveReportArchiveReadIdentity,
 } from "@aerodb/db/progressive-report-archive";
 import { createHash, randomUUID } from "node:crypto";
-import { Readable } from "node:stream";
+import { PassThrough, Readable } from "node:stream";
 import { gzipSync } from "node:zlib";
 import { beforeEach, expect, it, vi } from "vitest";
 import { readProgressiveReportArchive } from "../src/progressive-report-archive-reader";
@@ -160,4 +160,25 @@ it("propagates a late GCS stream failure instead of returning parsed data", asyn
   await expect(readProgressiveReportArchive(identity)).rejects.toThrow(
     "fixture GCS read failed",
   );
+});
+
+
+it("stops a pinned object stream at the report deadline and never opens media after a cancelled metadata lookup", async () => {
+  const { identity } = fixture("remote");
+  const controller = new AbortController();
+  const stream = new PassThrough();
+  let opened!: () => void;
+  const started = new Promise<void>((resolve) => { opened = resolve; });
+  gcs.read.mockImplementationOnce(() => { opened(); return stream; });
+  const pending = readProgressiveReportArchive({ ...identity, signal: controller.signal });
+  await started;
+  controller.abort();
+  await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+  expect(stream.destroyed).toBe(true);
+
+  const later = new AbortController();
+  const { metadata } = fixture("remote");
+  gcs.getMetadata.mockImplementationOnce(async () => { later.abort(); return [metadata]; });
+  await expect(readProgressiveReportArchive({ ...identity, signal: later.signal })).rejects.toMatchObject({ name: "AbortError" });
+  expect(gcs.read).toHaveBeenCalledTimes(1);
 });
