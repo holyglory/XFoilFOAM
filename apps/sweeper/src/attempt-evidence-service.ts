@@ -1,4 +1,4 @@
-import { configuredDeploymentRole } from "./config";
+import { hasConfiguredAttemptHubRole } from "@aerodb/db/attempt-evidence-verified-policy";
 import type { DB } from "@aerodb/db/client";
 import {
   attemptEvidenceArchiveCandidates,
@@ -196,7 +196,7 @@ export async function runAttemptEvidenceStorageService(
   const bucket = process.env.AIRFOILFOAM_EVIDENCE_BUCKET?.trim();
   if (
     !bucket ||
-    configuredDeploymentRole() !== "hub" ||
+    !hasConfiguredAttemptHubRole() ||
     process.env.AIRFOILFOAM_ATTEMPT_EVIDENCE_ARCHIVE === "false" ||
     signal.aborted
   )

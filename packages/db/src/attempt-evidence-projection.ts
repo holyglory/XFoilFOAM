@@ -1,4 +1,4 @@
-import { verifiedAttemptCandidatesSql } from "./attempt-evidence-verified-policy";
+import { hasConfiguredAttemptHubRole, requireConfiguredAttemptHubRole, verifiedAttemptCandidatesSql } from "./attempt-evidence-verified-policy";
 import { sql, type SQL } from "drizzle-orm";
 import type { DB } from "./client";
 import {
@@ -542,6 +542,13 @@ export async function shortenAttemptEvidence(
   return db.transaction(async (tx) => {
     await tx.execute(sql`SET LOCAL statement_timeout='5s'`);
     await tx.execute(sql`SET LOCAL lock_timeout='500ms'`);
+    if (!hasConfiguredAttemptHubRole()) {
+      // Match the underlying writer's first SHARE lock. A scoped worker cannot
+      // race a switch to the verified hub policy between this check and commit.
+      const [policy] = await tx.execute(sql`SELECT to_jsonb(p)->>'progressive_source_scope' AS scope
+        FROM attempt_evidence_storage_policy p WHERE p.id=1 FOR SHARE OF p`);
+      if (policy?.scope === "verified") requireConfiguredAttemptHubRole();
+    }
     const [row] = await tx.execute(
       sql`SELECT attempt_evidence_shorten(${attemptId}::uuid,${archiveId}::uuid,${JSON.stringify(verification)}::jsonb) AS measurement`,
     );

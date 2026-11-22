@@ -10,7 +10,19 @@ export const VERIFIED_HUB_ATTEMPT_COHORTS = [
 export type VerifiedHubAttemptCohort =
   (typeof VERIFIED_HUB_ATTEMPT_COHORTS)[number];
 
+export function hasConfiguredAttemptHubRole(): boolean {
+  return process.env.AIRFOILFOAM_DEPLOYMENT_ROLE?.trim() === "hub";
+}
+
+export function requireConfiguredAttemptHubRole() {
+  if (!hasConfiguredAttemptHubRole())
+    throw new Error(
+      "Verified attempts require an explicit hub deployment role. Worker attempts require the HZ custody relay",
+    );
+}
+
 export async function requireVerifiedAttemptHub(db: DB) {
+  requireConfiguredAttemptHubRole();
   const [installed] = await db.execute(
     sql`SELECT to_regprocedure('attempt_evidence_verified_route(uuid,uuid)') IS NOT NULL AS ready`,
   );
