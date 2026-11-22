@@ -182,7 +182,7 @@ const crcTable = Array.from({ length: 256 }, (_, index) => {
     crc = (crc >>> 1) ^ (crc & 1 ? 0x82f63b78 : 0);
   return crc >>> 0;
 });
-function crc32c(bytes: Buffer): string {
+export function crc32c(bytes: Buffer): string {
   let crc = 0xffffffff;
   for (const byte of bytes) crc = crcTable[(crc ^ byte) & 255]! ^ (crc >>> 8);
   const result = Buffer.alloc(4);

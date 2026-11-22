@@ -9,6 +9,8 @@ frame tracks, steady history, attempt payloads, or any progressive report.
 The inventory commands below measure counts and exported JSON sizes against the
 configured database. Retain their outputs in private operation receipts.
 
+For HZ, the controller can migrate force, steady and frame histories and keep an API-readable working copy on the existing results volume. [HZ point history migration](hz-point-history-storage.md)
+
 ## Inventory and consumer map
 
 | Stored data                                                   | Current consumers                                                                                                                                               | Storage behavior                                                                                                  |

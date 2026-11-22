@@ -6,6 +6,8 @@ import {
 } from "@aerodb/db/result-history-storage";
 import type { DB } from "@aerodb/db/client";
 import { env } from "./env";
+import { readHzPointHistory } from "./hz-point-history-reader";
+import type { ResultHistoryEnvelope } from "@aerodb/core/result-history-storage";
 
 let store: ResultHistoryGcsStore | undefined;
 
@@ -19,6 +21,11 @@ export function readStoredResultHistories<T extends ResultHistoryRow>(
     db,
     {
       read(identity) {
+        if (process.env.AIRFOILFOAM_DEPLOYMENT_ROLE === "remote-solver")
+          return readHzPointHistory(
+            db,
+            identity,
+          ) as Promise<ResultHistoryEnvelope>;
         if (
           !env.evidenceBucket ||
           identity.bucket !== env.evidenceBucket.trim()

@@ -189,13 +189,17 @@ export async function offloadResultHistory(
 export async function resultHistoryOffloadCandidates(
   db: DB,
   after: string | null = null,
+  kind?: ResultHistoryKind,
 ) {
   if (after) assertId(after);
+  const inline = kind
+    ? sql`r.${column(kind)} IS NOT NULL AND r.${pointer(kind)} IS NULL`
+    : sql`((r.steady_history IS NOT NULL AND r.steady_history_archive_id IS NULL)
+          OR (r.frame_track IS NOT NULL AND r.frame_track_archive_id IS NULL))`;
   const rows = (await db.execute(sql`
     WITH page AS MATERIALIZED (
       SELECT r.id FROM results r WHERE ${after ? sql`r.id > ${after}::uuid AND` : sql``}
-        ((r.steady_history IS NOT NULL AND r.steady_history_archive_id IS NULL)
-          OR (r.frame_track IS NOT NULL AND r.frame_track_archive_id IS NULL))
+        ${inline}
       ORDER BY r.id LIMIT 32
     )
     SELECT r.id, history.kind, octet_length(history.value::text) AS byte_size,
@@ -205,7 +209,7 @@ export async function resultHistoryOffloadCandidates(
     FROM page JOIN results r ON r.id=page.id
     CROSS JOIN LATERAL (VALUES ('steady_history',r.steady_history,r.steady_history_archive_id),
       ('frame_track',r.frame_track,r.frame_track_archive_id)) history(kind,value,archive_id)
-    WHERE history.archive_id IS NULL
+    WHERE history.archive_id IS NULL ${kind ? sql`AND history.kind = ${kind}` : sql``}
     ORDER BY r.id, history.kind
   `)) as unknown as Array<{
     id: string;
