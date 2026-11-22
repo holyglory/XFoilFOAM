@@ -47,7 +47,7 @@ export function createAttemptEvidenceSettlementDependencies(
 export async function configuredAttemptEvidenceSettlementDependencies(db: DB) {
   const { installApiReportArchiveReader } = await import("../../api/src/progressive-report-archive-reader");
   const { readApiAttemptEvidenceForApp } = await import("../../api/src/attempt-evidence-reader");
-  await installApiReportArchiveReader(db);
+  await installApiReportArchiveReader();
   return createAttemptEvidenceSettlementDependencies(db, request => readApiAttemptEvidenceForApp(db, request));
 }
 
