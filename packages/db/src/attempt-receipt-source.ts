@@ -50,14 +50,27 @@ function idsSql(ids: readonly string[]) {
   );
 }
 
-/** Nullable for inline values. Cold SQL callers compare the result with the
- * independently supplied candidate/CFD digest, never with the compact JSON. */
+/** Use the original 0208 tables so readers can run before 0211 is installed.
+ * 0208 local events have no application digest. 0210 stopped and 0211
+ * scientific events seal it against the owning archive and projection. */
 export function archivedAttemptApplicationSha256Sql(
   attempt: SQL,
 ): SQL<string | null> {
-  return sql`CASE WHEN ${attempt}.evidence_archive_id IS NOT NULL THEN
-    attempt_evidence_archived_application_sha256(${attempt}.id,${attempt}.evidence_archive_id,${attempt}.evidence_storage_event_id)
-    END`;
+  return sql`CASE WHEN ${attempt}.evidence_archive_id IS NOT NULL THEN (
+    SELECT event.verification#>>'{dependencies,applicationSha256}'
+    FROM attempt_evidence_storage_events event
+    JOIN attempt_evidence_archives archive ON archive.id=event.archive_id AND archive.result_attempt_id=event.result_attempt_id
+    JOIN attempt_evidence_history_projections projection ON projection.result_attempt_id=event.result_attempt_id AND projection.archive_id=archive.id
+    WHERE event.id=${attempt}.evidence_storage_event_id AND event.result_attempt_id=${attempt}.id
+      AND event.archive_id=${attempt}.evidence_archive_id AND event.completed AND event.action='shorten'
+      AND archive.result_id IS NOT DISTINCT FROM ${attempt}.result_id
+      AND (${attempt}.sim_job_id IS NULL OR archive.sim_job_id=${attempt}.sim_job_id)
+      AND event.verification#>>'{dependencies,verifier}' IN ('server-consumers/stopped-progressive-rans-v1','server-consumers/receipt-bearing-rans-v1')
+      AND event.verification#>>'{dependencies,sourceSha256}'=archive.source_sha256
+      AND projection.projection->>'sourceSha256'=archive.source_sha256
+      AND (projection.projection->>'sourceByteSize')::bigint=archive.source_byte_size
+      AND event.verification#>>'{dependencies,applicationSha256}' ~ '^[a-f0-9]{64}$'
+  ) END`;
 }
 
 async function sourcePins(db: DB, ids: readonly string[], lock: boolean) {
