@@ -133,33 +133,46 @@ export function legacyResultMemberSql(
     'sequence',sequence,'contentSignature',content_signature,'sha256',result_sha256,'byteSize',result_bytes)`;
   return legacyReadOnlySql(`WITH selected AS MATERIALIZED (${sourceRow(input)}),
   predecessor AS MATERIALIZED (${predecessor}),
-  shared AS MATERIALIZED (SELECT m.*,${shared} AS shared_result FROM selected m),
+  shared AS NOT MATERIALIZED (SELECT m.*,${shared} AS shared_result FROM selected m),
   textual AS MATERIALIZED (
-    SELECT *,row_json::text AS row_text,full_report::text AS report_text,
-      CASE WHEN shared_result THEN NULL::text ELSE (full_report->'result')::text END AS result_text FROM shared
-  ), measured AS MATERIALIZED (
-    SELECT *,octet_length(row_text)::bigint AS row_bytes,octet_length(report_text)::bigint AS report_bytes,
-      CASE WHEN shared_result THEN ${previous?.byteSize ?? 0}::bigint ELSE octet_length(result_text)::bigint END AS result_bytes,
-      encode(sha256(convert_to(row_text,'UTF8')),'hex') AS row_sha256,
-      encode(sha256(convert_to(report_text,'UTF8')),'hex') AS report_sha256,
-      CASE WHEN shared_result THEN ${previous ? `'${previous.sha256}'` : "NULL::text"}
-        ELSE encode(sha256(convert_to(result_text,'UTF8')),'hex') END AS result_sha256 FROM textual
-  ), templates AS MATERIALIZED (
-    SELECT m.*,${reusable} AS reuse,
-      CASE WHEN NOT unavailable AND row_bytes+report_bytes<=${maxBytes} AND jsonb_typeof(full_report->'result')='object'
+    SELECT sim_job_id,sequence,content_signature,solver_id,unavailable,shared_result,
+      row_json::text AS row_text,full_report::text AS report_text,
+      CASE WHEN NOT unavailable AND jsonb_typeof(full_report->'result')='object'
         THEN jsonb_set(full_report,'{result}',to_jsonb('${marker}'::text),false)::text END AS report_template,
-      CASE WHEN NOT unavailable AND row_bytes+report_bytes<=${maxBytes} AND jsonb_typeof(full_report->'result')='object'
-        AND row_is_full
+      CASE WHEN NOT unavailable AND row_is_full AND jsonb_typeof(full_report->'result')='object'
         THEN jsonb_set(row_json,'{report,result}',to_jsonb('${marker}'::text),false)::text END AS row_template
-    FROM measured m
-  ), packet AS MATERIALIZED (
-    SELECT *,jsonb_build_object('kind','${input.kind}','executionId',sim_job_id::text,'sequence',sequence,
-      'contentSignature',content_signature,'solverId',solver_id,'rowSha256',row_sha256,
-      'reportSha256',report_sha256,'reportByteSize',report_bytes) AS metadata,
+    FROM shared
+  ), splits AS NOT MATERIALIZED (
+    SELECT *,octet_length(row_text)::bigint AS row_bytes,octet_length(report_text)::bigint AS report_bytes,
+      left(report_template,strpos(report_template,'${token}')-1) AS report_prefix,
+      substring(report_template FROM strpos(report_template,'${token}')+length('${token}')) AS report_suffix,
+      left(row_template,strpos(row_template,'${token}')-1) AS row_prefix,
+      substring(row_template FROM strpos(row_template,'${token}')+length('${token}')) AS row_suffix
+    FROM textual
+  ), bounds AS NOT MATERIALIZED (
+    SELECT *,
       (report_template IS NOT NULL
         AND length(report_template)-length(replace(report_template,'${token}',''))=length('${token}')
-        AND (row_template IS NULL OR length(row_template)-length(replace(row_template,'${token}',''))=length('${token}'))) AS unambiguous
-    FROM templates
+        AND (row_template IS NULL OR length(row_template)-length(replace(row_template,'${token}',''))=length('${token}'))
+        AND left(report_text,length(report_prefix)) COLLATE "C"=report_prefix COLLATE "C"
+        AND right(report_text,length(report_suffix)) COLLATE "C"=report_suffix COLLATE "C") AS unambiguous
+    FROM splits
+  ), spans AS NOT MATERIALIZED (
+    SELECT *,report_bytes-octet_length(report_prefix)-octet_length(report_suffix) AS result_bytes,
+      CASE WHEN unambiguous AND NOT shared_result THEN substring(report_text FROM length(report_prefix)+1
+        FOR length(report_text)-length(report_prefix)-length(report_suffix)) END AS result_text
+    FROM bounds
+  ), measured AS NOT MATERIALIZED (
+    SELECT *,CASE WHEN shared_result THEN ${previous ? `'${previous.sha256}'` : "NULL::text"}
+      ELSE encode(sha256(convert_to(result_text,'UTF8')),'hex') END AS result_sha256
+    FROM spans
+  ), packet AS NOT MATERIALIZED (
+    SELECT m.*,${reusable} AS reuse,
+      jsonb_build_object('kind','${input.kind}','executionId',sim_job_id::text,'sequence',sequence,
+        'contentSignature',content_signature,'solverId',solver_id,
+        'rowSha256',encode(sha256(convert_to(row_text,'UTF8')),'hex'),
+        'reportSha256',encode(sha256(convert_to(report_text,'UTF8')),'hex'),'reportByteSize',report_bytes) AS metadata
+    FROM measured m
   ) SELECT CASE
     WHEN unavailable OR report_text IS NULL THEN jsonb_build_object('blocked','cold or missing source body requires its existing reader')
     WHEN row_bytes+report_bytes>${maxBytes} THEN jsonb_build_object('blocked','row exceeds remaining byte budget','inputBytes',row_bytes+report_bytes)
@@ -169,10 +182,8 @@ export function legacyResultMemberSql(
       'member',metadata||jsonb_build_object('rowText',NULL,'reportText',NULL),
       'rowByteSize',row_bytes,
       'row',CASE WHEN row_template IS NULL THEN jsonb_build_object('text',row_text)
-        ELSE jsonb_build_object('prefix',left(row_template,strpos(row_template,'${token}')-1),
-          'suffix',substring(row_template FROM strpos(row_template,'${token}')+length('${token}'))) END,
-      'report',jsonb_build_object('prefix',left(report_template,strpos(report_template,'${token}')-1),
-        'suffix',substring(report_template FROM strpos(report_template,'${token}')+length('${token}'))),
+        ELSE jsonb_build_object('prefix',row_prefix,'suffix',row_suffix) END,
+      'report',jsonb_build_object('prefix',report_prefix,'suffix',report_suffix),
       'result',CASE WHEN reuse THEN ${previous ? referenceSql(previous) : "NULL::jsonb"}
         ELSE ${currentReference}||jsonb_build_object('text',result_text) END)
     END::text FROM packet;`);
