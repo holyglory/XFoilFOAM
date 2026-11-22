@@ -50,6 +50,8 @@ vi.mock("../src/db", async (original) => {
   } }) };
 });
 
+import { checkHzHistoryApi } from "./hz-point-history-fixture";
+
 const PREFIX = `api-exact-${process.pid}-${Date.now().toString(36)}`;
 const sha = (value: string): string =>
   createHash("sha256").update(value).digest("hex");
@@ -597,6 +599,10 @@ describe("public exact-generation reads", () => {
       await db.update(forceHistory).set({ t: history.t, cl: history.cl, cd: history.cd, cm: history.cm }).where(eq(forceHistory.id, history.id));
       read.mockRestore();
     }
+  });
+
+  it("HZ point histories preserve selected detail, sync export and missing-copy failure", async () => {
+    await checkHzHistoryApi(app, db, resultId, currentAttemptId, `${PREFIX}-foil`);
   });
 
   it("returns a truthful temporary failure while missing local media is queued for reconstruction", async () => {

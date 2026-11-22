@@ -5810,3 +5810,40 @@ tier = "development"
 timeout_seconds = 120
 command = ["/bin/bash", "-c", "exec /home/holyglory/XFoilFOAM/.venv/bin/python -m pytest tests/test_solver_domain_reset.py -q --junitxml=\"$DEVCOORDINATOR_DIAGNOSTICS_DIR/reset.xml\""]
 diagnostic_sources = [{ format = "junit", path = "reset.xml" }]
+
+[test.hz-point-histories]
+timeout_seconds = 2400
+[test.hz-point-histories.postgres]
+image = "postgres:16-alpine"
+database = "aerodb"
+user = "aerodb"
+[[test.hz-point-histories.check]]
+name = "workspace"
+tier = "development"
+timeout_seconds = 600
+command = ["/usr/bin/corepack", "pnpm", "install", "--frozen-lockfile", "--ignore-scripts", "--offline"]
+[[test.hz-point-histories.check]]
+name = "schema"
+requires = ["workspace"]
+tier = "development"
+timeout_seconds = 300
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "migrate"]
+[[test.hz-point-histories.check]]
+name = "seed"
+tier = "development"
+requires = ["schema"]
+timeout_seconds = 600
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "seed"]
+[[test.hz-point-histories.check]]
+name = "hz-storage"
+tier = "development"
+timeout_seconds = 300
+requires = ["schema"]
+env = { VITEST_PURE_REDUCER_TEST = "1" }
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/hz-point-history-storage.test.ts", "test/hz-point-history-protocol.test.ts"]
+[[test.hz-point-histories.check]]
+name = "hz-api"
+tier = "development"
+requires = ["seed"]
+timeout_seconds = 600
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/api", "exec", "vitest", "run", "test/exact-generation-public.test.ts", "-t", "HZ point histories|serves the same selected coefficients"]
