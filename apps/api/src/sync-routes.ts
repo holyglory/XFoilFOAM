@@ -135,6 +135,7 @@ import { makeEngineClient } from "./engine-client";
 import { mediaStore } from "./media-store";
 import { readStoredForceHistory } from "./solver-history-reader";
 import { readStoredResultHistories } from "./result-history-reader";
+import { readStoredAttemptEvidenceBatch } from "./attempt-evidence-reader";
 import {
   hasArchivedResultHistory,
   resultHistoriesMatch,
@@ -4769,6 +4770,25 @@ export async function importPolarPush(
         }
       : attemptValues;
     if (progressivePoint) incomingResult.simJobId = importedEngineJobId;
+    const attemptIdentity = and(
+      eq(resultAttempts.engineJobId, importedEngineJobId),
+      eq(resultAttempts.aoaDeg, point.aoaDeg),
+      eq(resultAttempts.regime, attemptRegime),
+      sql`${resultAttempts.engineCaseSlug} IS NOT DISTINCT FROM ${point.engineCaseSlug ?? null}`,
+      progressivePoint
+        ? eq(resultAttempts.simJobId, importedEngineJobId)
+        : isNull(resultAttempts.simJobId),
+    );
+    // Restore outside the evidence/publication locks. The locked reread below
+    // must still match this compact source before using its restored body.
+    const preparedAttemptRows = await db.select().from(resultAttempts)
+      .where(attemptIdentity).orderBy(resultAttempts.createdAt, resultAttempts.id);
+    const preparedAttemptBodies = transportedPoint.progressiveArchiveOnly
+      ? preparedAttemptRows
+      : await readStoredAttemptEvidenceBatch(db, preparedAttemptRows);
+    const preparedAttempts = new Map(preparedAttemptRows.map((row, index) => [row.id, {
+      stored: row, full: preparedAttemptBodies[index]!,
+    }]));
     const insertAttemptForResult = async (
       tx: DB,
       resultId: string,
@@ -4777,19 +4797,21 @@ export async function importPolarPush(
       const existingAttempts = await tx
         .select()
         .from(resultAttempts)
-        .where(
-          and(
-            eq(resultAttempts.engineJobId, importedEngineJobId),
-            eq(resultAttempts.aoaDeg, point.aoaDeg),
-            eq(resultAttempts.regime, attemptRegime),
-            sql`${resultAttempts.engineCaseSlug} IS NOT DISTINCT FROM ${point.engineCaseSlug ?? null}`,
-            progressivePoint
-              ? eq(resultAttempts.simJobId, importedEngineJobId)
-              : isNull(resultAttempts.simJobId),
-          ),
-        )
+        .where(attemptIdentity)
         .orderBy(resultAttempts.createdAt, resultAttempts.id);
-      const matchingAttempt = existingAttempts.find(
+      const fullAttempts = archiveOnlyReplay
+        ? existingAttempts
+        : existingAttempts.map((candidate) => {
+            if (!candidate.evidenceArchiveId) return candidate;
+            const prepared = preparedAttempts.get(candidate.id);
+            if (!prepared || prepared.stored.evidenceArchiveId !== candidate.evidenceArchiveId ||
+                prepared.stored.resultId !== candidate.resultId || prepared.stored.simJobId !== candidate.simJobId ||
+                stableHash(comparableRemoteAttempt(prepared.stored as unknown as Record<string, unknown>)) !==
+                  stableHash(comparableRemoteAttempt(candidate as unknown as Record<string, unknown>)))
+              throw new PolarEvidenceBindingError("Stored attempt changed during archive preparation; retry the exact sync request");
+            return { ...candidate, evidencePayload: prepared.full.evidencePayload };
+          });
+      const matchingAttempt = fullAttempts.find(
         (candidate) =>
           candidate.resultId === resultId &&
           (archiveOnlyReplay ||
@@ -4810,7 +4832,7 @@ export async function importPolarPush(
           attempt: { id: matchingAttempt.id },
         };
       }
-      const existingAttempt = existingAttempts[0];
+      const existingAttempt = fullAttempts[0];
       if (existingAttempt && !progressivePoint)
         return { kind: "conflict" as const, attempt: existingAttempt };
       const [attempt] = await tx

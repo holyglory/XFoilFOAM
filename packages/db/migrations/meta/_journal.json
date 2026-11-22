@@ -1457,6 +1457,13 @@
       "when": 1795115576343,
       "tag": "0207_attempt_evidence_archives",
       "breakpoints": true
+    },
+    {
+      "idx": 208,
+      "version": "7",
+      "when": 1795115576344,
+      "tag": "0208_attempt_history_readthrough",
+      "breakpoints": true
     }
   ]
 }

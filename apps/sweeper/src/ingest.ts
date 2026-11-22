@@ -79,6 +79,11 @@ import { promisify } from "node:util";
 
 import { touchHeartbeat } from "./heartbeat";
 import {
+  prepareAttemptPublicationEvidence,
+  publicationAttemptPayload,
+  readSweeperAttemptEvidence,
+} from "./attempt-evidence-consumer-reader";
+import {
   databaseMemberAssociationsSha256,
   manifestMemberSetSha256,
   parseEvidenceManifest,
@@ -1421,7 +1426,9 @@ async function insertResultAttempt(opts: {
     .select({
       id: resultAttempts.id,
       resultId: resultAttempts.resultId,
+      simJobId: resultAttempts.simJobId,
       evidencePayload: resultAttempts.evidencePayload,
+      evidenceArchiveId: resultAttempts.evidenceArchiveId,
     })
     .from(resultAttempts)
     .where(
@@ -1435,7 +1442,12 @@ async function insertResultAttempt(opts: {
     )
     .limit(1);
   if (!existing) return null;
-  const existingPayload = existing.evidencePayload ?? null;
+  // The ingest preparation loop is outside its later publication transactions.
+  // Replays compare the immutable original, never a shortened SQL projection.
+  const hydratedExisting = existing.evidenceArchiveId
+    ? await readSweeperAttemptEvidence(db, existing)
+    : existing;
+  const existingPayload = hydratedExisting.evidencePayload ?? null;
   const exactReplay =
     stableHash(existingPayload) === stableHash(evidencePayload);
   const sameLegacyUnacknowledgedVersion =
@@ -3994,7 +4006,7 @@ export async function repairDefaultMediaForStoredResult(opts: {
     .limit(1);
   if (!result)
     throw new Error(`media-repair result ${opts.resultId} no longer exists`);
-  const [attempt] = await opts.db
+  const [storedAttempt] = await opts.db
     .select()
     .from(resultAttempts)
     .where(
@@ -4004,11 +4016,14 @@ export async function repairDefaultMediaForStoredResult(opts: {
       ),
     )
     .limit(1);
-  if (!attempt) {
+  if (!storedAttempt) {
     throw new Error(
       `media-repair attempt ${opts.resultAttemptId} no longer exists for result ${opts.resultId}`,
     );
   }
+  // Restore before rendering or opening a repair/publication transaction. This
+  // also supports a later explicit repair of an initially unreferenced source.
+  const attempt = await readSweeperAttemptEvidence(opts.db, storedAttempt);
   if (attempt.status !== "done" || attempt.source !== "solved") {
     throw new Error(
       `media-repair attempt ${opts.resultAttemptId} is not done solved evidence`,
@@ -5417,6 +5432,7 @@ async function publishStagedPoints(
   airfoilId: string,
   revisionId: string,
   candidates: StagedPoint[],
+  prepared: Awaited<ReturnType<typeof prepareAttemptPublicationEvidence>>,
 ): Promise<FinalizedPoint[]> {
   const finalized = new Map<string, FinalizedPoint>();
   await refreshPolarCacheForRevision(db, airfoilId, revisionId, {
@@ -5569,7 +5585,7 @@ async function publishStagedPoints(
         });
 
         if (eligible && outranksCurrent) {
-          const payload = candidateAttempt.evidencePayload;
+          const payload = publicationAttemptPayload(candidateAttempt, prepared);
           const [published] = await tx
             .update(results)
             .set({
@@ -5647,6 +5663,7 @@ async function publishStagedPoints(
         }
 
         if (!cell.currentAttemptId) {
+          const payload = publicationAttemptPayload(candidateAttempt, prepared);
           const reasons = candidateClassification?.reasons ?? [];
           const reason = hasManifest
             ? reasons.length
@@ -5687,13 +5704,13 @@ async function publishStagedPoints(
                 candidate.derived.error ?? candidateAttempt.error ?? reason,
               qualityWarnings: candidateAttempt.qualityWarnings,
               frameTrack: payloadField(
-                candidateAttempt.evidencePayload,
+                payload,
                 "frame_track",
                 "frameTrack",
               ),
               fidelity: candidateFidelity,
               steadyHistory: payloadField(
-                candidateAttempt.evidencePayload,
+                payload,
                 "steady_history",
                 "steadyHistory",
               ),
@@ -5748,7 +5765,7 @@ async function publishStagedPoints(
             )
             .limit(1);
           if (selectedAttempt) {
-            const payload = selectedAttempt.evidencePayload;
+            const payload = publicationAttemptPayload(selectedAttempt, prepared);
             const [restored] = await tx
               .update(results)
               .set({
@@ -5843,6 +5860,9 @@ export async function publishRepairedResultAttempt(opts: {
     .limit(1);
   if (!scope?.revisionId) return "waiting";
   const revisionId = scope.revisionId;
+  const prepared = await prepareAttemptPublicationEvidence(opts.db, [
+    opts.resultAttemptId,
+  ]);
 
   return withRepairedProgressiveCfdEvidence(
     opts.db,
@@ -6031,7 +6051,7 @@ export async function publishRepairedResultAttempt(opts: {
               outcome = "rejected";
               return;
             }
-            const payload = attempt.evidencePayload;
+            const payload = publicationAttemptPayload(attempt, prepared);
             const [updated] = await tx
               .update(results)
               .set({
@@ -6451,6 +6471,13 @@ export async function ingestResult(opts: {
 
   const finalizedByResult = new Map<string, FinalizedPoint>();
   for (const [revisionId, candidates] of candidatesByRevision) {
+    const prepared = await prepareAttemptPublicationEvidence(
+      db,
+      candidates.flatMap((candidate) => [
+        candidate.resultAttemptId,
+        candidate.observedCurrentAttemptId,
+      ]),
+    );
     const finalized = await db.transaction(async (transaction) => {
       const connection = transaction as unknown as DB;
       await assertIngestEvidenceScope(connection, {
@@ -6459,7 +6486,7 @@ export async function ingestResult(opts: {
         result,
         remoteProgressiveReportSequence: opts.remoteProgressiveReportSequence,
       });
-      return publishStagedPoints(connection, airfoilId, revisionId, candidates);
+      return publishStagedPoints(connection, airfoilId, revisionId, candidates, prepared);
     });
     for (const row of finalized) finalizedByResult.set(row.resultId, row);
   }

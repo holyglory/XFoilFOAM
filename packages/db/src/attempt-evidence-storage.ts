@@ -12,6 +12,16 @@ export const MAX_ATTEMPT_EVIDENCE_BYTES = 32 * 1024 ** 2;
 export const ATTEMPT_EVIDENCE_INLINE_REQUIRED =
   "sql-classification-and-immutable-payload-signatures" as const;
 
+/** Resolve the actual relation on this connection's search path. A copied
+ * 0207 table may coexist with 0208 tables in another schema during upgrades. */
+export async function hasAttemptEvidenceStoragePointer(
+  db: DB,
+): Promise<boolean> {
+  const [row] = await db.execute(sql`SELECT EXISTS(SELECT 1 FROM pg_attribute
+    WHERE attrelid=to_regclass('result_attempts') AND attname='evidence_archive_id' AND NOT attisdropped) AS ready`);
+  return row?.ready === true;
+}
+
 export interface AttemptEvidenceAuditOptions {
   after?: string;
   limit?: number;
@@ -217,12 +227,16 @@ export async function loadSettledAttemptEvidenceCopy(
     await tx.execute(sql`SET TRANSACTION READ ONLY`);
     await tx.execute(sql`SET LOCAL statement_timeout='5s'`);
     await tx.execute(sql`SET LOCAL lock_timeout='500ms'`);
+    const hasPointer = await hasAttemptEvidenceStoragePointer(
+      tx as unknown as DB,
+    );
     const [row] = await tx.execute(sql`
       SELECT a.id AS "attemptId",a.result_id AS "resultId",a.sim_job_id AS "simJobId",
         CASE WHEN octet_length(a.evidence_payload::text) <= ${MAX_ATTEMPT_EVIDENCE_BYTES}
           THEN a.evidence_payload::text END AS "payloadText"
       FROM result_attempts a LEFT JOIN sim_jobs job ON job.id=a.sim_job_id
       WHERE a.id=${attemptId}::uuid AND a.status IN ('done','failed') AND jsonb_typeof(a.evidence_payload)='object'
+        ${hasPointer ? sql`AND a.evidence_archive_id IS NULL` : sql``}
         AND (a.sim_job_id IS NULL OR (job.id IS NOT NULL AND job.status IN ('done','failed','cancelled')
           AND job."ingestedAt" IS NOT NULL AND (job.ingest_lease_token IS NULL OR job.ingest_lease_expires_at <= clock_timestamp())))`);
     if (!row || typeof row.payloadText !== "string")

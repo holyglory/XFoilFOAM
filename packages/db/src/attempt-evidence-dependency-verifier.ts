@@ -1,0 +1,236 @@
+import { buildPolarFit, classifyPolarEvidence } from "@aerodb/core";
+import { sql } from "drizzle-orm";
+import type { DB } from "./client";
+import { canonicalAnalysisJson } from "./analysis-target";
+import {
+  attemptEvidenceColdCohortSql,
+  projectAttemptEvidenceForConsumers,
+} from "./attempt-evidence-consumers";
+import type { AttemptEvidenceArchiveReader } from "./attempt-evidence-reader";
+import type {
+  AttemptEvidenceDependencyVerifier,
+  AttemptEvidenceDependencyProof,
+} from "./attempt-evidence-projection";
+import { readPolarAttemptEvidenceForConsumerProof } from "./polar-cache";
+import {
+  canonicalReportJson,
+  parseReportJson,
+  reportTextIdentity,
+} from "./progressive-report-archive";
+
+export const ATTEMPT_SERVER_CONSUMER_VERIFIER =
+  "server-consumers/local-steady-rans-v1";
+
+function requireProof(value: unknown, reason: string): asserts value {
+  if (!value)
+    throw new Error(`Attempt evidence dependency proof refused: ${reason}`);
+}
+
+function forcePresent(
+  payload: Record<string, unknown>,
+  facts: Map<string, number>,
+): boolean {
+  const parent =
+    payload.force_history !== null && payload.force_history !== undefined
+      ? "force_history"
+      : "forceHistory";
+  const raw = payload[parent];
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return false;
+  const object = raw as Record<string, unknown>;
+  return ["t", "cl", "cd"].every((child) =>
+    Object.hasOwn(object, child)
+      ? Array.isArray(object[child]) && object[child].length > 0
+      : (facts.get(JSON.stringify([parent, child])) ?? 0) > 0,
+  );
+}
+
+function normalizedHistory(
+  payload: Record<string, unknown>,
+  snake: string,
+  camel: string,
+) {
+  return payload[snake] !== null && payload[snake] !== undefined
+    ? payload[snake]
+    : (payload[camel] ?? null);
+}
+
+function decisions(classified: ReturnType<typeof classifyPolarEvidence>) {
+  return {
+    lowAoaFailure: classified.lowAoaFailure,
+    needsUransAoas: classified.needsUransAoas,
+    hardRejectedAoas: classified.hardRejectedAoas,
+    classifications: classified.classifications.map((entry) => ({
+      attemptId: (entry.evidence as { resultAttemptId?: string | null })
+        .resultAttemptId,
+      state: entry.state,
+      reasons: entry.reasons,
+      region: entry.region,
+      confidence: entry.confidence,
+    })),
+    fit: buildPolarFit(classified.classifications),
+  };
+}
+
+/** Actual archive access happens BEFORE the bounded read-only SQL snapshot.
+ * This verifier never updates a verdict, curve, attempt or scheduling owner.
+ * The writer must repeat attemptEvidenceColdCohortSql in its final locked CAS. */
+export function createAttemptServerDependencyVerifier(
+  db: DB,
+  reader: AttemptEvidenceArchiveReader,
+): AttemptEvidenceDependencyVerifier {
+  return async (input): Promise<AttemptEvidenceDependencyProof> => {
+    const { attemptId, archive, preview, originalPayloadText } = input;
+    const projection = preview.projection;
+    const source = reportTextIdentity(originalPayloadText);
+    requireProof(
+      attemptId === archive.attemptId &&
+        source.sha256 === archive.sourceSha256 &&
+        source.byteSize === archive.sourceByteSize,
+      "original source/catalog identity changed",
+    );
+    requireProof(
+      projection.version === 1 &&
+        projection.attemptId === attemptId &&
+        projection.archiveId === archive.id &&
+        projection.sourceSha256 === source.sha256 &&
+        projection.sourceByteSize === source.byteSize,
+      "projection identifies another source",
+    );
+    requireProof(
+      reportTextIdentity(preview.compactPayloadText).sha256 ===
+        projection.compactSha256,
+      "compact representation fingerprint changed",
+    );
+    const expected = projectAttemptEvidenceForConsumers(
+      originalPayloadText,
+      projection.removedPaths,
+    );
+    requireProof(
+      expected.arrayFacts.length > 0 &&
+        expected.arrayFacts.length === projection.removedPaths.length,
+      "only actual inventoried array leaves may be removed",
+    );
+    requireProof(
+      canonicalReportJson(parseReportJson(expected.projectionText)) ===
+        canonicalReportJson(parseReportJson(preview.compactPayloadText)),
+      "scalar, certificate, unknown field, null or presence semantics changed",
+    );
+    const lengths = new Map<string, number>();
+    for (const fact of expected.arrayFacts) {
+      const value = projection.values[JSON.stringify(fact.path)];
+      requireProof(
+        value &&
+          JSON.stringify(value.path) === JSON.stringify(fact.path) &&
+          value.present === true &&
+          value.jsonType === "array" &&
+          value.length === fact.length &&
+          value.byteSize === fact.byteSize &&
+          value.sourceSha256 === fact.sha256,
+        "original array type, count or exact content facts changed",
+      );
+      lengths.set(JSON.stringify(fact.path), fact.length);
+    }
+    const restored = await reader.read(archive, AbortSignal.timeout(30_000));
+    requireProof(
+      restored.attemptId === attemptId &&
+        restored.resultId === archive.resultId &&
+        restored.simJobId === archive.simJobId &&
+        restored.payloadText === originalPayloadText,
+      "archive read did not restore the exact original owner and PG text",
+    );
+
+    return db.transaction(async (rawTx) => {
+      const tx = rawTx as unknown as DB;
+      await tx.execute(sql`SET TRANSACTION READ ONLY`);
+      await tx.execute(sql`SET LOCAL statement_timeout='5s'`);
+      await tx.execute(sql`SET LOCAL lock_timeout='500ms'`);
+      const [row] =
+        await tx.execute(sql`SELECT a.result_id,a.sim_job_id,a.airfoil_id,a.simulation_preset_revision_id,
+        ${attemptEvidenceColdCohortSql(sql`a`)} AS eligible,
+        CASE WHEN octet_length(a.evidence_payload::text)<=33554432 THEN
+          attempt_evidence_make_projection(a.evidence_payload,a.id,${archive.id}::uuid)
+            IS NOT DISTINCT FROM ${JSON.stringify(projection)}::jsonb END AS projection_verified,
+        CASE WHEN octet_length(a.evidence_payload::text)<=33554432 THEN
+          attempt_evidence_compact(a.evidence_payload) IS NOT DISTINCT FROM ${preview.compactPayloadText}::jsonb END AS compact_verified,
+        CASE WHEN octet_length(a.evidence_payload::text)<=33554432 THEN a.evidence_payload::text END AS payload_text
+        FROM result_attempts a WHERE a.id=${attemptId}::uuid`);
+      requireProof(
+        row?.eligible === true &&
+          row.result_id === archive.resultId &&
+          row.sim_job_id === archive.simJobId &&
+          row.payload_text === originalPayloadText,
+        "source is open, selected, replay-sensitive, referenced or changed",
+      );
+      requireProof(
+        row.projection_verified === true && row.compact_verified === true,
+        "immutable SQL equality/presence/value-hash projection differs from the original",
+      );
+      requireProof(
+        typeof row.simulation_preset_revision_id === "string" &&
+          typeof row.airfoil_id === "string" &&
+          typeof row.sim_job_id === "string",
+        "scientific setup/job scope is missing",
+      );
+      const before = await readPolarAttemptEvidenceForConsumerProof(
+        tx,
+        row.airfoil_id,
+        row.simulation_preset_revision_id,
+        row.sim_job_id,
+      );
+      requireProof(
+        before.filter((point) => point.resultAttemptId === attemptId).length ===
+          1,
+        "scientific source job does not contain the exact attempt once",
+      );
+      const original = JSON.parse(originalPayloadText) as Record<
+        string,
+        unknown
+      >;
+      const compact = JSON.parse(preview.compactPayloadText) as Record<
+        string,
+        unknown
+      >;
+      const hasForceHistory = forcePresent(compact, lengths);
+      requireProof(
+        forcePresent(original, new Map()) === hasForceHistory,
+        "force-history existence changed",
+      );
+      const after = before.map((point) =>
+        point.resultAttemptId !== attemptId
+          ? point
+          : {
+              ...point,
+              hasForceHistory,
+              frameTrack: normalizedHistory(
+                compact,
+                "frame_track",
+                "frameTrack",
+              ) as typeof point.frameTrack,
+              steadyHistory: normalizedHistory(
+                compact,
+                "steady_history",
+                "steadyHistory",
+              ) as typeof point.steadyHistory,
+            },
+      );
+      const originalDecision = decisions(classifyPolarEvidence(before));
+      const projectedDecision = decisions(classifyPolarEvidence(after));
+      requireProof(
+        canonicalAnalysisJson(originalDecision) ===
+          canonicalAnalysisJson(projectedDecision),
+        "job-scoped classification, promotion or fitted polar changed",
+      );
+      return {
+        contractVersion: 1,
+        attemptId,
+        archiveId: archive.id,
+        sourceSha256: archive.sourceSha256,
+        classificationEquivalent: true,
+        equalityEquivalent: true,
+        scientificEquivalent: true,
+        readDependenciesSatisfied: true,
+        verifier: ATTEMPT_SERVER_CONSUMER_VERIFIER,
+      };
+    });
+  };
+}

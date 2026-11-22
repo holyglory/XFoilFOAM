@@ -40,6 +40,7 @@ import { and, desc, eq, inArray, isNull, sql } from "drizzle-orm";
 import { db } from "../db";
 import { mediaStore, resultMediaUrl } from "../media-store";
 import { readStoredForceHistory } from "../solver-history-reader";
+import { readStoredAttemptEvidence } from "../attempt-evidence-reader";
 
 type ReviewDisclosure = {
   verdict: "exclude";
@@ -680,7 +681,7 @@ export async function assembleSim(
     return solvedDetail(
       a.name,
       selected.reynolds,
-      selectedResultProjection(selected.result, selected.attempt),
+      selectedResultProjection(selected.result, await readStoredAttemptEvidence(db, selected.attempt)),
       {
         method: selected.attempt.regime === "urans" ? "URANS" : "RANS",
         classification: selected.classification,
@@ -724,7 +725,7 @@ export async function assembleSim(
       )
       .limit(1);
     if (!selected) return null;
-    const r = selectedResultProjection(selected.result, selected.attempt);
+    const r = selectedResultProjection(selected.result, await readStoredAttemptEvidence(db, selected.attempt));
     const effectiveRe = r.reynolds ?? selected.revisionReynolds ?? re;
     if (!finiteStored(effectiveRe) || effectiveRe <= 0) return null;
     return solvedDetail(a.name, effectiveRe, r);
@@ -797,17 +798,16 @@ export async function assembleSim(
           ),
         );
       const candidates = selectedRows
-        .map(({ result, attempt }) => selectedResultProjection(result, attempt))
-        .map((row) => {
+        .map(({ result, attempt }) => {
           const effectiveRe =
-            row.reynolds ??
-            (row.simulationPresetRevisionId
-              ? reByRevision.get(row.simulationPresetRevisionId)
+            result.reynolds ??
+            (result.simulationPresetRevisionId
+              ? reByRevision.get(result.simulationPresetRevisionId)
               : null);
-          return effectiveRe ? { row, effectiveRe } : null;
+          return effectiveRe ? { result, attempt, effectiveRe } : null;
         })
         .filter(
-          (candidate): candidate is { row: Result; effectiveRe: number } =>
+          (candidate): candidate is { result: Result; attempt: typeof resultAttempts.$inferSelect; effectiveRe: number } =>
             candidate !== null,
         )
         .sort(
@@ -819,7 +819,8 @@ export async function assembleSim(
         match &&
         Math.abs(match.effectiveRe - re) <= Math.max(1000, Math.abs(re) * 0.02)
       ) {
-        return solvedDetail(a.name, match.effectiveRe, match.row);
+        const fullAttempt = await readStoredAttemptEvidence(db, match.attempt);
+        return solvedDetail(a.name, match.effectiveRe, selectedResultProjection(match.result, fullAttempt));
       }
     }
   }
@@ -869,7 +870,7 @@ export async function assembleAdminSim(
     .where(eq(results.id, resultId))
     .limit(1);
   if (!selected) return null;
-  const projected = selectedResultProjection(selected.result, selected.attempt);
+  const projected = selectedResultProjection(selected.result, await readStoredAttemptEvidence(db, selected.attempt));
   const effectiveRe = projected.reynolds ?? selected.revisionReynolds;
   if (!finiteStored(effectiveRe) || effectiveRe <= 0) return null;
   return solvedDetail(selected.airfoilName, effectiveRe, projected);

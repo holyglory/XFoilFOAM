@@ -10,6 +10,7 @@ import {
 } from "@aerodb/core";
 
 import type { DB } from "./client";
+import { attemptEvidenceArrayLengthSql } from "./attempt-evidence-consumers";
 import {
   exactValidSolverManifestSql,
   exactVerifiedRestartableEvidenceArchiveSql,
@@ -2473,16 +2474,16 @@ export async function settlePrecalcObligationsForJobInTransaction(
         engineCaseSlug: resultAttempts.engineCaseSlug,
         qualityWarnings: resultAttempts.qualityWarnings,
         evidencePayload: resultAttempts.evidencePayload,
-        forceSampleCount: sql<number | null>`CASE
-          WHEN jsonb_typeof(${resultAttempts.evidencePayload} -> 'force_history' -> 't') = 'array'
-          THEN jsonb_array_length(${resultAttempts.evidencePayload} -> 'force_history' -> 't')
-          ELSE NULL
-        END`,
-        fieldFrameCount: sql<number | null>`CASE
-          WHEN jsonb_typeof(${resultAttempts.evidencePayload} -> 'frame_track' -> 'frames') = 'array'
-          THEN jsonb_array_length(${resultAttempts.evidencePayload} -> 'frame_track' -> 'frames')
-          ELSE NULL
-        END`,
+        forceSampleCount: attemptEvidenceArrayLengthSql(
+          sql`result_attempts`,
+          ["force_history", "t"],
+          sql`attempt_history_projection.projection`,
+        ),
+        fieldFrameCount: attemptEvidenceArrayLengthSql(
+          sql`result_attempts`,
+          ["frame_track", "frames"],
+          sql`attempt_history_projection.projection`,
+        ),
         solverImplementationId: resultAttempts.solverImplementationId,
         fidelity: sql<
           string | null
@@ -2538,6 +2539,11 @@ export async function settlePrecalcObligationsForJobInTransaction(
         ), false)`,
       })
       .from(resultAttempts)
+      .leftJoin(
+        sql`attempt_evidence_history_projections attempt_history_projection`,
+        sql`attempt_history_projection.result_attempt_id=${resultAttempts.id}
+          AND attempt_history_projection.archive_id=${resultAttempts}.evidence_archive_id`,
+      )
       .leftJoin(
         resultClassifications,
         eq(resultClassifications.resultAttemptId, resultAttempts.id),

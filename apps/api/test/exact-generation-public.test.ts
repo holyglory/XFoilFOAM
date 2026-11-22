@@ -37,6 +37,18 @@ import { loadSolverHistorySource } from "@aerodb/db/solver-history-storage";
 import { decodeSolverHistory, encodeSolverHistory, type SolverHistoryArchiveIdentity } from "@aerodb/core/solver-history-storage";
 import { SolverHistoryGcsStore } from "@aerodb/core/solver-history-gcs";
 import { archiveSolverHistory } from "../../sweeper/src/solver-history-archive";
+import type { DB } from "@aerodb/db/client";
+import { verifyAttemptEvidenceApiAccess, verifyAttemptEvidenceApiReadthrough } from "./attempt-evidence-readthrough-fixture";
+
+const attemptReadScope = vi.hoisted(() => ({ connection: null as DB | null }));
+vi.mock("../src/db", async (original) => {
+  const actual = await original<typeof import("../src/db")>();
+  return { ...actual, db: new Proxy(actual.db, { get(target, property) {
+    const connection = attemptReadScope.connection ?? target;
+    const value = Reflect.get(connection, property);
+    return typeof value === "function" ? value.bind(connection) : value;
+  } }) };
+});
 
 const PREFIX = `api-exact-${process.pid}-${Date.now().toString(36)}`;
 const sha = (value: string): string =>
@@ -439,6 +451,15 @@ afterAll(async () => {
 });
 
 describe("public exact-generation reads", () => {
+  it("keeps canonical attempt archive reads within configured access and leaves HZ unavailable", async () => {
+    await verifyAttemptEvidenceApiAccess();
+  });
+  it("preserves accepted/provisional public science and original admin evidence through exact attempt archive read-through", async () => {
+    await verifyAttemptEvidenceApiReadthrough({ db, app, resultId, selectedAttemptId: currentAttemptId,
+      originalAttemptId: oldAttemptId, slug: `${PREFIX}-foil`, revisionId,
+      setConnection: (connection) => { attemptReadScope.connection = connection; },
+    });
+  });
   it("serves media, evidence, custom renders, fields, coefficients and history only from the selected attempt", async () => {
     const media = await app.inject({
       method: "GET",

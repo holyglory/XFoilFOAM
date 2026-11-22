@@ -20,6 +20,7 @@ import { alias } from "drizzle-orm/pg-core";
 import { createHash } from "node:crypto";
 
 import type { DB } from "./client";
+import { attemptEvidenceHasForceHistorySql } from "./attempt-evidence-consumers";
 import {
   progressiveParentRevisionIds,
   supersedeProgressivePriorEvidence,
@@ -109,20 +110,12 @@ export interface PolarCacheRefreshHooks {
 /** Attempt force history is immutable evidence inside the exact attempt
  * payload. Accept both engine snake_case and normalized camelCase envelopes,
  * but fail closed on placeholders, JSON null, or empty coefficient arrays. */
-function hasAttemptForceHistory(payload: SQL): SQL<boolean> {
-  const normalized = sql`COALESCE(
-    NULLIF(${payload} -> 'force_history', 'null'::jsonb),
-    ${payload} -> 'forceHistory'
-  )`;
-  return sql<boolean>`(
-    jsonb_typeof(${normalized}) = 'object'
-    AND jsonb_typeof((${normalized}) -> 't') = 'array'
-    AND jsonb_typeof((${normalized}) -> 'cl') = 'array'
-    AND jsonb_typeof((${normalized}) -> 'cd') = 'array'
-    AND jsonb_array_length((${normalized}) -> 't') > 0
-    AND jsonb_array_length((${normalized}) -> 'cl') > 0
-    AND jsonb_array_length((${normalized}) -> 'cd') > 0
-  )`;
+function hasAttemptForceHistory(
+  payload: SQL,
+  attempt: SQL,
+  projection: SQL,
+): SQL<boolean> {
+  return attemptEvidenceHasForceHistorySql(payload, attempt, projection);
 }
 
 function toEvidence(row: {
@@ -298,6 +291,8 @@ async function loadResultEvidence(
 ): Promise<EvidenceWithDbIds[]> {
   const currentAttemptForce = hasAttemptForceHistory(
     sql.raw('"current_attempt"."evidence_payload"'),
+    sql.raw('"current_attempt"'),
+    sql`current_attempt_projection.projection`,
   );
   // A selected archive interpretation is usable only when all ownership
   // links agree *and* its archive is still the current generation for this
@@ -408,6 +403,9 @@ async function loadResultEvidence(
         WHEN "results"."current_result_attempt_id" IS NOT NULL THEN EXISTS (
           SELECT 1
           FROM ${resultAttempts} current_attempt
+          LEFT JOIN attempt_evidence_history_projections current_attempt_projection
+            ON current_attempt_projection.result_attempt_id=current_attempt.id
+              AND current_attempt_projection.archive_id=current_attempt.evidence_archive_id
           WHERE current_attempt.id = "results"."current_result_attempt_id"
             AND current_attempt.result_id = "results"."id"
             AND ${currentAttemptForce}
@@ -577,11 +575,14 @@ async function loadAttemptEvidence(
   simulationPresetRevisionId: string,
   points: readonly Point[],
   simJobId?: string,
+  rowLimit?: number,
 ): Promise<EvidenceWithDbIds[]> {
   const exactAttemptForce = hasAttemptForceHistory(
     sql.raw('"result_attempts"."evidence_payload"'),
+    sql.raw('"result_attempts"'),
+    sql`attempt_history_projection.projection`,
   );
-  const rows = await db
+  const query = db
     .select({
       id: resultAttempts.resultId,
       attemptId: resultAttempts.id,
@@ -670,6 +671,11 @@ async function loadAttemptEvidence(
       qualityWarnings: resultAttempts.qualityWarnings,
     })
     .from(resultAttempts)
+    .leftJoin(
+      sql`attempt_evidence_history_projections attempt_history_projection`,
+      sql`attempt_history_projection.result_attempt_id=${resultAttempts.id}
+        AND attempt_history_projection.archive_id=${resultAttempts}.evidence_archive_id`,
+    )
     .where(
       and(
         eq(resultAttempts.airfoilId, airfoilId),
@@ -680,7 +686,38 @@ async function loadAttemptEvidence(
         simJobId ? eq(resultAttempts.simJobId, simJobId) : undefined,
       ),
     );
+  const rows = await (rowLimit === undefined ? query : query.limit(rowLimit));
   return sourceAwareEvidence(db, airfoilId, points, rows);
+}
+
+/** Read-only bounded inputs for the cold-storage dependency verifier. This is
+ * the same source projection used by job-scoped production classification. */
+export async function readPolarAttemptEvidenceForConsumerProof(
+  db: DB,
+  airfoilId: string,
+  revisionId: string,
+  simJobId: string,
+): Promise<EvidenceWithDbIds[]> {
+  const [airfoil] = await db
+    .select({ points: airfoils.points })
+    .from(airfoils)
+    .where(eq(airfoils.id, airfoilId))
+    .limit(1);
+  if (!airfoil)
+    throw new Error("Attempt scientific source geometry is missing");
+  const rows = await loadAttemptEvidence(
+    db,
+    airfoilId,
+    revisionId,
+    airfoil.points,
+    simJobId,
+    257,
+  );
+  if (rows.length > 256)
+    throw new Error(
+      "Attempt scientific dependency proof exceeds its bounded source job",
+    );
+  return rows;
 }
 
 export async function refreshPolarClassificationsForJob(

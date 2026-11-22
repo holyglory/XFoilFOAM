@@ -6,23 +6,18 @@ including point metadata, coefficients, artifact descriptors, certificates and
 history arrays. PostgreSQL retains the original point and an independent archive
 receipt. References never replace numeric arrays or masquerade as solver samples.
 
-The existing classifiers, fitters and replay APIs continue reading the same
-online point. They hash complete payloads and validate actual coordinate/channel
-arrays. GCS retention therefore does not currently reclaim PostgreSQL payload
-bytes; `onlineBytesRemoved` is zero. It establishes verified remote custody and
-exact restoration without changing physical acceptance or result identity.
+Migration 0207 establishes GCS custody. Its copy commands retain the full
+PostgreSQL point and report zero online bytes removed. After migration 0208,
+eligible histories can be shortened through the [settlement procedure](attempt-evidence-settlement.md).
+The stable attempt ID continues to resolve the original point.
 
-## Online bytes retained by this release
+## Online storage measurements
 
-The original live `result_attempts.evidence_payload` remains the classification
-source after archival. Its exact text, stored JSONB bytes and history arrays are
-retained. This release removes **zero per-attempt online payload bytes**.
-
-`onlineStoredPayloadBytes` measures the currently stored JSONB values; it is not
-the total relation allocation. `sourceTextBytes` and `historyBytes` measure
-logical UTF-8 JSON text. GCS object sizes and reductions in
-`remainingGcsSourceBytes` do not represent PostgreSQL savings. A successful copy
-reduces the remote-custody backlog while leaving the online-byte counters intact.
+Use `onlineStoredPayloadBytes` for PostgreSQL value storage and `sourceTextBytes`
+and `historyBytes` for logical UTF-8 JSON text. Use `shortening-status` to read
+the measured reduction for active shortened attempts. `remainingGcsSourceBytes`
+measures the outstanding copy workload. Record the measurement time alongside
+each counter.
 
 For an individual attempt, bind the stable UUID as the `psql` variable
 `attempt_id` and measure the existing value without exporting its contents:
@@ -169,6 +164,5 @@ The regression also compares the complete live payload and per-attempt stored
 and logical byte counts before and after upload/replay, requires unchanged
 online/history totals, and requires the bounded backfill to copy a real source.
 
-Removing online histories requires a separate representation transition with
-read-through for every full-point consumer and equivalent SQL validity/equality
-proofs. Raw array markers or compact metadata alone cannot satisfy those checks.
+The settlement integration suite exercises the subsequent SQL transition,
+scientific dependency verification, exact replay and inline restoration.

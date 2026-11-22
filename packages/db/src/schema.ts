@@ -1202,6 +1202,9 @@ export const resultAttempts = pgTable(
      *  attempts (no backfill; absence is shown as absence). */
     qualityWarnings: text("quality_warnings").array(),
     evidencePayload: jsonb("evidence_payload"),
+    /** 0208 exact original and immutable representation-event pointers. */
+    evidenceArchiveId: uuid("evidence_archive_id"),
+    evidenceStorageEventId: uuid("evidence_storage_event_id"),
     solvedAt: ts(),
     createdAt: ts().notNull().defaultNow(),
   },
@@ -3780,6 +3783,125 @@ export const resultHistoryArchives = pgTable("result_history_archives", {
   generationCheck: check("result_history_archives_generation_check", sql`${t.generation} ~ '^[1-9][0-9]{0,19}$'`),
   crc32cCheck: check("result_history_archives_crc32c_check", sql`${t.crc32c} ~ '^[A-Za-z0-9+/]{6}==$'`),
 }));
+
+// Attempt-history storage keeps the complete PG JSONB source in immutable GCS
+// and leaves a compact SQL projection online only after 0208's consumer proof.
+export const attemptEvidenceArchives = pgTable(
+  "attempt_evidence_archives",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    sourceInstance: text("source_instance").notNull(),
+    resultAttemptId: uuid("result_attempt_id")
+      .notNull()
+      .references(() => resultAttempts.id, { onDelete: "cascade" }),
+    resultId: uuid("result_id"),
+    simJobId: uuid("sim_job_id"),
+    sourceSha256: text("source_sha256").notNull(),
+    sourceByteSize: bigint("source_byte_size", { mode: "number" }).notNull(),
+    historySeries: jsonb("history_series")
+      .notNull()
+      .$type<Array<Record<string, unknown>>>(),
+    historyByteSize: bigint("history_byte_size", { mode: "number" }).notNull(),
+    envelopeSha256: text("envelope_sha256").notNull(),
+    envelopeByteSize: bigint("envelope_byte_size", {
+      mode: "number",
+    }).notNull(),
+    storedSha256: text("stored_sha256").notNull(),
+    storedByteSize: bigint("stored_byte_size", { mode: "number" }).notNull(),
+    bucket: text("bucket").notNull(),
+    objectKey: text("object_key").notNull(),
+    generation: text("generation").notNull(),
+    crc32c: text("crc32c").notNull(),
+    verifiedAt: timestamp("verified_at", { withTimezone: true }).notNull(),
+  },
+  (t) => ({
+    objectUq: unique("attempt_evidence_archives_object_uq").on(
+      t.bucket,
+      t.objectKey,
+      t.generation,
+    ),
+    sourceUq: unique("attempt_evidence_archives_source_uq").on(
+      t.sourceInstance,
+      t.resultAttemptId,
+      t.envelopeSha256,
+    ),
+    attemptIdx: index("attempt_evidence_archives_attempt_source_idx").on(
+      t.resultAttemptId,
+      t.sourceSha256,
+      t.sourceByteSize,
+    ),
+  }),
+);
+
+export const attemptEvidenceStoragePolicy = pgTable(
+  "attempt_evidence_storage_policy",
+  {
+    id: integer("id").primaryKey(),
+    shorteningEnabled: boolean("shortening_enabled").notNull(),
+    canaryAttemptId: uuid("canary_attempt_id"),
+    consumerContractVersion: integer("consumer_contract_version").notNull(),
+    minLogicalBytes: integer("min_logical_bytes").notNull(),
+    minNetValueBytes: integer("min_net_value_bytes").notNull(),
+    maxSourceBytes: integer("max_source_bytes").notNull(),
+    initialSubset: text("initial_subset").notNull(),
+  },
+);
+
+export const attemptEvidenceHistoryProjections = pgTable(
+  "attempt_evidence_history_projections",
+  {
+    resultAttemptId: uuid("result_attempt_id")
+      .notNull()
+      .references(() => resultAttempts.id, { onDelete: "cascade" }),
+    archiveId: uuid("archive_id")
+      .notNull()
+      .references(() => attemptEvidenceArchives.id, { onDelete: "cascade" }),
+    projection: jsonb("projection").notNull().$type<Record<string, unknown>>(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull(),
+  },
+  (t) => ({
+    primary: primaryKey({
+      columns: [t.resultAttemptId, t.archiveId],
+      name: "attempt_evidence_history_projections_pk",
+    }),
+  }),
+);
+
+export const attemptEvidenceStorageEvents = pgTable(
+  "attempt_evidence_storage_events",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    resultAttemptId: uuid("result_attempt_id")
+      .notNull()
+      .references(() => resultAttempts.id, { onDelete: "cascade" }),
+    archiveId: uuid("archive_id")
+      .notNull()
+      .references(() => attemptEvidenceArchives.id, { onDelete: "cascade" }),
+    action: text("action").notNull().$type<"shorten" | "restore">(),
+    transactionId: text("transaction_id").notNull(),
+    verification: jsonb("verification")
+      .notNull()
+      .$type<Record<string, unknown>>(),
+    sourceStoredBytes: bigint("source_stored_bytes", {
+      mode: "number",
+    }).notNull(),
+    resultStoredBytes: bigint("result_stored_bytes", { mode: "number" }),
+    projectionValueBytes: bigint("projection_value_bytes", { mode: "number" }),
+    verificationValueBytes: bigint("verification_value_bytes", {
+      mode: "number",
+    }),
+    netValueBytesSaved: bigint("net_value_bytes_saved", { mode: "number" }),
+    completed: boolean("completed").notNull(),
+    appReadbackAt: timestamp("app_readback_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull(),
+  },
+  (t) => ({
+    ownerUq: unique("attempt_evidence_storage_events_owner_uq").on(
+      t.resultAttemptId,
+      t.id,
+    ),
+  }),
+);
 
 // ---------------------------------------------------------------------------
 // 10. Result classifications and fitted polar cache — solver evidence stays

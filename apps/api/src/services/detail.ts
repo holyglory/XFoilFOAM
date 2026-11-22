@@ -1,3 +1,4 @@
+import { readStoredAttemptEvidenceBatch } from "../attempt-evidence-reader";
 import {
   type AirfoilDetailPayload,
   canonicalAoa,
@@ -527,11 +528,13 @@ async function loadSolvedRows(
         sql`NOT ${progressiveBenchmarkAttemptSql(sql`${resultAttempts.id}`)}`,
       ),
     );
+  const fullAttempts = await readStoredAttemptEvidenceBatch(db, rows.map((row) => row.attempt));
+  const fullRows = rows.map((row, index) => ({ ...row, attempt: fullAttempts[index]! }));
   const geometryCompatibility = await solverGeometryCompatibility(
     db,
     airfoilId,
     points,
-    rows.map((row) => ({
+    fullRows.map((row) => ({
       attemptId: row.attempt.id,
       source: row.attempt.source,
       meshRecoveryVersion: (
@@ -539,7 +542,7 @@ async function loadSolvedRows(
       )?.mesh_recovery_version,
     })),
   );
-  for (const row of rows) {
+  for (const row of fullRows) {
     if (geometryCompatibility.get(row.attempt.id) !== true) continue;
     const revisionId = row.result.simulationPresetRevisionId;
     if (!revisionId) continue;
