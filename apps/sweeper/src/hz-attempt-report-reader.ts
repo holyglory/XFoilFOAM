@@ -47,6 +47,7 @@ interface WorkerReportRow {
   envelope: ProgressiveRemoteExecutionEnvelope;
   hub_attempt: string;
   hub_result: string;
+  storage_only: boolean;
   point: string;
   sequence: number;
   signature: string;
@@ -182,7 +183,7 @@ export async function readHzAttemptFromWorkerReport(
         pg_column_size(a.evidence_payload)::int AS pgbytes, coalesce(ar.history_series,attempt_evidence_series_inventory(a.evidence_payload)) AS series,
         s.instance_id::text AS instance, s.remote_solver_registered_id::text AS solver, p.id::text AS promise,
         j.request_payload->'remoteProgressiveExecution' AS envelope,
-        h.receipt->>'resultAttemptId' AS hub_attempt, h.receipt->>'resultId' AS hub_result,
+        h.receipt->>'resultAttemptId' AS hub_attempt, h.receipt->>'resultId' AS hub_result,(h.receipt->>'storageOnly')::boolean AS storage_only,
         h.point_content_signature AS point, h.sequence::int AS sequence, e.content_signature AS signature,
         b.bucket,b.object_key,b.generation,b.mime_type,b.compression,b.archive_format,
         b.stored_sha256,b.stored_byte_size::int,b.crc32c,b.member_count,b.first_sequence::int,b.last_sequence::int,
@@ -209,7 +210,7 @@ export async function readHzAttemptFromWorkerReport(
       LEFT JOIN attempt_evidence_archives ar ON ar.id=a.evidence_archive_id AND ar.result_attempt_id=a.id
         AND ar.result_id=a.result_id AND ar.sim_job_id=a.sim_job_id AND ar.source_instance=s.instance_id::text
       WHERE a.id=${attemptId}::uuid AND (a.evidence_archive_id IS NULL OR ar.id IS NOT NULL) AND ((a.status='done' AND a.source='solved') OR (a.status='failed' AND a.source='queued'))
-        AND (r.current_result_attempt_id IS DISTINCT FROM a.id OR ar.id IS NOT NULL) AND j.status='cancelled' AND j."ingestedAt" IS NOT NULL
+        AND (r.current_result_attempt_id IS DISTINCT FROM a.id OR ar.id IS NOT NULL) AND j.status IN ('done','failed','cancelled') AND j."ingestedAt" IS NOT NULL
         AND (j.ingest_lease_token IS NULL OR j.ingest_lease_expires_at<=statement_timestamp())
         AND j.request_payload->>'remoteSolver'='true' AND p.status IN ('cancelled','expired','fulfilled')
         AND pg_column_size(a.evidence_payload)<=262144 AND octet_length(a.evidence_payload::text)<=262144
@@ -263,6 +264,7 @@ export async function readHzAttemptFromWorkerReport(
     instance: x.instance,
     promise: x.promise,
     hubAttempt: x.hub_attempt,
+    storageOnly: x.storage_only,
     hubResult: x.hub_result,
     point: x.point,
     report,

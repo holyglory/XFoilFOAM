@@ -56,9 +56,9 @@ CREATE FUNCTION attempt_evidence_hz_scope_for(p_id uuid,extended boolean) RETURN
         AND m.sequence=w.sequence AND m.content_signature=e.content_signature AND m.source_kind='worker' AND m.member_kind='report'
       JOIN progressive_report_archive_bundles b ON b.id=m.bundle_id AND b.sim_job_id=j.id AND b.source_kind=m.source_kind
       WHERE a.id=p_id AND ((a.status='done' AND a.source='solved' AND (extended OR (a.regime='rans' AND NOT a.unsteady)))
-          OR (extended AND a.status='failed' AND a.source='queued')) AND r.current_result_attempt_id IS DISTINCT FROM a.id AND j.status='cancelled' AND j."ingestedAt" IS NOT NULL
+          OR (extended AND a.status='failed' AND a.source='queued')) AND r.current_result_attempt_id IS DISTINCT FROM a.id AND (j.status='cancelled' OR (extended AND j.status IN ('done','failed'))) AND j."ingestedAt" IS NOT NULL
         AND (j.ingest_lease_token IS NULL OR j.ingest_lease_expires_at<=statement_timestamp())
-        AND j.request_payload->>'remoteSolver'='true' AND p.status IN ('cancelled','expired')
+        AND j.request_payload->>'remoteSolver'='true' AND (p.status IN ('cancelled','expired') OR (extended AND p.status='fulfilled'))
 
         AND wr.stopped_engine_job_id=j.id::text AND NOT EXISTS (SELECT FROM progressive_worker_reports later WHERE later.sim_job_id=j.id AND later.sequence>wr.sequence)
         AND b.verified_at IS NOT NULL AND w.sequence BETWEEN b.first_sequence AND b.last_sequence

@@ -98,6 +98,7 @@ async function hubSource() {
     "scope",
   );
   const w = request.witness;
+  requireProof(typeof w.storageOnly === "boolean", "scope");
   const { sql: pg, db } = client();
   try {
     const rows = await pg.unsafe(
@@ -110,7 +111,7 @@ async function hubSource() {
       JOIN sync_api_settings settings ON settings.id=1 AND settings.instance_id::text=ar.source_instance
       JOIN progressive_remote_reports report ON report.sim_job_id=e.sim_job_id AND report.sequence=e.sequence AND report.content_signature=$11::text
       WHERE e.sim_job_id=$1::uuid AND e.result_attempt_id=$2::uuid AND e.remote_result_attempt_id=$3::uuid AND e.remote_result_id=$6::uuid
-        AND e.point_content_signature=$9::text AND e.sequence=$12::bigint AND e.storage_only
+        AND e.point_content_signature=$9::text AND e.sequence=$12::bigint AND e.storage_only=$15::boolean
         AND ar.source_sha256=$13::text AND ar.source_byte_size=$14::bigint
       ORDER BY ar.verified_at DESC,ar.id LIMIT 1`,
       [
@@ -128,6 +129,7 @@ async function hubSource() {
         w.report.sequence,
         w.sha256,
         w.byteSize,
+        w.storageOnly,
       ],
     );
     requireProof(rows.length === 1, "scope");
