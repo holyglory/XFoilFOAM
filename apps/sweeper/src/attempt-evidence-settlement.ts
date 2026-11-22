@@ -306,7 +306,7 @@ export async function runAttemptEvidenceSettlementPass(
   }
   const candidates =
     automatic && processed < maxRows
-      ? await attemptEvidenceShorteningCandidates(db, next)
+      ? await attemptEvidenceShorteningCandidates(db, next, policy?.progressiveSourceScope === "receipt-bearing" ? "receipt-bearing" : policy?.progressiveSourceScope === "stopped-only")
       : [];
   for (const candidate of candidates) {
     if (options.signal?.aborted) break;

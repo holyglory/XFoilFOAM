@@ -62,6 +62,7 @@ export async function attemptEvidenceStorageMain(
         "--catalog",
         "--consumer-contract",
         "--stopped-progressive",
+        "--receipt-bearing",
         "--archive-id",
       ].includes(flag) ||
       !args[index + 1] ||
@@ -78,7 +79,12 @@ export async function attemptEvidenceStorageMain(
       8 * 1024 ** 2,
     ),
   };
-  const stoppedProgressive = flags.get("--stopped-progressive") === "true";
+  const stoppedMode = flags.get("--stopped-progressive");
+  const stoppedProgressive = stoppedMode === "true" || stoppedMode === "only";
+  const receiptBearing = flags.get("--receipt-bearing") === "true";
+  if (flags.has("--receipt-bearing") && (!receiptBearing || flags.has("--stopped-progressive") ||
+      (command !== "enable-shortening" && command !== "shortening-candidates")))
+    throw new Error("--receipt-bearing true selects one scoped preview or writer policy");
   if (flags.has("--stopped-progressive") && (!stoppedProgressive ||
       (command !== "enable-shortening" && command !== "shortening-candidates")))
     throw new Error("--stopped-progressive true applies to shortening-candidates and enable-shortening");
@@ -125,7 +131,7 @@ export async function attemptEvidenceStorageMain(
     ].includes(command ?? "")
   )
     throw new Error(
-      "Usage: attempt-evidence-storage-cli.ts sql|use-sql|audit|use-audit|copy|archive|backfill|restore|shortening-status|shortening-candidates|enable-shortening|disable-shortening|shorten|shorten-pass|restore-inline [--consumer-contract 1] [--stopped-progressive true] [--id ATTEMPT_UUID --archive-id ARCHIVE_UUID] [--after UUID] [--rows N] [--pages N] [--output NEW_FILE] [--bucket BUCKET] [--source-instance INSTANCE]",
+      "Usage: attempt-evidence-storage-cli.ts sql|use-sql|audit|use-audit|copy|archive|backfill|restore|shortening-status|shortening-candidates|enable-shortening|disable-shortening|shorten|shorten-pass|restore-inline [--consumer-contract 1] [--stopped-progressive true|only] [--receipt-bearing true] [--id ATTEMPT_UUID --archive-id ARCHIVE_UUID] [--after UUID] [--rows N] [--pages N] [--output NEW_FILE] [--bucket BUCKET] [--source-instance INSTANCE]",
     );
   if (!process.env.DATABASE_URL)
     throw new Error("An explicit DATABASE_URL is required");
@@ -167,7 +173,7 @@ export async function attemptEvidenceStorageMain(
           const rows = await attemptEvidenceShorteningCandidates(
             client.db,
             after,
-            stoppedProgressive,
+            receiptBearing ? "receipt-bearing" : stoppedProgressive,
           );
           for (const row of rows) {
             const reason =
@@ -212,7 +218,7 @@ export async function attemptEvidenceStorageMain(
         // SQL policy. No cloud request or permission change is made here.
         await configuredAttemptEvidenceSettlementDependencies(client.db);
         process.stdout.write(
-          `${JSON.stringify(await setAttemptEvidenceStoragePolicy(client.db, { enabled: true, consumerContractVersion: 1, canaryAttemptId: flags.get("--id"), stoppedProgressive }))}\n`,
+          `${JSON.stringify(await setAttemptEvidenceStoragePolicy(client.db, { enabled: true, consumerContractVersion: 1, canaryAttemptId: flags.get("--id"), stoppedProgressive: stoppedMode === "only" ? "only" : stoppedProgressive, receiptBearing }))}\n`,
         );
         return;
       }

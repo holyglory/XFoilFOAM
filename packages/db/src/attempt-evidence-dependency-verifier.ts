@@ -12,6 +12,11 @@ import type {
   AttemptEvidenceDependencyProof,
 } from "./attempt-evidence-projection";
 import { readPolarAttemptEvidenceForConsumerProof } from "./polar-cache";
+import { getAttemptEvidenceStoragePolicy } from "./attempt-evidence-projection";
+import {
+  RECEIPT_SOURCE_VERIFIER,
+  verifyProgressiveAttemptReceipt,
+} from "./attempt-receipt-verification";
 import {
   canonicalReportJson,
   parseReportJson,
@@ -206,11 +211,18 @@ export function createAttemptServerDependencyVerifier(
       "archive read did not restore the exact original owner and PG text",
     );
 
-    const stopped = await verifyStoppedSource(
-      db,
-      attemptId,
-      originalPayloadText,
-    );
+    const policy = await getAttemptEvidenceStoragePolicy(db);
+    const broad =
+      policy?.progressiveSourceScope === "receipt-bearing"
+        ? await verifyProgressiveAttemptReceipt(
+            db,
+            attemptId,
+            originalPayloadText,
+          )
+        : null;
+    const stopped = broad
+      ? null
+      : await verifyStoppedSource(db, attemptId, originalPayloadText);
     return db.transaction(async (rawTx) => {
       const tx = rawTx as unknown as DB;
       await tx.execute(sql`SET TRANSACTION READ ONLY`);
@@ -219,9 +231,11 @@ export function createAttemptServerDependencyVerifier(
       const [row] =
         await tx.execute(sql`SELECT a.result_id,a.sim_job_id,a.airfoil_id,a.simulation_preset_revision_id,
         ${
-          stopped
-            ? sql`attempt_evidence_stopped_scope(a.id)=${JSON.stringify(stopped.progressiveScope)}::jsonb`
-            : attemptEvidenceColdCohortSql(sql`a`)
+          broad
+            ? sql`attempt_evidence_receipt_scope(a.id)=${JSON.stringify(broad.progressiveScope)}::jsonb`
+            : stopped
+              ? sql`attempt_evidence_stopped_scope(a.id)=${JSON.stringify(stopped.progressiveScope)}::jsonb`
+              : attemptEvidenceColdCohortSql(sql`a`)
         } AS eligible,
         CASE WHEN octet_length(a.evidence_payload::text)<=33554432 THEN
           attempt_evidence_make_projection(a.evidence_payload,a.id,${archive.id}::uuid)
@@ -247,17 +261,6 @@ export function createAttemptServerDependencyVerifier(
           typeof row.sim_job_id === "string",
         "scientific setup/job scope is missing",
       );
-      const before = await readPolarAttemptEvidenceForConsumerProof(
-        tx,
-        row.airfoil_id,
-        row.simulation_preset_revision_id,
-        row.sim_job_id,
-      );
-      requireProof(
-        before.filter((point) => point.resultAttemptId === attemptId).length ===
-          1,
-        "scientific source job does not contain the exact attempt once",
-      );
       const original = JSON.parse(originalPayloadText) as Record<
         string,
         unknown
@@ -270,6 +273,49 @@ export function createAttemptServerDependencyVerifier(
       requireProof(
         forcePresent(original, new Map()) === hasForceHistory,
         "force-history existence changed",
+      );
+      if (broad) {
+        // All leaves except the four replayed numerical channels have already
+        // been compared losslessly above. Job-scoped RANS classification reads
+        // mean_stable from this parent, with geometry, certificates and force
+        // presence kept separately. Thus every sibling sees identical classifier
+        // inputs regardless of job cardinality. Progressive fitting uses the
+        // authenticated full numerical source, never this compact parent.
+        const channels = new Set(["iterations", "cl", "cd", "cm"]);
+        requireProof(
+          expected.arrayFacts.length === 4 &&
+            expected.arrayFacts.every(
+              (f) =>
+                f.path.length === 2 &&
+                f.path[0] === "steady_history" &&
+                channels.delete(f.path[1]!),
+            ) &&
+            channels.size === 0,
+          "receipt source removed a non-steady classifier input",
+        );
+        return {
+          contractVersion: 1,
+          attemptId,
+          archiveId: archive.id,
+          sourceSha256: archive.sourceSha256,
+          classificationEquivalent: true,
+          equalityEquivalent: true,
+          scientificEquivalent: true,
+          readDependenciesSatisfied: true,
+          verifier: RECEIPT_SOURCE_VERIFIER,
+          ...broad,
+        };
+      }
+      const before = await readPolarAttemptEvidenceForConsumerProof(
+        tx,
+        row.airfoil_id,
+        row.simulation_preset_revision_id,
+        row.sim_job_id,
+      );
+      requireProof(
+        before.filter((point) => point.resultAttemptId === attemptId).length ===
+          1,
+        "scientific source job does not contain the exact attempt once",
       );
       const after = before.map((point) =>
         point.resultAttemptId !== attemptId

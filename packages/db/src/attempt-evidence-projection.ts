@@ -104,6 +104,7 @@ export interface AttemptEvidenceDependencyProof {
   verifier: string;
   progressiveScope?: Record<string, unknown>;
   applicationSha256?: string;
+  reportedApplicationSha256?: string;
 }
 
 export interface AttemptEvidencePreview {
@@ -330,6 +331,7 @@ export function attemptEvidenceValueMatchesSql(
 export interface AttemptEvidenceStoragePolicy {
   shorteningEnabled: boolean;
   stoppedProgressiveEnabled: boolean;
+  progressiveSourceScope: "legacy" | "stopped-only" | "receipt-bearing";
   canaryAttemptId: string | null;
   consumerContractVersion: number;
   minLogicalBytes: number;
@@ -370,7 +372,8 @@ export async function getAttemptEvidenceStoragePolicy(
   const [row] =
     await db.execute(sql`SELECT shortening_enabled AS "shorteningEnabled",canary_attempt_id AS "canaryAttemptId",consumer_contract_version AS "consumerContractVersion",
     min_logical_bytes AS "minLogicalBytes",min_net_value_bytes AS "minNetValueBytes",max_source_bytes AS "maxSourceBytes",initial_subset AS "initialSubset",
-    coalesce((to_jsonb(policy)->>'stopped_progressive_enabled')::boolean,false) AS "stoppedProgressiveEnabled"
+    coalesce((to_jsonb(policy)->>'stopped_progressive_enabled')::boolean,false) AS "stoppedProgressiveEnabled",
+    coalesce(to_jsonb(policy)->>'progressive_source_scope','legacy') AS "progressiveSourceScope"
     FROM attempt_evidence_storage_policy policy WHERE id=1`);
   return row as unknown as AttemptEvidenceStoragePolicy;
 }
@@ -381,7 +384,8 @@ export async function setAttemptEvidenceStoragePolicy(
     enabled: boolean;
     consumerContractVersion?: 1;
     canaryAttemptId?: string;
-    stoppedProgressive?: boolean;
+    stoppedProgressive?: boolean | "only";
+    receiptBearing?: boolean;
   },
 ) {
   if (options.enabled && options.consumerContractVersion !== 1)
@@ -389,12 +393,17 @@ export async function setAttemptEvidenceStoragePolicy(
   if (options.canaryAttemptId !== undefined) assertId(options.canaryAttemptId);
   const [schema] = await db.execute(sql`SELECT EXISTS(SELECT FROM pg_attribute
     WHERE attrelid=to_regclass('attempt_evidence_storage_policy') AND attname='stopped_progressive_enabled'
-      AND NOT attisdropped) AS installed`);
+      AND NOT attisdropped) AS installed, EXISTS(SELECT FROM pg_attribute
+    WHERE attrelid=to_regclass('attempt_evidence_storage_policy') AND attname='progressive_source_scope' AND NOT attisdropped) AS scoped`);
+  if (options.receiptBearing && options.stoppedProgressive) throw new Error("Select one scientific storage scope");
+  const scope = options.receiptBearing ? "receipt-bearing" : options.stoppedProgressive === "only" ? "stopped-only" : "legacy";
+  if (scope !== "legacy" && (!schema?.scoped || !options.enabled)) throw new Error("Scoped progressive shortening requires migration 0211 and enabled readers");
   if (options.stoppedProgressive && (!options.enabled || !schema?.installed))
     throw new Error("Stopped progressive shortening requires 0210 and enabled readers");
   const stopped = schema?.installed
-    ? sql`stopped_progressive_enabled=${options.stoppedProgressive === true},` : sql``;
-  await db.execute(sql`UPDATE attempt_evidence_storage_policy SET ${stopped} shortening_enabled=${options.enabled},
+    ? sql`stopped_progressive_enabled=${Boolean(options.stoppedProgressive)},` : sql``;
+  const scoped = schema?.scoped ? sql`progressive_source_scope=${scope},` : sql``;
+  await db.execute(sql`UPDATE attempt_evidence_storage_policy SET ${scoped} ${stopped} shortening_enabled=${options.enabled},
     consumer_contract_version=${options.consumerContractVersion ?? 0},canary_attempt_id=${options.canaryAttemptId ?? null}::uuid WHERE id=1`);
   return getAttemptEvidenceStoragePolicy(db);
 }
@@ -522,17 +531,18 @@ export async function restoreAttemptEvidence(
 export async function attemptEvidenceShorteningCandidates(
   db: DB,
   after: string | null = null,
-  stoppedProgressiveOnly = false,
+  stoppedProgressiveOnly: boolean | "receipt-bearing" = false,
 ) {
   if (after !== null) assertId(after);
   return db.transaction(async (tx) => {
     await tx.execute(sql`SET TRANSACTION READ ONLY`);
     await tx.execute(sql`SET LOCAL statement_timeout='5s'`);
     await tx.execute(sql`SET LOCAL lock_timeout='500ms'`);
-    const retained = stoppedProgressiveOnly
+    const broad = stoppedProgressiveOnly === "receipt-bearing";
+    const retained = !broad && stoppedProgressiveOnly
       ? sql`JOIN progressive_remote_evidence_receipts rr ON rr.result_attempt_id=ar.result_attempt_id AND rr.storage_only`
       : sql``;
-    const limiter = stoppedProgressiveOnly
+    const limiter = broad ? sql`attempt_evidence_receipt_shortening_limiter(a.id)` : stoppedProgressiveOnly
       ? sql`attempt_evidence_stopped_shortening_limiter(a.id)` : sql`attempt_evidence_shortening_limiter(a.id)`;
     return tx.execute(sql`WITH ids AS MATERIALIZED (
       SELECT DISTINCT ar.result_attempt_id AS id FROM attempt_evidence_archives ar ${retained}
