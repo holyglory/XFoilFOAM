@@ -1,3 +1,5 @@
+import { readSweeperAttemptEvidence, sweeperAttemptArchiveReader } from "./attempt-evidence-consumer-reader";
+import { assertAttemptSourcePins, loadAttemptSourcePins, prepareAttemptSources } from "@aerodb/db/attempt-receipt-source";
 import { resolveStoredProgressiveReport } from "@aerodb/db/progressive-report-reader";
 import { canonicalRemoteHubBaseUrl } from "@aerodb/core";
 import {
@@ -13,7 +15,7 @@ import {
 import { sql } from "drizzle-orm";
 import { randomUUID } from "node:crypto";
 import { assertProgressiveWorkerEvidenceJob } from "./progressive-remote-jobs";
-import { progressiveDeliverySelectionSql } from "./progressive-delivery-selection";
+import { progressiveDeliverySelectionSql, workerEvidenceStorageColumns } from "./progressive-delivery-selection";
 import { recordInactiveStoppedPromise } from "./progressive-inactive-promise";
 import {
   progressiveStoppedStorageEligible,
@@ -47,7 +49,8 @@ async function claimNextProgressiveWorkerDelivery(
     `);
     const timeout = Math.min(Number(previous.milliseconds) || DELIVERY_CLAIM_TIMEOUT_MS, DELIVERY_CLAIM_TIMEOUT_MS);
     await connection.execute(sql`SELECT set_config('statement_timeout', ${`${timeout}ms`}, true)`);
-    const rows = await connection.execute(progressiveDeliverySelectionSql(preferActive, claimToken));
+    const columns = await workerEvidenceStorageColumns(connection);
+    const rows = await connection.execute(progressiveDeliverySelectionSql(preferActive, claimToken, columns.attempts));
     // Successful nested calls must restore their caller's setting. A failure
     // rolls back this transaction/savepoint, including its local GUC and claim.
     await connection.execute(sql`SELECT set_config('statement_timeout', ${String(previous.value)}, true)`);
@@ -92,10 +95,14 @@ export async function recordProgressiveWorkerEvidenceReceipt(
   )
     throw new Error("Hub did not retain the exact progressive source attempt");
   const sequence = Number(receipt.sequence);
-  await db.transaction(async (transaction) => {
-    const connection = transaction as unknown as DB;
-    const [source] = await connection.execute(sql`
-      SELECT association.sequence,resolve_progressive_report(to_jsonb(report.*)) AS report,report.content_signature,attempt.evidence_payload,job.request_payload,
+  const columns = await workerEvidenceStorageColumns(db);
+  const archivedAt = columns.reports ? sql`report.archived_at` : sql`NULL::timestamptz`;
+  const sourceQuery = (metadataOnly: boolean) => sql`
+      SELECT association.sequence,${metadataOnly ? sql`CASE WHEN ${archivedAt} IS NOT NULL THEN report.report END`
+        : sql`resolve_progressive_report(to_jsonb(report.*))`} AS report,report.content_signature,${archivedAt} AS archived_at,
+        ${columns.attempts ? sql`attempt.evidence_archive_id,attempt.evidence_storage_event_id` : sql`NULL::uuid AS evidence_archive_id,NULL::uuid AS evidence_storage_event_id`},
+        ${metadataOnly ? sql`NULL::jsonb` : sql`attempt.evidence_payload`} AS evidence_payload,
+        ${metadataOnly ? sql`NULL::jsonb` : sql`job.request_payload`} AS request_payload,
         EXISTS (SELECT 1 FROM progressive_worker_reports stopped
           WHERE stopped.sim_job_id=job.id AND stopped.stopped_engine_job_id=job.id::text
             AND stopped.assignment_signature=report.assignment_signature AND stopped.acknowledged_at IS NOT NULL) AS stopped
@@ -109,12 +116,48 @@ export async function recordProgressiveWorkerEvidenceReceipt(
         AND association.point_content_signature=${expected.pointContentSignature}
         AND attempt.result_id=${expected.resultId}::uuid AND report.acknowledged_at IS NOT NULL
       ORDER BY CASE WHEN association.sequence=${sequence} THEN 0 ELSE 1 END,association.sequence LIMIT 1
-    `);
+    `;
+  const [initial] = await db.execute(sourceQuery(true));
+  if (!initial) throw new Error("Hub receipt has no acknowledged exact source association");
+  const full = initial.evidence_archive_id
+    ? (await prepareAttemptSources(db, sweeperAttemptArchiveReader(), [...(await loadAttemptSourcePins(db,[expected.resultAttemptId])).values()],
+        {signal:AbortSignal.timeout(30_000)})).get(expected.resultAttemptId)
+    : undefined;
+  const preparedReports = new Map<string,ProgressiveRemoteReport>();
+  if (initial.archived_at)
+    preparedReports.set(String(initial.content_signature),await resolveStoredProgressiveReport(db,"worker",initial,expected.executionId));
+  if (diagnostic && columns.reports) {
+    const [anchor] = await db.execute(sql`SELECT report,content_signature FROM progressive_worker_reports
+      WHERE sim_job_id=${expected.executionId}::uuid AND sequence=${sequence} AND archived_at IS NOT NULL AND acknowledged_at IS NOT NULL`);
+    if (anchor && !preparedReports.has(String(anchor.content_signature)))
+      preparedReports.set(String(anchor.content_signature),await resolveStoredProgressiveReport(db,"worker",anchor,expected.executionId));
+  }
+  await db.transaction(async (transaction) => {
+    const connection = transaction as unknown as DB;
+    const [source] = await connection.execute(sourceQuery(false));
     if (!source)
       throw new Error(
         "Hub receipt has no acknowledged exact source association",
       );
-    source.report = await resolveStoredProgressiveReport(connection, "worker", source, expected.executionId);
+    if (source.content_signature !== initial.content_signature || source.sequence !== initial.sequence ||
+        (source.evidence_archive_id ?? null) !== (full?.pin.archiveId ?? null) ||
+        (full && source.evidence_storage_event_id !== full.pin.storageEventId))
+      throw new Error("Hub receipt source changed after exact worker preparation");
+    if (full) {
+      await assertAttemptSourcePins(connection,[full.pin]);
+      source.evidence_payload = full.payload;
+    }
+    source.report = source.archived_at ? preparedReports.get(String(source.content_signature))
+      : await resolveStoredProgressiveReport(connection, "worker", source, expected.executionId);
+    if (!source.report) throw new Error("Worker source report changed before acknowledgement");
+    if (full && !diagnostic) {
+      const report = source.report as unknown as ProgressiveRemoteReport;
+      const envelope = verifyProgressiveRemoteExecution((source.request_payload as Record<string,unknown>).remoteProgressiveExecution,
+        {executionId:expected.executionId,solverId:report.solverId,promiseId:report.promiseId,contentSignature:report.assignmentSignature});
+      const point = progressiveReportedPointSources(report.result!).find(p=>p.contentSignature===expected.pointContentSignature);
+      if (!point || analysisContentHash(progressiveRemotePointProjection({...point,envelope,report}).evidencePayload) !== full.pin.applicationSha256)
+        throw new Error("Acknowledged physical receipt differs from original worker attempt");
+    }
     await assertProgressiveWorkerEvidenceJob(connection, {
       simJobId: expected.executionId,
       engineJobId: expected.executionId,
@@ -128,10 +171,12 @@ export async function recordProgressiveWorkerEvidenceReceipt(
         contentSignature: report.assignmentSignature,
       });
       const point = progressiveReportedPointSources(report.result!).find((entry) => entry.contentSignature === expected.pointContentSignature);
-      const [anchor] = await connection.execute(sql`SELECT resolve_progressive_report(to_jsonb(progressive_worker_reports.*)) AS report,content_signature FROM progressive_worker_reports
+      const [anchor] = await connection.execute(sql`SELECT resolve_progressive_report(to_jsonb(progressive_worker_reports.*)) AS report,content_signature,${columns.reports ? sql`archived_at` : sql`NULL::timestamptz`} AS archived_at FROM progressive_worker_reports
         WHERE sim_job_id=${expected.executionId}::uuid AND sequence=${sequence} AND acknowledged_at IS NOT NULL`);
       if (!anchor) throw new Error("Hub diagnostic receipt has no acknowledged source report");
-      anchor.report = await resolveStoredProgressiveReport(connection, "worker", anchor, expected.executionId);
+      anchor.report = anchor.archived_at ? preparedReports.get(String(anchor.content_signature))
+        : await resolveStoredProgressiveReport(connection, "worker", anchor, expected.executionId);
+      if (!anchor.report) throw new Error("Worker diagnostic anchor changed before acknowledgement");
       await assertProgressiveWorkerEvidenceJob(connection, {
         simJobId: expected.executionId, engineJobId: expected.executionId, reportSequence: sequence,
         result: (anchor.report as unknown as ProgressiveRemoteReport).result!,
@@ -227,10 +272,14 @@ export async function deliverNextProgressiveWorkerEvidence(
       envelope,
       report,
     });
+    const original = await readSweeperAttemptEvidence(db, { id: String(pending.result_attempt_id), resultId: String(pending.result_id),
+      simJobId: executionId, evidenceArchiveId: pending.evidence_archive_id == null ? null : String(pending.evidence_archive_id),
+      evidenceStorageEventId: pending.evidence_storage_event_id == null ? null : String(pending.evidence_storage_event_id),
+      evidencePayload: pending.evidence_payload });
     if (
       source.contentSignature !== pending.point_content_signature ||
       analysisContentHash(projection.evidencePayload) !==
-        analysisContentHash(pending.evidence_payload)
+        analysisContentHash(original.evidencePayload)
     )
       throw new Error(
         "Worker evidence delivery differs from its immutable reported source",

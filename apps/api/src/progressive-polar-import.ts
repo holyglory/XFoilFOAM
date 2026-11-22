@@ -10,6 +10,13 @@ import {
   type ProgressiveRemoteEvidenceDelivery,
   type ProgressiveRemoteEvidenceReference,
 } from "@aerodb/db";
+import { prepareProgressiveRemoteEvidence } from "@aerodb/db/progressive-remote-evidence";
+import {
+  prepareProgressiveRemoteReceiptReplay,
+  recheckPreparedProgressiveRemoteReceipt,
+} from "@aerodb/db/progressive-remote-evidence-receipts";
+import { apiAttemptEvidenceReader } from "./attempt-evidence-reader";
+import { prepareStoppedProgressiveStorage } from "@aerodb/db/progressive-stopped-storage";
 
 interface IncomingPoint {
   aoaDeg: number;
@@ -56,13 +63,16 @@ export async function prepareProgressivePolarImport(
         );
       continue;
     }
-    const source = await resolveProgressiveRemoteEvidence(db, {
+    const reference = point.progressiveEvidence && {
+      ...point.progressiveEvidence,
+    };
+    const source = await prepareProgressiveRemoteEvidence(db, {
       solverId: solverId ?? "",
       promiseId: payload.promiseId,
       engineJobId: point.engineJobId ?? "",
       aoaDeg: point.aoaDeg,
       engineCaseSlug: point.engineCaseSlug ?? null,
-      progressiveEvidence: point.progressiveEvidence,
+      progressiveEvidence: reference,
     });
     if (!source) {
       if (point.progressiveEvidence)
@@ -86,14 +96,21 @@ export async function prepareProgressivePolarImport(
       engineJobId: source.report.executionId,
       aoaDeg: point.aoaDeg,
       engineCaseSlug: point.engineCaseSlug ?? null,
-      progressiveEvidence: point.progressiveEvidence,
+      progressiveEvidence: reference!,
       remoteResultId: point.remoteResultId,
       remoteResultAttemptId: point.remoteResultAttemptId,
     };
+    const receipt = await prepareProgressiveRemoteReceiptReplay(
+      db,
+      delivery,
+      apiAttemptEvidenceReader,
+    );
+    if (options.storageOnly && !receipt?.storageOnly)
+      await prepareStoppedProgressiveStorage(db, delivery);
     prepared.set(point.aoaDeg, {
       source,
       delivery,
-      receipt: await readProgressiveRemoteEvidenceReceipt(db, delivery),
+      receipt,
       projection: progressiveRemotePointProjection(source),
       storageOnly: options.storageOnly === true,
     });
@@ -111,6 +128,7 @@ export async function assertProgressivePolarImportScope(
 ) {
   const publishable = new Set<number>();
   for (const { source, receipt, delivery, storageOnly } of prepared.values()) {
+    if (receipt) await recheckPreparedProgressiveRemoteReceipt(db, delivery);
     if (storageOnly || receipt?.storageOnly) {
       await assertStoppedProgressiveStorage(db, delivery);
       continue;

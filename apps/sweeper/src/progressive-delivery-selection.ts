@@ -1,4 +1,13 @@
 import { sql } from "drizzle-orm";
+import type { DB } from "@aerodb/db/client";
+
+export async function workerEvidenceStorageColumns(db: DB) {
+  const [row] = await db.execute(sql`SELECT EXISTS(SELECT FROM pg_attribute WHERE attrelid=to_regclass('progressive_worker_reports')
+      AND attname='archived_at' AND NOT attisdropped) AS reports,
+    EXISTS(SELECT FROM pg_attribute WHERE attrelid=to_regclass('result_attempts')
+      AND attname='evidence_archive_id' AND NOT attisdropped) AS attempts`);
+  return { reports: row?.reports === true, attempts: row?.attempts === true };
+}
 
 export function progressiveMaterialDiagnosticSql(alias: string) {
   const attempt = sql.identifier(alias);
@@ -29,6 +38,7 @@ export function progressiveDiagnosticRetrySql(failureAlias: string, attemptAlias
 export function progressiveDeliverySelectionSql(
   preferActive: boolean,
   claimToken?: string,
+  hasArchivePointer = false,
 ) {
   const retryableFailure = sql`(
     failure.state = 'retry'
@@ -97,7 +107,9 @@ export function progressiveDeliverySelectionSql(
     : sql`${candidate(false)}`;
   const selectedCandidate = sql`SELECT selected.sim_job_id, selected.sequence, selected.result_attempt_id, selected.point_content_signature,
       report.content_signature AS report_signature, resolve_progressive_report(to_jsonb(report.*)) AS report, attempt.result_id, attempt.aoa_deg,
-      attempt.engine_case_slug, attempt.evidence_payload, selected.request_payload, selected.upstream_base_url,
+      attempt.engine_case_slug, attempt.evidence_payload,
+      ${hasArchivePointer ? sql`attempt.evidence_archive_id,attempt.evidence_storage_event_id` : sql`NULL::uuid AS evidence_archive_id,NULL::uuid AS evidence_storage_event_id`},
+      selected.request_payload, selected.upstream_base_url,
       selected.remote_solver_auth_token, selected.remote_solver_registered_id, selected.instance_id, selected.instance_name,
       selected.promise_id
     FROM (${selected}) selected

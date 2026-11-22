@@ -137,7 +137,9 @@ import { makeEngineClient } from "./engine-client";
 import { mediaStore } from "./media-store";
 import { readStoredForceHistory } from "./solver-history-reader";
 import { readStoredResultHistories } from "./result-history-reader";
-import { readStoredAttemptEvidenceBatch } from "./attempt-evidence-reader";
+import { apiAttemptEvidenceReader, readStoredAttemptEvidenceBatch } from "./attempt-evidence-reader";
+import { prepareProgressiveRemoteEvidence } from "@aerodb/db/progressive-remote-evidence";
+import { prepareProgressiveRemoteReceiptReplay } from "@aerodb/db/progressive-remote-evidence-receipts";
 import {
   hasArchivedResultHistory,
   resultHistoriesMatch,
@@ -4773,6 +4775,7 @@ export async function importPolarPush(
       : attemptValues;
     if (progressivePoint) incomingResult.simJobId = importedEngineJobId;
     const attemptIdentity = and(
+      progressivePoint?.receipt ? eq(resultAttempts.id, progressivePoint.receipt.resultAttemptId) : undefined,
       eq(resultAttempts.engineJobId, importedEngineJobId),
       eq(resultAttempts.aoaDeg, point.aoaDeg),
       eq(resultAttempts.regime, attemptRegime),
@@ -4785,9 +4788,7 @@ export async function importPolarPush(
     // must still match this compact source before using its restored body.
     const preparedAttemptRows = await db.select().from(resultAttempts)
       .where(attemptIdentity).orderBy(resultAttempts.createdAt, resultAttempts.id);
-    const preparedAttemptBodies = transportedPoint.progressiveArchiveOnly
-      ? preparedAttemptRows
-      : await readStoredAttemptEvidenceBatch(db, preparedAttemptRows);
+    const preparedAttemptBodies = await readStoredAttemptEvidenceBatch(db, preparedAttemptRows);
     const preparedAttempts = new Map(preparedAttemptRows.map((row, index) => [row.id, {
       stored: row, full: preparedAttemptBodies[index]!,
     }]));
@@ -4801,12 +4802,11 @@ export async function importPolarPush(
         .from(resultAttempts)
         .where(attemptIdentity)
         .orderBy(resultAttempts.createdAt, resultAttempts.id);
-      const fullAttempts = archiveOnlyReplay
-        ? existingAttempts
-        : existingAttempts.map((candidate) => {
+      const fullAttempts = existingAttempts.map((candidate) => {
             if (!candidate.evidenceArchiveId) return candidate;
             const prepared = preparedAttempts.get(candidate.id);
             if (!prepared || prepared.stored.evidenceArchiveId !== candidate.evidenceArchiveId ||
+                prepared.stored.evidenceStorageEventId !== candidate.evidenceStorageEventId ||
                 prepared.stored.resultId !== candidate.resultId || prepared.stored.simJobId !== candidate.simJobId ||
                 stableHash(comparableRemoteAttempt(prepared.stored as unknown as Record<string, unknown>)) !==
                   stableHash(comparableRemoteAttempt(candidate as unknown as Record<string, unknown>)))
@@ -4816,7 +4816,10 @@ export async function importPolarPush(
       const matchingAttempt = fullAttempts.find(
         (candidate) =>
           candidate.resultId === resultId &&
-          (archiveOnlyReplay ||
+          (archiveOnlyReplay
+            ? candidate.id === progressivePoint?.receipt?.resultAttemptId &&
+              stableHash(candidate.evidencePayload) === stableHash(progressivePoint.projection.evidencePayload)
+            :
             stableHash(
               comparableRemoteAttempt(
                 candidate as unknown as Record<string, unknown>,
@@ -4834,6 +4837,7 @@ export async function importPolarPush(
           attempt: { id: matchingAttempt.id },
         };
       }
+      if (archiveOnlyReplay) throw new PolarEvidenceBindingError("Archive-only replay differs from its original receipted attempt");
       const existingAttempt = fullAttempts[0];
       if (existingAttempt && !progressivePoint)
         return { kind: "conflict" as const, attempt: existingAttempt };
@@ -5170,7 +5174,7 @@ export async function importPolarPush(
 
       const observedCurrentAttemptId = existing.currentResultAttemptId;
 
-      const attemptResolution = exactStorageOnlyReplay
+      const attemptResolution = exactStorageOnlyReplay && !progressivePoint
         ? ({
             kind: "existing" as const,
             attempt: { id: exactReplayAttempt!.id },
@@ -5178,7 +5182,7 @@ export async function importPolarPush(
         : await insertAttemptForResult(
             tx,
             existing.id,
-            transportedPoint.progressiveArchiveOnly === true,
+            transportedPoint.progressiveArchiveOnly === true || (exactStorageOnlyReplay && !!progressivePoint),
           );
       if (attemptResolution.kind === "conflict") {
         return { kind: "conflict" as const, existing };
@@ -7352,13 +7356,13 @@ export async function registerSyncRoutes(app: FastifyInstance): Promise<void> {
           executionId: params.data.executionId,
           report: body.data.report,
         });
-        const retainedAttempt = body.data.diagnostic ? await readProgressiveRemoteEvidenceReceipt(db, {
+        const retainedAttempt = body.data.diagnostic ? await prepareProgressiveRemoteReceiptReplay(db, {
           solverId: solver.id, promiseId: body.data.promiseId, engineJobId: params.data.executionId,
           aoaDeg: body.data.diagnostic.aoaDeg, engineCaseSlug: body.data.diagnostic.engineCaseSlug,
           remoteResultId: body.data.diagnostic.remoteResultId, remoteResultAttemptId: body.data.diagnostic.remoteResultAttemptId,
           progressiveEvidence: { sequence: receipt.sequence, reportContentSignature: receipt.contentSignature,
             pointContentSignature: body.data.diagnostic.pointContentSignature },
-        }) : null;
+        }, apiAttemptEvidenceReader) : null;
         const diagnosticReceipt = body.data.diagnostic && !retainedAttempt ? await recordProgressiveRemoteDiagnosticReceipt(db, {
           solverId: solver.id, promiseId: body.data.promiseId, engineJobId: params.data.executionId,
           aoaDeg: body.data.diagnostic.aoaDeg, engineCaseSlug: body.data.diagnostic.engineCaseSlug,
@@ -7659,6 +7663,11 @@ export async function registerSyncRoutes(app: FastifyInstance): Promise<void> {
         .send({ error: "push disabled for evidence_artifacts" });
     const body = brokeredEvidenceRequestSchema.parse(req.body ?? {});
     try {
+      if (body.progressiveEvidence) {
+        const delivery = { ...body, solverId: solver.id, progressiveEvidence: body.progressiveEvidence };
+        await prepareProgressiveRemoteEvidence(db, delivery);
+        await prepareProgressiveRemoteReceiptReplay(db, delivery, apiAttemptEvidenceReader);
+      }
       return await requestBrokeredEvidenceUpload(db, solver, body);
     } catch (error) {
       const message =
@@ -7723,9 +7732,7 @@ export async function registerSyncRoutes(app: FastifyInstance): Promise<void> {
         return reply
           .code(409)
           .send({ error: "exact bound progressive custody is unavailable" });
-      const receipt = await readProgressiveEvidenceCustodyReceipt(
-        db,
-        {
+      const delivery = {
           solverId: solver.id,
           promiseId: String(row.promise_id),
           engineJobId: String(row.engine_job_id),
@@ -7740,9 +7747,10 @@ export async function registerSyncRoutes(app: FastifyInstance): Promise<void> {
             reportContentSignature: String(row.report_content_signature),
             pointContentSignature: String(row.point_content_signature),
           },
-        },
-        params.id,
-      );
+        };
+      await prepareProgressiveRemoteEvidence(db, delivery);
+      await prepareProgressiveRemoteReceiptReplay(db, delivery, apiAttemptEvidenceReader);
+      const receipt = await readProgressiveEvidenceCustodyReceipt(db, delivery, params.id);
       return {
         progressiveArchiveReceipt: signProgressiveEvidenceCustodyReceipt(
           receipt,

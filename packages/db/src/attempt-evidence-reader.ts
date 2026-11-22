@@ -10,7 +10,11 @@ import {
   prepareAttemptEvidenceCopy,
   type AttemptEvidenceCopySource,
 } from "./attempt-evidence-storage";
-import { canonicalAnalysisJson } from "./analysis-target";
+import { analysisContentHash, canonicalAnalysisJson } from "./analysis-target";
+import {
+  loadAttemptSourcePins,
+  type AttemptSourcePin,
+} from "./attempt-receipt-source";
 import {
   canonicalReportJson,
   parseReportJson,
@@ -36,6 +40,7 @@ export interface AttemptEvidenceReadRow {
   /** Authoritative 0208 pointer. Undefined projections are resolved by ID;
    * a null pointer is the normal inline fast path. */
   evidenceArchiveId?: string | null;
+  evidenceStorageEventId?: string | null;
 }
 export interface AttemptEvidenceReadOptions {
   signal?: AbortSignal;
@@ -72,6 +77,8 @@ interface CurrentRow {
   resultId: string | null;
   simJobId: string | null;
   archiveId: string | null;
+  storageEventId?: string | null;
+  sourcePin?: AttemptSourcePin;
   payloadText: string | null;
   payloadBytes: number | null;
   projection?: AttemptEvidenceProjection;
@@ -92,6 +99,7 @@ async function currentRows(
   return (await db.execute(sql`
     SELECT a.id, a.result_id AS "resultId", a.sim_job_id AS "simJobId",
       ${pointer} AS "archiveId",
+      ${schema?.ready === true ? sql`a.evidence_storage_event_id` : sql`NULL::uuid`} AS "storageEventId",
       CASE WHEN ${fullInline} OR ${pointer} IS NOT NULL
         THEN octet_length(a.evidence_payload::text) END AS "payloadBytes",
       CASE WHEN (${fullInline} OR ${pointer} IS NOT NULL)
@@ -200,6 +208,54 @@ export function attemptEvidenceMetadataMatches(
 async function attachProjections(db: DB, current: CurrentRow[]): Promise<void> {
   const cold = current.filter((row) => row.archiveId && !row.forcedInline);
   if (!cold.length) return;
+  const withEvents = cold.filter((row) => row.storageEventId);
+  if (withEvents.length) {
+    const [schema] = await db.execute(
+      sql`SELECT to_regprocedure('attempt_evidence_archived_application_sha256(uuid,uuid,uuid)') IS NOT NULL AS ready`,
+    );
+    if (schema?.ready === true) {
+      const pins = await loadAttemptSourcePins(
+        db,
+        withEvents.map((row) => row.id),
+      );
+      const sealed = await db.execute(sql`SELECT result_attempt_id,
+          verification#>>'{dependencies,progressiveScope,scientific,attemptToken}' AS token,
+          verification#>>'{dependencies,progressiveScope,scientific,applicationSha256}' AS scientific,
+          verification#>>'{dependencies,applicationSha256}' AS application
+        FROM attempt_evidence_storage_events WHERE id IN (${ids(withEvents.map((row) => row.storageEventId!))})
+        AND completed AND action='shorten' AND verification#>>'{dependencies,verifier}'='server-consumers/receipt-bearing-rans-v1'`);
+      const originals = new Map(
+        sealed.map((r) => [String(r.result_attempt_id), r]),
+      );
+      for (const row of withEvents) {
+        const pin = pins.get(row.id);
+        if (
+          !pin ||
+          pin.archiveId !== row.archiveId ||
+          pin.storageEventId !== row.storageEventId ||
+          pin.resultId !== row.resultId ||
+          pin.simJobId !== row.simJobId
+        )
+          fail(
+            "stale",
+            "Attempt receipt or storage event changed before the archived read",
+          );
+        const original = originals.get(row.id);
+        if (
+          original &&
+          (original.token !== pin.cfdAttemptToken ||
+            original.scientific !== pin.cfdEvidenceSignature ||
+            !pin.applicationSha256 ||
+            original.application !== pin.applicationSha256)
+        )
+          fail(
+            "stale",
+            "Original attempt token or scientific receipt changed after shortening",
+          );
+        row.sourcePin = pin;
+      }
+    }
+  }
   const rows =
     await db.execute(sql`SELECT result_attempt_id,archive_id,projection
     FROM attempt_evidence_history_projections WHERE result_attempt_id IN (${ids(cold.map((row) => row.id))})`);
@@ -225,6 +281,26 @@ async function attachProjections(db: DB, current: CurrentRow[]): Promise<void> {
       fail("stale", "Attempt compact payload or immutable projection changed");
     row.projection = p;
   }
+}
+
+async function recheckReadSources(db: DB, rows: Iterable<CurrentRow>) {
+  const pins = [...rows].flatMap((row) =>
+    row.sourcePin ? [row.sourcePin] : [],
+  );
+  if (!pins.length) return;
+  const current = await loadAttemptSourcePins(
+    db,
+    pins.map((pin) => pin.attemptId),
+  );
+  for (const pin of pins)
+    if (
+      canonicalAnalysisJson(current.get(pin.attemptId) ?? null) !==
+      canonicalAnalysisJson(pin)
+    )
+      fail(
+        "stale",
+        "Attempt source or receipt changed during the archived read",
+      );
 }
 
 function assertOwner(
@@ -274,6 +350,8 @@ async function fullText(
     );
   if (
     !options.requireArchiveRead &&
+    !current.sourcePin?.applicationSha256 &&
+    !current.sourcePin?.cfdEvidenceSignature &&
     inline.sha256 === archive.sourceSha256 &&
     inline.byteSize === archive.sourceByteSize
   )
@@ -324,6 +402,18 @@ async function fullText(
       "stale",
       "Retained attempt metadata differs from its immutable archived source",
     );
+  const pin = current.sourcePin;
+  if (pin?.applicationSha256 || pin?.cfdEvidenceSignature) {
+    const digest = analysisContentHash(JSON.parse(source!.payloadText));
+    if (
+      (pin.applicationSha256 && digest !== pin.applicationSha256) ||
+      (pin.cfdEvidenceSignature && digest !== pin.cfdEvidenceSignature)
+    )
+      fail(
+        "stale",
+        "Archived attempt payload differs from its scientific receipt",
+      );
+  }
   return source!.payloadText;
 }
 
@@ -383,10 +473,12 @@ export async function readAttemptEvidenceText(
     fail("missing", "Exact attempt archive catalog entry was not found");
   assertOwner(current, archive);
   await attachProjections(db, [current]);
-  return fullText(current, archive!, reader, {
+  const text = await fullText(current, archive!, reader, {
     ...options,
     requireArchiveRead: options.requireArchiveRead || options.forceArchive,
   });
+  await recheckReadSources(db, [current]);
+  return text;
 }
 
 export async function hydrateAttemptEvidenceBatch<
@@ -457,6 +549,8 @@ export async function hydrateAttemptEvidenceBatch<
     if (
       stored.resultId !== row.resultId ||
       stored.simJobId !== row.simJobId ||
+      (row.evidenceStorageEventId !== undefined &&
+        row.evidenceStorageEventId !== stored.storageEventId) ||
       (row.evidenceArchiveId !== undefined &&
         row.evidenceArchiveId?.toLowerCase() !== stored.archiveId)
     )
@@ -481,6 +575,7 @@ export async function hydrateAttemptEvidenceBatch<
       );
     result.push({ ...row, evidencePayload: payloads.get(archive.id) });
   }
+  await recheckReadSources(db, current.values());
   return result;
 }
 

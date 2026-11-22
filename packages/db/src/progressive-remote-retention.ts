@@ -1,10 +1,15 @@
 import { resolveStoredProgressiveReport } from "./progressive-report-reader";
-import { sql } from "drizzle-orm";
+import { is, sql } from "drizzle-orm";
+import { PgTransaction } from "drizzle-orm/pg-core";
 import type { DB } from "./client";
 import { analysisContentHash, canonicalAnalysisJson } from "./analysis-target";
 import { readProgressiveEvidenceCustodyReceipt } from "./progressive-evidence-custody";
-import { resolveProgressiveRemoteEvidence, ProgressiveRemoteEvidenceConflict } from "./progressive-remote-evidence";
-import type { ProgressiveRemoteEvidenceDelivery } from "./progressive-remote-evidence-receipts";
+import { prepareProgressiveRemoteEvidence, resolveProgressiveRemoteEvidence, ProgressiveRemoteEvidenceConflict } from "./progressive-remote-evidence";
+import { prepareProgressiveRemoteReceiptReplay, readProgressiveRemoteEvidenceReceipt, type ProgressiveRemoteEvidenceDelivery } from "./progressive-remote-evidence-receipts";
+import type { AttemptEvidenceArchiveReader } from "./attempt-evidence-reader";
+import { hasAttemptEvidenceStoragePointer } from "./attempt-evidence-storage";
+import { progressiveRemotePointProjection } from "./progressive-remote-point-projection";
+import { AsyncLocalStorage } from "node:async_hooks";
 import {
   isFinalProgressiveRemoteReport,
   progressiveReportedPointSources,
@@ -16,6 +21,110 @@ import { progressiveRemoteReportInventory } from "./progressive-remote-inventory
 import { validateProgressiveExecutionStopProof } from "./progressive-cfd-settlement";
 
 export type ProgressiveDiagnosticFailureKind = "material_domain" | "infrastructure" | "hard_solver";
+
+interface RetentionPreparation {
+  executionId: string;
+  deliveries: Map<string, ProgressiveRemoteEvidenceDelivery>;
+  reports: Map<string, ProgressiveRemoteReport>;
+}
+const retentionContext = new AsyncLocalStorage<RetentionPreparation>();
+let retentionReader: AttemptEvidenceArchiveReader | undefined;
+export function installProgressiveRetentionReader(
+  reader: AttemptEvidenceArchiveReader,
+) {
+  retentionReader = reader;
+}
+export function progressiveRetentionReader() {
+  return retentionReader;
+}
+
+/** Do external reads at the outer operation, before taking any scientific
+ * locks. The normal retention pass repeats source, receipt and custody checks. */
+export async function withPreparedProgressiveRemoteRetention<T>(
+  db: DB,
+  executionId: string,
+  reader: AttemptEvidenceArchiveReader,
+  action: () => Promise<T>,
+): Promise<T> {
+  if (
+    retentionContext.getStore()?.executionId === executionId ||
+    !(await hasAttemptEvidenceStoragePointer(db))
+  )
+    return action();
+  const rows =
+    await db.execute(sql`SELECT e.result_attempt_id,e.remote_result_id,e.remote_result_attempt_id,e.point_content_signature,
+    e.sequence,r.content_signature,a.aoa_deg,a.engine_case_slug,d.solver_id,d.promise_id
+    FROM progressive_remote_evidence_receipts e JOIN result_attempts a ON a.id=e.result_attempt_id
+    JOIN progressive_remote_reports r ON r.sim_job_id=e.sim_job_id AND r.sequence=e.sequence
+    JOIN progressive_remote_dispatches d ON d.sim_job_id=e.sim_job_id
+    WHERE e.sim_job_id=${executionId}::uuid AND a.evidence_archive_id IS NOT NULL ORDER BY e.result_attempt_id LIMIT 2049`);
+  if (!rows.length) return action();
+  if (rows.length > 2048)
+    throw new Error(
+      "Remote retention exceeds the bounded source-attempt inventory",
+    );
+  const prepared: RetentionPreparation = {
+    executionId,
+    deliveries: new Map(),
+    reports: new Map(),
+  };
+  for (const row of rows) {
+    const delivery: ProgressiveRemoteEvidenceDelivery = {
+      engineJobId: executionId,
+      solverId: String(row.solver_id),
+      promiseId: String(row.promise_id),
+      remoteResultId: String(row.remote_result_id),
+      remoteResultAttemptId: String(row.remote_result_attempt_id),
+      aoaDeg: Number(row.aoa_deg),
+      engineCaseSlug:
+        row.engine_case_slug == null ? null : String(row.engine_case_slug),
+      progressiveEvidence: {
+        sequence: Number(row.sequence),
+        reportContentSignature: String(row.content_signature),
+        pointContentSignature: String(row.point_content_signature),
+      },
+    };
+    const source = await prepareProgressiveRemoteEvidence(db, delivery);
+    const receipt = await prepareProgressiveRemoteReceiptReplay(
+      db,
+      delivery,
+      reader,
+    );
+    if (!source || receipt?.resultAttemptId !== row.result_attempt_id)
+      throw new Error("Remote retention source changed during preparation");
+    prepared.deliveries.set(String(row.result_attempt_id), delivery);
+    prepared.reports.set(String(row.content_signature), source.report);
+  }
+  const others = await db.execute(sql`WITH distinct_sources AS MATERIALIZED (
+      SELECT DISTINCT ON(point_content_signature) sequence FROM progressive_remote_report_sources
+      WHERE sim_job_id=${executionId}::uuid ORDER BY point_content_signature,sequence LIMIT 2049
+    ), keys AS (SELECT sequence FROM distinct_sources UNION (SELECT sequence FROM progressive_remote_reports
+      WHERE sim_job_id=${executionId}::uuid ORDER BY sequence DESC LIMIT 1))
+    SELECT r.sequence,r.content_signature,r.report FROM keys JOIN progressive_remote_reports r USING(sequence)
+    WHERE r.sim_job_id=${executionId}::uuid AND r.archived_at IS NOT NULL`);
+  for (const row of others)
+    if (!prepared.reports.has(String(row.content_signature)))
+      prepared.reports.set(
+        String(row.content_signature),
+        await resolveStoredProgressiveReport(db, "remote", row, executionId),
+      );
+  return retentionContext.run(prepared, action);
+}
+
+function retentionReport(
+  db: DB,
+  row: { report?: unknown; content_signature?: unknown },
+  executionId: string,
+) {
+  const prepared = retentionContext.getStore();
+  if (prepared?.executionId === executionId) {
+    const original = prepared.reports.get(String(row.content_signature));
+    if (original) return original;
+    if ((row.report as { archivedReport?: boolean } | null)?.archivedReport)
+      throw new Error("Archived retention report changed; prepare again");
+  }
+  return resolveStoredProgressiveReport(db, "remote", row, executionId);
+}
 
 export function progressivePointHasRetainedHistory(point: ReturnType<typeof progressiveReportedPointSources>[number]["point"]) {
   return [point.force_history, point.steady_history, point.frame_track,
@@ -68,7 +177,7 @@ export async function readProgressiveRemoteSourceClassifications(
   if (canonicalAnalysisJson(payload.engineRequest) !== canonicalAnalysisJson(envelope.request) ||
     canonicalAnalysisJson(payload.progressive) !== canonicalAnalysisJson(envelope.scope))
     throw new ProgressiveRemoteEvidenceConflict("Remote diagnostic history differs from immutable execution ownership");
-  const latest = validateProgressiveRemoteReport(await resolveStoredProgressiveReport(db, "remote", stored, executionId), envelope);
+  const latest = validateProgressiveRemoteReport(await retentionReport(db, stored, executionId), envelope);
   if (latest.contentSignature !== stored.content_signature)
     throw new Error("Remote diagnostic history changed its final report bytes");
   if (!isFinalProgressiveRemoteReport(latest.report) || !stored.proof) return [];
@@ -109,7 +218,7 @@ export async function readProgressiveRemoteSourceClassifications(
     failureKinds: Map<string, ProgressiveDiagnosticFailureKind | null>;
   }>();
   for (const entry of reports) {
-    const validated = validateProgressiveRemoteReport(await resolveStoredProgressiveReport(db, "remote", entry, executionId), envelope);
+    const validated = validateProgressiveRemoteReport(await retentionReport(db, entry, executionId), envelope);
     const inventory = progressiveRemoteReportInventory(validated.report);
     if (validated.contentSignature !== entry.content_signature ||
       inventory.inventorySignature !== entry.inventory_signature ||
@@ -202,6 +311,16 @@ export function terminalReportNoPhysicalEvidenceSignatures(
 export async function readProgressiveRemoteRetention(
   db: DB,
   executionId: string,
+  reader = retentionReader,
+) {
+  if (reader && !is(db, PgTransaction) && retentionContext.getStore()?.executionId !== executionId)
+    return withPreparedProgressiveRemoteRetention(db,executionId,reader,() => readRemoteRetention(db,executionId));
+  return readRemoteRetention(db,executionId);
+}
+
+async function readRemoteRetention(
+  db: DB,
+  executionId: string,
 ) {
   const [latest] =
     await db.execute(sql`SELECT report.report, report.sequence, report.content_signature,
@@ -212,7 +331,7 @@ export async function readProgressiveRemoteRetention(
   if (!latest)
     return { kind: "waiting" as const, reason: "final_report" as const };
   const { report, contentSignature } = validateProgressiveRemoteReport(
-    await resolveStoredProgressiveReport(db, "remote", latest, executionId),
+    await retentionReport(db, latest, executionId),
     latest.envelope as ProgressiveRemoteExecutionEnvelope,
   );
   if (contentSignature !== latest.content_signature)
@@ -228,6 +347,7 @@ export async function readProgressiveRemoteRetention(
           WHERE source.sim_job_id = inventory.sim_job_id AND source.sequence = inventory.sequence)) LIMIT 1`);
   if (missingInventory)
     return { kind: "waiting" as const, reason: "source_inventory" as const };
+  const archivePointer = await hasAttemptEvidenceStoragePointer(db) ? sql`raw.evidence_archive_id` : sql`NULL::uuid`;
   const sources = await db.execute(sql`WITH source_identities AS MATERIALIZED (
       SELECT DISTINCT source.point_content_signature, source.aoa_deg, source.case_slug
       FROM progressive_remote_report_sources source
@@ -236,7 +356,8 @@ export async function readProgressiveRemoteRetention(
     )
     SELECT source.point_content_signature, source.aoa_deg, source.case_slug,
       receipt.sequence, receipt.remote_result_id, receipt.remote_result_attempt_id, receipt.result_attempt_id, receipt.storage_only,
-      owned_report.content_signature AS report_content_signature, raw.evidence_payload, evidence.evidence_signature
+      owned_report.content_signature AS report_content_signature, ${archivePointer} AS archive_id,
+      CASE WHEN ${archivePointer} IS NULL THEN raw.evidence_payload END AS evidence_payload, evidence.evidence_signature
     FROM source_identities source
     LEFT JOIN progressive_remote_evidence_receipts receipt
       ON receipt.sim_job_id = ${executionId}::uuid AND receipt.point_content_signature = source.point_content_signature
@@ -287,7 +408,7 @@ export async function readProgressiveRemoteRetention(
     )
       continue;
     if (
-      source.storage_only !== true &&
+      source.archive_id == null && source.storage_only !== true &&
       (!source.evidence_signature ||
         analysisContentHash(source.evidence_payload) !==
           source.evidence_signature)
@@ -310,9 +431,20 @@ export async function readProgressiveRemoteRetention(
         pointContentSignature: String(source.point_content_signature),
       },
     };
+    if (source.archive_id) {
+      const prepared = retentionContext.getStore()?.deliveries.get(String(source.result_attempt_id));
+      if (!prepared || canonicalAnalysisJson(prepared) !== canonicalAnalysisJson(delivery))
+        throw new Error("Cold remote retention requires its current original delivery to be prepared before locking");
+      delivery.progressiveEvidence = prepared.progressiveEvidence;
+      const receipt = await readProgressiveRemoteEvidenceReceipt(db, delivery);
+      if (receipt?.resultAttemptId !== source.result_attempt_id) throw new Error("Cold retained attempt changed");
+    }
     const reported = await resolveProgressiveRemoteEvidence(db, delivery);
     if (!reported)
       throw new Error("Remote retention has no exact source report");
+    if (source.archive_id && source.storage_only !== true &&
+      analysisContentHash(progressiveRemotePointProjection(reported).evidencePayload) !== source.evidence_signature)
+      throw new Error("Remote retention differs from its original CFD evidence receipt");
     const hasManifest =
       reported.point.evidence_artifacts?.some(
         (artifact) => artifact.kind === "manifest",

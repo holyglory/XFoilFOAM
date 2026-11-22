@@ -5,6 +5,7 @@ import { verifyProgressiveRemoteExecution } from "./progressive-remote-execution
 import {
   resolveProgressiveReportedPoint,
   validateProgressiveRemoteReport,
+  type ProgressiveRemoteReport,
 } from "./progressive-remote-report";
 
 export interface ProgressiveRemoteEvidenceReference {
@@ -14,6 +15,26 @@ export interface ProgressiveRemoteEvidenceReference {
 }
 
 export class ProgressiveRemoteEvidenceConflict extends Error {}
+
+// Only the server prepares these reference objects. The HTTP caller supplies
+// identifiers, never the reusable authenticated body. The database rechecks
+// dispatch ownership and the immutable sequence/signature on every use.
+const preparedReports = new WeakMap<
+  ProgressiveRemoteEvidenceReference,
+  ProgressiveRemoteReport
+>();
+
+export async function prepareProgressiveRemoteEvidence(
+  db: DB,
+  input: Parameters<typeof resolveProgressiveRemoteEvidence>[1],
+) {
+  if (input.progressiveEvidence)
+    preparedReports.delete(input.progressiveEvidence);
+  const source = await resolveProgressiveRemoteEvidence(db, input);
+  if (source && input.progressiveEvidence)
+    preparedReports.set(input.progressiveEvidence, source.report);
+  return source;
+}
 
 export async function resolveProgressiveRemoteEvidence(
   db: DB,
@@ -69,14 +90,24 @@ export async function resolveProgressiveRemoteEvidence(
     executionId: input.engineJobId,
     contentSignature: String(assigned.content_signature),
   });
+  const prepared = preparedReports.get(reference);
   const [stored] =
-    await db.execute(sql`SELECT resolve_progressive_report(to_jsonb(progressive_remote_reports.*)) AS report, content_signature FROM progressive_remote_reports
+    await db.execute(sql`SELECT ${prepared ? sql`NULL::jsonb` : sql`resolve_progressive_report(to_jsonb(progressive_remote_reports.*))`} AS report, content_signature FROM progressive_remote_reports
     WHERE sim_job_id = ${input.engineJobId}::uuid AND sequence = ${reference.sequence}`);
   if (!stored)
     throw new ProgressiveRemoteEvidenceConflict(
       "Progressive evidence report has not reached the hub",
     );
-  const validated = validateProgressiveRemoteReport(await resolveStoredProgressiveReport(db, "remote", stored, input.engineJobId), envelope);
+  const validated = validateProgressiveRemoteReport(
+    prepared ??
+      (await resolveStoredProgressiveReport(
+        db,
+        "remote",
+        stored,
+        input.engineJobId,
+      )),
+    envelope,
+  );
   if (
     validated.contentSignature !== stored.content_signature ||
     validated.contentSignature !== reference.reportContentSignature ||

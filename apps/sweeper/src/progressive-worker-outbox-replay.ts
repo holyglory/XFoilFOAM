@@ -12,6 +12,9 @@ import {
 } from "@aerodb/db";
 import { sql } from "drizzle-orm";
 import { configuredDeploymentRole } from "./config";
+import { loadAttemptSourcePins, prepareAttemptSources, assertAttemptSourcePins } from "@aerodb/db/attempt-receipt-source";
+import { sweeperAttemptArchiveReader } from "./attempt-evidence-consumer-reader";
+import { workerEvidenceStorageColumns } from "./progressive-delivery-selection";
 
 const UUID = /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/;
 const SIGNATURE = /^[a-f0-9]{64}$/;
@@ -140,6 +143,18 @@ export async function replayProgressiveWorkerOutbox(
       "Replay manifest signature differs from the exact selection",
     );
 
+  const selectedIds = sql.join(input.points.map((p) => sql`${p.resultAttemptId}::uuid`),sql`,`);
+  const columns = await workerEvidenceStorageColumns(db);
+  const cold = columns.attempts ? await db.execute(sql`SELECT id FROM result_attempts WHERE id IN (${selectedIds})
+    AND sim_job_id=${input.executionId}::uuid AND engine_job_id=${input.executionId}
+    AND evidence_archive_id IS NOT NULL`) : [];
+  const pins = await loadAttemptSourcePins(db,cold.map((row) => String(row.id)));
+  const prepared = await prepareAttemptSources(db,sweeperAttemptArchiveReader(),[...pins.values()],{signal:AbortSignal.timeout(30_000)});
+  const archivedReports = columns.reports ? await db.execute(sql`SELECT r.sequence,r.report,r.content_signature FROM progressive_worker_reports r
+    WHERE r.sim_job_id=${input.executionId}::uuid AND r.sequence IN (${sql.join(input.points.map(p=>sql`${p.sequence}::bigint`),sql`,`)})
+    AND r.archived_at IS NOT NULL AND r.acknowledged_at IS NOT NULL`) : [];
+  const reports = new Map<string,Awaited<ReturnType<typeof resolveStoredProgressiveReport>>>();
+  for (const row of archivedReports) reports.set(String(row.content_signature),await resolveStoredProgressiveReport(db,"worker",row,input.executionId));
   return db.transaction(async (transaction) => {
     const connection = transaction as unknown as DB;
     await connection.execute(sql`SET LOCAL lock_timeout = '2s'`);
@@ -224,9 +239,16 @@ export async function replayProgressiveWorkerOutbox(
     })[] = [];
     for (const point of input.points) {
       const [source] = await connection.execute(sql`
-        SELECT resolve_progressive_report(to_jsonb(report.*)) AS report, report.content_signature,
+        SELECT resolve_progressive_report(to_jsonb(report.*)) AS report, report.content_signature,${columns.reports ? sql`report.archived_at` : sql`NULL::timestamptz`} AS archived_at,
           staged.content_signature AS staged_signature,
-          to_jsonb(attempt) AS attempt, to_jsonb(result) AS result
+          ${columns.attempts ? sql`attempt.evidence_archive_id,attempt.evidence_storage_event_id` : sql`NULL::uuid AS evidence_archive_id,NULL::uuid AS evidence_storage_event_id`},attempt.evidence_payload,
+          jsonb_build_object('result_id',attempt.result_id,'airfoil_id',attempt.airfoil_id,
+            'bc_id',attempt.bc_id,'simulation_preset_revision_id',attempt.simulation_preset_revision_id,
+            'aoa_deg',attempt.aoa_deg,'engine_case_slug',attempt.engine_case_slug,'cl',attempt.cl,'cd',attempt.cd,
+            'cm',attempt.cm,'converged',attempt.converged,'unsteady',attempt.unsteady) AS attempt,
+          jsonb_build_object('airfoil_id',result.airfoil_id,'bc_id',result.bc_id,
+            'simulation_preset_revision_id',result.simulation_preset_revision_id,'aoa_deg',result.aoa_deg,
+            'reynolds',result.reynolds,'speed',result.speed,'chord',result.chord,'mach',result.mach) AS result
         FROM progressive_worker_evidence_attempts association
         JOIN progressive_worker_reports report ON report.sim_job_id = association.sim_job_id
           AND report.sequence = association.sequence AND report.acknowledged_at IS NOT NULL
@@ -247,10 +269,10 @@ export async function replayProgressiveWorkerOutbox(
         throw new ProgressiveWorkerOutboxReplayRefused(
           "Replay has no acknowledged exact stored source association",
         );
-      const validated = validateProgressiveRemoteReport(
-        await resolveStoredProgressiveReport(connection, "worker", source, input.executionId),
-        envelope,
-      );
+      const body = source.archived_at ? reports.get(String(source.content_signature))
+        : await resolveStoredProgressiveReport(connection, "worker", source, input.executionId);
+      if (!body) throw new ProgressiveWorkerOutboxReplayRefused("Worker report storage changed during replay preparation");
+      const validated = validateProgressiveRemoteReport(body, envelope);
       const report = validated.report;
       if (
         report.sequence !== point.sequence ||
@@ -264,6 +286,11 @@ export async function replayProgressiveWorkerOutbox(
         );
       const attempt = source.attempt as Record<string, unknown>;
       const result = source.result as Record<string, unknown>;
+      const full = prepared.get(point.resultAttemptId);
+      if ((source.evidence_archive_id ?? null) !== (full?.pin.archiveId ?? null) ||
+          (full && source.evidence_storage_event_id !== full.pin.storageEventId))
+        throw new ProgressiveWorkerOutboxReplayRefused("Worker attempt storage changed during replay preparation");
+      if (full) await assertAttemptSourcePins(connection, [full.pin]);
       const reported = resolveProgressiveReportedPoint(report.result, {
         alpha: Number(attempt.aoa_deg),
         caseSlug: attempt.engine_case_slug as string | null,
@@ -278,7 +305,7 @@ export async function replayProgressiveWorkerOutbox(
       if (
         reported.contentSignature !== point.pointContentSignature ||
         analysisContentHash(projection.evidencePayload) !==
-          analysisContentHash(attempt.evidence_payload) ||
+          analysisContentHash(full ? full.payload : source.evidence_payload) ||
         [attempt, result].some(
           (row) =>
             row.airfoil_id !== owner.airfoil_id ||
