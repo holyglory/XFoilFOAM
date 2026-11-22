@@ -1099,6 +1099,25 @@ afterAll(async () => {
 });
 
 describe("remote solver sync validation regressions", () => {
+  it("publishes authentic ordered live reports, compact progress and uncertain retries through the registered route", async () => {
+    const { verifyProgressivePublicationBatch } = await import("./progressive-publication-batch-fixture");
+    const rollback = new Error("rollback ordered report publication test");
+    try {
+      await db.transaction(async tx => {
+      const connection = tx as unknown as DB;
+      attemptReadScope.connection = connection;
+      try {
+        await verifyProgressivePublicationBatch(connection, app, { airfoilId, revisionId, bcId: legacyBcId });
+        throw rollback;
+      } finally {
+        attemptReadScope.connection = null;
+      }
+      });
+    } catch (error) {
+      if (error !== rollback) throw error;
+    }
+  }, 60_000);
+
   it.each([
     ["pending", "pending"],
     ["running", "pushing"],

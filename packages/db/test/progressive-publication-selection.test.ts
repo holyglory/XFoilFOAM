@@ -116,6 +116,15 @@ it("prioritizes active exact-owned reports before stale pending backlog", async 
         progressivePublicationSelectionSql(0, 1, "backlog"),
       ),
     ).toEqual(await expected("backlog"));
+    // A failed head remains pending, but the next turn in its lane can serve
+    // the other exact owners and eventually wrap back to the failed job.
+    const pendingOwners = (await expected("backlog", 0, 1, 32))
+      .map(row => String(row.sim_job_id)).sort();
+    expect(pendingOwners.length).toBeGreaterThan(1);
+    for (const [index, after] of pendingOwners.entries()) {
+      expect(await transaction.execute(progressivePublicationSelectionSql(0, 1, "backlog", after)))
+        .toEqual([{ sim_job_id: pendingOwners[(index + 1) % pendingOwners.length] }]);
+    }
     const selectedJobs = new Set();
     for (let ordinal = 0; ordinal < 12; ordinal += 1) {
       const rows = await select();

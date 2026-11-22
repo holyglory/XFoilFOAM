@@ -4,6 +4,11 @@ import { isDeepStrictEqual } from "node:util";
 import { canonicalRemoteHubBaseUrl } from "@aerodb/core";
 import type { DB } from "./client";
 import { canonicalAnalysisJson } from "./analysis-target";
+import {
+  MAX_PROGRESSIVE_PUBLICATION_REPORTS,
+  sameLiveProgressStatus,
+  type ProgressiveReportStatusUpdate,
+} from "./progressive-report-publication-batch";
 import { verifyProgressiveRemoteExecution } from "./progressive-remote-execution";
 import {
   isFinalProgressiveRemoteReport,
@@ -48,6 +53,53 @@ function liveMeasurements(report: ProgressiveRemoteReport) {
   if (!solver_budget_progress) return { ...report, status: { ...status, solver_budget_progress } };
   const { observed_at, ...budget } = solver_budget_progress;
   return { ...report, status: { ...status, solver_budget_progress: budget } };
+}
+
+async function isAcknowledgedLiveResult(
+  db: DB,
+  candidate: ProgressiveRemoteReport,
+  previous: ProgressiveRemoteReport,
+): Promise<boolean> {
+  if (candidate.result?.state !== "running" || candidate.stopProof !== null || previous.stopProof !== null ||
+      !sameLiveProgressStatus(previous.status, candidate.status)) return false;
+  if (previous.result !== null && !isDeepStrictEqual(previous.result, candidate.result)) return false;
+
+  // The ordered outbox keeps quarantined rows with acknowledgement timestamps.
+  // A conflict is never a receipt, and an older A cannot hide a new B-to-A change.
+  const [source] = await db.execute(sql`
+    WITH latest AS MATERIALIZED (
+      SELECT r.sequence,r.report,r.result_payload_hash,r.archived_at
+      FROM progressive_worker_reports r WHERE r.sim_job_id=${candidate.executionId}::uuid
+        AND (r.result_payload_hash IS NOT NULL OR r.archived_at IS NOT NULL OR r.report->'result' IS DISTINCT FROM 'null'::jsonb)
+      ORDER BY r.sequence DESC LIMIT 1
+    ), acknowledged AS MATERIALIZED (
+      SELECT r.sequence,r.report,r.result_payload_hash,r.archived_at
+      FROM progressive_worker_reports r WHERE r.sim_job_id=${candidate.executionId}::uuid AND r.acknowledged_at IS NOT NULL
+        AND (r.result_payload_hash IS NOT NULL OR r.archived_at IS NOT NULL OR r.report->'result' IS DISTINCT FROM 'null'::jsonb)
+      ORDER BY r.sequence DESC LIMIT 1
+    )
+    SELECT latest.sequence,CASE WHEN latest.sequence<>${previous.sequence}
+      THEN resolve_progressive_report(latest.report,latest.result_payload_hash)->'result' END AS earlier_result
+    FROM latest JOIN acknowledged a ON a.sequence=latest.sequence OR a.result_payload_hash=latest.result_payload_hash
+    WHERE latest.archived_at IS NULL AND a.archived_at IS NULL
+      AND latest.report->>'executionId'=${candidate.executionId} AND a.report->>'executionId'=${candidate.executionId}
+      AND latest.report->>'solverId'=${candidate.solverId} AND a.report->>'solverId'=${candidate.solverId}
+      AND latest.report->>'promiseId'=${candidate.promiseId} AND a.report->>'promiseId'=${candidate.promiseId}
+      AND latest.report->>'assignmentSignature'=${candidate.assignmentSignature} AND a.report->>'assignmentSignature'=${candidate.assignmentSignature}
+      AND latest.report->'stopProof'='null'::jsonb AND a.report->'stopProof'='null'::jsonb
+      AND latest.report#>>'{status,state}'='running' AND a.report#>>'{status,state}'='running'
+      AND NOT EXISTS (SELECT FROM progressive_worker_report_conflicts conflict
+        WHERE conflict.sim_job_id=${candidate.executionId}::uuid AND conflict.sequence>=a.sequence)
+      AND NOT EXISTS (SELECT FROM progressive_worker_reports changed
+        WHERE changed.sim_job_id=${candidate.executionId}::uuid
+          AND changed.sequence>a.sequence AND changed.sequence<=latest.sequence
+          AND changed.result_payload_hash IS DISTINCT FROM a.result_payload_hash
+          AND (changed.result_payload_hash IS NOT NULL OR changed.archived_at IS NOT NULL
+            OR changed.report->'result' IS DISTINCT FROM 'null'::jsonb))
+  `);
+  return Boolean(source && (Number(source.sequence) === previous.sequence
+    ? previous.result !== null
+    : isDeepStrictEqual(source.earlier_result, candidate.result)));
 }
 
 async function projectRunningWorkerReport(
@@ -289,15 +341,18 @@ export async function enqueueProgressiveWorkerReport(
       version: 1 as const,
     });
     if (latest) {
-      const replay = validateProgressiveRemoteReport(
-        { ...content, sequence: Number(latest.sequence) },
-        envelope,
-      );
       const previous = latest.report as unknown as ProgressiveRemoteReport;
+      const observed = { ...content, sequence: Number(latest.sequence) };
+      const unchanged = await isAcknowledgedLiveResult(connection, observed, previous);
+      if (unchanged) content.result = null;
+      const replay = validateProgressiveRemoteReport(
+        { ...content, sequence: observed.sequence }, envelope,
+      );
+      const previousMeasurement = unchanged ? { ...previous, result: null } : previous;
       if (replay.contentSignature !== latest.content_signature &&
           (previous.status.state === "running" || previous.status.state === "pending") &&
           previous.stopProof === null && replay.report.stopProof === null &&
-          isDeepStrictEqual(liveMeasurements(previous), liveMeasurements(replay.report))) {
+          isDeepStrictEqual(liveMeasurements(previousMeasurement), liveMeasurements(replay.report))) {
         // A later observation clock by itself carries no new solver measurement.
         // Project the live heartbeat and preserve the prior report's identity.
         await projectRunningWorkerReport(connection,replay.report);
@@ -390,6 +445,42 @@ export async function readPendingProgressiveWorkerReport(
         report: await resolveStoredProgressiveReport(db, "worker", row, input.executionId),
       }
     : null;
+}
+
+/** Only the uninterrupted prefix sharing the actual immutable PG result may follow this head. */
+export async function readPendingProgressiveReportUpdates(
+  db: DB,
+  anchor: ProgressiveRemoteReport,
+  contentSignature: string,
+): Promise<ProgressiveReportStatusUpdate[]> {
+  if (anchor.stopProof !== null || anchor.status.state !== "running" || anchor.result?.state !== "running")
+    return [];
+  const rows = await db.execute(sql`
+    WITH source AS (
+      SELECT result_payload_hash FROM progressive_worker_reports
+      WHERE sim_job_id=${anchor.executionId}::uuid AND sequence=${anchor.sequence}
+        AND content_signature=${contentSignature} AND result_payload_hash IS NOT NULL
+    )
+    SELECT w.sequence,w.content_signature,w.report->'status' AS status,
+      w.result_payload_hash=source.result_payload_hash AND w.acknowledged_at IS NULL
+      AND w.report->'stopProof'='null'::jsonb
+      AND w.report->>'executionId'=${anchor.executionId} AND w.report->>'solverId'=${anchor.solverId}
+      AND w.report->>'promiseId'=${anchor.promiseId} AND w.report->>'assignmentSignature'=${anchor.assignmentSignature} AS same_source
+    FROM source CROSS JOIN LATERAL (
+      SELECT sequence,content_signature,report,result_payload_hash,acknowledged_at FROM progressive_worker_reports
+      WHERE sim_job_id=${anchor.executionId}::uuid AND sequence>${anchor.sequence}
+      ORDER BY sequence LIMIT ${MAX_PROGRESSIVE_PUBLICATION_REPORTS - 1}
+    ) w ORDER BY w.sequence
+  `);
+  const updates: ProgressiveReportStatusUpdate[] = [];
+  for (const row of rows) {
+    const sequence = Number(row.sequence);
+    const status = row.status as ProgressiveRemoteReport["status"];
+    if (row.same_source !== true || !status || sequence !== anchor.sequence + updates.length + 1 ||
+        !sameLiveProgressStatus(anchor.status, status)) break;
+    updates.push({ sequence, status, contentSignature: String(row.content_signature) });
+  }
+  return updates;
 }
 
 export async function acknowledgeProgressiveWorkerReport(
