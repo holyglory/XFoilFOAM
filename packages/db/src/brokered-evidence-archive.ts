@@ -1,4 +1,4 @@
-import { and, eq } from "drizzle-orm";
+import { and, eq, inArray } from "drizzle-orm";
 
 import type { DB } from "./client";
 import type { EvidenceManifestEntry } from "./evidence-archive-manifest";
@@ -12,6 +12,11 @@ import {
 
 type EvidenceArtifactKind =
   (typeof solverEvidenceArtifacts.$inferInsert)["kind"];
+type Artifact = typeof solverEvidenceArtifacts.$inferSelect;
+
+// A logical artifact has many bound columns. Keep each VALUES statement well
+// below the PostgreSQL parameter limit even for multi-thousand-file archives.
+const MEMBER_BATCH_SIZE = 512;
 
 export interface VerifiedBrokeredArchiveIdentity {
   bucket: string;
@@ -27,6 +32,16 @@ export interface VerifiedBrokeredArchiveIdentity {
   zstdLevel: number;
   bundledFileCount: number;
   verifiedAt: Date;
+}
+
+interface ArchiveRegistration {
+  resultId: string;
+  resultAttemptId: string;
+  sourceArtifactId: string;
+  manifestArtifactId: string;
+  evidenceBase: string;
+  identity: VerifiedBrokeredArchiveIdentity;
+  memberSet: ReadonlyArray<EvidenceManifestEntry>;
 }
 
 function artifactKindForManifestRole(role: string): EvidenceArtifactKind {
@@ -94,6 +109,209 @@ function exactJson(value: unknown): string {
     .join(",")}}`;
 }
 
+function sameOwner(artifact: Artifact, source: Artifact): boolean {
+  return (
+    artifact.resultId === source.resultId &&
+    artifact.resultAttemptId === source.resultAttemptId &&
+    artifact.airfoilId === source.airfoilId &&
+    artifact.simJobId === source.simJobId &&
+    artifact.engineJobId === source.engineJobId &&
+    artifact.engineCaseSlug === source.engineCaseSlug &&
+    artifact.methodKey === source.methodKey &&
+    artifact.solverImplementationId === source.solverImplementationId &&
+    artifact.solverRuntimeBuildId === source.solverRuntimeBuildId &&
+    artifact.aoaDeg === source.aoaDeg
+  );
+}
+
+function logicalMember(
+  member: EvidenceManifestEntry,
+  source: Artifact,
+  evidenceBase: string,
+  identity: VerifiedBrokeredArchiveIdentity,
+) {
+  return {
+    resultId: source.resultId,
+    resultAttemptId: source.resultAttemptId,
+    airfoilId: source.airfoilId,
+    simJobId: source.simJobId,
+    engineJobId: source.engineJobId,
+    engineCaseSlug: source.engineCaseSlug,
+    methodKey: source.methodKey,
+    solverImplementationId: source.solverImplementationId,
+    solverRuntimeBuildId: source.solverRuntimeBuildId,
+    aoaDeg: source.aoaDeg,
+    kind: artifactKindForManifestRole(member.role!),
+    role: member.role!,
+    storageKey: memberStorageKey(identity, member.path),
+    mimeType: mimeTypeForMember(member.path),
+    sha256: member.sha256,
+    byteSize: member.byteSize,
+    metadata: {
+      evidenceBase,
+      archiveMemberPath: member.path,
+      storageBackend: "gcs",
+      bucket: identity.bucket,
+      objectKey: identity.objectKey,
+      generation: identity.generation,
+      ...(member.role === "mesh_evidence"
+        ? { engineArtifactKind: "mesh_evidence" }
+        : {}),
+    },
+  };
+}
+
+type LogicalMember = ReturnType<typeof logicalMember>;
+
+function matchesMember(
+  row: Artifact,
+  wanted: LogicalMember,
+  source: Artifact,
+): boolean {
+  return (
+    sameOwner(row, source) &&
+    row.kind === wanted.kind &&
+    row.role === wanted.role &&
+    (row.field ?? "") === "" &&
+    row.storageKey === wanted.storageKey &&
+    row.sha256 === wanted.sha256 &&
+    row.byteSize === wanted.byteSize &&
+    row.mimeType === wanted.mimeType &&
+    exactJson(row.metadata) === exactJson(wanted.metadata)
+  );
+}
+
+async function registerMembers(
+  db: DB,
+  archiveId: string,
+  existingArchive: boolean,
+  source: Artifact,
+  manifest: Artifact,
+  input: ArchiveRegistration,
+) {
+  const expected = new Map(
+    input.memberSet.map((member) => [
+      member.path,
+      member.path === "evidence_manifest.json"
+        ? null
+        : logicalMember(member, source, input.evidenceBase, input.identity),
+    ]),
+  );
+  const ids = new Map<string, string>([
+    ["evidence_manifest.json", manifest.id],
+  ]);
+
+  // The whole set (including any unexpected path) belongs to this archive.
+  // Validate the actual linked rows both on replay and after inserting gaps.
+  async function verifiedLinks() {
+    const rows = await db
+      .select({
+        path: solverEvidenceArtifactMembers.memberPath,
+        artifact: solverEvidenceArtifacts,
+      })
+      .from(solverEvidenceArtifactMembers)
+      .innerJoin(
+        solverEvidenceArtifacts,
+        eq(
+          solverEvidenceArtifacts.id,
+          solverEvidenceArtifactMembers.artifactId,
+        ),
+      )
+      .where(eq(solverEvidenceArtifactMembers.archiveId, archiveId))
+      .limit(expected.size + 1);
+    const paths = new Set<string>();
+    for (const { path, artifact } of rows) {
+      const wanted = expected.get(path);
+      if (
+        wanted === undefined ||
+        paths.has(path) ||
+        (ids.has(path) && ids.get(path) !== artifact.id)
+      ) {
+        throw new Error(
+          `brokered archive member ${path} conflicts with existing evidence`,
+        );
+      }
+      const matches = wanted
+        ? matchesMember(artifact, wanted, source)
+        : artifact.kind === "manifest" &&
+          artifact.sha256 === manifest.sha256 &&
+          artifact.byteSize === manifest.byteSize &&
+          sameOwner(artifact, source);
+      if (!matches) {
+        throw new Error(
+          `brokered archive member ${path} changed immutable metadata`,
+        );
+      }
+      paths.add(path);
+      ids.set(path, artifact.id);
+    }
+    return paths;
+  }
+
+  const existing = existingArchive ? await verifiedLinks() : new Set<string>();
+  if (existing.size === expected.size) return existing.size;
+  const missing = Array.from(expected).filter(([path]) => !existing.has(path));
+  for (let offset = 0; offset < missing.length; offset += MEMBER_BATCH_SIZE) {
+    const batch = missing.slice(offset, offset + MEMBER_BATCH_SIZE);
+    const values = batch.flatMap(([, wanted]) => (wanted ? [wanted] : []));
+    if (values.length) {
+      const byKey = new Map(
+        values.map((wanted) => [wanted.storageKey, wanted]),
+      );
+      const inserted = await db
+        .insert(solverEvidenceArtifacts)
+        .values(values)
+        .onConflictDoNothing()
+        .returning({
+          id: solverEvidenceArtifacts.id,
+          storageKey: solverEvidenceArtifacts.storageKey,
+        });
+      for (const artifact of inserted) {
+        const wanted = byKey.get(artifact.storageKey)!;
+        ids.set(wanted.metadata.archiveMemberPath, artifact.id);
+        byKey.delete(artifact.storageKey);
+      }
+      if (byKey.size) {
+        // A partial registration or concurrent insert may already own an
+        // unlinked artifact. Reuse only the exact association on this attempt.
+        const stored = await db
+          .select()
+          .from(solverEvidenceArtifacts)
+          .where(
+            and(
+              eq(
+                solverEvidenceArtifacts.resultAttemptId,
+                input.resultAttemptId,
+              ),
+              inArray(solverEvidenceArtifacts.storageKey, [...byKey.keys()]),
+            ),
+          );
+        for (const artifact of stored) {
+          const wanted = byKey.get(artifact.storageKey)!;
+          if (matchesMember(artifact, wanted, source))
+            ids.set(wanted.metadata.archiveMemberPath, artifact.id);
+        }
+      }
+    }
+    const links = batch.map(([memberPath]) => {
+      const artifactId = ids.get(memberPath);
+      if (!artifactId)
+        throw new Error(
+          `brokered archive member ${memberPath} changed immutable metadata`,
+        );
+      return { archiveId, artifactId, memberPath };
+    });
+    await db
+      .insert(solverEvidenceArtifactMembers)
+      .values(links)
+      .onConflictDoNothing();
+  }
+  const verified = await verifiedLinks();
+  if (verified.size !== expected.size)
+    throw new Error("brokered archive database member coverage is incomplete");
+  return verified.size;
+}
+
 /**
  * Register the exact generation-pinned archive accepted through the remote
  * evidence broker. The broker authenticates the compressed/tar identity and
@@ -104,18 +322,10 @@ function exactJson(value: unknown): string {
  */
 export async function registerVerifiedBrokeredEvidenceArchive(
   db: DB,
-  input: {
-    resultId: string;
-    resultAttemptId: string;
-    sourceArtifactId: string;
-    manifestArtifactId: string;
-    evidenceBase: string;
-    identity: VerifiedBrokeredArchiveIdentity;
-    memberSet: ReadonlyArray<EvidenceManifestEntry>;
-  },
+  input: ArchiveRegistration,
 ): Promise<{ archiveId: string; memberCount: number }> {
   const [owner] = await db
-    .select()
+    .select({ id: resultAttempts.id })
     .from(resultAttempts)
     .where(
       and(
@@ -165,18 +375,7 @@ export async function registerVerifiedBrokeredEvidenceArchive(
   ) {
     throw new Error("brokered archive manifest changed immutable identity");
   }
-  const sameOwner = (
-    artifact: typeof solverEvidenceArtifacts.$inferSelect,
-  ): boolean =>
-    artifact.airfoilId === source.airfoilId &&
-    artifact.simJobId === source.simJobId &&
-    artifact.engineJobId === source.engineJobId &&
-    artifact.engineCaseSlug === source.engineCaseSlug &&
-    artifact.methodKey === source.methodKey &&
-    artifact.solverImplementationId === source.solverImplementationId &&
-    artifact.solverRuntimeBuildId === source.solverRuntimeBuildId &&
-    artifact.aoaDeg === source.aoaDeg;
-  if (!sameOwner(manifest)) {
+  if (!sameOwner(manifest, source)) {
     throw new Error(
       "brokered manifest and bundle do not share one exact owner",
     );
@@ -258,29 +457,21 @@ export async function registerVerifiedBrokeredEvidenceArchive(
     throw new Error("brokered GCS generation changed immutable blob metadata");
   }
 
-  const [current] = await db
-    .select()
-    .from(solverEvidenceArchives)
-    .where(
-      and(
-        eq(solverEvidenceArchives.resultAttemptId, input.resultAttemptId),
-        eq(solverEvidenceArchives.state, "current"),
-      ),
-    )
-    .limit(1);
-  if (
-    current &&
-    (current.resultId !== input.resultId ||
-      current.sourceArtifactId !== source.id ||
-      current.blobId !== blob.id)
-  ) {
-    throw new Error(
-      "exact attempt already owns a different current evidence archive",
-    );
-  }
-  let archive = current;
+  const findCurrent = () =>
+    db
+      .select()
+      .from(solverEvidenceArchives)
+      .where(
+        and(
+          eq(solverEvidenceArchives.resultAttemptId, input.resultAttemptId),
+          eq(solverEvidenceArchives.state, "current"),
+        ),
+      )
+      .limit(1);
+  let [archive] = await findCurrent();
+  let created = false;
   if (!archive) {
-    [archive] = await db
+    const [inserted] = await db
       .insert(solverEvidenceArchives)
       .values({
         resultId: input.resultId,
@@ -289,119 +480,29 @@ export async function registerVerifiedBrokeredEvidenceArchive(
         blobId: blob.id,
         state: "current",
       })
+      .onConflictDoNothing()
       .returning();
+    created = Boolean(inserted);
+    archive = inserted ?? (await findCurrent())[0];
   }
   if (!archive) throw new Error("failed to register brokered evidence archive");
-
-  for (const member of input.memberSet) {
-    let artifact =
-      member.path === "evidence_manifest.json" ? manifest : undefined;
-    if (!artifact) {
-      const kind = artifactKindForManifestRole(member.role!);
-      const storageKey = memberStorageKey(input.identity, member.path);
-      const metadata = {
-        evidenceBase: input.evidenceBase,
-        archiveMemberPath: member.path,
-        storageBackend: "gcs",
-        bucket: input.identity.bucket,
-        objectKey: input.identity.objectKey,
-        generation: input.identity.generation,
-        ...(member.role === "mesh_evidence"
-          ? { engineArtifactKind: "mesh_evidence" }
-          : {}),
-      };
-      [artifact] = await db
-        .insert(solverEvidenceArtifacts)
-        .values({
-          resultId: input.resultId,
-          resultAttemptId: input.resultAttemptId,
-          airfoilId: source.airfoilId,
-          simJobId: source.simJobId,
-          engineJobId: source.engineJobId,
-          engineCaseSlug: source.engineCaseSlug,
-          methodKey: source.methodKey,
-          solverImplementationId: source.solverImplementationId,
-          solverRuntimeBuildId: source.solverRuntimeBuildId,
-          aoaDeg: source.aoaDeg,
-          kind,
-          role: member.role!,
-          storageKey,
-          mimeType: mimeTypeForMember(member.path),
-          sha256: member.sha256,
-          byteSize: member.byteSize,
-          metadata,
-        })
-        .onConflictDoNothing()
-        .returning();
-      if (!artifact) {
-        [artifact] = await db
-          .select()
-          .from(solverEvidenceArtifacts)
-          .where(
-            and(
-              eq(
-                solverEvidenceArtifacts.resultAttemptId,
-                input.resultAttemptId,
-              ),
-              eq(solverEvidenceArtifacts.kind, kind),
-              eq(solverEvidenceArtifacts.storageKey, storageKey),
-              eq(solverEvidenceArtifacts.sha256, member.sha256),
-            ),
-          )
-          .limit(1);
-      }
-      if (
-        !artifact ||
-        artifact.resultId !== input.resultId ||
-        artifact.resultAttemptId !== input.resultAttemptId ||
-        artifact.role !== member.role ||
-        artifact.byteSize !== member.byteSize ||
-        artifact.mimeType !== mimeTypeForMember(member.path) ||
-        exactJson(artifact.metadata) !== exactJson(metadata) ||
-        !sameOwner(artifact)
-      ) {
-        throw new Error(
-          `brokered archive member ${member.path} changed immutable metadata`,
-        );
-      }
-    }
-    const [insertedMember] = await db
-      .insert(solverEvidenceArtifactMembers)
-      .values({
-        archiveId: archive.id,
-        artifactId: artifact.id,
-        memberPath: member.path,
-      })
-      .onConflictDoNothing()
-      .returning({ archiveId: solverEvidenceArtifactMembers.archiveId });
-    if (!insertedMember) {
-      const [existingMember] = await db
-        .select()
-        .from(solverEvidenceArtifactMembers)
-        .where(
-          and(
-            eq(solverEvidenceArtifactMembers.archiveId, archive.id),
-            eq(solverEvidenceArtifactMembers.artifactId, artifact.id),
-          ),
-        )
-        .limit(1);
-      if (!existingMember || existingMember.memberPath !== member.path) {
-        throw new Error(
-          `brokered archive member ${member.path} conflicts with existing evidence`,
-        );
-      }
-    }
-  }
-  const members = await db
-    .select({ path: solverEvidenceArtifactMembers.memberPath })
-    .from(solverEvidenceArtifactMembers)
-    .where(eq(solverEvidenceArtifactMembers.archiveId, archive.id));
   if (
-    members.length !== input.memberSet.length ||
-    new Set(members.map((member) => member.path)).size !==
-      input.memberSet.length
+    archive.resultId !== input.resultId ||
+    archive.sourceArtifactId !== source.id ||
+    archive.blobId !== blob.id
   ) {
-    throw new Error("brokered archive database member coverage is incomplete");
+    throw new Error(
+      "exact attempt already owns a different current evidence archive",
+    );
   }
-  return { archiveId: archive.id, memberCount: members.length };
+
+  const memberCount = await registerMembers(
+    db,
+    archive.id,
+    !created,
+    source,
+    manifest,
+    input,
+  );
+  return { archiveId: archive.id, memberCount };
 }

@@ -432,8 +432,8 @@ function artifactItem(label: string) {
   };
 }
 
-function brokeredRestartManifest() {
-  const members = [
+function brokeredRestartManifest(memberCount: number) {
+  const paths = [
     ["openfoam/transient/transient_start.json", "continuation_state"],
     ["openfoam/transient/system/controlDict", "dictionary"],
     ["openfoam/transient/system/fvSchemes", "dictionary"],
@@ -455,7 +455,20 @@ function brokeredRestartManifest() {
       "openfoam/postProcessing/forceCoeffs/0/coefficient.dat",
       "force_coefficients",
     ],
-  ].map(([path, role]) => {
+    ["diagnostics/custom.json", "solver_diagnostic"],
+  ];
+  // Real archived time directories contribute many separate logical files.
+  // Two paths with the same bytes must still retain distinct artifact IDs.
+  const fields = ["U", "p", "k", "omega", "nut", "phi"];
+  for (let index = 0; paths.length < memberCount - 1; index++) {
+    const time = 2 + Math.floor(index / fields.length);
+    paths.push([`time_directories/${time}/${fields[index % fields.length]}`, "time_directory"]);
+  }
+  const members = paths.map(([path, role]) => {
+    if (path.endsWith("/nut")) {
+      const bytes = Buffer.from("uniform 0");
+      return { path, role, sha256: sha256(bytes), byteSize: bytes.length };
+    }
     const bytes = Buffer.from(`${PREFIX}:brokered-member:${path}`);
     return {
       path,
@@ -468,6 +481,47 @@ function brokeredRestartManifest() {
     JSON.stringify({ schemaVersion: 1, bundleExcludes: [], files: members }),
   );
   return { bytes, members };
+}
+
+function measureArchiveRegistration() {
+  const register = dbSchema.registerVerifiedBrokeredEvidenceArchive;
+  const samples: { roundTrips: number; memberInserts: number; artifactInserts: number; elapsedMs: number }[] = [];
+  // Count driver calls made by the real helper inside the HTTP transaction.
+  // The public route and the broker verification run outside this timer.
+  const spy = vi.spyOn(dbSchema, "registerVerifiedBrokeredEvidenceArchive").mockImplementation(async (tx, input) => {
+    const previous = sql.options.debug;
+    const sample = { roundTrips: 0, memberInserts: 0, artifactInserts: 0, elapsedMs: 0 };
+    const start = performance.now();
+    sql.options.debug = (_id, statement) => {
+      sample.roundTrips++;
+      if (/^\s*insert into "solver_evidence_artifact_members"/i.test(statement)) sample.memberInserts++;
+      if (/^\s*insert into "solver_evidence_artifacts"/i.test(statement)) sample.artifactInserts++;
+    };
+    try {
+      return await register(tx, input);
+    } finally {
+      sql.options.debug = previous;
+      sample.elapsedMs = Math.round(performance.now() - start);
+      samples.push(sample);
+    }
+  });
+  return { samples, restore: () => spy.mockRestore() };
+}
+
+function brokeredMemberRows(archiveId: string) {
+  return db.select({
+    id: solverEvidenceArtifacts.id,
+    path: solverEvidenceArtifactMembers.memberPath,
+    kind: solverEvidenceArtifacts.kind,
+    role: solverEvidenceArtifacts.role,
+    sha256: solverEvidenceArtifacts.sha256,
+    byteSize: solverEvidenceArtifacts.byteSize,
+    resultId: solverEvidenceArtifacts.resultId,
+    attemptId: solverEvidenceArtifacts.resultAttemptId,
+  }).from(solverEvidenceArtifactMembers)
+    .innerJoin(solverEvidenceArtifacts, eq(solverEvidenceArtifacts.id, solverEvidenceArtifactMembers.artifactId))
+    .where(eq(solverEvidenceArtifactMembers.archiveId, archiveId))
+    .orderBy(solverEvidenceArtifactMembers.memberPath);
 }
 
 function makePoint(aoaDeg: number, patch: Record<string, unknown> = {}) {
@@ -4000,8 +4054,8 @@ describe("remote solver sync validation regressions", () => {
     ).toBe(200);
   });
 
-  it("registers one generation-pinned brokered PRECALC archive and durably owns FINAL before acknowledging the point", async () => {
-    const aoaDeg = 712.101;
+  it.each([700, 2876])("registers one generation-pinned brokered PRECALC archive and durably owns FINAL before acknowledging the point (%i members)", async (memberCount) => {
+    const aoaDeg = memberCount === 700 ? 712.101 : 712.102;
     const promiseId = await createPromise("active", aoaDeg);
     const [{ id: promisePointId }] = await db
       .select({ id: syncSweepPromisePoints.id })
@@ -4017,19 +4071,19 @@ describe("remote solver sync validation regressions", () => {
     const uploadId = randomUUID();
     const remoteResultId = randomUUID();
     const remoteResultAttemptId = randomUUID();
-    const manifest = brokeredRestartManifest();
+    const manifest = brokeredRestartManifest(memberCount);
     const manifestSha256 = sha256(manifest.bytes);
     const storedSha256 = sha256(
-      Buffer.from(`${PREFIX}:brokered-restart-archive`),
+      Buffer.from(`${PREFIX}:brokered-restart-archive:${memberCount}`),
     );
-    const tarSha256 = sha256(Buffer.from(`${PREFIX}:brokered-restart-tar`));
+    const tarSha256 = sha256(Buffer.from(`${PREFIX}:brokered-restart-tar:${memberCount}`));
     const bucket = `${PREFIX}-bucket`;
     const objectKey = `solver-evidence/v1/sha256/${storedSha256.slice(0, 2)}/${storedSha256}.tar.zst`;
     const generation = "9007199254740993123";
     const crc32c = "ImIEBA==";
     const storedByteSize = 4096;
     const tarByteSize = 8192;
-    const engineJobId = `${PREFIX}-brokered-precalc-engine`;
+    const engineJobId = `${PREFIX}-brokered-precalc-engine-${memberCount}`;
     const engineCaseSlug = "aoa_712_101";
     const evidenceBase = `cases/${engineCaseSlug}/evidence`;
     let canonicalResultId: string | null = null;
@@ -4257,6 +4311,8 @@ describe("remote solver sync validation regressions", () => {
           `Bearer ${process.env.ENGINE_CONTROL_PLANE_TOKEN}`,
         );
         const request = JSON.parse(String(init?.body));
+        expect(request.manifestSha256).toBe(manifestSha256);
+        expect(request.manifestMemberCount).toBe(memberCount);
         return Response.json({
           state: "verified",
           remote: request.remote,
@@ -4268,6 +4324,7 @@ describe("remote solver sync validation regressions", () => {
       },
     );
     vi.stubGlobal("fetch", fetchMock);
+    const registration = measureArchiveRegistration();
     try {
       const pushed = await postRemote();
       expect(pushed.statusCode, pushed.body).toBe(200);
@@ -4298,12 +4355,17 @@ describe("remote solver sync validation regressions", () => {
         .where(eq(solverEvidenceArchives.resultAttemptId, attemptId));
       expect(archive).toBeTruthy();
       blobId = archive!.blobId;
-      expect(
-        await db
-          .select({ path: solverEvidenceArtifactMembers.memberPath })
-          .from(solverEvidenceArtifactMembers)
-          .where(eq(solverEvidenceArtifactMembers.archiveId, archive!.id)),
-      ).toHaveLength(manifest.members.length + 1);
+      const firstMembers = await brokeredMemberRows(archive!.id);
+      expect(firstMembers).toHaveLength(memberCount);
+      const byPath = new Map(firstMembers.map(row => [row.path, row]));
+      expect(byPath.size).toBe(memberCount);
+      expect(new Set(firstMembers.map(row => row.id)).size).toBe(memberCount);
+      expect(firstMembers.every(row => row.resultId === canonicalResultId && row.attemptId === attemptId)).toBe(true);
+      for (const member of manifest.members) expect(byPath.get(member.path)).toMatchObject(member);
+      expect(byPath.get("diagnostics/custom.json")).toMatchObject({ kind: "field_data", role: "solver_diagnostic" });
+      expect(byPath.get("evidence_manifest.json")).toMatchObject({
+        kind: "manifest", sha256: manifestSha256, byteSize: manifest.bytes.length,
+      });
       expect(
         await db
           .select()
@@ -4399,6 +4461,24 @@ describe("remote solver sync validation regressions", () => {
         fulfilledAoas: [aoaDeg],
       });
       expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(await brokeredMemberRows(archive!.id)).toEqual(firstMembers);
+      expect(registration.samples).toHaveLength(2);
+      const [first, repeated] = registration.samples;
+      console.info("brokered-archive-registration", JSON.stringify({ memberCount, first, replay: repeated }));
+      // Growth is in bounded groups; a complete replay must not re-run the
+      // per-row INSERT triggers, even if every INSERT would hit a conflict.
+      expect(first!.artifactInserts).toBeGreaterThan(0);
+      expect(first!.memberInserts).toBeGreaterThan(0);
+      expect(first!.roundTrips).toBeLessThanOrEqual(12 + 2 * Math.ceil(memberCount / 256));
+      expect(repeated!.roundTrips).toBeGreaterThan(0);
+      expect(repeated!.roundTrips).toBeLessThanOrEqual(10);
+      expect(repeated).toMatchObject({ memberInserts: 0, artifactInserts: 0 });
+      const evidenceList = await app.inject({ method: "GET", url: `/api/results/${canonicalResultId}/evidence` });
+      expect(evidenceList.statusCode).toBe(200);
+      const { artifacts } = evidenceList.json<{ artifacts: { id: string; sha256: string; byteSize: number }[] }>();
+      const listed = new Map(artifacts.map(artifact => [artifact.id, artifact]));
+      for (const row of firstMembers) expect(listed.get(row.id)).toMatchObject({ sha256: row.sha256, byteSize: row.byteSize });
+      expect(listed.get(initialLogicalMember!.id)).toMatchObject({ sha256: legacyMember.sha256, byteSize: legacyMember.byteSize });
       expect(
         await db
           .select({ id: solverEvidenceArtifacts.id })
@@ -4418,6 +4498,7 @@ describe("remote solver sync validation regressions", () => {
           .where(eq(simUransVerifyQueue.precalcResultAttemptId, attemptId)),
       ).toHaveLength(1);
     } finally {
+      registration.restore();
       vi.unstubAllGlobals();
       // Bound broker rows are deliberately immutable in runtime. This test's
       // isolated fixture cleanup bypasses only those audit triggers so it
@@ -4441,7 +4522,7 @@ describe("remote solver sync validation regressions", () => {
         .delete(registeredRemoteSolvers)
         .where(eq(registeredRemoteSolvers.id, solverId));
     }
-  });
+  }, 120_000);
 
   it("retains a rejected URANS timeout on its attempt without publishing it", async () => {
     const aoaDeg = 713.001;
