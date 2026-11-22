@@ -229,6 +229,14 @@ export async function verifyHzAttemptTransition(
       report: (value: unknown) => reports.push(value as Record<string, any>),
     };
     if (periodic) {
+      // A finished assigned job may contain rejected individual points. The
+      // signed original and measured stop establish custody for a closed promise.
+      await db.execute(
+        sql`UPDATE sim_jobs SET status='done',engine_state='completed' WHERE id=${input.executionId}::uuid`,
+      );
+      await db.execute(
+        sql`UPDATE sync_sweep_promises SET status='fulfilled' WHERE id::text=(SELECT request_payload->>'syncPromiseId' FROM sim_jobs WHERE id=${input.executionId}::uuid)`,
+      );
       await db.execute(
         sql`UPDATE progressive_worker_hub_receipts SET receipt=receipt||'{"storageOnly":false}'::jsonb WHERE result_attempt_id=${id}::uuid`,
       );
