@@ -1,3 +1,7 @@
+import {
+  backfillWorkerReportPrefix,
+  type WorkerPrefixCursor,
+} from "@aerodb/db/progressive-report-prefix";
 import type { DB } from "@aerodb/db";
 import {
   canonicalReportJson,
@@ -615,5 +619,78 @@ export async function runDuplicateReportCleanup(
     } catch (error) {
       if (!signal.aborted) throw error;
     }
+  }
+}
+
+/** Local historical sharing has no cloud dependency. The existing report
+ * storage process owns its lifetime, signal and bounded database pool. */
+export async function runNativeWorkerReportSharing(
+  db: DB,
+  signal: AbortSignal,
+  after: WorkerPrefixCursor | null = null,
+): Promise<void> {
+  if (
+    configuredDeploymentRole() !== "remote-solver" ||
+    process.env.AIRFOILFOAM_NATIVE_REPORT_SHARING !== "true"
+  )
+    return;
+  const excludeJobs = (process.env.AIRFOILFOAM_NATIVE_REPORT_EXCLUDE_JOBS ?? "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const inspectedThrough = new Map<string, number>();
+  let rows = 8;
+  while (!signal.aborted) {
+    let pause = 100;
+    try {
+      const result = await backfillWorkerReportPrefix(db, {
+        apply: true,
+        after,
+        excludeJobs,
+        inspectedThrough,
+        rows,
+      });
+      after = result.after;
+      if (after && result.inspectedThrough !== null)
+        inspectedThrough.set(after.executionId, result.inspectedThrough);
+      if (result.state === "disabled") {
+        inspectedThrough.clear();
+        after = null;
+      }
+      if (
+        result.normalized ||
+        result.state === "reader-unverified" ||
+        result.state === "timed-out"
+      )
+        console.info(
+          JSON.stringify({
+            component: "native-worker-report-sharing",
+            ...result,
+            physicalSpaceReleased: null,
+          }),
+        );
+      if (result.state === "complete" || result.state === "disabled")
+        pause = 300_000;
+      if (result.state === "timed-out" && after && rows > 2) {
+        rows = Math.max(2, Math.floor(rows / 2));
+        pause = 1500;
+      } else if (
+        (result.state === "busy" || result.state === "timed-out") &&
+        after
+      ) {
+        // Revisit this execution on the next sweep instead of holding up siblings.
+        after = { executionId: after.executionId, sequence: null };
+      }
+      if (!after || after.sequence === null) rows = 8;
+    } catch (error) {
+      console.error(
+        "[sweeper] native worker report sharing",
+        error instanceof Error ? error.message : String(error),
+      );
+      pause = 30_000;
+    }
+    await delay(pause, undefined, { signal }).catch((error) => {
+      if (!signal.aborted) throw error;
+    });
   }
 }

@@ -5610,6 +5610,18 @@ timeout_seconds = 600
 requires = ["workspace"]
 command = ["/usr/bin/corepack", "pnpm", "-r", "--filter", "@aerodb/core", "--filter", "@aerodb/db", "--filter", "@aerodb/sweeper", "--filter", "@aerodb/api", "typecheck"]
 
+# The portable CLI opens a second session and commits the 0198 policy for its
+# lock/retry case. Give it its own migrated database, including the benchmark.
+[[test.progressive-report-archive.check]]
+name = "native-report-prefix"
+tier = "development"
+timeout_seconds = 300
+requires = ["workspace"]
+env = { PROGRESSIVE_REPORT_ARCHIVE_DISPOSABLE_DB = "1" }
+case_command = ["/bin/bash", "-c", "/usr/bin/corepack pnpm --filter @aerodb/db migrate && /usr/bin/corepack pnpm --filter @aerodb/db seed && exec /usr/bin/corepack pnpm --filter @aerodb/sweeper exec vitest run test/native-worker-report-sharing.test.ts --reporter=default --reporter=junit --outputFile.junit=\"$DEVCOORDINATOR_DIAGNOSTICS_DIR/report.xml\""]
+cases = [{ id = "native-prefix-postgres", args = [], postgres = "default" }]
+diagnostic_sources = [{ format = "junit", path = "report.xml" }]
+
 [[test.progressive-report-archive.check]]
 name = "archive-database"
 tier = "development"

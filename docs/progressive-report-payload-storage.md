@@ -195,3 +195,42 @@ measurements, not a claim of OS disk space released. PostgreSQL can reuse pages
 freed by UPDATE while the physical relation remains large. Any offline compaction
 is a separate guarded maintenance operation after full migration proof; this CLI never
 runs VACUUM FULL.
+
+## Native sharing for closed HZ report histories
+
+The HZ report-storage worker can share repeated historical results locally while the archive transfer proceeds. Each original report keeps its own sequence, content signature, status, stop proof, and acknowledgement. Its 0198 foreign key protects the full result in PostgreSQL. This operation sets no archive pointers and changes no scientific, dispatch, promise, or delivery records.
+
+Discovery uses the worker report index to seek one execution and at most 129 sequence keys per call. The default looks for inline report values of at least 256 KiB, selects up to eight rows, and limits the selected stored values and matching expanded binary prefix to 96 MiB. The walker can inspect one boundary value to detect a mismatch or a byte limit. It stops before that row. At a page boundary, a single trailing report can reuse its immediately preceding protected result after an exact comparison. A different singleton stays inline. The ordinary per-row backfill remains available for explicit scope or restoration.
+
+Applications require enabled 0198 normalization, a terminal ingested worker job, a closed promise, stopped execution evidence, acknowledged reports, and an available ingestion lease. Job/promise and report row locks cover the transaction. A locked sequence leaves the prefix uncommitted. A statement timeout preserves the cursor. The automatic worker retries with smaller batches down to two rows, then revisits the job on a later sweep. PostgreSQL compares exact JSONB images, including numeric scale, and reconstructs every original full report from the newly written reference. The ordinary full-report reader independently verifies the anchor's original signature before commit. The writer rolls back the whole prefix on failed readback or nonpositive measured value savings.
+
+### Bounded operator step
+
+The installed backfill CLI accepts `--native-prefix` on HZ. It defaults to a dry run. Use `--execution=UUID` to restrict it to one job or omit that option for ordered discovery. `--after-worker=UUID:SEQUENCE` continues within a job and `--after-worker=UUID:end` continues past it. `--rows`, `--batches`, `--max-bytes`, and `--min-stored-bytes` bound an invocation. Preserve `after` from the last acknowledged result. A retry reads the current representation before writing.
+
+An existing HZ sweeper with the 0198 schema and full-report reader can run the same step before installing new application code. From the checked release on the operator host, emit the bounded CLI to a private file. Supply the active private cohort's frozen scope and the existing SSH/container names.
+
+```bash
+set -euo pipefail
+umask 077
+: "${PRIVATE_NATIVE_SCOPE:?path to the active private native-sharing-scope.json}"
+: "${HZ_SSH_HOST:?existing HZ SSH alias}" "${HZ_SWEEPER_CONTAINER:?existing HZ sweeper}"
+exclude=$(jq -er '.jobs | keys | select(length>0) | join(",")' "$PRIVATE_NATIVE_SCOPE")
+step=$(mktemp)
+trap 'rm -f "$step"' EXIT
+node scripts/deploy/emit-native-report-prefix.mjs > "$step"
+sha256sum "$step"
+ssh -T -oBatchMode=yes -oStrictHostKeyChecking=yes "$HZ_SSH_HOST" \
+  flock -s -w 5 -E 75 /tmp/airfoils-pro-deploy.lock \
+  docker exec -i -w /app/packages/db/src "$HZ_SWEEPER_CONTAINER" \
+  node --import tsx --input-type=module - --native-prefix --dry-run \
+  "--exclude-jobs=$exclude" --rows=8 --batches=1 < "$step"
+```
+
+Use `--apply` for a reviewed write step. Both stdout and the worker log distinguish previewed matches from committed `normalized` and `binaryVerified` counts. The live values measured by `reportValueBytesReduced` are the difference between old report columns and persisted envelopes. `netValueBytesSavedAtLeast` also subtracts new reference-column bytes and conservatively charges all retained payload value columns when prior custody in PostgreSQL was unproven. The receipt binds the shared hash and digest of ordered sequence/signature pairs. Relation and index overhead, dead tuples, WAL and filesystem blocks have separate measurements. `physicalSpaceReleased` is null.
+
+### Automatic discovery after handoff
+
+Use the existing sweeper report-storage process with `AIRFOILFOAM_NATIVE_REPORT_SHARING=true` and `AIRFOILFOAM_NATIVE_REPORT_EXCLUDE_JOBS` set to the comma-separated execution IDs still owned by the private run. The installed CLI also honors this exclusion list. Automatic mode defaults off. It runs one local transaction at a time, independently of cloud I/O, and sleeps five minutes after a sweep. It remembers the inspected sequences of eligible jobs, retaining one boundary row for a later append. On restart it can rediscover from the index and recognize already shared values. Disabling native sharing does not disable normal 0198 writes or full readers.
+
+The `progressive-report-archive` graph check `native-report-prefix` compares the prefix and original per-row algorithm on identical PostgreSQL rows in alternating rollback trials. It checks every full-body digest and exercises ordinary product reads, the portable CLI, locks, exclusions, rollback and replay.
