@@ -312,6 +312,46 @@ export async function archiveProgressiveReportBatch(
   }
 }
 
+export async function nextProgressiveReportArchiveJob(
+  db: DB,
+  source: Source,
+  after: string | null,
+) {
+  // The hub's partial index starts at the first still-inline report. Seek
+  // past the entire execution so even a large open job costs one index key.
+  const batch =
+    source === "remote"
+      ? sql`WITH RECURSIVE batch(id, visited) AS (
+          (SELECT r.sim_job_id, 1 FROM progressive_remote_reports r
+           WHERE r.archived_at IS NULL ${after ? sql`AND r.sim_job_id>${after}::uuid` : sql``}
+           ORDER BY r.sim_job_id,r.sequence LIMIT 1)
+          UNION ALL
+          SELECT next_job.id, prev.visited+1 FROM batch prev CROSS JOIN LATERAL (
+            SELECT r.sim_job_id AS id FROM progressive_remote_reports r
+            WHERE r.archived_at IS NULL AND r.sim_job_id>prev.id
+            ORDER BY r.sim_job_id,r.sequence LIMIT 1
+          ) next_job WHERE prev.visited<32
+        )`
+      : sql`WITH batch AS MATERIALIZED (
+          SELECT j.id FROM sim_jobs j WHERE j.status IN ('done','failed','cancelled') AND j."ingestedAt" IS NOT NULL
+            ${after ? sql`AND j.id>${after}::uuid` : sql``} ORDER BY j.id LIMIT 64
+        )`;
+  const workerPending =
+    source === "worker"
+      ? sql`AND (EXISTS (SELECT 1 FROM progressive_worker_reports r
+          WHERE r.sim_job_id=job.id AND r.archived_at IS NULL)
+        OR EXISTS (SELECT 1 FROM progressive_worker_report_conflicts c
+          WHERE c.sim_job_id=job.id AND c.archived_at IS NULL AND c.body_source_sequence IS NULL))`
+      : sql``;
+  const [job] = await db.execute<{ id: string | null; last_id: string | null }>(
+    sql`${batch}, eligible AS (
+      SELECT job.id ${owner(source)} JOIN batch ON batch.id=job.id
+      WHERE ${closedScope(source)} ${workerPending} ORDER BY job.id LIMIT 1
+    ) SELECT (SELECT id FROM eligible) AS id, (SELECT id FROM batch ORDER BY id DESC LIMIT 1) AS last_id`,
+  );
+  return job;
+}
+
 export async function runProgressiveReportArchiveService(
   db: DB,
   signal: AbortSignal,
@@ -355,29 +395,12 @@ export async function runProgressiveReportArchiveService(
         return remote;
       };
   let after: string | null = null;
+  let hubArchivedThisSweep = false;
   while (!signal.aborted) {
     let waitMs = 30000;
     let current: string | null = null;
     try {
-      const jobs: { id: string | null; last_id: string | null }[] =
-        await db.execute<{
-          id: string | null;
-          last_id: string | null;
-        }>(sql`WITH batch AS MATERIALIZED (
-        SELECT j.id FROM sim_jobs j WHERE j.status IN ('done','failed','cancelled') AND j."ingestedAt" IS NOT NULL
-          ${after ? sql`AND j.id>${after}::uuid` : sql``} ORDER BY j.id LIMIT 64
-      ), eligible AS (SELECT job.id ${owner(source)} JOIN batch ON batch.id=job.id WHERE ${closedScope(source)}
-        AND (EXISTS (SELECT 1 FROM ${reportTable(source)} r
-          WHERE r.sim_job_id=job.id AND r.archived_at IS NULL)
-          ${
-            source === "worker"
-              ? sql`OR EXISTS (SELECT 1 FROM progressive_worker_report_conflicts c
-            WHERE c.sim_job_id=job.id AND c.archived_at IS NULL AND c.body_source_sequence IS NULL)`
-              : sql``
-          })
-        ORDER BY job.id LIMIT 1)
-        SELECT (SELECT id FROM eligible) AS id, (SELECT id FROM batch ORDER BY id DESC LIMIT 1) AS last_id`);
-      const job = jobs[0];
+      const job = await nextProgressiveReportArchiveJob(db, source, after);
       if (job?.id) {
         current = String(job.id);
         after = current;
@@ -387,7 +410,8 @@ export async function runProgressiveReportArchiveService(
           current,
           upload,
         );
-        if (n)
+        if (n) {
+          if (source === "remote") hubArchivedThisSweep = true;
           console.info(
             JSON.stringify({
               component: "progressive-report-archive",
@@ -396,10 +420,12 @@ export async function runProgressiveReportArchiveService(
               members: n,
             }),
           );
+        }
         waitMs = 100;
       } else {
         after = job?.last_id ?? null;
-        if (after) waitMs = 100;
+        if (after || hubArchivedThisSweep) waitMs = 100;
+        if (!after) hubArchivedThisSweep = false;
       }
     } catch (error) {
       console.error(
