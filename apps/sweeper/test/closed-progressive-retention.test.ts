@@ -1,4 +1,8 @@
 import { createHash, randomUUID } from "node:crypto";
+import { createServer } from "node:http";
+import { once } from "node:events";
+import { createRequire } from "node:module";
+import { preflightProgressiveArchive } from "../src/progressive-archive-reclaim";
 import { afterAll, expect, it, vi } from "vitest";
 import {
   createClient,
@@ -508,3 +512,77 @@ it("keeps path-owned images unbound and checks all image routes, their legend an
     }
   });
 }, 30000);
+
+it("lets a delayed archive response finish inside the proof deadline and restores the previous HTTP dispatcher", async () => {
+  const resolver = createRequire(
+    new URL("../../../packages/engine-client/package.json", import.meta.url),
+  );
+  const undici = resolver("undici");
+  const location = new URL(
+    "../../../scripts/deploy/hz-closed-job-node.mjs",
+    import.meta.url,
+  );
+  const { withReadbackTransport } = await import(
+    /* @vite-ignore */ location.href
+  );
+  const previous = undici.getGlobalDispatcher();
+  const short = new undici.Agent({ headersTimeout: 50, bodyTimeout: 50 });
+  const body = Buffer.from("authenticated compressed archive fixture");
+  const remote = {
+    generation: "18446744073709551614",
+    storedSha256: createHash("sha256").update(body).digest("hex"),
+    storedByteSize: body.length,
+  } as ProgressiveEvidenceCustodyReceipt["remote"];
+  const server = createServer((req, res) => {
+    if (req.headers["x-xfoilfoam-solver-token"] !== "fixture-token") {
+      res.writeHead(403).end();
+      return;
+    }
+    const send = setTimeout(
+      () => {
+        res.writeHead(200, {
+          "content-type": "application/zstd",
+          "content-length": body.length,
+          "x-content-sha256": remote.storedSha256,
+          "x-gcs-generation": remote.generation,
+        });
+        res.end(req.url === "/corrupt" ? Buffer.alloc(body.length) : body);
+      },
+      req.url === "/slow" ? 1800 : 0,
+    );
+    res.once("close", () => clearTimeout(send));
+  });
+  try {
+    server.listen(0, "127.0.0.1");
+    await once(server, "listening");
+    const address = server.address();
+    if (!address || typeof address === "string")
+      throw Error("Missing local archive server");
+    const read = (path: string, timeout: number) =>
+      preflightProgressiveArchive(
+        `http://127.0.0.1:${address.port}${path}`,
+        "fixture-token",
+        remote,
+        AbortSignal.timeout(timeout),
+      );
+    undici.setGlobalDispatcher(short);
+    await expect(read("/slow", 6000)).rejects.toMatchObject({
+      cause: { code: "UND_ERR_HEADERS_TIMEOUT" },
+    });
+    await withReadbackTransport(undici, () => read("/slow", 6000));
+    expect(undici.getGlobalDispatcher()).toBe(short);
+    await expect(
+      withReadbackTransport(undici, () => read("/slow", 75)),
+    ).rejects.toMatchObject({ name: "TimeoutError" });
+    expect(undici.getGlobalDispatcher()).toBe(short);
+    await expect(
+      withReadbackTransport(undici, () => read("/corrupt", 6000)),
+    ).rejects.toThrow(/complete byte proof/);
+    expect(undici.getGlobalDispatcher()).toBe(short);
+  } finally {
+    undici.setGlobalDispatcher(previous);
+    await short.destroy();
+    server.closeAllConnections();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+}, 15_000);

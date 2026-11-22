@@ -3,17 +3,10 @@ import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { createInterface } from "node:readline";
 import { compileFunction } from "node:vm";
 
-const lines = createInterface({ input: process.stdin, crlfDelay: Infinity });
-const frames = lines[Symbol.asyncIterator]();
-const next = async () => {
-  const frame = await frames.next();
-  if (frame.done || Buffer.byteLength(frame.value) > 2 * 1024 ** 2)
-    throw Error("Maintenance transport ended or exceeded its bound");
-  return JSON.parse(frame.value);
-};
 const digest = (bytes) => createHash("sha256").update(bytes).digest("hex");
 const emit = (obj) => process.stdout.write(JSON.stringify(obj) + "\n");
 function mac(key, kind, nonce, body) {
@@ -24,7 +17,21 @@ function mac(key, kind, nonce, body) {
     .digest("hex");
 }
 
-async function run() {
+/** Scope the long-read dispatcher to this one-shot operator process. Each read
+ * still receives the verifier's absolute AbortSignal deadline. */
+export async function withReadbackTransport(undici, verify) {
+  const previous = undici.getGlobalDispatcher();
+  const agent = new undici.Agent({ headersTimeout: 0, bodyTimeout: 0 });
+  undici.setGlobalDispatcher(agent);
+  try {
+    return await verify();
+  } finally {
+    undici.setGlobalDispatcher(previous);
+    await agent.destroy();
+  }
+}
+
+async function run(next) {
   const boot = await next(),
     scope = boot.scope;
   if (
@@ -48,12 +55,16 @@ async function run() {
     ts = require("typescript");
   const dbRequire = createRequire(resolve("packages/db/src/client.ts"));
   const rootRequire = createRequire(resolve("package.json"));
+  const engineRequire = createRequire(
+    resolve("packages/engine-client/package.json"),
+  );
   const entries = [
     ["typescript", require],
     ["tsx", rootRequire],
     ["drizzle-orm", require],
     ["drizzle-orm/postgres-js", dbRequire],
     ["postgres", dbRequire],
+    ["undici", engineRequire],
     ["@aerodb/db", require],
     ["@aerodb/core", require],
     ["@aerodb/engine-client", require],
@@ -205,11 +216,8 @@ async function run() {
         return response.result;
       },
     };
-    const result = await exports.closedProgressiveJob(
-      client.db,
-      backend,
-      scope.id,
-      {
+    const result = await withReadbackTransport(engineRequire("undici"), () =>
+      exports.closedProgressiveJob(client.db, backend, scope.id, {
         now: new Date(),
         ageMs: retentionConfigFromEnv().stripMinAgeMs,
         timeoutMs: DEFAULT_RETENTION_QUERY_TIMEOUT_MS,
@@ -220,7 +228,7 @@ async function run() {
         keepMedia: scope.keepMedia === true,
         expectedMediaSha256: scope.expectedMedia ?? undefined,
         signal: AbortSignal.timeout(20 * 60_000),
-      },
+      }),
     );
     if (!inspect && !result.settled)
       throw Error("Final locked ownership or eligibility check refused");
@@ -236,23 +244,37 @@ async function run() {
     await client.sql.end({ timeout: 2 });
   }
 }
-try {
-  emit({ type: "result", value: await run() });
-} catch (error) {
-  // SQL errors may include query parameters. Only safe, bounded diagnostics leave this process.
-  const message = String(error?.message ?? "Maintenance failed");
-  emit({
-    type: /^(Installed Node|SQL helper|Maintenance transport|Unexpected maintenance|Unexpected database|Engine control-plane authentication|Maintenance response|Failed query:|fetch failed|.*ENOTFOUND|.*ECONNRESET)/.test(
-      message,
-    )
-      ? "fault"
-      : "refusal",
-    reason: message.startsWith("Failed query:")
-      ? "Database custody query refused"
-      : message.replace(/[\r\n].*/s, "").slice(0, 400),
-  });
-  process.exitCode = 1;
-} finally {
-  lines.close();
-  process.stdin.destroy();
+// Node 22.18+ reports import.meta.main for both a file and the SSH peer's -e entry.
+const main =
+  import.meta.main ??
+  fileURLToPath(import.meta.url) === resolve(process.argv[1] ?? "[eval1]");
+if (main) {
+  const lines = createInterface({ input: process.stdin, crlfDelay: Infinity });
+  const frames = lines[Symbol.asyncIterator]();
+  const next = async () => {
+    const frame = await frames.next();
+    if (frame.done || Buffer.byteLength(frame.value) > 2 * 1024 ** 2)
+      throw Error("Maintenance transport ended or exceeded its bound");
+    return JSON.parse(frame.value);
+  };
+  try {
+    emit({ type: "result", value: await run(next) });
+  } catch (error) {
+    // SQL errors may include query parameters. Only safe, bounded diagnostics leave this process.
+    const message = String(error?.message ?? "Maintenance failed");
+    emit({
+      type: /^(Installed Node|SQL helper|Maintenance transport|Unexpected maintenance|Unexpected database|Engine control-plane authentication|Maintenance response|Failed query:|fetch failed|.*ENOTFOUND|.*ECONNRESET)/.test(
+        message,
+      )
+        ? "fault"
+        : "refusal",
+      reason: message.startsWith("Failed query:")
+        ? "Database custody query refused"
+        : message.replace(/[\r\n].*/s, "").slice(0, 400),
+    });
+    process.exitCode = 1;
+  } finally {
+    lines.close();
+    process.stdin.destroy();
+  }
 }
