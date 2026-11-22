@@ -21,7 +21,7 @@ import {
 import { HistoryOperationError } from "@aerodb/core/point-history-protocol";
 
 const sha = (text: string) => createHash("sha256").update(text).digest("hex");
-async function atomicJson(path: string, value: unknown, immutable = false) {
+export async function atomicJson(path: string, value: unknown, immutable = false) {
   const bytes = JSON.stringify(value) + "\n",
     temporary = join(path, "..", `.history-${randomUUID()}.tmp`),
     fd = await open(temporary, "wx", 0o600);
@@ -55,7 +55,7 @@ async function atomicJson(path: string, value: unknown, immutable = false) {
     await directory.close();
   }
 }
-async function lockDirectory(directory: string) {
+export async function lockDirectory(directory: string) {
   await mkdir(directory, { recursive: true, mode: 0o700 });
   const child = spawn(
     "flock",

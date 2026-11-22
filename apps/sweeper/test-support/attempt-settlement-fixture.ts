@@ -150,14 +150,30 @@ const dependencies = [
   "sync_brokered_evidence_uploads",
 ];
 
-export async function createSettlementFixture() {
+export async function createSettlementFixture(workerCustody = false) {
   const client = createClient({ max: 1 });
   const namespace = `attempt_settle_${randomUUID().replaceAll("-", "")}`;
   const db = client.db;
   await db.execute(sql`CREATE SCHEMA ${sql.identifier(namespace)}`);
   try {
     await db.execute(sql`SET search_path=${sql.identifier(namespace)},public`);
-    for (const table of dependencies)
+    const workerTables = workerCustody
+      ? [
+          "sync_api_settings",
+          "sync_sweep_promises",
+          "registered_remote_solvers",
+          "progressive_worker_hub_receipts",
+          "progressive_worker_submission_intents",
+          "progressive_worker_evidence_receipts",
+          "progressive_worker_evidence_delivery_claims",
+          "progressive_worker_delivery_failures",
+          "progressive_worker_reports",
+          "progressive_worker_report_conflicts",
+          "progressive_report_archive_bundles",
+          "progressive_report_archive_members",
+        ]
+      : [];
+    for (const table of [...dependencies, ...workerTables])
       await db.execute(
         sql`CREATE TABLE ${sql.identifier(table)} AS SELECT * FROM public.${sql.identifier(table)} WITH NO DATA`,
       );
@@ -168,6 +184,13 @@ export async function createSettlementFixture() {
     for (const file of [
       "0207_attempt_evidence_archives.sql",
       "0208_attempt_history_readthrough.sql",
+      ...(workerCustody
+        ? [
+            "0210_stopped_progressive_attempt_history.sql",
+            "0211_progressive_attempt_receipt_sources.sql",
+            "0212_hz_attempt_history_custody.sql",
+          ]
+        : []),
     ]) {
       const body = await readFile(
         new URL(`../../../packages/db/migrations/${file}`, import.meta.url),

@@ -28,16 +28,17 @@ export function readOriginalAttemptForProjection(db: DB, id: string, archiveId: 
 
 export function sweeperAttemptArchiveReader() {
   return {
-    read(
+    async read(
       identity: Parameters<AttemptEvidenceStore["read"]>[0],
       signal?: AbortSignal,
     ) {
+      if (process.env.AIRFOILFOAM_DEPLOYMENT_ROLE === "remote-solver") {
+        const { readHzAttemptWorkingCopy } =
+          await import("./hz-attempt-volume");
+        return readHzAttemptWorkingCopy(identity, signal);
+      }
       const bucket = process.env.AIRFOILFOAM_EVIDENCE_BUCKET?.trim();
-      if (
-        !bucket ||
-        identity.bucket !== bucket ||
-        process.env.AIRFOILFOAM_DEPLOYMENT_ROLE === "remote-solver"
-      )
+      if (!bucket || identity.bucket !== bucket)
         throw new Error(
           "Attempt evidence source archive is unavailable on this solver",
         );
