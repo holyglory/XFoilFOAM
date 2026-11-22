@@ -134,30 +134,35 @@ it("prioritizes active exact-owned reports before stale pending backlog", async 
     expect(batch).toHaveLength(6);
     expect(new Set(batch.map((row) => row.sim_job_id)).size).toBe(6);
     expect(batch[0].sim_job_id).toBe(eligible.id);
-    const ownedLanes = new Map<string, number>();
     const sequences = new Map<string, number[]>();
-    for (let round = 0; round < 12; round += 1) {
-      for (let lane = 0; lane < 4; lane += 1) {
-        const pass = round % 2 === 0 ? "active" : "backlog";
-        const rows = await transaction.execute(
-          progressivePublicationSelectionSql(lane, 4, pass),
-        );
-        expect(rows).toEqual(await expected(pass, lane, 4));
-        if (!rows.length) continue;
-        const executionId = String(rows[0].sim_job_id);
-        expect(ownedLanes.get(executionId) ?? lane).toBe(lane);
-        ownedLanes.set(executionId, lane);
-        const [acknowledged] =
-          await transaction.execute(sql`UPDATE progressive_worker_reports
+    // Restart after the first two acknowledgements. Only the lane count changes.
+    for (const laneCount of [2, 3]) {
+      const ownedLanes = new Map<string, number>();
+      const rounds = laneCount === 2 ? 1 : 12;
+      for (let round = 0; round < rounds; round += 1) {
+        for (let lane = 0; lane < laneCount; lane += 1) {
+          const pass = round % 2 === 0 ? "active" : "backlog";
+          const rows = await transaction.execute(
+            progressivePublicationSelectionSql(lane, laneCount, pass),
+          );
+          expect(rows).toEqual(await expected(pass, lane, laneCount));
+          if (!rows.length) continue;
+          const executionId = String(rows[0].sim_job_id);
+          expect(ownedLanes.get(executionId) ?? lane).toBe(lane);
+          ownedLanes.set(executionId, lane);
+          const [acknowledged] =
+            await transaction.execute(sql`UPDATE progressive_worker_reports
           SET acknowledged_at=clock_timestamp() WHERE sim_job_id=${executionId}::uuid
             AND sequence=(SELECT min(sequence) FROM progressive_worker_reports
               WHERE sim_job_id=${executionId}::uuid AND acknowledged_at IS NULL)
           RETURNING sequence`);
-        sequences.set(executionId, [
-          ...(sequences.get(executionId) ?? []),
-          Number(acknowledged.sequence),
-        ]);
+          sequences.set(executionId, [
+            ...(sequences.get(executionId) ?? []),
+            Number(acknowledged.sequence),
+          ]);
+        }
       }
+      if (laneCount === 2) expect([...sequences.values()]).toEqual([[1], [1]]);
     }
     expect(sequences.size).toBe(6);
     for (const sequence of sequences.values()) expect(sequence).toEqual([1, 2]);

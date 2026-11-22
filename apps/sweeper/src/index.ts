@@ -14,7 +14,10 @@ import {
 import { startHeartbeatTimer } from "./heartbeat";
 import { runLoop } from "./loop";
 import { runProgressiveBaselineService } from "./progressive-service";
-import { runProgressiveReportService } from "./progressive-report-service";
+import {
+  configuredReportPublicationLanes,
+  runProgressiveReportService,
+} from "./progressive-report-service";
 import { runProgressiveEvidenceService } from "./progressive-evidence-service";
 import { runProgressiveArchiveService } from "./progressive-archive-service";
 import { runReportStorageProcess } from "./report-storage-process";
@@ -27,12 +30,13 @@ import { runProgressiveHubProgressService } from "./progressive-hub-progress-ser
 import { runSweeperServices } from "./service-lifecycle";
 import { startRemoteSolverFleetHeartbeatTimer } from "./remote-solver";
 
+const reportLaneCount = configuredReportPublicationLanes();
 const { db, sql, engine } = makeContext();
 const critical = makeIsolatedDatabase(2);
 const hubProgress = makeIsolatedDatabase(4);
 const retention = makeIsolatedDatabase(1);
 const evidence = makeIsolatedDatabase(8);
-const reports = makeIsolatedDatabase(8);
+const reports = makeIsolatedDatabase(reportLaneCount);
 const archive = makeIsolatedDatabase(2);
 const reportStorage = makeReportStorageDatabase("report-storage");
 if (configuredDeploymentRole() === "remote-solver") {
@@ -124,12 +128,12 @@ try {
       name: "progressive-polars",
       run: (signal) => runProgressiveBaselineService(db, sql, engine, signal),
     },
-    ...Array.from({ length: 8 }, (_, lane) => ({
+    ...Array.from({ length: reportLaneCount }, (_, lane) => ({
       name: `progressive-report-delivery-${lane}`,
       run: (signal: AbortSignal) =>
         runProgressiveReportService(reports.db, reports.sql, signal, {
           lane,
-          laneCount: 8,
+          laneCount: reportLaneCount,
         }),
     })),
     {
