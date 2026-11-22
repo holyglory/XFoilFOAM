@@ -2,7 +2,7 @@ import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { gzipSync, gunzipSync } from "node:zlib";
 import { afterEach, expect, it, vi } from "vitest";
 import { analysisContentHash } from "../src/analysis-target";
-import { encodeLegacyPage, readLegacyPageMembers, type LegacyBackupPage, type LegacyExactPageIdentity } from "../src/legacy-report-storage-codec";
+import { encodeLegacyPage, inspectLegacyPage, readLegacyPageMembers, type LegacyBackupPage, type LegacyExactPageIdentity } from "../src/legacy-report-storage-codec";
 import type { LegacyReportMember } from "../src/legacy-report-storage";
 import {
   legacyReportCustodySql, verifyLegacyReportCustodyPage,
@@ -203,6 +203,23 @@ it("keeps report and conflict identities separate at the same execution and sequ
   expect(actual).toHaveLength(4);
   expect(actual.filter((member) => member.sequence === 1).map((member) => member.kind)).toEqual(["report", "conflict"]);
   expect(actual.at(-1)?.rowText).toBe(rowText);
+});
+
+it("rejects invalid UTF-8 even when the stored chunk and every reference agree on its hash", () => {
+  const input = fixture(1);
+  const records = gunzipSync(input.bytes).toString("utf8").trimEnd().split("\n").map((line) => JSON.parse(line));
+  const member = records.find((record) => record.type === "member");
+  const oldHash = member.rowChunks[0];
+  const chunk = records.find((record) => record.type === "chunk" && record.sha256 === oldHash);
+  const bytes = Buffer.from(chunk.base64, "base64");
+  bytes[0] = 0xff;
+  chunk.sha256 = digest(bytes);
+  chunk.base64 = bytes.toString("base64");
+  for (const field of ["rowChunks", "reportChunks"]) {
+    member[field] = member[field].map((hash: string) => hash === oldHash ? chunk.sha256 : hash);
+  }
+  const packed = gzipSync(records.map((record) => JSON.stringify(record)).join("\n") + "\n");
+  expect(() => inspectLegacyPage(packed)).toThrow("Invalid legacy UTF-8 bytes");
 });
 
 it("refuses an oversized page object before either transport reads it", async () => {

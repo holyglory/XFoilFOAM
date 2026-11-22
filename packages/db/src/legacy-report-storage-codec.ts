@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { gzipSync, gunzipSync } from "node:zlib";
+import { isUtf8 } from "node:buffer";
 import {
   LEGACY_HASH,
   LEGACY_UUID,
@@ -207,10 +208,9 @@ export function inspectLegacyPage(
       return value;
     });
     const value = Buffer.concat(values);
-    const text = value.toString("utf8");
-    if (!Buffer.from(text).equals(value))
+    if (!isUtf8(value))
       throw new Error("Invalid legacy UTF-8 bytes");
-    return text;
+    return value.toString("utf8");
   };
   const members: LegacyReportMember[] = [];
   const seen = new Set<string>();
