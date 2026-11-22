@@ -27,6 +27,7 @@ import {
   settleProgressiveRemoteJob,
 } from "../../sweeper/src/progressive-remote-settlement";
 import { verifyProgressivePublicationPrecedence } from "./progressive-publication-settlement-fixture";
+import { verifyCancelledReportCopyReplay } from "./cancelled-report-copy-fixture";
 
 export async function verifyProgressivePolarArchiveImport(input: {
   db: DB;
@@ -323,6 +324,8 @@ export async function verifyProgressivePolarArchiveImport(input: {
             expect(finished.status).toBe("done");
             expect(finished.ingestedAt).not.toBeNull();
           }
+          if (closed && !input.storageOnly && !reported.converged)
+            await verifyCancelledReportCopyReplay(connection, input.app, input.token, payload, input.delivery);
           throw rollback;
         });
       } catch (error) {

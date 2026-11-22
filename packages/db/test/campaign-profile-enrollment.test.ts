@@ -5995,6 +5995,10 @@ describe("progressive CPU admission", () => {
           }),
         ).rejects.toThrow("publication order");
         const reportedResult = progressiveRemoteEvidenceResult(bound.envelope);
+        reportedResult.polars[0].attempts![0].force_history = {
+          t: [0, 0.1, 0.2], cl: [0.32, 0.46, 0.4],
+          cd: [0.032, 0.029, 0.03], cm: [0.001, 0.002, 0.001], samples: 3,
+        };
         const running = {
           ...report,
           sequence: 2,

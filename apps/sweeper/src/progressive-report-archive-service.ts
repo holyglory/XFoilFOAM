@@ -1,4 +1,10 @@
 import type { DB } from "@aerodb/db";
+import {
+  canonicalReportJson,
+  parseReportJson,
+  reportJsonObject,
+} from "@aerodb/db/progressive-report-archive";
+import { retainedReportInventory } from "@aerodb/db/retained-solver-reports";
 import { sql } from "drizzle-orm";
 import { createHash } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
@@ -6,6 +12,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { configuredDeploymentRole } from "./config";
+import {
+  cancelledReportOwner,
+  nextCancelledReportCopies,
+  receiptedReportCopy,
+  type ReportCopyCursor,
+} from "./cancelled-report-copies";
 import {
   putWorkerReportBundle,
   readWorkerReportArchiveText,
@@ -38,6 +50,7 @@ interface Member {
   sha256: string;
   bytes: number;
   payload: string | null;
+  sourceList?: string;
 }
 
 function reportTable(source: Source) {
@@ -149,7 +162,7 @@ async function* archiveLines(
   db: DB,
   source: Source,
   executionId: string,
-  keys: { sequence: unknown; kind: unknown }[],
+  keys: { sequence: unknown; kind: unknown; inventorySignature?: string }[],
   members: Member[],
 ) {
   let logicalBytes = 0;
@@ -176,6 +189,27 @@ async function* archiveLines(
     const bytes = Buffer.byteLength(raw);
     const sha256 = createHash("sha256").update(raw).digest("hex");
     const signature = String(row.content_signature);
+    let sourceList: string | undefined;
+    if (key.inventorySignature !== undefined) {
+      // Bound an individual member for the full product reader. Verify the
+      // actual PG numeric tokens and scientific source inventory before upload.
+      if (bytes > restoredByteTarget) continue;
+      const report = reportJsonObject(parseReportJson(raw));
+      const canonicalHash = createHash("sha256")
+        .update(canonicalReportJson(report))
+        .digest("hex");
+      const inventory = retainedReportInventory(report, signature);
+      if (
+        report.executionId !== executionId ||
+        canonicalReportJson(report.sequence!) !== String(sequence) ||
+        canonicalHash !== signature ||
+        inventory.signature !== key.inventorySignature
+      )
+        throw new Error(
+          "Cancelled report differs from the receipted source inventory",
+        );
+      sourceList = canonicalReportJson(inventory.sources);
+    }
     members.push({
       sequence,
       kind,
@@ -183,6 +217,7 @@ async function* archiveLines(
       bytes,
       sha256,
       payload: row.payload == null ? null : String(row.payload),
+      sourceList,
     });
     const line = archiveLine(
       {
@@ -211,12 +246,38 @@ export async function archiveProgressiveReportBatch(
   source: Source,
   executionId: string,
   putFile: PutFile,
+  cancelledSequences?: readonly number[],
 ): Promise<number> {
-  const scope = sql`SELECT job.id ${owner(source)} WHERE job.id=${executionId}::uuid AND ${closedScope(source)}`;
+  if (
+    cancelledSequences &&
+    (source !== "remote" ||
+      !cancelledSequences.length ||
+      cancelledSequences.length > maxMembers ||
+      cancelledSequences.some((n) => !Number.isSafeInteger(n) || n < 1))
+  )
+    throw new Error(
+      "Cancelled report copies require bounded exact hub sequences",
+    );
+  const scope = sql`SELECT job.id ${owner(source)} WHERE job.id=${executionId}::uuid
+    AND ${cancelledSequences ? cancelledReportOwner : closedScope(source)}`;
   if (!(await db.execute(scope)).length) return 0;
-  const keys = (await db.execute(memberKeys(source, executionId))).map(
-    ({ sequence, kind }) => ({ sequence, kind }),
-  );
+  const keys = cancelledSequences
+    ? await db.execute<{
+        sequence: string;
+        kind: string;
+        inventorySignature: string;
+      }>(sql`
+        SELECT r.sequence,'report' AS kind,inventory.inventory_signature AS "inventorySignature"
+        FROM progressive_remote_reports r JOIN progressive_remote_report_inventories inventory USING (sim_job_id,sequence)
+        WHERE r.sim_job_id=${executionId}::uuid AND r.archived_at IS NULL AND r.sequence IN (
+          ${sql.join(
+            cancelledSequences.map((n) => sql`${n}::bigint`),
+            sql`,`,
+          )})
+          AND ${receiptedReportCopy} ORDER BY r.sequence`)
+    : (await db.execute(memberKeys(source, executionId))).map(
+        ({ sequence, kind }) => ({ sequence, kind }),
+      );
   if (!keys.length) return 0;
   const dir = await mkdtemp(join(tmpdir(), "progressive-reports-"));
   const members: Member[] = [];
@@ -281,6 +342,15 @@ export async function archiveProgressiveReportBatch(
         const table = conflict
           ? sql.identifier("progressive_worker_report_conflicts")
           : reportTable(source);
+        // Bind the live source rows to the exact list reconstructed from the
+        // uploaded PG bytes. A same-count substitution cannot pass the update.
+        const sourceLists = cancelledSequences
+          ? JSON.stringify(
+              Object.fromEntries(
+                members.map((m) => [m.sequence, m.sourceList]),
+              ),
+            )
+          : null;
         const changed =
           await conn.execute(sql`UPDATE ${table} r SET archive_bundle_id=${inserted.id}::uuid,
           archived_at=clock_timestamp(),${conflict ? sql`` : sql`result_payload_hash=NULL,`}
@@ -288,7 +358,15 @@ export async function archiveProgressiveReportBatch(
           FROM progressive_report_archive_members m WHERE m.bundle_id=${inserted.id}::uuid
             AND m.member_kind=${kind} AND r.sim_job_id=m.sim_job_id AND r.sequence=m.sequence
             AND r.content_signature=m.content_signature AND r.archived_at IS NULL
-            ${conflict ? sql`` : sql`AND ${settledReport(source)}`} RETURNING r.sequence`);
+            ${conflict ? sql`` : sql`AND ${cancelledSequences ? receiptedReportCopy : settledReport(source)}`}
+            ${
+              sourceLists
+                ? sql`AND (SELECT jsonb_agg(jsonb_build_object('point_content_signature',s.point_content_signature,
+              'aoa_deg',s.aoa_deg,'case_slug',s.case_slug) ORDER BY s.point_content_signature COLLATE "C")
+              FROM progressive_remote_report_sources s WHERE s.sim_job_id=r.sim_job_id AND s.sequence=r.sequence)
+              =((${sourceLists}::jsonb)->>r.sequence::text)::jsonb`
+                : sql``
+            } RETURNING r.sequence`);
         if (changed.length !== members.filter((m) => m.kind === kind).length)
           throw new Error(
             "Report or evidence status changed before archive commit",
@@ -394,6 +472,8 @@ export async function runProgressiveReportArchiveService(
         }
         return remote;
       };
+  let copyCursor: ReportCopyCursor | null = null;
+  let nextCopyScan = 0;
   let after: string | null = null;
   let hubArchivedThisSweep = false;
   while (!signal.aborted) {
@@ -436,11 +516,53 @@ export async function runProgressiveReportArchiveService(
       );
       if (current) waitMs = 1500;
     }
-    try {
-      await delay(waitMs, undefined, { signal });
-    } catch (error) {
-      if (!signal.aborted) throw error;
-    }
+    const nextJobScan = Date.now() + waitMs;
+    do {
+      if (store && !signal.aborted && Date.now() >= nextCopyScan) {
+        try {
+          const page = await nextCancelledReportCopies(db, copyCursor);
+          // Advance past refused or concurrently changed copies on this pass.
+          copyCursor = page.after;
+          nextCopyScan = Date.now() + (copyCursor ? 500 : 30_000);
+          if (page.executionId) {
+            const members = await archiveProgressiveReportBatch(
+              db,
+              "remote",
+              page.executionId,
+              upload,
+              page.sequences,
+            );
+            if (members) {
+              if (members < page.sequences.length)
+                copyCursor = {
+                  executionId: page.executionId,
+                  sequence: page.sequences[members - 1]!,
+                };
+              console.info(
+                JSON.stringify({
+                  component: "cancelled-report-copies",
+                  members,
+                }),
+              );
+            }
+          }
+        } catch (error) {
+          nextCopyScan = Date.now() + 30_000;
+          console.error(
+            "[sweeper] cancelled report copies",
+            error instanceof Error ? error.message : String(error),
+          );
+        }
+      }
+      // Both use the same connection budget. A copy page never starts an
+      // extra ordinary discovery pass during that pass's idle backoff.
+      const wake = store ? Math.min(nextJobScan, nextCopyScan) : nextJobScan;
+      try {
+        await delay(Math.max(0, wake - Date.now()), undefined, { signal });
+      } catch (error) {
+        if (!signal.aborted) throw error;
+      }
+    } while (!signal.aborted && Date.now() < nextJobScan);
   }
 }
 
