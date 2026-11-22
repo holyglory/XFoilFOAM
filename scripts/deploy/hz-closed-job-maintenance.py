@@ -32,7 +32,8 @@ FILES = {
 ENGINE_MODULES = ("retention", "evidence_store", "evidence_runtime", "config", "jobs", "tasks")
 NODE_FILES = ("apps/sweeper/src/progressive-archive-reclaim.ts", "apps/sweeper/src/config.ts",
               "packages/core/src/remote-hub-url.ts", "packages/db/src/progressive-evidence-custody.ts",
-              "packages/db/src/client.ts", "apps/sweeper/src/retention.ts")
+              "packages/db/src/client.ts", "apps/sweeper/src/retention.ts", "pnpm-lock.yaml", "package.json",
+              "packages/db/package.json", "packages/core/package.json", "packages/engine-client/package.json", "apps/sweeper/package.json")
 SHA = re.compile(r"[0-9a-f]{64}")
 UUID = re.compile(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}")
 SSH = ("ssh", "-T", "-C", "-oBatchMode=yes", "-oForwardAgent=no", "-oClearAllForwardings=yes",
@@ -48,7 +49,7 @@ scope["host_main"](package)
 INSPECT = ('{{.Id}}|{{.Image}}|{{.State.Running}}|{{.State.StartedAt}}|'
            '{{index .Config.Labels "com.docker.compose.project"}}|{{index .Config.Labels "com.docker.compose.service"}}|'
            '{{range .Mounts}}{{if eq .Destination "/data/airfoilfoam"}}{{.Type}}|{{.Name}}|{{.RW}}{{end}}{{end}}')
-WORKER_PROBE = """import hashlib,importlib.util,json,os,stat,sys
+WORKER_PROBE = """import hashlib,importlib.util,importlib.metadata,json,os,stat,sys
 from pathlib import Path
 from airfoilfoam.config import get_settings
 req=json.load(sys.stdin)
@@ -58,7 +59,13 @@ for name,sha in req["engineHashes"].items():
 s=get_settings()
 job=s.job_dir(req["id"])
 if job.resolve()!=job or job.parent!=s.data_dir/"jobs" or str(s.data_dir)!="/data/airfoilfoam":raise SystemExit("worker job root mismatch")
-out={}
+packages={}
+for name in ("zstandard","google-crc32c","pydantic","pydantic-settings"):
+ d=importlib.metadata.distribution(name);record=d.read_text("RECORD")
+ if not record:raise SystemExit("installed engine wheel identity unavailable: "+name)
+ packages[name]=[d.version,hashlib.sha256(record.encode()).hexdigest()]
+binary=hashlib.sha256(Path(sys.executable).read_bytes()).hexdigest()
+out={"pythonPackages":hashlib.sha256(json.dumps([sys.version,binary,packages],sort_keys=True).encode()).hexdigest()}
 for key,p,kind in [("jobsInode",job.parent,stat.S_ISDIR),("jobInode",job,stat.S_ISDIR),("lockInode",job/".execute.lock",stat.S_ISREG)]:
  try:st=p.lstat()
  except FileNotFoundError:
@@ -127,7 +134,7 @@ def send_frame(pipe, value):
 def host_job(package):
     target = package["target"]
     scope = selection(target["mode"], target["id"], target["plan"])
-    scope.update(helper=validate_sources(package), nonce=secrets.token_hex(32), expectedScience=target.get("science"))
+    scope.update(helper=validate_sources(package), nonce=secrets.token_hex(32), expectedScience=target.get("science"),dependencies=target.get("dependencies"),nodePackages=target.get("nodePackages"))
     require(scope["expectedScience"] is None or SHA.fullmatch(scope["expectedScience"]), "invalid scientific source digest")
     lock_fd = os.open(DEPLOY_LOCK, os.O_RDONLY | os.O_NOFOLLOW)
     with os.fdopen(lock_fd, "rb") as lock:
@@ -136,11 +143,21 @@ def host_job(package):
         require(stat.S_ISREG(os.fstat(lock_fd).st_mode) and os.path.samestat(os.fstat(lock_fd), os.stat(DEPLOY_LOCK)),
                 "deployment lock identity changed")
         topology = containers()
+        images={s:v["image"] for s,v in topology.items()}
+        if target.get("images") and target["images"]!=images:
+            return {"status":"runtime-changed","observedImages":images,"job":scope["id"]}
         pinned = {s: v["id"] for s, v in topology.items()}
         observed = json.loads(command(["docker", "exec", "-i", pinned["worker"], "python", "-IB", "-c", WORKER_PROBE],
                                       encoded({"id": scope["id"], "engineHashes": package["engineHashes"]})))
         if "refused" in observed:
             return {"status": "refused", "job": scope["id"], "reason": observed["refused"]}
+        api_observed=json.loads(command(["docker","exec","-i",pinned["api"],"python","-IB","-c",WORKER_PROBE],
+                                 encoded({"id":scope["id"],"engineHashes":package["engineHashes"]})))
+        if "refused" in api_observed:
+            return {"status":"refused","job":scope["id"],"reason":api_observed["refused"]}
+        require(all(observed[k]==api_observed[k] for k in ("jobsInode","jobInode","lockInode")),"worker and gateway execution paths differ")
+        native_packages={"worker":observed.pop("pythonPackages"),"gateway":api_observed["pythonPackages"]}
+        require(not target.get("nativePackages") or target["nativePackages"]==native_packages,"installed Python dependency fingerprint changed")
         scope.update(observed)
         if "proof" in target:
             earlier=target["proof"]
@@ -198,7 +215,7 @@ def host_job(package):
                     except subprocess.TimeoutExpired:
                         proc.terminate()
         return {"job": scope["id"], "helperRevision": package["revision"], "helperSha256": scope["helper"],
-                "deployedRevision": marker["sourceRevision"], "deployLockInode":deploy_identity, "containers": topology, "jobsInode": scope["jobsInode"],
+                "deployedRevision": marker["sourceRevision"], "deployLockInode":deploy_identity,"nativePackages":native_packages, "containers": topology, "jobsInode": scope["jobsInode"],
                 "jobInode": scope["jobInode"], "lockInode": scope["lockInode"], **msg["value"]}
 
 
@@ -258,7 +275,7 @@ def confirm_reclaim(package, target, effect):
     prior = effect.get("record", {})
     science = effect.get("scientificSha256") or prior.get("scientificSha256")
     require(isinstance(science, str) and SHA.fullmatch(science), "completed job lacks its pre-removal scientific signature")
-    after = run_remote(package, {**selection("verify", target["id"], target["plan"]), "science": science})
+    after = run_remote(package, {**selection("verify", target["id"], target["plan"]), "science": science, "dependencies":effect.get("dependenciesSha256"),"nodePackages":effect.get("nodePackagesSha256"),"nativePackages":effect.get("nativePackages")})
     require(after["status"]=="verified" and after["databaseReadOnly"] is True and after["plan"].get("replayed") is True and
             after["scientificSha256"]==science and after["readbacks"] and after["points"],
             "post-operation point, native receipt or GCS verification refused: "+str(after.get("reason","missing proof"))[:300])
@@ -286,7 +303,7 @@ def totals_add(status, receipt):
         status["netAttributedAllocatedBytes"]+=allocation["netAttributedAllocatedBytes"]
 
 
-def run_inventory(package, inventory, expected_sha, state, apply):
+def run_inventory(package, inventory, expected_sha, state, apply, runtime_proof):
     require(apply and state.is_absolute(), "inventory reclaim requires --apply and an absolute private state directory")
     data=inventory.read_bytes()
     require(digest(data)==expected_sha, "private inventory digest differs")
@@ -297,6 +314,18 @@ def run_inventory(package, inventory, expected_sha, state, apply):
             "controller state directory must be private to the operator")
     contract={"helperRevision":package["revision"],"helperSha256":validate_sources(package),
               "inventorySha256":expected_sha,"total":len(targets),"host":ROOT}
+    canary=runtime_proof
+    require(canary.get("status")=="verified" and canary.get("databaseReadOnly") is True and
+            canary.get("helperSha256")==contract["helperSha256"] and canary["plan"].get("replayed") is True and
+            canary.get("readbacks") and SHA.fullmatch(canary.get("nodePackagesSha256","")) and
+            all(SHA.fullmatch(canary.get("nativePackages",{}).get(s,"")) for s in ("worker","gateway")) and
+            SHA.fullmatch(canary.get("dependenciesSha256","")) and SHA.fullmatch(canary.get("scientificSha256","")),
+            "runtime pin requires a read-only post-canary receipt from this exact helper")
+    contract["dependenciesSha256"]=canary["dependenciesSha256"]
+    contract["nodePackages"]=canary["nodePackagesSha256"]
+    contract["nativePackages"]=canary["nativePackages"]
+    contract["runtimeCanary"]={"id":canary["job"],"plan":canary["plan"]["plan"],"science":canary["scientificSha256"]}
+    contract["initialImages"]={s:v["image"] for s,v in canary["containers"].items()}
     with (state/"operator.lock").open("a+b") as lock:
         fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
         manifest=state/"manifest.json"
@@ -304,6 +333,8 @@ def run_inventory(package, inventory, expected_sha, state, apply):
             require(read_json(manifest)==contract,"resume requires the same pinned helper and inventory")
         else:
             atomic_json(manifest,contract)
+        runtime_file=state/"runtime.json"
+        runtime=read_json(runtime_file) if runtime_file.exists() else {"images":contract["initialImages"],"dependencies":contract["dependenciesSha256"]}
         status={**contract,"examined":0,"verified":0,"deferred":0,"logicalBytes":0,"files":0,
                 "fileAllocatedBytes":0,"netAttributedAllocatedBytes":0,"unmeasuredJobs":0}
         def publish(phase, **extra):
@@ -326,7 +357,23 @@ def run_inventory(package, inventory, expected_sha, state, apply):
                     entry={"index":index,"target":target,"startedAt":datetime.now(timezone.utc).isoformat()}
                     atomic_json(pending,entry)
                 if "effect" not in entry:
-                    entry["effect"]=run_remote(package,target)
+                    packages={"nodePackages":contract["nodePackages"],"nativePackages":contract["nativePackages"]}
+                    pin={"images":runtime["images"],"dependencies":runtime["dependencies"],**packages}
+                    effect=run_remote(package,{**target,**pin})
+                    if effect["status"]=="runtime-changed":
+                        # The host returned before opening the job. Requalify an already settled canary
+                        # read-only, using the original dependency and scientific fingerprints.
+                        anchor=contract["runtimeCanary"]
+                        fresh=run_remote(package,{**selection("verify",anchor["id"],anchor["plan"]),
+                            "science":anchor["science"],**packages})
+                        require(fresh["status"]=="verified" and fresh["scientificSha256"]==anchor["science"] and
+                                fresh["nodePackagesSha256"]==contract["nodePackages"] and fresh["nativePackages"]==contract["nativePackages"] and
+                                fresh["plan"].get("replayed") is True,
+                                "changed runtime did not reproduce the qualified scientific and storage proof")
+                        runtime={"images":{s:v["image"] for s,v in fresh["containers"].items()},"dependencies":fresh["dependenciesSha256"],"revalidation":fresh}
+                        atomic_json(runtime_file,runtime)
+                        effect=run_remote(package,{**target,"dependencies":runtime["dependencies"],"images":runtime["images"],**packages})
+                    entry["effect"]=effect
                     atomic_json(pending,entry)
                 effect=entry["effect"]
                 if effect["status"]=="refused":
@@ -368,11 +415,12 @@ def main():
     full.add_argument("inventory",type=Path)
     full.add_argument("--sha256",required=True)
     full.add_argument("--state",type=Path,required=True)
+    full.add_argument("--runtime-proof",type=Path,required=True,help="private completed-canary verification receipt")
     full.add_argument("--apply",action="store_true")
     args = parser.parse_args()
     package = source_package(Path(__file__).resolve().parents[2])
     if args.mode=="run-inventory":
-        return run_inventory(package,args.inventory,args.sha256,args.state,args.apply)
+        return run_inventory(package,args.inventory,args.sha256,args.state,args.apply,read_json(args.runtime_proof))
     offset = 0
     if args.mode == "batch":
         data = args.inventory.read_bytes()

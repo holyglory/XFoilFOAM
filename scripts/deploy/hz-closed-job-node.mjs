@@ -34,8 +34,11 @@ async function run() {
     throw Error(
       "Maintenance requires the credentialless remote-solver profile",
     );
+  const actualSources = {};
   for (const [path, reviewed] of Object.entries(boot.nodeHashes)) {
-    if (!reviewed.includes(digest(readFileSync(path))))
+    const actual = digest(readFileSync(path));
+    actualSources[path] = actual;
+    if (!reviewed.includes(actual))
       throw Error("Installed Node source differs: " + path);
   }
   if (digest(boot.sql) !== boot.sqlSha)
@@ -43,6 +46,49 @@ async function run() {
   const filename = resolve("apps/sweeper/src/closed-progressive-retention.ts");
   const require = createRequire(filename),
     ts = require("typescript");
+  const dbRequire = createRequire(resolve("packages/db/src/client.ts"));
+  const rootRequire = createRequire(resolve("package.json"));
+  const entries = [
+    ["typescript", require],
+    ["tsx", rootRequire],
+    ["drizzle-orm", require],
+    ["drizzle-orm/postgres-js", dbRequire],
+    ["postgres", dbRequire],
+    ["@aerodb/db", require],
+    ["@aerodb/core", require],
+    ["@aerodb/engine-client", require],
+  ];
+  const runtimeDependencies = {
+    node: process.version,
+    modules: process.versions.modules,
+    openssl: process.versions.openssl,
+    sources: actualSources,
+    entries: Object.fromEntries(
+      entries.map(([name, resolver]) => [
+        name,
+        digest(readFileSync(resolver.resolve(name))),
+      ]),
+    ),
+  };
+  const dependenciesSha256 = digest(JSON.stringify(runtimeDependencies));
+  const nodePackagesSha256 = digest(
+    JSON.stringify({
+      version: process.version,
+      abi: process.versions.modules,
+      openssl: process.versions.openssl,
+      lock: actualSources["pnpm-lock.yaml"],
+      entries: Object.fromEntries(
+        Object.entries(runtimeDependencies.entries).filter(
+          ([name]) => !name.startsWith("@aerodb/"),
+        ),
+      ),
+    }),
+  );
+  if (scope.nodePackages && scope.nodePackages !== nodePackagesSha256)
+    throw Error("Installed Node package fingerprint changed");
+
+  if (scope.dependencies && dependenciesSha256 !== scope.dependencies)
+    throw Error("Installed Node dependency fingerprint changed");
   const { outputText } = ts.transpileModule(boot.sql, {
     compilerOptions: {
       target: ts.ScriptTarget.ES2022,
@@ -96,6 +142,8 @@ async function run() {
         return {
           status: "already-settled",
           record: prior.receipt,
+          dependenciesSha256,
+          nodePackagesSha256,
           databaseReadOnly: false,
           bytesFreedThisRun: 0,
         };
@@ -172,6 +220,8 @@ async function run() {
       status:
         scope.mode === "verify" ? "verified" : inspect ? "proved" : "settled",
       databaseReadOnly: inspect,
+      dependenciesSha256,
+      nodePackagesSha256,
       ...result,
     };
   } finally {

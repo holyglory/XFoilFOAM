@@ -88,8 +88,11 @@ The absolute state directory must be private to the operator.
 
 ```bash
 python3 scripts/deploy/hz-closed-job-maintenance.py run-inventory "$inventory" \
-  --sha256 "$inventory_sha256" --state "$private_state" --apply
+  --sha256 "$inventory_sha256" --state "$private_state" \
+  --runtime-proof "$verified_canary_receipt" --apply
 ```
+
+Use a successful read-only canary verification from this helper as the runtime pin. A changed container image triggers a new read-only verification of that canary with the original dependency, plan and science fingerprints. A dependency mismatch stops before removal.
 
 The operator processes one job at a time under an exclusive controller lock.
 A job with a positive plan gets a fresh complete read of each object before

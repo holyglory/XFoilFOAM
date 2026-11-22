@@ -1191,9 +1191,14 @@ def test_closed_storage_inventory_resumes_one_pinned_job_and_preserves_refusals(
     applied = set()
     calls = []
     scientific = "d"*64
+    baseline={"job":ids[0],"status":"verified","databaseReadOnly":True,"helperSha256":"c"*64,
+              "plan":{"replayed":True,"plan":"a"*64}, "readbacks":[{}],"dependenciesSha256":"e"*64,"nodePackagesSha256":"f"*64,"nativePackages":{"worker":"1"*64,"gateway":"2"*64},"scientificSha256":scientific,
+              "containers":{s:{"image":"old"} for s in ("api","worker","sweeper")}}
     def remote(_, target):
         job, mode = target["id"], target["mode"]
         calls.append((job, mode))
+        if job==ids[2] and mode=="reclaim" and target.get("images",{}).get("api")=="old":
+            return {"status":"runtime-changed","observedImages":{s:"new" for s in baseline["containers"]}}
         if job == ids[1]:
             return {"job":job, "status":"refused","reason":"held worker execution lock"}
         allocation={"fileAllocatedBytes":8192,"netAttributedAllocatedBytes":4096}
@@ -1204,19 +1209,20 @@ def test_closed_storage_inventory_resumes_one_pinned_job_and_preserves_refusals(
             if job==ids[0]:
                 raise RuntimeError("response lost after commit")
         return {"job":job,"status":"settled" if mode=="reclaim" else "verified", "scientificSha256":scientific,
-                "settled":mode=="reclaim","databaseReadOnly":mode=="verify","plan":{"plan":"a"*64,"files":2,"bytes":5000,
+                "settled":mode=="reclaim","databaseReadOnly":mode=="verify","dependenciesSha256":"e"*64,"nodePackagesSha256":"f"*64,"nativePackages":{"worker":"1"*64,"gateway":"2"*64},
+                "containers":{s:{"image":"new"} for s in baseline["containers"]},"plan":{"plan":"a"*64,"files":2,"bytes":5000,
                 "replayed":mode=="verify"}, "allocation":allocation, "points":[{"attemptId":job}],
                 "readbacks":[{"brokeredUploadId":job,"generation":"1","storedSha256":"b"*64,"storedByteSize":120}]}
     monkeypatch.setitem(run.__globals__, "run_remote", remote)
     monkeypatch.setitem(run.__globals__, "validate_sources", lambda _: "c"*64)
     with pytest.raises(RuntimeError, match="lost"):
-        run({"revision":"test"},inventory,digest,state,True)
-    assert run({"revision":"test"},inventory,digest,state,True)==0
+        run({"revision":"test"},inventory,digest,state,True,baseline)
+    assert run({"revision":"test"},inventory,digest,state,True,baseline)==0
     summary=json.loads((state/"status.json").read_bytes())
     assert (summary["verified"], summary["deferred"], summary["fileAllocatedBytes"], summary["netAttributedAllocatedBytes"])==(2,1,16384,8192)
-    assert sum(mode=="verify" for _,mode in calls)==2
+    assert sum(mode=="verify" for _,mode in calls)==3
     assert len(list((state/"receipts").glob("*.json")))==3
     count=len(calls)
-    assert run({"revision":"test"},inventory,digest,state,True)==0 and len(calls)==count
+    assert run({"revision":"test"},inventory,digest,state,True,baseline)==0 and len(calls)==count
     with pytest.raises(ValueError, match="same pinned helper"):
-        run({"revision":"different"},inventory,digest,state,True)
+        run({"revision":"different"},inventory,digest,state,True,baseline)
