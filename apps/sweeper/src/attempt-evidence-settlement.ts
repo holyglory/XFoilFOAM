@@ -1,3 +1,4 @@
+import { configuredDeploymentRole } from "./config";
 import type { DB } from "@aerodb/db/client";
 import { getAttemptEvidenceArchive } from "@aerodb/db/attempt-evidence-catalog";
 import {
@@ -45,6 +46,7 @@ export function createAttemptEvidenceSettlementDependencies(
 /** The isolated worker and CLI each need a reader for archived source
  * reports. Installing the API's hub reader uses the existing bucket. */
 export async function configuredAttemptEvidenceSettlementDependencies(db: DB) {
+  if (configuredDeploymentRole() !== "hub") throw new Error("Attempt settlement requires the canonical hub reader");
   const { installApiReportArchiveReader } = await import("../../api/src/progressive-report-archive-reader");
   const { readApiAttemptEvidenceForApp } = await import("../../api/src/attempt-evidence-reader");
   await installApiReportArchiveReader();
@@ -260,6 +262,7 @@ export async function runAttemptEvidenceSettlementPass(
   deps: AttemptEvidenceSettlementDependencies,
   options: {
     after?: string | null;
+    afterReadback?: string | null;
     maxRows?: number;
     signal?: AbortSignal;
   } = {},
@@ -271,7 +274,7 @@ export async function runAttemptEvidenceSettlementPass(
   const automatic = Boolean(
     policy?.shorteningEnabled &&
     policy.consumerContractVersion === 1 &&
-    !policy.canaryAttemptId,
+    !policy.canaryAttemptId && !policy.hzWorkerOnly,
   );
   let next = options.after ?? null,
     processed = 0,
@@ -284,8 +287,11 @@ export async function runAttemptEvidenceSettlementPass(
   const limited: Array<{ attemptId: string; limiter: string }> = [];
   // Replay unacknowledged committed events before selecting new sources. This
   // also runs while new work is disabled, including after a worker restart.
+  const combined = automatic && policy?.progressiveSourceScope === "verified";
+  // Keep capacity for other cohorts while an older archive is temporarily unavailable.
+  const readbackLimit = combined ? Math.max(1, maxRows - 1) : maxRows;
   const pending = policy
-    ? await pendingAttemptEvidenceReadbacks(db, maxRows)
+    ? await pendingAttemptEvidenceReadbacks(db, readbackLimit, combined ? options.afterReadback : null)
     : [];
   for (const item of pending) {
     if (options.signal?.aborted) break;
@@ -304,12 +310,9 @@ export async function runAttemptEvidenceSettlementPass(
       });
     }
   }
-  const scope = policy?.progressiveSourceScope;
-  const preview = scope === "receipt-bearing" || scope === "receipt-urans"
-    ? scope : scope === "stopped-only";
   const candidates =
     automatic && processed < maxRows
-      ? await attemptEvidenceShorteningCandidates(db, next, preview)
+      ? await attemptEvidenceShorteningCandidates(db, next, policy?.progressiveSourceScope)
       : [];
   for (const candidate of candidates) {
     if (options.signal?.aborted) break;
@@ -346,6 +349,7 @@ export async function runAttemptEvidenceSettlementPass(
   if (automatic && processed < maxRows && !candidates.length) next = null;
   return {
     enabled: automatic,
+    nextReadback: combined && pending.length === readbackLimit ? pending.at(-1)!.eventId : null,
     recovered,
     processed,
     shortened,
@@ -366,14 +370,17 @@ export async function runAttemptEvidenceSettlementService(
   signal: AbortSignal,
 ): Promise<void> {
   let after: string | null = null;
+  let afterReadback: string | null = null;
   while (!signal.aborted) {
     let pause = 30_000;
     try {
       const result = await runAttemptEvidenceSettlementPass(db, deps, {
         after,
+        afterReadback,
         signal,
       });
       after = result.next;
+      afterReadback = result.nextReadback;
       if (result.enabled && after !== null) pause = 250;
       if (result.shortened || result.recovered || result.failures.length)
         console.info("attempt-history-shortening", result);
@@ -398,7 +405,7 @@ export async function runConfiguredAttemptEvidenceSettlementService(
 ): Promise<void> {
   if (
     !process.env.AIRFOILFOAM_EVIDENCE_BUCKET?.trim() ||
-    process.env.AIRFOILFOAM_DEPLOYMENT_ROLE === "remote-solver" ||
+    configuredDeploymentRole() !== "hub" ||
     process.env.AIRFOILFOAM_ATTEMPT_HISTORY_SHORTENING === "false" ||
     signal.aborted
   )
