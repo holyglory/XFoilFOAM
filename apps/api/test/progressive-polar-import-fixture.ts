@@ -27,8 +27,8 @@ const isolated = vi.hoisted(() => ({
   advisorySql: null as Sql | null,
 }));
 
-vi.mock("../src/db", () => ({
-  db: new Proxy(
+vi.mock("../src/db", () => {
+  const connection = new Proxy(
     {},
     {
       get(_target, property) {
@@ -40,15 +40,19 @@ vi.mock("../src/db", () => ({
           : value;
       },
     },
-  ),
-  advisoryLockSql: {
-    reserve: () => {
-      if (!isolated.advisorySql)
-        throw new Error("Isolated advisory database is not assigned");
-      return isolated.advisorySql.reserve();
+  );
+  return {
+    db: connection,
+    syncDb: connection,
+    advisoryLockSql: {
+      reserve: () => {
+        if (!isolated.advisorySql)
+          throw new Error("Isolated advisory database is not assigned");
+        return isolated.advisorySql.reserve();
+      },
     },
-  },
-}));
+  };
+});
 
 export async function withProgressiveSyncApi<T>(db: DB, run: (app: ReturnType<typeof Fastify>) => Promise<T>) {
   if (isolated.connection) throw new Error("Isolated API fixture is already active");

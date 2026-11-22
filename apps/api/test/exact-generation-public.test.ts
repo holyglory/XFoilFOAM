@@ -31,7 +31,8 @@ import { and, eq } from "drizzle-orm";
 import { createHash } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 
-import { db } from "../src/db";
+import { db, sql as interactiveSql, syncSql, advisoryLockSql, closeDatabasePools } from "../src/db";
+import { verifyInteractivePool } from "./interactive-pool-fixture";
 import { buildServer } from "../src/server";
 import { loadSolverHistorySource } from "@aerodb/db/solver-history-storage";
 import { decodeSolverHistory, encodeSolverHistory, type SolverHistoryArchiveIdentity } from "@aerodb/core/solver-history-storage";
@@ -43,11 +44,14 @@ import { verifyAttemptEvidenceApiAccess, verifyAttemptEvidenceApiReadthrough } f
 const attemptReadScope = vi.hoisted(() => ({ connection: null as DB | null }));
 vi.mock("../src/db", async (original) => {
   const actual = await original<typeof import("../src/db")>();
-  return { ...actual, db: new Proxy(actual.db, { get(target, property) {
-    const connection = attemptReadScope.connection ?? target;
-    const value = Reflect.get(connection, property);
-    return typeof value === "function" ? value.bind(connection) : value;
-  } }) };
+  const scoped = (pool: DB) => new Proxy(pool, {
+    get(target, property) {
+      const connection = attemptReadScope.connection ?? target;
+      const value = Reflect.get(connection, property);
+      return typeof value === "function" ? value.bind(connection) : value;
+    },
+  });
+  return { ...actual, db: scoped(actual.db), syncDb: scoped(actual.syncDb) };
 });
 
 import { checkHzHistoryApi } from "./hz-point-history-fixture";
@@ -450,9 +454,17 @@ afterAll(async () => {
   if (categoryId)
     await db.delete(categories).where(eq(categories.id, categoryId));
   await app.close();
+  await closeDatabasePools();
 });
 
 describe("public exact-generation reads", () => {
+  it("opens a selected 400-sample point and reads the catalog and admin sync view while report imports hold every sync connection", async () => {
+    expect(interactiveSql.options.max + syncSql.options.max).toBe(10);
+    expect(advisoryLockSql.options.max).toBe(16);
+    await verifyInteractivePool({ db, app, slots: syncSql.options.max, slug: `${PREFIX}-foil`, airfoilName: `${PREFIX} foil`, airfoilId,
+      revisionId, bcId, resultId, attemptId: currentAttemptId });
+  }, 45_000);
+
   it("keeps canonical attempt archive reads within configured access and leaves HZ unavailable", async () => {
     await verifyAttemptEvidenceApiAccess();
   });

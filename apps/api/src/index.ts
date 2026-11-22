@@ -1,9 +1,9 @@
 import { env } from "./env";
 import { installApiReportArchiveReader } from "./progressive-report-archive-reader";
-import { closeDatabasePools, db } from "./db";
+import { closeDatabasePools } from "./db";
 import { buildServer } from "./server";
 
-await installApiReportArchiveReader(db);
+await installApiReportArchiveReader();
 const app = await buildServer();
 try {
   await app.listen({ port: env.port, host: env.host });

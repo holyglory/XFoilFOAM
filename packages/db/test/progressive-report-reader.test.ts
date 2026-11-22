@@ -48,7 +48,10 @@ it.each(["remote", "worker"] as const)("restores exact archived %s reports with 
     expect(await readProgressiveReport(db, reference)).toEqual(report);
     const archived = await archiveReportFixture(db, sourceKind, reference.executionId, reference.sequence);
     expect(archived.proof.sha256).not.toBe(reference.contentSignature);
-    const read = vi.fn(async (_identity: ProgressiveReportArchiveIdentity) => archived.text);
+    const read = vi.fn(async (_identity: ProgressiveReportArchiveIdentity, connection: DB) => {
+      expect(connection === db, "Archive ownership reads must use the selecting transaction").toBe(true);
+      return archived.text;
+    });
     installProgressiveReportArchiveReader({ read });
     const before = await db.execute(sql`SELECT to_jsonb(report.*) AS row FROM ${table} report`);
     expect(await readProgressiveReport(db, reference)).toEqual(report);

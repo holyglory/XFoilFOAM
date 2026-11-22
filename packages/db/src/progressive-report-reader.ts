@@ -33,7 +33,7 @@ export interface ProgressiveReportArchiveIdentity extends ProgressiveReportArchi
 }
 
 export interface ProgressiveReportArchiveReader {
-  read(identity: ProgressiveReportArchiveIdentity): Promise<string>;
+  read(identity: ProgressiveReportArchiveIdentity, connection: DB): Promise<string>;
 }
 
 const UUID = /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i;
@@ -149,7 +149,7 @@ export async function readProgressiveReport(
           ...(stored.legacy_local_storage_key ? { legacyLocalStorageKey: String(stored.legacy_local_storage_key) } : {}),
         } : {}),
         signal: controller.signal,
-      }),
+      }, db),
       new Promise<never>((_, reject) => {
         timer = setTimeout(() => {
           reject(new Error("Archived progressive full report read timed out"));

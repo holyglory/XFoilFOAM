@@ -17,11 +17,14 @@ import type { DB } from "@aerodb/db/client";
 const attemptReadScope = vi.hoisted(() => ({ connection: null as DB | null }));
 vi.mock("../src/db", async (original) => {
   const actual = await original<typeof import("../src/db")>();
-  return { ...actual, db: new Proxy(actual.db, { get(target, property) {
-    const connection = attemptReadScope.connection ?? target;
-    const value = Reflect.get(connection, property);
-    return typeof value === "function" ? value.bind(connection) : value;
-  } }) };
+  const scoped = (pool: DB) => new Proxy(pool, {
+    get(target, property) {
+      const connection = attemptReadScope.connection ?? target;
+      const value = Reflect.get(connection, property);
+      return typeof value === "function" ? value.bind(connection) : value;
+    },
+  });
+  return { ...actual, db: scoped(actual.db), syncDb: scoped(actual.syncDb) };
 });
 import { SolverHistoryGcsStore } from "@aerodb/core/solver-history-gcs";
 import { decodeSolverHistory, encodeSolverHistory, type SolverHistoryArchiveIdentity } from "@aerodb/core/solver-history-storage";
@@ -71,7 +74,7 @@ process.env.SYNC_POLAR_MULTIPART_MAX_MANIFEST_BYTES = String(
 const dbSchema = await import("@aerodb/db");
 const { ensureSimulationPresetRevision } =
   await import("@aerodb/db/simulation-setup");
-const { advisoryLockSql, db, sql } = await import("../src/db");
+const { db, sql, syncSql, closeDatabasePools } = await import("../src/db");
 const { buildServer } = await import("../src/server");
 const { createProgressiveReportFixture } = await import("./progressive-report-fixture");
 const {
@@ -500,10 +503,10 @@ function measureArchiveRegistration() {
   // Count driver calls made by the real helper inside the HTTP transaction.
   // The public route and the broker verification run outside this timer.
   const spy = vi.spyOn(dbSchema, "registerVerifiedBrokeredEvidenceArchive").mockImplementation(async (tx, input) => {
-    const previous = sql.options.debug;
+    const previous = syncSql.options.debug;
     const sample = { roundTrips: 0, memberInserts: 0, artifactInserts: 0, elapsedMs: 0 };
     const start = performance.now();
-    sql.options.debug = (_id, statement) => {
+    syncSql.options.debug = (_id, statement) => {
       sample.roundTrips++;
       if (/^\s*insert into "solver_evidence_artifact_members"/i.test(statement)) sample.memberInserts++;
       if (/^\s*insert into "solver_evidence_artifacts"/i.test(statement)) sample.artifactInserts++;
@@ -511,7 +514,7 @@ function measureArchiveRegistration() {
     try {
       return await register(tx, input);
     } finally {
-      sql.options.debug = previous;
+      syncSql.options.debug = previous;
       sample.elapsedMs = Math.round(performance.now() - start);
       samples.push(sample);
     }
@@ -1078,8 +1081,7 @@ afterAll(async () => {
     );
   }
   await restoreSync();
-  await advisoryLockSql.end();
-  await sql.end();
+  await closeDatabasePools();
   rmSync(MEDIA_DIR, { recursive: true, force: true });
   if (savedMultipartUploadLimit == null)
     delete process.env.SYNC_POLAR_MULTIPART_MAX_UPLOAD_BYTES;

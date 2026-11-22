@@ -1,5 +1,4 @@
 import { Storage } from "@google-cloud/storage";
-import type { DB } from "@aerodb/db/client";
 import { installProgressiveReportArchiveReader } from "@aerodb/db/progressive-report-reader";
 import {
   assertProgressiveReportArchiveIdentity,
@@ -10,11 +9,13 @@ import { env } from "./env";
 
 let storage: Storage | null = null;
 
-export async function installApiReportArchiveReader(db: DB): Promise<void> {
+export async function installApiReportArchiveReader(): Promise<void> {
   if (process.env.AIRFOILFOAM_DEPLOYMENT_ROLE === "remote-solver") {
     const { readStoredWorkerArchiveText } = await import("../../sweeper/src/report-archive-broker-client");
     installProgressiveReportArchiveReader({
-      read: (identity) => readStoredWorkerArchiveText(db, identity),
+      // Owner/credential lookups use the connection that selected the report,
+      // including its transaction when a sync import already holds a slot.
+      read: (identity, connection) => readStoredWorkerArchiveText(connection, identity),
     });
   } else if (env.evidenceBucket) {
     installProgressiveReportArchiveReader({ read: readProgressiveReportArchive });

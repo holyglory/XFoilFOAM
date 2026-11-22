@@ -125,7 +125,9 @@ import { pipeline } from "node:stream/promises";
 import { z } from "zod";
 
 import { requireAdmin } from "./admin-auth";
-import { advisoryLockSql, db } from "./db";
+// Machine sync requests and their nested helpers share the sync pool. Admin
+// GETs explicitly pass the interactive connection through their read model.
+import { advisoryLockSql, syncDb as db, db as interactiveDb } from "./db";
 import {
   resolveEngineRuntimeBuild,
   type ResolvedEngineRuntime,
@@ -764,13 +766,13 @@ async function ensureSyncRows(): Promise<void> {
     .onConflictDoNothing();
 }
 
-async function getSettings() {
-  const [settings] = await db
+async function getSettings(database: DB = db) {
+  const [settings] = await database
     .select()
     .from(syncApiSettings)
     .where(eq(syncApiSettings.id, 1))
     .limit(1);
-  const permissions = await db
+  const permissions = await database
     .select()
     .from(syncApiPermissions)
     .orderBy(asc(syncApiPermissions.dataType));
@@ -1586,24 +1588,24 @@ function conflictReview(
   };
 }
 
-async function syncAdminPayload(req: FastifyRequest) {
-  await reconcileObsoleteExactPolarConflicts();
-  const { settings, permissions } = await getSettings();
-  const promiseRows = await db
+async function syncAdminPayload(req: FastifyRequest, database: DB = db) {
+  await reconcileObsoleteExactPolarConflicts(database);
+  const { settings, permissions } = await getSettings(database);
+  const promiseRows = await database
     .select({
       status: syncSweepPromises.status,
       n: count(),
     })
     .from(syncSweepPromises)
     .groupBy(syncSweepPromises.status);
-  const pointRows = await db
+  const pointRows = await database
     .select({
       status: syncSweepPromisePoints.status,
       n: count(),
     })
     .from(syncSweepPromisePoints)
     .groupBy(syncSweepPromisePoints.status);
-  const [promisePointContext] = (await db.execute(sql`
+  const [promisePointContext] = (await database.execute(sql`
     SELECT
       count(*) FILTER (
         WHERE promise.status = 'active' AND point.status = 'active'
@@ -1672,7 +1674,7 @@ async function syncAdminPayload(req: FastifyRequest) {
       "current-campaign remote AoA count exceeds the accepted remote total",
     );
   }
-  const conflicts = await db
+  const conflicts = await database
     .select()
     .from(syncImportConflicts)
     .where(eq(syncImportConflicts.status, "pending"))
@@ -1691,7 +1693,7 @@ async function syncAdminPayload(req: FastifyRequest) {
     ),
   );
   const conflictAirfoils = polarAirfoilIds.length
-    ? await db
+    ? await database
         .select({ id: airfoils.id, name: airfoils.name })
         .from(airfoils)
         .where(inArray(airfoils.id, polarAirfoilIds))
@@ -1699,12 +1701,12 @@ async function syncAdminPayload(req: FastifyRequest) {
   const conflictAirfoilNames = new Map(
     conflictAirfoils.map((row) => [row.id, row.name]),
   );
-  const solvers = await db
+  const solvers = await database
     .select()
     .from(registeredRemoteSolvers)
     .orderBy(desc(registeredRemoteSolvers.updatedAt))
     .limit(100);
-  const activePromiseRows = await db
+  const activePromiseRows = await database
     .select({
       solverId: syncSweepPromises.registeredSolverId,
       promises: count(),
@@ -1727,11 +1729,11 @@ async function syncAdminPayload(req: FastifyRequest) {
         { promises: Number(row.promises), aoas: Number(row.aoas ?? 0) },
       ]),
   );
-  const remoteAssetRows = await db
+  const remoteAssetRows = await database
     .select({ availability: remoteAssetReferences.availability, n: count() })
     .from(remoteAssetReferences)
     .groupBy(remoteAssetReferences.availability);
-  const evidenceTransferRows = await db
+  const evidenceTransferRows = await database
     .select({
       state: syncBrokeredEvidenceUploads.state,
       n: count(),
@@ -9076,7 +9078,7 @@ export async function registerSyncRoutes(app: FastifyInstance): Promise<void> {
   });
 
   app.get("/api/admin/sync", { preHandler: requireAdmin }, async (req) =>
-    syncAdminPayload(req),
+    syncAdminPayload(req, interactiveDb),
   );
 
   app.post(

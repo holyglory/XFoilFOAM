@@ -12,7 +12,7 @@ import { registerCampaignRoutes } from "./campaign-routes";
 import { registerEngineCutoverRoutes } from "./engine-cutover-routes";
 import { registerPointHistoryRoutes } from "./point-history-routes";
 import { registerRetainedReportRoutes } from "./retained-report-routes";
-import { db } from "./db";
+import { db, syncDb } from "./db";
 import { createBrokeredEvidenceUploadReconciler } from "./remote-evidence-broker";
 import { registerRoutes } from "./routes";
 import { registerSolvedPointsRoutes } from "./solved-points-routes";
@@ -27,7 +27,7 @@ import {
 
 export async function buildServer(): Promise<FastifyInstance> {
   const app = Fastify({ logger: { level: process.env.LOG_LEVEL ?? "info" } });
-  const evidenceUploadReconciler = createBrokeredEvidenceUploadReconciler(db, {
+  const evidenceUploadReconciler = createBrokeredEvidenceUploadReconciler(syncDb, {
     onError: (error) =>
       app.log.error(
         { err: error },
