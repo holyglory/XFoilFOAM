@@ -12,6 +12,8 @@ import {
   getAttemptEvidenceStoragePolicy,
   setAttemptEvidenceStoragePolicy,
   restoreAttemptEvidence,
+  shortenAttemptEvidence,
+  type AttemptEvidenceFreshVerification,
 } from "@aerodb/db/attempt-evidence-projection";
 import { enableVerifiedAttemptPolicy } from "@aerodb/db/attempt-evidence-verified-policy";
 import {
@@ -21,6 +23,7 @@ import {
 import { env } from "../../api/src/env";
 import {
   runAttemptEvidenceSettlementPass,
+  runConfiguredAttemptEvidenceSettlementService,
   settleAttemptEvidenceHistory,
 } from "../src/attempt-evidence-settlement";
 import { attemptEvidenceStorageMain } from "../src/attempt-evidence-storage-cli";
@@ -424,17 +427,97 @@ export async function verifyPendingAttemptPolicy(db: DB) {
   }
 }
 
+export async function verifyPausedWorkerRole(db: DB) {
+  const source = await seedSettledHistory(db);
+  const deps = dependencies(db, source);
+  const priorBucket = env.evidenceBucket;
+  try {
+    env.evidenceBucket = "fixture";
+    vi.stubEnv("AIRFOILFOAM_EVIDENCE_BUCKET", "fixture");
+    await enableVerifiedAttemptPolicy(db);
+    await settleAttemptEvidenceHistory(db, deps, {
+      attemptId: source.attemptId,
+      archiveId: source.archive.id,
+    });
+    const [event] =
+      await db.execute(sql`SELECT e.verification FROM result_attempts a JOIN attempt_evidence_storage_events e
+      ON e.id=a.evidence_storage_event_id AND e.archive_id=a.evidence_archive_id
+      WHERE a.id=${source.attemptId}::uuid AND e.completed AND e.app_readback_at IS NOT NULL`);
+    const original = await source.store.read(source.archive);
+    const restore = await restoreAttemptEvidence(
+      db,
+      source.attemptId,
+      source.archive.id,
+      original.payloadText,
+      "runtime role test",
+    );
+    const [proof] =
+      await db.execute(sql`SELECT attempt_evidence_verified_hub() AS database_allows_hub,
+      attempt_evidence_verification_valid(${source.attemptId}::uuid,${source.archive.id}::uuid,${JSON.stringify(event.verification)}::jsonb) AS valid`);
+    expect(proof).toEqual({ database_allows_hub: true, valid: true });
+    const read = vi.spyOn(source.store, "read");
+    for (const role of ["remote-solver", ""]) {
+      vi.stubEnv("AIRFOILFOAM_DEPLOYMENT_ROLE", role);
+      await expect(enableVerifiedAttemptPolicy(db)).rejects.toThrow(
+        "explicit hub",
+      );
+      await runConfiguredAttemptEvidenceSettlementService(
+        db,
+        AbortSignal.timeout(1000),
+      );
+      await expect(runAttemptEvidenceSettlementPass(db, deps)).rejects.toThrow(
+        "explicit hub",
+      );
+      await expect(
+        settleAttemptEvidenceHistory(db, deps, {
+          attemptId: source.attemptId,
+          archiveId: source.archive.id,
+        }),
+      ).rejects.toThrow("explicit hub");
+      await expect(
+        shortenAttemptEvidence(
+          db,
+          source.attemptId,
+          source.archive.id,
+          event.verification as AttemptEvidenceFreshVerification,
+        ),
+      ).rejects.toThrow("explicit hub");
+    }
+    expect(read).not.toHaveBeenCalled();
+    const [row] =
+      await db.execute(sql`SELECT evidence_archive_id,evidence_storage_event_id,evidence_payload::text AS original
+      FROM result_attempts WHERE id=${source.attemptId}::uuid`);
+    expect(row.evidence_archive_id).toBeNull();
+    expect(row.evidence_storage_event_id).toBe(restore.eventId);
+    expect(row.original === original.payloadText).toBe(true);
+  } finally {
+    env.evidenceBucket = priorBucket;
+    vi.restoreAllMocks();
+    vi.unstubAllEnvs();
+  }
+}
+
 export async function verifyAttemptPolicyRole(db: DB) {
   // Ordinary hub preview, enable and settlement in this suite use the same retained registration.
-  await db.execute(sql`UPDATE sync_api_settings SET remote_solver_enabled=true WHERE id=1`);
+  await db.execute(
+    sql`UPDATE sync_api_settings SET remote_solver_enabled=true WHERE id=1`,
+  );
   await expect(enableVerifiedAttemptPolicy(db)).rejects.toThrow("HZ custody");
-  await db.execute(sql`UPDATE sync_api_settings SET remote_solver_enabled=false WHERE id=1`);
-  await db.execute(sql`UPDATE attempt_evidence_storage_policy SET hz_worker_only=true WHERE id=1`);
+  await db.execute(
+    sql`UPDATE sync_api_settings SET remote_solver_enabled=false WHERE id=1`,
+  );
+  await db.execute(
+    sql`UPDATE attempt_evidence_storage_policy SET hz_worker_only=true WHERE id=1`,
+  );
   await expect(enableVerifiedAttemptPolicy(db)).rejects.toThrow("HZ custody");
-  await db.execute(sql`UPDATE attempt_evidence_storage_policy SET hz_worker_only=false WHERE id=1`);
+  await db.execute(
+    sql`UPDATE attempt_evidence_storage_policy SET hz_worker_only=false WHERE id=1`,
+  );
   await db.execute(sql`DELETE FROM sync_api_settings WHERE id=1`);
   await expect(enableVerifiedAttemptPolicy(db)).rejects.toThrow("HZ custody");
-  expect((await getAttemptEvidenceStoragePolicy(db))?.shorteningEnabled).toBe(false);
+  expect((await getAttemptEvidenceStoragePolicy(db))?.shorteningEnabled).toBe(
+    false,
+  );
   try {
     vi.stubEnv("AIRFOILFOAM_DEPLOYMENT_ROLE", "remote-solver");
     await expect(

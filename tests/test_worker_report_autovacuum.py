@@ -142,6 +142,146 @@ class WorkerAutovacuumTest(unittest.TestCase):
         self.assertEqual(maintenance.scale_factor("2e-2"), Decimal(".02"))
 
 
+@unittest.skipUnless(CASE, "requires the isolated report-relation case")
+class WorkerReturnCheckTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        db = unquote(urlsplit(os.environ["DATABASE_URL"]).path[1:])
+        if not db or not os.environ.get("PGHOST") or not os.environ.get("PGPORT"):
+            raise ValueError("Isolated PostgreSQL target required")
+        cls.psql = ["psql", "-XwqAt", "-v", "ON_ERROR_STOP=1", "-d", db]
+        existing = cls.sql("SELECT relname FROM pg_class WHERE relnamespace='public'::regnamespace AND relkind='r' ORDER BY 1")
+        if existing.strip() != "progressive_worker_reports":
+            raise ValueError("Expected only the disposable report table")
+        cls.sql("""ALTER TABLE public.progressive_worker_reports ADD COLUMN archived_at timestamptz,
+            ADD COLUMN result_payload_hash text, ADD COLUMN acknowledged_at timestamptz,
+            ADD COLUMN content_signature text;
+            CREATE TABLE public.sim_jobs (status text);
+            CREATE TABLE public.progressive_worker_evidence_delivery_claims (claim_expires_at timestamptz);
+            CREATE TABLE public.sync_sweep_promises (status text, "expiresAt" timestamptz);
+            INSERT INTO public.sim_jobs VALUES ('running'),('ingesting');
+            INSERT INTO public.sync_sweep_promises VALUES ('active',now()+interval '1 hour');
+            INSERT INTO public.progressive_worker_evidence_delivery_claims VALUES(now()+interval '1 hour');
+            INSERT INTO public.progressive_worker_reports(id,report,acknowledged_at)
+            VALUES (42,'{"sequence":42,"unknown":null,"result":{"science":9007199254740993001,"polars":[{"cl":1.00,"cd":0.005}]}}',now());
+            UPDATE public.progressive_worker_reports SET content_signature=encode(sha256(convert_to(report::text,'UTF8')),'hex');
+        """)
+
+    @classmethod
+    def sql(cls, statement, readonly=False):
+        return subprocess.run(cls.psql, input=statement, text=True, check=True, capture_output=True, timeout=15,
+            env={**os.environ, "PGOPTIONS": f"-c default_transaction_read_only={'on' if readonly else 'off'} -c statement_timeout=5000"}).stdout
+
+    def session(self, statement, write):
+        self.assertFalse(write)
+        try:
+            return maintenance.json_rows(self.sql(statement, True))
+        except subprocess.CalledProcessError as error:
+            self.fail(error.stderr)
+
+    def host(self, role, command):
+        self.assertEqual(role, "worker")
+        self.assertEqual(command[:2], ["python3", "-c"])
+        paths = json.loads(command[-1])
+        return json.dumps({
+            "devices": {"1": {"source":"/dev/data","mount":"/data","sizeBytes":10000000,"freeBytes":8000000},
+                        "2": {"source":"/dev/wal","mount":"/wal","sizeBytes":4000000,"freeBytes":3000000}},
+            "files": {k: "2" if k=="wal" and self.split_wal else "1" for k in paths},
+            "services": {"postgres":[{"id":"pg","state":"running","startedAt":"start","restarts":0}],
+                "worker":[{"id":"engine","state":"running","startedAt":"original","restarts":2}],
+                "api":[{"id":"api","state":"exited","startedAt":"old","restarts":0}],
+                "node-api":[{"id":"ingress","state":"running","startedAt":"start","restarts":0}],"media-repair":[]}
+        })
+
+    def test_check_preserves_scientific_metadata_and_exact_service_states(self):
+        identity = """SELECT id,acknowledged_at::text,result_payload_hash,content_signature,report::text
+            FROM public.progressive_worker_reports ORDER BY id"""
+        data = self.sql(identity)
+        self.split_wal = False
+        before = maintenance.worker_return_check(live_values=True, session=self.session, host=self.host)
+        self.sql("VACUUM (TRUNCATE FALSE) public.progressive_worker_reports")
+        after = maintenance.worker_return_check(before, True, self.session, self.host)
+        self.assertEqual(data, self.sql(identity))
+        self.assertEqual(after["liveValues"], before["liveValues"])
+        self.assertEqual(after["liveValues"]["inline"]["rows"], 2)
+        self.assertTrue(after["change"]["samePhysicalFile"])
+        self.assertTrue(after["change"]["sameIndexFiles"])
+        self.assertTrue(after["change"]["sameServiceStates"])
+        self.assertEqual(after["serviceStates"]["api"][0]["state"], "exited")
+        self.assertEqual(after["serviceStates"]["media-repair"], [])
+        self.assertEqual(after["change"]["liveValueMarginDeltaBytes"], 0)
+        self.assertEqual(after["tail"]["heap"]["visibleTailUpperBoundBytes"], 0)
+        if after["toastReadable"]:
+            self.assertTrue(0 < after["tail"]["toast"]["probedBlocks"] <= 32)
+        else:
+            self.assertEqual(after["tail"]["toast"]["status"], "no-existing-read-access")
+        self.assertTrue(after["ingress"]["liveClaims"])
+        self.assertEqual(after["ingress"]["runningJobs"], 1)
+        self.assertEqual(after["freeMinusCurrentAllocationBytes"], 8000000-after["totalBytes"])
+        with self.assertRaisesRegex(ValueError, "physical files"):
+            maintenance.worker_return_check({**before,"toastFilenode":0}, session=self.session, host=self.host)
+
+    def test_split_storage_and_real_allocation_signal(self):
+        self.split_wal = True
+        prior = maintenance.worker_return_check(session=self.session, host=self.host)
+        self.assertIsNone(prior["freeMinusCurrentAllocationBytes"])
+        self.assertNotIn("liveValues",prior)
+        prior["totalBytes"] += 8192
+        after = maintenance.worker_return_check(prior, session=self.session, host=self.host)
+        self.assertEqual(after["change"]["relationFileDecreaseBytes"], 8192)
+        self.assertIn("relation-allocation-fell",after["reviewSignals"])
+        self.assertEqual(after["fileVolumes"]["wal"]["source"],"/dev/wal")
+        self.assertNotIn("available-space-crossed-current-allocation",after["reviewSignals"])
+
+    def test_budget_crossing_only_requests_review_on_the_same_physical_volume(self):
+        self.split_wal = False
+        old = maintenance.worker_return_check(session=self.session, host=self.host)
+        old["postgresFilesystem"]["freeBytes"] = 10000
+        result = maintenance.worker_return_check(old, session=self.session, host=self.host, review_free_bytes=50000)
+        self.assertIn("specified-review-budget-reached",result["reviewSignals"])
+        self.assertTrue(result["reviewBudgetCovered"])
+        self.assertTrue(result["change"]["sameServiceStates"])
+        self.split_wal = True
+        split = maintenance.worker_return_check(old, session=self.session, host=self.host, review_free_bytes=50000)
+        self.assertIsNone(split["reviewBudgetCovered"])
+        self.assertNotIn("specified-review-budget-reached",split["reviewSignals"])
+
+    def test_real_empty_tail_shrinks_and_retained_original_survives(self):
+        self.split_wal = False
+        original = self.sql("SELECT id,report::text,content_signature,acknowledged_at::text FROM public.progressive_worker_reports WHERE id IN (1,42) ORDER BY id")
+        self.sql("""ALTER TABLE public.progressive_worker_reports SET (autovacuum_enabled=false);
+            INSERT INTO public.progressive_worker_reports(id,report)
+              SELECT 1000000+n,jsonb_build_object('padding',repeat(md5(n::text),16)) FROM generate_series(1,8192) AS n;
+            DELETE FROM public.progressive_worker_reports WHERE id>1000000;""")
+        try:
+            before = maintenance.worker_return_check(session=self.session,host=self.host)
+            self.assertIsNone(before["tail"]["heap"]["visibleTailUpperBoundBytes"])
+            self.sql("VACUUM (TRUNCATE TRUE, INDEX_CLEANUP ON) public.progressive_worker_reports")
+            after = maintenance.worker_return_check(before,session=self.session,host=self.host)
+            self.assertGreater(before["heapBytes"], after["heapBytes"])
+            self.assertEqual(after["change"]["relationFileDecreaseBytes"], before["totalBytes"]-after["totalBytes"])
+            self.assertIn("relation-allocation-fell",after["reviewSignals"])
+            self.assertTrue(after["change"]["samePhysicalFile"])
+            self.assertEqual(after["change"]["changedServices"],[])
+            self.assertEqual(self.sql("SELECT id,report::text,content_signature,acknowledged_at::text FROM public.progressive_worker_reports WHERE id IN (1,42) ORDER BY id"), original)
+        finally:
+            self.sql("ALTER TABLE public.progressive_worker_reports RESET (autovacuum_enabled)")
+
+    def test_changed_container_identity_is_reported_without_restoring_a_replacement(self):
+        self.split_wal = False
+        prior = maintenance.worker_return_check(session=self.session,host=self.host)
+        prior["serviceStates"]["api"][0]["id"] = "previous-api"
+        after = maintenance.worker_return_check(prior,session=self.session,host=self.host)
+        self.assertEqual(after["change"]["changedServices"],["api"])
+        self.assertIn("service-state-changed",after["reviewSignals"])
+        self.assertEqual(after["serviceStates"]["api"],[{"id":"api","state":"exited","startedAt":"old","restarts":0}])
+
+    def test_check_has_no_write_or_hub_entrypoint(self):
+        for args in (["--return-check","worker","--apply"],["--return-check","hub"],["--autovacuum","worker","--live-values"]):
+            p = subprocess.run([sys.executable,str(SCRIPT),*args], capture_output=True, timeout=4)
+            self.assertEqual(p.returncode,2)
+
+
 if __name__ == "__main__":
     if not CASE:
         raise SystemExit("Use the isolated worker-report-native-reclamation check")

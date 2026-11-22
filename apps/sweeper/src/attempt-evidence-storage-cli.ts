@@ -1,5 +1,5 @@
 import { configuredDeploymentRole } from "./config";
-import { enableVerifiedAttemptPolicy, requireVerifiedAttemptHub, VERIFIED_HUB_ATTEMPT_COHORTS } from "@aerodb/db/attempt-evidence-verified-policy";
+import { enableVerifiedAttemptPolicy, hasConfiguredAttemptHubRole, requireVerifiedAttemptHub, VERIFIED_HUB_ATTEMPT_COHORTS } from "@aerodb/db/attempt-evidence-verified-policy";
 import {
   attemptEvidenceAuditSql,
   auditAttemptEvidencePage,
@@ -300,7 +300,7 @@ export async function attemptEvidenceStorageMain(
       if (
         !bucket ||
         policy.hzWorkerOnly ||
-        configuredDeploymentRole() !== "hub"
+        !hasConfiguredAttemptHubRole()
       )
         throw new Error(
           "Attempt shortening requires the canonical hub bucket and existing server credentials",
@@ -487,7 +487,7 @@ export async function attemptEvidenceStorageMain(
     }
     if (
       ["restore", "archive", "backfill"].includes(command!) &&
-      configuredDeploymentRole() !== "hub"
+      !hasConfiguredAttemptHubRole()
     )
       throw new Error(
         "Worker attempt custody uses its registered volume and relay",

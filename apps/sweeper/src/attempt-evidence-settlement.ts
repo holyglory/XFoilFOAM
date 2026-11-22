@@ -1,4 +1,4 @@
-import { configuredDeploymentRole } from "./config";
+import { hasConfiguredAttemptHubRole, requireConfiguredAttemptHubRole } from "@aerodb/db/attempt-evidence-verified-policy";
 import type { DB } from "@aerodb/db/client";
 import { getAttemptEvidenceArchive } from "@aerodb/db/attempt-evidence-catalog";
 import {
@@ -46,7 +46,7 @@ export function createAttemptEvidenceSettlementDependencies(
 /** The isolated worker and CLI each need a reader for archived source
  * reports. Installing the API's hub reader uses the existing bucket. */
 export async function configuredAttemptEvidenceSettlementDependencies(db: DB) {
-  if (configuredDeploymentRole() !== "hub") throw new Error("Attempt settlement requires the canonical hub reader");
+  requireConfiguredAttemptHubRole();
   const { installApiReportArchiveReader } = await import("../../api/src/progressive-report-archive-reader");
   const { readApiAttemptEvidenceForApp } = await import("../../api/src/attempt-evidence-reader");
   await installApiReportArchiveReader();
@@ -139,8 +139,9 @@ export async function settleAttemptEvidenceHistory(
       stored.storageEventId !== options.pendingEventId)
   )
     throw new Error("Pending readback was superseded");
+  const policy = await getAttemptEvidenceStoragePolicy(db);
+  if (policy?.progressiveSourceScope === "verified") requireConfiguredAttemptHubRole();
   if (stored.state === "inline") {
-    const policy = await getAttemptEvidenceStoragePolicy(db);
     if (
       !policy?.shorteningEnabled ||
       policy.consumerContractVersion !== ATTEMPT_EVIDENCE_CONTRACT_VERSION
@@ -271,6 +272,7 @@ export async function runAttemptEvidenceSettlementPass(
   if (!Number.isSafeInteger(maxRows) || maxRows < 1 || maxRows > 8)
     throw new Error("Attempt history shortening budget must be 1..8");
   const policy = await getAttemptEvidenceStoragePolicy(db);
+  if (policy?.progressiveSourceScope === "verified") requireConfiguredAttemptHubRole();
   const automatic = Boolean(
     policy?.shorteningEnabled &&
     policy.consumerContractVersion === 1 &&
@@ -405,7 +407,7 @@ export async function runConfiguredAttemptEvidenceSettlementService(
 ): Promise<void> {
   if (
     !process.env.AIRFOILFOAM_EVIDENCE_BUCKET?.trim() ||
-    configuredDeploymentRole() !== "hub" ||
+    !hasConfiguredAttemptHubRole() ||
     process.env.AIRFOILFOAM_ATTEMPT_HISTORY_SHORTENING === "false" ||
     signal.aborted
   )

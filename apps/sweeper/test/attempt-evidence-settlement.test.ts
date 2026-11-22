@@ -1,4 +1,4 @@
-import { createVerifiedPolicyFixture, verifyMixedAttemptPolicy, verifyLateAttemptPolicy, verifyPendingAttemptPolicy, verifyAttemptPolicyRole } from "../test-support/verified-attempt-policy";
+import { createVerifiedPolicyFixture, verifyMixedAttemptPolicy, verifyLateAttemptPolicy, verifyPendingAttemptPolicy, verifyPausedWorkerRole, verifyAttemptPolicyRole } from "../test-support/verified-attempt-policy";
 import {
   afterAll,
   afterEach,
@@ -652,10 +652,12 @@ describe("verified automatic attempt cohorts", () => {
     fixture = await createVerifiedPolicyFixture();
   });
   beforeEach(async () => {
+    vi.stubEnv("AIRFOILFOAM_DEPLOYMENT_ROLE","hub");
     await fixture.reset();
     await fixture.db.execute(sql`INSERT INTO sync_api_settings(id,remote_solver_enabled,remote_solver_registered_id,upstream_base_url)
       VALUES(1,false,${randomUUID()}::uuid,'https://upstream.invalid')`);
   });
+  afterEach(() => vi.unstubAllEnvs());
   afterAll(async () => {
     if (fixture) await fixture.close();
   });
@@ -668,6 +670,9 @@ describe("verified automatic attempt cohorts", () => {
   });
   it("admits another cohort while retrying an unavailable pending readback", async () => {
     await verifyPendingAttemptPolicy(fixture.db);
+  });
+  it("refuses a valid hub proof on a paused remote-solver or an unconfigured writer", async () => {
+    await verifyPausedWorkerRole(fixture.db);
   });
   it("keeps the automatic hub policy and its credentials off the worker and unsupported roles", async () => {
     await verifyAttemptPolicyRole(fixture.db);

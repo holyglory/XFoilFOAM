@@ -13,7 +13,7 @@ import type {
 } from "./attempt-evidence-projection";
 import { readPolarAttemptEvidenceForConsumerProof } from "./polar-cache";
 import { precalcContinuationProgressFromEvidence } from "./precalc-obligations";
-import { verifiedAttemptProofScope } from "./attempt-evidence-verified-policy";
+import { requireConfiguredAttemptHubRole, verifiedAttemptProofScope } from "./attempt-evidence-verified-policy";
 import { getAttemptEvidenceStoragePolicy } from "./attempt-evidence-projection";
 import {
   RECEIPT_SOURCE_VERIFIER,
@@ -236,10 +236,10 @@ export function createAttemptServerDependencyVerifier(
       lengths.set(JSON.stringify(fact.path), fact.length);
     }
     const policy = await getAttemptEvidenceStoragePolicy(db);
-    if (verifyWorker && policy?.progressiveSourceScope === "verified")
-      throw new Error(
-        "A worker-volume proof cannot be used for the verified hub policy",
-      );
+    if (policy?.progressiveSourceScope === "verified") {
+      requireConfiguredAttemptHubRole();
+      if (verifyWorker) throw new Error("A worker-volume proof cannot be used for the verified hub policy");
+    }
     const restored = await reader.read(archive, AbortSignal.timeout(30_000));
     requireProof(
       restored.attemptId === attemptId &&
