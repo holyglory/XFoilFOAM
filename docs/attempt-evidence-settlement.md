@@ -119,13 +119,31 @@ cycle or no-shedding policy to that generation.
 
 ## Automatic mode and recovery
 
-After a successful canary, enable the bounded automatic writer with the same
-contract version and an unrestricted attempt scope.
+After verifying the compatible hub cohorts with their scoped canaries, preview
+the combined policy and enable it for new arrivals. The preview reports the
+stable attempt ID, exact archive ID and selected cohort. It works before the
+policy is enabled.
 
 ```sh
-attempt_history enable-shortening --consumer-contract 1
+attempt_history preview-verified --pages 1
+attempt_history enable-verified --consumer-contract 1
 attempt_history shortening-status
 ```
+
+The `verified` policy uses the existing local RANS, stopped progressive RANS,
+receipt-bearing RANS and receipt-bearing URANS verifiers. A qualifying stopped
+receipt keeps its stopped proof. Each write repeats the selected cohort’s
+eligibility and requires that cohort’s original readbacks and scientific proof.
+The combined policy keeps the URANS byte limit established by its scoped
+canary and the existing independent limit for RANS.
+The worker revisits the catalog after each bounded sweep, including attempts
+that arrived behind its cursor or whose earlier read failed. Existing storage
+events retain their original verifier, archive and restore identity.
+
+Use `enable-shortening --consumer-contract 1` for the original local policy.
+Its scoped options and `--id` continue to select individual canaries. HZ uses
+its registered worker volume and the operator’s existing watch command.
+The hub policy runs only on a hub. [HZ attempt custody](hz-attempt-history.md)
 
 `report-storage-worker.ts` starts `runConfiguredAttemptEvidenceSettlementService`
 on the hub. It takes at most four attempts per pass by default. The policy is

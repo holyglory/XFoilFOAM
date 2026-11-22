@@ -1,3 +1,5 @@
+import { configuredDeploymentRole } from "./config";
+import { enableVerifiedAttemptPolicy, requireVerifiedAttemptHub, VERIFIED_HUB_ATTEMPT_COHORTS } from "@aerodb/db/attempt-evidence-verified-policy";
 import {
   attemptEvidenceAuditSql,
   auditAttemptEvidencePage,
@@ -21,6 +23,7 @@ import {
 import { AttemptEvidenceStore } from "./attempt-evidence-store";
 import { writeFile } from "node:fs/promises";
 import {
+  type AttemptEvidenceStoragePolicy,
   attemptEvidenceShorteningCandidates,
   attemptEvidenceSettlementTotals,
   getAttemptEvidenceStoragePolicy,
@@ -38,6 +41,23 @@ function integer(text: string | undefined, fallback: number): number {
   if (!/^[1-9][0-9]*$/.test(text) || !Number.isSafeInteger(Number(text)))
     throw new Error("Audit bounds require positive safe integers");
   return Number(text);
+}
+
+function activeCohorts(
+  policy: AttemptEvidenceStoragePolicy,
+  role: ReturnType<typeof configuredDeploymentRole>,
+) {
+  if (!policy.shorteningEnabled) return [];
+  if (role === "remote-solver" || policy.hzWorkerOnly)
+    return role === "remote-solver" && policy.hzWorkerOnly ? ["hz-worker"] : [];
+  if (policy.progressiveSourceScope === "verified")
+    return VERIFIED_HUB_ATTEMPT_COHORTS;
+  if (
+    policy.progressiveSourceScope === "legacy" &&
+    policy.stoppedProgressiveEnabled
+  )
+    return ["legacy", "stopped-only"];
+  return [policy.progressiveSourceScope];
 }
 
 export async function attemptEvidenceStorageMain(
@@ -72,6 +92,20 @@ export async function attemptEvidenceStorageMain(
     )
       throw new Error("Invalid attempt evidence command options");
     flags.set(flag, args[index + 1]!);
+  }
+  const verified =
+    command === "enable-verified" || command === "preview-verified";
+  if (verified) {
+    const allowed =
+      command === "enable-verified"
+        ? ["--consumer-contract"]
+        : ["--after", "--pages"];
+    if ([...flags.keys()].some((flag) => !allowed.includes(flag)))
+      throw new Error(
+        "The verified policy uses all qualified hub cohorts. Use a scoped command for a canary.",
+      );
+    if (configuredDeploymentRole() !== "hub")
+      throw new Error("Worker attempts require the HZ custody relay");
   }
   const options = {
     after: flags.get("--after"),
@@ -152,6 +186,8 @@ export async function attemptEvidenceStorageMain(
       "archive",
       "backfill",
       "restore",
+      "preview-verified",
+      "enable-verified",
       "shortening-status",
       "shortening-candidates",
       "enable-shortening",
@@ -162,7 +198,7 @@ export async function attemptEvidenceStorageMain(
     ].includes(command ?? "")
   )
     throw new Error(
-      "Usage: attempt-evidence-storage-cli.ts sql|use-sql|audit|use-audit|copy|archive|backfill|restore|shortening-status|shortening-candidates|enable-shortening|disable-shortening|shorten|shorten-pass|restore-inline [--consumer-contract 1] [--stopped-progressive true|only] [--receipt-bearing true | --receipt-urans true [--urans-max-source-bytes N]] [--id ATTEMPT_UUID --archive-id ARCHIVE_UUID] [--after UUID] [--rows N] [--pages N] [--output NEW_FILE] [--bucket BUCKET] [--source-instance INSTANCE]",
+      "Usage: attempt-evidence-storage-cli.ts sql|use-sql|audit|use-audit|copy|archive|backfill|restore|shortening-status|preview-verified|enable-verified|shortening-candidates|enable-shortening|disable-shortening|shorten|shorten-pass|restore-inline [--consumer-contract 1] [--stopped-progressive true|only] [--receipt-bearing true | --receipt-urans true [--urans-max-source-bytes N]] [--id ATTEMPT_UUID --archive-id ARCHIVE_UUID] [--after UUID] [--rows N] [--pages N] [--output NEW_FILE] [--bucket BUCKET] [--source-instance INSTANCE]",
     );
   if (!process.env.DATABASE_URL)
     throw new Error("An explicit DATABASE_URL is required");
@@ -174,6 +210,8 @@ export async function attemptEvidenceStorageMain(
   try {
     if (
       [
+        "preview-verified",
+        "enable-verified",
         "shortening-status",
         "shortening-candidates",
         "enable-shortening",
@@ -189,29 +227,55 @@ export async function attemptEvidenceStorageMain(
           "Attempt history shortening requires forward migration 0208",
         );
       if (command === "shortening-status") {
+        const role = configuredDeploymentRole();
+        const cohorts = activeCohorts(policy, role);
         process.stdout.write(
-          `${JSON.stringify({ policy, current: await attemptEvidenceSettlementTotals(client.db), automaticWorker: "report-storage-worker", emergencyDisabled: process.env.AIRFOILFOAM_ATTEMPT_HISTORY_SHORTENING === "false" })}\n`,
+          `${JSON.stringify({ role, policy, cohorts, current: await attemptEvidenceSettlementTotals(client.db), automaticWorker: role === "remote-solver" ? "hz-attempt-storage-cli.ts watch" : "report-storage-worker", emergencyDisabled: process.env.AIRFOILFOAM_ATTEMPT_HISTORY_SHORTENING === "false" })}\n`,
         );
         return;
       }
-      if (command === "shortening-candidates") {
+      if (
+        command === "shortening-candidates" ||
+        command === "preview-verified"
+      ) {
+        let scoped:
+          | AttemptEvidenceStoragePolicy["progressiveSourceScope"]
+          | undefined;
+        if (stoppedProgressive) scoped = "stopped-only";
+        if (receiptBearing) scoped = "receipt-bearing";
+        if (receiptUrans) scoped = "receipt-urans";
+        const previewVerified =
+          verified || (!scoped && policy.progressiveSourceScope === "verified");
+        if (previewVerified) {
+          if (configuredDeploymentRole() !== "hub")
+            throw new Error("Worker attempts require the HZ custody relay");
+          await requireVerifiedAttemptHub(client.db);
+        }
         let after = options.after ?? null,
           scanned = 0,
           complete = false;
-        const eligible: Array<{ attemptId: string; archiveId: string }> = [];
+        const eligible: Array<{
+          attemptId: string;
+          archiveId: string;
+          cohort?: string | null;
+        }> = [];
         const limits = new Map<string, number>();
         for (let page = 0; page < pages; page++) {
           const rows = await attemptEvidenceShorteningCandidates(
             client.db,
             after,
-            receiptUrans ? "receipt-urans" : receiptBearing ? "receipt-bearing" : stoppedProgressive,
+            previewVerified ? "verified" : (scoped ?? false),
           );
           for (const row of rows) {
             const reason =
               row.limiter ?? (row.archive_id ? null : "missing-exact-archive");
             if (reason) limits.set(reason, (limits.get(reason) ?? 0) + 1);
             else
-              eligible.push({ attemptId: row.id, archiveId: row.archive_id! });
+              eligible.push({
+                attemptId: row.id,
+                archiveId: row.archive_id!,
+                ...(previewVerified ? { cohort: row.cohort } : {}),
+              });
           }
           scanned += rows.length;
           after = rows.at(-1)?.id ?? null;
@@ -235,11 +299,23 @@ export async function attemptEvidenceStorageMain(
       const bucket = process.env.AIRFOILFOAM_EVIDENCE_BUCKET?.trim();
       if (
         !bucket ||
-        process.env.AIRFOILFOAM_DEPLOYMENT_ROLE === "remote-solver"
+        policy.hzWorkerOnly ||
+        configuredDeploymentRole() !== "hub"
       )
         throw new Error(
           "Attempt shortening requires the canonical hub bucket and existing server credentials",
         );
+      if (command === "enable-verified") {
+        if (flags.get("--consumer-contract") !== "1")
+          throw new Error("Verified shortening requires --consumer-contract 1");
+        await requireVerifiedAttemptHub(client.db);
+        await configuredAttemptEvidenceSettlementDependencies(client.db);
+        await enableVerifiedAttemptPolicy(client.db);
+        process.stdout.write(
+          `${JSON.stringify(await getAttemptEvidenceStoragePolicy(client.db))}\n`,
+        );
+        return;
+      }
       if (command === "enable-shortening") {
         if (flags.get("--consumer-contract") !== "1")
           throw new Error(
@@ -252,11 +328,13 @@ export async function attemptEvidenceStorageMain(
           enabled: true,
           consumerContractVersion: 1,
           canaryAttemptId: flags.get("--id"),
-          stoppedProgressive: stoppedMode === "only" ? "only" : stoppedProgressive,
+          stoppedProgressive:
+            stoppedMode === "only" ? "only" : stoppedProgressive,
           receiptBearing,
           receiptUrans,
           uransMaxSourceBytes: flags.has("--urans-max-source-bytes")
-            ? integer(flags.get("--urans-max-source-bytes"), 262144) : undefined,
+            ? integer(flags.get("--urans-max-source-bytes"), 262144)
+            : undefined,
         });
         process.stdout.write(`${JSON.stringify(enabled)}\n`);
         return;
@@ -284,7 +362,9 @@ export async function attemptEvidenceStorageMain(
       }
       if (!policy.shorteningEnabled || policy.consumerContractVersion !== 1)
         throw new Error("Attempt history shortening is not enabled");
-      const deps = await configuredAttemptEvidenceSettlementDependencies(client.db);
+      const deps = await configuredAttemptEvidenceSettlementDependencies(
+        client.db,
+      );
       if (command === "shorten") {
         const id = flags.get("--id"),
           archiveId = flags.get("--archive-id");
@@ -297,6 +377,7 @@ export async function attemptEvidenceStorageMain(
       }
       if (policy.canaryAttemptId)
         throw new Error("Use shorten with the configured canary attempt ID");
+      let afterReadback: string | null = null;
       let after = options.after ?? null,
         processed = 0,
         shortened = 0,
@@ -307,6 +388,7 @@ export async function attemptEvidenceStorageMain(
       for (let page = 0; page < pages; page++) {
         const result = await runAttemptEvidenceSettlementPass(client.db, deps, {
           after,
+          afterReadback,
           maxRows: integer(flags.get("--rows"), 4),
         });
         processed += result.processed;
@@ -315,7 +397,8 @@ export async function attemptEvidenceStorageMain(
         netValueBytesReclaimed += result.netValueBytesReclaimed;
         failures.push(...result.failures);
         after = result.next;
-        if (after === null) {
+        afterReadback = result.nextReadback;
+        if (after === null && afterReadback === null) {
           scanComplete = true;
           break;
         }
@@ -402,6 +485,13 @@ export async function attemptEvidenceStorageMain(
       );
       return;
     }
+    if (
+      ["restore", "archive", "backfill"].includes(command!) &&
+      configuredDeploymentRole() !== "hub"
+    )
+      throw new Error(
+        "Worker attempt custody uses its registered volume and relay",
+      );
     if (command === "restore") {
       if (!flags.get("--id") || !flags.get("--output"))
         throw new Error("restore requires a catalog --id and new --output");

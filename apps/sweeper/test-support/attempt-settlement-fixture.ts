@@ -1,3 +1,5 @@
+import type { PolarPoint } from "@aerodb/engine-client";
+import { PgDialect } from "drizzle-orm/pg-core";
 import { CRC32C, type File, type Storage } from "@google-cloud/storage";
 import { createClient, type DB } from "@aerodb/db/client";
 import { sql } from "drizzle-orm";
@@ -242,37 +244,21 @@ export async function createSettlementFixture(workerCustody = false) {
   }
 }
 
-export async function seedSettledHistory(
-  db: DB,
-  options: { id?: string; compressible?: boolean } = {},
-) {
-  const attemptId = options.id ?? randomUUID(),
-    resultId = randomUUID(),
-    jobId = randomUUID(),
-    airfoilId = randomUUID(),
-    revisionId = randomUUID();
+function settledRansPayload(compressible = false) {
   const count = 1600;
   const values = Array.from({ length: count }, (_, i) =>
-    options.compressible
-      ? 0
-      : Number((Math.sin(i * 0.143) / 100 + 0.6).toFixed(12)),
+    compressible ? 0 : Number((Math.sin(i * 0.143) / 100 + 0.6).toFixed(12)),
   );
   const history = {
-    iterations: Array.from({ length: count }, (_, i) =>
-      options.compressible ? 0 : i,
-    ),
+    iterations: Array.from({ length: count }, (_, i) => (compressible ? 0 : i)),
     cl: values,
-    cd: values.map((v) =>
-      options.compressible ? 0 : Number((v / 40).toFixed(12)),
-    ),
-    cm: values.map((v) =>
-      options.compressible ? 0 : Number((-v / 20).toFixed(12)),
-    ),
+    cd: values.map((v) => (compressible ? 0 : Number((v / 40).toFixed(12)))),
+    cm: values.map((v) => (compressible ? 0 : Number((-v / 20).toFixed(12)))),
     window: { start_iter: 0, end_iter: count - 1 },
     mean_stable: true,
     note: "measured stable history fixture",
   };
-  const payload = JSON.stringify({
+  return JSON.stringify({
     fidelity: "rans",
     mesh_recovery_version: 1,
     aoa_deg: 0,
@@ -294,32 +280,76 @@ export async function seedSettledHistory(
     certificate: { source: "preserved" },
     diagnostic: "EXACT_WIDE_NUMBER",
   }).replace('"EXACT_WIDE_NUMBER"', "9007199254740993123456789");
+}
+
+interface SettledHistoryOptions {
+  id?: string;
+  compressible?: boolean;
+  uransPoint?: PolarPoint;
+}
+
+export async function seedInlineSettledHistory(
+  db: DB,
+  options: SettledHistoryOptions = {},
+) {
+  const attemptId = options.id ?? randomUUID(),
+    resultId = randomUUID(),
+    jobId = randomUUID(),
+    airfoilId = randomUUID(),
+    revisionId = randomUUID();
+  const point = options.uransPoint;
+  const payload = point
+    ? JSON.stringify({ ...point, mesh_recovery_version: 3 })
+    : settledRansPayload(options.compressible);
   await db.execute(sql`INSERT INTO airfoils(id,points) VALUES(${airfoilId}::uuid,
     '[{"x":1,"y":0.001},{"x":0,"y":0},{"x":1,"y":-0.001}]'::jsonb)`);
   await db.execute(sql`INSERT INTO sim_jobs(id,status,"ingestedAt",engine_state,request_payload,airfoil_id,simulation_preset_revision_id)
     VALUES(${jobId}::uuid,'done',clock_timestamp(),'completed','{}'::jsonb,${airfoilId}::uuid,${revisionId}::uuid)`);
   await db.execute(sql`INSERT INTO results(id,current_result_attempt_id,airfoil_id,simulation_preset_revision_id,cl,cd)
-    VALUES(${resultId}::uuid,NULL,${airfoilId}::uuid,${revisionId}::uuid,0.6,0.015)`);
+    VALUES(${resultId}::uuid,NULL,${airfoilId}::uuid,${revisionId}::uuid,${point ? point.cl : 0.6},${point ? point.cd : 0.015})`);
   await db.execute(sql`INSERT INTO result_attempts(id,result_id,sim_job_id,airfoil_id,bc_id,simulation_preset_revision_id,
     aoa_deg,status,source,regime,valid_for_polar,unsteady,converged,stalled,first_order_fallback,engine_job_id,
     evidence_payload,cl,cd,cm,"createdAt","solvedAt") VALUES(${attemptId}::uuid,${resultId}::uuid,${jobId}::uuid,
-    ${airfoilId}::uuid,${randomUUID()}::uuid,${revisionId}::uuid,0,'done','solved','rans',true,false,true,false,false,
-    ${`local:${jobId}`},${payload}::jsonb,0.6,0.015,-0.03,clock_timestamp(),clock_timestamp())`);
-  const memory = new SettlementGcs(),
+    ${airfoilId}::uuid,${randomUUID()}::uuid,${revisionId}::uuid,${point?.aoa_deg ?? 0},'done','solved',${point ? "urans" : "rans"},
+    ${!point},${Boolean(point)},${point ? point.converged : true},false,false,
+    ${`local:${jobId}`},${payload}::jsonb,${point ? point.cl : 0.6},${point ? point.cd : 0.015},${point ? point.cm : -0.03},clock_timestamp(),clock_timestamp())`);
+  return { attemptId, resultId, jobId, airfoilId, revisionId };
+}
+
+export async function seedSettledHistory(
+  db: DB,
+  options: SettledHistoryOptions & { memory?: SettlementGcs } = {},
+) {
+  const source = await seedInlineSettledHistory(db, options);
+  const memory = options.memory ?? new SettlementGcs(),
     store = new AttemptEvidenceStore(memory as unknown as Storage);
   const result = await archiveAttemptEvidence(db, store, {
-    attemptId,
+    attemptId: source.attemptId,
     bucket: "fixture",
     sourceInstance: "hub",
   });
   return {
-    attemptId,
-    resultId,
-    jobId,
-    airfoilId,
-    revisionId,
+    ...source,
     archive: result.archive,
     memory,
     store,
   };
+}
+
+export function interruptBeforeReadback(db: DB) {
+  const dialect = new PgDialect();
+  return new Proxy(db, {
+    get(target, key) {
+      if (key !== "execute") return Reflect.get(target, key, target);
+      return (query: Parameters<DB["execute"]>[0]) => {
+        const statement =
+          typeof query === "string"
+            ? query
+            : dialect.sqlToQuery(query.getSQL()).sql;
+        if (statement.includes("SET app_readback_at=clock_timestamp()"))
+          throw new Error("process stopped before confirming visible read");
+        return target.execute(query);
+      };
+    },
+  });
 }

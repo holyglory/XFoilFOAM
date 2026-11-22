@@ -13,6 +13,7 @@ import type {
 } from "./attempt-evidence-projection";
 import { readPolarAttemptEvidenceForConsumerProof } from "./polar-cache";
 import { precalcContinuationProgressFromEvidence } from "./precalc-obligations";
+import { verifiedAttemptProofScope } from "./attempt-evidence-verified-policy";
 import { getAttemptEvidenceStoragePolicy } from "./attempt-evidence-projection";
 import {
   RECEIPT_SOURCE_VERIFIER,
@@ -208,6 +209,11 @@ export function createAttemptServerDependencyVerifier(
       );
       lengths.set(JSON.stringify(fact.path), fact.length);
     }
+    const policy = await getAttemptEvidenceStoragePolicy(db);
+    if (verifyWorker && policy?.progressiveSourceScope === "verified")
+      throw new Error(
+        "A worker-volume proof cannot be used for the verified hub policy",
+      );
     const restored = await reader.read(archive, AbortSignal.timeout(30_000));
     requireProof(
       restored.attemptId === attemptId &&
@@ -220,11 +226,13 @@ export function createAttemptServerDependencyVerifier(
     const workerScope = verifyWorker
       ? await verifyWorker(attemptId, originalPayloadText)
       : null;
-    const policy = await getAttemptEvidenceStoragePolicy(db);
-    const urans = policy?.progressiveSourceScope === "receipt-urans";
+    const proofScope =
+      policy?.progressiveSourceScope === "verified"
+        ? await verifiedAttemptProofScope(db, attemptId, archive.id)
+        : policy?.progressiveSourceScope;
+    const urans = proofScope === "receipt-urans";
     const broad =
-      !workerScope &&
-      (urans || policy?.progressiveSourceScope === "receipt-bearing")
+      !workerScope && (urans || proofScope === "receipt-bearing")
         ? await verifyProgressiveAttemptReceipt(
             db,
             attemptId,

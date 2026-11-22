@@ -1,3 +1,4 @@
+import { verifiedAttemptCandidatesSql } from "./attempt-evidence-verified-policy";
 import { sql, type SQL } from "drizzle-orm";
 import type { DB } from "./client";
 import {
@@ -329,9 +330,10 @@ export function attemptEvidenceValueMatchesSql(
 }
 
 export interface AttemptEvidenceStoragePolicy {
+  hzWorkerOnly: boolean;
   shorteningEnabled: boolean;
   stoppedProgressiveEnabled: boolean;
-  progressiveSourceScope: "legacy" | "stopped-only" | "receipt-bearing" | "receipt-urans";
+  progressiveSourceScope: "legacy" | "stopped-only" | "receipt-bearing" | "receipt-urans" | "verified";
   canaryAttemptId: string | null;
   consumerContractVersion: number;
   minLogicalBytes: number;
@@ -375,6 +377,7 @@ export async function getAttemptEvidenceStoragePolicy(
     min_logical_bytes AS "minLogicalBytes",min_net_value_bytes AS "minNetValueBytes",max_source_bytes AS "maxSourceBytes",initial_subset AS "initialSubset",
     coalesce((to_jsonb(policy)->>'stopped_progressive_enabled')::boolean,false) AS "stoppedProgressiveEnabled",
     coalesce(to_jsonb(policy)->>'progressive_source_scope','legacy') AS "progressiveSourceScope",
+    coalesce((to_jsonb(policy)->>'hz_worker_only')::boolean,false) AS "hzWorkerOnly",
     (to_jsonb(policy)->>'urans_max_source_bytes')::integer AS "uransMaxSourceBytes"
     FROM attempt_evidence_storage_policy policy WHERE id=1`);
   return row as unknown as AttemptEvidenceStoragePolicy;
@@ -575,18 +578,33 @@ export async function restoreAttemptEvidence(
   });
 }
 
+type AttemptShorteningCandidate = {
+  id: string;
+  limiter: string | null;
+  archive_id: string | null;
+  cohort?: string | null;
+};
+
 export async function attemptEvidenceShorteningCandidates(
   db: DB,
   after: string | null = null,
-  stoppedProgressiveOnly: boolean | "receipt-bearing" | "receipt-urans" = false,
+  selection:
+    | boolean
+    | AttemptEvidenceStoragePolicy["progressiveSourceScope"] = false,
 ) {
   if (after !== null) assertId(after);
   return db.transaction(async (tx) => {
     await tx.execute(sql`SET TRANSACTION READ ONLY`);
     await tx.execute(sql`SET LOCAL statement_timeout='5s'`);
     await tx.execute(sql`SET LOCAL lock_timeout='500ms'`);
-    const urans = stoppedProgressiveOnly === "receipt-urans";
-    const broad = urans || stoppedProgressiveOnly === "receipt-bearing";
+    if (selection === "verified")
+      return tx.execute<AttemptShorteningCandidate>(
+        verifiedAttemptCandidatesSql(after),
+      );
+    const stoppedProgressiveOnly =
+      selection === true || selection === "stopped-only";
+    const urans = selection === "receipt-urans";
+    const broad = urans || selection === "receipt-bearing";
     const retained =
       !broad && stoppedProgressiveOnly
         ? sql`JOIN progressive_remote_evidence_receipts rr ON rr.result_attempt_id=ar.result_attempt_id AND rr.storage_only`
@@ -598,7 +616,7 @@ export async function attemptEvidenceShorteningCandidates(
         : stoppedProgressiveOnly
           ? sql`attempt_evidence_stopped_shortening_limiter(a.id)`
           : sql`attempt_evidence_shortening_limiter(a.id)`;
-    return tx.execute(sql`WITH ids AS MATERIALIZED (
+    return tx.execute<AttemptShorteningCandidate>(sql`WITH ids AS MATERIALIZED (
       SELECT DISTINCT ar.result_attempt_id AS id FROM attempt_evidence_archives ar ${retained}
       ${after ? sql`WHERE ar.result_attempt_id>${after}::uuid` : sql``} ORDER BY ar.result_attempt_id LIMIT 32
     ), candidates AS MATERIALIZED (
@@ -609,21 +627,30 @@ export async function attemptEvidenceShorteningCandidates(
         WHERE c.limiter IS NULL AND ar.result_attempt_id=c.id AND ar.result_id IS NOT DISTINCT FROM c.result_id
           AND ar.sim_job_id IS NOT DISTINCT FROM c.sim_job_id
           AND ar.source_sha256=(SELECT encode(sha256(convert_to(a.evidence_payload::text,'UTF8')),'hex') FROM result_attempts a WHERE a.id=c.id)
-        ORDER BY ar.verified_at DESC,ar.id LIMIT 1) origin ON true ORDER BY c.id`) as unknown as Promise<
-      Array<{ id: string; limiter: string | null; archive_id: string | null }>
-    >;
+        ORDER BY ar.verified_at DESC,ar.id LIMIT 1) origin ON true ORDER BY c.id`);
   });
 }
 
 /** An interrupted worker leaves its committed shortening available for a real
  * app read (or exact restore) on restart. Only the active event owns recovery. */
-export async function pendingAttemptEvidenceReadbacks(db: DB, limit: number) {
+export async function pendingAttemptEvidenceReadbacks(
+  db: DB,
+  limit: number,
+  afterEventId?: string | null,
+) {
+  if (afterEventId) assertId(afterEventId);
   if (!Number.isSafeInteger(limit) || limit < 1 || limit > 8)
     throw new Error("Invalid attempt readback budget");
   return db.execute(sql`SELECT a.id AS "attemptId",e.archive_id AS "archiveId",e.id AS "eventId"
     FROM attempt_evidence_storage_events e JOIN result_attempts a ON a.id=e.result_attempt_id
       AND a.evidence_archive_id=e.archive_id AND a.evidence_storage_event_id=e.id
-    WHERE e.completed AND e.action='shorten' AND e.app_readback_at IS NULL
+    WHERE e.completed AND e.action='shorten' AND e.app_readback_at IS NULL AND e.verification#>>'{app,source}'='gcs'
+      ${
+        afterEventId
+          ? sql`AND (e.created_at,e.id) > (SELECT previous.created_at,previous.id
+        FROM attempt_evidence_storage_events previous WHERE previous.id=${afterEventId}::uuid)`
+          : sql``
+      }
     ORDER BY e.created_at,e.id LIMIT ${limit}`) as unknown as Promise<
     Array<{ attemptId: string; archiveId: string; eventId: string }>
   >;

@@ -89,6 +89,9 @@ export async function verifyStoppedAttemptHistory(
   await db.execute(sql`INSERT INTO progressive_cfd_attempts(token,unit_id,owner,started_at,lease_until,outcome,finished_at)
     VALUES (${randomUUID()}::uuid,${lease.id}::uuid,'later-unit-attempt',clock_timestamp(),clock_timestamp(),'failed',clock_timestamp())`);
   expect(await limit()).toBeNull();
+  const combinedRoute = async () => (await db.execute(sql`SELECT cohort,limiter
+    FROM attempt_evidence_verified_route(${attemptId}::uuid,${archive.id}::uuid)`))[0];
+  expect(await combinedRoute()).toEqual({ cohort: "stopped-only", limiter: null });
   expect(await attemptEvidenceShorteningCandidates(db)).toContainEqual({
     id: attemptId,
     archive_id: archive.id,
@@ -276,6 +279,7 @@ export async function verifyStoppedAttemptHistory(
       verified.payload,
     );
     expect(await limit()).toBe("returned-to-publication");
+    expect(await combinedRoute()).toEqual({ cohort: "receipt-bearing", limiter: null });
     await expect(db.transaction(tx => assertAttemptSourcePins(tx as unknown as DB, [stoppedPin]))).rejects.toThrow(/binding changed/);
     const restoredPin = (await loadAttemptSourcePins(db, [attemptId])).get(attemptId)!;
     expect(restoredPin.archiveId).toBeNull();

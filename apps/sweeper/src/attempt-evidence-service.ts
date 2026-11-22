@@ -1,3 +1,4 @@
+import { configuredDeploymentRole } from "./config";
 import type { DB } from "@aerodb/db/client";
 import {
   attemptEvidenceArchiveCandidates,
@@ -195,7 +196,7 @@ export async function runAttemptEvidenceStorageService(
   const bucket = process.env.AIRFOILFOAM_EVIDENCE_BUCKET?.trim();
   if (
     !bucket ||
-    process.env.AIRFOILFOAM_DEPLOYMENT_ROLE === "remote-solver" ||
+    configuredDeploymentRole() !== "hub" ||
     process.env.AIRFOILFOAM_ATTEMPT_EVIDENCE_ARCHIVE === "false" ||
     signal.aborted
   )

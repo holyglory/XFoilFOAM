@@ -1,3 +1,4 @@
+import { createVerifiedPolicyFixture, verifyMixedAttemptPolicy, verifyLateAttemptPolicy, verifyPendingAttemptPolicy, verifyAttemptPolicyRole } from "../test-support/verified-attempt-policy";
 import {
   afterAll,
   afterEach,
@@ -9,7 +10,6 @@ import {
   vi,
 } from "vitest";
 import { sql } from "drizzle-orm";
-import { PgDialect } from "drizzle-orm/pg-core";
 import { createClient, type DB } from "@aerodb/db/client";
 import { databaseUrl } from "@aerodb/db/env";
 import { randomUUID } from "node:crypto";
@@ -42,6 +42,7 @@ import {
 } from "../src/attempt-evidence-settlement";
 import {
   createSettlementFixture,
+  interruptBeforeReadback,
   seedSettledHistory,
 } from "../test-support/attempt-settlement-fixture";
 import { attemptEvidenceStorageMain } from "../src/attempt-evidence-storage-cli";
@@ -517,22 +518,8 @@ describe("verified settled attempt history transition", () => {
     const source = await seedSettledHistory(fixture.db),
       deps = dependencies(source);
     await enabled();
-    const db = fixture.db,
-      dialect = new PgDialect();
-    const interrupted = new Proxy(db, {
-      get(target, key) {
-        if (key !== "execute") return Reflect.get(target, key, target);
-        return (query: Parameters<DB["execute"]>[0]) => {
-          const statement =
-            typeof query === "string"
-              ? query
-              : dialect.sqlToQuery(query.getSQL()).sql;
-          if (statement.includes("SET app_readback_at=clock_timestamp()"))
-            throw new Error("process stopped before confirming visible read");
-          return target.execute(query);
-        };
-      },
-    });
+    const db = fixture.db;
+    const interrupted = interruptBeforeReadback(db);
     await expect(
       settleAttemptEvidenceHistory(interrupted, deps, {
         attemptId: source.attemptId,
@@ -656,5 +643,31 @@ describe("verified settled attempt history transition", () => {
       if (prior === undefined) delete process.env.DATABASE_URL;
       else process.env.DATABASE_URL = prior;
     }
+  });
+});
+
+describe("verified automatic attempt cohorts", () => {
+  let fixture: Awaited<ReturnType<typeof createVerifiedPolicyFixture>>;
+  beforeAll(async () => {
+    fixture = await createVerifiedPolicyFixture();
+  });
+  beforeEach(async () => {
+    await fixture.reset();
+  });
+  afterAll(async () => {
+    if (fixture) await fixture.close();
+  });
+
+  it("picks the original verifier for local and receipt-bearing histories in one real worker pass", async () => {
+    await verifyMixedAttemptPolicy(fixture.db, fixture.namespace);
+  });
+  it("retries a late archive read failure and picks up a new qualified cohort behind the cursor", async () => {
+    await verifyLateAttemptPolicy(fixture.db);
+  });
+  it("admits another cohort while retrying an unavailable pending readback", async () => {
+    await verifyPendingAttemptPolicy(fixture.db);
+  });
+  it("keeps the automatic hub policy and its credentials off the worker and unsupported roles", async () => {
+    await verifyAttemptPolicyRole(fixture.db);
   });
 });
