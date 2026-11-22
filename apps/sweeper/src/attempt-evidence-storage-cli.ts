@@ -28,7 +28,7 @@ import {
   restoreAttemptEvidence,
 } from "@aerodb/db/attempt-evidence-projection";
 import {
-  createAttemptEvidenceSettlementDependencies,
+  configuredAttemptEvidenceSettlementDependencies,
   runAttemptEvidenceSettlementPass,
   settleAttemptEvidenceHistory,
 } from "./attempt-evidence-settlement";
@@ -61,6 +61,7 @@ export async function attemptEvidenceStorageMain(
         "--bytes",
         "--catalog",
         "--consumer-contract",
+        "--stopped-progressive",
         "--archive-id",
       ].includes(flag) ||
       !args[index + 1] ||
@@ -77,6 +78,10 @@ export async function attemptEvidenceStorageMain(
       8 * 1024 ** 2,
     ),
   };
+  const stoppedProgressive = flags.get("--stopped-progressive") === "true";
+  if (flags.has("--stopped-progressive") && (!stoppedProgressive ||
+      (command !== "enable-shortening" && command !== "shortening-candidates")))
+    throw new Error("--stopped-progressive true applies to shortening-candidates and enable-shortening");
   if (command === "sql") {
     process.stdout.write(
       `${JSON.stringify(new PgDialect().sqlToQuery(attemptEvidenceAuditSql(options)))}\n`,
@@ -120,7 +125,7 @@ export async function attemptEvidenceStorageMain(
     ].includes(command ?? "")
   )
     throw new Error(
-      "Usage: attempt-evidence-storage-cli.ts sql|use-sql|audit|use-audit|copy|archive|backfill|restore|shortening-status|shortening-candidates|enable-shortening|disable-shortening|shorten|shorten-pass|restore-inline [--consumer-contract 1] [--id ATTEMPT_UUID --archive-id ARCHIVE_UUID] [--after UUID] [--rows N] [--pages N] [--output NEW_FILE] [--bucket BUCKET] [--source-instance INSTANCE]",
+      "Usage: attempt-evidence-storage-cli.ts sql|use-sql|audit|use-audit|copy|archive|backfill|restore|shortening-status|shortening-candidates|enable-shortening|disable-shortening|shorten|shorten-pass|restore-inline [--consumer-contract 1] [--stopped-progressive true] [--id ATTEMPT_UUID --archive-id ARCHIVE_UUID] [--after UUID] [--rows N] [--pages N] [--output NEW_FILE] [--bucket BUCKET] [--source-instance INSTANCE]",
     );
   if (!process.env.DATABASE_URL)
     throw new Error("An explicit DATABASE_URL is required");
@@ -162,6 +167,7 @@ export async function attemptEvidenceStorageMain(
           const rows = await attemptEvidenceShorteningCandidates(
             client.db,
             after,
+            stoppedProgressive,
           );
           for (const row of rows) {
             const reason =
@@ -204,13 +210,9 @@ export async function attemptEvidenceStorageMain(
           );
         // Resolve the actual installed consumer/app contracts before changing
         // SQL policy. No cloud request or permission change is made here.
-        const { readApiAttemptEvidenceForApp } =
-          await import("../../api/src/attempt-evidence-reader");
-        createAttemptEvidenceSettlementDependencies(client.db, (request) =>
-          readApiAttemptEvidenceForApp(client.db, request),
-        );
+        await configuredAttemptEvidenceSettlementDependencies(client.db);
         process.stdout.write(
-          `${JSON.stringify(await setAttemptEvidenceStoragePolicy(client.db, { enabled: true, consumerContractVersion: 1, canaryAttemptId: flags.get("--id") }))}\n`,
+          `${JSON.stringify(await setAttemptEvidenceStoragePolicy(client.db, { enabled: true, consumerContractVersion: 1, canaryAttemptId: flags.get("--id"), stoppedProgressive }))}\n`,
         );
         return;
       }
@@ -237,12 +239,7 @@ export async function attemptEvidenceStorageMain(
       }
       if (!policy.shorteningEnabled || policy.consumerContractVersion !== 1)
         throw new Error("Attempt history shortening is not enabled");
-      const { readApiAttemptEvidenceForApp } =
-        await import("../../api/src/attempt-evidence-reader");
-      const deps = createAttemptEvidenceSettlementDependencies(
-        client.db,
-        (request) => readApiAttemptEvidenceForApp(client.db, request),
-      );
+      const deps = await configuredAttemptEvidenceSettlementDependencies(client.db);
       if (command === "shorten") {
         const id = flags.get("--id"),
           archiveId = flags.get("--archive-id");

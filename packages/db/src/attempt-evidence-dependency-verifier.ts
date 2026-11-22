@@ -1,7 +1,7 @@
 import { buildPolarFit, classifyPolarEvidence } from "@aerodb/core";
 import { sql } from "drizzle-orm";
 import type { DB } from "./client";
-import { canonicalAnalysisJson } from "./analysis-target";
+import { analysisContentHash, canonicalAnalysisJson } from "./analysis-target";
 import {
   attemptEvidenceColdCohortSql,
   projectAttemptEvidenceForConsumers,
@@ -20,6 +20,73 @@ import {
 
 export const ATTEMPT_SERVER_CONSUMER_VERIFIER =
   "server-consumers/local-steady-rans-v1";
+
+const STOPPED_VERIFIER = "server-consumers/stopped-progressive-rans-v1";
+
+/** Authenticate the independent signed dispatch/report projection and the
+ * measured stop outside the scientific snapshot. No sampling or GCS read is
+ * needed by the fitter: this receipt never entered progressive_cfd_evidence.
+ * A later numerical registration requires restoration of the exact original. */
+async function verifyStoppedSource(
+  db: DB,
+  attemptId: string,
+  originalText: string,
+) {
+  const [receipt] =
+    await db.execute(sql`SELECT storage_only FROM progressive_remote_evidence_receipts
+    WHERE result_attempt_id=${attemptId}::uuid`);
+  if (receipt?.storage_only !== true) return null;
+  const [row] =
+    await db.execute(sql`SELECT attempt_evidence_stopped_scope(a.id) AS scope,stopped.proof
+    FROM result_attempts a JOIN progressive_cfd_execution_stops stopped ON stopped.sim_job_id=a.sim_job_id
+    WHERE a.id=${attemptId}::uuid`);
+  const scope = row?.scope as Record<string, unknown> | null;
+  requireProof(
+    scope,
+    "stopped progressive custody or superseding attempt changed",
+  );
+  const { validateProgressiveExecutionStopProof } =
+    await import("./progressive-cfd-settlement");
+  const stop = row.proof as Parameters<
+    typeof validateProgressiveExecutionStopProof
+  >[0];
+  validateProgressiveExecutionStopProof(stop);
+  requireProof(
+    stop.job_id === scope.executionId &&
+      analysisContentHash(stop) === scope.stopSignature,
+    "stopped execution proof changed",
+  );
+  const { assertProgressiveRemoteEvidenceAttempt } =
+    await import("./progressive-remote-evidence-receipts");
+  const verified = await assertProgressiveRemoteEvidenceAttempt(db, {
+    solverId: String(scope.solverId),
+    promiseId: String(scope.promiseId),
+    engineJobId: String(scope.executionId),
+    resultAttemptId: attemptId,
+    remoteResultId: String(scope.remoteResultId),
+    remoteResultAttemptId: String(scope.remoteResultAttemptId),
+    aoaDeg: Number(scope.aoaDeg),
+    engineCaseSlug: String(scope.caseSlug),
+    progressiveEvidence: {
+      sequence: Number(scope.sequence),
+      reportContentSignature: String(scope.reportContentSignature),
+      pointContentSignature: String(scope.pointContentSignature),
+    },
+  });
+  const digest = analysisContentHash(JSON.parse(originalText));
+  requireProof(
+    !verified.archiveId && analysisContentHash(verified.payload) === digest,
+    "signed report and full application source differ",
+  );
+  const [original] = await db.execute(
+    sql`SELECT (${JSON.stringify(verified.payload)}::jsonb)::text = ${originalText} AS matches`,
+  );
+  requireProof(
+    original?.matches === true,
+    "signed replay cannot restore the exact original PostgreSQL text",
+  );
+  return { progressiveScope: scope, applicationSha256: digest };
+}
 
 function requireProof(value: unknown, reason: string): asserts value {
   if (!value)
@@ -139,6 +206,11 @@ export function createAttemptServerDependencyVerifier(
       "archive read did not restore the exact original owner and PG text",
     );
 
+    const stopped = await verifyStoppedSource(
+      db,
+      attemptId,
+      originalPayloadText,
+    );
     return db.transaction(async (rawTx) => {
       const tx = rawTx as unknown as DB;
       await tx.execute(sql`SET TRANSACTION READ ONLY`);
@@ -146,7 +218,11 @@ export function createAttemptServerDependencyVerifier(
       await tx.execute(sql`SET LOCAL lock_timeout='500ms'`);
       const [row] =
         await tx.execute(sql`SELECT a.result_id,a.sim_job_id,a.airfoil_id,a.simulation_preset_revision_id,
-        ${attemptEvidenceColdCohortSql(sql`a`)} AS eligible,
+        ${
+          stopped
+            ? sql`attempt_evidence_stopped_scope(a.id)=${JSON.stringify(stopped.progressiveScope)}::jsonb`
+            : attemptEvidenceColdCohortSql(sql`a`)
+        } AS eligible,
         CASE WHEN octet_length(a.evidence_payload::text)<=33554432 THEN
           attempt_evidence_make_projection(a.evidence_payload,a.id,${archive.id}::uuid)
             IS NOT DISTINCT FROM ${JSON.stringify(projection)}::jsonb END AS projection_verified,
@@ -229,7 +305,8 @@ export function createAttemptServerDependencyVerifier(
         equalityEquivalent: true,
         scientificEquivalent: true,
         readDependenciesSatisfied: true,
-        verifier: ATTEMPT_SERVER_CONSUMER_VERIFIER,
+        verifier: stopped ? STOPPED_VERIFIER : ATTEMPT_SERVER_CONSUMER_VERIFIER,
+        ...stopped,
       };
     });
   };

@@ -42,6 +42,15 @@ export function createAttemptEvidenceSettlementDependencies(
   };
 }
 
+/** The isolated worker and CLI each need a reader for archived source
+ * reports. Installing the API's hub reader uses the existing bucket. */
+export async function configuredAttemptEvidenceSettlementDependencies(db: DB) {
+  const { installApiReportArchiveReader } = await import("../../api/src/progressive-report-archive-reader");
+  const { readApiAttemptEvidenceForApp } = await import("../../api/src/attempt-evidence-reader");
+  await installApiReportArchiveReader(db);
+  return createAttemptEvidenceSettlementDependencies(db, request => readApiAttemptEvidenceForApp(db, request));
+}
+
 function checkAbort(signal?: AbortSignal) {
   if (signal?.aborted)
     throw new Error("Attempt history shortening was aborted");
@@ -391,10 +400,6 @@ export async function runConfiguredAttemptEvidenceSettlementService(
     signal.aborted
   )
     return;
-  const { readApiAttemptEvidenceForApp } =
-    await import("../../api/src/attempt-evidence-reader");
-  const deps = createAttemptEvidenceSettlementDependencies(db, (request) =>
-    readApiAttemptEvidenceForApp(db, request),
-  );
+  const deps = await configuredAttemptEvidenceSettlementDependencies(db);
   await runAttemptEvidenceSettlementService(db, deps, signal);
 }

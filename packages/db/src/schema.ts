@@ -3838,6 +3838,7 @@ export const attemptEvidenceStoragePolicy = pgTable(
   {
     id: integer("id").primaryKey(),
     shorteningEnabled: boolean("shortening_enabled").notNull(),
+    stoppedProgressiveEnabled: boolean("stopped_progressive_enabled").notNull().default(false),
     canaryAttemptId: uuid("canary_attempt_id"),
     consumerContractVersion: integer("consumer_contract_version").notNull(),
     minLogicalBytes: integer("min_logical_bytes").notNull(),
@@ -7879,6 +7880,10 @@ export const progressiveCfdRecoveryPlans = pgTable(
       .default(sql`clock_timestamp()`),
   },
   (table) => ({
+    diagnosticAttempt: index("progressive_recovery_diagnostic_attempt_idx")
+      .using("brin", sql`${table.diagnosticAttemptId} uuid_bloom_ops(n_distinct_per_range=128,false_positive_rate=0.001)`)
+      .with({ pages_per_range: 16, autosummarize: "on" })
+      .where(sql`${table.diagnosticAttemptId} IS NOT NULL`),
     diagnosticSource: foreignKey({
       name: "progressive_cfd_recovery_plans_diagnostic_source_fk",
       columns: [table.parentJobId, table.diagnosticPointContentSignature],

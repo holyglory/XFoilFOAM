@@ -60,6 +60,15 @@ timeout_seconds = 300
 command = ["/bin/bash", "-c", "exec /usr/bin/corepack pnpm --filter @aerodb/sweeper exec vitest run test/attempt-evidence-consumer-integration.test.ts --reporter=default --reporter=junit --outputFile.junit=\"$DEVCOORDINATOR_DIAGNOSTICS_DIR/report.xml\""]
 diagnostic_sources = [{ format = "junit", path = "report.xml" }]
 
+[[test.attempt-server-consumers.check]]
+name = "stopped-progressive-history"
+tier = "development"
+requires = ["schema"]
+timeout_seconds = 300
+command = ["/bin/bash", "-c", "export PATH=\"$PWD/.venv/bin:$PATH\"; exec /usr/bin/corepack pnpm --filter @aerodb/db exec vitest run test/campaign-profile-enrollment.test.ts -t 'shortens and replays a stopped progressive stage-3 history|republishes current-scope storage-only evidence append-only and remains idempotent [(](accepted|rejected)[)]' --reporter=default --reporter=junit --outputFile.junit=\"$DEVCOORDINATOR_DIAGNOSTICS_DIR/report.xml\""]
+env = { PYTHONDONTWRITEBYTECODE = "1" }
+diagnostic_sources = [{ format = "junit", path = "report.xml" }]
+
 [test.stopped-canonical-retirement]
 timeout_seconds = 900
 

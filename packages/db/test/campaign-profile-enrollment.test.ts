@@ -65,6 +65,7 @@ import {
 } from "vitest";
 import { EngineClient, EngineError } from "../../engine-client/src/client";
 import type { EngineExecutionStopProof } from "../../engine-client/src/types";
+import type { SteadyHistory } from "../../engine-client/src/fidelity";
 import {
   acknowledgeProgressiveCfdExecutionStop,
   settleProgressiveCfdExecution,
@@ -11585,6 +11586,7 @@ describe("progressive CFD evidence accounting", () => {
     connection: DB,
     fixture: Awaited<ReturnType<typeof cfdEvidenceFixture>>,
     solverId: string,
+    steadyHistory?: SteadyHistory,
   ) {
     const lease = fixture.leases[0];
     const [job] = await connection
@@ -11600,13 +11602,14 @@ describe("progressive CFD evidence accounting", () => {
         INSERT INTO sync_sweep_promises(id, registered_solver_id, airfoil_id,
           simulation_preset_revision_id, aoa_count, "expiresAt")
         VALUES (${promiseId}::uuid, ${solverId}::uuid, ${job.airfoilId}::uuid,
-          ${job.simulationPresetRevisionId}::uuid, 1, clock_timestamp()+interval '1 hour')
+          ${job.simulationPresetRevisionId}::uuid, ${fixture.leases.length}, clock_timestamp()+interval '1 hour')
       `);
     await connection.execute(sql`
         INSERT INTO sync_sweep_promise_points(promise_id, airfoil_id,
           simulation_preset_revision_id, aoa_deg)
-        VALUES (${promiseId}::uuid, ${job.airfoilId}::uuid,
-          ${job.simulationPresetRevisionId}::uuid, ${lease.alpha})
+        SELECT ${promiseId}::uuid, ${job.airfoilId}::uuid,
+          ${job.simulationPresetRevisionId}::uuid, alpha
+        FROM unnest(ARRAY[${sql.join(fixture.leases.map(unit => sql`${unit.alpha}`), sql`,`)}]::double precision[]) alpha
       `);
     const bound = await bindProgressiveRemoteDispatch(connection, {
       simJobId: job.id,
@@ -11619,6 +11622,11 @@ describe("progressive CFD evidence accounting", () => {
     polar.reynolds = fixture.execution.snapshot.derived.reynolds;
     polar.mach = fixture.execution.snapshot.derived.mach;
     const point = polar.attempts![0];
+    if (steadyHistory) {
+      point.steady_history = steadyHistory;
+      point.fidelity = "rans";
+      result.mesh_recovery_version = 3;
+    }
     point.error = null;
     delete point.failure_disposition;
     point.evidence_artifacts = [
@@ -11640,12 +11648,12 @@ describe("progressive CFD evidence accounting", () => {
       status: {
         job_id: job.id,
         state: "completed",
-        total_cases: 1,
+        total_cases: fixture.leases.length,
         completed_cases: 1,
         engine: result.engine,
       },
       result,
-      stopProof: executionStopProof(job.id),
+      stopProof: { ...executionStopProof(job.id), ...(steadyHistory && { ownership_basis: "recorded_execution_namespace" as const }) },
     };
     const reported = await storeProgressiveRemoteReport(connection, {
       solverId,
@@ -11706,7 +11714,8 @@ describe("progressive CFD evidence accounting", () => {
         validForPolar: false,
       })
       .returning();
-    await connection.execute(sql`
+    // Exercise the job classifier before a stored classification exists.
+    if (!steadyHistory) await connection.execute(sql`
         INSERT INTO result_classifications(result_attempt_id, airfoil_id,
           simulation_preset_revision_id, aoa_deg, classifier_version, state, reasons)
         VALUES (${attempt.id}::uuid, ${job.airfoilId}::uuid,
@@ -11714,7 +11723,7 @@ describe("progressive CFD evidence accounting", () => {
           'storage-probe-fixture', 'rejected', '{}')
       `);
     await connection.execute(sql`
-        UPDATE sim_jobs SET status='done', engine_job_id=id::text, engine_state='completed',
+        UPDATE sim_jobs SET status=${steadyHistory ? "cancelled" : "done"}::sim_job_status, engine_job_id=id::text, engine_state='completed',
           "ingestedAt"=clock_timestamp(), "finishedAt"=clock_timestamp(),
           ingest_lease_token=NULL, ingest_lease_expires_at=NULL
         WHERE id=${job.id}::uuid
@@ -11729,10 +11738,10 @@ describe("progressive CFD evidence accounting", () => {
       `);
     await connection.execute(sql`
         UPDATE progressive_cfd_units SET state='gap', lease_token=NULL, lease_owner=NULL,
-          lease_until=NULL WHERE id=${lease.id}::uuid
+          lease_until=NULL WHERE id IN (SELECT unit_id FROM progressive_cfd_attempts WHERE sim_job_id=${job.id}::uuid)
       `);
     await connection.execute(sql`
-        UPDATE sync_sweep_promises SET status='expired', "expiresAt"=clock_timestamp()-interval '1 second'
+        UPDATE sync_sweep_promises SET status=${steadyHistory ? "cancelled" : "expired"}::sync_promise_status, "expiresAt"=clock_timestamp()-interval '1 second'
         WHERE id=${promiseId}::uuid
       `);
     const delivery = {
@@ -11755,8 +11764,37 @@ describe("progressive CFD evidence accounting", () => {
       storageOnly: true,
     });
     await retainStorageRecoveryArchive(connection, delivery);
-    return { jobId: job.id, promiseId, resultAttemptId: attempt.id };
+    return { jobId: job.id, promiseId, resultAttemptId: attempt.id, delivery };
   }
+
+  it("shortens and replays a stopped progressive stage-3 history with the same fit and source bytes", async () => {
+    const fixture = await cfdEvidenceFixture(33.732, 3, [], [0, 2], false, undefined, {}, 2, true, true);
+    // Retained broker and report ownership is intentionally immutable. Exercise
+    // real committed transactions and recovery in a disposable database copy.
+    const copy = `stopped_history_${randomUUID().replaceAll("-", "")}`;
+    await client.sql.end();
+    try {
+      await admin.unsafe(`CREATE DATABASE "${copy}" TEMPLATE "${DATABASE}"`);
+      const url = new URL(targetUrl);
+      url.pathname = `/${copy}`;
+      const owned = createClient({ url: url.toString(), max: 4 });
+      try {
+        const { verifyStoppedAttemptHistory, stoppedHistoryFixture } = await import("./progressive-stopped-history-fixture");
+        const solverId = randomUUID();
+        await owned.db.execute(sql`UPDATE sweeper_state SET enabled=true,admission_fence_active=false,disk_admission_blocked=false WHERE id=1`);
+        await owned.db.execute(sql`INSERT INTO registered_remote_solvers(id,instance_id,instance_name,cpu_capacity,cpu_budget,max_active_polar_promises,auth_token_hash)
+          VALUES (${solverId}::uuid,${randomUUID()},'stopped history fixture',96,96,96,${analysisContentHash(randomUUID())})`);
+        const { delivery } = await prepareStorageRecoveryProbeFixture(owned.db, fixture, solverId, stoppedHistoryFixture());
+        await verifyStoppedAttemptHistory(owned.db, delivery, fixture.leases[0], fitUsingPython);
+      } finally {
+        await owned.sql.end();
+      }
+    } finally {
+      await admin.unsafe(`DROP DATABASE IF EXISTS "${copy}"`);
+      client = createClient({ url: targetUrl.toString(), max: 4 });
+      db = client.db;
+    }
+  }, 120_000);
 
   it.each([
     "accepted",
