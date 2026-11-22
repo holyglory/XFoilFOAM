@@ -276,6 +276,18 @@ class WorkerReturnCheckTest(unittest.TestCase):
         self.assertIn("service-state-changed",after["reviewSignals"])
         self.assertEqual(after["serviceStates"]["api"],[{"id":"api","state":"exited","startedAt":"old","restarts":0}])
 
+    def test_expired_census_preserves_physical_measurement_without_inventing_live_bytes(self):
+        self.split_wal = False
+        def timed_census(statement, write):
+            if maintenance.LIVE_VALUES in statement:
+                raise RuntimeError("ERROR:  57014: canceling statement due to statement timeout")
+            return self.session(statement, write)
+        result = maintenance.worker_return_check(live_values=True, session=timed_census, host=self.host)
+        self.assertGreater(result["totalBytes"], 0)
+        self.assertEqual(result["liveCensus"]["state"], "cancelled")
+        self.assertNotIn("liveReportValueBytes", result)
+        self.assertNotIn("freeMinusLiveReportValuesBytes", result)
+
     def test_check_has_no_write_or_hub_entrypoint(self):
         for args in (["--return-check","worker","--apply"],["--return-check","hub"],["--autovacuum","worker","--live-values"]):
             p = subprocess.run([sys.executable,str(SCRIPT),*args], capture_output=True, timeout=4)
