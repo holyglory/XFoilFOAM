@@ -11587,6 +11587,7 @@ describe("progressive CFD evidence accounting", () => {
     fixture: Awaited<ReturnType<typeof cfdEvidenceFixture>>,
     solverId: string,
     steadyHistory?: SteadyHistory,
+    bindArchive: typeof retainStorageRecoveryArchive = retainStorageRecoveryArchive,
   ) {
     const lease = fixture.leases[0];
     const [job] = await connection
@@ -11763,7 +11764,7 @@ describe("progressive CFD evidence accounting", () => {
       ...delivery,
       storageOnly: true,
     });
-    await retainStorageRecoveryArchive(connection, delivery);
+    await bindArchive(connection, delivery);
     return { jobId: job.id, promiseId, resultAttemptId: attempt.id, delivery };
   }
 
@@ -11815,12 +11816,14 @@ describe("progressive CFD evidence accounting", () => {
     try {
       await withHistoryDatabaseCopy(async (connection) => {
         const { stoppedHistoryFixture } = await import("./progressive-stopped-history-fixture");
-        const { verifyReceiptBearingSignedTransition } = await import("./receipt-bearing-signed-replay-fixture");
+        const { bindReceiptBearingSignedArchive, verifyReceiptBearingSignedTransition } = await import("./receipt-bearing-signed-replay-fixture");
         const solverId = randomUUID();
         await connection.execute(sql`UPDATE sweeper_state SET enabled=true,admission_fence_active=false,disk_admission_blocked=false WHERE id=1`);
         await connection.execute(sql`INSERT INTO registered_remote_solvers(id,instance_id,instance_name,cpu_capacity,cpu_budget,max_active_polar_promises,auth_token_hash)
           VALUES (${solverId}::uuid,${randomUUID()},'signed history fixture',96,96,96,${analysisContentHash(randomUUID())})`);
-        const { delivery } = await prepareStorageRecoveryProbeFixture(connection, fixture, solverId, stoppedHistoryFixture());
+        const { delivery } = await prepareStorageRecoveryProbeFixture(
+          connection, fixture, solverId, stoppedHistoryFixture(), bindReceiptBearingSignedArchive,
+        );
         const [campaignRow] = await connection.execute(sql`SELECT current_plan_revision_id FROM sim_campaigns WHERE id=${fixture.campaignId}::uuid`);
         const lease = fixture.leases[0]!;
         const recovery = await recoverProgressiveStorageOnlyEvidence(connection, {
