@@ -3,9 +3,6 @@ import { pinExactGcsGeneration } from "@aerodb/core/gcs-exact-generation";
 import type { DB } from "@aerodb/db";
 import {
   canonicalReportJson,
-  parseReportJson,
-  reportJsonObject,
-  reportValidationValue,
   visitProgressiveReportArchive,
 } from "@aerodb/db/progressive-report-archive";
 import { sql } from "drizzle-orm";
@@ -17,6 +14,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
+import { setImmediate as yieldToRequests } from "node:timers/promises";
 import { z } from "zod";
 import { env } from "./env";
 
@@ -127,30 +125,28 @@ async function inspectBundle(
   await visitProgressiveReportArchive(
     createReadStream(path),
     identity,
-    (entry) => {
-      // reportText is reconstructed by the shared delta decoder. Its PG ::text
-      // SHA/size is independently verified there, before this canonical identity.
-      const parsed = reportJsonObject(parseReportJson(entry.reportText));
-      const report = reportValidationValue(parsed) as Record<string, unknown>;
+    async (entry, _line, report) => {
+      // The shared decoder already parsed these exact PG bytes losslessly.
+      // Verify the dispatch and canonical signature for every reconstructed member.
       if (
         entry.sourceKind !== "worker" ||
         entry.executionId !== executionId ||
-        !report ||
-        typeof report !== "object" ||
-        Array.isArray(report) ||
-        canonicalReportJson(parsed.version!) !== "1" ||
+        canonicalReportJson(report.version!) !== "1" ||
         report.executionId !== executionId ||
         report.solverId !== solver.id ||
         report.promiseId !== dispatch.promiseId ||
         report.assignmentSignature !== dispatch.assignmentSignature ||
-        canonicalReportJson(parsed.sequence!) !== String(entry.sequence) ||
+        canonicalReportJson(report.sequence!) !== String(entry.sequence) ||
         createHash("sha256")
-          .update(canonicalReportJson(parsed))
+          .update(canonicalReportJson(report))
           .digest("hex") !== entry.contentSignature
       )
         reject(
           "Worker report archive member changed the exact dispatch scope or content",
         );
+      // Small encoded deltas can expand into many full reports in one zlib
+      // chunk. Yield to socket callbacks between members under sustained CPU work.
+      await yieldToRequests();
     },
     {
       maxMembers: MAX_MEMBERS,

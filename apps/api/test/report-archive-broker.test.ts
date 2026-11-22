@@ -1,12 +1,14 @@
 import { CRC32C, type File } from "@google-cloud/storage";
 import { analysisContentHash, type DB } from "@aerodb/db";
 import { reportTextIdentity } from "@aerodb/db/progressive-report-archive";
+import * as archiveCodec from "@aerodb/db/progressive-report-archive";
 import { PgDialect } from "drizzle-orm/pg-core";
 import type { SQL } from "drizzle-orm";
 import Fastify from "fastify";
 import { createHash, randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { Readable } from "node:stream";
+import { setImmediate as nextTurn } from "node:timers/promises";
 import { gzipSync } from "node:zlib";
 import { afterEach, expect, it, vi } from "vitest";
 import {
@@ -253,6 +255,55 @@ it("pins every metadata and media request to the exact uint64 generation string"
       ),
     ).toBe(true);
   } finally {
+    await f.app.close();
+  }
+});
+
+it("serves a pinned read between delta members and refuses a forged final member", async () => {
+  const f = await fixture();
+  const visit = archiveCodec.visitProgressiveReportArchive;
+  const observer = vi.spyOn(archiveCodec, "visitProgressiveReportArchive");
+  try {
+    const source = f.bundle();
+    const upload = (page: typeof source) =>
+      f.app.inject({ method: "POST", url: page.url, headers: f.headers, payload: page.bytes });
+    const saved = await upload(source);
+    expect(saved.statusCode).toBe(200);
+    const { generation, crc32c } = saved.json();
+    const read = () => f.app.inject({
+      url: `${source.url}&generation=${generation}&crc32c=${encodeURIComponent(crc32c)}`, headers: f.headers,
+    });
+    const reports = Array.from({ length: 12 }, (_, i) => f.report(30 + i));
+    const page = f.bundle(reports);
+    let visited = 0;
+    let atReadStart: number | undefined;
+    let pending: Promise<Awaited<ReturnType<typeof read>>> | undefined;
+    observer.mockImplementation((stream, identity, visitor, limits) =>
+      visit(stream, identity, async (...args) => {
+        if (identity.storedSha256 === page.sha256 && ++visited === 1) {
+          // A socket callback made runnable during the first member must get
+          // a turn before the rest of this single decompressor chunk finishes.
+          pending = nextTurn().then(() => {
+            atReadStart = visited;
+            return read();
+          });
+        }
+        await visitor(...args);
+      }, limits));
+    expect((await upload(page)).statusCode).toBe(200);
+    const restored = await pending;
+    expect(visited).toBe(reports.length);
+    expect(atReadStart).toBe(1);
+    expect(restored?.statusCode).toBe(200);
+    expect(restored?.rawPayload).toEqual(source.bytes);
+
+    const forged = f.bundle(reports, (entry, i) => {
+      if (i === reports.length - 1) entry.contentSignature = "0".repeat(64);
+    });
+    expect((await upload(forged)).statusCode).toBe(409);
+    expect(f.upload).toHaveBeenCalledTimes(2);
+  } finally {
+    observer.mockRestore();
     await f.app.close();
   }
 });
