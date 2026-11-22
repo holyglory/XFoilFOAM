@@ -144,17 +144,24 @@ export function isMeasuredCancelledProgressiveRemoteReport(
   );
 }
 
+/** These are the complete order checks when the previous stop proof is JSON null. */
+export function validateProgressiveReportProgress(
+  report: ProgressiveRemoteReport,
+  previousSequence: number,
+  previousCompletedCases: number,
+): void {
+  if (report.sequence !== previousSequence + 1)
+    throw new Error("Remote reports must arrive in their durable publication order");
+  if (report.status.completed_cases < previousCompletedCases)
+    throw new Error("Remote report cannot forget previously completed cases");
+}
+
 export function validateProgressiveRemoteReportOrder(
   report: ProgressiveRemoteReport,
   previous: ProgressiveRemoteReport | null,
 ): void {
-  if (report.sequence !== (previous?.sequence ?? 0) + 1)
-    throw new Error(
-      "Remote reports must arrive in their durable publication order",
-    );
+  validateProgressiveReportProgress(report, previous?.sequence ?? 0, previous?.status.completed_cases ?? 0);
   if (!previous) return;
-  if (report.status.completed_cases < previous.status.completed_cases)
-    throw new Error("Remote report cannot forget previously completed cases");
   if (
     previous.stopProof !== null &&
     (report.stopProof === null ||

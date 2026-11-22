@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { sql } from "drizzle-orm";
+import { sql, type SQL } from "drizzle-orm";
+import { PgDialect } from "drizzle-orm/pg-core";
 import { expect, vi } from "vitest";
 import type { DB } from "../src/client";
 import { analysisContentHash } from "../src/analysis-target";
@@ -401,23 +402,38 @@ export async function verifyProgressiveRemoteReportInventory(
       changed.stopProof = null;
       changed.result!.state = "running";
       changed.result!.polars[0].attempts![0].cl = 0.314159;
-      await storeProgressiveRemoteReport(connection, {
+      const fullReadTransactions: boolean[] = [];
+      const dialect = new PgDialect();
+      const observeReads = (db: DB, inside: boolean): DB => new Proxy(db, {
+        get(target, key) {
+          if (key === "transaction") return (run: (tx: DB) => Promise<unknown>) =>
+            target.transaction((tx) => run(observeReads(tx as unknown as DB, true)));
+          if (key === "execute") return (query: SQL) => {
+            if (/\bresolve_progressive_report\s*\(/i.test(dialect.sqlToQuery(query).sql)) fullReadTransactions.push(inside);
+            return target.execute(query);
+          };
+          return Reflect.get(target, key);
+        },
+      });
+      const observed = observeReads(connection, false);
+      await storeProgressiveRemoteReport(observed, {
         ...sender,
         report: changed,
       });
       expect(
-        await storeProgressiveRemoteReport(connection, {
+        await storeProgressiveRemoteReport(observed, {
           ...sender,
           report: changed,
         }),
       ).toMatchObject({ replayed: true });
+      expect(fullReadTransactions).toEqual([]);
       const final = {
         ...terminal,
         sequence: terminal.sequence + 2,
         status: stoppedStatus,
         result: { ...terminal.result!, polars: [] },
       };
-      await storeProgressiveRemoteReport(connection, {
+      await storeProgressiveRemoteReport(observed, {
         ...sender,
         report: final,
       });
@@ -429,8 +445,9 @@ export async function verifyProgressiveRemoteReportInventory(
         sourceCount: 2,
         pendingCount: 2,
       });
+      expect(fullReadTransactions).toEqual([]);
       await expect(
-        storeProgressiveRemoteReport(connection, {
+        storeProgressiveRemoteReport(observed, {
           ...sender,
           report: {
             ...final,
@@ -439,6 +456,7 @@ export async function verifyProgressiveRemoteReportInventory(
           },
         }),
       ).rejects.toThrow("Final remote execution evidence cannot change");
+      expect(fullReadTransactions).toEqual([false]);
       const inventories =
         await connection.execute(sql`SELECT sequence::integer, source_count FROM progressive_remote_report_inventories
         WHERE sim_job_id = ${executionId}::uuid ORDER BY sequence`);
