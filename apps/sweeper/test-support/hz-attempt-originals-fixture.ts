@@ -1,3 +1,4 @@
+import { originalHubRequest } from "../src/hz-attempt-original-rpc";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
@@ -21,8 +22,14 @@ import {
   inventoryOriginalPage,
   type OriginalEndpoints,
 } from "../src/hz-attempt-original-relay";
-import { getAttemptEvidenceArchive } from "@aerodb/db/attempt-evidence-catalog";
-import { loadSettledAttemptEvidenceCopy } from "@aerodb/db/attempt-evidence-storage";
+import {
+  getAttemptEvidenceArchive,
+  registerAttemptEvidenceArchive,
+} from "@aerodb/db/attempt-evidence-catalog";
+import {
+  loadSettledAttemptEvidenceCopy,
+  prepareAttemptEvidenceCopy,
+} from "@aerodb/db/attempt-evidence-storage";
 import { packHzAttemptSource } from "../src/hz-attempt-custody";
 import { type HzAttemptHubStore } from "../src/hz-attempt-hub";
 
@@ -180,6 +187,64 @@ export async function verifyOriginalCopyJourney(
   await expect(
     registerOriginalPage(relay, binding, upload.uploads, budget),
   ).rejects.toThrow(/own/);
+  // Model two actual namespaces in the disposable DB. Equal attempt AND
+  // result UUIDs still rank as an independent verified upstream receipt.
+  const [local] = await inspectOriginals(db, binding, { ids: [model] });
+  expect(local?.ack).toBeTruthy();
+  const src = await loadSettledAttemptEvidenceCopy(db, model),
+    encoded = await packHzAttemptSource(src);
+  const upstream = await store.put(
+    hubInstance,
+    encoded.proof,
+    Buffer.from(encoded.packed, "base64"),
+  );
+  const counterpart = await registerAttemptEvidenceArchive(
+    db,
+    upstream.identity,
+    prepareAttemptEvidenceCopy(src),
+  );
+  const rollback = new Error("rollback independent hub registration fixture");
+  const role = process.env.AIRFOILFOAM_DEPLOYMENT_ROLE;
+  try {
+    process.env.AIRFOILFOAM_DEPLOYMENT_ROLE = "hub";
+    await db.transaction(async (raw) => {
+      const tx = raw as unknown as DB;
+      await tx.execute(
+        sql`UPDATE sync_api_settings SET instance_id=${hubInstance}::uuid,remote_solver_enabled=false WHERE id=1`,
+      );
+      await tx.execute(sql`INSERT INTO progressive_remote_dispatches(sim_job_id,promise_id,solver_id,content_signature,envelope)
+       SELECT j.id,(j.request_payload->>'syncPromiseId')::uuid,${binding.solver}::uuid,i.assignment_signature,j.request_payload->'remoteProgressiveExecution'
+       FROM sim_jobs j JOIN progressive_worker_submission_intents i ON i.sim_job_id=j.id WHERE j.id=${local.job}::uuid`);
+      await tx.execute(sql`INSERT INTO progressive_remote_evidence_receipts(sim_job_id,sequence,point_content_signature,result_attempt_id,remote_result_attempt_id,remote_result_id,storage_only)
+       VALUES(${local.job}::uuid,${local.ack!.seq},${local.ack!.point},${model}::uuid,${model}::uuid,${local.result}::uuid,${local.ack!.storageOnly})`);
+      const row = {
+        ...local,
+        ack: { ...local.ack!, hubAttempt: model, hubResult: src.resultId! },
+      };
+      const request = { operation: "mapping", binding, rows: [row] };
+      expect(await originalHubRequest(tx, request)).toEqual([
+        {
+          id: model,
+          hubInstance,
+          hubAttempt: model,
+          hubResult: src.resultId,
+          hubArchive: counterpart.archive.id,
+          generation: upstream.identity.generation,
+        },
+      ]);
+      expect(
+        await originalHubRequest(tx, {
+          ...request,
+          rows: [{ ...row, ack: { ...row.ack, hubResult: randomUUID() } }],
+        }),
+      ).toEqual([]);
+      throw rollback;
+    });
+  } catch (e) {
+    if (e !== rollback) throw e;
+  } finally {
+    process.env.AIRFOILFOAM_DEPLOYMENT_ROLE = role;
+  }
   await promisify(execFile)("python3", [
     "-B",
     fileURLToPath(new URL("./hz-original-controller.py", import.meta.url)),

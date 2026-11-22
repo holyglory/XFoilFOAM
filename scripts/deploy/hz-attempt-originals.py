@@ -23,9 +23,18 @@ stopping = False
 def json_text(value):
     return json.dumps(value, separators=(",", ":"), sort_keys=True)
 
-def digest_file(path):
+def file_identity(st):
+    return [st.st_dev,st.st_ino,st.st_size,st.st_mtime_ns,st.st_ctime_ns]
+
+def digest_file(db,path):
     with path.open("rb") as source:
-        return hashlib.file_digest(source, "sha256").hexdigest()
+        stamp=file_identity(os.fstat(source.fileno()))
+        memo=get(db,"scopeDigest")
+        if memo and memo["stamp"]==stamp:return memo["sha"]
+        digest=hashlib.file_digest(source,"sha256").hexdigest()
+        if file_identity(os.fstat(source.fileno()))!=stamp:raise ValueError("Scope changed while hashing")
+        with db:save(db,"scopeDigest",dict(stamp=stamp,sha=digest))
+        return digest
 
 def identifier(value):
     if not isinstance(value, str) or str(uuid.UUID(value)) != value:
@@ -115,8 +124,9 @@ def summary(db):
     return dict(inventory=get(db,"scan"),rows=counts,excluded={r[0]:r[1] for r in db.execute("SELECT * FROM excluded")},
                 sourceAttemptPayloadWrites=False)
 
-def scope_page(path, offset, count):
+def scope_page(path, offset, count, stamp):
     with path.open("rb") as src:
+        if file_identity(os.fstat(src.fileno()))!=stamp:raise ValueError("Frozen scope changed")
         src.seek(offset)
         out=[]
         for _ in range(count):
@@ -129,6 +139,7 @@ def scope_page(path, offset, count):
             if not isinstance(sha,str) or len(sha)!=64 or any(c not in "0123456789abcdef" for c in sha) or not 0<r["sourceByteSize"]<=NATIVE_LIMIT:
                 raise ValueError("Invalid scope identity")
             out.append(r)
+        if file_identity(os.fstat(src.fileno()))!=stamp:raise ValueError("Frozen scope changed")
         return out,src.tell()
 
 def bind(db,args,b,sig):
@@ -148,7 +159,7 @@ def inventory_page(db,args,relay,b):
     scan=get(db,"scan")
     refs=None
     if args.scope:
-        refs,offset=scope_page(args.scope,scan["offset"],args.limit)
+        refs,offset=scope_page(args.scope,scan["offset"],args.limit,get(db,"scopeDigest")["stamp"])
         selector={"ids":[r["attemptId"] for r in refs]}
     else:
         offset=scan["offset"]
@@ -172,12 +183,16 @@ def inventory_page(db,args,relay,b):
                 continue
             pin={k:r[k] for k in ("id","result","job","sha","bytes","history")}
             status="pending" if r["owned"] else "owner-unproven"
-            present=db.execute("SELECT pin,state FROM originals WHERE id=?",(r["id"],)).fetchone()
+            present=db.execute("SELECT pin,state,archive,remote_proof FROM originals WHERE id=?",(r["id"],)).fetchone()
             if present and present["pin"]!=json_text(pin):raise ValueError("Stored original changed within snapshot")
+            if present and present["state"]=="verified":
+                if present["archive"] == r["archive"]: status="verified"
+                elif not r["archive"] and present["remote_proof"] and r["owned"]: status="uploaded"
+                else: raise ValueError("Previously verified HZ catalog binding changed")
             if present and refs is not None:raise ValueError("Duplicate entry in frozen source")
             db.execute("""INSERT INTO originals(id,pin,history,source_bytes,stored,matched,hub,settled,prior,state,archive)
                 VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET matched=excluded.matched,hub=excluded.hub,
-                settled=excluded.settled,state=CASE WHEN originals.state='verified' THEN 'verified' ELSE excluded.state END,
+                settled=excluded.settled,state=excluded.state,
                 archive=coalesce(excluded.archive,originals.archive)""",
                 (r["id"],json_text(pin),r["history"],r["bytes"],r["stored"],int(r["match"] is not None),json_text(r["match"]),int(bool(r["settled"])),int(bool(r["archive"])),status,r["archive"]))
         for reason,n in excluded.items():
@@ -185,6 +200,7 @@ def inventory_page(db,args,relay,b):
         scan.update(complete=len(rows)<args.limit or (refs is None and rows and rows[-1]["id"]==scan["high"]),
                     offset=offset,after=rows[-1]["id"] if rows else scan["after"],scanned=scan["scanned"]+len(rows))
         save(db,"scan",scan)
+        if scan["complete"]:save(db,"lastCompleteInventory",time.time())
     return not scan["complete"]
 
 def backup_page(db,args,relay,b):
@@ -234,6 +250,8 @@ def parse(argv):
     ap.add_argument("--hub-host",default="airfoils.pro");ap.add_argument("--hub-container",default="app-sweeper-1")
     ap.add_argument("--bucket");ap.add_argument("--hub-account-file",type=Path)
     ap.add_argument("--limit",type=int,default=32);ap.add_argument("--page-bytes",type=int,default=16*1024**2)
+    ap.add_argument("--slice-seconds",type=int,help="For cycle, yield after this many seconds at a page boundary")
+    ap.add_argument("--refresh-seconds",type=int,help="For cycle, revisit completed inventory or deferred frozen sources after this interval")
     ap.add_argument("--pages",type=int,default=1);ap.add_argument("--until-complete",action="store_true")
     ap.add_argument("--apply",action="store_true")
     ap.add_argument("--retry-deferred",action="store_true");ap.add_argument("--refresh",action="store_true")
@@ -241,6 +259,8 @@ def parse(argv):
     if not 1<=a.limit<=64 or not 1<=a.page_bytes<=NATIVE_LIMIT or a.pages<1 or a.apply!=(a.mode in ('backup','cycle')) or (a.apply and (not a.bucket or not a.hub_account_file)):
         ap.error("Check copy bounds and write options")
     if a.refresh and (a.scope or a.mode!='inventory') or a.retry_deferred and not a.apply:ap.error("Invalid refresh or retry scope")
+    if ((a.slice_seconds is not None or a.refresh_seconds is not None) and a.mode!="cycle") or any(v is not None and v<1 for v in (a.slice_seconds,a.refresh_seconds)):
+        ap.error("Invalid cycle timing")
     return a
 
 def main(argv=None,relay_factory=Relay):
@@ -254,18 +274,26 @@ def main(argv=None,relay_factory=Relay):
     with state(args.directory) as db:
         relay=relay_factory(args)
         try:
-            b=relay.send("bound");sig=digest_file(args.scope) if args.scope else None
+            b=relay.send("bound");sig=digest_file(db,args.scope) if args.scope else None
             bind(db,args,b,sig)
-            if args.refresh:
+            # A fixed file never admits a new identity. An unscoped watch
+            # revisits random UUIDs behind its high-water mark after its drain.
+            due=(args.mode=="cycle" and args.refresh_seconds and get(db,"scan")["complete"] and
+                 time.time()-get(db,"lastCompleteInventory",0)>=args.refresh_seconds and
+                 not db.execute("SELECT 1 FROM originals WHERE state IN ('pending','uploaded') LIMIT 1").fetchone())
+            if args.refresh or (due and not args.scope):
                 if not get(db,"scan")["complete"] or db.execute("SELECT 1 FROM originals WHERE state='uploaded' LIMIT 1").fetchone():
                     raise ValueError("Finish inventory and pending generation registration before refresh")
                 with db:
                     save(db,"scan",dict(after=ZERO,high=b["high"],offset=0,complete=False,scanned=0))
                     db.execute("DELETE FROM excluded")
-            if args.retry_deferred:
-                with db:db.execute("UPDATE originals SET state='pending' WHERE state='deferred'")
+            if args.retry_deferred or (due and args.scope):
+                with db:
+                    db.execute("UPDATE originals SET state='pending' WHERE state='deferred'")
+                    if due:save(db,"lastCompleteInventory",time.time())
             batch=0;backoff=1
-            while not stopping and (args.until_complete or batch<args.pages):
+            deadline=time.monotonic()+args.slice_seconds if args.slice_seconds else None
+            while not stopping and (deadline is None or batch==0 or time.monotonic()<deadline) and (args.until_complete or batch<args.pages):
                 try:
                     scan=not get(db,"scan")["complete"]
                     if args.mode=="inventory" and not scan:break
@@ -277,10 +305,15 @@ def main(argv=None,relay_factory=Relay):
                     if not e.retryable or not args.until_complete:raise
                     relay.close()
                     for _ in range(backoff*4):
-                        if stopping:break
+                        if stopping or (deadline and time.monotonic()>=deadline):break
                         time.sleep(0.25)
+                    if deadline and time.monotonic()>=deadline:break
                     backoff=min(30,backoff*2)
-            print(json_text(summary(db)))
+            if args.mode=="cycle" and args.slice_seconds:
+                pending=db.execute("SELECT 1 FROM originals WHERE state IN ('pending','uploaded') LIMIT 1").fetchone()
+                print(json_text(dict(pages=batch,inventoryComplete=get(db,"scan")["complete"],copyPending=pending is not None,
+                                     sourceAttemptPayloadWrites=False)))
+            else:print(json_text(summary(db)))
         finally:relay.close()
 
 def stop(*_):

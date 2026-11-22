@@ -146,6 +146,32 @@ function decisions(classified: ReturnType<typeof classifyPolarEvidence>) {
   };
 }
 
+/** Use the same classifier, sibling job and fitted-curve decisions for the
+ * post-commit worker readback as for the pre-commit projection proof. */
+export async function storedJobDecisionSha256(db: DB, id: string) {
+  const [a] = await db.execute(
+    sql`SELECT airfoil_id,simulation_preset_revision_id,sim_job_id FROM result_attempts WHERE id=${id}::uuid`,
+  );
+  requireProof(
+    a &&
+      typeof a.airfoil_id === "string" &&
+      typeof a.simulation_preset_revision_id === "string" &&
+      typeof a.sim_job_id === "string",
+    "missing job decision owner",
+  );
+  const rows = await readPolarAttemptEvidenceForConsumerProof(
+    db,
+    a.airfoil_id,
+    a.simulation_preset_revision_id,
+    a.sim_job_id,
+  );
+  requireProof(
+    rows.filter((p) => p.resultAttemptId === id).length === 1,
+    "job does not contain the exact replay attempt",
+  );
+  return analysisContentHash(decisions(classifyPolarEvidence(rows)));
+}
+
 /** Actual archive access happens BEFORE the bounded read-only SQL snapshot.
  * This verifier never updates a verdict, curve, attempt or scheduling owner.
  * The writer must repeat attemptEvidenceColdCohortSql in its final locked CAS. */
@@ -297,22 +323,21 @@ export function createAttemptServerDependencyVerifier(
         forcePresent(original, new Map()) === hasForceHistory,
         "force-history existence changed",
       );
-      if (broad) {
-        if (urans) {
-          // The lossless comparison above also keeps the complete cycle and
-          // no-shedding certificates, frame cadence and exact time windows.
-          // Status/classifier gates use those fields and the verified force
-          // presence. Numerical fit and archive publication use the original.
-          requireProof(
+      const extendedWorker = workerScope?.contract === "retained-original-v2";
+      // 0213 owns the cycle/time/frame continuation contract on both roles.
+      if ((broad && urans) || extendedWorker) {
+        requireProof(
+          canonicalAnalysisJson(
+            precalcContinuationProgressFromEvidence(original),
+          ) ===
             canonicalAnalysisJson(
-              precalcContinuationProgressFromEvidence(original),
-            ) ===
-              canonicalAnalysisJson(
-                precalcContinuationProgressFromEvidence(compact),
-              ),
-            "URANS physical time, cycle, frame or continuation evidence changed",
-          );
-        } else {
+              precalcContinuationProgressFromEvidence(compact),
+            ),
+          "URANS physical time, cycle, frame or continuation evidence changed",
+        );
+      }
+      if (broad) {
+        if (!urans) {
           // All leaves except the four replayed numerical channels have already
           // been compared losslessly above. Job-scoped RANS classification reads
           // mean_stable from this parent, with geometry, certificates and force
@@ -392,15 +417,20 @@ export function createAttemptServerDependencyVerifier(
         equalityEquivalent: true,
         scientificEquivalent: true,
         readDependenciesSatisfied: true,
-        verifier: workerScope
-          ? "server-consumers/hz-worker-steady-rans-v1"
-          : stopped
-            ? STOPPED_VERIFIER
-            : ATTEMPT_SERVER_CONSUMER_VERIFIER,
+        verifier: extendedWorker
+          ? "server-consumers/hz-retained-original-v2"
+          : workerScope
+            ? "server-consumers/hz-worker-steady-rans-v1"
+            : stopped
+              ? STOPPED_VERIFIER
+              : ATTEMPT_SERVER_CONSUMER_VERIFIER,
         ...stopped,
         ...(workerScope
           ? {
               workerScope,
+              ...(extendedWorker
+                ? { jobDecisionsSha256: analysisContentHash(originalDecision) }
+                : {}),
               applicationSha256: analysisContentHash(
                 JSON.parse(originalPayloadText),
               ),

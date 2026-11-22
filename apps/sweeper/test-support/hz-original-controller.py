@@ -68,6 +68,10 @@ with TemporaryDirectory() as tmp:
     assert not r["sourceAttemptPayloadWrites"]
     with sqlite3.connect(root/"job"/"originals.sqlite3") as db:
         assert db.execute("SELECT generation FROM originals WHERE id=?",(ids[1],)).fetchone()[0]==str(9007199254741001)
+    # The same watch can yield between bounded copy pages without restarting
+    # a frozen scan or recomputing the full aggregate in each time slice.
+    summary=run("cycle",*scope,*apply,"--until-complete","--slice-seconds","1","--refresh-seconds","60")
+    assert summary["inventoryComplete"] and not summary["copyPending"] and sent.count(ids[1])==1
     src.write_text(src.read_text()+"\n")
     try:run("inventory",*scope)
     except ValueError:pass

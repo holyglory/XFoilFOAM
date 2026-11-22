@@ -191,6 +191,10 @@ export async function createSettlementFixture(workerCustody = false) {
             "0210_stopped_progressive_attempt_history.sql",
             "0211_progressive_attempt_receipt_sources.sql",
             "0212_hz_attempt_history_custody.sql",
+            "0213_urans_attempt_history.sql",
+            "0214_verified_attempt_history_policy.sql",
+            "0215_verified_attempt_active_role.sql",
+            "0216_hz_retained_original_attempts.sql",
           ]
         : []),
     ]) {
