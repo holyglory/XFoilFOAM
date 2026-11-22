@@ -71,7 +71,7 @@ export async function createVerifiedPolicyFixture() {
   }
 }
 
-async function bindScientificReceipt(
+export async function bindScientificReceipt(
   db: DB,
   source: Awaited<ReturnType<typeof seedInlineSettledHistory>>,
 ) {
@@ -97,7 +97,7 @@ async function bindScientificReceipt(
     VALUES (${token},${attemptId},${analysisContentHash(attempt.evidence_payload)})`);
 }
 
-function dependencies(
+export function verifiedAttemptTestDependencies(
   db: DB,
   source: Awaited<ReturnType<typeof seedSettledHistory>>,
 ) {
@@ -133,7 +133,7 @@ export async function verifyMixedAttemptPolicy(db: DB, namespace: string) {
     memory,
     uransPoint: { ...periodicPoint(0, 3, false), fidelity: "urans_precalc" },
   });
-  const deps = dependencies(db, local);
+  const deps = verifiedAttemptTestDependencies(db, local);
   const originalBucket = env.evidenceBucket;
   try {
     env.evidenceBucket = "fixture";
@@ -323,7 +323,7 @@ export async function verifyLateAttemptPolicy(db: DB) {
     id: "90000000-0000-4000-8000-000000000001",
     memory,
   });
-  const deps = dependencies(db, missed);
+  const deps = verifiedAttemptTestDependencies(db, missed);
   const originalBucket = env.evidenceBucket;
   try {
     env.evidenceBucket = "fixture";
@@ -376,7 +376,7 @@ export async function verifyLateAttemptPolicy(db: DB) {
 export async function verifyPendingAttemptPolicy(db: DB) {
   const memory = new SettlementGcs();
   const pending = await seedSettledHistory(db, { memory });
-  const deps = dependencies(db, pending);
+  const deps = verifiedAttemptTestDependencies(db, pending);
   const originalBucket = env.evidenceBucket;
   try {
     env.evidenceBucket = "fixture";
@@ -429,7 +429,7 @@ export async function verifyPendingAttemptPolicy(db: DB) {
 
 export async function verifyPausedWorkerRole(db: DB) {
   const source = await seedSettledHistory(db);
-  const deps = dependencies(db, source);
+  const deps = verifiedAttemptTestDependencies(db, source);
   const priorBucket = env.evidenceBucket;
   try {
     env.evidenceBucket = "fixture";
