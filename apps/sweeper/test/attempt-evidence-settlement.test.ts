@@ -653,6 +653,8 @@ describe("verified automatic attempt cohorts", () => {
   });
   beforeEach(async () => {
     await fixture.reset();
+    await fixture.db.execute(sql`INSERT INTO sync_api_settings(id,remote_solver_enabled,remote_solver_registered_id,upstream_base_url)
+      VALUES(1,false,${randomUUID()}::uuid,'https://upstream.invalid')`);
   });
   afterAll(async () => {
     if (fixture) await fixture.close();
