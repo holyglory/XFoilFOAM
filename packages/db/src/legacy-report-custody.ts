@@ -377,17 +377,18 @@ function payload(proof: VerifiedLegacyReportCustodyPage): BoundPage {
 export interface LegacyReportCustodyOptions { apply?: boolean; readersReady?: boolean }
 
 /** Each verified scientific result travels once in its original PostgreSQL form.
- * Encode the bound page for SQL text clients independently of session string escaping. */
+ * An explicit PostgreSQL escape string keeps receipt identities readable and
+ * round-trips quotes and backslashes independently of session settings. */
 export function legacyReportCustodySql(proof: VerifiedLegacyReportCustodyPage, options: LegacyReportCustodyOptions = {}): string {
   if (options.apply && !options.readersReady) throw new Error("Legacy cold custody requires installed legacy report readers");
-  const encoded = Buffer.from(JSON.stringify(payload(proof)), "utf8").toString("base64");
+  const json = JSON.stringify(payload(proof)).replaceAll("\\", "\\\\").replaceAll("'", "''");
   return `BEGIN;
 SET LOCAL search_path=pg_catalog,public;
 SET LOCAL timezone='UTC';
 SET LOCAL lock_timeout='2s';
 SET LOCAL statement_timeout='30s';
 SET LOCAL idle_in_transaction_session_timeout='35s';
-SELECT public.register_legacy_report_archive_custody(convert_from(decode('${encoded}','base64'),'UTF8')::jsonb)::text;
+SELECT public.register_legacy_report_archive_custody(E'${json}'::jsonb)::text;
 ${options.apply ? "COMMIT" : "ROLLBACK"};\n`;
 }
 
