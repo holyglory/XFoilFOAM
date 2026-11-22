@@ -1,3 +1,4 @@
+import { selectedDetailBaseline, verifySelectedDetailField, verifyCompactDetail } from "../../../apps/api/test/selected-attempt-detail-fixture";
 import { periodicPoint } from "../test-support/periodic-urans-point";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -364,6 +365,8 @@ export async function verifyUransAttemptPublication(
       };
     };
     const before = await scientific();
+    let publicInline: Awaited<ReturnType<typeof selectedDetailBaseline>>;
+    let steadyInline: typeof publicInline;
     let hot: Awaited<ReturnType<typeof resultState>> | undefined;
     const rollback = new Error("restore pointerless fixture");
     await expect(
@@ -373,6 +376,8 @@ export async function verifyUransAttemptPublication(
         expect(await select(conn, chosen)).toBe("selected");
         expect(await select(conn, steadyEquivalent)).toBe("selected");
         hot = await resultState(conn);
+        publicInline = await selectedDetailBaseline(conn, chosen.id);
+        steadyInline = await selectedDetailBaseline(conn, steadyEquivalent.id);
         throw rollback;
       }),
     ).rejects.toBe(rollback);
@@ -511,6 +516,8 @@ export async function verifyUransAttemptPublication(
       (await resultState(db)).find((r) => r.id === chosen.cell)!.frame,
     ).toContain("0.810000");
     expect(await scientific()).toEqual(before);
+    await verifySelectedDetailField(db, publicInline!, "frame_track");
+    await verifyCompactDetail(db, steadyInline!);
     expect(
       (
         await db.execute(
