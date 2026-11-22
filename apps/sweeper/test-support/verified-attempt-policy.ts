@@ -50,6 +50,7 @@ export async function createVerifiedPolicyFixture() {
       "0212_hz_attempt_history_custody.sql",
       "0213_urans_attempt_history.sql",
       "0214_verified_attempt_history_policy.sql",
+      "0215_verified_attempt_active_role.sql",
     ]) {
       const body = await readFile(
         new URL(`../../../packages/db/migrations/${file}`, import.meta.url),
@@ -424,13 +425,16 @@ export async function verifyPendingAttemptPolicy(db: DB) {
 }
 
 export async function verifyAttemptPolicyRole(db: DB) {
-  await db.execute(
-    sql`INSERT INTO sync_api_settings(id,remote_solver_enabled,remote_solver_registered_id) VALUES(1,true,${randomUUID()})`,
-  );
+  // Ordinary hub preview, enable and settlement in this suite use the same retained registration.
+  await db.execute(sql`UPDATE sync_api_settings SET remote_solver_enabled=true WHERE id=1`);
   await expect(enableVerifiedAttemptPolicy(db)).rejects.toThrow("HZ custody");
-  expect((await getAttemptEvidenceStoragePolicy(db))?.shorteningEnabled).toBe(
-    false,
-  );
+  await db.execute(sql`UPDATE sync_api_settings SET remote_solver_enabled=false WHERE id=1`);
+  await db.execute(sql`UPDATE attempt_evidence_storage_policy SET hz_worker_only=true WHERE id=1`);
+  await expect(enableVerifiedAttemptPolicy(db)).rejects.toThrow("HZ custody");
+  await db.execute(sql`UPDATE attempt_evidence_storage_policy SET hz_worker_only=false WHERE id=1`);
+  await db.execute(sql`DELETE FROM sync_api_settings WHERE id=1`);
+  await expect(enableVerifiedAttemptPolicy(db)).rejects.toThrow("HZ custody");
+  expect((await getAttemptEvidenceStoragePolicy(db))?.shorteningEnabled).toBe(false);
   try {
     vi.stubEnv("AIRFOILFOAM_DEPLOYMENT_ROLE", "remote-solver");
     await expect(
