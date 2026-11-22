@@ -2,7 +2,9 @@ import { createHash } from "node:crypto";
 import { sql } from "drizzle-orm";
 import type { DB } from "./client";
 import { LEGACY_HASH, LEGACY_UUID, legacyBound, type LegacyReportMember } from "./legacy-report-storage";
-import { parseReportJson, reportTextIdentity, reportValidationValue, type ProgressiveReportArchiveReadIdentity } from "./progressive-report-archive";
+import { canonicalReportJson, reportJsonObject, parseReportJson, reportTextIdentity, reportValidationValue, type ProgressiveReportArchiveReadIdentity } from "./progressive-report-archive";
+import type { JobResult } from "../../engine-client/src/types";
+import { progressiveReportedPointSources } from "./progressive-remote-report";
 import { readLegacyPageMembers } from "./legacy-report-storage-codec";
 
 export interface LegacyCustodyObject {
@@ -132,6 +134,47 @@ export class LegacyRegisteredRestoreUnavailable extends Error {
   }
 }
 
+interface ScientificResultGroup {
+  executionId: string;
+  resultSha256: string;
+  resultByteSize: number;
+  resultText: string;
+  pointSignatures: string[];
+  reports: { sequence: number; contentSignature: string; envelopeText: string }[];
+}
+
+// Preserve the PostgreSQL text used for whole-report reconstruction. Only the
+// normal staging point identity uses the application's numerical representation.
+function collectScientificSource(member: LegacyReportMember, groups: Map<string, ScientificResultGroup>) {
+  if (member.kind !== "report") return;
+  const fields = new Map<string, string>();
+  const report = parseReportJson(member.reportText, fields);
+  if (createHash("sha256").update(canonicalReportJson(report)).digest("hex") !== member.contentSignature)
+    throw new Error("Legacy report canonical signature differs from its stored identity");
+  const resultText = fields.get("result");
+  if (!resultText?.startsWith("{")) return;
+
+  const { sha256, byteSize } = reportTextIdentity(resultText);
+  const key = `${member.executionId}:${sha256}:${byteSize}`;
+  let group = groups.get(key);
+  if (!group) {
+    const result = reportValidationValue(reportJsonObject(report).result!) as JobResult;
+    if (result.job_id !== member.executionId || !Array.isArray(result.polars) ||
+      !result.polars.every(polar => polar && Array.isArray(polar.points) &&
+        (polar.attempts == null || Array.isArray(polar.attempts)) &&
+        [...polar.points, ...(polar.attempts ?? [])].every(point => point && Number.isFinite(point.aoa_deg)))) return;
+    const pointSignatures = progressiveReportedPointSources(result).map(point => point.contentSignature).sort();
+    if (pointSignatures.length === 0 || pointSignatures.length > 2048) return;
+    group = { executionId: member.executionId, resultSha256: sha256, resultByteSize: byteSize, resultText, pointSignatures, reports: [] };
+    groups.set(key, group);
+  } else if (group.resultText !== resultText) {
+    throw new Error("Scientific result digest collision");
+  }
+  const envelopeText = `{${[...fields].map(([name, text]) =>
+    `${JSON.stringify(name)}: ${name === "result" ? "null" : text}`).join(", ")}}`;
+  group.reports.push({ sequence: member.sequence, contentSignature: member.contentSignature, envelopeText });
+}
+
 interface BoundPage {
   version: 1;
   sourceInstance: string;
@@ -144,6 +187,7 @@ interface BoundPage {
   localVerifiedAt: string | null;
   object: Omit<ProgressiveReportArchiveReadIdentity, "executionId" | "sequence" | "memberKind" | "signature" | "reportSha256" | "reportByteSize">;
   members: readonly LegacyReportCustodyMemberProof[];
+  scientificResults: ScientificResultGroup[];
 }
 
 const verified = new WeakMap<VerifiedLegacyReportCustodyPage, { page: BoundPage; startedAt: number }>();
@@ -193,6 +237,7 @@ export async function verifyLegacyReportCustodyPage(
     throw new Error("Legacy custody object differs from the exact registered worker namespace");
   legacyBound(object.byteSize, 2 * 1024 ** 3, "legacy object bytes");
   const members: LegacyReportCustodyMemberProof[] = [];
+  const scientificResults = new Map<string, ScientificResultGroup>();
   const keys = new Set<string>();
   let bytes = 0;
   for (const member of page.members) {
@@ -217,6 +262,7 @@ export async function verifyLegacyReportCustodyPage(
     members.push({ kind: member.kind, executionId: member.executionId, sequence: member.sequence,
       contentSignature: member.contentSignature, reportSha256: body.sha256, reportByteSize: body.byteSize,
       rowSha256: row.sha256, rowByteSize: row.byteSize });
+    collectScientificSource(member, scientificResults);
   }
   const memberProofs = Object.freeze(members.map((member) => Object.freeze(member)));
   const startedAt = Date.now();
@@ -316,7 +362,7 @@ export async function verifyLegacyReportCustodyPage(
     object: { sourceKind: "worker", archiveFormat: "legacy-jsonl", mimeType: "application/gzip", compression: "gzip",
       bucket: object.bucket, objectKey: object.objectKey, generation: object.generation,
       storedSha256: object.sha256, storedByteSize: object.byteSize, crc32c: object.crc32c },
-    members: memberProofs,
+    members: memberProofs, scientificResults: [...scientificResults.values()],
   } });
   return proof;
 }
@@ -330,18 +376,18 @@ function payload(proof: VerifiedLegacyReportCustodyPage): BoundPage {
 
 export interface LegacyReportCustodyOptions { apply?: boolean; readersReady?: boolean }
 
-/** Bound metadata only: no solver JSON is parsed/re-emitted in this SQL. A page
- * is one transaction; default output rolls back and never changes permissions. */
+/** Each verified scientific result travels once in its original PostgreSQL form.
+ * Encode the bound page for SQL text clients independently of session string escaping. */
 export function legacyReportCustodySql(proof: VerifiedLegacyReportCustodyPage, options: LegacyReportCustodyOptions = {}): string {
   if (options.apply && !options.readersReady) throw new Error("Legacy cold custody requires installed legacy report readers");
-  const json = JSON.stringify(payload(proof)).replaceAll("'", "''");
+  const encoded = Buffer.from(JSON.stringify(payload(proof)), "utf8").toString("base64");
   return `BEGIN;
 SET LOCAL search_path=pg_catalog,public;
 SET LOCAL timezone='UTC';
 SET LOCAL lock_timeout='2s';
 SET LOCAL statement_timeout='30s';
 SET LOCAL idle_in_transaction_session_timeout='35s';
-SELECT public.register_legacy_report_archive_custody('${json}'::jsonb)::text;
+SELECT public.register_legacy_report_archive_custody(convert_from(decode('${encoded}','base64'),'UTF8')::jsonb)::text;
 ${options.apply ? "COMMIT" : "ROLLBACK"};\n`;
 }
 

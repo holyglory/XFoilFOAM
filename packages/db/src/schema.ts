@@ -8810,6 +8810,32 @@ export const progressiveWorkerEvidenceReceipts = pgTable(
   }),
 );
 
+export const progressiveWorkerReportScienceProofs = pgTable(
+  "progressive_worker_report_science_proofs",
+  {
+    simJobId: uuid("sim_job_id").notNull(),
+    sequence: bigint("sequence", { mode: "number" }).notNull(),
+    reportContentSignature: text("report_content_signature").notNull(),
+    reportSha256: text("report_sha256").notNull(),
+    reportByteSize: bigint("report_byte_size", { mode: "number" }).notNull(),
+    resultSha256: text("result_sha256").notNull(),
+    resultByteSize: bigint("result_byte_size", { mode: "number" }).notNull(),
+    envelope: jsonb("envelope").$type<Record<string, unknown>>().notNull(),
+    pointSignatures: jsonb("point_signatures").$type<string[]>().notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().default(sql`clock_timestamp()`),
+  },
+  (table) => ({
+    primary: primaryKey({ name: "progressive_worker_report_science_proofs_pkey", columns: [table.simJobId, table.sequence] }),
+    report: foreignKey({ name: "worker_science_proof_report_fk", columns: [table.simJobId, table.sequence], foreignColumns: [progressiveWorkerReports.simJobId, progressiveWorkerReports.sequence] }).onDelete("restrict"),
+    staged: foreignKey({ name: "worker_science_proof_staging_fk", columns: [table.simJobId, table.sequence], foreignColumns: [progressiveWorkerEvidenceReceipts.simJobId, progressiveWorkerEvidenceReceipts.sequence] }).onDelete("restrict"),
+    resultSignatureCheck: check("worker_science_proof_hashes_check", sql`${table.reportContentSignature} ~ '^[a-f0-9]{64}$' AND ${table.reportSha256} ~ '^[a-f0-9]{64}$' AND ${table.resultSha256} ~ '^[a-f0-9]{64}$'`),
+    sizeCheck: check("worker_science_proof_size_check", sql`${table.reportByteSize}>0 AND ${table.resultByteSize}>0`),
+    envelopeCheck: check("worker_science_proof_envelope_check", sql`jsonb_typeof(${table.envelope})='object' AND (${table.envelope}->>'executionId') IS NOT DISTINCT FROM ${table.simJobId}::text`),
+    pointsCheck: check("worker_science_proof_points_check", sql`jsonb_typeof(${table.pointSignatures})='array' AND jsonb_array_length(${table.pointSignatures}) BETWEEN 1 AND 2048`),
+    resultIdx: index("progressive_worker_report_science_proofs_result_idx").on(table.simJobId, table.resultSha256, table.resultByteSize, table.sequence),
+  }),
+);
+
 export const progressiveWorkerEvidenceAttempts = pgTable(
   "progressive_worker_evidence_attempts",
   {

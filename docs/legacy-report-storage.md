@@ -63,6 +63,8 @@ and immutable object identities in the operation's receipts.
 
 ## Canary and bulk migration
 
+For historical scientific duplicates, use the [0209 one-page canary](legacy-report-0209-canary.md).
+
 For a one-execution, one-page canary, use a separate scope selecting its exact
 measured interval and a new progress directory. `CANARY_REPORT_ROWS` is the
 number of selected reports, not an invented count of contiguous sequence IDs.
