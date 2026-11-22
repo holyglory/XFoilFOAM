@@ -3846,6 +3846,7 @@ export const attemptEvidenceStoragePolicy = pgTable(
     minLogicalBytes: integer("min_logical_bytes").notNull(),
     minNetValueBytes: integer("min_net_value_bytes").notNull(),
     maxSourceBytes: integer("max_source_bytes").notNull(),
+    uransMaxSourceBytes: integer("urans_max_source_bytes"),
     initialSubset: text("initial_subset").notNull(),
   },
 );

@@ -91,6 +91,32 @@ its original and removes it from the automatic cohort. To enable automatic
 processing after the canary, repeat the enable command without `--id`. Omitting
 `--stopped-progressive true` returns enablement to the original 0208 cohort.
 
+## URANS attempts with immutable receipts
+
+Migration 0213 adds a separately enabled hub scope for settled URANS sources.
+It retains exact force times and channels, frame records and any steady
+history in the existing attempt archive. Cycle certificates, selected
+intervals, dispositions and other metadata keep their original values.
+Classification, physical progress, force-table rows and stored media keep
+their existing acceptance and ownership checks.
+
+Preview the new scope with `shortening-candidates --receipt-urans true`.
+After the matching readers are deployed, use the returned stable IDs for
+a single-attempt canary. The inherited source limit applies by default. The
+optional URANS limit is bounded at 8 MiB and affects only this scope.
+
+```sh
+attempt_history enable-shortening --consumer-contract 1 --receipt-urans true --id "$ATTEMPT_ID" --urans-max-source-bytes 8388608
+attempt_history shorten --id "$ATTEMPT_ID" --archive-id "$ARCHIVE_ID"
+```
+
+Every removal still requires exact source custody, an authenticated
+generation-pinned read, a working application read and positive stored
+value savings. Archive interpretation of a pointerless result prepares the
+original PG text before the scientific write. Publication rechecks the
+attempt, result, archive and storage event, then applies the existing
+cycle or no-shedding policy to that generation.
+
 ## Automatic mode and recovery
 
 After a successful canary, enable the bounded automatic writer with the same

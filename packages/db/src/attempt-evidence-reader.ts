@@ -223,7 +223,7 @@ async function attachProjections(db: DB, current: CurrentRow[]): Promise<void> {
           verification#>>'{dependencies,progressiveScope,scientific,applicationSha256}' AS scientific,
           verification#>>'{dependencies,applicationSha256}' AS application
         FROM attempt_evidence_storage_events WHERE id IN (${ids(withEvents.map((row) => row.storageEventId!))})
-        AND completed AND action='shorten' AND verification#>>'{dependencies,verifier}'='server-consumers/receipt-bearing-rans-v1'`);
+        AND completed AND action='shorten' AND verification#>>'{dependencies,verifier}' IN ('server-consumers/receipt-bearing-rans-v1','server-consumers/receipt-bearing-urans-v1')`);
       const originals = new Map(
         sealed.map((r) => [String(r.result_attempt_id), r]),
       );

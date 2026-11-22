@@ -66,6 +66,27 @@ describe("server consumer SQL contract", () => {
     await client.sql.end();
   });
 
+  it("preserves PostgreSQL numeric scale semantics and exact array omission on large scientific sources", async () => {
+    const [r] = await client.db
+      .execute(sql`WITH RECURSIVE docs(id,v) AS MATERIALIZED (
+      SELECT i, jsonb_build_object('retained',repeat(md5(i::text),1800),'source',
+        CASE i WHEN 1 THEN '[-1200.0000,9007199254740993.00,0.00000]'::jsonb
+        WHEN 2 THEN '{"a":[1e-400,1.23456789012345678901234567890123456789]}'::jsonb
+        WHEN 3 THEN '["0.00,","1.000]","nested",0.1234]'::jsonb ELSE 'null'::jsonb END,
+        'force_history',jsonb_build_object('t','[0.00,1.0001]'::jsonb,'cl','null'::jsonb,'cd',i),
+        'forceHistory',jsonb_build_object('t','[]'::jsonb,'cm','[0]'::jsonb),
+        'frame_track',jsonb_build_object('frames','[]'::jsonb,'stationary',false),'steady_history','null'::jsonb)
+      FROM generate_series(1,4) i
+    ), original(id,n,v) AS (
+      SELECT id,0,v FROM docs UNION ALL
+      SELECT original.id,h.ordinal,CASE WHEN jsonb_typeof(original.v#>h.path)='array'
+        THEN original.v#-h.path ELSE original.v END FROM original JOIN attempt_evidence_history_paths() h ON h.ordinal=original.n+1
+    ) SELECT count(*)::int AS rows, bool_and(result_history_normalized(d.v)::text=attempt_evidence_normalized_value(d.v)::text) AS normalized,
+      bool_and(o.v::text=attempt_evidence_compact(d.v)::text) AS compact
+      FROM docs d JOIN original o ON o.id=d.id AND o.n=(SELECT max(ordinal) FROM attempt_evidence_history_paths())`);
+    expect(r).toMatchObject({ rows: 4, normalized: true, compact: true });
+  });
+
   it("admits a real settled cohort, blocks each referenced dependency, and keeps inline/cold predicates equivalent", async () => {
     await client.db.transaction(async (tx) => {
       await tx.execute(sql`SET LOCAL statement_timeout='5s'`);

@@ -11807,6 +11807,13 @@ describe("progressive CFD evidence accounting", () => {
     });
   }, 120_000);
 
+  it("publishes the exact pointerless URANS cycle history after verified offload", async () => {
+    const angles = [0, 2, 4];
+    const fixture = await cfdEvidenceFixture(34.347, 3, [], angles, false, undefined, {}, 3);
+    const { verifyUransAttemptPublication } = await import("./urans-attempt-publication-fixture");
+    await withHistoryDatabaseCopy(db => verifyUransAttemptPublication(db, fixture.composed.jobId, angles));
+  }, 120_000);
+
   it("shortens current and historical receipt-bearing RANS histories with identical fit and replay", async () => {
     const fixture = await cfdEvidenceFixture(33.741, 2, [], [0, 2], false, undefined, {}, 2);
     const { verifyReceiptBearingHistory } = await import("./attempt-receipt-source-fixture");

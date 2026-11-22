@@ -1,3 +1,4 @@
+import { isProgressiveReceiptVerifier } from "./attempt-receipt-verification";
 import { eq, is, sql } from "drizzle-orm";
 import { PgTransaction } from "drizzle-orm/pg-core";
 import type { DB } from "./client";
@@ -165,7 +166,7 @@ async function assertSignedStorageBinding(
     throw new ProgressiveRemoteEvidenceConflict(
       "Original source inventory or storage event is missing",
     );
-  if (binding.verifier === "server-consumers/receipt-bearing-rans-v1") {
+  if (isProgressiveReceiptVerifier(binding.verifier)) {
     const scope = binding.scope as {
       scientific?: { attemptToken: string; applicationSha256: string } | null;
       remote?: Record<string, unknown> | null;
@@ -370,7 +371,7 @@ export async function assertProgressiveRemoteEvidenceAttempt(
       await db.execute(sql`SELECT verification#>>'{dependencies,verifier}' AS verifier FROM attempt_evidence_storage_events
       WHERE id=${attempt.evidenceStorageEventId}::uuid AND archive_id=${attempt.evidenceArchiveId}::uuid
         AND result_attempt_id=${attempt.id}::uuid AND completed AND action='shorten'`);
-    if (event?.verifier === "server-consumers/receipt-bearing-rans-v1") {
+    if (isProgressiveReceiptVerifier(event?.verifier)) {
       const pin = (await loadAttemptSourcePins(db, [attempt.id])).get(
         attempt.id,
       )!;

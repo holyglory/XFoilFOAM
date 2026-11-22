@@ -69,6 +69,14 @@ command = ["/bin/bash", "-c", "export PATH=\"$PWD/.venv/bin:$PATH\"; exec /usr/b
 env = { PYTHONDONTWRITEBYTECODE = "1" }
 diagnostic_sources = [{ format = "junit", path = "report.xml" }]
 
+[[test.attempt-server-consumers.check]]
+name = "urans-archive-publication"
+tier = "development"
+requires = ["schema"]
+timeout_seconds = 300
+command = ["/bin/bash", "-c", "exec /usr/bin/corepack pnpm --filter @aerodb/db exec vitest run test/campaign-profile-enrollment.test.ts -t 'publishes the exact pointerless URANS cycle history after verified offload' --reporter=default --reporter=junit --outputFile.junit=\"$DEVCOORDINATOR_DIAGNOSTICS_DIR/report.xml\""]
+diagnostic_sources = [{ format = "junit", path = "report.xml" }]
+
 [test.stopped-canonical-retirement]
 timeout_seconds = 900
 
@@ -5764,7 +5772,7 @@ name = "stopped-progressive-history"
 tier = "development"
 requires = ["schema"]
 timeout_seconds = 600
-command = ["/bin/bash", "-c", "repo_git=$(git rev-parse --path-format=absolute --git-common-dir) && export PATH=\"${repo_git%/*}/.venv/bin:$PATH\" && exec /usr/bin/corepack pnpm --filter @aerodb/db exec vitest run test/campaign-profile-enrollment.test.ts -t 'shortens and replays a stopped progressive stage-3 history|shortens current and historical receipt-bearing RANS histories|replays a signed remote point after its receipt-bearing RANS history moves to storage|republishes current-scope storage-only evidence append-only and remains idempotent [(](accepted|rejected)[)]' --reporter=default --reporter=junit --outputFile.junit=\"$DEVCOORDINATOR_DIAGNOSTICS_DIR/report.xml\""]
+command = ["/bin/bash", "-c", "repo_git=$(git rev-parse --path-format=absolute --git-common-dir) && export PATH=\"${repo_git%/*}/.venv/bin:$PATH\" && exec /usr/bin/corepack pnpm --filter @aerodb/db exec vitest run test/campaign-profile-enrollment.test.ts -t 'shortens and replays a stopped progressive stage-3 history|shortens current and historical receipt-bearing RANS histories|publishes the exact pointerless URANS cycle history after verified offload|replays a signed remote point after its receipt-bearing RANS history moves to storage|republishes current-scope storage-only evidence append-only and remains idempotent [(](accepted|rejected)[)]' --reporter=default --reporter=junit --outputFile.junit=\"$DEVCOORDINATOR_DIAGNOSTICS_DIR/report.xml\""]
 diagnostic_sources = [{ format = "junit", path = "report.xml" }]
 
 [[test.progressive-report-archive.check]]

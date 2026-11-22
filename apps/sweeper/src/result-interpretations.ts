@@ -8,6 +8,8 @@
  * transaction accepts the exact attempt.
  */
 import { selectedCleanCycleQualityReasons } from "@aerodb/core";
+import { AttemptEvidenceReadError } from "@aerodb/db/attempt-evidence-reader";
+import { readOriginalAttemptForProjection } from "./attempt-evidence-consumer-reader";
 import {
   type DB,
   resultCanonicalSelections,
@@ -20,6 +22,7 @@ import {
   solverEvidenceBlobs,
 } from "@aerodb/db";
 import {
+  EngineError,
   parseNoSheddingCertificate,
   parseRansHoldCertificate,
   parseUransCycleCertificate,
@@ -1544,6 +1547,24 @@ export async function stageArchiveResultInterpretation(opts: {
   };
 }
 
+interface ArchiveSelectionOptions {
+  db: DB;
+  resultId: string;
+  resultAttemptId: string;
+  sourceArchiveId: string;
+  interpretationId: string | null;
+  backfillRunId: string;
+  actor?: string;
+}
+
+type ArchiveSelectionSource = {
+  id: string;
+  result_id: string;
+  sim_job_id: string | null;
+  archive_id: string | null;
+  event_id: string | null;
+};
+
 /**
  * Select an accepted archive reduction when its producing attempt is either
  * the result's current generation or the exact terminal attempt projected
@@ -1552,16 +1573,59 @@ export async function stageArchiveResultInterpretation(opts: {
  * authenticated archive was reduced. Selection is append-only and the result
  * update remains a compare-and-swap, so active/newer work is never retargeted.
  */
-export async function selectAcceptedArchiveInterpretation(opts: {
-  db: DB;
-  resultId: string;
-  resultAttemptId: string;
-  sourceArchiveId: string;
-  interpretationId: string | null;
-  backfillRunId: string;
-  actor?: string;
-}): Promise<ArchiveInterpretationSelectionOutcome> {
+export async function selectAcceptedArchiveInterpretation(
+  opts: ArchiveSelectionOptions,
+): Promise<ArchiveInterpretationSelectionOutcome> {
   if (!opts.interpretationId) return "not_eligible";
+  // Only a pointerless promotion copies numerical histories. Read the
+  // original PG bytes before the write transaction. An already-selected
+  // generation only needs its scalar and cycle evidence.
+  const [observed] = await opts.db.execute<ArchiveSelectionSource>(sql`
+    SELECT a.id,a.result_id,a.sim_job_id,a.evidence_archive_id AS archive_id,a.evidence_storage_event_id AS event_id
+    FROM result_attempts a JOIN results r ON r.id=a.result_id
+    JOIN result_interpretations i ON i.id=${opts.interpretationId}::uuid AND i.result_id=r.id
+      AND i.result_attempt_id=a.id AND i.source='archive_backfill' AND i.state='accepted' AND i.source_archive_id=${opts.sourceArchiveId}::uuid
+    WHERE a.id=${opts.resultAttemptId}::uuid AND r.id=${opts.resultId}::uuid
+      AND r.status='failed' AND r.current_result_attempt_id IS NULL AND r.current_result_interpretation_id IS NULL
+      AND r.current_canonical_selection_id IS NULL AND r.sim_job_id IS NOT DISTINCT FROM a.sim_job_id`);
+  let originalText: string | null = null;
+  if (observed?.archive_id) {
+    try {
+      originalText = await readOriginalAttemptForProjection(
+        opts.db,
+        observed.id,
+        observed.archive_id,
+      );
+    } catch (error) {
+      if (
+        error instanceof AttemptEvidenceReadError &&
+        (error.code === "stale" || error.code === "unavailable")
+      )
+        throw new EngineError(
+          "Archive interpretation is waiting for the exact attempt history",
+          503,
+          "attempt_history_unavailable",
+        );
+      throw error;
+    }
+  }
+  const interpretationId = opts.interpretationId;
+  return opts.db.transaction((tx) =>
+    commitArchiveInterpretationSelection(
+      { ...opts, db: tx as unknown as DB },
+      interpretationId,
+      observed,
+      originalText,
+    ),
+  );
+}
+
+async function commitArchiveInterpretationSelection(
+  opts: ArchiveSelectionOptions,
+  interpretationId: string,
+  observed: ArchiveSelectionSource | undefined,
+  originalText: string | null,
+): Promise<ArchiveInterpretationSelectionOutcome> {
   const [interpretation] = await opts.db
     .select({
       id: resultInterpretations.id,
@@ -1581,7 +1645,7 @@ export async function selectAcceptedArchiveInterpretation(opts: {
       resultAttemptId: resultInterpretations.resultAttemptId,
     })
     .from(resultInterpretations)
-    .where(eq(resultInterpretations.id, opts.interpretationId))
+    .where(eq(resultInterpretations.id, interpretationId))
     .limit(1);
   if (
     !interpretation ||
@@ -1605,6 +1669,7 @@ export async function selectAcceptedArchiveInterpretation(opts: {
     })
     .from(results)
     .where(eq(results.id, opts.resultId))
+    .for("update")
     .limit(1);
   if (!current) return "stale_attempt";
   if (
@@ -1614,6 +1679,11 @@ export async function selectAcceptedArchiveInterpretation(opts: {
     return "already_selected";
   }
 
+  // Cycle rows are append-only. Their composite FK takes KEY SHARE on this
+  // interpretation, so hold it through the suffix check and selection insert.
+  await opts.db.execute(
+    sql`SELECT id FROM result_interpretations WHERE id=${interpretation.id}::uuid FOR UPDATE`,
+  );
   const [[attempt], [archive], cycles] = await Promise.all([
     opts.db
       .select({
@@ -1640,7 +1710,8 @@ export async function selectAcceptedArchiveInterpretation(opts: {
         strouhal: resultAttempts.strouhal,
         error: resultAttempts.error,
         qualityWarnings: resultAttempts.qualityWarnings,
-        evidencePayload: resultAttempts.evidencePayload,
+        archiveId: resultAttempts.evidenceArchiveId,
+        eventId: resultAttempts.evidenceStorageEventId,
         engineJobId: resultAttempts.engineJobId,
         engineCaseSlug: resultAttempts.engineCaseSlug,
         simJobId: resultAttempts.simJobId,
@@ -1660,6 +1731,7 @@ export async function selectAcceptedArchiveInterpretation(opts: {
           eq(resultAttempts.resultId, opts.resultId),
         ),
       )
+      .for("share")
       .limit(1),
     opts.db
       .select({
@@ -1685,6 +1757,7 @@ export async function selectAcceptedArchiveInterpretation(opts: {
           eq(solverEvidenceArchives.state, "current"),
         ),
       )
+      .for("share")
       .limit(1),
     opts.db
       .select({
@@ -1741,6 +1814,21 @@ export async function selectAcceptedArchiveInterpretation(opts: {
     return "stale_attempt";
   }
 
+  if (
+    promotesPointerlessTerminalAttempt &&
+    (!observed ||
+      observed.id !== attempt.id ||
+      observed.result_id !== opts.resultId ||
+      observed.sim_job_id !== attempt.simJobId ||
+      observed.archive_id !== attempt.archiveId ||
+      observed.event_id !== attempt.eventId)
+  )
+    throw new EngineError(
+      "Attempt history changed during archive interpretation preparation",
+      503,
+      "attempt_history_changed",
+    );
+
   const [selection] = await opts.db
     .insert(resultCanonicalSelections)
     .values({
@@ -1774,72 +1862,81 @@ export async function selectAcceptedArchiveInterpretation(opts: {
         current.currentCanonicalSelectionId,
       )
     : isNull(results.currentCanonicalSelectionId);
-  const attemptEvidence = asRecord(attempt.evidencePayload);
-  const attemptFidelity =
-    typeof attemptEvidence.fidelity === "string"
-      ? attemptEvidence.fidelity
-      : null;
-  const [updated] = await opts.db
-    .update(results)
-    .set({
-      ...(promotesPointerlessTerminalAttempt
-        ? {
-            currentResultAttemptId: attempt.id,
-            status: attempt.status,
-            source: attempt.source,
-            regime: attempt.regime,
-            cl: interpretation.cl,
-            cd: interpretation.cd,
-            cm: interpretation.cm,
-            clCd: interpretation.clCd,
-            clStd: attempt.clStd,
-            cdStd: attempt.cdStd,
-            cmStd: attempt.cmStd,
-            stalled: attempt.stalled,
-            unsteady: attempt.unsteady,
-            converged: attempt.converged,
-            finalResidual: attempt.finalResidual,
-            iterations: attempt.iterations,
-            yPlusAvg: attempt.yPlusAvg,
-            yPlusMax: attempt.yPlusMax,
-            nCells: attempt.nCells,
-            firstOrderFallback: attempt.firstOrderFallback,
-            strouhal: attempt.strouhal,
-            error: attempt.error,
-            qualityWarnings: attempt.qualityWarnings,
-            frameTrack: attemptEvidence.frame_track ?? null,
-            fidelity: attemptFidelity,
-            steadyHistory: attemptEvidence.steady_history ?? null,
-            engineJobId: attempt.engineJobId,
-            engineCaseSlug: attempt.engineCaseSlug,
-            simJobId: attempt.simJobId,
-            methodKey: attempt.methodKey,
-            solverImplementationId: attempt.solverImplementationId,
-            solverRuntimeBuildId: attempt.solverRuntimeBuildId,
-            solvedAt: attempt.solvedAt,
-            priority: 0,
-          }
-        : {}),
-      currentResultInterpretationId: interpretation.id,
-      currentCanonicalSelectionId: selection.id,
-      updatedAt: new Date(),
-    })
-    .where(
-      and(
-        eq(results.id, opts.resultId),
-        promotesPointerlessTerminalAttempt
-          ? and(
-              isNull(results.currentResultAttemptId),
-              eq(results.status, "failed"),
-              sql`${results.simJobId} IS NOT DISTINCT FROM ${attempt.simJobId}::uuid`,
-            )
-          : eq(results.currentResultAttemptId, opts.resultAttemptId),
-        currentInterpretationGuard,
-        currentCanonicalSelectionGuard,
-      ),
-    )
-    .returning({ id: results.id });
-  return updated ? "selected" : "stale_attempt";
+  const update = opts.db.update(results).set({
+    ...(promotesPointerlessTerminalAttempt
+      ? {
+          currentResultAttemptId: attempt.id,
+          status: attempt.status,
+          source: attempt.source,
+          regime: attempt.regime,
+          cl: interpretation.cl,
+          cd: interpretation.cd,
+          cm: interpretation.cm,
+          clCd: interpretation.clCd,
+          clStd: attempt.clStd,
+          cdStd: attempt.cdStd,
+          cmStd: attempt.cmStd,
+          stalled: attempt.stalled,
+          unsteady: attempt.unsteady,
+          converged: attempt.converged,
+          finalResidual: attempt.finalResidual,
+          iterations: attempt.iterations,
+          yPlusAvg: attempt.yPlusAvg,
+          yPlusMax: attempt.yPlusMax,
+          nCells: attempt.nCells,
+          firstOrderFallback: attempt.firstOrderFallback,
+          strouhal: attempt.strouhal,
+          error: attempt.error,
+          qualityWarnings: attempt.qualityWarnings,
+          frameTrack: sql`NULLIF(attempt_source.original->'frame_track','null'::jsonb)`,
+          frameTrackArchiveId: null,
+          fidelity: sql`CASE WHEN jsonb_typeof(attempt_source.original->'fidelity')='string' THEN attempt_source.original->>'fidelity' END`,
+          steadyHistory: sql`NULLIF(attempt_source.original->'steady_history','null'::jsonb)`,
+          steadyHistoryArchiveId: null,
+          engineJobId: attempt.engineJobId,
+          engineCaseSlug: attempt.engineCaseSlug,
+          simJobId: attempt.simJobId,
+          methodKey: attempt.methodKey,
+          solverImplementationId: attempt.solverImplementationId,
+          solverRuntimeBuildId: attempt.solverRuntimeBuildId,
+          solvedAt: attempt.solvedAt,
+          priority: 0,
+        }
+      : {}),
+    currentResultInterpretationId: interpretation.id,
+    currentCanonicalSelectionId: selection.id,
+    updatedAt: new Date(),
+  });
+  const selectionStillOwned = and(
+    eq(results.id, opts.resultId),
+    promotesPointerlessTerminalAttempt
+      ? and(
+          isNull(results.currentResultAttemptId),
+          eq(results.status, "failed"),
+          sql`${results.simJobId} IS NOT DISTINCT FROM ${attempt.simJobId}::uuid`,
+        )
+      : eq(results.currentResultAttemptId, opts.resultAttemptId),
+    currentInterpretationGuard,
+    currentCanonicalSelectionGuard,
+  );
+  const projection = sql`(WITH exact AS MATERIALIZED (
+    SELECT CASE WHEN a.evidence_archive_id IS NULL THEN a.evidence_payload
+      ELSE public.attempt_evidence_payload_for_publication(a.id,${observed?.archive_id ?? null}::uuid,${originalText}::text)
+      END AS original FROM result_attempts a WHERE a.id=${attempt.id}::uuid AND a.result_id=${opts.resultId}::uuid
+  ) SELECT original FROM exact) AS attempt_source`;
+  const [updated] = promotesPointerlessTerminalAttempt
+    ? await update
+        .from(projection)
+        .where(selectionStillOwned)
+        .returning({ id: results.id })
+    : await update.where(selectionStillOwned).returning({ id: results.id });
+  if (!updated)
+    throw new EngineError(
+      "Result owner changed before archive interpretation publication",
+      503,
+      "attempt_history_changed",
+    );
+  return "selected";
 }
 
 /**
