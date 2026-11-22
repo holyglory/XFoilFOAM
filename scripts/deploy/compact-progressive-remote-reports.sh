@@ -116,7 +116,14 @@ done
 [[ "$LOCK_FILE" == /* && ! -L "$LOCK_FILE" && -d "$(dirname -- "$LOCK_FILE")" ]] ||
   die 2 'Expected an absolute non-symlink deployment lock in an existing directory.'
 umask 077
-exec 9>>"$LOCK_FILE"
+if [[ -e "$LOCK_FILE" ]]; then
+  [[ -f "$LOCK_FILE" ]] || die 2 'Expected a regular deployment lock.'
+  # Linux permits flock on a read-only descriptor. Reopening an existing
+  # deployer-owned lock with O_CREAT in sticky /tmp can fail even for root.
+  exec 9<"$LOCK_FILE"
+else
+  exec 9>>"$LOCK_FILE"
+fi
 flock -n 9 || die 9 'Another deployment or maintenance operation holds the deployment lock.'
 
 DEADLINE=$((SECONDS + MAINTENANCE_TIMEOUT_SECONDS))
@@ -146,16 +153,25 @@ compose() {
     -p "$COMPOSE_PROJECT_NAME" "${COMPOSE_FILE_ARGS[@]}" "$@"
 }
 capture() {
-  local service="$1" ids details
+  local service="$1" ids id details oneoff state started
   ids="$(compose ps --all -q "$service")" || return 1
-  CAPTURED_ID="$ids"; CAPTURED_STATE=absent; CAPTURED_STARTED=-
+  CAPTURED_ID=""; CAPTURED_STATE=absent; CAPTURED_STARTED=-
   [[ -n "$ids" ]] || return 0
-  [[ "$ids" =~ ^[0-9a-f]{12,64}$ ]] || return 1
-  details="$(run_bounded "$COMMAND_TIMEOUT_SECONDS" docker inspect --format \
-    '{{.State.Status}}|{{.State.StartedAt}}' "$ids")" || return 1
-  IFS='|' read -r CAPTURED_STATE CAPTURED_STARTED <<<"$details"
-  case "$CAPTURED_STATE" in running|exited|created) ;; *) return 1 ;; esac
-  [[ -n "$CAPTURED_STARTED" && "$details" != *$'\n'* ]]
+  while IFS= read -r id; do
+    [[ "$id" =~ ^[0-9a-f]{12,64}$ ]] || return 1
+    details="$(run_bounded "$COMMAND_TIMEOUT_SECONDS" docker inspect --format \
+      '{{index .Config.Labels "com.docker.compose.oneoff"}}|{{.State.Status}}|{{.State.StartedAt}}' "$id")" || return 1
+    IFS='|' read -r oneoff state started <<<"$details"
+    [[ -n "$started" && "$details" != *$'\n'* ]] || return 1
+    case "${oneoff,,}" in
+      true) [[ "$state" == exited ]] || return 1; continue ;;
+      false|'') ;;
+      *) return 1 ;;
+    esac
+    [[ -z "$CAPTURED_ID" ]] || return 1
+    case "$state" in running|exited|created) ;; *) return 1 ;; esac
+    CAPTURED_ID="$id"; CAPTURED_STATE="$state"; CAPTURED_STARTED="$started"
+  done <<<"$ids"
 }
 assert_prior() {
   local service="$1"

@@ -5625,6 +5625,14 @@ cases = [{ id = "transport-schema", args = [], postgres = "default" }]
 diagnostic_sources = [{ format = "junit", path = "report.xml" }]
 
 [[test.progressive-report-archive.check]]
+name = "report-table-maintenance"
+tier = "development"
+timeout_seconds = 300
+requires = ["workspace"]
+command = ["/bin/bash", "-c", "repo_git=$(git rev-parse --path-format=absolute --git-common-dir) && exec \"${repo_git%/*}/.venv/bin/python\" -m pytest -q tests/test_deploy_sweeper_state.py -k \"compaction_preserves_existing_lock or compaction_refuses_unproven_state or compaction_server_run_outlives_observer\" --junitxml=\"$DEVCOORDINATOR_DIAGNOSTICS_DIR/report.xml\""]
+diagnostic_sources = [{ format = "junit", path = "report.xml" }]
+
+[[test.progressive-report-archive.check]]
 name = "worker-report-native-reclamation"
 tier = "development"
 timeout_seconds = 120

@@ -7,6 +7,7 @@ from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import os
 import signal
+import stat
 import shutil
 import subprocess
 from pathlib import Path
@@ -3553,10 +3554,17 @@ if args[0] == 'compose':
         raise SystemExit(43)
     if load(service)['state'] != 'absent':
         print(ids[service])
+    if service == 'api' and os.environ.get('COMPACTION_EXTRA_API'):
+        print('f' * 64)
     raise SystemExit(0)
 if args[0] == 'inspect':
+    if args[-1] == 'f' * 64:
+        extra = os.environ['COMPACTION_EXTRA_API']
+        print(('False' if extra == 'second-service' else 'True') + '|' +
+              ('exited' if extra == 'exited-oneoff' else 'running') + '|2026-07-30T07:38:34Z')
+        raise SystemExit(0)
     row = load(service_for(args[-1]))
-    print(row['state'] + '|' + row['started'])
+    print('False|' + row['state'] + '|' + row['started'])
     raise SystemExit(0)
 if args[0] in ['stop', 'start']:
     action = args[0]
@@ -3781,6 +3789,29 @@ def test_control_plane_deploy_report_compaction_refuses_unproven_state(tmp_path:
         assert not any(args[0] in ("start", "stop", "exec") for args in _compaction_calls(env))
     else:
         _assert_compaction_restored(env, (True,) * 4)
+
+
+@pytest.mark.parametrize("extra", ["exited-oneoff", "running-oneoff", "second-service"])
+def test_control_plane_deploy_compaction_preserves_existing_lock_and_recovery_container(tmp_path: Path, extra: str) -> None:
+    env = _compaction_harness(tmp_path)
+    env["COMPACTION_EXTRA_API"] = extra
+    lock = Path(env["LOCK_FILE"])
+    lock.touch()
+    lock.chmod(0o400)
+    inode = lock.stat().st_ino
+    try:
+        result = _compact(env, "--execute")
+        assert lock.stat().st_ino == inode
+        assert stat.S_IMODE(lock.stat().st_mode) == 0o400
+    finally:
+        lock.chmod(0o600)
+    if extra == "exited-oneoff":
+        assert result.returncode == 0, result.stderr
+        _assert_compaction_restored(env, (True,) * 4)
+        assert not any(call[0] in ("start", "stop") and call[-1] == "f" * 64 for call in _compaction_calls(env))
+    else:
+        assert result.returncode == 14, result.stderr
+        assert not any(call[0] in ("start", "stop", "exec") for call in _compaction_calls(env))
 
 
 def test_control_plane_deploy_report_compaction_server_run_outlives_observer(tmp_path: Path) -> None:
