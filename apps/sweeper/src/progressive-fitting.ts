@@ -3,6 +3,7 @@ import {
   analysisContentHash,
   claimProgressivePolarFit,
   failProgressivePolarFit,
+  ProgressiveFitPreparationError,
   progressiveEvidencePreservesGeometry,
   SOURCE_GEOMETRY_MESH_VERSION,
   storeProgressivePolarFit,
@@ -10,6 +11,8 @@ import {
   type ProgressiveFitEvidence,
   type ProgressiveFitLease,
 } from "@aerodb/db";
+import type { AttemptEvidenceArchiveReader } from "@aerodb/db/attempt-evidence-reader";
+import { sweeperAttemptArchiveReader } from "./attempt-evidence-consumer-reader";
 import type {
   EngineClient,
   ProgressiveCoefficientVector,
@@ -479,18 +482,26 @@ export async function runProgressiveFitBatch(
   engine: Pick<EngineClient, "fitProgressivePolar">,
   owner: string,
   options: {
+    archiveReader?: AttemptEvidenceArchiveReader;
     requireSweeperEnabled?: boolean;
     requireCfdEvidence?: boolean;
     currentCampaignEvidenceOnly?: boolean;
   } = {},
 ): Promise<{ claimed: number; stored: number; errors: string[] }> {
-  const lease = await claimProgressivePolarFit(db, {
-    owner,
-    leaseSeconds: 180,
-    requireCfdEvidence: options.requireCfdEvidence ?? true,
-    currentCampaignEvidenceOnly: options.currentCampaignEvidenceOnly ?? false,
-    requireSweeperEnabled: options.requireSweeperEnabled ?? true,
-  });
+  let lease: ProgressiveFitLease | null;
+  try {
+    lease = await claimProgressivePolarFit(db, {
+      owner,
+      leaseSeconds: 180,
+      archiveReader: options.archiveReader ?? sweeperAttemptArchiveReader(),
+      requireCfdEvidence: options.requireCfdEvidence ?? true,
+      currentCampaignEvidenceOnly: options.currentCampaignEvidenceOnly ?? false,
+      requireSweeperEnabled: options.requireSweeperEnabled ?? true,
+    });
+  } catch (error) {
+    if (!(error instanceof ProgressiveFitPreparationError)) throw error;
+    return { claimed: 1, stored: 0, errors: [error.message] };
+  }
   if (!lease) return { claimed: 0, stored: 0, errors: [] };
   try {
     const request = buildProgressiveFitRequest(lease);
