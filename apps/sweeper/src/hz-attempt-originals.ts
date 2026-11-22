@@ -134,26 +134,39 @@ export async function originalBinding(db: DB): Promise<SourceBinding> {
 }
 /** HZ proves the producing job, worker registration and immutable submission.
  * The upstream receipt and current selected result are deliberately independent. */
-function workerOwners(keys: SQL, b: SourceBinding, full: boolean) {
-  return sql`SELECT a.id,j.id AS job,pr.id AS promise,intent.assignment_signature AS signature
-   ${full ? sql`,j.request_payload->'remoteProgressiveExecution' AS envelope` : sql``}
- FROM ${keys} k JOIN result_attempts a ON a.id=k.id
- JOIN sim_jobs j ON j.id=a.sim_job_id AND j.engine_job_id=j.id::text AND a.engine_job_id=j.engine_job_id
-   AND j.airfoil_id=a.airfoil_id AND j.simulation_preset_revision_id=a.simulation_preset_revision_id
-   AND j.bc_ids ? a.bc_id::text
- JOIN sync_api_settings cfg ON cfg.id=1 AND cfg.instance_id::text=${b.instance} AND cfg.remote_solver_registered_id=${b.solver}::uuid
-   AND j.request_payload->>'remoteSolver'='true' AND j.request_payload->>'upstreamBaseUrl'=cfg.upstream_base_url
+function workerOwners(
+  keys: SQL,
+  b: SourceBinding,
+  full: boolean,
+  lock = false,
+) {
+  return sql`WITH native AS MATERIALIZED (
+   SELECT a.id,a.airfoil_id,a.simulation_preset_revision_id AS revision,j.id AS job,j.request_payload->>'syncPromiseId' AS promise,
+     j.request_payload->'remoteProgressiveExecution' AS envelope,j.request_payload->>'upstreamBaseUrl' AS upstream,
+     (j.request_payload->>'remoteSolver'='true' AND j.request_payload->'engineRequest'=j.request_payload#>'{remoteProgressiveExecution,request}') AS signed_request
+   FROM ${keys} k JOIN LATERAL (
+     SELECT a.id,a.result_id,a.sim_job_id,a.engine_job_id,a.airfoil_id,a.aoa_deg,a.bc_id,a.simulation_preset_revision_id
+     FROM result_attempts a WHERE a.id=k.id OFFSET 0
+   ) a ON true JOIN LATERAL (
+     SELECT j.id,j.request_payload,j.engine_job_id,j.airfoil_id,j.simulation_preset_revision_id,j.bc_ids FROM sim_jobs j WHERE j.id=a.sim_job_id OFFSET 0
+   ) j ON j.engine_job_id=j.id::text AND a.engine_job_id=j.engine_job_id AND j.airfoil_id=a.airfoil_id
+     AND j.simulation_preset_revision_id=a.simulation_preset_revision_id AND j.bc_ids ? a.bc_id::text
+   WHERE a.result_id IS NULL OR EXISTS(SELECT FROM results r WHERE r.id=a.result_id AND r.airfoil_id=a.airfoil_id
+     AND r.aoa_deg=a.aoa_deg AND r.simulation_preset_revision_id=a.simulation_preset_revision_id))
+ SELECT n.id,n.job,pr.id AS promise,intent.assignment_signature AS signature
+   ${full ? sql`,n.envelope` : sql``}
+ FROM native n JOIN sync_api_settings cfg ON cfg.id=1 AND cfg.instance_id::text=${b.instance}
+   AND cfg.remote_solver_registered_id=${b.solver}::uuid AND n.upstream=cfg.upstream_base_url
  JOIN registered_remote_solvers worker ON worker.id=cfg.remote_solver_registered_id AND worker.instance_id=cfg.instance_id::text AND worker.revoked_at IS NULL
- JOIN sync_sweep_promises pr ON pr.id::text=j.request_payload->>'syncPromiseId' AND pr.registered_solver_id=worker.id
-   AND pr.source_base_url=cfg.upstream_base_url AND pr.airfoil_id=a.airfoil_id AND pr.simulation_preset_revision_id=a.simulation_preset_revision_id
- JOIN progressive_worker_submission_intents intent ON intent.sim_job_id=j.id
-   AND intent.authorization->>'kind'='authorized' AND intent.authorization->>'executionId'=j.id::text
-   AND intent.authorization->>'contentSignature'=intent.assignment_signature AND intent.assignment_signature=j.request_payload#>>'{remoteProgressiveExecution,contentSignature}'
- WHERE j.request_payload#>>'{remoteProgressiveExecution,solverId}'=worker.id::text
-   AND j.request_payload#>>'{remoteProgressiveExecution,promiseId}'=pr.id::text
-   AND j.request_payload#>>'{remoteProgressiveExecution,scope,executionId}'=j.id::text
-   AND j.request_payload->'engineRequest'=j.request_payload#>'{remoteProgressiveExecution,request}'
-   AND (a.result_id IS NULL OR EXISTS(SELECT FROM results r WHERE r.id=a.result_id AND r.airfoil_id=a.airfoil_id AND r.aoa_deg=a.aoa_deg AND r.simulation_preset_revision_id=a.simulation_preset_revision_id))`;
+ JOIN LATERAL (SELECT pr.id,pr.registered_solver_id,pr.source_base_url,pr.airfoil_id,pr.simulation_preset_revision_id
+   FROM sync_sweep_promises pr WHERE pr.id=CASE WHEN n.promise ~ '^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$' THEN n.promise::uuid END
+   OFFSET 0 ${lock ? sql`FOR SHARE NOWAIT` : sql``}) pr ON pr.registered_solver_id=worker.id AND pr.source_base_url=cfg.upstream_base_url
+   AND pr.airfoil_id=n.airfoil_id AND pr.simulation_preset_revision_id=n.revision
+ JOIN progressive_worker_submission_intents intent ON intent.sim_job_id=n.job AND intent.authorization->>'kind'='authorized'
+   AND intent.authorization->>'executionId'=n.job::text AND intent.authorization->>'contentSignature'=intent.assignment_signature
+   AND intent.assignment_signature=n.envelope->>'contentSignature'
+ WHERE n.signed_request AND n.envelope->>'solverId'=worker.id::text AND n.envelope->>'promiseId'=pr.id::text
+   AND n.envelope#>>'{scope,executionId}'=n.job::text`;
 }
 async function checkWorkerOwner(
   db: DB,
@@ -161,9 +174,9 @@ async function checkWorkerOwner(
   p: OriginalPin,
   lock = false,
 ) {
-  const query = workerOwners(sql`(SELECT ${p.id}::uuid AS id)`, b, true);
+  const query = workerOwners(sql`(SELECT ${p.id}::uuid AS id)`, b, true, lock);
   const [owner] = await db.execute(
-    sql`${query} ${lock ? sql`FOR SHARE OF cfg,worker,pr,intent NOWAIT` : sql``}`,
+    sql`${query} ${lock ? sql`FOR SHARE OF cfg,worker,intent NOWAIT` : sql``}`,
   );
   if (!owner || owner.job !== p.job)
     throw Error("Registered worker does not own the producing job");
@@ -184,7 +197,7 @@ export async function inspectOriginals(
   checkOriginalPage(count);
   const keys =
     "ids" in input
-      ? sql`SELECT a.id FROM result_attempts a JOIN jsonb_array_elements_text(${JSON.stringify(input.ids.map(exactId))}::jsonb) k ON a.id=k.value::uuid`
+      ? sql`SELECT a.id FROM result_attempts a JOIN jsonb_array_elements_text(${JSON.stringify(input.ids.map(exactId))}::text::jsonb) k ON a.id=k.value::uuid`
       : sql`SELECT id FROM result_attempts WHERE id>${exactId(input.after)}::uuid AND id<=${exactId(input.high)}::uuid ORDER BY id LIMIT ${input.limit}`;
   // The copy owner is this DB's exact native row. A signed acknowledgment
   // affects priority only. No selection, regime or upstream-result predicate.
@@ -221,7 +234,7 @@ export async function mapOriginals(
   // Match remote and canonical owners independently, even when UUID strings coincide.
   return (await db.execute(sql`SELECT DISTINCT ON(k.id) k.id::text,settings.instance_id::text AS "hubInstance",
   e.result_attempt_id::text AS "hubAttempt",a.result_id::text AS "hubResult",ar.id::text AS "hubArchive",ar.generation
- FROM jsonb_to_recordset(${JSON.stringify(rows)}::jsonb) k(id uuid,result uuid,job uuid,sha text,bytes int,ack jsonb)
+ FROM jsonb_to_recordset(${JSON.stringify(rows)}::text::jsonb) k(id uuid,result uuid,job uuid,sha text,bytes int,ack jsonb)
  JOIN progressive_remote_evidence_receipts e ON e.remote_result_attempt_id=k.id AND e.remote_result_id=k.result AND e.sim_job_id=k.job
  AND e.result_attempt_id::text=k.ack->>'hubAttempt' AND e.sequence::text=k.ack->>'seq' AND e.point_content_signature=k.ack->>'point'
  AND e.storage_only=(k.ack->>'storageOnly')::boolean
