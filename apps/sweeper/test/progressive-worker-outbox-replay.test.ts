@@ -724,7 +724,8 @@ it.each([
   ],
   [
     "multiple job boundaries",
-    sql`UPDATE sim_jobs SET bc_ids=jsonb_build_array(bc_ids->>0,md5('foreign-boundary')::uuid)`,
+    sql`UPDATE sim_jobs SET bc_ids=jsonb_build_array(bc_ids->>0,md5('foreign-boundary')::uuid)
+      WHERE id=(SELECT id FROM replay_target)`,
   ],
   [
     "foreign attempt boundary",
@@ -740,7 +741,8 @@ it.each([
   ],
   [
     "changed request",
-    sql`UPDATE sim_jobs SET request_payload=jsonb_set(request_payload,'{engineRequest,chord_lengths}','[2]'::jsonb)`,
+    sql`UPDATE sim_jobs SET request_payload=jsonb_set(request_payload,'{engineRequest,chord_lengths}','[2]'::jsonb)
+      WHERE id=(SELECT id FROM replay_target)`,
   ],
   [
     "changed authorization",
@@ -810,11 +812,13 @@ it.each([
   ],
   [
     "active ingest claim",
-    sql`UPDATE sim_jobs SET ingest_lease_token=md5('claim'),ingest_lease_expires_at=clock_timestamp()+interval '1 day'`,
+    sql`UPDATE sim_jobs SET ingest_lease_token=md5('claim'),ingest_lease_expires_at=clock_timestamp()+interval '1 day'
+      WHERE id=(SELECT id FROM replay_target)`,
   ],
   [
     "unknown ingest expiry",
-    sql`UPDATE sim_jobs SET ingest_lease_token=md5('claim'),ingest_lease_expires_at=NULL`,
+    sql`UPDATE sim_jobs SET ingest_lease_token=md5('claim'),ingest_lease_expires_at=NULL
+      WHERE id=(SELECT id FROM replay_target)`,
   ],
   [
     "report conflict",

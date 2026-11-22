@@ -3,6 +3,7 @@ import { configuredDeploymentRole, makeReportStorageDatabase } from "./config";
 import {
   runProgressiveReportArchiveService,
   runDuplicateReportCleanup,
+  runNativeWorkerReportSharing,
 } from "./progressive-report-archive-service";
 import { runSolverHistoryStorageService } from "./solver-history-service";
 import { runResultHistoryStorageService } from "./result-history-service";
@@ -34,6 +35,7 @@ try {
   const work = [runProgressiveReportArchiveService(client.db, stop.signal)];
   if (configuredDeploymentRole() === "remote-solver") {
     work.push(runDuplicateReportCleanup(client.db, stop.signal));
+    work.push(runNativeWorkerReportSharing(client.db, stop.signal));
     work.push(runWorkerVolumeCleanup(client.db, stop.signal));
   } else {
     work.push(runSolverHistoryStorageService(client.db, stop.signal));
