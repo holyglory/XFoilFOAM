@@ -143,3 +143,24 @@ the surviving images again before completing its durable receipt. A separate
 read-only pass verifies the served bytes, point evidence and legends after
 commit. The file allocation in the proof is gross; the completed receipt also
 measures the filesystem allocation occupied by the durable controls.
+
+## Follow a raw-file inventory with a media inventory
+
+On the trusted controller, `scripts/deploy/hz-closed-job-media-queue.py CONFIG --sha256 DIGEST`
+runs the two frozen operators in one supervised process. The private configuration
+pins the original inventory, manifest, operator checkout and runtime proof,
+and separately pins the media roster, keep-media checkout and successful media
+canary verification. Individual media rows identify their exact job, expected
+attempt count, media IDs and signed objects. Measured rows also carry the
+native plan digest, file count, logical bytes and allocated bytes.
+
+The controller can process one explicitly named, measured media job in a
+vacant slot. It then runs the original inventory command against its existing
+checkpoints. The remaining media jobs run only after every original row has
+a terminal receipt. The media operator takes the original inventory lock,
+requalifies its canary, and obtains a fresh proof and generation-pinned read
+for each named job. A successful proof is persisted before applying its exact
+plan. A lost response is recovered by a read-only verification of that plan.
+Transport faults keep their pending receipts. Individual proof refusals are
+recorded and the next media row can proceed. The same supervisor controls
+quiescence and recovery for both inventories.
