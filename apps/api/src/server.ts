@@ -1,3 +1,4 @@
+import type { PublicPointReader } from "./public-point-reader";
 import cookie from "@fastify/cookie";
 import cors from "@fastify/cors";
 import multipart from "@fastify/multipart";
@@ -25,7 +26,7 @@ import {
   SYNC_POLAR_MULTIPART_MANIFEST_PARSER_BYTES,
 } from "./sync-upload-limits";
 
-export async function buildServer(): Promise<FastifyInstance> {
+export async function buildServer(publicPoints?: PublicPointReader): Promise<FastifyInstance> {
   const app = Fastify({ logger: { level: process.env.LOG_LEVEL ?? "info" } });
   const evidenceUploadReconciler = createBrokeredEvidenceUploadReconciler(syncDb, {
     onError: (error) =>
@@ -64,7 +65,11 @@ export async function buildServer(): Promise<FastifyInstance> {
       fieldSize: SYNC_POLAR_MULTIPART_MANIFEST_PARSER_BYTES,
     },
   });
-  await registerRoutes(app);
+  if (publicPoints) {
+    app.addHook("onReady", async () => publicPoints.start());
+    app.addHook("onClose", async () => publicPoints.close());
+  }
+  await registerRoutes(app, publicPoints);
   await registerSyncRoutes(app);
   await registerAdminRoutes(app);
   await registerSolvedPointsRoutes(app);

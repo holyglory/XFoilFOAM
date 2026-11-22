@@ -1,3 +1,4 @@
+import { pointStage } from "./public-point-timing";
 import type { DB } from "@aerodb/db/client";
 import type { AttemptEvidenceReadRow } from "@aerodb/db/attempt-evidence-reader";
 import { readPublicAttemptFields } from "@aerodb/db/public-attempt-fields";
@@ -33,17 +34,20 @@ export async function readSelectedAttemptDetailFields(
       const hit = fields.get(attempt.id);
       if (hit) return hit;
     }
-    const full = await readStoredAttemptEvidence(
-      db,
-      {
-        id: attempt.id,
-        resultId: attempt.resultId,
-        simJobId: attempt.simJobId,
-        evidenceArchiveId: attempt.evidenceArchiveId,
-        evidenceStorageEventId: attempt.evidenceStorageEventId,
-        evidencePayload: null,
-      },
-      { signal, requireArchiveRead: true },
+    const full = await pointStage(
+      "fullOriginal",
+      readStoredAttemptEvidence(
+        db,
+        {
+          id: attempt.id,
+          resultId: attempt.resultId,
+          simJobId: attempt.simJobId,
+          evidenceArchiveId: attempt.evidenceArchiveId,
+          evidenceStorageEventId: attempt.evidenceStorageEventId,
+          evidencePayload: null,
+        },
+        { signal, requireArchiveRead: true },
+      ),
     );
     return payloadObject(full.evidencePayload);
   }

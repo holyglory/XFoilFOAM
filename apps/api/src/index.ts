@@ -1,10 +1,11 @@
+import { PublicPointReader } from "./public-point-reader";
 import { env } from "./env";
 import { installApiReportArchiveReader } from "./progressive-report-archive-reader";
 import { closeDatabasePools } from "./db";
 import { buildServer } from "./server";
 
 await installApiReportArchiveReader();
-const app = await buildServer();
+const app = await buildServer(new PublicPointReader());
 try {
   await app.listen({ port: env.port, host: env.host });
 } catch (err) {
