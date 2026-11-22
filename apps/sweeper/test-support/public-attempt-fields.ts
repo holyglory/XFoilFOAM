@@ -1,10 +1,12 @@
 import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { sql } from "drizzle-orm";
+import type { DB } from "@aerodb/db/client";
 import { expect, vi } from "vitest";
 import type { ResultHistoryArchiveStore } from "@aerodb/core/result-history-storage";
 import {
   readPublicAttemptFields,
+  inlinePublicAttemptFieldsSql,
   type PublicAttemptFieldOwner,
 } from "@aerodb/db/public-attempt-fields";
 import { enableVerifiedAttemptPolicy } from "@aerodb/db/attempt-evidence-verified-policy";
@@ -59,8 +61,13 @@ export async function verifyPublicAttemptFieldSources(
         typeof AttemptEvidenceStore
       >[0],
     );
-    const periodic = periodicPoint(0,5,true);
-    const point = {...periodic, frame_track:null, frameTrack:periodic.frame_track, fidelity:"urans_full" as const};
+    const periodic = periodicPoint(0, 5, true);
+    const point = {
+      ...periodic,
+      frame_track: null,
+      frameTrack: periodic.frame_track,
+      fidelity: "urans_full" as const,
+    };
     const source = await seedInlineSettledHistory(db, { uransPoint: point });
     const { attemptId, resultId, jobId } = source;
     // Both spellings and a real JSON null must survive independently, including PG decimal scale.
@@ -70,6 +77,15 @@ export async function verifyPublicAttemptFieldSources(
       sql`SELECT evidence_payload::text AS text FROM result_attempts WHERE id=${attemptId}::uuid`,
     );
     const full = JSON.parse(String(before.text));
+    const projectedInline = (id: string) =>
+      db.execute(sql`SELECT
+      ${inlinePublicAttemptFieldsSql(sql`a.evidence_payload`, sql`a.evidence_archive_id`)} AS fields
+      FROM result_attempts a WHERE a.id=${id}::uuid`);
+    expect((await projectedInline(attemptId))[0].fields).toEqual({
+      frame_track: null,
+      frameTrack: full.frameTrack,
+      fidelity: full.fidelity,
+    });
     const { archive } = await archiveAttemptEvidence(db, store, {
       attemptId,
       bucket: "fixture",
@@ -103,6 +119,7 @@ export async function verifyPublicAttemptFieldSources(
     const read = vi.fn(historyStore.read.bind(historyStore));
     const lookup = (owners = [owner]) =>
       readPublicAttemptFields(db, owners, { read });
+    expect((await projectedInline(attemptId))[0].fields).toBeNull();
     const expected = {
       frame_track: null,
       frameTrack: full.frameTrack,
@@ -168,18 +185,126 @@ export async function verifyPublicAttemptFieldSources(
     expect(
       (await lookup([{ ...owner, evidenceStorageEventId: randomUUID() }])).size,
     ).toBe(0);
-    await db.execute(
-      sql`DELETE FROM progressive_cfd_evidence WHERE result_attempt_id=${attemptId}::uuid`,
-    );
-    expect((await lookup()).has(attemptId)).toBe(false);
-    // The archive and old event remain real, but a restored attempt cannot be read through the stale pointer.
-    await restoreAttemptEvidence(
+    const steady = await seedInlineSettledHistory(db);
+    const [originalSteady] = await projectedInline(steady.attemptId);
+    expect(Object.keys(originalSteady.fields as object).sort()).toEqual([
+      "fidelity",
+      "steady_history",
+    ]);
+    await bindScientificReceipt(db, steady);
+    await db.execute(sql`UPDATE results r SET steady_history=a.evidence_payload->'steady_history' FROM result_attempts a
+      WHERE a.id=${steady.attemptId}::uuid AND r.id=a.result_id`);
+    const steadyCopy = (
+      await archiveAttemptEvidence(db, store, {
+        attemptId: steady.attemptId,
+        bucket: "fixture",
+        sourceInstance: "hub",
+      })
+    ).archive;
+    await settleAttemptEvidenceHistory(
       db,
-      attemptId,
-      archive.id,
-      String(before.text),
-      "public field regression restore",
+      verifiedAttemptTestDependencies(db, {
+        ...steady,
+        archive: steadyCopy,
+        store,
+        memory,
+      }),
+      { attemptId: steady.attemptId, archiveId: steadyCopy.id },
     );
+    const [steadyEvent] = await db.execute(
+      sql`SELECT evidence_storage_event_id AS id FROM result_attempts WHERE id=${steady.attemptId}::uuid`,
+    );
+    const steadyOwner = {
+      id: steady.attemptId,
+      resultId: steady.resultId,
+      simJobId: steady.jobId,
+      evidenceArchiveId: steadyCopy.id,
+      evidenceStorageEventId: String(steadyEvent.id),
+    };
+    // Even identical inline bytes at a different selected generation have no authority for this attempt.
+    await db.execute(
+      sql`UPDATE results SET current_result_attempt_id=NULL WHERE id=${steady.resultId}::uuid`,
+    );
+    const mixed = await readPublicAttemptFields(db, [owner, steadyOwner], {
+      read,
+    });
+    expect(mixed.get(attemptId)).toEqual(expected);
+    expect(mixed.has(steady.attemptId)).toBe(false);
+    await db.execute(
+      sql`UPDATE results SET current_result_attempt_id=${steady.attemptId}::uuid WHERE id=${steady.resultId}::uuid`,
+    );
+    expect(
+      (
+        await archiveResultHistory(db, historyStore, {
+          resultId: steady.resultId,
+          sourceKind: "steady_history",
+          bucket: "fixture",
+          sourceInstance: "hub",
+        })
+      ).offloaded,
+    ).toBe(true);
+    expect(
+      (await readPublicAttemptFields(db, [steadyOwner], { read })).get(
+        steady.attemptId,
+      ),
+    ).toEqual(originalSteady.fields);
+    expect(read.mock.lastCall![0].sourceKind).toBe("steady_history");
+
+    const rollback = new Error("rollback field proof control");
+    await expect(
+      db.transaction(async (tx) => {
+        await tx.execute(
+          sql`DELETE FROM progressive_cfd_evidence WHERE result_attempt_id=${attemptId}::uuid`,
+        );
+        expect(
+          (
+            await readPublicAttemptFields(
+              tx as unknown as DB,
+              [owner],
+              { read },
+              ["fidelity"],
+            )
+          ).size,
+        ).toBe(0);
+        throw rollback;
+      }),
+    ).rejects.toBe(rollback);
+    await db.transaction(async (tx) => {
+      await tx.execute(
+        sql`CREATE TEMP TABLE result_attempts ON COMMIT DROP AS SELECT * FROM ${sql.identifier(fixture.namespace)}.result_attempts WHERE id=${attemptId}::uuid`,
+      );
+      await tx.execute(
+        sql`SET LOCAL search_path=pg_temp,${sql.identifier(fixture.namespace)},public`,
+      );
+      await tx.execute(
+        sql`UPDATE pg_temp.result_attempts SET evidence_payload=evidence_payload||'{"fidelity":"stale"}'::jsonb`,
+      );
+      expect(
+        (
+          await readPublicAttemptFields(
+            tx as unknown as DB,
+            [owner],
+            { read },
+            ["fidelity"],
+          )
+        ).size,
+      ).toBe(0);
+    });
+    let restoredDuringRead = false;
+    read.mockImplementationOnce(async (identity) => {
+      const envelope = await historyStore.read(identity);
+      await restoreAttemptEvidence(
+        db,
+        attemptId,
+        archive.id,
+        String(before.text),
+        "public field regression restore",
+      );
+      restoredDuringRead = true;
+      return envelope;
+    });
+    expect((await lookup()).has(attemptId)).toBe(false);
+    expect(restoredDuringRead).toBe(true);
     expect((await lookup()).has(attemptId)).toBe(false);
   } finally {
     env.evidenceBucket = priorBucket;
