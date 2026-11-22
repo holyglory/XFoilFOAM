@@ -54,6 +54,10 @@ def run_engine(scope, packet, source, settings):
             (scope["mode"] == "reclaim" and plan == scope["plan"] and plan is not None and req["step"] == 2),
             "operation differs from the authorized plan")
     manifests, readbacks = req["manifests"], req["readbacks"]
+    keep_media = scope.get("keepMedia") is True
+    require((req.get("keepMedia") is True) == keep_media and
+            all(("keepMedia" in manifest) == keep_media for manifest in manifests),
+            "media keep-set differs from the explicitly named operation")
     require(isinstance(manifests, list) and 1 <= len(manifests) <= 256 and
             isinstance(readbacks, list) and len(readbacks) <= 256, "invalid custody inventory")
     for m in manifests:

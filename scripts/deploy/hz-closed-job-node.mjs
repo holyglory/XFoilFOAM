@@ -137,7 +137,12 @@ async function run() {
         [scope.id],
       );
       if (prior?.receipt?.complete === true) {
-        if (prior.receipt.planSha256 !== scope.plan)
+        if (
+          prior.receipt.planSha256 !== scope.plan ||
+          Boolean(prior.receipt.mediaSha256) !== Boolean(scope.keepMedia) ||
+          (scope.expectedMedia &&
+            scope.expectedMedia !== prior.receipt.mediaSha256)
+        )
           throw Error("A different plan is already complete");
         return {
           status: "already-settled",
@@ -169,6 +174,7 @@ async function run() {
           id,
           step,
           helper: scope.helper,
+          ...(scope.keepMedia ? { keepMedia: true } : {}),
           mode: scope.mode,
           manifests,
           expectedPlan,
@@ -211,6 +217,8 @@ async function run() {
         expectedPlan: scope.plan ?? undefined,
         verifyCompleted: scope.mode === "verify",
         expectedScientificSha256: scope.expectedScience ?? undefined,
+        keepMedia: scope.keepMedia === true,
+        expectedMediaSha256: scope.expectedMedia ?? undefined,
         signal: AbortSignal.timeout(20 * 60_000),
       },
     );

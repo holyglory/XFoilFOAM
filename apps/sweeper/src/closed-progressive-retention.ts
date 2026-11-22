@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { EngineError } from "@aerodb/engine-client";
 import { canonicalRemoteHubBaseUrl } from "@aerodb/core";
 import {
+  canonicalAnalysisJson,
   verifyProgressiveEvidenceCustodyReceipt,
   type DB,
   type ProgressiveEvidenceCustodyReceipt,
@@ -17,6 +18,7 @@ export interface ClosedProgressiveManifest {
   brokeredUploadId: string;
   generation: string;
   receiptHmac: string;
+  keepMedia?: KeptImage[];
 }
 
 export interface ClosedProgressiveReadback {
@@ -31,6 +33,9 @@ export interface ClosedProgressiveReclaimResponse {
   job_id: string;
   state: "absent" | "planned" | "reclaimed";
   replayed?: boolean;
+  mediaFiles?: MediaFile[];
+  workingPaths?: string[];
+  plannedAllocatedBytes?: number;
   allocation?: {
     fileAllocatedBytes: number;
     netAttributedAllocatedBytes?: number;
@@ -50,8 +55,265 @@ export interface ClosedProgressiveBackend {
   ): Promise<ClosedProgressiveReclaimResponse>;
 }
 
+type KeptImage = {
+  id: string;
+  resultId: string;
+  attemptId: string;
+  slug: string;
+  path: string;
+  field: string;
+  evidenceSha256: string;
+  sha256: string;
+  byteSize: number;
+  rowSha256: string;
+  engineUrl: string | null;
+  legend: Record<string, unknown> | null;
+};
+type MediaFile = { path: string; sha256: string; byteSize: number };
+
+function unaccountedMedia(media: readonly KeptImage[]) {
+  return media.length
+    ? sql`AND m.id NOT IN (${sql.join(
+        media.map((m) => sql`${m.id}::uuid`),
+        sql`,`,
+      )})`
+    : sql``;
+}
+
+// A named keep-set covers both attempt-owned rows and paths below the job, including rows with broken ownership.
+// The ordinary scanner never supplies an exemption.
+async function registeredImages(
+  db: DB,
+  jobId: string,
+  lock: boolean,
+): Promise<KeptImage[]> {
+  const prefix = `jobs/${jobId}/`;
+  const owned = sql`(SELECT id FROM result_attempts WHERE sim_job_id=${jobId}::uuid OR engine_job_id=${jobId})`;
+  const selected = sql`(m.result_attempt_id IN ${owned} OR m.storage_key LIKE ${prefix + "%"})`;
+  if (lock) {
+    await db.execute(
+      sql`SELECT r.id FROM results r WHERE r.id IN (SELECT result_id FROM result_attempts WHERE id IN ${owned}) ORDER BY r.id FOR UPDATE`,
+    );
+    await db.execute(
+      sql`SELECT a.id FROM result_attempts a WHERE a.id IN ${owned} ORDER BY a.id FOR UPDATE`,
+    );
+    await db.execute(
+      sql`SELECT m.id FROM result_media m WHERE ${selected} ORDER BY m.id FOR SHARE`,
+    );
+    await db.execute(
+      sql`SELECT s.id FROM field_color_scales s WHERE s.id IN (SELECT m.color_scale_id FROM result_media m WHERE ${selected}) ORDER BY s.id FOR SHARE`,
+    );
+  }
+  const rows =
+    await db.execute(sql`SELECT m.id,m.result_id AS "resultId",m.result_attempt_id AS "attemptId",f.slug, m.engine_url AS "engineUrl",
+    substring(m.storage_key from ${prefix.length + 1}::int) AS path,m.field,m.sha256,m.byte_size::float8 AS "byteSize",m.evidence_sha256 AS "evidenceSha256",
+    encode(sha256(convert_to(to_jsonb(m)::text,'UTF8')),'hex') AS "rowSha256",
+    CASE WHEN s.id IS NOT NULL THEN jsonb_build_object('mode','track','vmin',coalesce(m.scale_vmin,s.vmin),'vmax',coalesce(m.scale_vmax,s.vmax),
+      'policy',coalesce(m.scale_policy,s.scale_policy),'version',coalesce(m.color_scale_version,s.version),'status',s.status) END AS legend,
+    (a.sim_job_id=${jobId}::uuid AND a.engine_job_id=${jobId} AND a.result_id=m.result_id AND a.regime='rans' AND r.current_result_attempt_id=a.id
+     AND m.storage_key LIKE ${prefix + "%"} AND m.kind='image' AND m.role='instantaneous' AND m.mime_type='image/png'
+     AND m.sha256~'^[a-f0-9]{64}$' AND m.byte_size>0 AND m.evidence_sha256~'^[a-f0-9]{64}$' AND m.field IS NOT NULL AND f.slug IS NOT NULL
+     AND NOT EXISTS(SELECT 1 FROM result_media_storage_bindings b WHERE b.result_media_id=m.id)
+     AND NOT EXISTS(SELECT 1 FROM result_media_storage_uploads u WHERE u.result_media_id=m.id)) AS ok
+    FROM result_media m LEFT JOIN result_attempts a ON a.id=m.result_attempt_id LEFT JOIN results r ON r.id=m.result_id
+    LEFT JOIN airfoils f ON f.id=a.airfoil_id LEFT JOIN field_color_scales s ON s.id=m.color_scale_id WHERE ${selected} ORDER BY m.id LIMIT 257`);
+  if (!rows.length || rows.length > 256 || rows.some((r) => r.ok !== true))
+    throw Error(
+      "Keep-set requires a bounded inventory of exact current-job instantaneous PNG rows",
+    );
+  return rows.map(({ ok, ...r }) => r as unknown as KeptImage);
+}
+
+async function assertWorkingPathsUnreferenced(
+  db: DB,
+  id: string,
+  paths: readonly string[],
+) {
+  if (!paths.length) return;
+  if (
+    paths.length > 4096 ||
+    paths.some(
+      (p) =>
+        !p.startsWith("cases/") ||
+        p.split("/").some((s) => !s || s === "." || s === ".."),
+    )
+  )
+    throw Error("Invalid candidate working paths");
+  const keys = sql`(${sql.join(
+    paths.map((p) => sql`${`jobs/${id}/${p}`}`),
+    sql`,`,
+  )})`;
+  const [row] =
+    await db.execute(sql`SELECT EXISTS (SELECT 1 FROM result_media WHERE storage_key IN ${keys})
+    OR EXISTS(SELECT 1 FROM solver_evidence_artifacts WHERE storage_key IN ${keys})
+    OR EXISTS(SELECT 1 FROM field_render_cache WHERE storage_key IN ${keys})
+    OR EXISTS(SELECT 1 FROM remote_asset_references WHERE local_storage_key IN ${keys} OR cached_storage_key IN ${keys}) AS referenced`);
+  if (row?.referenced !== false)
+    throw Error(
+      "A proposed working file still has a live artifact or media path reference",
+    );
+}
+
+async function readPng(url: URL, file: MediaFile, signal: AbortSignal) {
+  const r = await fetch(url, {
+    signal,
+    redirect: "error",
+    headers: { accept: "image/png", "accept-encoding": "identity" },
+  });
+  if (
+    !r.ok ||
+    !r.body ||
+    r.headers.get("content-type")?.split(";")[0] !== "image/png" ||
+    Number(r.headers.get("content-length")) !== file.byteSize
+  ) {
+    await r.body?.cancel();
+    throw Error("Existing image route did not return its stored PNG identity");
+  }
+  let length = 0;
+  const hash = createHash("sha256");
+  for await (const bytes of r.body as unknown as AsyncIterable<Uint8Array>) {
+    length += bytes.length;
+    if (length > file.byteSize) throw Error("Image exceeded its stored size");
+    hash.update(bytes);
+  }
+  if (length !== file.byteSize || hash.digest("hex") !== file.sha256)
+    throw Error("Existing image route returned different bytes");
+}
+
+async function readKeptMedia(
+  id: string,
+  media: KeptImage[],
+  plan: ClosedProgressiveReclaimResponse,
+  signal: AbortSignal,
+) {
+  if (
+    !plan.mediaFiles?.length ||
+    plan.mediaFiles.length > 512 ||
+    !Array.isArray(plan.workingPaths) ||
+    plan.workingPaths.length !== plan.files
+  )
+    throw Error(
+      "Native peer omitted the protected image or working-file inventory",
+    );
+  const expectedPaths = new Set<string>();
+  for (const row of media) {
+    const suffix = "/evidence/scaled_media/";
+    const prefixLength = row.path.lastIndexOf(suffix);
+    if (prefixLength < 0)
+      throw Error(
+        "Registered image is outside a signed scaled-media directory",
+      );
+    expectedPaths.add(row.path);
+    expectedPaths.add(
+      row.path.slice(0, prefixLength) + "/images/" + row.field + ".png",
+    );
+  }
+  if (
+    expectedPaths.size !== 2 * media.length ||
+    plan.mediaFiles.length !== expectedPaths.size ||
+    plan.mediaFiles.some((file) => !expectedPaths.has(file.path)) ||
+    new Set(plan.workingPaths).size !== plan.files ||
+    plan.workingPaths.some((path) => expectedPaths.has(path))
+  )
+    throw Error(
+      "Protected image/working-file inventory is incomplete or overlaps",
+    );
+  const api = "http://node-api:4000";
+  const engine = new URL(process.env.ENGINE_URL ?? "http://api:8000");
+  const files = new Map<string, MediaFile>();
+  for (const f of plan.mediaFiles) {
+    if (
+      files.has(f.path) ||
+      !f.path.startsWith("cases/") ||
+      f.path.split("/").some((s) => !s || s === "." || s === "..") ||
+      !/^[a-f0-9]{64}$/.test(f.sha256) ||
+      !Number.isSafeInteger(f.byteSize) ||
+      f.byteSize <= 0
+    )
+      throw Error("Invalid protected native image identity");
+    files.set(f.path, f);
+    const path = f.path.split("/").map(encodeURIComponent).join("/");
+    await readPng(new URL(`/jobs/${id}/files/${path}`, engine), f, signal);
+    await readPng(new URL(`/api/media/jobs/${id}/${path}`, api), f, signal);
+  }
+  const results = new Map<
+    string,
+    Record<
+      string,
+      { kind?: string; url?: string; imageUrl?: string; scale?: unknown }
+    >
+  >();
+  for (const m of media) {
+    const file = files.get(m.path);
+    if (!file || m.sha256 !== file.sha256 || m.byteSize !== file.byteSize)
+      throw Error("Database and native image inventories differ");
+    if (m.engineUrl) {
+      const expected = new URL(
+        `/jobs/${id}/files/${m.path.split("/").map(encodeURIComponent).join("/")}`,
+        engine,
+      );
+      if (new URL(m.engineUrl).href !== expected.href)
+        throw Error(
+          "Stored engine media URL differs from the verified file path",
+        );
+    }
+    const stable = `/api/result-media/${m.id}`;
+    await readPng(new URL(stable, api), file, signal);
+    let displayed = results.get(m.resultId);
+    if (!displayed) {
+      const r = await fetch(
+        new URL(
+          `/api/airfoils/${encodeURIComponent(m.slug)}/sim?resultId=${m.resultId}`,
+          api,
+        ),
+        { signal, redirect: "error" },
+      );
+      if (!r.ok) {
+        await r.body?.cancel();
+        throw Error("Stored point detail is unavailable");
+      }
+      if (!r.body) throw Error("Stored point detail has no body");
+      const parts: Uint8Array[] = [];
+      let size = 0;
+      for await (const part of r.body as unknown as AsyncIterable<Uint8Array>) {
+        size += part.length;
+        if (size > 2 * 1024 ** 2)
+          throw Error(
+            "Stored point detail exceeded the media-proof byte bound",
+          );
+        parts.push(part);
+      }
+      const sim = JSON.parse(Buffer.concat(parts).toString("utf8")) as {
+        resultId: string;
+        media: NonNullable<typeof displayed>;
+      };
+      if (sim.resultId !== m.resultId || !sim.media)
+        throw Error("Stored point detail changed owner or lost media");
+      displayed = sim.media;
+      results.set(m.resultId, displayed);
+    }
+    const entry = displayed[m.field];
+    if (
+      !entry ||
+      entry.kind !== "image" ||
+      (entry.url !== stable && entry.imageUrl !== stable) ||
+      canonicalAnalysisJson(entry.scale ?? null) !==
+        canonicalAnalysisJson(m.legend)
+    )
+      throw Error("Displayed media link or color legend changed");
+  }
+  return createHash("sha256")
+    .update(canonicalAnalysisJson({ media, files: plan.mediaFiles }))
+    .digest("hex");
+}
+
 const LIVE = sql`('pending','submitted','running','ingesting')`;
-function eligible(now: Date, ageMs: number, completedPlan?: string) {
+function eligible(
+  now: Date,
+  ageMs: number,
+  completedPlan?: string,
+  media: KeptImage[] = [],
+) {
   return sql`j.status IN ('done','failed','cancelled') AND j.engine_job_id=j.id::text
     AND j.request_payload ? 'remoteProgressiveExecution' AND j.stripped_at IS NULL
     AND ${
@@ -82,7 +344,7 @@ function eligible(now: Date, ageMs: number, completedPlan?: string) {
       LEFT JOIN result_media_storage_bindings b ON b.result_media_id=m.id
       LEFT JOIN result_media_blobs blob ON blob.id=b.blob_id AND blob.backend='gcs' AND blob."verifiedAt" IS NOT NULL
        AND b.local_storage_key=m.storage_key AND blob.sha256=m.sha256 AND blob.byte_size=m.byte_size AND blob.mime_type=m.mime_type
-      WHERE (a.sim_job_id=j.id OR a.engine_job_id=j.engine_job_id) AND blob.id IS NULL)`;
+      WHERE (a.sim_job_id=j.id OR a.engine_job_id=j.engine_job_id) AND blob.id IS NULL ${unaccountedMedia(media)})`;
 }
 
 type ScientificPoint = {
@@ -104,13 +366,13 @@ type Archive = {
   manifest: ClosedProgressiveManifest;
   remote: ProgressiveEvidenceCustodyReceipt["remote"];
 };
-async function proofs(db: DB, jobId: string) {
+async function proofs(db: DB, jobId: string, media: KeptImage[] = []) {
   const prefix = `jobs/${jobId}/`;
   const [unprotected] = await db.execute(sql`SELECT EXISTS (
     SELECT 1 FROM result_media m LEFT JOIN result_media_storage_bindings b ON b.result_media_id=m.id AND b.local_storage_key=m.storage_key
     LEFT JOIN result_media_blobs blob ON blob.id=b.blob_id AND blob.backend='gcs' AND blob."verifiedAt" IS NOT NULL
       AND blob.sha256=m.sha256 AND blob.byte_size=m.byte_size AND blob.mime_type=m.mime_type
-    WHERE m.storage_key LIKE ${prefix + "%"} AND blob.id IS NULL
+    WHERE m.storage_key LIKE ${prefix + "%"} AND blob.id IS NULL ${unaccountedMedia(media)}
   ) OR EXISTS(SELECT 1 FROM solver_evidence_incomplete_quarantines WHERE engine_job_id=${jobId})
     OR EXISTS(SELECT 1 FROM solver_evidence_orphan_quarantines WHERE engine_job_id=${jobId}) AS blocked`);
   if (unprotected?.blocked !== false)
@@ -219,6 +481,18 @@ async function proofs(db: DB, jobId: string) {
       throw new Error(
         "Job point differs from its exact hub, manifest or archive owner",
       );
+    const kept = media.filter((m) => m.attemptId === row.id);
+    if (
+      media.length &&
+      (!kept.length ||
+        kept.some(
+          (m) =>
+            m.resultId !== row.result_id ||
+            m.evidenceSha256 !== receipt.remote.manifestSha256 ||
+            !m.path.startsWith(directory + "/scaled_media/"),
+        ))
+    )
+      throw Error("Kept images differ from the exact signed point owner");
     return {
       point: {
         attemptId: String(row.id),
@@ -239,6 +513,7 @@ async function proofs(db: DB, jobId: string) {
       manifest: {
         directory,
         catalogSha256: row.catalog_sha,
+        ...(media.length ? { keepMedia: kept } : {}),
         manifestSha256: receipt.remote.manifestSha256,
         manifestByteSize: receipt.remote.manifestByteSize,
         brokeredUploadId: receipt.brokeredUploadId,
@@ -251,7 +526,12 @@ async function proofs(db: DB, jobId: string) {
     new Set(archives.map((a) => a.manifest.directory)).size !== archives.length
   )
     throw new Error("Ambiguous job manifest ownership");
-  return { archives, base, token: settings.token };
+  if (
+    archives.reduce((n, a) => n + (a.manifest.keepMedia?.length ?? 0), 0) !==
+    media.length
+  )
+    throw Error("Kept media owner missing from archive set");
+  return { archives, base, token: settings.token, media };
 }
 
 function checkReceipt(
@@ -286,9 +566,11 @@ async function record(
   verifiedArchives = 0,
   scientificSha256: string | null = null,
   allocation: ClosedProgressiveReclaimResponse["allocation"] = null,
+  mediaSha256?: string,
 ) {
   await db.execute(sql`UPDATE sim_jobs SET strip_report=jsonb_set(coalesce(strip_report,'{}'::jsonb),'{closedProgressiveFiles}',
-    jsonb_build_object('checkedAt',clock_timestamp(),'complete',${complete}::boolean,'retryAfter',CASE WHEN ${complete}::boolean THEN NULL ELSE clock_timestamp()+interval '5 minutes' END,'outcome',${outcome}::text,'bytes',${bytes}::bigint,'files',${files}::int,'planSha256',${planSha256}::text,'verifiedArchives',${verifiedArchives}::int,'scientificSha256',${scientificSha256}::text,'allocation',${JSON.stringify(allocation ?? null)}::jsonb))
+    jsonb_build_object('checkedAt',clock_timestamp(),'complete',${complete}::boolean,'retryAfter',CASE WHEN ${complete}::boolean THEN NULL ELSE clock_timestamp()+interval '5 minutes' END,'outcome',${outcome}::text,'bytes',${bytes}::bigint,'files',${files}::int,'planSha256',${planSha256}::text,'verifiedArchives',${verifiedArchives}::int,'scientificSha256',${scientificSha256}::text,'allocation',${JSON.stringify(allocation ?? null)}::jsonb)
+    || ${mediaSha256 ? sql`jsonb_build_object('mediaSha256',${mediaSha256}::text)` : sql`'{}'::jsonb`})
     WHERE id=${id}::uuid AND stripped_at IS NULL AND strip_report#>>'{closedProgressiveFiles,complete}' IS DISTINCT FROM 'true'`);
 }
 
@@ -303,6 +585,8 @@ export async function closedProgressiveJob(
     inspect?: boolean;
     verifyCompleted?: boolean;
     expectedScientificSha256?: string;
+    keepMedia?: boolean;
+    expectedMediaSha256?: string;
     expectedPlan?: string;
     signal?: AbortSignal;
   },
@@ -315,14 +599,17 @@ export async function closedProgressiveJob(
     await tx.execute(
       sql`SELECT set_config('statement_timeout',${String(timeoutMs)},true),set_config('lock_timeout','500ms',true)`,
     );
+    const media = options.keepMedia
+      ? await registeredImages(tx, id, false)
+      : [];
     const [ready] = await tx.execute(
-      sql`SELECT j.id FROM sim_jobs j WHERE j.id=${id}::uuid AND ${eligible(now, ageMs, options.verifyCompleted ? options.expectedPlan : undefined)}`,
+      sql`SELECT j.id FROM sim_jobs j WHERE j.id=${id}::uuid AND ${eligible(now, ageMs, options.verifyCompleted ? options.expectedPlan : undefined, media)}`,
     );
     if (!ready)
       throw new Error(
         "Job has active ownership, a retention refusal, unbound media or an existing completion",
       );
-    return proofs(tx, id);
+    return proofs(tx, id, media);
   });
   const manifests = source.archives.map((a) => a.manifest);
   const plan = await engine.reclaimClosedProgressiveFiles(id, manifests);
@@ -342,6 +629,21 @@ export async function closedProgressiveJob(
     options.expectedScientificSha256 !== scientificSha256
   )
     throw new Error("Scientific point evidence differs from the pinned proof");
+  let mediaSha256: string | undefined;
+  if (options.keepMedia) {
+    await assertWorkingPathsUnreferenced(db, id, plan.workingPaths ?? []);
+    mediaSha256 = await readKeptMedia(
+      id,
+      source.media,
+      plan,
+      options.signal ?? AbortSignal.timeout(120_000),
+    );
+    if (
+      options.expectedMediaSha256 &&
+      options.expectedMediaSha256 !== mediaSha256
+    )
+      throw Error("Kept media differ from the pinned proof");
+  }
   const readbacks: ClosedProgressiveReadback[] = [];
   if (plan.state !== "absent" && plan.files) {
     const signal = options.signal ?? AbortSignal.timeout(20 * 60_000);
@@ -366,7 +668,14 @@ export async function closedProgressiveJob(
     }
   }
   if (options.inspect)
-    return { plan, readbacks, points, scientificSha256, settled: false };
+    return {
+      plan,
+      readbacks,
+      points,
+      scientificSha256,
+      ...(mediaSha256 ? { mediaSha256, keptMediaRows: source.media } : {}),
+      settled: false,
+    };
   let allocation: ClosedProgressiveReclaimResponse["allocation"] = null;
   options.signal?.throwIfAborted();
   const settled = await db.transaction(async (raw) => {
@@ -378,11 +687,14 @@ export async function closedProgressiveJob(
       sql`SELECT id FROM sim_jobs WHERE id=${id}::uuid FOR UPDATE SKIP LOCKED`,
     );
     if (!locked) return false;
+    const media = options.keepMedia ? await registeredImages(tx, id, true) : [];
     const [ready] = await tx.execute(
-      sql`SELECT j.id FROM sim_jobs j WHERE j.id=${id}::uuid AND ${eligible(now, ageMs)}`,
+      sql`SELECT j.id FROM sim_jobs j WHERE j.id=${id}::uuid AND ${eligible(now, ageMs, undefined, media)}`,
     );
     if (!ready) return false;
-    const fresh = await proofs(tx, id);
+    const fresh = await proofs(tx, id, media);
+    if (options.keepMedia)
+      await assertWorkingPathsUnreferenced(tx, id, plan.workingPaths!);
     options.signal?.throwIfAborted();
     if (
       fresh.base !== source.base ||
@@ -398,6 +710,14 @@ export async function closedProgressiveJob(
         readbacks,
       );
       checkReceipt(done, id, "reclaimed");
+      if (
+        options.keepMedia &&
+        (canonicalAnalysisJson(done.mediaFiles) !==
+          canonicalAnalysisJson(plan.mediaFiles) ||
+          canonicalAnalysisJson(done.workingPaths) !==
+            canonicalAnalysisJson(plan.workingPaths))
+      )
+        throw Error("Native keep-set or removed paths changed");
       allocation = done.allocation ?? null;
       if (
         done.state !== "reclaimed" ||
@@ -420,10 +740,19 @@ export async function closedProgressiveJob(
       readbacks.length,
       scientificSha256,
       allocation,
+      mediaSha256,
     );
     return true;
   });
-  return { plan, readbacks, points, scientificSha256, allocation, settled };
+  return {
+    plan,
+    readbacks,
+    points,
+    scientificSha256,
+    ...(mediaSha256 ? { mediaSha256, keptMediaRows: source.media } : {}),
+    allocation,
+    settled,
+  };
 }
 
 const scanCursor = new WeakMap<DB, string | null>();
