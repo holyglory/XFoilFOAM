@@ -1351,7 +1351,7 @@ def test_media_queue_uses_the_same_lane_and_recovers_a_real_persisted_effect(tmp
         operator["predecessor_complete"]({"state": str(missing)}, [{"id": job, "plan": plan["plan"]}])
 
 
-@pytest.mark.parametrize("boundary", ["clear", "original-effect", "interrupted-read-only-slot"])
+@pytest.mark.parametrize("boundary", ["clear", "original-effect", "original-uncertain", "interrupted-read-only-slot"])
 def test_media_queue_runs_original_frozen_inventory_before_the_remaining_media(tmp_path, monkeypatch, boundary):
     import runpy
     module = runpy.run_path(str(Path(__file__).resolve().parents[1] / "scripts/deploy/hz-closed-job-media-queue.py"))
@@ -1371,6 +1371,8 @@ def test_media_queue_runs_original_frozen_inventory_before_the_remaining_media(t
     publish(proof, {"job": anchor})
     if boundary == "original-effect":
         publish(old / "pending" / "work.json", {"effect": {"settled": True}})
+    if boundary == "original-uncertain":
+        publish(old / "pending" / "work.json", {"startedAt": "before lost response"})
     if boundary == "interrupted-read-only-slot":
         publish(state / "named-slot.json", {"job": lead})
     sha = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()

@@ -273,8 +273,9 @@ def run(config, config_sha):
                 status("named-media-job", job=lead)
                 # The named slot is optional. An outstanding removal in the original
                 # inventory must finish its native, SQL and cloud replay first.
-                unfinished = [read(path) for path in (old_state / "pending").glob("*.json")]
-                if not any(item.get("effect") for item in unfinished):
+                # A missing local effect field can also mean a lost SSH response.
+                # Give every pending journal to its original owner.
+                if not any((old_state / "pending").glob("*.json")):
                     publish(slot, {"job": lead, "startedAt": now()})
                     process(jobs[lead], state, installation, anchor_read(installation, baseline))
         if not predecessor_complete(previous, entries):
