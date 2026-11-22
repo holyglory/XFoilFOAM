@@ -277,7 +277,7 @@ class BundleDecoder {
   firstSequence = Infinity;
   lastSequence = 0;
 
-  line(line: string): ProgressiveReportArchiveEntry {
+  line(line: string) {
     // Root value spans preserve the text, including legacy rows whose report
     // was not last. Nested fields and quoted delimiters cannot confuse them.
     const fields = new Map<string, string>();
@@ -333,7 +333,7 @@ class BundleDecoder {
       throw new Error(
         "Progressive report archive member exceeds its decoded report limit",
       );
-    reportJsonObject(
+    const report = reportJsonObject(
       Object.hasOwn(object, "report")
         ? object.report!
         : parseReportJson(reportText),
@@ -368,9 +368,9 @@ class BundleDecoder {
     );
     this.lastSequence = Math.max(this.lastSequence, Number(metadata.sequence));
     return {
-      ...metadata,
-      reportText,
-    } as unknown as ProgressiveReportArchiveEntry;
+      entry: { ...metadata, reportText } as unknown as ProgressiveReportArchiveEntry,
+      report,
+    };
   }
 }
 
@@ -394,6 +394,7 @@ async function consumeBundle(
   visit: (
     entry: ProgressiveReportArchiveEntry,
     line: string,
+    report: ReturnType<typeof reportJsonObject>,
   ) => void | Promise<void>,
   limits: ProgressiveReportArchiveLimits = {},
 ): Promise<void> {
@@ -424,7 +425,8 @@ async function consumeBundle(
       pending = pending.slice(newline + 1);
       if (limits.maxMembers !== undefined && decoder.count >= limits.maxMembers)
         throw new Error("Progressive report archive exceeds its member limit");
-      await visit(decoder.line(line), line);
+      const { entry, report } = decoder.line(line);
+      await visit(entry, line, report);
     }
   };
   await pipeline(
@@ -509,7 +511,11 @@ async function consumeBundle(
 export async function visitProgressiveReportArchive(
   source: Readable,
   identity: ProgressiveReportArchiveStoredIdentity,
-  visitor: (entry: ProgressiveReportArchiveEntry) => void | Promise<void>,
+  visitor: (
+    entry: ProgressiveReportArchiveEntry,
+    line: string,
+    report: ReturnType<typeof reportJsonObject>,
+  ) => void | Promise<void>,
   limits: ProgressiveReportArchiveLimits = {},
 ): Promise<void> {
   await consumeBundle(source, identity, visitor, limits);
