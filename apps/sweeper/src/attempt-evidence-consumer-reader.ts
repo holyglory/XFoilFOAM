@@ -7,6 +7,7 @@ import { and, eq, inArray, isNotNull, sql } from "drizzle-orm";
 import {
   hydrateAttemptEvidence,
   hydrateAttemptEvidenceBatch,
+  readAttemptEvidenceText,
   type AttemptEvidenceReadRow,
   type AttemptEvidenceReadOptions,
 } from "@aerodb/db/attempt-evidence-reader";
@@ -15,7 +16,17 @@ import { createAttemptServerDependencyVerifier } from "@aerodb/db/attempt-eviden
 
 let reader: AttemptEvidenceStore | undefined;
 
-function sourceReader() {
+/** Use PostgreSQL's original text when a SQL projection copies history fields.
+ * Parsing and re-encoding the document in JavaScript can round numeric tokens. */
+export function readOriginalAttemptForProjection(db: DB, id: string, archiveId: string): Promise<string> {
+  return readAttemptEvidenceText(db, sweeperAttemptArchiveReader(), id, {
+    archiveId,
+    requireArchiveRead: true,
+    signal: AbortSignal.timeout(30_000),
+  });
+}
+
+export function sweeperAttemptArchiveReader() {
   return {
     read(
       identity: Parameters<AttemptEvidenceStore["read"]>[0],
@@ -81,7 +92,7 @@ export async function prepareAttemptPublicationEvidence(
     if (cold.length === 0) continue;
     const restored = await hydrateAttemptEvidenceBatch(
       db,
-      sourceReader(),
+      sweeperAttemptArchiveReader(),
       cold.map((row) => ({ ...row, evidencePayload: null as unknown })),
       { signal: AbortSignal.timeout(30_000) },
     );
@@ -128,7 +139,7 @@ export function publicationAttemptPayload(
 /** Galileo's writer uses this proof after upload/API readback and before its
  * final locked source/dependency recheck. It performs no removal itself. */
 export function sweeperAttemptEvidenceDependencyVerifier(db: DB) {
-  return createAttemptServerDependencyVerifier(db, sourceReader());
+  return createAttemptServerDependencyVerifier(db, sweeperAttemptArchiveReader());
 }
 
 /** Call at a bounded preparation boundary, before opening publication/write
@@ -142,7 +153,7 @@ export function readSweeperAttemptEvidence<T extends AttemptEvidenceReadRow>(
   const signal = options.signal
     ? AbortSignal.any([options.signal, deadline])
     : deadline;
-  return hydrateAttemptEvidence(db, sourceReader(), row, {
+  return hydrateAttemptEvidence(db, sweeperAttemptArchiveReader(), row, {
     ...options,
     signal,
   });

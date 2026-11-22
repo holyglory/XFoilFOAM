@@ -1,6 +1,12 @@
 import { resolveStoredProgressiveReport } from "@aerodb/db/progressive-report-reader";
 import { randomUUID } from "node:crypto";
 import { sql } from "drizzle-orm";
+import {
+  preparePublicationHistories,
+  publicationHistoryJoin,
+  publicationHistoryPayload,
+  type PreparedPublicationHistory,
+} from "./attempt-publication-history";
 import { effectiveProgressiveStageSql } from "@aerodb/db/progressive-execution-policy";
 import { progressiveBenchmarkAttemptSql } from "@aerodb/db/progressive-recipe-policy";
 import { assertProgressiveCfdTerminalDiagnostics, readProgressiveDiagnosticRecoveryTrigger } from "@aerodb/db/progressive-cfd-evidence";
@@ -131,6 +137,7 @@ export async function promoteRetainedProgressiveAttempts(
     attemptIds: readonly string[];
     stoppedPublication?: boolean;
   },
+  preparedHistories: readonly PreparedPublicationHistory[] = [],
 ) {
   if (!input.attemptIds.length) return false;
   const promotion = sql`
@@ -141,9 +148,9 @@ export async function promoteRetainedProgressiveAttempts(
         result.current_result_attempt_id AS observed_current_attempt_id,
         classification.state AS incoming_state,
         raw.regime AS incoming_regime,
-        raw.evidence_payload AS incoming_evidence_payload,
+        raw.evidence_payload->>'fidelity' AS incoming_fidelity,
         current_attempt.regime AS current_regime,
-        current_attempt.evidence_payload AS current_evidence_payload,
+        current_attempt.evidence_payload->>'fidelity' AS current_fidelity,
         current_classification.state AS current_state
       FROM result_attempts raw
       JOIN result_classifications classification
@@ -199,8 +206,8 @@ export async function promoteRetainedProgressiveAttempts(
       SELECT candidates.*,
         CASE incoming_state WHEN 'accepted' THEN 200 ELSE 100 END +
         CASE
-          WHEN incoming_evidence_payload->>'fidelity' = 'urans_full' THEN 30
-          WHEN incoming_evidence_payload->>'fidelity' = 'urans_precalc'
+          WHEN incoming_fidelity = 'urans_full' THEN 30
+          WHEN incoming_fidelity = 'urans_precalc'
             OR incoming_regime = 'urans' THEN 20
           ELSE 10
         END AS incoming_rank,
@@ -211,16 +218,22 @@ export async function promoteRetainedProgressiveAttempts(
             ELSE NULL
           END +
           CASE
-            WHEN current_evidence_payload->>'fidelity' = 'urans_full' THEN 30
-            WHEN current_evidence_payload->>'fidelity' = 'urans_precalc'
+            WHEN current_fidelity = 'urans_full' THEN 30
+            WHEN current_fidelity = 'urans_precalc'
               OR current_regime = 'urans' THEN 20
             ELSE 10
           END,
           -1
         ) AS current_rank
       FROM candidates
+    ), projection AS MATERIALIZED (
+      SELECT eligible.result_id, eligible.attempt_id, eligible.observed_current_attempt_id,
+        ${publicationHistoryPayload(sql`raw`)} AS original
+      FROM eligible JOIN result_attempts raw ON raw.id=eligible.attempt_id
+      ${publicationHistoryJoin(sql`raw`, preparedHistories)}
+      WHERE eligible.incoming_rank >= eligible.current_rank
     )
-    UPDATE results result SET current_result_attempt_id = eligible.attempt_id,
+    UPDATE results result SET current_result_attempt_id = projection.attempt_id,
       status = raw.status, source = raw.source, regime = raw.regime,
       method_key = raw.method_key, solver_implementation_id = raw.solver_implementation_id,
       solver_runtime_build_id = raw.solver_runtime_build_id, cl = raw.cl, cd = raw.cd,
@@ -230,17 +243,16 @@ export async function promoteRetainedProgressiveAttempts(
       iterations = raw.iterations, y_plus_avg = raw.y_plus_avg, y_plus_max = raw.y_plus_max,
       n_cells = raw.n_cells, first_order_fallback = raw.first_order_fallback,
       strouhal = raw.strouhal, error = raw.error, quality_warnings = raw.quality_warnings,
-      frame_track = coalesce(raw.evidence_payload->'frame_track', raw.evidence_payload->'frameTrack'),
+      frame_track = coalesce(projection.original->'frame_track', projection.original->'frameTrack'),
       fidelity = raw.evidence_payload->>'fidelity',
-      steady_history = coalesce(raw.evidence_payload->'steady_history', raw.evidence_payload->'steadyHistory'),
+      steady_history = coalesce(projection.original->'steady_history', projection.original->'steadyHistory'),
       engine_job_id = raw.engine_job_id, engine_case_slug = raw.engine_case_slug,
       sim_job_id = raw.sim_job_id, "solvedAt" = raw."solvedAt", priority = 0,
       "updatedAt" = clock_timestamp()
-    FROM eligible
-    JOIN result_attempts raw ON raw.id = eligible.attempt_id
-    WHERE result.id = eligible.result_id
-      AND eligible.incoming_rank >= eligible.current_rank
-      AND result.current_result_attempt_id IS NOT DISTINCT FROM eligible.observed_current_attempt_id
+    FROM projection
+    JOIN result_attempts raw ON raw.id = projection.attempt_id
+    WHERE result.id = projection.result_id
+      AND result.current_result_attempt_id IS NOT DISTINCT FROM projection.observed_current_attempt_id
     RETURNING result.id
   `;
   const noPromotion = new Error("No eligible retained progressive attempt");
@@ -269,11 +281,15 @@ async function publishAcceptedProgressiveAttempts(db: DB, executionId: string) {
   const [historical] = await db.execute(sql`SELECT id FROM sim_jobs
     WHERE id=${executionId}::uuid AND status='cancelled' AND "ingestedAt" IS NULL`);
   if (historical) {
+    const histories = await preparePublicationHistories(db, sql`
+      a.sim_job_id=${executionId}::uuid AND a.status='done' AND a.valid_for_polar
+      AND EXISTS (SELECT FROM results r WHERE r.id=a.result_id AND r.current_result_attempt_id IS NULL)
+    `);
     await db.transaction(async (transaction) => {
       const connection = transaction as unknown as DB;
       const publication = await readStoppedAcceptedProgressivePublication(connection, executionId);
       if (publication?.attemptIds.length)
-        await promoteRetainedProgressiveAttempts(connection, { ...publication, stoppedPublication: true });
+        await promoteRetainedProgressiveAttempts(connection, { ...publication, stoppedPublication: true }, histories);
     });
     return;
   }
@@ -371,12 +387,16 @@ async function publishAcceptedProgressiveAttempts(db: DB, executionId: string) {
     String(candidate.simulation_preset_revision_id),
     executionId,
   );
+  const histories = await preparePublicationHistories(db, sql`
+    a.sim_job_id=${executionId}::uuid AND a.id IN
+      (SELECT value::uuid FROM jsonb_array_elements_text(${JSON.stringify(attemptIds)}::jsonb))
+  `);
   await promoteRetainedProgressiveAttempts(db, {
     executionId,
     airfoilId: String(candidate.airfoil_id),
     simulationPresetRevisionId: String(candidate.simulation_preset_revision_id),
     attemptIds,
-  });
+  }, histories);
 }
 
 import { validateRansPrecalcPromotionSignal } from "./ingest";

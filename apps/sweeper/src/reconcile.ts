@@ -1,3 +1,4 @@
+import { preparePublicationHistories, publicationHistoryJoin, publicationHistoryPayload } from "./attempt-publication-history";
 import {
   assertProgressiveExecutionIdentity,
   acknowledgeProgressiveCfdExecutionStop,
@@ -332,6 +333,11 @@ async function markOwnedJobResultsFailed(
   // endpoint classifies them 'unknown' (ERROR_CLASS_SQL treats NULL/'' as
   // unknown — incident 2026-07-04: 12 campaign points terminal-failed with
   // empty error). Callers guarantee msg is non-empty (nonEmptyFailureMessage).
+  const histories = await preparePublicationHistories(db, sql`EXISTS (
+    SELECT FROM results r JOIN sim_jobs j ON j.id=r.sim_job_id
+    WHERE r.id=a.result_id AND r.current_result_attempt_id=a.id AND j.id=${jobId}::uuid
+      AND j.ingest_lease_token=${lease.token} AND r.status IN ('queued','running')
+  )`);
   const outcome = await db.transaction(async (rawTx) => {
     const tx = rawTx as unknown as DB;
     const [owned] = await tx
@@ -358,6 +364,14 @@ async function markOwnedJobResultsFailed(
     // into a failed mutable projection. Reproject every pointer-owned cell from
     // its immutable attempt and detach it from the failed correction job.
     const restoredRows = (await tx.execute(sql`
+      WITH projection AS MATERIALIZED (
+        SELECT r.id AS result_id, attempt.id AS attempt_id,
+          ${publicationHistoryPayload(sql`attempt`)} AS original
+        FROM results r JOIN result_attempts attempt
+          ON attempt.id=r.current_result_attempt_id AND attempt.result_id=r.id
+        ${publicationHistoryJoin(sql`attempt`, histories)}
+        WHERE r.sim_job_id=${jobId}::uuid AND r.status IN ('queued','running')
+      )
       UPDATE results result
       SET bc_id = attempt.bc_id,
           status = attempt.status,
@@ -383,8 +397,8 @@ async function markOwnedJobResultsFailed(
           error = attempt.error,
           quality_warnings = attempt.quality_warnings,
           frame_track = COALESCE(
-            NULLIF(attempt.evidence_payload -> 'frame_track', 'null'::jsonb),
-            NULLIF(attempt.evidence_payload -> 'frameTrack', 'null'::jsonb),
+            NULLIF(projection.original -> 'frame_track', 'null'::jsonb),
+            NULLIF(projection.original -> 'frameTrack', 'null'::jsonb),
             result.frame_track
           ),
           fidelity = COALESCE(
@@ -392,8 +406,8 @@ async function markOwnedJobResultsFailed(
             result.fidelity
           ),
           steady_history = COALESCE(
-            NULLIF(attempt.evidence_payload -> 'steady_history', 'null'::jsonb),
-            NULLIF(attempt.evidence_payload -> 'steadyHistory', 'null'::jsonb),
+            NULLIF(projection.original -> 'steady_history', 'null'::jsonb),
+            NULLIF(projection.original -> 'steadyHistory', 'null'::jsonb),
             result.steady_history
           ),
           engine_job_id = attempt.engine_job_id,
@@ -402,8 +416,9 @@ async function markOwnedJobResultsFailed(
           "solvedAt" = attempt."solvedAt",
           priority = 0,
           "updatedAt" = now()
-      FROM result_attempts attempt
+      FROM projection JOIN result_attempts attempt ON attempt.id=projection.attempt_id
       WHERE result.sim_job_id = ${jobId}
+        AND result.id=projection.result_id
         AND result.status IN ('queued', 'running')
         AND result.current_result_attempt_id = attempt.id
         AND attempt.result_id = result.id
