@@ -2,7 +2,8 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
-import { sql } from "drizzle-orm";
+import { sql, type SQL } from "drizzle-orm";
+import { PgDialect } from "drizzle-orm/pg-core";
 import type { DB } from "@aerodb/db/client";
 import { expect } from "vitest";
 import {
@@ -78,6 +79,19 @@ export async function verifyOriginalCopyJourney(
       );
     },
   };
+  // Production misestimated upstream-base-url selectivity and expanded every
+  // worker job. Preserve keyed lateral boundaries before evaluating ownership.
+  let lookupSql = "";
+  const planned = {
+    execute: (query: SQL) => {
+      lookupSql = new PgDialect().sqlToQuery(query).sql;
+      return db.execute(query);
+    },
+  } as unknown as DB;
+  await inspectOriginals(planned, binding, { ids: [id] });
+  expect(lookupSql).toContain("WITH native AS MATERIALIZED");
+  expect(lookupSql).toMatch(/FROM sim_jobs j WHERE j.id=a.sim_job_id OFFSET 0/);
+  expect(lookupSql).toMatch(/FROM sync_sweep_promises pr WHERE pr.id=CASE/);
   const [row] = await inventoryOriginalPage(relay, binding, { ids: [id] });
   expect(row?.match).toBeNull();
   expect(row?.owned).toBe(true);
