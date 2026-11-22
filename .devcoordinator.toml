@@ -5755,7 +5755,8 @@ name = "worker-report-native-reclamation"
 tier = "development"
 timeout_seconds = 120
 requires = ["workspace"]
-case_command = ["/bin/bash", "-c", "case_db=$(python3 -c 'import os; from urllib.parse import unquote, urlsplit; print(unquote(urlsplit(os.environ[\"DATABASE_URL\"]).path[1:]))') && test -n \"$case_db\" && : \"${PGHOST:?disposable PostgreSQL host required}\" \"${PGPORT:?disposable PostgreSQL port required}\" && exec psql -d \"$case_db\" -X -q -v ON_ERROR_STOP=1 -c \"CREATE TABLE public.progressive_worker_reports (id bigint PRIMARY KEY, report jsonb)\" -f scripts/deploy/reclaim-progressive-worker-reports.sql"]
+env = { HZ_REPORT_AUTOVACUUM_TEST_DB = "1" }
+case_command = ["/bin/bash", "-c", "case_db=$(python3 -c 'import os; from urllib.parse import unquote, urlsplit; print(unquote(urlsplit(os.environ[\"DATABASE_URL\"]).path[1:]))') && test -n \"$case_db\" && : \"${PGHOST:?disposable PostgreSQL host required}\" \"${PGPORT:?disposable PostgreSQL port required}\" && psql -d \"$case_db\" -X -q -v ON_ERROR_STOP=1 -c \"CREATE TABLE public.progressive_worker_reports (id bigint PRIMARY KEY, report jsonb)\" -f scripts/deploy/reclaim-progressive-worker-reports.sql && exec python3 tests/test_worker_report_autovacuum.py"]
 cases = [{ id = "disposable-relation", args = [], postgres = "default" }]
 
 [[test.progressive-report-archive.check]]

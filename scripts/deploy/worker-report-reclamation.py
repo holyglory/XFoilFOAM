@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""Private read-only relation audit and before/after file-size comparison.
-
-Native maintenance is in reclaim-progressive-worker-reports.sql. This audit
-never executes maintenance, changes controls, or uses sample estimates as gates.
+"""Measure report storage and plan HZ table-local autovacuum changes.
+Use --apply with --autovacuum worker to lower the vacuum scale factor.
 """
 
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
+from decimal import Decimal, InvalidOperation
 import json
 import math
 import os
@@ -33,7 +33,7 @@ def ssh(role: str, command: list[str], sql: str = "") -> str:
     )
     if result.returncode:
         # Keep output limited to diagnostics from these fixed metadata queries.
-        raise RuntimeError(f"{role} read-only probe failed ({result.returncode}): {result.stderr[-2000:].strip()}")
+        raise RuntimeError(f"{role} operation failed ({result.returncode}): {result.stderr[-2000:].strip()}")
     return result.stdout
 
 
@@ -172,24 +172,176 @@ def comparison(before: dict, after: dict) -> dict:
         "note": "Observed net file changes only. Concurrent writers/WAL/case activity prevent filesystem-level attribution."}
 
 
+# Two catalog rows. Inspect the specific TOAST relation PostgreSQL owns for this
+# table. Neither planning nor verification visits any report or TOAST chunks.
+VACUUM_RELATIONS = """
+SELECT v.kind,c.oid::bigint AS oid,pg_relation_filenode(c.oid)::bigint AS filenode,
+       c.reltuples::float8 AS tuples,c.oid::regclass::text AS relation,
+       coalesce((SELECT jsonb_object_agg(option_name,option_value) FROM pg_options_to_table(c.reloptions)), '{}') AS options
+FROM pg_class heap CROSS JOIN LATERAL (VALUES ('heap',heap.oid),('toast',heap.reltoastrelid)) v(kind,id)
+JOIN pg_class c ON c.oid=v.id
+WHERE heap.oid='public.progressive_worker_reports'::regclass AND heap.relkind='r'
+  AND ((v.kind='heap' AND c.relkind='r') OR (v.kind='toast' AND c.relkind='t'))
+"""
+VACUUM_SNAPSHOT = f"""
+SELECT to_jsonb(r) || jsonb_build_object(
+ 'deadEstimate',s.n_dead_tup,'lastVacuum',s.last_vacuum,'lastAutovacuum',s.last_autovacuum,
+ 'vacuumPhase',(SELECT phase FROM pg_stat_progress_vacuum WHERE relid=r.oid::oid LIMIT 1),
+ 'serverScale',current_setting('autovacuum_vacuum_scale_factor'),
+ 'serverBase',current_setting('autovacuum_vacuum_threshold'),
+ 'serverMax',current_setting('autovacuum_vacuum_max_threshold',true),
+ 'localEnabled',(r.options->>'autovacuum_enabled')::boolean,
+ 'autovacuum',current_setting('autovacuum'),'trackCounts',current_setting('track_counts'),
+ 'costDelayMs',(SELECT setting::numeric FROM pg_settings WHERE name='autovacuum_vacuum_cost_delay'),
+ 'vacuumCostDelayMs',(SELECT setting::numeric FROM pg_settings WHERE name='vacuum_cost_delay'),
+ 'costLimit',current_setting('autovacuum_vacuum_cost_limit'),
+ 'vacuumCostLimit',current_setting('vacuum_cost_limit'),'observedAt',clock_timestamp())
+FROM ({VACUUM_RELATIONS}) r LEFT JOIN pg_stat_all_tables s ON s.relid=r.oid::oid ORDER BY r.kind
+"""
+SCALE = "autovacuum_vacuum_scale_factor"
+
+
+def scale_factor(value: str) -> Decimal:
+    try:
+        result = Decimal(value)
+        if result.is_finite() and 0 <= result <= 100:
+            return result if result else Decimal(0)
+    except InvalidOperation:
+        pass
+    raise argparse.ArgumentTypeError("vacuum scale factor must be a finite PostgreSQL factor from 0 through 100")
+
+
+def vacuum_session(statement: str, write: bool) -> list[dict]:
+    # Bind both the host/container and the configured deployment role. Inspect
+    # only this one nonsecret setting. Apply shares the existing HZ deploy lock.
+    role_check = ["docker", "inspect", "--format",
+        '{{range .Config.Env}}{{if eq . "AIRFOILFOAM_DEPLOYMENT_ROLE=remote-solver"}}remote-solver{{end}}{{end}}',
+        "hz-solver2-sweeper-1"]
+    psql = ["docker", "exec", "-i", "-e",
+        f"PGOPTIONS=-c default_transaction_read_only={'off' if write else 'on'} -c statement_timeout=5000 "
+        "-c lock_timeout=500 -c idle_in_transaction_session_timeout=5000 -c application_name=hz_report_autovacuum",
+        TARGETS["worker"][1], "psql", "-XwqAt", "-v", "ON_ERROR_STOP=1", "-U", "aerodb", "-d", "aerodb"]
+    command = ["sh", "-ec", f'test "$({shlex.join(role_check)})" = remote-solver || '
+        '{ echo "Expected the HZ remote-solver deployment" >&2; exit 1; }; exec ' + shlex.join(psql)]
+    if write:
+        command = ["flock", "-s", "-w", "5", "-E", "75", "/tmp/airfoils-pro-deploy.lock", *command]
+    return [json.loads(line) for line in ssh("worker", command, statement).splitlines() if line.strip()]
+
+
+def autovacuum_plan(rows: list[dict], target: Decimal) -> tuple[dict, dict]:
+    relations = {r["kind"]: r for r in rows}
+    if len(rows) != 2 or set(relations) != {"heap", "toast"}:
+        raise ValueError("Expected the worker report heap and its owned TOAST relation")
+    changes, facts = {}, {}
+    for kind in ("heap", "toast"):
+        r = relations[kind]
+        # PostgreSQL uses the parent's autovacuum options only when the TOAST
+        # relation has no options of its own. Creating a first toast option
+        # could discard inherited cost/threshold settings. Keep inheritance.
+        inherited = kind == "toast" and not r["options"]
+        options = relations["heap"]["options"] if inherited else r["options"]
+        scale = Decimal(options.get(SCALE, r["serverScale"]))
+        desired = min(scale, target)
+        if desired < scale and not inherited:
+            changes[kind] = str(desired)
+        base = int(options.get("autovacuum_vacuum_threshold", r["serverBase"]))
+        cap = int(options.get("autovacuum_vacuum_max_threshold", r["serverMax"] or -1))
+        tuples = max(Decimal(0), Decimal(str(r["tuples"])))
+
+        def threshold(factor: Decimal) -> float:
+            estimate = base + tuples * factor
+            return float(min(estimate, cap) if cap >= 0 else estimate)
+
+        delay = float(options.get("autovacuum_vacuum_cost_delay", r["costDelayMs"]))
+        limit = int(options.get("autovacuum_vacuum_cost_limit", r["costLimit"]))
+        facts[kind] = {
+            **r,
+            "inheritsHeapOptions": inherited,
+            "currentScale": float(scale),
+            "targetScale": float(desired),
+            "currentDeadTupleThresholdEstimate": threshold(scale),
+            "targetDeadTupleThresholdEstimate": threshold(desired),
+            "aboveTargetEstimate": r["deadEstimate"] > threshold(desired) if r["deadEstimate"] is not None else None,
+            "ordinaryAutovacuumEnabled": (
+                r["autovacuum"] == "on" and r["trackCounts"] == "on" and
+                (relations["heap"] if inherited else r)["localEnabled"] is not False
+            ),
+            "effectiveCostDelayMs": delay if delay >= 0 else r["vacuumCostDelayMs"],
+            "effectiveCostLimit": limit if limit > 0 else int(r["vacuumCostLimit"]),
+        }
+    return changes, facts
+
+
+def worker_autovacuum(target: Decimal, apply: bool, session=vacuum_session) -> dict:
+    rows = session(f"BEGIN READ ONLY; SET LOCAL search_path=pg_catalog; {VACUUM_SNAPSHOT}; COMMIT;", False)
+    changes, facts = autovacuum_plan(rows, target)
+    setters = [f"{'toast.' if kind == 'toast' else ''}{SCALE}='{value}'" for kind, value in changes.items()]
+    ddl = "ALTER TABLE ONLY public.progressive_worker_reports SET (" + ", ".join(setters) + ")" if setters else None
+    result = {
+        "role": "worker", "table": "public.progressive_worker_reports", "mode": "apply" if apply else "dry-run",
+        "scaleFactorCeiling": float(target), "plannedChanges": changes, "sql": ddl, "changed": False, "before": facts,
+    }
+    if not apply or ddl is None:
+        return result
+
+    def expected(after: bool) -> str:
+        identity = {}
+        for r in rows:
+            opts = dict(r["options"])
+            if after and r["kind"] in changes:
+                opts[SCALE] = changes[r["kind"]]
+            identity[r["kind"]] = [r["oid"], r["filenode"], opts, r["serverScale"]]
+        # Arbitrary pre-existing option strings are data, never SQL fragments.
+        return "convert_from(decode('" + json.dumps(identity).encode().hex() + "','hex'),'UTF8')::jsonb"
+
+    observed = f"""SELECT jsonb_object_agg(r.kind,jsonb_build_array(r.oid,r.filenode,r.options,current_setting('{SCALE}')))
+                   FROM ({VACUUM_RELATIONS}) r"""
+    # Recheck under the same lock as ALTER. A racing policy change aborts the
+    # transaction. Both file identities and every unrelated reloption must match
+    # again after the change, before we commit.
+    script = f"""BEGIN; SET LOCAL search_path=pg_catalog;
+LOCK TABLE ONLY public.progressive_worker_reports IN SHARE UPDATE EXCLUSIVE MODE NOWAIT;
+DO $verify$ BEGIN
+ IF ({observed}) IS DISTINCT FROM {expected(False)} THEN RAISE EXCEPTION 'Worker report storage policy changed; rerun the plan'; END IF;
+ {ddl};
+ IF ({observed}) IS DISTINCT FROM {expected(True)} THEN RAISE EXCEPTION 'Unexpected worker report policy or relation file change'; END IF;
+END $verify$;
+{VACUUM_SNAPSHOT};
+COMMIT;"""
+    after = session(script, True)
+    result["after"] = autovacuum_plan(after, target)[1]
+    result["changed"] = True
+    return result
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     action = parser.add_mutually_exclusive_group()
     action.add_argument("--measure", choices=TARGETS)
     action.add_argument("--compare", nargs=2, type=Path, metavar=("BEFORE_JSON", "AFTER_JSON"))
+    action.add_argument("--autovacuum", choices=["worker"], help="plan HZ report heap and TOAST vacuum thresholds")
+    parser.add_argument("--scale-factor", type=scale_factor, help="ceiling for both effective scale factors (default 0.02)")
+    parser.add_argument("--apply", action="store_true", help="commit the planned worker-local reloptions")
     parser.add_argument("--output", type=Path, help="new local private audit file; existing files are never overwritten")
     args = parser.parse_args()
-    if args.compare:
-        result = comparison(*(json.loads(path.read_text()) for path in args.compare))
-    elif args.measure:
-        result = measure(args.measure)
-    else:
+    if not args.autovacuum and (args.apply or args.scale_factor is not None):
+        parser.error("--apply and --scale-factor require --autovacuum worker")
+    if not (args.autovacuum or args.compare or args.measure):
         parser.print_help()
         return 0
-    text = json.dumps(result, indent=2) + "\n"
-    if args.output:
-        fd = os.open(args.output, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(fd, "w") as stream:
+    # Reserve the private receipt before a possible database commit.
+    output = (os.fdopen(os.open(args.output, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w")
+              if args.output else nullcontext())
+    with output as stream:
+        if args.autovacuum:
+            target = Decimal("0.02") if args.scale_factor is None else args.scale_factor
+            result = worker_autovacuum(target, args.apply)
+        elif args.compare:
+            result = comparison(*(json.loads(path.read_text()) for path in args.compare))
+        else:
+            result = measure(args.measure)
+        text = json.dumps(result, indent=2) + "\n"
+        if stream is not None:
             stream.write(text)
             stream.flush()
             os.fsync(stream.fileno())
