@@ -29,6 +29,7 @@ FILES = {
     "sql": "apps/sweeper/src/closed-progressive-retention.ts",
     "native": "src/airfoilfoam/closed_progressive_retention.py",
 }
+MEDIA_READERS = ("apps/api/src/media-store.ts", "apps/api/src/routes.ts", "apps/api/src/services/sim.ts")
 ENGINE_MODULES = ("retention", "evidence_store", "evidence_runtime", "config", "jobs", "tasks")
 NODE_FILES = ("apps/sweeper/src/progressive-archive-reclaim.ts", "apps/sweeper/src/config.ts",
               "packages/core/src/remote-hub-url.ts", "packages/db/src/progressive-evidence-custody.ts",
@@ -106,12 +107,14 @@ def command(argv, data=None, timeout=30):
     return result.stdout
 
 
-def containers():
+def containers(include_media=False):
     found = {}
-    for service in ("sweeper", "api", "worker"):
+    services = ("sweeper", "api", "worker", "node-api") if include_media else ("sweeper", "api", "worker")
+    for service in services:
         row = command(["docker", "inspect", "--format", INSPECT, f"{ROOT}-{service}-1"]).decode().strip().split("|")
         require(len(row) == 9 and SHA.fullmatch(row[0]) and row[2] == "true" and row[4:9] ==
-                [ROOT, service, "volume", ROOT + "_results", "true"], f"{service} container/volume identity differs")
+                [ROOT, service, "volume", ROOT + "_results", "false" if service == "node-api" else "true"],
+                f"{service} container/volume identity differs")
         found[service] = {"id": row[0], "image": row[1], "startedAt": row[3]}
     return found
 
@@ -121,7 +124,10 @@ def validate_sources(package):
     require(set(hashes) == set(FILES) and hashes == package["hashes"], "helper files differ")
     require(set(package["nodeHashes"]) == set(NODE_FILES) and set(package["engineHashes"]) == set(ENGINE_MODULES),
             "incomplete runtime dependency identity")
-    return digest(encoded({"helpers": hashes, "engine": package["engineHashes"], "node": package["nodeHashes"]}))
+    require(set(package["mediaReaderHashes"]) == set(MEDIA_READERS) and
+            all(SHA.fullmatch(h) for h in package["mediaReaderHashes"].values()), "incomplete media reader identity")
+    return digest(encoded({"helpers": hashes, "engine": package["engineHashes"], "node": package["nodeHashes"],
+                           "mediaReaders": package["mediaReaderHashes"]}))
 
 
 def send_frame(pipe, value):
@@ -148,7 +154,12 @@ def host_job(package):
         deploy_identity=[os.fstat(lock_fd).st_dev,os.fstat(lock_fd).st_ino]
         require(stat.S_ISREG(os.fstat(lock_fd).st_mode) and os.path.samestat(os.fstat(lock_fd), os.stat(DEPLOY_LOCK)),
                 "deployment lock identity changed")
-        topology = containers()
+        keep_media = scope.get("keepMedia") is True
+        topology = containers(keep_media)
+        if keep_media:
+            rows = command(["docker", "exec", "-w", "/app", topology["node-api"]["id"], "sha256sum", *MEDIA_READERS]).decode().splitlines()
+            actual = {name: sha for sha, name in (row.split(None, 1) for row in rows)}
+            require(actual == package["mediaReaderHashes"], "installed media read or public point module differs")
         images={s:v["image"] for s,v in topology.items()}
         if target.get("images") and target["images"]!=images:
             return {"status":"runtime-changed","observedImages":images,"job":scope["id"]}
@@ -189,7 +200,7 @@ def host_job(package):
                     count += 1
                     require(msg["type"] == "engine" and msg["step"] == count and
                             (count == 1 or count == 2 and scope["mode"] == "reclaim"), "unexpected native call")
-                    require(containers() == topology, "runtime changed during maintenance")
+                    require(containers(keep_media) == topology, "runtime changed during maintenance")
                     boot = {"scope": scope, "packet": msg["packet"], "native": package["sources"]["native"],
                             "nativeSha": package["hashes"]["native"], "engineHashes": package["engineHashes"]}
                     answer = command(["docker", "exec", "-i", pinned["api"], "python", "-IB", "-c", package["sources"]["engine"]],
@@ -212,7 +223,7 @@ def host_job(package):
                     require(receipt["status"] == "settled" and receipt["settled"] is True and
                             receipt["plan"]["plan"] == scope["plan"] and count == (2 if receipt["plan"]["files"] else 1),
                             "apply peer returned an invalid receipt")
-                require(code == 0 and containers() == topology, "runtime changed or receipt lost; repeat the same pinned plan")
+                require(code == 0 and containers(keep_media) == topology, "runtime changed or receipt lost; repeat the same pinned plan")
             finally:
                 if proc.poll() is None:
                     proc.stdin.close()
@@ -245,6 +256,7 @@ def source_package(repo):
     sources = {k: source(revision, path).decode() for k, path in FILES.items()}
     require(Path(__file__).read_bytes() == sources["host"].encode(), "run the operator from its committed checkout")
     return {"revision": revision, "sources": sources, "hashes": {k: digest(v.encode()) for k,v in sources.items()},
+            "mediaReaderHashes": {p: digest(source(revision, p)) for p in MEDIA_READERS},
             "nodeHashes": {p: sorted({digest(source(ref, p)) for ref in (RUNTIME_BASE, revision)}) for p in NODE_FILES},
             "engineHashes": {n: digest(source(RUNTIME_BASE, f"src/airfoilfoam/{n}.py")) for n in ENGINE_MODULES}}
 

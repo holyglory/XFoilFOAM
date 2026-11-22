@@ -1265,3 +1265,25 @@ def test_closed_storage_inventory_resumes_one_pinned_job_and_preserves_refusals(
     assert run({"revision":"test"},inventory,digest,state,True,baseline)==0 and len(calls)==count
     with pytest.raises(ValueError, match="same pinned helper"):
         run({"revision":"different"},inventory,digest,state,True,baseline)
+
+
+
+def test_keep_media_pins_the_read_only_api_mount_without_changing_the_original_service_set(monkeypatch):
+    import runpy
+    module = runpy.run_path(str(Path(__file__).resolve().parents[1] / "scripts/deploy/hz-closed-job-maintenance.py"))
+    lookup = module["containers"]
+    reads = []
+    writable_api = False
+
+    def inspect(argv):
+        service = argv[-1].removeprefix("hz-solver2-").removesuffix("-1")
+        reads.append(service)
+        rw = "false" if service == "node-api" and not writable_api else "true"
+        return f"{'a'*64}|image|true|start|hz-solver2|{service}|volume|hz-solver2_results|{rw}".encode()
+
+    monkeypatch.setitem(lookup.__globals__, "command", inspect)
+    assert set(lookup()) == {"sweeper", "api", "worker"}
+    assert set(lookup(True)) == {"sweeper", "api", "worker", "node-api"}
+    writable_api = True
+    with pytest.raises(ValueError, match="node-api container/volume"):
+        lookup(True)

@@ -132,7 +132,7 @@ python3 scripts/deploy/hz-closed-job-maintenance.py reclaim --keep-media \
 python3 scripts/deploy/hz-closed-job-maintenance.py verify --keep-media "$job" "$plan"
 ```
 
-The proof binds each image path, SHA-256 and length, the original media ID and
+The proof pins the running read-only Node API container and the installed media and point-detail modules. It binds each image path, SHA-256 and length, the original media ID and
 display metadata, and the working-file plan. It reads the stable media IDs,
 legacy paths, engine file paths and point-detail links/legends. A
 `reclaim` repeats the complete proof, including every pinned CFD archive,
