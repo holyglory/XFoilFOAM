@@ -233,7 +233,7 @@ def vacuum_session(statement: str, write: bool) -> list[dict]:
     psql = ["docker", "exec", "-i", "-e",
         f"PGOPTIONS=-c default_transaction_read_only={'off' if write else 'on'} -c statement_timeout=5000 "
         "-c lock_timeout=500 -c idle_in_transaction_session_timeout=5000 -c application_name=hz_report_autovacuum",
-        TARGETS["worker"][1], "psql", "-XwqAt", "-v", "ON_ERROR_STOP=1", "-U", "aerodb", "-d", "aerodb"]
+        TARGETS["worker"][1], "psql", "-XwqAt", "-v", "ON_ERROR_STOP=1", "-v", "VERBOSITY=verbose", "-U", "aerodb", "-d", "aerodb"]
     command = ["sh", "-ec", f'test "$({shlex.join(role_check)})" = remote-solver || '
         '{ echo "Expected the HZ remote-solver deployment" >&2; exit 1; }; exec ' + shlex.join(psql)]
     if write:
@@ -457,13 +457,10 @@ def worker_return_check(prior=None, live_values=False, session=vacuum_session, h
         raise ValueError("Expected a private HZ worker report measurement as the baseline")
     if review_free_bytes is not None and review_free_bytes < 1:
         raise ValueError("A workspace review budget must be positive")
-    statement = "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; SET LOCAL search_path=pg_catalog; " + RETURN_SNAPSHOT + ";"
-    if live_values:
-        statement += ("SET LOCAL statement_timeout='12s'; SET LOCAL max_parallel_workers_per_gather=0; "
-                      "SET LOCAL jit=off; SET LOCAL work_mem='1MB'; " + LIVE_VALUES + ";")
-    rows = session(statement + " COMMIT;", False)
-    if len(rows) != 1 + int(live_values):
-        raise ValueError("Missing report, TOAST or live-value observation")
+    statement = "BEGIN READ ONLY; SET LOCAL search_path=pg_catalog; " + RETURN_SNAPSHOT + "; COMMIT;"
+    rows = session(statement, False)
+    if len(rows) != 1:
+        raise ValueError("Missing worker report or TOAST relation")
     facts = rows[0]
     facts["mode"] = "read-only-return-check"
     # PostgreSQL can check privileges on a function RTE even in a skipped
@@ -492,10 +489,24 @@ def worker_return_check(prior=None, live_values=False, session=vacuum_session, h
         facts["reviewBudgetBytes"] = review_free_bytes
         facts["reviewBudgetCovered"] = free >= review_free_bytes if facts["sharedDataAndWalVolume"] else None
     if live_values:
-        facts["liveValues"] = rows[1] or {}
-        total = sum(group["storedReportBytes"] for group in facts["liveValues"].values())
-        facts["liveReportValueBytes"] = total
-        facts["freeMinusLiveReportValuesBytes"] = free - total if facts["sharedDataAndWalVolume"] else None
+        # Keep the file/volume observation even when concurrent I/O exhausts
+        # the census deadline. An unavailable value sum never becomes zero.
+        census = ("BEGIN READ ONLY; SET LOCAL search_path=pg_catalog; SET LOCAL statement_timeout='12s'; "
+                  "SET LOCAL max_parallel_workers_per_gather=0; SET LOCAL jit=off; SET LOCAL work_mem='1MB'; "
+                  "SELECT jsonb_build_object('observedAt',statement_timestamp(),'groups',g.value) "
+                  "FROM (" + LIVE_VALUES + ") g(value); COMMIT;")
+        try:
+            [observed] = session(census, False)
+        except RuntimeError as error:
+            if not re.search(r"\b57014\b", str(error)) and "canceling statement due to statement timeout" not in str(error):
+                raise
+            facts["liveCensus"] = {"state": "cancelled", "statementDeadlineSeconds": 12}
+        else:
+            facts["liveCensus"] = {"state": "measured", "observedAt": observed["observedAt"]}
+            facts["liveValues"] = observed["groups"]
+            total = sum(group["storedReportBytes"] for group in facts["liveValues"].values())
+            facts["liveReportValueBytes"] = total
+            facts["freeMinusLiveReportValuesBytes"] = free - total if facts["sharedDataAndWalVolume"] else None
     if prior is not None:
         change = comparison(prior, facts)
         if (not change["samePhysicalFile"] or not change["sameServerStart"] or
