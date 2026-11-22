@@ -5734,7 +5734,15 @@ name = "stopped-progressive-history"
 tier = "development"
 requires = ["schema"]
 timeout_seconds = 600
-command = ["/bin/bash", "-c", "repo_git=$(git rev-parse --path-format=absolute --git-common-dir) && export PATH=\"${repo_git%/*}/.venv/bin:$PATH\" && exec /usr/bin/corepack pnpm --filter @aerodb/db exec vitest run test/campaign-profile-enrollment.test.ts -t 'shortens and replays a stopped progressive stage-3 history|republishes current-scope storage-only evidence append-only and remains idempotent [(](accepted|rejected)[)]' --reporter=default --reporter=junit --outputFile.junit=\"$DEVCOORDINATOR_DIAGNOSTICS_DIR/report.xml\""]
+command = ["/bin/bash", "-c", "repo_git=$(git rev-parse --path-format=absolute --git-common-dir) && export PATH=\"${repo_git%/*}/.venv/bin:$PATH\" && exec /usr/bin/corepack pnpm --filter @aerodb/db exec vitest run test/campaign-profile-enrollment.test.ts -t 'shortens and replays a stopped progressive stage-3 history|shortens current and historical receipt-bearing RANS histories|replays a signed remote point after its receipt-bearing RANS history moves to storage|republishes current-scope storage-only evidence append-only and remains idempotent [(](accepted|rejected)[)]' --reporter=default --reporter=junit --outputFile.junit=\"$DEVCOORDINATOR_DIAGNOSTICS_DIR/report.xml\""]
+diagnostic_sources = [{ format = "junit", path = "report.xml" }]
+
+[[test.progressive-report-archive.check]]
+name = "receipt-bound-fit-rebuild"
+tier = "development"
+requires = ["schema"]
+timeout_seconds = 360
+command = ["/bin/bash", "-c", "repo_git=$(git rev-parse --path-format=absolute --git-common-dir) && export XFOILFOAM_PYTHON=\"${repo_git%/*}/.venv/bin/python\" && exec /usr/bin/corepack pnpm --filter @aerodb/db exec vitest run test/progressive-fit-archived-evidence.test.ts --reporter=default --reporter=junit --outputFile.junit=\"$DEVCOORDINATOR_DIAGNOSTICS_DIR/report.xml\""]
 diagnostic_sources = [{ format = "junit", path = "report.xml" }]
 
 [[test.progressive-report-archive.check]]
