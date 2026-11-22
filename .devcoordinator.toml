@@ -5709,11 +5709,45 @@ case_command = ["/bin/bash", "-c", "case_db=$(python3 -c 'import os; from urllib
 cases = [{ id = "disposable-relation", args = [], postgres = "default" }]
 
 [[test.progressive-report-archive.check]]
+name = "attempt-history-transition"
+tier = "development"
+timeout_seconds = 600
+requires = ["solver-history-storage"]
+command = ["/bin/bash", "-c", "exec /usr/bin/corepack pnpm --filter @aerodb/sweeper exec vitest run test/attempt-evidence-settlement.test.ts --reporter=default --reporter=junit --outputFile.junit=\"$DEVCOORDINATOR_DIAGNOSTICS_DIR/report.xml\""]
+diagnostic_sources = [{ format = "junit", path = "report.xml" }]
+
+[[test.progressive-report-archive.check]]
+name = "attempt-history-replay"
+tier = "development"
+timeout_seconds = 600
+requires = ["report-readers", "attempt-history-transition"]
+env = { PROGRESSIVE_REPORT_ARCHIVE_DISPOSABLE_DB = "1" }
+command = ["/bin/bash", "-c", "exec /usr/bin/corepack pnpm --filter @aerodb/sweeper exec vitest run test/attempt-evidence-consumer-integration.test.ts --reporter=default --reporter=junit --outputFile.junit=\"$DEVCOORDINATOR_DIAGNOSTICS_DIR/report.xml\""]
+diagnostic_sources = [{ format = "junit", path = "report.xml" }]
+
+[[test.progressive-report-archive.check]]
+name = "hz-history-transfer"
+tier = "development"
+timeout_seconds = 600
+requires = ["schema"]
+env = { VITEST_PURE_REDUCER_TEST = "1" }
+command = ["/bin/bash", "-c", "exec /usr/bin/corepack pnpm --filter @aerodb/sweeper exec vitest run test/hz-point-history-storage.test.ts test/hz-point-history-protocol.test.ts --reporter=default --reporter=junit --outputFile.junit=\"$DEVCOORDINATOR_DIAGNOSTICS_DIR/report.xml\""]
+diagnostic_sources = [{ format = "junit", path = "report.xml" }]
+
+[[test.progressive-report-archive.check]]
+name = "storage-reset-classification"
+tier = "development"
+timeout_seconds = 600
+requires = ["workspace"]
+command = ["/bin/bash", "-c", "repo_git=$(git rev-parse --path-format=absolute --git-common-dir) && exec \"${repo_git%/*}/.venv/bin/python\" -m pytest -q tests/test_solver_domain_reset.py --junitxml=\"$DEVCOORDINATOR_DIAGNOSTICS_DIR/report.xml\""]
+diagnostic_sources = [{ format = "junit", path = "report.xml" }]
+
+[[test.progressive-report-archive.check]]
 name = "report-readers"
 tier = "development"
 timeout_seconds = 300
 requires = ["schema"]
-command = ["/bin/bash", "-c", "exec /usr/bin/corepack pnpm --filter @aerodb/db exec vitest run test/progressive-report-reader.test.ts --reporter=default --reporter=junit --outputFile.junit=\"$DEVCOORDINATOR_DIAGNOSTICS_DIR/report.xml\""]
+command = ["/bin/bash", "-c", "exec /usr/bin/corepack pnpm --filter @aerodb/db exec vitest run test/progressive-report-reader.test.ts test/attempt-evidence-reader.test.ts test/attempt-evidence-consumers.test.ts --reporter=default --reporter=junit --outputFile.junit=\"$DEVCOORDINATOR_DIAGNOSTICS_DIR/report.xml\""]
 diagnostic_sources = [{ format = "junit", path = "report.xml" }]
 
 [[test.progressive-report-archive.check]]
