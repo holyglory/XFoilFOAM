@@ -37,7 +37,7 @@ function reportHash(value: ReportJson): string {
 
 // Same inventory contract as progressiveRemoteReportInventory. The token tree
 // retains numbers in point evidence that cannot survive a JS JSON round trip.
-function retainedReportInventory(
+export function retainedReportInventory(
   report: { [key: string]: ReportJson },
   signature: string,
 ) {
@@ -74,6 +74,7 @@ function retainedReportInventory(
     ),
   );
   return {
+    sources: sorted,
     sourceCount: sources.size,
     signature: reportHash({
       kind: "progressive-remote-report-inventory-v1",
