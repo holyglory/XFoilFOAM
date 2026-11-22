@@ -8845,6 +8845,60 @@ export const progressiveWorkerReportScienceProofs = pgTable(
   }),
 );
 
+export const progressiveWorkerStagingCopies = pgTable(
+  "progressive_worker_staging_copies",
+  {
+    simJobId: uuid("sim_job_id").notNull(),
+    sequence: bigint("sequence", { mode: "number" }).notNull(),
+    sourceSequence: bigint("source_sequence", { mode: "number" }).notNull(),
+    reportSignature: text("report_signature").notNull(),
+    sourceSignature: text("source_signature").notNull(),
+    resultSha256: text("result_sha256").notNull(),
+    resultByteSize: bigint("result_byte_size", { mode: "number" }).notNull(),
+    pointSignatures: jsonb("point_signatures").$type<string[]>().notNull(),
+    promiseId: uuid("promise_id").notNull(),
+    solverId: uuid("solver_id").notNull(),
+  },
+  (t) => ({
+    primary: primaryKey({
+      name: "progressive_worker_staging_copies_pkey",
+      columns: [t.simJobId, t.sequence],
+    }),
+    target: foreignKey({
+      name: "worker_staging_copy_target_fk",
+      columns: [t.simJobId, t.sequence],
+      foreignColumns: [
+        progressiveWorkerReports.simJobId,
+        progressiveWorkerReports.sequence,
+      ],
+    }).onDelete("cascade"),
+    source: foreignKey({
+      name: "worker_staging_copy_source_fk",
+      columns: [t.simJobId, t.sourceSequence],
+      foreignColumns: [
+        progressiveWorkerEvidenceReceipts.simJobId,
+        progressiveWorkerEvidenceReceipts.sequence,
+      ],
+    }).onDelete("cascade"),
+    identityCheck: check(
+      "worker_staging_copy_identity_check",
+      sql`${t.sourceSequence}<>${t.sequence} AND ${t.resultByteSize}>0`,
+    ),
+    hashCheck: check(
+      "worker_staging_copy_hash_check",
+      sql`${t.reportSignature} ~ '^[0-9a-f]{64}$' AND ${t.sourceSignature} ~ '^[0-9a-f]{64}$' AND ${t.resultSha256} ~ '^[0-9a-f]{64}$'`,
+    ),
+    pointsCheck: check(
+      "worker_staging_copy_points_check",
+      sql`jsonb_typeof(${t.pointSignatures})='array' AND jsonb_array_length(${t.pointSignatures}) BETWEEN 1 AND 512`,
+    ),
+    sourceIdx: index("worker_staging_copy_source_idx").on(
+      t.simJobId,
+      t.sourceSequence,
+    ),
+  }),
+);
+
 export const progressiveWorkerEvidenceAttempts = pgTable(
   "progressive_worker_evidence_attempts",
   {

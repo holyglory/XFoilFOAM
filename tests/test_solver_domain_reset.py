@@ -42,7 +42,7 @@ def test_reset_allowlists_are_disjoint_and_preserve_campaign_membership():
             "progressive_worker_evidence_delivery_claims", "progressive_generation_cohorts",
             "progressive_generation_cohort_targets", "progressive_report_result_payloads",
             "progressive_report_archive_bundles", "progressive_report_archive_members", "solver_history_archives",
-            "progressive_worker_report_science_proofs",
+            "progressive_worker_report_science_proofs", "progressive_worker_staging_copies",
             "attempt_evidence_archives", "attempt_evidence_history_projections", "attempt_evidence_storage_events"} <= RESET["SOLVER_TABLES"]
 
 

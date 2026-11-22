@@ -59,6 +59,7 @@ export async function withArchiveFixture(
     stopped?: boolean;
     settled?: boolean;
     reportCount?: number;
+    angles?: number[];
     historyRepeats?: number;
     legacyConflict?: "identical" | "distinct";
   } = {},
@@ -97,7 +98,12 @@ export async function withArchiveFixture(
         })
         .returning();
       const promiseId = randomUUID();
-      const token = randomUUID();
+      const units = (options.angles ?? [0]).map((alpha) => ({
+        unitId: randomUUID(),
+        token: randomUUID(),
+        alpha,
+        activeBudgetSeconds: 900,
+      }));
       const envelope = sealProgressiveRemoteExecution({
         solverId: remote.id,
         promiseId,
@@ -109,10 +115,8 @@ export async function withArchiveFixture(
           targetId: "a".repeat(64),
           recipeId: "b".repeat(64),
           stage: 2,
-          tokens: [token],
-          units: [
-            { unitId: randomUUID(), token, alpha: 0, activeBudgetSeconds: 900 },
-          ],
+          tokens: units.map((u) => u.token),
+          units,
         },
         request: {
           execution_id: executionId,
@@ -123,7 +127,7 @@ export async function withArchiveFixture(
           airfoil: { name: airfoil.slug },
           chord_lengths: [0.987654],
           speeds: [19.876543],
-          aoa: { angles: [0] },
+          aoa: { angles: units.map((u) => u.alpha) },
           solver: { warm_start: true },
           resources: { case_concurrency: 1, case_solver_budget_seconds: 900 },
         },
@@ -133,7 +137,7 @@ export async function withArchiveFixture(
         registeredSolverId: remote.id,
         airfoilId: airfoil.id,
         simulationPresetRevisionId: solver.revisionId,
-        aoaCount: 1,
+        aoaCount: units.length,
         status: "expired",
         expiresAt: new Date("2026-01-01T00:00:00Z"),
         requestPayload: { ...envelope },
@@ -149,7 +153,7 @@ export async function withArchiveFixture(
         referenceChordM: 0.987654,
         status: "failed",
         engineState: "failed",
-        totalCases: 1,
+        totalCases: units.length,
         completedCases: 1,
         ingestedAt: new Date(),
         requestPayload:
@@ -242,7 +246,7 @@ export async function withArchiveFixture(
           status: {
             job_id: executionId,
             state: sequence === count ? "failed" : "running",
-            total_cases: 1,
+            total_cases: units.length,
             completed_cases: sequence === 1 ? 0 : 1,
             // Unknown diagnostic values must survive archival without JS rounding.
             diagnosticLargeInteger: "__LARGE_INTEGER__",

@@ -23,12 +23,17 @@ import {
   installProgressiveReportArchiveReader,
   readProgressiveReport,
 } from "../src/progressive-report-reader";
+import { progressiveEvidenceWakeSql } from "../../../apps/sweeper/src/progressive-evidence-wake";
+import { progressiveStagingSelectionSql } from "../../../apps/sweeper/src/progressive-staging-selection";
 import { type ProgressiveRemoteReport } from "../src/progressive-remote-report";
 import { type ProgressiveRemoteExecutionEnvelope } from "../src/progressive-remote-execution";
 import { type LegacyReportMember } from "../src/legacy-report-storage";
 import { type EngineClient } from "../../engine-client/src";
 import { progressiveRemoteEvidenceResult } from "./progressive-remote-evidence-fixture";
-import { stageProgressiveWorkerEvidence } from "../../../apps/sweeper/src/progressive-worker-evidence";
+import {
+  stageNextProgressiveWorkerEvidence,
+  stageProgressiveWorkerEvidence,
+} from "../../../apps/sweeper/src/progressive-worker-evidence";
 import { readStoredWorkerArchiveText } from "../../../apps/sweeper/src/report-archive-broker-client";
 import { readLegacyWorkerReportArchivePage } from "../../../apps/sweeper/src/legacy-worker-report-product-read";
 import { storeWorkerReportVolume } from "../../../apps/sweeper/src/worker-report-volume";
@@ -62,7 +67,7 @@ const noEngine = new Proxy(
 ) as EngineClient;
 type Fixture = Awaited<ReturnType<typeof prepare>>;
 
-async function prepare(base: ArchiveFixture) {
+async function prepare(base: ArchiveFixture, inline = false) {
   const db = base.db,
     executionId = base.executionId,
     sourceSequence = 3487;
@@ -109,7 +114,7 @@ async function prepare(base: ArchiveFixture) {
     status: {
       job_id: executionId,
       state: "running",
-      total_cases: 1,
+      total_cases: envelope.scope.units.length,
       completed_cases: 1,
     },
     result,
@@ -129,6 +134,22 @@ async function prepare(base: ArchiveFixture) {
     const report = structuredClone(scientific);
     report.sequence = sequence;
     report.status.state = input.headerState ?? "running";
+    if (inline)
+      report.status.solver_budget_progress = {
+        version: 1,
+        job_id: executionId,
+        observed_at: new Date(1700000000000 + sequence * 1000).toISOString(),
+        cases: [
+          {
+            chord: envelope.request.chord_lengths![0],
+            speed: envelope.request.speeds![0],
+            aoa_deg: envelope.scope.units[0].alpha,
+            solver_running: input.headerState !== "cancelled",
+            limit_seconds: envelope.scope.units[0].activeBudgetSeconds,
+            solver_active_seconds: sequence / 10,
+          },
+        ],
+      };
     if (input.nullResult) {
       report.result = null;
       report.status.completed_cases = 0;
@@ -141,6 +162,10 @@ async function prepare(base: ArchiveFixture) {
       VALUES (${executionId}::uuid,${sequence},${signature},${JSON.stringify(report)}::jsonb,clock_timestamp())`);
     return { report, signature };
   };
+  if (inline)
+    await db.execute(
+      sql`UPDATE progressive_report_storage_policy SET normalization_enabled=false WHERE id=1`,
+    );
   for (let sequence = 3465; sequence <= 3509; sequence++)
     await append(sequence, {
       nullResult: sequence < 3473,
@@ -179,19 +204,23 @@ async function prepare(base: ArchiveFixture) {
   };
 }
 
-async function fixture(run: (f: Fixture) => Promise<void>) {
+async function fixture(
+  run: (f: Fixture) => Promise<void>,
+  inline = false,
+  angles = [0],
+) {
   await withArchiveFixture(
     client,
     "worker",
     async (base) => {
-      const f = await prepare(base);
+      const f = await prepare(base, inline);
       try {
         await run(f);
       } finally {
         await rm(f.volume, { force: true, recursive: true });
       }
     },
-    { reportCount: 1, normalized: true },
+    { reportCount: 1, normalized: true, angles },
   );
 }
 
@@ -327,6 +356,265 @@ async function protectedState(f: Fixture) {
   );
   return state;
 }
+
+async function prepareBackground(f: Fixture) {
+  await f.db.execute(
+    sql`UPDATE sync_api_settings SET remote_solver_auth_token='disposable-test-token' WHERE id=1`,
+  );
+  // The real historical backlog already has a genuine final staging receipt.
+  expect(
+    await stageProgressiveWorkerEvidence(f.db, noEngine, f.executionId, {
+      reportSequence: 3509,
+    }),
+  ).toMatchObject({ kind: "staged" });
+}
+const coveredRows = (f: Fixture) =>
+  f.db
+    .execute(sql`SELECT sequence::int,source_sequence::int,result_sha256,result_byte_size::int,point_signatures
+  FROM progressive_worker_staging_copies WHERE sim_job_id=${f.executionId}::uuid ORDER BY sequence`);
+
+it.each([true, false])(
+  "the ordinary backlog drain covers only exact terminal snapshots without acquiring evidence leases (inline=%s)",
+  async (inline) => {
+    await fixture(async (f) => {
+      await prepareBackground(f);
+      const before = await protectedState(f);
+      const claimed = vi.fn();
+      for (const preferActive of [true, false]) {
+        expect(
+          await stageNextProgressiveWorkerEvidence(f.db, noEngine, {
+            preferActive,
+            afterEvidenceClaimed: claimed,
+          }),
+        ).toBe(true);
+      }
+      expect(
+        await stageNextProgressiveWorkerEvidence(f.db, noEngine, {
+          afterEvidenceClaimed: claimed,
+        }),
+      ).toBe(false);
+      expect(claimed).not.toHaveBeenCalled();
+      expect(
+        await f.db.execute(progressiveStagingSelectionSql(false)),
+      ).toHaveLength(0);
+      expect(
+        await f.db.execute(progressiveEvidenceWakeSql("staging", true)),
+      ).toHaveLength(0);
+      expect(
+        (await f.db.execute(progressiveEvidenceWakeSql("staging", false)))[0]
+          .wake_at,
+      ).toBeNull();
+      const rows = await coveredRows(f);
+      expect(rows.map((r) => r.sequence)).toEqual(
+        range(3473, 3508).filter((n) => n !== f.sourceSequence),
+      );
+      expect(new Set(rows.map((r) => r.source_sequence))).toEqual(
+        new Set([f.sourceSequence]),
+      );
+      expect(new Set(rows.map((r) => r.result_sha256)).size).toBe(1);
+      expect(await protectedState(f)).toEqual(before);
+      // Explicit recovery still performs normal staging for the individual sequence.
+      expect(
+        await stageProgressiveWorkerEvidence(f.db, noEngine, f.executionId, {
+          reportSequence: 3473,
+        }),
+      ).toMatchObject({ kind: "staged", sequence: 3473 });
+    }, inline);
+  },
+);
+
+it("restores ordinary staging eligibility when the genuine source point or its hub acknowledgement disappears", async () => {
+  await fixture(async (f) => {
+    await prepareBackground(f);
+    await stageNextProgressiveWorkerEvidence(f.db, noEngine);
+    expect((await coveredRows(f)).length).toBeGreaterThan(0);
+    const [ack] = await f.db.execute(
+      sql`DELETE FROM progressive_worker_hub_receipts WHERE sim_job_id=${f.executionId}::uuid RETURNING *`,
+    );
+    expect(await coveredRows(f)).toHaveLength(0);
+    const claimed = vi.fn();
+    expect(
+      await stageNextProgressiveWorkerEvidence(f.db, noEngine, {
+        afterEvidenceClaimed: claimed,
+      }),
+    ).toBe(true);
+    expect(claimed).toHaveBeenCalledOnce();
+    await f.db
+      .execute(sql`INSERT INTO progressive_worker_hub_receipts(sim_job_id,sequence,result_attempt_id,point_content_signature,receipt)
+      VALUES(${f.executionId}::uuid,${ack.sequence},${ack.result_attempt_id}::uuid,${ack.point_content_signature},${JSON.stringify(ack.receipt)}::jsonb)`);
+    await stageNextProgressiveWorkerEvidence(f.db, noEngine);
+    const rows = await coveredRows(f);
+    expect(rows.length).toBeGreaterThan(0);
+    await f.db.execute(
+      sql`DELETE FROM progressive_worker_evidence_attempts WHERE sim_job_id=${f.executionId}::uuid AND sequence=${rows[0].source_sequence}`,
+    );
+    expect(await coveredRows(f)).toHaveLength(0);
+  }, true);
+});
+
+it("replaces per-sequence terminal staging with one indexed proof page on the same original reports", async () => {
+  await fixture(async (f) => {
+    await prepareBackground(f);
+    const original = await protectedState(f);
+    await f.db.execute(sql`SAVEPOINT per_sequence_reference`);
+    const start = performance.now();
+    const sequences = range(3473, 3504).filter((n) => n !== f.sourceSequence);
+    for (const n of sequences)
+      expect(
+        await stageProgressiveWorkerEvidence(f.db, noEngine, f.executionId, {
+          reportSequence: n,
+        }),
+      ).toMatchObject({ kind: "staged", sequence: n });
+    const oldMs = Math.round(performance.now() - start);
+    await f.db.execute(sql`ROLLBACK TO SAVEPOINT per_sequence_reference`);
+    await f.db.execute(sql`RELEASE SAVEPOINT per_sequence_reference`);
+    expect(await protectedState(f)).toEqual(original);
+    const fast = performance.now(),
+      claim = vi.fn();
+    expect(
+      await stageNextProgressiveWorkerEvidence(f.db, noEngine, {
+        afterEvidenceClaimed: claim,
+      }),
+    ).toBe(true);
+    const proofMs = Math.round(performance.now() - fast);
+    const rows = await coveredRows(f);
+    expect(rows.map((r) => r.sequence)).toEqual(sequences);
+    expect(claim).not.toHaveBeenCalled();
+    const plan = await f.db
+      .execute(sql`EXPLAIN (FORMAT JSON,COSTS OFF) SELECT 1 FROM public.progressive_worker_closed_staging_copies
+      WHERE sim_job_id=${f.executionId}::uuid AND sequence=3473`);
+    expect(JSON.stringify(plan)).toContain(
+      "progressive_worker_staging_copies_pkey",
+    );
+    expect(await protectedState(f)).toEqual(original);
+    console.info(
+      JSON.stringify({
+        benchmark: "terminal-staging-copies",
+        reports: sequences.length,
+        oldMs,
+        proofMs,
+        oldLeases: sequences.length,
+        newLeases: claim.mock.calls.length,
+        newStagingReceipts: 0,
+        newAttemptAssociations: 0,
+      }),
+    );
+  }, true);
+}, 120000);
+
+it("uses an authenticated cold 0209 staged original and keeps a reopened promise eligible", async () => {
+  await fixture(async (f) => {
+    await prepareBackground(f);
+    const p = await pageFor(f, [f.sourceSequence]);
+    await apply(f, p);
+    expect(await stageNextProgressiveWorkerEvidence(f.db, noEngine)).toBe(true);
+    expect((await coveredRows(f)).length).toBeGreaterThan(0);
+    await stageNextProgressiveWorkerEvidence(f.db, noEngine);
+    expect(
+      await f.db.execute(progressiveStagingSelectionSql(false)),
+    ).toHaveLength(0);
+    await f.db.execute(
+      sql`UPDATE sync_sweep_promises SET status='active',"expiresAt"=clock_timestamp()+interval '1 hour' WHERE id=${f.promiseId}::uuid`,
+    );
+    expect(
+      await f.db.execute(progressiveStagingSelectionSql(true)),
+    ).toHaveLength(1);
+    const claim = vi.fn();
+    expect(
+      await stageNextProgressiveWorkerEvidence(f.db, noEngine, {
+        preferActive: true,
+        afterEvidenceClaimed: claim,
+      }),
+    ).toBe(true);
+    expect(claim).toHaveBeenCalledOnce();
+  });
+});
+it("invalidates existing coverage when a competing attempt appears on another staged sequence", async () => {
+  await fixture(async (f) => {
+    await prepareBackground(f);
+    await stageNextProgressiveWorkerEvidence(f.db, noEngine);
+    expect((await coveredRows(f)).length).toBeGreaterThan(0);
+    await f.db
+      .execute(sql`INSERT INTO progressive_worker_evidence_attempts(sim_job_id,sequence,result_attempt_id,point_content_signature)
+      SELECT sim_job_id,3509,${f.attemptId}::uuid,point_content_signature FROM progressive_worker_evidence_attempts
+      WHERE sim_job_id=${f.executionId}::uuid AND sequence=${f.sourceSequence}`);
+    expect(await coveredRows(f)).toEqual([]);
+    expect(
+      await f.db.execute(progressiveStagingSelectionSql(false)),
+    ).toHaveLength(1);
+  });
+});
+it("routes new AoA progress, changed coefficients and new failed evidence through the normal lease", async () => {
+  await fixture(
+    async (f) => {
+      await prepareBackground(f);
+      await stageNextProgressiveWorkerEvidence(f.db, noEngine);
+      await stageNextProgressiveWorkerEvidence(f.db, noEngine);
+      await f.append(3510, {
+        mutate: (r) => {
+          r.status.completed_cases = 2;
+          const next = structuredClone(r.result!.polars[0].attempts![0]);
+          next.aoa_deg = 1;
+          next.case_slug = "second-reported-case";
+          r.result!.polars[0].attempts!.push(next);
+        },
+      });
+      await f.append(3511, {
+        mutate: (r) => {
+          r.result!.polars[0].attempts![0].cl = 0.4001;
+        },
+      });
+      await f.append(3512, {
+        mutate: (r) => {
+          r.result!.polars[0].attempts![0].error =
+            "different measured rejection";
+        },
+      });
+      await f.append(3513, {
+        mutate: (r) => {
+          r.status.solver_budget_progress!.cases.push({
+            ...r.status.solver_budget_progress!.cases[0],
+            aoa_deg: 1,
+            solver_active_seconds: 0,
+          });
+        },
+      });
+      await f.append(3514, { headerState: "cancelled" });
+      // The terminal head is staged first. All three different histories must
+      // reach their own ingestion lease even if ingest rejects a conflicting solve.
+      await stageProgressiveWorkerEvidence(f.db, noEngine, f.executionId, {
+        reportSequence: 3514,
+      });
+      const newAngle = vi.fn();
+      expect(
+        await stageNextProgressiveWorkerEvidence(f.db, noEngine, {
+          afterEvidenceClaimed: newAngle,
+        }),
+      ).toBe(true);
+      expect(newAngle).toHaveBeenCalledOnce();
+      const [added] = await f.db
+        .execute(sql`SELECT a.aoa_deg,a.status,a.valid_for_polar FROM progressive_worker_evidence_attempts s
+      JOIN result_attempts a ON a.id=s.result_attempt_id WHERE s.sim_job_id=${f.executionId}::uuid AND s.sequence=3510 AND a.aoa_deg=1`);
+      expect(added).toMatchObject({ aoa_deg: 1, valid_for_polar: false });
+      for (let n = 3511; n <= 3513; n++) {
+        const lease = vi.fn(async () => {
+          throw new Error("observed ordinary lease " + n);
+        });
+        await expect(
+          stageNextProgressiveWorkerEvidence(f.db, noEngine, {
+            afterEvidenceClaimed: lease,
+          }),
+        ).rejects.toThrow("observed ordinary lease " + n);
+        expect(lease).toHaveBeenCalledOnce();
+      }
+      expect(
+        (await coveredRows(f)).every((r) => Number(r.sequence) < 3510),
+      ).toBe(true);
+    },
+    true,
+    [0, 1],
+  );
+});
 
 it("reclaims all 36 original-page duplicates using an already-cold genuinely staged source, preserving scientific identities", async () => {
   await fixture(async (f) => {
