@@ -36,7 +36,10 @@ import {
 import { readStoredForceHistory } from "../../api/src/solver-history-reader";
 import { readStoredResultHistories } from "../../api/src/result-history-reader";
 import { verifyHzApiHistory } from "../../api/src/hz-point-history-verify-cli";
-import { handleHzHistoryRequest } from "../src/hz-point-history-custody-cli";
+import {
+  handleHzHistoryRequest,
+  hzHistoryWorkerFailure,
+} from "../src/hz-point-history-custody-cli";
 import {
   migrateHzHistory,
   type HistoryRelayServices,
@@ -243,10 +246,57 @@ it("runs the real operator commands over fixture SSH, resumes a rejected API rea
   expect(state.pending).toMatch(/\.archive\.json$/);
   expect(state.queue).toEqual([{ kind: "steady_history", id: f.r }]);
   const [kept] = await db.execute(
-    sql`SELECT steady_history_archive_id FROM results WHERE id=${f.r}::uuid`,
+    sql`SELECT steady_history,steady_history_archive_id FROM results WHERE id=${f.r}::uuid`,
   );
   expect(kept.steady_history_archive_id).toBeNull();
   await rm(block);
+  const baseline = await readFile(join(progress, "checkpoint.json"), "utf8");
+  const saved = JSON.parse(baseline);
+  const receipt = await readFile(join(progress, saved.pending), "utf8");
+  const blocker = createClient({ max: 1 });
+  try {
+    await blocker.sql.begin(async (held) => {
+      await held.unsafe(
+        `SELECT id FROM "${namespace}".sim_jobs WHERE id=$1::uuid FOR UPDATE`,
+        [f.j],
+      );
+      const failure = await cli("pass", "--readers-ready", "--apply").then(
+        () => null,
+        (error: { stderr: string }) => JSON.parse(error.stderr.trim()),
+      );
+      expect(failure).toMatchObject({
+        operation: "worker_apply_lock_timeout",
+        category: "database_busy",
+        retryable: true,
+      });
+      expect(await readFile(join(progress, "checkpoint.json"), "utf8")).toBe(
+        baseline,
+      );
+      expect(await readFile(join(progress, saved.pending), "utf8")).toBe(
+        receipt,
+      );
+      const [stillWarm] = await db.execute(
+        sql`SELECT steady_history,steady_history_archive_id FROM results WHERE id=${f.r}::uuid`,
+      );
+      expect(stillWarm.steady_history_archive_id).toBeNull();
+      expect(stillWarm.steady_history).toEqual(kept.steady_history);
+    });
+  } finally {
+    await blocker.sql.end({ timeout: 1 });
+  }
+  const permanent = hzHistoryWorkerFailure("apply", {
+    cause: { code: "23514", message: "sensitive path and private data" },
+  });
+  expect({
+    operation: permanent.operation,
+    retryable: permanent.retryable,
+    category: permanent.category,
+  }).toEqual({
+    operation: "worker_apply_23514",
+    retryable: false,
+    category: "integrity",
+  });
+  expect(permanent.message).not.toContain("sensitive");
   const migrated = await cli("migrate", "--readers-ready", "--apply");
   expect(JSON.parse(migrated.stdout.trim().split("\n").at(-1)!)).toMatchObject({
     complete: true,
