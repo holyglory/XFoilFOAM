@@ -1,4 +1,4 @@
-import { sql } from "drizzle-orm";
+import { sql, type SQLWrapper } from "drizzle-orm";
 import {
   MAX_RESULT_HISTORY_BYTES,
   resultHistorySha256,
@@ -27,6 +27,22 @@ export type PublicAttemptFieldOwner = Pick<
   | "evidenceStorageEventId"
 >;
 type Payload = Partial<Record<PublicAttemptField, unknown>>;
+/** Public SQL projection for inline rows. The cold branch supplies only its owner/pointer columns. */
+export function inlinePublicAttemptFieldsSql(
+  payload: SQLWrapper,
+  archiveId: SQLWrapper,
+) {
+  const keys = sql.join(
+    detailFields.map((key) => sql`(${key}::text)`),
+    sql`, `,
+  );
+  return sql<Payload | null>`CASE WHEN ${archiveId} IS NULL THEN (
+    WITH doc AS MATERIALIZED (SELECT ${payload} || '{}'::jsonb AS value)
+    SELECT coalesce(jsonb_object_agg(key,value->key) FILTER (WHERE value ? key),'{}'::jsonb)
+    FROM doc CROSS JOIN (VALUES ${keys}) AS wanted(key) WHERE jsonb_typeof(value)='object'
+  ) END`;
+}
+
 const uuid = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i;
 const sha = /^[a-f0-9]{64}$/;
 
@@ -69,7 +85,7 @@ async function readFields(
   return db.execute<FieldRow>(sql`WITH requested(id,result_id,job_id,archive_id,event_id) AS (VALUES ${values}),
     owned AS MATERIALIZED (
       SELECT a.id,a.result_id,ar.source_instance,proj.projection,a.evidence_payload || '{}'::jsonb AS compact,
-        jsonb_build_array(ar.id,e.id,ar.sim_job_id,ar.generation,ar.source_sha256,ar.source_byte_size,
+        jsonb_build_array(ar.id,e.id,ar.sim_job_id,ar.source_instance,ar.generation,ar.source_sha256,ar.source_byte_size,
           proj.projection->>'compactSha256',cf.attempt_token,cf.evidence_signature,e.verification#>>'{dependencies,applicationSha256}')::text AS pin
       FROM requested q JOIN result_attempts a ON a.id=q.id AND a.result_id=q.result_id
         AND a.sim_job_id IS NOT DISTINCT FROM q.job_id AND a.evidence_archive_id=q.archive_id AND a.evidence_storage_event_id=q.event_id
@@ -88,6 +104,11 @@ async function readFields(
               'crc32c',ar.crc32c,'sourceSha256',ar.source_sha256,'sourceByteSize',ar.source_byte_size)
         AND e.verification->'app' @> jsonb_build_object('attemptId',a.id,'archiveId',ar.id,'forceArchive',true,
               'sourceSha256',ar.source_sha256,'sourceByteSize',ar.source_byte_size)
+        AND (CASE e.verification#>>'{dependencies,verifier}'
+          WHEN 'server-consumers/hz-worker-steady-rans-v1' THEN
+            e.verification#>>'{app,source}'='worker-volume' AND e.verification#>'{dependencies,workerScope}' @>
+              jsonb_build_object('job',ar.sim_job_id,'attempt',a.id,'result',a.result_id,'instance',ar.source_instance)
+          ELSE e.verification#>>'{app,source}'='gcs' END)
         AND e.verification->'dependencies' @> jsonb_build_object('contractVersion',1,'attemptId',a.id,'archiveId',ar.id,
               'sourceSha256',ar.source_sha256, 'readDependenciesSatisfied',true, 'scientificEquivalent',true)
         AND cf.attempt_token::text IS NOT DISTINCT FROM e.verification#>>'{dependencies,progressiveScope,scientific,attemptToken}'
@@ -204,8 +225,7 @@ async function archiveText(
       body.sourceKind !== archive.sourceKind ||
       body.resultId !== archive.resultId ||
       body.resultAttemptId !== archive.resultAttemptId ||
-      typeof body.payloadText !== "string" ||
-      !exactText(body.payloadText, f.original)
+      typeof body.payloadText !== "string"
     )
       return null;
     return body.payloadText;
@@ -241,7 +261,10 @@ async function readPage(
       (f.field_text === null
         ? f.original?.present !== false ||
           f.original.path?.length !== 1 ||
-          f.original.path[0] !== f.field
+          f.original.path[0] !== f.field ||
+          f.original.byteSize !== null ||
+          f.original.sourceSha256 !== null ||
+          f.original.jsonType !== null
         : !presentField(f) || !exactText(f.field_text, f.original))
     ) {
       invalid.add(f.id);
@@ -276,18 +299,25 @@ async function readPage(
         }),
       );
     }
-    const tried = new Map(
-      needed.filter((f) => !invalid.has(f.id)).map((f) => [f.id, f.pin]),
-    );
-    if (tried.size) {
+    const checked = needed.filter((f) => !invalid.has(f.id));
+    if (checked.length) {
+      const ids = new Set(checked.map((f) => f.id));
       const again = await readFields(
         db,
-        owners.filter((r) => tried.has(r.id)),
-        ["fidelity"],
+        owners.filter((r) => ids.has(r.id)),
+        [...new Set(checked.map((f) => f.field))],
       );
-      const current = new Map(again.map((f) => [f.id, f.pin]));
-      for (const [id, pin] of tried)
-        if (current.get(id) !== pin) invalid.add(id);
+      const current = new Map(again.map((f) => [f.id + f.field, f]));
+      for (const f of checked) {
+        const now = current.get(f.id + f.field);
+        if (
+          !now?.removed ||
+          now.pin !== f.pin ||
+          now.original?.sourceSha256 !== f.original.sourceSha256 ||
+          now.original?.byteSize !== f.original.byteSize
+        )
+          invalid.add(f.id);
+      }
     }
   }
   for (const [id, payload] of payloads)
