@@ -120,6 +120,22 @@ export async function verifyPublicAttemptFieldSources(
     const lookup = (owners = [owner]) =>
       readPublicAttemptFields(db, owners, { read });
     expect((await projectedInline(attemptId))[0].fields).toBeNull();
+    const upper = { ...owner, id: owner.id.toUpperCase() };
+    expect(
+      (await readPublicAttemptFields(db, [upper], { read }, ["fidelity"])).get(
+        upper.id,
+      ),
+    ).toEqual({ fidelity: full.fidelity });
+    expect(
+      (
+        await readPublicAttemptFields(
+          db,
+          [upper, { ...owner, resultId: randomUUID() }],
+          { read },
+          ["fidelity"],
+        )
+      ).size,
+    ).toBe(0);
     const expected = {
       frame_track: null,
       frameTrack: full.frameTrack,
@@ -178,6 +194,14 @@ export async function verifyPublicAttemptFieldSources(
       return {
         ...original,
         payloadText: original.payloadText.replace("0.810000", "0.81"),
+      };
+    });
+    expect((await lookup()).has(attemptId)).toBe(false);
+    read.mockImplementationOnce(async (identity) => {
+      const original = await historyStore.read(identity);
+      return {
+        ...original,
+        payloadText: original.payloadText.replace("0.810000", "0.810001"),
       };
     });
     expect((await lookup()).has(attemptId)).toBe(false);
@@ -249,6 +273,57 @@ export async function verifyPublicAttemptFieldSources(
       ),
     ).toEqual(originalSteady.fields);
     expect(read.mock.lastCall![0].sourceKind).toBe("steady_history");
+
+    // Histories with only force arrays removed have all five public keys available locally.
+    const forcePoint = {
+      ...periodicPoint(0, 24, false),
+      frame_track: null,
+      fidelity: "urans_precalc" as const,
+    };
+    const forceOnly = await seedInlineSettledHistory(db, {
+      uransPoint: forcePoint,
+    });
+    const [forceInline] = await projectedInline(forceOnly.attemptId);
+    await bindScientificReceipt(db, forceOnly);
+    const forceCopy = (
+      await archiveAttemptEvidence(db, store, {
+        attemptId: forceOnly.attemptId,
+        bucket: "fixture",
+        sourceInstance: "hub",
+      })
+    ).archive;
+    await settleAttemptEvidenceHistory(
+      db,
+      verifiedAttemptTestDependencies(db, {
+        ...forceOnly,
+        archive: forceCopy,
+        store,
+        memory,
+      }),
+      { attemptId: forceOnly.attemptId, archiveId: forceCopy.id },
+    );
+    const [forceEvent] =
+      await db.execute(sql`SELECT a.evidence_storage_event_id AS event,p.projection->'removedPaths' AS removed FROM result_attempts a
+      JOIN attempt_evidence_history_projections p ON p.result_attempt_id=a.id AND p.archive_id=a.evidence_archive_id WHERE a.id=${forceOnly.attemptId}::uuid`);
+    expect(forceEvent.removed).toEqual(
+      ["t", "cl", "cd", "cm"].map((k) => ["force_history", k]),
+    );
+    read.mockClear();
+    const intact = await readPublicAttemptFields(
+      db,
+      [
+        {
+          id: forceOnly.attemptId,
+          resultId: forceOnly.resultId,
+          simJobId: forceOnly.jobId,
+          evidenceArchiveId: forceCopy.id,
+          evidenceStorageEventId: String(forceEvent.event),
+        },
+      ],
+      { read },
+    );
+    expect(intact.get(forceOnly.attemptId)).toEqual(forceInline.fields);
+    expect(read).not.toHaveBeenCalled();
 
     const rollback = new Error("rollback field proof control");
     await expect(
