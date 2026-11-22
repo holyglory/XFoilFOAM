@@ -30,6 +30,10 @@ import {
   type LegacyBackupReceipt,
 } from "../src/legacy-report-storage";
 import { legacyReportStorageCli } from "../src/legacy-report-storage-cli";
+import {
+  legacyCustodyWorkerFailure,
+  parseLegacyCustodyWorkerFailure,
+} from "../src/legacy-report-storage-custody-worker";
 import { LegacyHubSshStore } from "../src/legacy-report-storage-hub";
 import { runLegacyUntilComplete } from "../src/legacy-report-storage-loop";
 import {
@@ -420,6 +424,255 @@ describe.sequential("worker-only legacy backup and 0198 representation", () => {
       ).not.toMatch(/example|secret|private\/path/);
     }
     expect(JSON.stringify(events)).not.toMatch(/Bearer|@|private\/path/);
+  });
+
+  it("retries the identical saved receipt after transient worker SQL failures and backs off without rereading source bodies", async () => {
+    const scope = await fixture(false),
+      path = await directory(),
+      store = new MemoryBackup();
+    await client.sql`UPDATE progressive_report_storage_policy SET normalization_enabled=true`;
+    const waits: number[] = [],
+      events: Record<string, unknown>[] = [];
+    const query = vi.spyOn(source, "query");
+    let calls = 0,
+      originalPacked: Buffer | undefined,
+      originalReceipt: string | undefined,
+      readsAtFailure = 0;
+    const before = await logical(scope.executions[0].executionId);
+    const applyVerifiedPage = async (
+      page: import("../src/legacy-report-storage").LegacyBackupPage,
+      receipt: LegacyBackupReceipt,
+      receiptFile: string,
+      packed: Buffer,
+    ) => {
+      calls++;
+      if (!originalPacked) {
+        originalPacked = Buffer.from(packed);
+        originalReceipt = receiptFile;
+        readsAtFailure = query.mock.calls.length;
+      }
+      expect(packed.equals(originalPacked)).toBe(true);
+      expect(receiptFile).toBe(originalReceipt);
+      expect(query.mock.calls).toHaveLength(readsAtFailure);
+      if (calls <= 3) {
+        const code = ["55P03", "40P01", "40001"][calls - 1];
+        const failure = legacyCustodyWorkerFailure({
+          code,
+          workerPhase: "job_lock",
+          message: "sensitive SQL body /private/path",
+        });
+        throw legacyOperatorWriteFailure(
+          { code: 1 },
+          "LEGACY_CUSTODY_FAILURE " + JSON.stringify(failure) + "\n",
+          "worker_custody",
+          true,
+        );
+      }
+      await execute(
+        legacyNormalizeSql(page.members, { apply: true, readersReady: true }),
+      );
+      return {
+        sourceReportRowsVerified: page.members.length,
+        sourceReportBodiesRetained: page.members.length,
+        rowsNewlyNormalized: 3,
+        archiveMembersReleased: 0,
+        migrationTransactionsCommitted: 1,
+        sourceDatabaseWrites: true,
+      };
+    };
+    try {
+      const result = await runLegacyUntilComplete(
+        () =>
+          exportLegacyReports({
+            scope,
+            source,
+            store,
+            directory: path,
+            sourceBinding: "worker-lock-recovery",
+            rows: 16,
+            pages: 1,
+            applyVerifiedPage,
+          }),
+        {
+          maxPasses: 4,
+          random: () => 0.5,
+          emit: (event) => events.push(event),
+          sleep: async (ms) => {
+            waits.push(ms);
+            expect(
+              (await readFile(join(path, "pending.jsonl.gz"))).equals(
+                originalPacked!,
+              ),
+            ).toBe(true);
+            const checkpoint = JSON.parse(
+              await readFile(join(path, "checkpoint.json"), "utf8"),
+            );
+            expect(checkpoint.next).toMatchObject({
+              execution: 0,
+              kind: "report",
+              after: 0,
+              copied: 0,
+            });
+            expect(store.objects.size).toBe(1);
+          },
+        },
+      );
+      expect(result).toMatchObject({
+        complete: true,
+        passesAttempted: 4,
+        passesCompleted: 1,
+        transientRetries: 3,
+      });
+      expect(waits).toEqual([1250, 2500, 5000]);
+      expect(
+        events
+          .filter((event) => event.event === "retry")
+          .map((event) => ({
+            sqlState: event.sqlState,
+            phase: event.workerPhase,
+          })),
+      ).toEqual(
+        ["55P03", "40P01", "40001"].map((sqlState) => ({
+          sqlState,
+          phase: "job_lock",
+        })),
+      );
+      expect(await logical(scope.executions[0].executionId)).toEqual(before);
+      expect(store.objects.size).toBe(1);
+      await expect(
+        readFile(join(path, "pending.jsonl.gz")),
+      ).rejects.toMatchObject({ code: "ENOENT" });
+      expect(JSON.stringify(events)).not.toMatch(/sensitive|private\/path/);
+    } finally {
+      query.mockRestore();
+    }
+  });
+
+  it.each(["57P01", "57P02", "57P03", "08006", "CONNECTION_CLOSED"])(
+    "retries a diagnosed worker database interruption %s",
+    async (code) => {
+      const failure = legacyCustodyWorkerFailure({
+        code,
+        workerPhase: "normalization",
+      });
+      const error = legacyOperatorWriteFailure(
+        { code: 1 },
+        "LEGACY_CUSTODY_FAILURE " + JSON.stringify(failure),
+        "worker_custody",
+        true,
+      );
+      expect(error).toMatchObject({
+        retryable: true,
+        details: {
+          category: "database_unavailable",
+          workerPhase: "normalization",
+        },
+      });
+      let calls = 0;
+      const result = await runLegacyUntilComplete(
+        async () => {
+          if (++calls === 1) throw error;
+          return { complete: true, next: 1 };
+        },
+        { maxPasses: 2, random: () => 0, sleep: async () => undefined },
+      );
+      expect(result).toMatchObject({ complete: true, transientRetries: 1 });
+    },
+  );
+
+  it.each(["P0001", "23514", "42501", "57014", "XX000"])(
+    "does not retry hard worker SQLSTATE %s or expose SQL text",
+    async (code) => {
+      const sensitive =
+        "SELECT secret_payload FROM /private/path owner@example.invalid";
+      const failure = legacyCustodyWorkerFailure({
+        code,
+        workerPhase: "custody_registration",
+        message: sensitive,
+        detail: sensitive,
+        query: sensitive,
+      });
+      const error = legacyOperatorWriteFailure(
+        { code: 1 },
+        "LEGACY_CUSTODY_FAILURE " + JSON.stringify(failure),
+        "worker_custody",
+        true,
+      );
+      expect(error).toMatchObject({
+        retryable: false,
+        details: { sqlState: code, workerPhase: "custody_registration" },
+      });
+      let calls = 0;
+      await expect(
+        runLegacyUntilComplete(
+          async () => {
+            calls++;
+            throw error;
+          },
+          { sleep: async () => undefined },
+        ),
+      ).rejects.toBe(error);
+      expect(calls).toBe(1);
+      expect(JSON.stringify({ failure, error })).not.toMatch(
+        /secret_payload|private\/path|example/,
+      );
+    },
+  );
+
+  it("fails malformed, contradictory or duplicate worker diagnostics closed", () => {
+    const valid = legacyCustodyWorkerFailure({
+      code: "55P03",
+      workerPhase: "job_lock",
+    });
+    const line = "LEGACY_CUSTODY_FAILURE " + JSON.stringify(valid);
+    for (const stderr of [
+      line + "\n" + line,
+      "LEGACY_CUSTODY_FAILURE {bad}",
+      "LEGACY_CUSTODY_FAILURE " +
+        JSON.stringify({ ...valid, category: "integrity" }),
+      "LEGACY_CUSTODY_FAILURE " +
+        JSON.stringify({ ...valid, sqlState: "payload secret" }),
+    ]) {
+      expect(parseLegacyCustodyWorkerFailure(stderr)).toBeNull();
+      expect(
+        legacyOperatorWriteFailure({ code: 1 }, stderr, "worker_custody", true),
+      ).toMatchObject({ retryable: false });
+    }
+  });
+
+  it("caps repeated database backoff within the existing invocation budget", async () => {
+    const failure = legacyCustodyWorkerFailure({
+      code: "55P03",
+      workerPhase: "job_lock",
+    });
+    const error = legacyOperatorWriteFailure(
+      { code: 1 },
+      "LEGACY_CUSTODY_FAILURE " + JSON.stringify(failure),
+      "worker_custody",
+      true,
+    );
+    const waits: number[] = [];
+    const result = await runLegacyUntilComplete(
+      async () => {
+        throw error;
+      },
+      {
+        maxPasses: 9,
+        random: () => 0.5,
+        sleep: async (ms) => {
+          waits.push(ms);
+        },
+      },
+    );
+    expect(result).toMatchObject({
+      complete: false,
+      stopReason: "pass_budget_exhausted",
+      transientRetries: 9,
+      passesCompleted: 0,
+    });
+    expect(waits).toEqual([
+      1250, 2500, 5000, 10000, 20000, 40000, 60000, 60000,
+    ]);
   });
 
   it("pauses writes for deployment without advancing the page and preserves the pre-lock binding", async () => {

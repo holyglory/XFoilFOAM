@@ -22,6 +22,10 @@ export type LegacyStorageCategory =
   | "container_restarting"
   | "gcs_rate_limited"
   | "gcs_server_error"
+  | "database_lock_timeout"
+  | "database_deadlock"
+  | "database_serialization_failure"
+  | "database_unavailable"
   | "credentials_denied"
   | "host_key_denied"
   | "bad_input"
@@ -38,6 +42,8 @@ export interface LegacyStorageFailureDetails {
   signal: string | null;
   httpStatus: number | null;
   localCode: string | null;
+  sqlState?: string | null;
+  workerPhase?: string;
 }
 const operations = new Set<string>([
   "hub_put",
@@ -62,6 +68,10 @@ const categories = new Set<string>([
   "container_restarting",
   "gcs_rate_limited",
   "gcs_server_error",
+  "database_lock_timeout",
+  "database_deadlock",
+  "database_serialization_failure",
+  "database_unavailable",
   "credentials_denied",
   "host_key_denied",
   "bad_input",
@@ -78,6 +88,10 @@ const transientCategories = new Set<LegacyStorageCategory>([
   "container_restarting",
   "gcs_rate_limited",
   "gcs_server_error",
+  "database_lock_timeout",
+  "database_deadlock",
+  "database_serialization_failure",
+  "database_unavailable",
 ]);
 export class LegacyStorageOperationError extends Error {
   readonly details: LegacyStorageFailureDetails;
@@ -89,6 +103,8 @@ export class LegacyStorageOperationError extends Error {
     signal?: unknown;
     httpStatus?: unknown;
     localCode?: unknown;
+    sqlState?: unknown;
+    workerPhase?: unknown;
   }) {
     const operation = (
       operations.has(String(input.operation)) ? input.operation : "operator_cli"
@@ -133,6 +149,25 @@ export class LegacyStorageOperationError extends Error {
       ].includes(String(input.localCode))
         ? String(input.localCode)
         : null,
+      ...(input.sqlState === null ||
+      (typeof input.sqlState === "string" &&
+        /^[0-9A-Z]{5}$/.test(input.sqlState))
+        ? { sqlState: input.sqlState }
+        : {}),
+      ...([
+        "worker",
+        "replay_verification",
+        "transaction_setup",
+        "settings_lock",
+        "job_lock",
+        "catalog_read",
+        "custody_registration",
+        "report_state",
+        "normalization",
+        "readback",
+      ].includes(String(input.workerPhase))
+        ? { workerPhase: String(input.workerPhase) }
+        : {}),
     };
     this.retryable = transientCategories.has(category);
   }

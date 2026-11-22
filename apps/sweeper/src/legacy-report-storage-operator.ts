@@ -1,8 +1,10 @@
 import {
+  LegacyStorageOperationError,
   legacySshOperationError,
   type LegacyStorageOperation,
 } from "./legacy-report-storage-gcs";
 import { legacyBound } from "@aerodb/db/legacy-report-storage";
+import { parseLegacyCustodyWorkerFailure } from "./legacy-report-storage-custody-worker";
 
 export class LegacyOperatorPaused extends Error {
   readonly code = "deployment_lock_held";
@@ -34,5 +36,20 @@ export function legacyOperatorWriteFailure(
 ): Error {
   if (Number((error as { code?: unknown })?.code) === 75)
     return new LegacyOperatorPaused();
+  if (
+    operation === "worker_custody" &&
+    Number((error as { code?: unknown })?.code) === 1
+  ) {
+    const failure = parseLegacyCustodyWorkerFailure(stderr);
+    if (failure)
+      return new LegacyStorageOperationError({
+        operation,
+        category: failure.category,
+        sqlState: failure.sqlState,
+        workerPhase: failure.workerPhase,
+        exitCode: 1,
+        signal: (error as { signal?: unknown }).signal,
+      });
+  }
   return legacySshOperationError(operation, error, stderr, provenTarget);
 }

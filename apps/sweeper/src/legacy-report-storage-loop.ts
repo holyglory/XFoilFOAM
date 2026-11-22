@@ -12,6 +12,7 @@ export async function runLegacyUntilComplete<
     yieldMs?: number;
     now?: () => number;
     sleep?: (milliseconds: number) => Promise<void>;
+    random?: () => number;
     emit?: (event: Record<string, unknown>) => void;
     signal?: AbortSignal;
   } = {},
@@ -37,6 +38,7 @@ export async function runLegacyUntilComplete<
     sleep =
       input.sleep ??
       ((ms) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  const random = input.random ?? Math.random;
   const emit = input.emit ?? (() => undefined),
     started = now(),
     deadline = started + maxSeconds * 1000;
@@ -93,6 +95,18 @@ export async function runLegacyUntilComplete<
         failures++;
         transientRetries++;
         backoff = Math.min(60000, 1000 * 2 ** Math.min(failures - 1, 6));
+        if (error.details.category.startsWith("database_")) {
+          // Repeated lock retries should not synchronize with the same worker
+          // heartbeat/ingest cadence. Keep the existing 60s ceiling and retry
+          // this durable pending receipt, never advance or recollect the page.
+          const jitter = random();
+          if (!Number.isFinite(jitter) || jitter < 0 || jitter >= 1)
+            throw new Error("Invalid database retry jitter");
+          backoff = Math.min(
+            60000,
+            backoff + Math.floor((jitter * backoff) / 2),
+          );
+        }
         emit({
           event: "retry",
           pass: attempted,

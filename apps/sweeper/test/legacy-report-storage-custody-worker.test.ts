@@ -19,16 +19,127 @@ import { withArchiveFixture } from "./progressive-report-archive-fixture";
 import { legacyNormalizationTelemetry } from "../src/legacy-report-storage-migration";
 import {
   applyLegacyCustodyWorkerTransaction,
+  lockLegacyCustodyWorkerScope,
+  legacyCustodyWorkerFailure,
   type LegacyWorkerSqlTransaction,
 } from "../src/legacy-report-storage-custody-worker";
+import { legacyOperatorWriteFailure } from "../src/legacy-report-storage-operator";
 
 // Run in the migrated archive graph (schema + seed), not the empty-schema case.
 // This is the production worker transaction with the real postgres-js driver,
 // actual 0205 registration/compaction and rollback-owned fixture data.
 const client = createClient({ max: 1 });
-afterAll(() => client.sql.end());
+const blockerClient = createClient({ max: 1 }),
+  retryClient = createClient({ max: 1 });
+afterAll(async () => {
+  await Promise.all([
+    client.sql.end(),
+    blockerClient.sql.end(),
+    retryClient.sql.end(),
+  ]);
+});
 const digest = (value: string | Buffer) =>
   createHash("sha256").update(value).digest("hex");
+
+it.each(["job", "settings"])(
+  "releases the transaction after a real %s row contention and retries the same scope after its owner finishes",
+  async (target) => {
+    // This committed fixture owns only a disposable job, so another real
+    // postgres-js connection can lock it. No campaign or solver work is launched.
+    const id = randomUUID();
+    const [airfoil] =
+      await client.sql`SELECT id FROM public.airfoils ORDER BY id LIMIT 1`;
+    if (!airfoil)
+      throw new Error("The governed graph must seed its disposable catalog");
+    await client.sql`INSERT INTO public.sim_jobs(id,airfoil_id,bc_ids,reference_chord_m,status)
+    VALUES (${id},${airfoil.id},'[]'::jsonb,1,'failed')`;
+    let release!: () => void,
+      acquired!: () => void,
+      acquireFailed!: (error: unknown) => void;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const locked = new Promise<void>((resolve, reject) => {
+      acquired = resolve;
+      acquireFailed = reject;
+    });
+    const owner = blockerClient.sql.begin(async (tx) => {
+      if (target === "job")
+        await tx`SELECT id FROM public.sim_jobs WHERE id=${id} FOR UPDATE`;
+      else
+        await tx`SELECT id FROM public.sync_api_settings WHERE id=1 FOR UPDATE`;
+      acquired();
+      await held;
+    });
+    // Observe early acquisition errors without leaving the contender suspended.
+    void owner.catch(acquireFailed);
+    try {
+      await locked;
+      let failure: unknown;
+      try {
+        await retryClient.sql.begin(async (tx) => {
+          await lockLegacyCustodyWorkerScope(
+            tx as unknown as LegacyWorkerSqlTransaction,
+            [id],
+          );
+        });
+      } catch (error) {
+        failure = error;
+      }
+      const diagnostic = legacyCustodyWorkerFailure(failure);
+      expect(diagnostic).toMatchObject({
+        sqlState: "55P03",
+        category: "database_lock_timeout",
+        workerPhase: target === "job" ? "job_lock" : "settings_lock",
+      });
+      const wire = legacyOperatorWriteFailure(
+        { code: 1 },
+        "LEGACY_CUSTODY_FAILURE " + JSON.stringify(diagnostic),
+        "worker_custody",
+        true,
+      );
+      expect(wire).toMatchObject({
+        retryable: true,
+        details: { sqlState: "55P03" },
+      });
+      if (target === "job") {
+        // The failed job acquisition has rolled back its earlier settings SHARE
+        // lock; a telemetry writer can now take its normal update lock at once.
+        await retryClient.sql.begin(async (tx) => {
+          await tx`SELECT id FROM public.sync_api_settings WHERE id=1 FOR NO KEY UPDATE NOWAIT`;
+        });
+      }
+      release();
+      await owner;
+      await retryClient.sql.begin(async (tx) => {
+        await lockLegacyCustodyWorkerScope(
+          tx as unknown as LegacyWorkerSqlTransaction,
+          [id],
+        );
+      });
+      const [unchanged] =
+        await client.sql`SELECT status,request_payload FROM public.sim_jobs WHERE id=${id}`;
+      expect(unchanged).toEqual({ status: "failed", request_payload: null });
+    } finally {
+      release();
+      await owner;
+      await client.sql`DELETE FROM public.sim_jobs WHERE id=${id}`;
+    }
+  },
+  30_000,
+);
+
+it("takes no settings or job locks for an empty worker scope", async () => {
+  let calls = 0;
+  const tx = {
+    unsafe: () => {
+      calls++;
+      throw new Error("Empty scope must be inert");
+    },
+  } as unknown as LegacyWorkerSqlTransaction;
+  await lockLegacyCustodyWorkerScope(tx, []);
+  expect(calls).toBe(0);
+});
 
 it.each([false, true])(
   "binds the real worker driver and distinguishes report/conflict retention on replay (mixed=%s)",

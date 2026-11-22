@@ -81,7 +81,7 @@ export class LegacyWorkingVolumeNormalizer implements LegacyPageNormalizer {
           module: ts.ModuleKind.ES2022,
         },
       }).outputText +
-      "\nlegacyCustodyWorkerStdin().catch(()=>{console.error('Legacy custody worker verification or transaction failed; pending bytes retained');process.exitCode=1;});\n";
+      "\nlegacyCustodyWorkerStdin().catch((error)=>{console.error('LEGACY_CUSTODY_FAILURE '+JSON.stringify(legacyCustodyWorkerFailure(error)));process.exitCode=1;});\n";
     const launch = `docker exec -i ${this.container} node --import tsx --input-type=module -e ${quote(program)}`;
     const hostProgram = `if [ "$(docker inspect --format '{{.State.Running}}' ${this.container} 2>/dev/null)" != true ]; then cat >/dev/null; printf '%s\\n' '{"mode":"fallback","reason":"supporting_worker_service_unavailable"}'; else exec ${launch}; fi`;
     const command = legacyOperatorWriteCommand(`sh -c ${quote(hostProgram)}`);
