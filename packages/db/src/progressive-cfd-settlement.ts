@@ -1,3 +1,4 @@
+import { attemptDigestColumns, matchesOriginalAttemptDigest } from "./attempt-evidence-digest";
 import { randomUUID } from "node:crypto";
 import { sql } from "drizzle-orm";
 import { effectiveProgressiveStageSql } from "./progressive-execution-policy";
@@ -120,7 +121,7 @@ export async function withRepairedProgressiveCfdEvidence(
           attempt.sim_job_id, attempt.execution_recipe_id,
           recipe.source_revision_id, recipe.execution_revision_id, recipe.recipe AS execution_recipe,
           generation_scope.revision_id AS scope_revision_id,
-          raw.airfoil_id, raw.engine_job_id, raw.engine_case_slug, raw.evidence_payload,
+          raw.airfoil_id, raw.engine_job_id, raw.engine_case_slug, ${attemptDigestColumns(sql`raw`)},
           evidence.evidence_signature AS payload_signature,
           raw.status AS raw_status, raw.source AS raw_source, raw.valid_for_polar,
           raw.regime, raw.evidence_payload->>'fidelity' AS fidelity,
@@ -213,7 +214,7 @@ export async function withRepairedProgressiveCfdEvidence(
           sourceRevisionId: scope.source_revision_id,
           recipe: scope.execution_recipe,
         }) !== scope.execution_recipe_id ||
-        analysisContentHash(scope.evidence_payload) !== scope.payload_signature
+        !matchesOriginalAttemptDigest(scope, scope.payload_signature)
       )
         return "waiting";
       if (
@@ -225,7 +226,7 @@ export async function withRepairedProgressiveCfdEvidence(
             parent.token, parent.execution_recipe_id,
             parent_recipe.recipe AS parent_recipe, parent_recipe.source_revision_id,
             parent_job.id AS parent_job_id, parent_job.engine_job_id, parent_job.request_payload,
-            diagnostic.evidence_payload, classification.state AS classification,
+            ${attemptDigestColumns(sql`diagnostic`, true)}, classification.state AS classification,
             evidence.evidence_signature, stopped.proof, stopped.proof_signature
           FROM progressive_cfd_recovery_claims claim
           JOIN progressive_cfd_recovery_plans plan ON plan.id = claim.recovery_plan_id
@@ -268,8 +269,7 @@ export async function withRepairedProgressiveCfdEvidence(
             sourceRevisionId: recovery.source_revision_id,
             recipe: recovery.parent_recipe,
           }) !== recovery.execution_recipe_id ||
-          analysisContentHash(recovery.evidence_payload) !==
-            recovery.evidence_signature ||
+          !matchesOriginalAttemptDigest(recovery, recovery.evidence_signature) ||
           recovery.evidence_signature !== recovery.diagnostic_signature ||
           analysisContentHash(recovery.proof) !== recovery.proof_signature
         )
@@ -662,7 +662,7 @@ export async function settleProgressiveCfdExecution(
         return { ...counts, waiting: 1 };
     }
     const sources = await connection.execute(sql`
-      SELECT receipt.evidence_signature, raw.evidence_payload FROM progressive_cfd_attempts attempt
+      SELECT receipt.evidence_signature, ${attemptDigestColumns(sql`raw`)} FROM progressive_cfd_attempts attempt
       JOIN progressive_cfd_evidence receipt ON receipt.attempt_token = attempt.token
       JOIN result_attempts raw ON raw.id = receipt.result_attempt_id WHERE attempt.sim_job_id = ${simJobId}
         ${selectedReceiptScope} LIMIT 2049
@@ -671,8 +671,7 @@ export async function settleProgressiveCfdExecution(
       sources.length > 2048 ||
       sources.some(
         (source) =>
-          analysisContentHash(source.evidence_payload) !==
-          source.evidence_signature,
+          !matchesOriginalAttemptDigest(source, source.evidence_signature),
       )
     )
       throw new Error(

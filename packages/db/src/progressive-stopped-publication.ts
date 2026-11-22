@@ -1,3 +1,4 @@
+import { attemptDigestColumns, matchesOriginalAttemptDigest } from "./attempt-evidence-digest";
 import { sql } from "drizzle-orm";
 import type { DB } from "./client";
 import { analysisContentHash, canonicalAnalysisJson } from "./analysis-target";
@@ -93,7 +94,7 @@ export async function readStoppedAcceptedProgressivePublication(
   for (const entry of retained.sources) {
     if (entry.storageOnly || !entry.archived || !final.has(entry.delivery.progressiveEvidence.pointContentSignature)) continue;
     const [raw] = await db.execute(sql`SELECT raw.id,raw.result_id,raw.airfoil_id,raw.aoa_deg,raw.simulation_preset_revision_id,
-        raw.evidence_payload,evidence.attempt_token,evidence.evidence_signature,result.airfoil_id AS cell_airfoil_id,
+        ${attemptDigestColumns(sql`raw`, true)},evidence.attempt_token,evidence.evidence_signature,result.airfoil_id AS cell_airfoil_id,
         result.aoa_deg AS cell_aoa_deg,result.simulation_preset_revision_id AS cell_revision_id
       FROM result_attempts raw JOIN progressive_cfd_evidence evidence ON evidence.result_attempt_id=raw.id
       JOIN result_classifications classification ON classification.result_attempt_id=raw.id AND classification.state='accepted'
@@ -114,7 +115,7 @@ export async function readStoppedAcceptedProgressivePublication(
       unit.source_revision_id !== unit.current_source_revision_id ||
       canonicalAnalysisJson(unit.current_recipe) !== canonicalAnalysisJson(unit.recipe) ||
       analysisContentHash({ sourceRevisionId: unit.source_revision_id, recipe: unit.recipe }) !== unit.execution_recipe_id ||
-      analysisContentHash(raw.evidence_payload) !== raw.evidence_signature) refuse();
+      !matchesOriginalAttemptDigest(raw, raw.evidence_signature)) refuse();
     const physical = unit.physical as Parameters<typeof progressiveEvidencePreservesGeometry>[0];
     const geometry = (unit.current_geometry as Array<{ x: number; y: number }>).map(({ x, y }) => [x, y]);
     if (analysisContentHash(unit.physical) !== unit.target_id ||

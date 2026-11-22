@@ -1,3 +1,4 @@
+import { attemptDigestColumns, matchesOriginalAttemptDigest, originalAttemptDigest } from "./attempt-evidence-digest";
 import { sql } from "drizzle-orm";
 import { analysisContentHash, canonicalAnalysisJson } from "./analysis-target";
 import type { DB } from "./client";
@@ -576,7 +577,7 @@ export async function readProgressiveDiagnosticRecoveryTrigger(
       assertProgressiveRemotePhysicalCase(source, unit.snapshot);
     }
     const physical = await connection.execute(sql`SELECT raw.id, raw.sim_job_id, raw.engine_job_id, raw.airfoil_id,
-      raw.simulation_preset_revision_id, raw.aoa_deg, raw.evidence_payload, evidence.evidence_signature, evidence.attempt_token
+      raw.simulation_preset_revision_id, raw.aoa_deg, ${attemptDigestColumns(sql`raw`)}, evidence.evidence_signature, evidence.attempt_token
       FROM progressive_cfd_attempts attempt JOIN progressive_cfd_evidence evidence ON evidence.attempt_token = attempt.token
       JOIN result_attempts raw ON raw.id = evidence.result_attempt_id
       WHERE attempt.sim_job_id = ${simJobId}::uuid ORDER BY raw.id LIMIT 2049`);
@@ -585,7 +586,7 @@ export async function readProgressiveDiagnosticRecoveryTrigger(
       const unit = scope.units.find((candidate) => candidate.token === raw.attempt_token);
       return !unit || !retained.has(String(raw.id)) || raw.sim_job_id !== simJobId || raw.engine_job_id !== simJobId ||
         raw.airfoil_id !== scope.airfoilId || raw.simulation_preset_revision_id !== unit.execution_revision_id ||
-        raw.aoa_deg !== unit.aoa_deg || analysisContentHash(raw.evidence_payload) !== raw.evidence_signature;
+        raw.aoa_deg !== unit.aoa_deg || !matchesOriginalAttemptDigest(raw, raw.evidence_signature);
     })) throw new ProgressiveRemoteEvidenceConflict("Numerical recovery changed retained physical evidence identity or coverage");
     const unit = scope.units.find((candidate) => candidate.aoa_deg === validated.triggerAoaDeg)!;
     return {
@@ -779,7 +780,7 @@ export async function recordProgressiveCfdEvidence(
     );
     const evidence = ids.length
       ? await connection.execute(sql`
-      SELECT attempt.id, attempt.airfoil_id, attempt.aoa_deg, attempt.simulation_preset_revision_id, attempt.evidence_payload,
+      SELECT attempt.id, attempt.airfoil_id, attempt.aoa_deg, attempt.simulation_preset_revision_id, ${attemptDigestColumns(sql`attempt`, true)},
         cell.airfoil_id AS cell_airfoil_id, cell.aoa_deg AS cell_aoa_deg,
         cell.simulation_preset_revision_id AS cell_revision_id
       FROM result_attempts attempt JOIN results cell ON cell.id = attempt.result_id
@@ -821,7 +822,8 @@ export async function recordProgressiveCfdEvidence(
         throw new Error(
           "Progressive CFD evidence lacks measured cumulative solver time",
         );
-      const signature = analysisContentHash(payload);
+      const signature = originalAttemptDigest(row);
+      if (!signature) throw new Error("Progressive CFD evidence requires its authenticated original source");
       const guard = payload?.solver_budget as
         | Record<string, unknown>
         | null

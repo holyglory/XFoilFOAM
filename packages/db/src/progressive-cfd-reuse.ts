@@ -1,3 +1,4 @@
+import { attemptDigestColumns, matchesOriginalAttemptDigest } from "./attempt-evidence-digest";
 import { sql } from "drizzle-orm";
 import type { DB } from "./client";
 import { analysisContentHash } from "./analysis-target";
@@ -69,7 +70,7 @@ export async function reuseAcceptedProgressiveCfdEvidence(
         source_generation.id AS source_generation_id,
         evidence.result_attempt_id AS source_result_attempt_id,
         evidence.evidence_signature AS source_evidence_signature,
-        raw.evidence_payload AS source_evidence_payload,
+        ${attemptDigestColumns(sql`raw`)},
         execution_recipe.execution_revision_id,
         raw.simulation_preset_revision_id AS result_revision_id,
         stopped.proof, stopped.proof_signature
@@ -148,8 +149,7 @@ export async function reuseAcceptedProgressiveCfdEvidence(
           sourceRevisionId: String(row.successor_revision_id),
           recipe: row.successor_recipe,
         }) !== row.source_execution_recipe_id ||
-        analysisContentHash(row.source_evidence_payload) !==
-          row.source_evidence_signature ||
+        !matchesOriginalAttemptDigest(row, row.source_evidence_signature) ||
         analysisContentHash(row.proof) !== row.proof_signature
       )
         continue;
@@ -249,7 +249,7 @@ export async function reuseInformativeProgressiveCfdEvidence(
         source_generation.id AS source_generation_id,
         evidence.result_attempt_id AS source_result_attempt_id,
         evidence.evidence_signature AS source_evidence_signature,
-        raw.evidence_payload AS source_evidence_payload,
+        ${attemptDigestColumns(sql`raw`)},
         execution_recipe.execution_revision_id,
         raw.simulation_preset_revision_id AS result_revision_id,
         stopped.proof, stopped.proof_signature
@@ -368,8 +368,7 @@ export async function reuseInformativeProgressiveCfdEvidence(
           sourceRevisionId: String(row.successor_revision_id),
           recipe: row.successor_recipe,
         }) !== row.source_execution_recipe_id ||
-        analysisContentHash(row.source_evidence_payload) !==
-          row.source_evidence_signature ||
+        !matchesOriginalAttemptDigest(row, row.source_evidence_signature) ||
         analysisContentHash(row.proof) !== row.proof_signature
       )
         continue;

@@ -1,3 +1,4 @@
+import { attemptDigestColumns, matchesOriginalAttemptDigest } from "./attempt-evidence-digest";
 import { resolveStoredProgressiveReport } from "./progressive-report-reader";
 import { sql } from "drizzle-orm";
 import type { DB } from "./client";
@@ -68,7 +69,7 @@ async function reuseCurrentUnit(db: DB, candidate: Candidate): Promise<"reused" 
         generation.benchmark_only,target_scope.revision_id,target_scope.angles,target.physical,target.airfoil_id,airfoil.points,
         source.token,source.sim_job_id,source.execution_recipe_id,source.outcome,source.finished_at,
         recipe.recipe AS execution_recipe,recipe.source_revision_id,recipe.execution_revision_id,revision.snapshot,
-        raw.result_id,raw.simulation_preset_revision_id,raw.evidence_payload,evidence.evidence_signature,
+        raw.result_id,raw.simulation_preset_revision_id,${attemptDigestColumns(sql`raw`, true)},evidence.evidence_signature,
         raw.aoa_deg=unit.aoa_deg AND raw.airfoil_id=target.airfoil_id AND raw.sim_job_id=source.sim_job_id AS exact_cell,
         EXISTS(SELECT 1 FROM progressive_cfd_recovery_plans plan WHERE plan.unit_id=unit.id) OR
         EXISTS(SELECT 1 FROM progressive_cfd_budget_extensions extension WHERE extension.unit_id=unit.id) OR
@@ -100,7 +101,7 @@ async function reuseCurrentUnit(db: DB, candidate: Candidate): Promise<"reused" 
       scope.source_revision_id === scope.revision_id && scope.simulation_preset_revision_id === scope.execution_revision_id &&
       canonicalAnalysisJson(scope.recipe) === canonicalAnalysisJson(scope.execution_recipe) &&
       analysisContentHash({ sourceRevisionId: scope.source_revision_id, recipe: scope.recipe }) === scope.execution_recipe_id &&
-      analysisContentHash(scope.evidence_payload) === scope.evidence_signature, "physical/numerical evidence identity changed");
+      matchesOriginalAttemptDigest(scope, scope.evidence_signature), "physical/numerical evidence identity changed");
     const physical = scope.physical as Parameters<typeof progressiveEvidencePreservesGeometry>[0];
     const geometry = (scope.points as Array<{ x: number; y: number }>).map(({ x, y }) => [x, y]);
     requireProof(analysisContentHash(scope.physical) === scope.target_id &&

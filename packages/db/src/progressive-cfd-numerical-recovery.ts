@@ -1,3 +1,4 @@
+import { attemptDigestColumns, matchesOriginalAttemptDigest } from "./attempt-evidence-digest";
 import { sql, type SQL } from "drizzle-orm";
 import { PROGRESSIVE_COMPUTE_POLICY } from "@aerodb/core";
 import { analysisContentHash, canonicalAnalysisJson } from "./analysis-target";
@@ -222,7 +223,7 @@ export async function recordProgressiveCfdRecoveryPlans(
         );
     }
     const evidence = (await connection.execute(sql`
-      SELECT raw.id, receipt.attempt_token, raw.aoa_deg, raw.regime, raw.evidence_payload,
+      SELECT raw.id, receipt.attempt_token, raw.aoa_deg, raw.regime, ${attemptDigestColumns(sql`raw`, true)},
         receipt.evidence_signature, classification.state AS classification,
         (raw.status = 'done' AND raw.valid_for_polar AND classification.state = 'accepted'
           AND coalesce((SELECT review.verdict FROM result_review_verdicts review WHERE review.result_id = raw.result_id
@@ -236,8 +237,7 @@ export async function recordProgressiveCfdRecoveryPlans(
       evidence.length > 2048 ||
       evidence.some(
         (item) =>
-          analysisContentHash(item.evidence_payload) !==
-          item.evidence_signature,
+          !matchesOriginalAttemptDigest(item, item.evidence_signature),
       )
     )
       throw new Error(
@@ -481,7 +481,7 @@ export async function recordProgressiveCfdMaterialDomainRecoveryPlans(
       );
     const evidence = (await connection.execute(sql`
       SELECT attempt.unit_id, raw.id, receipt.evidence_signature,
-        raw.evidence_payload, raw.status, raw.valid_for_polar, raw.regime
+        ${attemptDigestColumns(sql`raw`, true)}, raw.status, raw.valid_for_polar, raw.regime
       FROM progressive_cfd_attempts attempt
       JOIN progressive_cfd_evidence receipt ON receipt.attempt_token = attempt.token
       JOIN result_attempts raw ON raw.id = receipt.result_attempt_id
@@ -509,7 +509,7 @@ export async function recordProgressiveCfdMaterialDomainRecoveryPlans(
     for (const item of evidence) {
       if (
         !item.evidence_payload ||
-        analysisContentHash(item.evidence_payload) !== item.evidence_signature
+        !matchesOriginalAttemptDigest(item, item.evidence_signature)
       )
         throw new Error(
           "Material-domain recovery has changed diagnostic evidence",

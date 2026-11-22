@@ -4,6 +4,7 @@ import { expect, vi } from "vitest";
 import type { DB } from "../src/client";
 import { analysisContentHash } from "../src/analysis-target";
 import { recordProgressiveCfdEvidence } from "../src/progressive-cfd-evidence";
+import { acknowledgeProgressiveCfdExecutionStop, settleProgressiveCfdExecution } from "../src/progressive-cfd-settlement";
 import type { ProgressiveCfdLease } from "../src/progressive-cfd";
 import {
   claimProgressivePolarFit,
@@ -230,6 +231,12 @@ export async function verifyReceiptBearingHistory(
     );
     await db.execute(sql`UPDATE progressive_cfd_units SET state='complete',lease_token=NULL,lease_owner=NULL,lease_until=NULL
       WHERE id IN (SELECT unit_id FROM progressive_cfd_attempts WHERE sim_job_id=${job}::uuid)`);
+    await acknowledgeProgressiveCfdExecutionStop(db, {
+      simJobId: job, proof: {version:1,job_id:String(owner.engine_job_id),execution_stopped:true,
+        producer_stopped:true,namespace_verified:true,remaining:[],observed_at:new Date().toISOString(),error:null,
+        fence:"terminal_result",ownership_basis:"recorded_execution_namespace"},
+    });
+    const inlineSettlement = await settleProgressiveCfdExecution(db, job);
     expect(await limiter()).toBeNull();
     const deps = {
       ...(await configuredAttemptEvidenceSettlementDependencies(db)),
@@ -265,6 +272,7 @@ export async function verifyReceiptBearingHistory(
       maxRows: 2,
     });
     expect(pass).toMatchObject({ shortened: 2, failures: [] });
+    expect(await settleProgressiveCfdExecution(db, job)).toEqual(inlineSettlement);
     expect(
       await attemptEvidenceShorteningCandidates(db, null, "receipt-bearing"),
     ).toHaveLength(2);
