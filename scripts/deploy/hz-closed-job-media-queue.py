@@ -126,6 +126,13 @@ def match_roster(row, receipt):
                m["path"].removeprefix("jobs/" + row["id"] + "/"), m["sha"], m["bytes"]) for m in row["media"]}
     require(images == roster and len(images) == len(row["media"]) and
             len(receipt["plan"]["mediaFiles"]) == 2 * len(images), "served media differ from the named roster")
+    facts = {m["id"]: m for m in receipt["keptMediaRows"]}
+    owners = {p["attemptId"]: (p["resultId"], p["canonicalAttemptId"], p["canonicalResultId"])
+              for p in receipt["points"]}
+    require(len(owners) == len(receipt["points"]) and
+            all(owners.get(m["attempt"]) == (m["result"], m["hubAttempt"], m["hubResult"]) and
+                facts[m["id"]]["evidenceSha256"] == m["manifest"] for m in row["media"]),
+            "stored media and signed canonical point owners differ")
     if not receipt["plan"]["files"]:
         return
     known = {(a["upload"], a["generation"], a["sha"], a["bytes"]) for a in row["objects"]}

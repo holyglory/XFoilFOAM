@@ -1299,17 +1299,22 @@ def test_media_queue_uses_the_same_lane_and_recovers_a_real_persisted_effect(tmp
     plan = {"plan": "b"*64, "files": 1, "bytes": 9, "plannedAllocatedBytes": 4096,
             "workingPaths": ["cases/old/p"], "mediaFiles": [{"path": path}, {"path": "cases/point/images/p.png"}]}
     row = {"id": job, "expectedPointCount": 1, "media": [{"id": img, "attempt": attempt, "result": result, "field": "p",
-           "path": f"jobs/{job}/{path}", "sha": "c"*64, "bytes": 20}],
+           "path": f"jobs/{job}/{path}", "sha": "c"*64, "bytes": 20, "hubAttempt": attempt,
+           "hubResult": result, "manifest": "d"*64}],
            "objects": [{"upload": "source", "generation": "1", "sha": "a"*64, "bytes": 123}]}
     receipt = {
         "job": job, "helperRevision": "source", "helperSha256": "helper", "dependenciesSha256": "dependencies",
         "nodePackagesSha256": "node", "nativePackages": {"worker": "worker", "gateway": "api"}, "jobsInode": [3, 4],
         "deployLockInode": [5, 6], "lockInode": [7, 8], "jobInode": [9, 10], "containers": {"api": "frozen"},
-        "deployedRevision": "release", "readbacks": [readback], "points": [{"attemptId": attempt}],
+        "deployedRevision": "release", "readbacks": [readback], "points": [{"attemptId": attempt, "resultId": result,
+                                                      "canonicalAttemptId": attempt, "canonicalResultId": result}],
         "scientificSha256": "science", "mediaSha256": "images", "plan": plan,
         "keptMediaRows": [{"id": img, "resultId": result, "attemptId": attempt, "field": "p",
-                           "path": path, "sha256": "c"*64, "byteSize": 20}],
+                           "path": path, "sha256": "c"*64, "byteSize": 20, "evidenceSha256": "d"*64}],
     }
+    with pytest.raises(ValueError, match="canonical point owners"):
+        operator["match_roster"](row, dict(receipt, databaseReadOnly=True, status="proved", settled=False,
+                                 points=[{**receipt["points"][0], "canonicalResultId": job}]))
     calls = []
 
     def invoke(_, mode, jid, expected=None, proof=None):
