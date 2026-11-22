@@ -12,6 +12,15 @@ import { progressiveRemotePointProjection } from "./progressive-remote-point-pro
 export const RECEIPT_SOURCE_VERIFIER =
   "server-consumers/receipt-bearing-rans-v1";
 
+export const URANS_RECEIPT_SOURCE_VERIFIER =
+  "server-consumers/receipt-bearing-urans-v1";
+
+export function isProgressiveReceiptVerifier(value: unknown): boolean {
+  return (
+    value === RECEIPT_SOURCE_VERIFIER || value === URANS_RECEIPT_SOURCE_VERIFIER
+  );
+}
+
 interface ReceiptScope {
   attemptId: string;
   resultId: string;
@@ -46,9 +55,10 @@ export async function verifyProgressiveAttemptReceipt(
   db: DB,
   attemptId: string,
   originalText: string,
+  urans = false,
 ) {
   const [row] = await db.execute(
-    sql`SELECT attempt_evidence_receipt_scope(${attemptId}::uuid) AS scope`,
+    sql`SELECT ${urans ? sql`attempt_evidence_receipt_scope_for(${attemptId}::uuid,true)` : sql`attempt_evidence_receipt_scope(${attemptId}::uuid)`} AS scope`,
   );
   const scope = row?.scope as ReceiptScope | null;
   if (

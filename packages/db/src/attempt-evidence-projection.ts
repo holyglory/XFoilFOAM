@@ -331,12 +331,13 @@ export function attemptEvidenceValueMatchesSql(
 export interface AttemptEvidenceStoragePolicy {
   shorteningEnabled: boolean;
   stoppedProgressiveEnabled: boolean;
-  progressiveSourceScope: "legacy" | "stopped-only" | "receipt-bearing";
+  progressiveSourceScope: "legacy" | "stopped-only" | "receipt-bearing" | "receipt-urans";
   canaryAttemptId: string | null;
   consumerContractVersion: number;
   minLogicalBytes: number;
   minNetValueBytes: number;
   maxSourceBytes: number;
+  uransMaxSourceBytes: number | null;
   initialSubset: "unreferenced-rans-steady-v1";
 }
 
@@ -373,7 +374,8 @@ export async function getAttemptEvidenceStoragePolicy(
     await db.execute(sql`SELECT shortening_enabled AS "shorteningEnabled",canary_attempt_id AS "canaryAttemptId",consumer_contract_version AS "consumerContractVersion",
     min_logical_bytes AS "minLogicalBytes",min_net_value_bytes AS "minNetValueBytes",max_source_bytes AS "maxSourceBytes",initial_subset AS "initialSubset",
     coalesce((to_jsonb(policy)->>'stopped_progressive_enabled')::boolean,false) AS "stoppedProgressiveEnabled",
-    coalesce(to_jsonb(policy)->>'progressive_source_scope','legacy') AS "progressiveSourceScope"
+    coalesce(to_jsonb(policy)->>'progressive_source_scope','legacy') AS "progressiveSourceScope",
+    (to_jsonb(policy)->>'urans_max_source_bytes')::integer AS "uransMaxSourceBytes"
     FROM attempt_evidence_storage_policy policy WHERE id=1`);
   return row as unknown as AttemptEvidenceStoragePolicy;
 }
@@ -386,6 +388,8 @@ export async function setAttemptEvidenceStoragePolicy(
     canaryAttemptId?: string;
     stoppedProgressive?: boolean | "only";
     receiptBearing?: boolean;
+    receiptUrans?: boolean;
+    uransMaxSourceBytes?: number;
   },
 ) {
   if (options.enabled && options.consumerContractVersion !== 1)
@@ -395,15 +399,58 @@ export async function setAttemptEvidenceStoragePolicy(
     WHERE attrelid=to_regclass('attempt_evidence_storage_policy') AND attname='stopped_progressive_enabled'
       AND NOT attisdropped) AS installed, EXISTS(SELECT FROM pg_attribute
     WHERE attrelid=to_regclass('attempt_evidence_storage_policy') AND attname='progressive_source_scope' AND NOT attisdropped) AS scoped`);
-  if (options.receiptBearing && options.stoppedProgressive) throw new Error("Select one scientific storage scope");
-  const scope = options.receiptBearing ? "receipt-bearing" : options.stoppedProgressive === "only" ? "stopped-only" : "legacy";
-  if (scope !== "legacy" && (!schema?.scoped || !options.enabled)) throw new Error("Scoped progressive shortening requires migration 0211 and enabled readers");
+  if (
+    options.uransMaxSourceBytes !== undefined &&
+    (!options.receiptUrans ||
+      !Number.isSafeInteger(options.uransMaxSourceBytes) ||
+      options.uransMaxSourceBytes < 4096 ||
+      options.uransMaxSourceBytes > 8 * 1024 * 1024)
+  )
+    throw new Error(
+      "A scoped URANS source limit must be between 4096 bytes and 8 MiB",
+    );
+  if (
+    options.receiptUrans &&
+    (options.receiptBearing || options.stoppedProgressive)
+  )
+    throw new Error("Select one progressive storage scope");
+  if (options.receiptUrans) {
+    const [ready] = await db.execute(
+      sql`SELECT to_regprocedure('attempt_evidence_urans_shortening_limiter(uuid,uuid)') IS NOT NULL AS ready`,
+    );
+    if (!ready?.ready)
+      throw new Error(
+        "URANS attempt shortening requires forward migration 0213",
+      );
+  }
+  if (options.receiptBearing && options.stoppedProgressive)
+    throw new Error("Select one scientific storage scope");
+  const scope = options.receiptUrans
+    ? "receipt-urans"
+    : options.receiptBearing
+      ? "receipt-bearing"
+      : options.stoppedProgressive === "only"
+        ? "stopped-only"
+        : "legacy";
+  if (scope !== "legacy" && (!schema?.scoped || !options.enabled))
+    throw new Error(
+      "Scoped progressive shortening requires migration 0211 and enabled readers",
+    );
   if (options.stoppedProgressive && (!options.enabled || !schema?.installed))
-    throw new Error("Stopped progressive shortening requires 0210 and enabled readers");
+    throw new Error(
+      "Stopped progressive shortening requires 0210 and enabled readers",
+    );
   const stopped = schema?.installed
-    ? sql`stopped_progressive_enabled=${Boolean(options.stoppedProgressive)},` : sql``;
-  const scoped = schema?.scoped ? sql`progressive_source_scope=${scope},` : sql``;
-  await db.execute(sql`UPDATE attempt_evidence_storage_policy SET ${scoped} ${stopped} shortening_enabled=${options.enabled},
+    ? sql`stopped_progressive_enabled=${Boolean(options.stoppedProgressive)},`
+    : sql``;
+  const scoped = schema?.scoped
+    ? sql`progressive_source_scope=${scope},`
+    : sql``;
+  const uransBudget =
+    options.uransMaxSourceBytes === undefined
+      ? sql` `
+      : sql`urans_max_source_bytes=${options.uransMaxSourceBytes},`;
+  await db.execute(sql`UPDATE attempt_evidence_storage_policy SET ${uransBudget} ${scoped} ${stopped} shortening_enabled=${options.enabled},
     consumer_contract_version=${options.consumerContractVersion ?? 0},canary_attempt_id=${options.canaryAttemptId ?? null}::uuid WHERE id=1`);
   return getAttemptEvidenceStoragePolicy(db);
 }
@@ -531,19 +578,26 @@ export async function restoreAttemptEvidence(
 export async function attemptEvidenceShorteningCandidates(
   db: DB,
   after: string | null = null,
-  stoppedProgressiveOnly: boolean | "receipt-bearing" = false,
+  stoppedProgressiveOnly: boolean | "receipt-bearing" | "receipt-urans" = false,
 ) {
   if (after !== null) assertId(after);
   return db.transaction(async (tx) => {
     await tx.execute(sql`SET TRANSACTION READ ONLY`);
     await tx.execute(sql`SET LOCAL statement_timeout='5s'`);
     await tx.execute(sql`SET LOCAL lock_timeout='500ms'`);
-    const broad = stoppedProgressiveOnly === "receipt-bearing";
-    const retained = !broad && stoppedProgressiveOnly
-      ? sql`JOIN progressive_remote_evidence_receipts rr ON rr.result_attempt_id=ar.result_attempt_id AND rr.storage_only`
-      : sql``;
-    const limiter = broad ? sql`attempt_evidence_receipt_shortening_limiter(a.id)` : stoppedProgressiveOnly
-      ? sql`attempt_evidence_stopped_shortening_limiter(a.id)` : sql`attempt_evidence_shortening_limiter(a.id)`;
+    const urans = stoppedProgressiveOnly === "receipt-urans";
+    const broad = urans || stoppedProgressiveOnly === "receipt-bearing";
+    const retained =
+      !broad && stoppedProgressiveOnly
+        ? sql`JOIN progressive_remote_evidence_receipts rr ON rr.result_attempt_id=ar.result_attempt_id AND rr.storage_only`
+        : sql``;
+    const limiter = urans
+      ? sql`attempt_evidence_urans_shortening_limiter(a.id)`
+      : broad
+        ? sql`attempt_evidence_receipt_shortening_limiter(a.id)`
+        : stoppedProgressiveOnly
+          ? sql`attempt_evidence_stopped_shortening_limiter(a.id)`
+          : sql`attempt_evidence_shortening_limiter(a.id)`;
     return tx.execute(sql`WITH ids AS MATERIALIZED (
       SELECT DISTINCT ar.result_attempt_id AS id FROM attempt_evidence_archives ar ${retained}
       ${after ? sql`WHERE ar.result_attempt_id>${after}::uuid` : sql``} ORDER BY ar.result_attempt_id LIMIT 32

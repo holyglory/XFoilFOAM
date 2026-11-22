@@ -12,9 +12,11 @@ import type {
   AttemptEvidenceDependencyProof,
 } from "./attempt-evidence-projection";
 import { readPolarAttemptEvidenceForConsumerProof } from "./polar-cache";
+import { precalcContinuationProgressFromEvidence } from "./precalc-obligations";
 import { getAttemptEvidenceStoragePolicy } from "./attempt-evidence-projection";
 import {
   RECEIPT_SOURCE_VERIFIER,
+  URANS_RECEIPT_SOURCE_VERIFIER,
   verifyProgressiveAttemptReceipt,
 } from "./attempt-receipt-verification";
 import {
@@ -219,12 +221,15 @@ export function createAttemptServerDependencyVerifier(
       ? await verifyWorker(attemptId, originalPayloadText)
       : null;
     const policy = await getAttemptEvidenceStoragePolicy(db);
+    const urans = policy?.progressiveSourceScope === "receipt-urans";
     const broad =
-      !workerScope && policy?.progressiveSourceScope === "receipt-bearing"
+      !workerScope &&
+      (urans || policy?.progressiveSourceScope === "receipt-bearing")
         ? await verifyProgressiveAttemptReceipt(
             db,
             attemptId,
             originalPayloadText,
+            urans,
           )
         : null;
     const stopped =
@@ -242,7 +247,7 @@ export function createAttemptServerDependencyVerifier(
           workerScope
             ? sql`attempt_evidence_hz_scope(a.id)=${JSON.stringify(workerScope)}::jsonb`
             : broad
-              ? sql`attempt_evidence_receipt_scope(a.id)=${JSON.stringify(broad.progressiveScope)}::jsonb`
+              ? sql`${urans ? sql`attempt_evidence_receipt_scope_for(a.id,true)` : sql`attempt_evidence_receipt_scope(a.id)`}=${JSON.stringify(broad.progressiveScope)}::jsonb`
               : stopped
                 ? sql`attempt_evidence_stopped_scope(a.id)=${JSON.stringify(stopped.progressiveScope)}::jsonb`
                 : attemptEvidenceColdCohortSql(sql`a`)
@@ -285,24 +290,40 @@ export function createAttemptServerDependencyVerifier(
         "force-history existence changed",
       );
       if (broad) {
-        // All leaves except the four replayed numerical channels have already
-        // been compared losslessly above. Job-scoped RANS classification reads
-        // mean_stable from this parent, with geometry, certificates and force
-        // presence kept separately. Thus every sibling sees identical classifier
-        // inputs regardless of job cardinality. Progressive fitting uses the
-        // authenticated full numerical source, never this compact parent.
-        const channels = new Set(["iterations", "cl", "cd", "cm"]);
-        requireProof(
-          expected.arrayFacts.length === 4 &&
-            expected.arrayFacts.every(
-              (f) =>
-                f.path.length === 2 &&
-                f.path[0] === "steady_history" &&
-                channels.delete(f.path[1]!),
-            ) &&
-            channels.size === 0,
-          "receipt source removed a non-steady classifier input",
-        );
+        if (urans) {
+          // The lossless comparison above also keeps the complete cycle and
+          // no-shedding certificates, frame cadence and exact time windows.
+          // Status/classifier gates use those fields and the verified force
+          // presence. Numerical fit and archive publication use the original.
+          requireProof(
+            canonicalAnalysisJson(
+              precalcContinuationProgressFromEvidence(original),
+            ) ===
+              canonicalAnalysisJson(
+                precalcContinuationProgressFromEvidence(compact),
+              ),
+            "URANS physical time, cycle, frame or continuation evidence changed",
+          );
+        } else {
+          // All leaves except the four replayed numerical channels have already
+          // been compared losslessly above. Job-scoped RANS classification reads
+          // mean_stable from this parent, with geometry, certificates and force
+          // presence kept separately. Thus every sibling sees identical classifier
+          // inputs regardless of job cardinality. Progressive fitting uses the
+          // authenticated full numerical source, never this compact parent.
+          const channels = new Set(["iterations", "cl", "cd", "cm"]);
+          requireProof(
+            expected.arrayFacts.length === 4 &&
+              expected.arrayFacts.every(
+                (f) =>
+                  f.path.length === 2 &&
+                  f.path[0] === "steady_history" &&
+                  channels.delete(f.path[1]!),
+              ) &&
+              channels.size === 0,
+            "receipt source removed a non-steady classifier input",
+          );
+        }
         return {
           contractVersion: 1,
           attemptId,
@@ -312,7 +333,9 @@ export function createAttemptServerDependencyVerifier(
           equalityEquivalent: true,
           scientificEquivalent: true,
           readDependenciesSatisfied: true,
-          verifier: RECEIPT_SOURCE_VERIFIER,
+          verifier: urans
+            ? URANS_RECEIPT_SOURCE_VERIFIER
+            : RECEIPT_SOURCE_VERIFIER,
           ...broad,
         };
       }

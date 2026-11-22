@@ -5,6 +5,7 @@ import {
   restartablePrecalcWarningSql,
 } from "@aerodb/db";
 import { sql } from "drizzle-orm";
+import { readOriginalAttemptForProjection } from "./attempt-evidence-consumer-reader";
 
 const parsedLimit = Number.parseInt(
   process.env.PRECALC_EXPORT_LIMIT ?? "5000",
@@ -27,7 +28,8 @@ try {
       obligation.id AS obligation_id,
       latest.result_attempt_id,
       attempt.status,
-      attempt.evidence_payload,
+      attempt.evidence_archive_id,
+      CASE WHEN attempt.evidence_archive_id IS NULL THEN attempt.evidence_payload END AS evidence_payload,
       attempt.quality_warnings,
       classification.reasons AS classification_reasons,
       attempt.evidence_payload ->> 'failure_disposition' AS failure_disposition,
@@ -75,7 +77,18 @@ try {
     ORDER BY obligation.id
     LIMIT ${parsedLimit}
   `)) as unknown as Array<Record<string, unknown>>;
-  for (const row of rows) {
+  for (const { evidence_archive_id, ...row } of rows) {
+    // The offline evaluator reads physical time, force coefficients and frame
+    // samples. Preserve its existing JSONL shape and read one cold source at a time.
+    if (typeof evidence_archive_id === "string") {
+      row.evidence_payload = JSON.parse(
+        await readOriginalAttemptForProjection(
+          db,
+          String(row.result_attempt_id),
+          evidence_archive_id,
+        ),
+      );
+    }
     process.stdout.write(`${JSON.stringify(row)}\n`);
   }
 } finally {

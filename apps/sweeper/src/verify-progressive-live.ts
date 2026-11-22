@@ -1,3 +1,4 @@
+import { readOriginalAttemptForProjection } from "./attempt-evidence-consumer-reader";
 import assert from "node:assert/strict";
 import { spawn, execFileSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
@@ -904,13 +905,25 @@ try {
             let historiesReady = true;
             if (requireUransHistories) {
               const stored = await db.execute(sql`
-                SELECT id, aoa_deg, regime, converged, evidence_payload FROM result_attempts WHERE id IN (
+                SELECT id, aoa_deg, regime, converged, evidence_archive_id,
+                  CASE WHEN evidence_archive_id IS NULL THEN evidence_payload END AS evidence_payload FROM result_attempts WHERE id IN (
                   ${sql.join(
                     proof.contributorAttemptIds.map((id) => sql`${id}::uuid`),
                     sql`, `,
                   )}
                 )
               `);
+              for (const row of stored) {
+                if (typeof row.evidence_archive_id === "string") {
+                  row.evidence_payload = JSON.parse(
+                    await readOriginalAttemptForProjection(
+                      db,
+                      String(row.id),
+                      row.evidence_archive_id,
+                    ),
+                  );
+                }
+              }
               const [model] = await db.execute(
                 sql`SELECT request FROM progressive_polar_models WHERE id = ${modelId}`,
               );

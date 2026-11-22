@@ -304,9 +304,12 @@ export async function runAttemptEvidenceSettlementPass(
       });
     }
   }
+  const scope = policy?.progressiveSourceScope;
+  const preview = scope === "receipt-bearing" || scope === "receipt-urans"
+    ? scope : scope === "stopped-only";
   const candidates =
     automatic && processed < maxRows
-      ? await attemptEvidenceShorteningCandidates(db, next, policy?.progressiveSourceScope === "receipt-bearing" ? "receipt-bearing" : policy?.progressiveSourceScope === "stopped-only")
+      ? await attemptEvidenceShorteningCandidates(db, next, preview)
       : [];
   for (const candidate of candidates) {
     if (options.signal?.aborted) break;

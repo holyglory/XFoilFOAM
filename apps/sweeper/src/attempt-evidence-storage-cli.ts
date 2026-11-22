@@ -63,6 +63,8 @@ export async function attemptEvidenceStorageMain(
         "--consumer-contract",
         "--stopped-progressive",
         "--receipt-bearing",
+        "--receipt-urans",
+        "--urans-max-source-bytes",
         "--archive-id",
       ].includes(flag) ||
       !args[index + 1] ||
@@ -82,12 +84,41 @@ export async function attemptEvidenceStorageMain(
   const stoppedMode = flags.get("--stopped-progressive");
   const stoppedProgressive = stoppedMode === "true" || stoppedMode === "only";
   const receiptBearing = flags.get("--receipt-bearing") === "true";
-  if (flags.has("--receipt-bearing") && (!receiptBearing || flags.has("--stopped-progressive") ||
-      (command !== "enable-shortening" && command !== "shortening-candidates")))
-    throw new Error("--receipt-bearing true selects one scoped preview or writer policy");
-  if (flags.has("--stopped-progressive") && (!stoppedProgressive ||
-      (command !== "enable-shortening" && command !== "shortening-candidates")))
-    throw new Error("--stopped-progressive true applies to shortening-candidates and enable-shortening");
+  const receiptUrans = flags.get("--receipt-urans") === "true";
+  if (
+    flags.has("--urans-max-source-bytes") &&
+    (!receiptUrans || command !== "enable-shortening")
+  )
+    throw new Error(
+      "--urans-max-source-bytes applies to an explicit URANS policy",
+    );
+  if (
+    flags.has("--receipt-urans") &&
+    (!receiptUrans ||
+      flags.has("--receipt-bearing") ||
+      flags.has("--stopped-progressive") ||
+      (command !== "enable-shortening" && command !== "shortening-candidates"))
+  )
+    throw new Error(
+      "--receipt-urans true selects only the verified URANS reader scope",
+    );
+  if (
+    flags.has("--receipt-bearing") &&
+    (!receiptBearing ||
+      flags.has("--stopped-progressive") ||
+      (command !== "enable-shortening" && command !== "shortening-candidates"))
+  )
+    throw new Error(
+      "--receipt-bearing true selects one scoped preview or writer policy",
+    );
+  if (
+    flags.has("--stopped-progressive") &&
+    (!stoppedProgressive ||
+      (command !== "enable-shortening" && command !== "shortening-candidates"))
+  )
+    throw new Error(
+      "--stopped-progressive true applies to shortening-candidates and enable-shortening",
+    );
   if (command === "sql") {
     process.stdout.write(
       `${JSON.stringify(new PgDialect().sqlToQuery(attemptEvidenceAuditSql(options)))}\n`,
@@ -131,7 +162,7 @@ export async function attemptEvidenceStorageMain(
     ].includes(command ?? "")
   )
     throw new Error(
-      "Usage: attempt-evidence-storage-cli.ts sql|use-sql|audit|use-audit|copy|archive|backfill|restore|shortening-status|shortening-candidates|enable-shortening|disable-shortening|shorten|shorten-pass|restore-inline [--consumer-contract 1] [--stopped-progressive true|only] [--receipt-bearing true] [--id ATTEMPT_UUID --archive-id ARCHIVE_UUID] [--after UUID] [--rows N] [--pages N] [--output NEW_FILE] [--bucket BUCKET] [--source-instance INSTANCE]",
+      "Usage: attempt-evidence-storage-cli.ts sql|use-sql|audit|use-audit|copy|archive|backfill|restore|shortening-status|shortening-candidates|enable-shortening|disable-shortening|shorten|shorten-pass|restore-inline [--consumer-contract 1] [--stopped-progressive true|only] [--receipt-bearing true | --receipt-urans true [--urans-max-source-bytes N]] [--id ATTEMPT_UUID --archive-id ARCHIVE_UUID] [--after UUID] [--rows N] [--pages N] [--output NEW_FILE] [--bucket BUCKET] [--source-instance INSTANCE]",
     );
   if (!process.env.DATABASE_URL)
     throw new Error("An explicit DATABASE_URL is required");
@@ -173,7 +204,7 @@ export async function attemptEvidenceStorageMain(
           const rows = await attemptEvidenceShorteningCandidates(
             client.db,
             after,
-            receiptBearing ? "receipt-bearing" : stoppedProgressive,
+            receiptUrans ? "receipt-urans" : receiptBearing ? "receipt-bearing" : stoppedProgressive,
           );
           for (const row of rows) {
             const reason =
@@ -217,9 +248,17 @@ export async function attemptEvidenceStorageMain(
         // Resolve the actual installed consumer/app contracts before changing
         // SQL policy. No cloud request or permission change is made here.
         await configuredAttemptEvidenceSettlementDependencies(client.db);
-        process.stdout.write(
-          `${JSON.stringify(await setAttemptEvidenceStoragePolicy(client.db, { enabled: true, consumerContractVersion: 1, canaryAttemptId: flags.get("--id"), stoppedProgressive: stoppedMode === "only" ? "only" : stoppedProgressive, receiptBearing }))}\n`,
-        );
+        const enabled = await setAttemptEvidenceStoragePolicy(client.db, {
+          enabled: true,
+          consumerContractVersion: 1,
+          canaryAttemptId: flags.get("--id"),
+          stoppedProgressive: stoppedMode === "only" ? "only" : stoppedProgressive,
+          receiptBearing,
+          receiptUrans,
+          uransMaxSourceBytes: flags.has("--urans-max-source-bytes")
+            ? integer(flags.get("--urans-max-source-bytes"), 262144) : undefined,
+        });
+        process.stdout.write(`${JSON.stringify(enabled)}\n`);
         return;
       }
       if (command === "restore-inline") {
