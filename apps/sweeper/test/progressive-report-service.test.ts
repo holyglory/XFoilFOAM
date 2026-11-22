@@ -2,7 +2,10 @@ import type { DB, Sql } from "@aerodb/db";
 import { PgDialect } from "drizzle-orm/pg-core";
 import type { SQL } from "drizzle-orm";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { runProgressiveReportService } from "../src/progressive-report-service";
+import {
+  configuredReportPublicationLanes,
+  runProgressiveReportService,
+} from "../src/progressive-report-service";
 import { runSweeperServices } from "../src/service-lifecycle";
 import {
   publishProgressiveWorkerReports,
@@ -194,6 +197,97 @@ afterEach(() => {
 });
 
 describe("independent progressive report delivery", () => {
+  it("defaults to eight publishers and accepts only bounded positive counts", () => {
+    const count = (value?: string) =>
+      configuredReportPublicationLanes({
+        SWEEPER_PROGRESSIVE_REPORT_PUBLICATION_LANES: value,
+      });
+    expect(count()).toBe(8);
+    expect(count("")).toBe(8);
+    for (const n of [1, 2, 3, 8]) expect(count(String(n))).toBe(n);
+    for (const value of ["0", "-1", "2.5", "9", "abc"]) {
+      expect(() => count(value)).toThrow(
+        "SWEEPER_PROGRESSIVE_REPORT_PUBLICATION_LANES",
+      );
+    }
+  });
+
+  it("starts exactly the configured report publishers on the remote sweeper entry point", async () => {
+    const config = await import("../src/config");
+    const service = await import("../src/progressive-report-service");
+    const lifecycle = await import("../src/service-lifecycle");
+    const heartbeat = await import("../src/heartbeat");
+    const remote = await import("../src/remote-solver");
+    const reader = await import("@aerodb/db/progressive-report-reader");
+    const signals = (["SIGTERM", "SIGINT"] as const).map(
+      (event) => [event, new Set(process.listeners(event))] as const,
+    );
+    const connection = {
+      db: {
+        select: () => ({
+          from: () => ({
+            limit: async () => [
+              {
+                remoteSolverEnabled: true,
+                upstreamBaseUrl: "https://hub.invalid/api/sync/v1",
+              },
+            ],
+          }),
+        }),
+      },
+      sql: { end: vi.fn() },
+    } as unknown as ReturnType<typeof config.makeIsolatedDatabase>;
+    vi.stubEnv("AIRFOILFOAM_DEPLOYMENT_ROLE", "remote-solver");
+    vi.stubEnv("AIRFOILFOAM_EVIDENCE_BUCKET", "");
+    vi.stubEnv("AIRFOILFOAM_EVIDENCE_REMOTE_ONLY", "false");
+    vi.stubEnv("ENGINE_CONTROL_PLANE_TOKEN", "fixture-control-token".repeat(2));
+    vi.stubEnv("SWEEPER_PROGRESSIVE_REPORT_PUBLICATION_LANES", "3");
+    try {
+      vi.spyOn(config, "makeContext").mockReturnValue({
+        ...connection,
+        engine: { baseUrl: "http://engine.invalid" },
+      } as ReturnType<typeof config.makeContext>);
+      const pool = vi.spyOn(config, "makeIsolatedDatabase").mockReturnValue(connection);
+      vi.spyOn(config, "makeReportStorageDatabase").mockReturnValue(connection);
+      vi.spyOn(
+        reader,
+        "installProgressiveReportArchiveReader",
+      ).mockImplementation(() => {});
+      vi.spyOn(heartbeat, "startHeartbeatTimer").mockReturnValue(() => {});
+      vi.spyOn(remote, "startRemoteSolverFleetHeartbeatTimer").mockReturnValue(
+        () => {},
+      );
+      const publish = vi
+        .spyOn(service, "runProgressiveReportService")
+        .mockResolvedValue(undefined);
+      vi.spyOn(lifecycle, "runSweeperServices").mockImplementation(
+        async (signal, services) => {
+          const publishers = services.filter((s) =>
+            s.name.startsWith("progressive-report-delivery-"),
+          );
+          expect(publishers.map((s) => s.name)).toEqual(
+            [0, 1, 2].map((lane) => `progressive-report-delivery-${lane}`),
+          );
+          for (const publisher of publishers) await publisher.run(signal);
+        },
+      );
+      await import("../src/index");
+      expect(pool).toHaveBeenCalledWith(3);
+      expect(publish.mock.calls.map(([, , , partition]) => partition)).toEqual([
+        { lane: 0, laneCount: 3 },
+        { lane: 1, laneCount: 3 },
+        { lane: 2, laneCount: 3 },
+      ]);
+    } finally {
+      vi.restoreAllMocks();
+      vi.unstubAllEnvs();
+      for (const [event, prior] of signals) {
+        for (const listener of process.listeners(event))
+          if (!prior.has(listener)) process.off(event, listener);
+      }
+    }
+  });
+
   it.each([0, 1, 2])(
     "advances active and terminal reports in lane %i while new active reports keep arriving",
     async (lane) => {
