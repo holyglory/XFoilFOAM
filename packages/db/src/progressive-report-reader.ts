@@ -60,6 +60,24 @@ export async function recheckRemoteReportMember(db: DB, proof: VerifiedArchiveMe
   return Boolean(row);
 }
 
+/** The normal API logger records these verified identifiers. Its HTTP error
+ * response contains only the message. Do not attach report bodies or credentials. */
+export class ProgressiveReportArchiveTimeout extends Error {
+  readonly member;
+  constructor(identity: ProgressiveReportArchiveIdentity) {
+    super("Archived progressive full report read timed out");
+    this.member = {
+      sourceKind: identity.sourceKind,
+      executionId: identity.executionId,
+      sequence: identity.sequence,
+      contentSignature: identity.signature,
+      generation: identity.generation,
+      reportSha256: identity.reportSha256,
+      reportByteSize: identity.reportByteSize,
+    };
+  }
+}
+
 export interface ProgressiveReportArchiveReader {
   read(identity: ProgressiveReportArchiveIdentity, connection: DB): Promise<string>;
 }
@@ -182,7 +200,7 @@ export async function readProgressiveReport(
       active.reader.read(identity, db),
       new Promise<never>((_, reject) => {
         timer = setTimeout(() => {
-          reject(new Error("Archived progressive full report read timed out"));
+          reject(new ProgressiveReportArchiveTimeout(identity));
           controller.abort();
         }, active.timeoutMs);
       }),

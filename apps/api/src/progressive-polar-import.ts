@@ -15,6 +15,7 @@ import {
   prepareProgressiveRemoteReceiptReplay,
   recheckPreparedProgressiveRemoteReceipt,
 } from "@aerodb/db/progressive-remote-evidence-receipts";
+import { ProgressiveReportArchiveTimeout } from "@aerodb/db/progressive-report-reader";
 import { apiAttemptEvidenceReader } from "./attempt-evidence-reader";
 import { prepareStoppedProgressiveStorage } from "@aerodb/db/progressive-stopped-storage";
 
@@ -73,6 +74,15 @@ export async function prepareProgressivePolarImport(
       aoaDeg: point.aoaDeg,
       engineCaseSlug: point.engineCaseSlug ?? null,
       progressiveEvidence: reference,
+    }).catch((error: unknown) => {
+      if (reference && error instanceof ProgressiveReportArchiveTimeout)
+        Object.assign(error, { requestedPoint: {
+          promiseId: payload.promiseId,
+          pointContentSignature: reference.pointContentSignature,
+          remoteResultId: point.remoteResultId,
+          remoteResultAttemptId: point.remoteResultAttemptId,
+        } });
+      throw error;
     });
     if (!source) {
       if (point.progressiveEvidence)
