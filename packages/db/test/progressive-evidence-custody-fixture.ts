@@ -323,7 +323,7 @@ async function exerciseProgressiveArchiveCustody(
     await expect(
       readProgressiveEvidenceCustodyReceipt(db, source, uploadId),
     ).rejects.toThrow("complete registered archive");
-    const registered = await registerVerifiedBrokeredEvidenceArchive(db, {
+    const registration = {
       resultId: attempt.resultId,
       resultAttemptId,
       sourceArtifactId: bundle.id,
@@ -331,7 +331,11 @@ async function exerciseProgressiveArchiveCustody(
       evidenceBase: "isolated-case",
       identity,
       memberSet: progressiveArchiveMembers,
-    });
+    };
+    const registered = await registerVerifiedBrokeredEvidenceArchive(
+      db,
+      registration,
+    );
     const archiveId = registered.archiveId;
     const receipt = await readProgressiveEvidenceCustodyReceipt(
       db,
@@ -444,7 +448,12 @@ async function exerciseProgressiveArchiveCustody(
     const [member] = await db
       .select()
       .from(solverEvidenceArtifactMembers)
-      .where(eq(solverEvidenceArtifactMembers.archiveId, archiveId));
+      .where(
+        and(
+          eq(solverEvidenceArtifactMembers.archiveId, archiveId),
+          eq(solverEvidenceArtifactMembers.memberPath, "forceCoeffs.dat"),
+        ),
+      );
     await db
       .delete(solverEvidenceArtifactMembers)
       .where(
@@ -459,7 +468,97 @@ async function exerciseProgressiveArchiveCustody(
     await expect(
       readProgressiveRemoteRetention(db, source.engineJobId),
     ).rejects.toThrow("every authenticated manifest member");
-    await db.insert(solverEvidenceArtifactMembers).values(member);
+    if (status === "active") {
+      // The physical bytes may be shared. A foreign attempt's valid artifact
+      // cannot stand in for an altered artifact on this attempt during repair.
+      const restore = new Error("Rollback isolated unlinked archive member");
+      await expect(
+        db.transaction(async (raw) => {
+          const connection = raw as unknown as DB;
+          const [logical] = await connection
+            .select()
+            .from(solverEvidenceArtifacts)
+            .where(eq(solverEvidenceArtifacts.id, member.artifactId));
+          const [other] = await connection
+            .insert(resultAttempts)
+            .values({ ...attempt, id: randomUUID(), engineJobId: randomUUID() })
+            .returning();
+          const [foreign] = await connection
+            .insert(solverEvidenceArtifacts)
+            .values({
+              ...logical,
+              id: randomUUID(),
+              resultAttemptId: other.id,
+              engineJobId: other.engineJobId,
+            })
+            .returning();
+          await connection
+            .update(solverEvidenceArtifacts)
+            .set({ engineCaseSlug: "retained-different-case" })
+            .where(eq(solverEvidenceArtifacts.id, logical.id));
+          await expect(
+            connection.transaction((tx) =>
+              registerVerifiedBrokeredEvidenceArchive(
+                tx as unknown as DB,
+                registration,
+              ),
+            ),
+          ).rejects.toThrow("changed immutable metadata");
+          expect(
+            await connection
+              .select()
+              .from(solverEvidenceArtifacts)
+              .where(eq(solverEvidenceArtifacts.id, foreign.id)),
+          ).toEqual([foreign]);
+          const [preserved] = await connection
+            .select()
+            .from(solverEvidenceArtifacts)
+            .where(eq(solverEvidenceArtifacts.id, logical.id));
+          expect(preserved.engineCaseSlug).toBe("retained-different-case");
+          await expect(
+            readProgressiveRemoteRetention(connection, source.engineJobId),
+          ).rejects.toThrow("every authenticated manifest member");
+          throw restore;
+        }),
+      ).rejects.toBe(restore);
+    }
+    // Fill the missing association from its exact pre-existing logical artifact.
+    expect(
+      await registerVerifiedBrokeredEvidenceArchive(db, registration),
+    ).toEqual(registered);
+    const [repaired] = await db
+      .select()
+      .from(solverEvidenceArtifactMembers)
+      .where(
+        and(
+          eq(solverEvidenceArtifactMembers.archiveId, archiveId),
+          eq(solverEvidenceArtifactMembers.memberPath, member.memberPath),
+        ),
+      );
+    expect(repaired.artifactId).toBe(member.artifactId);
+    if (status === "active") {
+      // Same count, but a verified manifest path or identity differs from the
+      // existing archive. No unknown mapping may be silently dropped or replaced.
+      const original = registration.memberSet.find(entry => entry.path === member.memberPath)!;
+      for (const patch of [
+        { path: "other.dat" },
+        { byteSize: original.byteSize + 1 },
+        { sha256: "0".repeat(64) },
+        { role: "log" },
+      ]) {
+        const memberSet = registration.memberSet.map((entry) =>
+          entry.path === member.memberPath ? { ...entry, ...patch } : entry,
+        );
+        await expect(
+          db.transaction((tx) =>
+            registerVerifiedBrokeredEvidenceArchive(tx as unknown as DB, {
+              ...registration,
+              memberSet,
+            }),
+          ),
+        ).rejects.toThrow(/existing evidence|immutable metadata/);
+      }
+    }
     expect(
       await readProgressiveEvidenceCustodyReceipt(db, source, uploadId),
     ).toEqual(receipt);
