@@ -12,6 +12,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import shlex
 import subprocess
 import sys
@@ -211,6 +212,18 @@ def scale_factor(value: str) -> Decimal:
     raise argparse.ArgumentTypeError("vacuum scale factor must be a finite PostgreSQL factor from 0 through 100")
 
 
+def json_rows(text: str) -> list:
+    # EXPLAIN FORMAT JSON spans several psql output lines.
+    decoder = json.JSONDecoder()
+    records = []
+    text = text.lstrip()
+    while text:
+        value, used = decoder.raw_decode(text)
+        records.append(value)
+        text = text[used:].lstrip()
+    return records
+
+
 def vacuum_session(statement: str, write: bool) -> list[dict]:
     # Bind both the host/container and the configured deployment role. Inspect
     # only this one nonsecret setting. Apply shares the existing HZ deploy lock.
@@ -225,7 +238,7 @@ def vacuum_session(statement: str, write: bool) -> list[dict]:
         '{ echo "Expected the HZ remote-solver deployment" >&2; exit 1; }; exec ' + shlex.join(psql)]
     if write:
         command = ["flock", "-s", "-w", "5", "-E", "75", "/tmp/airfoils-pro-deploy.lock", *command]
-    return [json.loads(line) for line in ssh("worker", command, statement).splitlines() if line.strip()]
+    return json_rows(ssh("worker", command, statement))
 
 
 def autovacuum_plan(rows: list[dict], target: Decimal) -> tuple[dict, dict]:
@@ -314,19 +327,235 @@ COMMIT;"""
     return result
 
 
+# Fixed to the worker. The optional census reads stored sizes directly from the
+# parent heap; it never selects the JSON value or scans its TOAST relation.
+RETURN_SNAPSHOT = """
+WITH h AS (SELECT * FROM pg_class WHERE oid='public.progressive_worker_reports'::regclass),
+ idx AS (SELECT i.indexrelid AS oid FROM h JOIN pg_index i ON i.indrelid IN (h.oid,h.reltoastrelid))
+SELECT jsonb_build_object(
+ 'observedAt',clock_timestamp(),'serverStartedAt',pg_postmaster_start_time(),'role','worker',
+ 'table','public.progressive_worker_reports','oid',h.oid::bigint,'relfilenode',pg_relation_filenode(h.oid)::bigint,
+ 'toastName',t.oid::regclass::text,'toastReadable',has_schema_privilege(t.relnamespace,'USAGE') AND has_table_privilege(t.oid,'SELECT'),
+ 'blockBytes',current_setting('block_size')::int,
+ 'toastOid',t.oid::bigint,'toastFilenode',pg_relation_filenode(t.oid)::bigint,
+ 'heapBytes',pg_relation_size(h.oid),'toastHeapBytes',pg_relation_size(t.oid),'toastIndexBytes',pg_indexes_size(t.oid),
+ 'tableBytes',pg_table_size(h.oid),'indexBytes',pg_indexes_size(h.oid),'totalBytes',pg_total_relation_size(h.oid),
+ 'indexFiles',(SELECT jsonb_object_agg(oid::text,pg_relation_filenode(oid)::bigint) FROM idx),
+ 'paths',jsonb_build_object('heap',pg_relation_filepath(h.oid),'toast',pg_relation_filepath(t.oid),'wal','pg_wal') ||
+     (SELECT coalesce(jsonb_object_agg('index-'||oid,pg_relation_filepath(oid)),'{}') FROM idx),
+ 'dataDir',(SELECT setting FROM pg_settings WHERE name='data_directory'),'tempTablespaces',current_setting('temp_tablespaces'),
+ 'lastAutovacuum',hs.last_autovacuum,'lastToastAutovacuum',ts.last_autovacuum,'toastAutovacuumCount',ts.autovacuum_count,
+ 'vacuum',coalesce((SELECT jsonb_agg(jsonb_build_object('oid',v.relid::bigint,'pid',v.pid,'startedAt',a.query_start,
+    'backendStart',a.backend_start,'type',a.backend_type,'phase',v.phase,'scannedBlocks',v.heap_blks_scanned,
+    'totalBlocks',v.heap_blks_total,'vacuumedBlocks',v.heap_blks_vacuumed,'indexPasses',v.index_vacuum_count))
+    FROM pg_stat_progress_vacuum v LEFT JOIN pg_stat_activity a ON a.pid=v.pid WHERE v.relid IN (h.oid,t.oid)),'[]'),
+ 'wal',jsonb_build_object('canListDirectory',has_function_privilege('pg_catalog.pg_ls_waldir()','EXECUTE'),
+    'lsn',pg_current_wal_lsn()::text,'level',current_setting('wal_level'),'archiveMode',current_setting('archive_mode'),
+    'maxWalSize',current_setting('max_wal_size'),'slots',(SELECT count(*) FROM pg_replication_slots),
+    'retainedByOldestSlotBytes',(SELECT max(pg_wal_lsn_diff(pg_current_wal_lsn(),restart_lsn)) FROM pg_replication_slots)),
+ 'ingress',jsonb_build_object('runningJobs',(SELECT count(*) FROM public.sim_jobs WHERE status='running'),
+    'ingestingJobs',(SELECT count(*) FROM public.sim_jobs WHERE status='ingesting'),
+    'unacknowledgedReport',EXISTS(SELECT 1 FROM public.progressive_worker_reports WHERE acknowledged_at IS NULL),
+    'liveClaims',EXISTS(SELECT 1 FROM public.progressive_worker_evidence_delivery_claims WHERE claim_expires_at>clock_timestamp()),
+    'livePromises',(SELECT count(*) FROM public.sync_sweep_promises WHERE status='active' AND "expiresAt">clock_timestamp())))
+FROM h JOIN pg_class t ON t.oid=h.reltoastrelid LEFT JOIN pg_stat_all_tables hs ON hs.relid=h.oid
+LEFT JOIN pg_stat_all_tables ts ON ts.relid=t.oid
+"""
+LIVE_VALUES = """
+SELECT coalesce(jsonb_object_agg(kind,jsonb_build_object('rows',n,'storedReportBytes',bytes,'referenceBytes',refs)),'{}') FROM (
+ SELECT CASE WHEN archived_at IS NOT NULL THEN 'archived' WHEN result_payload_hash IS NULL THEN 'inline' ELSE 'shared' END AS kind,
+ count(*) AS n,sum(pg_column_size(report)) AS bytes,sum(coalesce(pg_column_size(result_payload_hash),0)) AS refs
+ FROM public.progressive_worker_reports GROUP BY 1) g
+"""
+
+# Resolve files through PostgreSQL's actual container mounts. Docker's in-container
+# df can report a different bind mount on the same device (for example /etc/hosts).
+WORKER_VOLUMES = """
+import json, os, pathlib, subprocess, sys
+def run(cmd):
+    return subprocess.check_output(cmd, text=True, timeout=8).strip()
+container='hz-solver2-postgres-1'
+paths=json.loads(sys.argv[1])
+if any(not pathlib.PurePosixPath(path).is_absolute() for path in paths.values()):
+    # Data directory in the live postmaster's lockfile, also usable when SQL
+    # intentionally hides the data_directory setting from the database role.
+    base=run(['docker','exec',container,'sh','-ec','sed -n 2p "$PGDATA/postmaster.pid"'])
+    if not pathlib.PurePosixPath(base).is_absolute():
+        raise ValueError('Cannot establish the active PostgreSQL data directory')
+    paths={k:str(pathlib.PurePosixPath(base)/v) for k,v in paths.items()}
+resolved=run(['docker','exec',container,'sh','-ec','for p; do readlink -f "$p"; done','sh',*paths.values()]).splitlines()
+if len(resolved)!=len(paths):
+    raise ValueError('Incomplete PostgreSQL filesystem mapping')
+mounts=json.loads(run(['docker','inspect','--format','{{json .Mounts}}',container]))
+devices, files = {}, {}
+for label, raw in zip(paths,resolved):
+    name=pathlib.PurePosixPath(raw)
+    mount=max((m for m in mounts if name.is_relative_to(m['Destination'])),key=lambda m:len(m['Destination']))
+    host=pathlib.Path(mount['Source'])/name.relative_to(mount['Destination'])
+    dev=str(os.stat(host).st_dev)
+    if dev not in devices:
+        disk=run(['df','-Pk',str(host)]).splitlines()[-1].split(maxsplit=5)
+        s=os.statvfs(host)
+        devices[dev]={'source':disk[0],'mount':disk[5],'freeBytes':s.f_bavail*s.f_frsize,'sizeBytes':s.f_blocks*s.f_frsize}
+    files[label]=dev
+services={s:[] for s in ['api','worker','postgres','redis','node-api','sweeper','web','media-repair']}
+ids=run(['docker','ps','--all','--no-trunc','--quiet','--filter','label=com.docker.compose.project=hz-solver2']).split()
+if ids:
+    fmt='{{index .Config.Labels "com.docker.compose.service"}}|{{index .Config.Labels "com.docker.compose.oneoff"}}|{{.Id}}|{{.State.Status}}|{{.State.StartedAt}}|{{.RestartCount}}'
+    for line in sorted(run(['docker','inspect','--format',fmt,*ids]).splitlines()):
+        service,oneoff,identity,state,start,restarts=line.split('|')
+        if service in services and oneoff.lower()!='true':
+            services[service].append({'id':identity,'state':state,'startedAt':start,'restarts':int(restarts)})
+print(json.dumps({'devices':devices,'files':files,'services':services}))
+"""
+
+
+def worker_tail_witness(facts, session):
+    tables = [("heap", "public.progressive_worker_reports", facts["oid"], facts["relfilenode"], facts["heapBytes"]),
+              ("toast", facts["toastName"], facts["toastOid"], facts["toastFilenode"], facts["toastHeapBytes"])]
+    if not re.fullmatch(r"pg_toast\.pg_toast_[0-9]+", tables[1][1]):
+        raise ValueError("Unexpected worker report TOAST relation")
+    block = facts["blockBytes"]
+    probes, result = {}, {}
+    for kind, name, oid, file, size in tables:
+        end = size // block
+        start = max(0, end - 32)
+        result[kind] = {"endBlockExclusive": end, "probedBlocks": 0, "visibleTailUpperBoundBytes": None}
+        if kind == "toast" and not facts["toastReadable"]:
+            result[kind]["status"] = "no-existing-read-access"
+            continue
+        if end == 0:
+            result[kind]["visibleTailUpperBoundBytes"] = 0
+            continue
+        select = f"""SELECT max(split_part(trim(both '()' from ctid::text),',',1)::bigint) AS last_block
+            FROM {name} WHERE ctid>='({start},0)'::tid AND ctid<'({end},0)'::tid"""
+        probes[kind] = (select, oid, file, end - start)
+    if not probes:
+        return result
+    prefix = ("BEGIN READ ONLY; SET LOCAL search_path=pg_catalog; SET LOCAL max_parallel_workers_per_gather=0; "
+              "SET LOCAL enable_seqscan=off; SET LOCAL enable_bitmapscan=off; ")
+    plans = session(prefix + "".join(f"EXPLAIN (FORMAT JSON,COSTS OFF) {p[0]};" for p in probes.values()) + "COMMIT;", False)
+    for (kind, (select, oid, file, span)), explained in zip(probes.items(), plans, strict=True):
+        plan = explained[0]["Plan"]
+        children = plan.get("Plans", [])
+        if plan["Node Type"] != "Aggregate" or len(children) != 1 or children[0]["Node Type"] != "Tid Range Scan" or children[0].get("Plans"):
+            result[kind]["status"] = "no-bounded-tid-plan"
+            continue
+        [observed] = session(prefix + f"""SELECT jsonb_build_object('lastVisibleBlock',last_block,
+            'blocksAtRead',pg_relation_size({oid}::oid)/{block},'filenodeAtRead',pg_relation_filenode({oid}::oid)::bigint)
+            FROM ({select}) visible; COMMIT;""", False)
+        result[kind].update(observed, probedBlocks=span)
+        last = observed["lastVisibleBlock"]
+        if observed["filenodeAtRead"] == file and last is not None and observed["blocksAtRead"] > last:
+            result[kind]["visibleTailUpperBoundBytes"] = (observed["blocksAtRead"] - last - 1) * block
+    return result
+
+
+def worker_return_check(prior=None, live_values=False, session=vacuum_session, host=ssh, *, review_free_bytes=None):
+    if prior is not None and (not isinstance(prior, dict) or prior.get("role") != "worker" or
+                              prior.get("table") != "public.progressive_worker_reports"):
+        raise ValueError("Expected a private HZ worker report measurement as the baseline")
+    if review_free_bytes is not None and review_free_bytes < 1:
+        raise ValueError("A workspace review budget must be positive")
+    statement = "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; SET LOCAL search_path=pg_catalog; " + RETURN_SNAPSHOT + ";"
+    if live_values:
+        statement += ("SET LOCAL statement_timeout='12s'; SET LOCAL max_parallel_workers_per_gather=0; "
+                      "SET LOCAL jit=off; SET LOCAL work_mem='1MB'; " + LIVE_VALUES + ";")
+    rows = session(statement + " COMMIT;", False)
+    if len(rows) != 1 + int(live_values):
+        raise ValueError("Missing report, TOAST or live-value observation")
+    facts = rows[0]
+    facts["mode"] = "read-only-return-check"
+    # PostgreSQL can check privileges on a function RTE even in a skipped
+    # CASE branch. Issue the separate metadata query only for existing rights.
+    facts["wal"]["directoryBytes"] = None
+    if facts["wal"].pop("canListDirectory"):
+        [wal] = session("BEGIN READ ONLY; SELECT jsonb_build_object('bytes',coalesce(sum(size),0)) FROM pg_catalog.pg_ls_waldir(); COMMIT;", False)
+        facts["wal"]["directoryBytes"] = wal["bytes"]
+    paths = {k: str(Path(facts["dataDir"] or "") / name) for k, name in facts["paths"].items()}
+    runtime = json.loads(host("worker", ["python3", "-c", WORKER_VOLUMES, json.dumps(paths)]))
+    devices, files = runtime["devices"], runtime["files"]
+    facts["tail"] = worker_tail_witness(facts, session)
+    facts["fileVolumes"] = {name: devices[dev] for name, dev in files.items()}
+    facts["postgresFilesystem"] = devices[files["heap"]]
+    facts["serviceStates"] = runtime["services"]
+    if len(facts["serviceStates"]["postgres"]) != 1 or facts["serviceStates"]["postgres"][0]["state"] != "running":
+        raise ValueError("Cannot identify the running HZ PostgreSQL container")
+    facts["sharedDataAndWalVolume"] = len(set(files.values())) == 1 and not facts["tempTablespaces"]
+    # This is the margin for a copy as large as the present allocation, not
+    # a replacement-size estimate or authorization to start an exclusive rewrite.
+    free = facts["postgresFilesystem"]["freeBytes"]
+    facts["freeMinusCurrentAllocationBytes"] = free - facts["totalBytes"] if facts["sharedDataAndWalVolume"] else None
+    if review_free_bytes is not None:
+        # A caller-supplied workspace budget triggers review only. Mixed volumes
+        # require separate budgets; never count unrelated space against one.
+        facts["reviewBudgetBytes"] = review_free_bytes
+        facts["reviewBudgetCovered"] = free >= review_free_bytes if facts["sharedDataAndWalVolume"] else None
+    if live_values:
+        facts["liveValues"] = rows[1] or {}
+        total = sum(group["storedReportBytes"] for group in facts["liveValues"].values())
+        facts["liveReportValueBytes"] = total
+        facts["freeMinusLiveReportValuesBytes"] = free - total if facts["sharedDataAndWalVolume"] else None
+    if prior is not None:
+        change = comparison(prior, facts)
+        if (not change["samePhysicalFile"] or not change["sameServerStart"] or
+                prior["postgresFilesystem"]["source"] != facts["postgresFilesystem"]["source"] or
+                ("toastFilenode" in prior and (prior["toastOid"], prior["toastFilenode"]) != (facts["toastOid"], facts["toastFilenode"]))):
+            raise ValueError("Worker, physical files, server start or data volume changed; capture a new baseline")
+        signals = []
+        if change["relationFileDecreaseBytes"] > 0:
+            signals.append("relation-allocation-fell")
+        if facts["lastToastAutovacuum"] and prior.get("lastToastAutovacuum") != facts["lastToastAutovacuum"]:
+            signals.append("new-toast-autovacuum")
+        if facts.get("reviewBudgetCovered") is True and prior["postgresFilesystem"]["freeBytes"] < review_free_bytes:
+            signals.append("specified-review-budget-reached")
+        gap = prior.get("freeMinusCurrentAllocationBytes")
+        if gap is not None and gap < 0 and facts["freeMinusCurrentAllocationBytes"] is not None and facts["freeMinusCurrentAllocationBytes"] >= 0:
+            signals.append("available-space-crossed-current-allocation")
+        old_margin, new_margin = prior.get("freeMinusLiveReportValuesBytes"), facts.get("freeMinusLiveReportValuesBytes")
+        if old_margin is not None and new_margin is not None:
+            change["liveValueMarginDeltaBytes"] = new_margin - old_margin
+            if new_margin > old_margin:
+                signals.append("live-value-workspace-improved")
+        if "serviceStates" in prior:
+            changed = [name for name in sorted(prior["serviceStates"].keys() | facts["serviceStates"].keys())
+                       if prior["serviceStates"].get(name) != facts["serviceStates"].get(name)]
+            change["changedServices"] = changed
+            change["sameServiceStates"] = not changed
+            if changed:
+                signals.append("service-state-changed")
+        if "indexFiles" in prior:
+            change["sameIndexFiles"] = prior["indexFiles"] == facts["indexFiles"]
+        if "ingress" in prior:
+            keys = ("unacknowledgedReport", "liveClaims", "livePromises", "ingestingJobs")
+            old_ingress = any(prior["ingress"][k] for k in keys)
+            new_ingress = any(facts["ingress"][k] for k in keys)
+            if old_ingress != new_ingress:
+                signals.append("outstanding-ingress-cleared" if old_ingress else "ingress-resumed")
+        facts["change"] = change
+        facts["reviewSignals"] = signals
+    return facts
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     action = parser.add_mutually_exclusive_group()
     action.add_argument("--measure", choices=TARGETS)
     action.add_argument("--compare", nargs=2, type=Path, metavar=("BEFORE_JSON", "AFTER_JSON"))
     action.add_argument("--autovacuum", choices=["worker"], help="plan HZ report heap and TOAST vacuum thresholds")
+    action.add_argument("--return-check", choices=["worker"], help="read HZ physical allocation, WAL, ingress and service state")
+    parser.add_argument("--prior", type=Path, help="previous private worker measurement or return check")
+    parser.add_argument("--review-free-bytes", type=int, help="optional combined workspace byte budget for a review signal")
+    parser.add_argument("--live-values", action="store_true", help="include a time-limited census of live stored report fields")
     parser.add_argument("--scale-factor", type=scale_factor, help="ceiling for both effective scale factors (default 0.02)")
     parser.add_argument("--apply", action="store_true", help="commit the planned worker-local reloptions")
     parser.add_argument("--output", type=Path, help="new local private audit file; existing files are never overwritten")
     args = parser.parse_args()
     if not args.autovacuum and (args.apply or args.scale_factor is not None):
         parser.error("--apply and --scale-factor require --autovacuum worker")
-    if not (args.autovacuum or args.compare or args.measure):
+    if not args.return_check and (args.prior or args.live_values or args.review_free_bytes is not None):
+        parser.error("--prior, --live-values and --review-free-bytes require --return-check worker")
+    if not (args.autovacuum or args.compare or args.measure or args.return_check):
         parser.print_help()
         return 0
     # Reserve the private receipt before a possible database commit.
@@ -336,6 +565,9 @@ def main() -> int:
         if args.autovacuum:
             target = Decimal("0.02") if args.scale_factor is None else args.scale_factor
             result = worker_autovacuum(target, args.apply)
+        elif args.return_check:
+            prior = json.loads(args.prior.read_text()) if args.prior else None
+            result = worker_return_check(prior, args.live_values, review_free_bytes=args.review_free_bytes)
         elif args.compare:
             result = comparison(*(json.loads(path.read_text()) for path in args.compare))
         else:
