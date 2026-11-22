@@ -1,3 +1,4 @@
+import { attemptDigestColumns, matchesOriginalAttemptDigest } from "./attempt-evidence-digest";
 import { sql } from "drizzle-orm";
 import type { DB } from "./client";
 import { analysisContentHash, canonicalAnalysisJson } from "./analysis-target";
@@ -66,7 +67,7 @@ export async function verifyProgressiveCfdMaterialGap(db: DB, unitId: string, at
       generation.id AS generation_id, generation.epoch_id,
       plan.recipe AS recovery_recipe, plan.diagnostic_signature,
       attempt.token, attempt.execution_recipe_id, recipe.source_revision_id, recipe.recipe,
-      raw.evidence_payload, evidence.evidence_signature,
+      ${attemptDigestColumns(sql`raw`)}, evidence.evidence_signature,
       attempt_job.id AS job_id, attempt_job.engine_job_id, attempt_job.request_payload,
       stop.proof, stop.proof_signature,
       dispatch.envelope, dispatch.solver_id, dispatch.promise_id, dispatch.content_signature
@@ -88,7 +89,7 @@ export async function verifyProgressiveCfdMaterialGap(db: DB, unitId: string, at
     if (!expected || canonicalAnalysisJson(expected) !== canonicalAnalysisJson(row.recovery_recipe) ||
       canonicalAnalysisJson(row.recipe) !== canonicalAnalysisJson(row.unit_recipe) ||
       analysisContentHash({ sourceRevisionId: row.source_revision_id, recipe: row.recipe }) !== row.execution_recipe_id ||
-      analysisContentHash(row.evidence_payload) !== row.evidence_signature ||
+      !matchesOriginalAttemptDigest(row, row.evidence_signature) ||
       row.evidence_signature !== row.diagnostic_signature ||
       canonicalAnalysisJson(expected) !== canonicalAnalysisJson(
         normalizeProgressiveMaterialDomainRecoveryRecipe(row.recovery_recipe as Record<string, unknown>),

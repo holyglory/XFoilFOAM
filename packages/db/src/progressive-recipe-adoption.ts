@@ -1,3 +1,4 @@
+import { attemptDigestColumns, matchesOriginalAttemptDigest } from "./attempt-evidence-digest";
 import { sql } from "drizzle-orm";
 import {
   FAST_WALL_SPACING_POLICY,
@@ -762,7 +763,7 @@ async function reusePreviousCfdEvidenceProofs(
       reuse.source_evidence_signature,
       reuse.source_generation_id,
       reuse.source_execution_recipe_id,
-      raw.evidence_payload AS source_evidence_payload,
+      ${attemptDigestColumns(sql`raw`)},
       stopped.proof,
       stopped.proof_signature
     FROM progressive_cfd_units successor
@@ -829,8 +830,7 @@ async function reusePreviousCfdEvidenceProofs(
         sourceRevisionId: String(row.successor_revision_id),
         recipe: row.successor_recipe,
       }) !== row.source_execution_recipe_id ||
-      analysisContentHash(row.source_evidence_payload) !==
-        row.source_evidence_signature ||
+      !matchesOriginalAttemptDigest(row, row.source_evidence_signature) ||
       analysisContentHash(row.proof) !== row.proof_signature
     )
       continue;
