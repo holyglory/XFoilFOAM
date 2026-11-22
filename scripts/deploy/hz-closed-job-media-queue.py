@@ -256,13 +256,19 @@ def run(config, config_sha):
         def status(phase, **values):
             publish(state / "status.json", {"phase": phase, "at": now(), "total": len(rows), **values})
 
-        if lead and saved_receipt(state, lead) is None:
+        slot = state / "named-slot.json"
+        pending_lead = state / "pending" / (str(lead) + ".json")
+        # A one-time discovery/transport fault in the optional early slot must
+        # not hold up the original inventory. An uncertain unlink still needs replay.
+        need_early = not slot.exists() or (pending_lead.exists() and read(pending_lead).get("applying"))
+        if lead and need_early and saved_receipt(state, lead) is None:
             with exclusive(old_state / "operator.lock"):
                 status("named-media-job", job=lead)
                 # The named slot is optional. An outstanding removal in the original
                 # inventory must finish its native, SQL and cloud replay first.
                 unfinished = [read(path) for path in (old_state / "pending").glob("*.json")]
                 if not any(item.get("effect") for item in unfinished):
+                    publish(slot, {"job": lead, "startedAt": now()})
                     process(jobs[lead], state, installation, anchor_read(installation, baseline))
         if not predecessor_complete(previous, entries):
             status("original-inventory", originalState=str(old_state))

@@ -1346,8 +1346,8 @@ def test_media_queue_uses_the_same_lane_and_recovers_a_real_persisted_effect(tmp
         operator["predecessor_complete"]({"state": str(missing)}, [{"id": job, "plan": plan["plan"]}])
 
 
-@pytest.mark.parametrize("pending_effect", [False, True])
-def test_media_queue_runs_original_frozen_inventory_before_the_remaining_media(tmp_path, monkeypatch, pending_effect):
+@pytest.mark.parametrize("boundary", ["clear", "original-effect", "interrupted-read-only-slot"])
+def test_media_queue_runs_original_frozen_inventory_before_the_remaining_media(tmp_path, monkeypatch, boundary):
     import runpy
     module = runpy.run_path(str(Path(__file__).resolve().parents[1] / "scripts/deploy/hz-closed-job-media-queue.py"))
     publish, run = module["publish"], module["run"]
@@ -1364,8 +1364,10 @@ def test_media_queue_runs_original_frozen_inventory_before_the_remaining_media(t
     publish(old / "status.json", {"phase": "checking"})
     proof = tmp_path / "canary.json"
     publish(proof, {"job": anchor})
-    if pending_effect:
+    if boundary == "original-effect":
         publish(old / "pending" / "work.json", {"effect": {"settled": True}})
+    if boundary == "interrupted-read-only-slot":
+        publish(state / "named-slot.json", {"job": lead})
     sha = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
     old_config = {"repository": str(old), "state": str(old), "inventory": str(previous), "sha256": sha(previous),
                   "manifestSha256": sha(old / "manifest.json"), "runtimeProof": str(proof), "runtimeProofSha256": sha(proof)}
@@ -1392,7 +1394,7 @@ def test_media_queue_runs_original_frozen_inventory_before_the_remaining_media(t
     monkeypatch.setitem(run.__globals__, "anchor_read", lambda *_: {})
     monkeypatch.setattr(module["subprocess"], "run", prior)
     run(config, "contract")
-    assert calls == ([original, lead, other] if pending_effect else [lead, original, other])
+    assert calls == ([lead, original, other] if boundary == "clear" else [original, lead, other])
     calls.clear()
     run(config, "contract")
     assert not calls and module["read"](state / "status.json")["verified"] == 2
