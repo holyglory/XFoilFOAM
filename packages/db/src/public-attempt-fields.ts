@@ -97,20 +97,27 @@ async function readFields(
       LEFT JOIN progressive_cfd_evidence cf ON cf.result_attempt_id=a.id
       WHERE proj.projection @> jsonb_build_object('version',1,'attemptId',a.id,'archiveId',ar.id,
               'sourceSha256',ar.source_sha256,'sourceByteSize',ar.source_byte_size)
-        AND jsonb_typeof(proj.projection->'removedPaths')='array' AND jsonb_typeof(proj.projection->'values')='object'
+        AND jsonb_typeof(proj.projection->'removedPaths')='array'
+        AND proj.projection#>'{values,[]}' @> jsonb_build_object('path','[]'::jsonb,'present',true,
+              'sourceSha256',ar.source_sha256,'byteSize',ar.source_byte_size)
         AND jsonb_typeof(a.evidence_payload)='object'
         AND e.verification->'direct' @> jsonb_build_object('attemptId',a.id,'archiveId',ar.id,'bucket',ar.bucket,
               'objectKey',ar.object_key,'generation',ar.generation,'storedSha256',ar.stored_sha256,'storedByteSize',ar.stored_byte_size,
               'crc32c',ar.crc32c,'sourceSha256',ar.source_sha256,'sourceByteSize',ar.source_byte_size)
         AND e.verification->'app' @> jsonb_build_object('attemptId',a.id,'archiveId',ar.id,'forceArchive',true,
               'sourceSha256',ar.source_sha256,'sourceByteSize',ar.source_byte_size)
-        AND (CASE e.verification#>>'{dependencies,verifier}'
-          WHEN 'server-consumers/hz-worker-steady-rans-v1' THEN
-            e.verification#>>'{app,source}'='worker-volume' AND e.verification#>'{dependencies,workerScope}' @>
+        AND (CASE
+          WHEN e.verification#>>'{dependencies,verifier}' IN
+                ('server-consumers/hz-worker-steady-rans-v1','server-consumers/hz-retained-original-v2') THEN
+            e.verification#>>'{app,source}'='worker-volume' AND e.verification#>>'{dependencies,applicationSha256}' ~ '^[0-9a-f]{64}$'
+            AND e.verification#>'{dependencies,workerScope}' @>
               jsonb_build_object('job',ar.sim_job_id,'attempt',a.id,'result',a.result_id,'instance',ar.source_instance)
-          ELSE e.verification#>>'{app,source}'='gcs' END)
+          WHEN e.verification#>>'{dependencies,verifier}' IN ('server-consumers/local-steady-rans-v1',
+                'server-consumers/stopped-progressive-rans-v1','server-consumers/receipt-bearing-rans-v1',
+                'server-consumers/receipt-bearing-urans-v1') THEN e.verification#>>'{app,source}'='gcs'
+          ELSE false END)
         AND e.verification->'dependencies' @> jsonb_build_object('contractVersion',1,'attemptId',a.id,'archiveId',ar.id,
-              'sourceSha256',ar.source_sha256, 'readDependenciesSatisfied',true, 'scientificEquivalent',true)
+              'sourceSha256',ar.source_sha256, 'readDependenciesSatisfied',true,'scientificEquivalent',true,'equalityEquivalent',true)
         AND cf.attempt_token::text IS NOT DISTINCT FROM e.verification#>>'{dependencies,progressiveScope,scientific,attemptToken}'
         AND cf.evidence_signature IS NOT DISTINCT FROM e.verification#>>'{dependencies,progressiveScope,scientific,applicationSha256}'
         AND (cf.attempt_token IS NULL OR cf.evidence_signature=e.verification#>>'{dependencies,applicationSha256}')
@@ -339,29 +346,38 @@ export async function readPublicAttemptFields(
   const hits = new Map<string, Payload>();
   if (!keys.length) return hits;
   const unique = new Map<string, PublicAttemptFieldOwner | null>();
-  for (const r of owners) {
-    const prior = unique.get(r.id);
+  for (const owner of owners) {
+    const id = owner.id.toLowerCase();
     if (
-      prior === null ||
-      (prior &&
-        (prior.resultId !== r.resultId ||
-          prior.simJobId !== r.simJobId ||
-          prior.evidenceArchiveId !== r.evidenceArchiveId ||
-          prior.evidenceStorageEventId !== r.evidenceStorageEventId))
+      !uuid.test(id) ||
+      !owner.resultId ||
+      !uuid.test(owner.resultId) ||
+      (owner.simJobId !== null && !uuid.test(owner.simJobId)) ||
+      !owner.evidenceArchiveId ||
+      !uuid.test(owner.evidenceArchiveId) ||
+      !owner.evidenceStorageEventId ||
+      !uuid.test(owner.evidenceStorageEventId)
     ) {
-      unique.set(r.id, null);
-    } else if (
-      !uuid.test(r.id) ||
-      !r.resultId ||
-      !uuid.test(r.resultId) ||
-      (r.simJobId !== null && !uuid.test(r.simJobId)) ||
-      !r.evidenceArchiveId ||
-      !uuid.test(r.evidenceArchiveId) ||
-      !r.evidenceStorageEventId ||
-      !uuid.test(r.evidenceStorageEventId)
-    ) {
-      unique.set(r.id, null);
-    } else unique.set(r.id, r);
+      unique.set(id, null);
+      continue;
+    }
+    const candidate = {
+      id,
+      resultId: owner.resultId.toLowerCase(),
+      simJobId: owner.simJobId?.toLowerCase() ?? null,
+      evidenceArchiveId: owner.evidenceArchiveId.toLowerCase(),
+      evidenceStorageEventId: owner.evidenceStorageEventId.toLowerCase(),
+    };
+    const prior = unique.get(id);
+    if (prior === undefined) unique.set(id, candidate);
+    else if (
+      prior &&
+      (prior.resultId !== candidate.resultId ||
+        prior.simJobId !== candidate.simJobId ||
+        prior.evidenceArchiveId !== candidate.evidenceArchiveId ||
+        prior.evidenceStorageEventId !== candidate.evidenceStorageEventId)
+    )
+      unique.set(id, null);
   }
   const cold = [...unique.values()].filter(
     (r): r is PublicAttemptFieldOwner => r !== null,
@@ -374,5 +390,10 @@ export async function readPublicAttemptFields(
       keys,
       hits,
     );
-  return hits;
+  const byInput = new Map<string, Payload>();
+  for (const owner of owners) {
+    const payload = hits.get(owner.id.toLowerCase());
+    if (payload) byInput.set(owner.id, payload);
+  }
+  return byInput;
 }
