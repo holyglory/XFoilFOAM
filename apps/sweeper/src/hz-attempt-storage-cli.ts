@@ -1,3 +1,4 @@
+import { runOriginalCycle } from "./hz-attempt-original-cycle";
 import { parseArgs } from "node:util";
 import { pathToFileURL } from "node:url";
 import { join, resolve } from "node:path";
@@ -16,12 +17,13 @@ export async function hzAttemptStorage(
     relay?: AttemptRelay;
     report?: (value: unknown) => void;
     signal?: AbortSignal;
+    originalCycle?: typeof runOriginalCycle;
   } = {},
 ) {
   const report = io.report ?? ((value) => console.log(JSON.stringify(value)));
   if (args.length === 1 && args[0] === "--help") {
     console.log(
-      "hz-attempt-storage-cli.ts plan [--id UUID | --until-complete] | status | migrate --apply (--id UUID | --directory DIR [--until-complete]) | watch --apply --directory DIR [--poll-seconds N] | restore --apply --id UUID. Writes require --bucket BUCKET --hub-account-file FILE.",
+      "hz-attempt-storage-cli.ts plan [--id UUID | --until-complete] | status | migrate --apply (--id UUID | --directory DIR [--until-complete]) | watch --apply --directory DIR [--poll-seconds N] | restore --apply --id UUID. Writes require --bucket BUCKET --hub-account-file FILE. Worker extension: --include-retained. Add --originals-directory DIR [--originals-scope FILE] to the same watch for archive-only discovery and copies.",
     );
     return;
   }
@@ -30,6 +32,9 @@ export async function hzAttemptStorage(
     allowPositionals: true,
     options: {
       apply: { type: "boolean" },
+      "include-retained": { type: "boolean" },
+      "originals-directory": { type: "string" },
+      "originals-scope": { type: "string" },
       id: { type: "string" },
       directory: { type: "string" },
       limit: { type: "string", default: "8" },
@@ -57,7 +62,9 @@ export async function hzAttemptStorage(
     !["plan", "status", "watch", "migrate", "restore"].includes(mode!) ||
     write !== Boolean(v.apply) ||
     (mode === "restore" && !v.id) ||
-    (v.id && (continuous || mode === "status"))
+    (v.id && (continuous || mode === "status")) ||
+    (v["originals-directory"] && mode !== "watch") ||
+    (v["originals-scope"] && !v["originals-directory"])
   )
     throw Error("Invalid command");
   const limit = Number(v.limit),
@@ -91,7 +98,7 @@ export async function hzAttemptStorage(
     }
   };
   const helper = "/app/apps/sweeper/src/hz-attempt-custody-cli.ts";
-  const relay: AttemptRelay = io.relay ?? {
+  const transport: AttemptRelay = io.relay ?? {
     worker: (r, write) =>
       endpoint(v["hz-host"], v["hz-sweeper"], helper, r, write),
     api: (r) =>
@@ -128,11 +135,31 @@ export async function hzAttemptStorage(
       }
     }
   }
+  const relay: AttemptRelay = v["include-retained"]
+    ? {
+        ...transport,
+        worker: (r, write) => transport.worker({ ...r, retained: true }, write),
+      }
+    : transport;
   const dir = v.directory && resolve(v.directory);
+  const originals = v["originals-directory"]
+    ? {
+        directory: resolve(v["originals-directory"]),
+        scope: v["originals-scope"] && resolve(v["originals-scope"]),
+        hzHost: v["hz-host"],
+        hzContainer: v["hz-sweeper"],
+        hubHost: v["hub-host"],
+        hubContainer: v["hub-sweeper"],
+        bucket: v.bucket!,
+        accountFile: resolve(v["hub-account-file"]!),
+      }
+    : null;
   const unlock = dir ? await lockDirectory(dir) : null;
   try {
     const bound = await retry(() => relay.worker({ operation: "bound" })),
       instance = exactId(bound.instance);
+    if (v["include-retained"] && bound.retained_contract !== true)
+      throw new HistoryOperationError("retained_worker_contract", "input");
     if (mode === "status") {
       report(await relay.worker({ operation: "status" }));
       return;
@@ -165,7 +192,15 @@ export async function hzAttemptStorage(
         ]),
       )
       .digest("hex");
-    const file = dir && join(dir, "attempt-" + mode + ".json");
+    const file =
+      dir &&
+      join(
+        dir,
+        "attempt-" +
+          mode +
+          (v["include-retained"] ? "-retained" : "") +
+          ".json",
+      );
     let state = {
       version: 1,
       binding,
@@ -218,6 +253,12 @@ export async function hzAttemptStorage(
         !state.complete && (continuous || pass < pages);
         pass++
       ) {
+        if (originals)
+          await (io.originalCycle ?? runOriginalCycle)(
+            originals,
+            15,
+            control.signal,
+          );
         const rows = await retry(() =>
           relay.worker({
             operation: "page",
@@ -271,7 +312,16 @@ export async function hzAttemptStorage(
             : {}),
         });
       if (!watching) break;
-      await delay(poll * 1000, undefined, { signal: control.signal });
+      const nextScan = Date.now() + poll * 1000;
+      if (originals)
+        await (io.originalCycle ?? runOriginalCycle)(
+          originals,
+          poll,
+          control.signal,
+        );
+      await delay(Math.max(0, nextScan - Date.now()), undefined, {
+        signal: control.signal,
+      });
       const next = await retry(() => relay.worker({ operation: "bound" }));
       if (next.instance !== instance || next.solver !== bound.solver)
         throw Error("Worker identity changed");

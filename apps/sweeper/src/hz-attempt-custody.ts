@@ -8,7 +8,10 @@ import {
   publicationHistoryJoin,
   publicationHistoryPayload,
 } from "./attempt-publication-history";
-import { createAttemptServerDependencyVerifier } from "@aerodb/db/attempt-evidence-dependency-verifier";
+import {
+  createAttemptServerDependencyVerifier,
+  storedJobDecisionSha256,
+} from "@aerodb/db/attempt-evidence-dependency-verifier";
 import { sql } from "drizzle-orm";
 import type { DB } from "@aerodb/db/client";
 import {
@@ -89,20 +92,21 @@ export async function attemptPage(
   after: string,
   high: string,
   limit: number,
+  retained = false,
 ) {
   if (!Number.isInteger(limit) || limit < 1 || limit > 64)
     throw Error("Invalid page size");
   return db.execute(sql`WITH keys AS MATERIALIZED (
-  SELECT DISTINCT a.id FROM progressive_worker_hub_receipts h JOIN result_attempts a ON a.id=h.result_attempt_id WHERE a.id>${exactId(after)}::uuid AND a.id<=${exactId(high)}::uuid
-   AND a.status='done' AND a.regime='rans' AND h.receipt->'storageOnly'='true'::jsonb
+  SELECT DISTINCT a.id FROM progressive_worker_hub_receipts h JOIN result_attempts a ON a.id=h.result_attempt_id WHERE h.result_attempt_id>${exactId(after)}::uuid AND h.result_attempt_id<=${exactId(high)}::uuid
+   AND ${retained ? sql`a.status IN ('done','failed') AND h.receipt->>'kind'='retained-progressive-attempt'` : sql`a.status='done' AND a.regime='rans'`} AND h.receipt->'storageOnly' IN ('true'::jsonb,${retained ? sql`'false'::jsonb` : sql`'true'::jsonb`})
   ORDER BY a.id LIMIT ${limit})
  SELECT k.id::text AS id,a.evidence_archive_id::text AS archive, e.app_readback_at IS NULL AND a.evidence_archive_id IS NOT NULL AS pending,
- CASE WHEN a.evidence_archive_id IS NULL THEN attempt_evidence_hz_limiter(k.id) END AS limiter,
+ CASE WHEN a.evidence_archive_id IS NULL THEN ${retained ? sql`attempt_evidence_hz_retained_limiter(k.id)` : sql`attempt_evidence_hz_limiter(k.id)`} END AS limiter,
  pg_column_size(a.evidence_payload) AS stored,CASE WHEN a.evidence_archive_id IS NULL AND pg_column_size(a.evidence_payload)<=262144 THEN octet_length(a.evidence_payload::text)-octet_length(attempt_evidence_compact(a.evidence_payload)::text) END AS logical
  FROM keys k JOIN result_attempts a ON a.id=k.id LEFT JOIN attempt_evidence_storage_events e ON e.id=a.evidence_storage_event_id ORDER BY k.id`);
 }
 /** The only worker mode enabled by this operator is the separately gated 0212 cohort. */
-export async function enableHzCustody(db: DB) {
+export async function enableHzCustody(db: DB, retained = false) {
   const changed =
     await db.execute(sql`UPDATE attempt_evidence_storage_policy p SET hz_worker_only=true,shortening_enabled=true,consumer_contract_version=1
    WHERE id=1 AND NOT shortening_enabled AND NOT stopped_progressive_enabled AND progressive_source_scope='legacy'
@@ -115,8 +119,20 @@ export async function enableHzCustody(db: DB) {
     if (cfg?.ready !== true)
       throw Error("A different attempt policy is active");
   }
+  if (retained) {
+    const [ready] =
+      await db.execute(sql`UPDATE attempt_evidence_storage_policy SET hz_retained_enabled=true WHERE id=1 AND NOT hz_retained_enabled AND hz_worker_only AND shortening_enabled AND consumer_contract_version=1
+      AND progressive_source_scope='legacy' AND EXISTS(SELECT FROM sync_api_settings WHERE id=1 AND remote_solver_enabled AND remote_solver_registered_id IS NOT NULL) RETURNING id`);
+    if (!ready) {
+      const [enabled] =
+        await db.execute(sql`SELECT hz_retained_enabled AND hz_worker_only AND shortening_enabled AND consumer_contract_version=1 AND progressive_source_scope='legacy' AS ready
+        FROM attempt_evidence_storage_policy WHERE id=1`);
+      if (enabled?.ready !== true)
+        throw Error("Worker retained-source policy unavailable");
+    }
+  }
 }
-export async function prepareHzEnvelope(db: DB, id: string) {
+export async function prepareHzEnvelope(db: DB, id: string, retained = false) {
   const [pointer] = await db.execute(
     sql`SELECT evidence_archive_id AS archive,evidence_storage_event_id AS event FROM result_attempts WHERE id=${id}::uuid`,
   );
@@ -128,7 +144,7 @@ export async function prepareHzEnvelope(db: DB, id: string) {
       eventId: String(pointer.event),
     };
   const [condition] = await db.execute(
-    sql`SELECT attempt_evidence_hz_limiter(${id}::uuid) AS reason`,
+    sql`SELECT ${retained ? sql`attempt_evidence_hz_retained_limiter(${id}::uuid)` : sql`attempt_evidence_hz_limiter(${id}::uuid)`} AS reason`,
   );
   if (condition?.reason !== null)
     return { limited: String(condition?.reason ?? "missing") };
@@ -310,6 +326,43 @@ export async function confirmHzAttempt(
     ${publicationHistoryJoin(sql`a`, docs)} WHERE a.id=${id}::uuid`);
   if (published?.original !== text)
     throw Error("Canonical repair projection differs");
+  const [event] = await db.execute(
+    sql`SELECT e.verification->'dependencies' AS deps FROM attempt_evidence_storage_events e WHERE e.id=${eventId}::uuid AND e.result_attempt_id=${id}::uuid AND e.archive_id=${app.archiveId}::uuid`,
+  );
+  const deps = event?.deps as
+    | {
+        verifier?: string;
+        jobDecisionsSha256?: string;
+        workerScope?: { selectionSha256?: string };
+      }
+    | undefined;
+  if (deps?.verifier === "server-consumers/hz-retained-original-v2") {
+    await db.transaction(async (rawTx) => {
+      const tx = rawTx as unknown as DB;
+      await tx.execute(sql`SET TRANSACTION ISOLATION LEVEL REPEATABLE READ`);
+      await tx.execute(sql`SET LOCAL statement_timeout='8s'`);
+      await tx.execute(sql`SET LOCAL lock_timeout='1s'`);
+      await tx.execute(sql`SELECT attempt_evidence_lock_source(${id}::uuid)`);
+      const [selection] = await tx.execute(
+        sql`SELECT attempt_evidence_hz_selection_sha256(${id}::uuid) AS sha`,
+      );
+      if (
+        selection?.sha !== deps.workerScope?.selectionSha256 ||
+        (await storedJobDecisionSha256(tx, id)) !== deps.jobDecisionsSha256
+      )
+        throw Error(
+          "Stored worker classification, selection, interpretation or fit changed",
+        );
+      await tx.execute(
+        sql`SELECT set_config('airfoilfoam.hz_retained_post_readback',${JSON.stringify({ event: eventId, source: app.sourceSha256, decisions: deps.jobDecisionsSha256, selection: selection.sha })},true)`,
+      );
+      await confirmAttemptEvidenceReadback(tx, eventId, {
+        ...app,
+        payloadText: text,
+      });
+    });
+    return;
+  }
   await confirmAttemptEvidenceReadback(db, eventId, {
     ...app,
     payloadText: text,

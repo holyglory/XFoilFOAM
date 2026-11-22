@@ -1,4 +1,4 @@
-import {verifyOriginalCopyJourney} from "./hz-attempt-originals-fixture";
+import { verifyOriginalCopyJourney } from "./hz-attempt-originals-fixture";
 import { getAttemptEvidenceArchive } from "@aerodb/db/attempt-evidence-catalog";
 import { readHzAttemptWorkingCopy } from "../src/hz-attempt-volume";
 import {
@@ -38,7 +38,7 @@ import { join } from "node:path";
 import { writeFile } from "node:fs/promises";
 import { HistoryOperationError } from "@aerodb/core/point-history-protocol";
 
-function objectStore(originalCopy=false) {
+function objectStore(originalCopy = false) {
   const objects = new Map<string, { bytes: Buffer; metadata: any }>();
   const account = "fixture@attempt-test.iam.gserviceaccount.com",
     bucket = "attempt-fixture";
@@ -97,7 +97,10 @@ function objectStore(originalCopy=false) {
     }
     return Response.json(entry.metadata);
   };
-  return { objects, store: new HzAttemptHubStore(bucket, account, request,originalCopy) };
+  return {
+    objects,
+    store: new HzAttemptHubStore(bucket, account, request, originalCopy),
+  };
 }
 
 export async function verifyHzAttemptTransition(
@@ -106,6 +109,7 @@ export async function verifyHzAttemptTransition(
   input: ProgressiveWorkerOutboxReplayInput,
   original: string,
   root: string,
+  periodic = false,
 ) {
   const fixture = await createSettlementFixture(true),
     db = fixture.db;
@@ -224,6 +228,66 @@ export async function verifyHzAttemptTransition(
       relay,
       report: (value: unknown) => reports.push(value as Record<string, any>),
     };
+    if (periodic) {
+      await db.execute(
+        sql`UPDATE progressive_worker_hub_receipts SET receipt=receipt||'{"storageOnly":false}'::jsonb WHERE result_attempt_id=${id}::uuid`,
+      );
+      expect(
+        (await relay.worker({ operation: "one", attemptId: id })).limiter,
+      ).not.toBeNull();
+      expect(
+        (
+          await relay.worker({
+            operation: "one",
+            attemptId: id,
+            retained: true,
+          })
+        ).limiter,
+      ).toBeNull();
+      await hzAttemptStorage(
+        ["migrate", ...config, "--id", id, "--include-retained"],
+        io,
+      );
+      const [point] =
+        await db.execute(sql`SELECT a.regime,a.status,a.source,a.evidence_payload->'urans_cycle_certificate' AS cycles,
+        a.evidence_payload#>'{force_history,t}' AS samples,a.evidence_payload#>'{frame_track,frames}' AS frames,
+        a.evidence_archive_id AS archive,e.app_readback_at,e.verification->'dependencies' AS deps
+        FROM result_attempts a JOIN attempt_evidence_storage_events e ON e.id=a.evidence_storage_event_id WHERE a.id=${id}::uuid`);
+      expect(point).toMatchObject({
+        regime: "urans",
+        status: "failed",
+        source: "queued",
+        cycles: JSON.parse(original).urans_cycle_certificate,
+        samples: null,
+        frames: null,
+        deps: {
+          verifier: "server-consumers/hz-retained-original-v2",
+          scientificEquivalent: true,
+          workerScope: { storageOnly: false },
+        },
+      });
+      expect(point.app_readback_at).toBeTruthy();
+      expect(
+        await readOriginalAttemptForProjection(db, id, String(point.archive)),
+      ).toBe(original);
+      expect(
+        await readStoredAttemptEvidenceText(db, id, {
+          source: "worker-report",
+        }),
+      ).toBe(original);
+      await hzAttemptStorage(
+        ["migrate", ...config, "--id", id, "--include-retained"],
+        io,
+      );
+      expect(reports.at(-1)).toMatchObject({
+        alreadyShortened: true,
+        payloadBytesReclaimed: 0,
+        netValueBytesReclaimed: 0,
+      });
+      await hzAttemptStorage(["restore", ...config, "--id", id], io);
+      expect(await readStoredAttemptEvidenceText(db, id)).toBe(original);
+      return;
+    }
     await hzAttemptStorage(["plan", "--until-complete", "--limit", "1"], io);
     expect(reports.at(-1)?.checkpoint.eligible).toBe(1);
     const wrongRelay: AttemptRelay = {
@@ -364,6 +428,32 @@ export async function verifyHzAttemptTransition(
     );
     await hzAttemptStorage(["status"], io);
     expect(reports.at(-1)?.confirmed).toBe(1);
+    const copySeen: number[] = [];
+    const held = new AbortController();
+    await hzAttemptStorage(
+      [
+        "watch",
+        ...config,
+        "--directory",
+        join(root, "combined"),
+        "--originals-directory",
+        join(root, "originals"),
+      ],
+      {
+        relay,
+        signal: held.signal,
+        report: (value) => {
+          if ((value as { activeCustody?: unknown }).activeCustody)
+            held.abort();
+        },
+        originalCycle: async (options, seconds) => {
+          expect(options.hzHost).toBe("hz-solver2");
+          expect(options.directory).toBe(join(root, "originals"));
+          copySeen.push(seconds);
+        },
+      },
+    );
+    expect(copySeen[0]).toBe(15);
     // A permanent failed normal API probe after commit restores the exact SQL source.
     await migrateHzAttempt(relay, id, instance, true);
     const broken = {
@@ -383,7 +473,85 @@ export async function verifyHzAttemptTransition(
         )
       )[0],
     ).toMatchObject({ evidence_archive_id: null, body: original });
-    await verifyOriginalCopyJourney(db,id,objectStore(true).store);
+
+    // Turn the same genuine point acknowledgment into the ordinary fixture
+    // class. The existing 0212 route remains restricted until explicit opt-in.
+    await db.execute(
+      sql`UPDATE progressive_worker_hub_receipts SET receipt=receipt||'{"storageOnly":false}'::jsonb WHERE result_attempt_id=${id}::uuid`,
+    );
+    expect(
+      (await relay.worker({ operation: "one", attemptId: id })).limiter,
+    ).not.toBeNull();
+    expect(
+      (await relay.worker({ operation: "one", attemptId: id, retained: true }))
+        .limiter,
+    ).toBeNull();
+    let interruptRetained = true;
+    const releasePause = {
+      ...relay,
+      async api(r: Record<string, unknown>) {
+        if (r.forceArchive === false && interruptRetained) {
+          interruptRetained = false;
+          throw new HistoryOperationError("deploy", "deployment_busy", true);
+        }
+        return relay.api(r);
+      },
+    };
+    await expect(
+      hzAttemptStorage(
+        ["migrate", ...config, "--id", id, "--include-retained"],
+        { ...io, relay: releasePause },
+      ),
+    ).rejects.toThrow("deployment_busy");
+    await expect(
+      db.execute(
+        sql`UPDATE attempt_evidence_storage_events SET app_readback_at=clock_timestamp() WHERE id=(SELECT evidence_storage_event_id FROM result_attempts WHERE id=${id}::uuid)`,
+      ),
+    ).rejects.toThrow();
+    await hzAttemptStorage(
+      ["migrate", ...config, "--id", id, "--include-retained"],
+      io,
+    );
+    const [extended] =
+      await db.execute(sql`SELECT e.id,e.verification->'dependencies' AS deps,e.app_readback_at FROM result_attempts a
+     JOIN attempt_evidence_storage_events e ON e.id=a.evidence_storage_event_id WHERE a.id=${id}::uuid AND a.evidence_archive_id=${String(cold.archive)}::uuid`);
+    expect(extended.deps).toMatchObject({
+      verifier: "server-consumers/hz-retained-original-v2",
+      jobDecisionsSha256: expect.stringMatching(/^[a-f0-9]{64}$/),
+      workerScope: {
+        storageOnly: false,
+        attempt: id,
+        selectionSha256: expect.stringMatching(/^[a-f0-9]{64}$/),
+      },
+    });
+    expect(extended.app_readback_at).toBeTruthy();
+    expect(await readStoredAttemptEvidenceText(db, id)).toBe(original);
+    expect(await interpretations()).toEqual(initialInterpretation);
+    await hzAttemptStorage(["restore", ...config, "--id", id], io);
+    const changing = {
+      ...relay,
+      async worker(r: Record<string, unknown>, write?: boolean) {
+        if (r.operation === "confirm")
+          await db.execute(
+            sql`UPDATE result_interpretations SET diagnostics='{"concurrent":true}'::jsonb WHERE result_attempt_id=${id}::uuid`,
+          );
+        return relay.worker(r, write);
+      },
+    };
+    await expect(
+      hzAttemptStorage(
+        ["migrate", ...config, "--id", id, "--include-retained"],
+        { relay: changing, report: io.report },
+      ),
+    ).rejects.toThrow(/selection|interpretation/);
+    expect(
+      (
+        await db.execute(
+          sql`SELECT evidence_archive_id,evidence_payload::text AS body FROM result_attempts WHERE id=${id}::uuid`,
+        )
+      )[0],
+    ).toMatchObject({ evidence_archive_id: null, body: original });
+    await verifyOriginalCopyJourney(db, id, objectStore(true).store);
   } finally {
     if (prior === undefined) delete process.env.MEDIA_DIR;
     else process.env.MEDIA_DIR = prior;

@@ -82,3 +82,30 @@ attempt_history restore --apply --id "$HZ_ATTEMPT_ID" \
 ```
 
 The restored row becomes eligible again when a new apply or watch pass reaches it. Stop the watch before restoring a row intended to stay inline. The catalog retains its immutable history. The accepted roll-forward and rollback evidence is the PostgreSQL event together with its confirmed product readback.
+
+## Broader signed worker histories
+
+Migration `0216_hz_retained_original_attempts.sql` follows the 0213 URANS consumer migration, the 0214 hub policy and the 0215 active-role correction. The wider HZ policy is opt-in. The canonical hub may retain a dormant worker registration. A worker backup always uses the actual remote-solver role, the active source instance identity and the registered producing worker.
+
+The broader release gate accepts an ordinary retained-point acknowledgment as well as a storage-only acknowledgment. It verifies the local attempt, result, job, promise, signed point, independently restored registered worker report and HZ-owned 0207 original. A selected or live source, missing or conflicting custody, unsupported byte size, active scientific dependency or insufficient measured savings keeps the original inline. Source-only backups remain available independently with the original archive operator.
+
+The worker compares the actual point status, source and regime with the immutable report projector. It checks the inventoried channels rather than choosing a result by its solver label. The normal API and sweeper must replay every original byte. The 0213 continuation checker preserves cycle certificates, force samples, selected physical windows and frame cadence. The shared job classifier, promotion decisions and fitted curve must agree on the original and projected inputs. After publication the worker rechecks the original through the normal sources, recomputes actual job decisions and verifies the selected point and its interpretations. The event's post-readback stamp requires those values to match the sealed before-proof. A failed post-transition check restores the exact original in a bounded transaction.
+
+After the matching integrated release is running on both hosts, use the existing controller with the following options.
+
+```sh
+attempt_history plan --include-retained --until-complete
+attempt_history migrate --include-retained --apply --id "$HZ_ATTEMPT_ID" \
+  --bucket "$HUB_BUCKET" --hub-account-file "$HUB_ACCOUNT_FILE"
+attempt_history status
+```
+
+Repeat the canary to verify its original generation and zero additional reclaimed value bytes. A wider fixed scan uses a separate checkpoint filename in the same operator directory. To run archive-only copying and wider scientific transitions sequentially in the same durable watcher, add `--originals-directory`. It gives bounded time slices to the original-copy controller between shortening pages and during the ordinary polling wait. A finite supplied `--originals-scope` preserves its exact membership. Without that option the original inventory periodically revisits newly created UUIDs and sources that settle later.
+
+```sh
+attempt_history watch --apply --include-retained --directory "$HZ_ATTEMPT_STATE" \
+  --originals-directory "$HZ_ORIGINALS_STATE" \
+  --bucket "$HUB_BUCKET" --hub-account-file "$HUB_ACCOUNT_FILE"
+```
+
+When transferring an already running standalone original-copy job into the combined watcher, quiesce that job at a bounded page during the coordinated operator handoff and reuse its directory and scope. PostgreSQL shortening measurements and original-copy progress have separate counters. The original-copy controller's `status` command can inspect its SQLite receipts while the combined watcher runs.

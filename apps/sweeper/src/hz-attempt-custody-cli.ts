@@ -28,6 +28,7 @@ export async function attemptWorkerOperation(db: DB, r: Record<string, any>) {
     case "bound": {
       const [row] =
         await db.execute(sql`SELECT s.instance_id::text AS instance,s.remote_solver_registered_id::text AS solver,
+    to_regprocedure('attempt_evidence_hz_retained_limiter(uuid,uuid)') IS NOT NULL AS retained_contract,
     (SELECT a.id::text FROM result_attempts a ORDER BY a.id DESC LIMIT 1) AS high FROM sync_api_settings s
     WHERE s.id=1 AND s.remote_solver_registered_id IS NOT NULL AND s.upstream_base_url IS NOT NULL AND to_regprocedure('attempt_evidence_hz_limiter(uuid,uuid)') IS NOT NULL`);
       if (!row) throw Error("Worker contract unavailable");
@@ -35,13 +36,13 @@ export async function attemptWorkerOperation(db: DB, r: Record<string, any>) {
     }
     case "one": {
       const [row] = await db.execute(
-        sql`SELECT a.id,attempt_evidence_hz_limiter(a.id) AS limiter,a.evidence_archive_id AS archive,pg_column_size(a.evidence_payload) AS stored,octet_length(a.evidence_payload::text)-octet_length(attempt_evidence_compact(a.evidence_payload)::text) AS logical FROM result_attempts a WHERE a.id=${exactId(r.attemptId)}::uuid`,
+        sql`SELECT a.id,${r.retained === true ? sql`attempt_evidence_hz_retained_limiter(a.id)` : sql`attempt_evidence_hz_limiter(a.id)`} AS limiter,a.evidence_archive_id AS archive,pg_column_size(a.evidence_payload) AS stored,octet_length(a.evidence_payload::text)-octet_length(attempt_evidence_compact(a.evidence_payload)::text) AS logical FROM result_attempts a WHERE a.id=${exactId(r.attemptId)}::uuid`,
       );
       if (!row) throw Error("Missing attempt");
       return row;
     }
     case "page":
-      return attemptPage(db, r.after, r.high, r.limit);
+      return attemptPage(db, r.after, r.high, r.limit, r.retained === true);
     case "status": {
       const [row] =
         await db.execute(sql`SELECT count(*)::int AS archived,count(*) FILTER(WHERE e.app_readback_at IS NULL)::int AS pending,
@@ -49,22 +50,22 @@ export async function attemptWorkerOperation(db: DB, r: Record<string, any>) {
         coalesce(sum(e.net_value_bytes_saved),0)::text AS "netValueBytesReclaimed",coalesce(sum((p.projection->>'removedLogicalBytes')::bigint),0)::text AS "removedLogicalBytes"
         FROM result_attempts a JOIN attempt_evidence_storage_events e ON e.id=a.evidence_storage_event_id AND e.archive_id=a.evidence_archive_id AND e.result_attempt_id=a.id
         JOIN attempt_evidence_history_projections p ON p.result_attempt_id=a.id AND p.archive_id=e.archive_id
-        WHERE e.action='shorten' AND e.completed AND e.verification#>>'{dependencies,verifier}'='server-consumers/hz-worker-steady-rans-v1'`);
+        WHERE e.action='shorten' AND e.completed AND e.verification#>>'{dependencies,verifier}' IN ('server-consumers/hz-worker-steady-rans-v1','server-consumers/hz-retained-original-v2')`);
       return row;
     }
     case "pending":
       return db.execute(sql`SELECT a.id::text AS id FROM attempt_evidence_storage_events e JOIN result_attempts a ON a.evidence_storage_event_id=e.id
-  WHERE e.action='shorten' AND e.completed AND e.app_readback_at IS NULL AND e.verification#>>'{dependencies,verifier}'='server-consumers/hz-worker-steady-rans-v1'
+  WHERE e.action='shorten' AND e.completed AND e.app_readback_at IS NULL AND e.verification#>>'{dependencies,verifier}' IN ('server-consumers/hz-worker-steady-rans-v1','server-consumers/hz-retained-original-v2')
   ORDER BY e.created_at,e.id LIMIT 8`);
     case "prepare":
-      return prepareHzEnvelope(db, exactId(r.attemptId));
+      return prepareHzEnvelope(db, exactId(r.attemptId), r.retained === true);
     case "stage": {
       const ar = await stageHzEnvelope(
         db,
         { ...r.identity, verifiedAt: new Date(r.identity.verifiedAt) },
         packedBytes(r.packed),
       );
-      if (r.enable === true) await enableHzCustody(db);
+      if (r.enable === true) await enableHzCustody(db, r.retained === true);
       return { id: ar.id, attemptId: ar.attemptId };
     }
     case "replay":

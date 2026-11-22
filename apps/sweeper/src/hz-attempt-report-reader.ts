@@ -18,6 +18,7 @@ import {
 import { readWorkerReportVolume } from "./worker-report-volume";
 
 interface AttemptReportPoint {
+  pointClass?: { regime: string; source: string; status: string };
   solver: string;
   promise: string;
   job: string;
@@ -28,6 +29,9 @@ interface AttemptReportPoint {
   report: ProgressiveReportArchiveReadIdentity;
 }
 interface WorkerReportRow {
+  regime: string;
+  source: string;
+  status: string;
   attempt: string;
   result: string;
   job: string;
@@ -145,9 +149,9 @@ export async function projectHzReportAttempt(
     envelope,
   });
   requireHzSource(
-    projected.regime === "rans" &&
-      projected.source === "solved" &&
-      projected.status === "done",
+    projected.regime === (owner.pointClass?.regime ?? "rans") &&
+      projected.source === (owner.pointClass?.source ?? "solved") &&
+      projected.status === (owner.pointClass?.status ?? "done"),
     "replay",
   );
   const [row] = await db.execute(
@@ -173,7 +177,7 @@ export async function readHzAttemptFromWorkerReport(
   signal?.throwIfAborted();
   const rows =
     (await db.execute(sql`SELECT a.id::text AS attempt, a.result_id::text AS result, a.sim_job_id::text AS job,
-        a.aoa_deg AS alpha, a.engine_case_slug AS slug, CASE WHEN a.evidence_archive_id IS NULL THEN encode(sha256(convert_to(a.evidence_payload::text,'UTF8')),'hex') ELSE ar.source_sha256 END AS source_sha256,
+        a.aoa_deg AS alpha, a.engine_case_slug AS slug,a.regime,a.source,a.status, CASE WHEN a.evidence_archive_id IS NULL THEN encode(sha256(convert_to(a.evidence_payload::text,'UTF8')),'hex') ELSE ar.source_sha256 END AS source_sha256,
         coalesce(ar.source_byte_size,octet_length(a.evidence_payload::text))::int AS source_bytes,
         pg_column_size(a.evidence_payload)::int AS pgbytes, coalesce(ar.history_series,attempt_evidence_series_inventory(a.evidence_payload)) AS series,
         s.instance_id::text AS instance, s.remote_solver_registered_id::text AS solver, p.id::text AS promise,
@@ -193,7 +197,7 @@ export async function readHzAttemptFromWorkerReport(
         AND h.receipt->>'remoteResultAttemptId'=a.id::text AND h.receipt->>'remoteResultId'=r.id::text
         AND h.receipt->>'pointContentSignature'=h.point_content_signature AND h.receipt->>'executionId'=j.id::text
         AND h.receipt->>'kind'='retained-progressive-attempt' AND h.receipt->>'version'='1'
-        AND h.receipt->'storageOnly'='true'::jsonb AND h.receipt->>'sequence'=h.sequence::text
+        AND h.receipt->'storageOnly' IN ('true'::jsonb,'false'::jsonb) AND h.receipt->>'sequence'=h.sequence::text
       JOIN progressive_worker_evidence_attempts w ON w.result_attempt_id=a.id AND w.sim_job_id=j.id
         AND w.sequence=h.sequence AND w.point_content_signature=h.point_content_signature
       JOIN progressive_worker_evidence_receipts e ON e.sim_job_id=w.sim_job_id AND e.sequence=w.sequence
@@ -204,8 +208,8 @@ export async function readHzAttemptFromWorkerReport(
       JOIN progressive_report_archive_bundles b ON b.id=m.bundle_id AND b.sim_job_id=j.id AND b.source_kind=m.source_kind
       LEFT JOIN attempt_evidence_archives ar ON ar.id=a.evidence_archive_id AND ar.result_attempt_id=a.id
         AND ar.result_id=a.result_id AND ar.sim_job_id=a.sim_job_id AND ar.source_instance=s.instance_id::text
-      WHERE a.id=${attemptId}::uuid AND (a.evidence_archive_id IS NULL OR ar.id IS NOT NULL) AND a.status='done' AND a.source='solved' AND a.regime='rans'
-        AND NOT a.unsteady AND r.current_result_attempt_id IS DISTINCT FROM a.id AND j.status='cancelled' AND j."ingestedAt" IS NOT NULL
+      WHERE a.id=${attemptId}::uuid AND (a.evidence_archive_id IS NULL OR ar.id IS NOT NULL) AND ((a.status='done' AND a.source='solved') OR (a.status='failed' AND a.source='queued'))
+        AND (r.current_result_attempt_id IS DISTINCT FROM a.id OR ar.id IS NOT NULL) AND j.status='cancelled' AND j."ingestedAt" IS NOT NULL
         AND (j.ingest_lease_token IS NULL OR j.ingest_lease_expires_at<=statement_timestamp())
         AND j.request_payload->>'remoteSolver'='true' AND p.status IN ('cancelled','expired','fulfilled')
         AND pg_column_size(a.evidence_payload)<=262144 AND octet_length(a.evidence_payload::text)<=262144
@@ -218,11 +222,7 @@ export async function readHzAttemptFromWorkerReport(
       LIMIT 2`)) as unknown as WorkerReportRow[];
   requireHzSource(rows.length === 1, "scope");
   const x = rows[0]!;
-  requireHzSource(
-    x.series.length === 4 &&
-      x.series.every((entry) => entry.path[0] === "steady_history"),
-    "scope",
-  );
+  requireHzSource(x.series.length > 0, "scope");
   requireHzSource(
     [x.hub_result, x.hub_attempt].every(
       (id) =>
@@ -253,6 +253,7 @@ export async function readHzAttemptFromWorkerReport(
     lastSequence: x.last_sequence,
   };
   const owner = {
+    pointClass: { regime: x.regime, source: x.source, status: x.status },
     attempt: x.attempt,
     result: x.result,
     job: x.job,
