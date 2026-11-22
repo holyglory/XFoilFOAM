@@ -271,11 +271,14 @@ def read_json(path):
     return json.loads(path.read_bytes())
 
 
-def confirm_reclaim(package, target, effect):
+def confirm_reclaim(package, target, effect, qualified=None):
     prior = effect.get("record", {})
     science = effect.get("scientificSha256") or prior.get("scientificSha256")
     require(isinstance(science, str) and SHA.fullmatch(science), "completed job lacks its pre-removal scientific signature")
-    after = run_remote(package, {**selection("verify", target["id"], target["plan"]), "science": science, "dependencies":effect.get("dependenciesSha256"),"nodePackages":effect.get("nodePackagesSha256"),"nativePackages":effect.get("nativePackages")})
+    check = {**selection("verify", target["id"], target["plan"]), "science": science}
+    after = qualified(check) if qualified is not None else run_remote(package, {**check,
+        "dependencies":effect.get("dependenciesSha256"), "nodePackages":effect.get("nodePackagesSha256"),
+        "nativePackages":effect.get("nativePackages")})
     require(after["status"]=="verified" and after["databaseReadOnly"] is True and after["plan"].get("replayed") is True and
             after["scientificSha256"]==science and after["readbacks"] and after["points"],
             "post-operation point, native receipt or GCS verification refused: "+str(after.get("reason","missing proof"))[:300])
@@ -335,6 +338,26 @@ def run_inventory(package, inventory, expected_sha, state, apply, runtime_proof)
             atomic_json(manifest,contract)
         runtime_file=state/"runtime.json"
         runtime=read_json(runtime_file) if runtime_file.exists() else {"images":contract["initialImages"],"dependencies":contract["dependenciesSha256"]}
+        def qualified(target):
+            nonlocal runtime
+            packages={"nodePackages":contract["nodePackages"],"nativePackages":contract["nativePackages"]}
+            pin={"images":runtime["images"],"dependencies":runtime["dependencies"],**packages}
+            effect=run_remote(package,{**target,**pin})
+            if effect["status"]=="runtime-changed":
+                # The host returned before opening the job. Requalify an already settled canary
+                # read-only, using the original dependency and scientific fingerprints.
+                anchor=contract["runtimeCanary"]
+                fresh=run_remote(package,{**selection("verify",anchor["id"],anchor["plan"]),
+                    "science":anchor["science"],**packages})
+                require(fresh["status"]=="verified" and fresh["scientificSha256"]==anchor["science"] and
+                        fresh["nodePackagesSha256"]==contract["nodePackages"] and fresh["nativePackages"]==contract["nativePackages"] and
+                        fresh["plan"].get("replayed") is True,
+                        "changed runtime did not reproduce the qualified scientific and storage proof")
+                runtime={"images":{s:v["image"] for s,v in fresh["containers"].items()},"dependencies":fresh["dependenciesSha256"],"revalidation":fresh}
+                atomic_json(runtime_file,runtime)
+                effect=run_remote(package,{**target,"dependencies":runtime["dependencies"],"images":runtime["images"],**packages})
+            require(effect["status"]!="runtime-changed","runtime changed again during requalification")
+            return effect
         status={**contract,"examined":0,"verified":0,"deferred":0,"logicalBytes":0,"files":0,
                 "fileAllocatedBytes":0,"netAttributedAllocatedBytes":0,"unmeasuredJobs":0}
         def publish(phase, **extra):
@@ -357,23 +380,7 @@ def run_inventory(package, inventory, expected_sha, state, apply, runtime_proof)
                     entry={"index":index,"target":target,"startedAt":datetime.now(timezone.utc).isoformat()}
                     atomic_json(pending,entry)
                 if "effect" not in entry:
-                    packages={"nodePackages":contract["nodePackages"],"nativePackages":contract["nativePackages"]}
-                    pin={"images":runtime["images"],"dependencies":runtime["dependencies"],**packages}
-                    effect=run_remote(package,{**target,**pin})
-                    if effect["status"]=="runtime-changed":
-                        # The host returned before opening the job. Requalify an already settled canary
-                        # read-only, using the original dependency and scientific fingerprints.
-                        anchor=contract["runtimeCanary"]
-                        fresh=run_remote(package,{**selection("verify",anchor["id"],anchor["plan"]),
-                            "science":anchor["science"],**packages})
-                        require(fresh["status"]=="verified" and fresh["scientificSha256"]==anchor["science"] and
-                                fresh["nodePackagesSha256"]==contract["nodePackages"] and fresh["nativePackages"]==contract["nativePackages"] and
-                                fresh["plan"].get("replayed") is True,
-                                "changed runtime did not reproduce the qualified scientific and storage proof")
-                        runtime={"images":{s:v["image"] for s,v in fresh["containers"].items()},"dependencies":fresh["dependenciesSha256"],"revalidation":fresh}
-                        atomic_json(runtime_file,runtime)
-                        effect=run_remote(package,{**target,"dependencies":runtime["dependencies"],"images":runtime["images"],**packages})
-                    entry["effect"]=effect
+                    entry["effect"]=qualified(target)
                     atomic_json(pending,entry)
                 effect=entry["effect"]
                 if effect["status"]=="refused":
@@ -381,7 +388,7 @@ def run_inventory(package, inventory, expected_sha, state, apply, runtime_proof)
                 else:
                     require(effect["status"] in ("settled","already-settled"),"unrecognized storage outcome")
                     publish("verifying",index=index,job=target["id"])
-                    entry["after"]=confirm_reclaim(package,target,effect)
+                    entry["after"]=confirm_reclaim(package,target,effect,qualified)
                     entry["outcome"]="verified"
                 entry["finishedAt"]=datetime.now(timezone.utc).isoformat()
                 atomic_json(done,entry)

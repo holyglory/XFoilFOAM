@@ -1197,7 +1197,7 @@ def test_closed_storage_inventory_resumes_one_pinned_job_and_preserves_refusals(
     def remote(_, target):
         job, mode = target["id"], target["mode"]
         calls.append((job, mode))
-        if job==ids[2] and mode=="reclaim" and target.get("images",{}).get("api")=="old":
+        if job==ids[2] and mode=="verify" and target.get("images",{}).get("api")=="old":
             return {"status":"runtime-changed","observedImages":{s:"new" for s in baseline["containers"]}}
         if job == ids[1]:
             return {"job":job, "status":"refused","reason":"held worker execution lock"}
@@ -1220,7 +1220,8 @@ def test_closed_storage_inventory_resumes_one_pinned_job_and_preserves_refusals(
     assert run({"revision":"test"},inventory,digest,state,True,baseline)==0
     summary=json.loads((state/"status.json").read_bytes())
     assert (summary["verified"], summary["deferred"], summary["fileAllocatedBytes"], summary["netAttributedAllocatedBytes"])==(2,1,16384,8192)
-    assert sum(mode=="verify" for _,mode in calls)==3
+    assert sum(mode=="verify" for _,mode in calls)==4
+    assert sum(mode=="reclaim" and job==ids[2] for job,mode in calls)==1
     assert len(list((state/"receipts").glob("*.json")))==3
     count=len(calls)
     assert run({"revision":"test"},inventory,digest,state,True,baseline)==0 and len(calls)==count
