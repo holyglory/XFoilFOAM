@@ -5625,6 +5625,14 @@ cases = [{ id = "transport-schema", args = [], postgres = "default" }]
 diagnostic_sources = [{ format = "junit", path = "report.xml" }]
 
 [[test.progressive-report-archive.check]]
+name = "package-report-migrator"
+tier = "development"
+timeout_seconds = 180
+requires = ["workspace"]
+command = ["node", "scripts/deploy/package-report-migrator.mjs"]
+retained_artifacts = [{ name = "report-migrator", path = ".codex-artifacts/report-migrator", max_bytes = 16777216 }]
+
+[[test.progressive-report-archive.check]]
 name = "report-table-maintenance"
 tier = "development"
 timeout_seconds = 300
