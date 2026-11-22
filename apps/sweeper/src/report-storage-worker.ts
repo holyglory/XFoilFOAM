@@ -8,6 +8,7 @@ import { runSolverHistoryStorageService } from "./solver-history-service";
 import { runResultHistoryStorageService } from "./result-history-service";
 import { runWorkerVolumeCleanup } from "./worker-report-volume-cleanup";
 import { runAttemptEvidenceStorageService } from "./attempt-evidence-service";
+import { runConfiguredAttemptEvidenceSettlementService } from "./attempt-evidence-settlement";
 
 const client = makeReportStorageDatabase("report-storage-backfill");
 const stop = new AbortController();
@@ -15,6 +16,14 @@ const attemptEvidence = createClient({
   max: 1,
   connection: {
     application_name: "attempt-evidence-storage",
+    statement_timeout: "5s",
+    lock_timeout: "500ms",
+  },
+});
+const attemptSettlement = createClient({
+  max: 1,
+  connection: {
+    application_name: "attempt-history-shortening",
     statement_timeout: "5s",
     lock_timeout: "500ms",
   },
@@ -32,11 +41,18 @@ try {
     work.push(
       runAttemptEvidenceStorageService(attemptEvidence.db, stop.signal),
     );
+    work.push(
+      runConfiguredAttemptEvidenceSettlementService(
+        attemptSettlement.db,
+        stop.signal,
+      ),
+    );
   }
   await Promise.all(work);
 } finally {
   stop.abort();
   await client.sql.end({ timeout: 2 });
   await attemptEvidence.sql.end({ timeout: 2 });
+  await attemptSettlement.sql.end({ timeout: 2 });
   if (process.connected) process.disconnect();
 }

@@ -5714,3 +5714,48 @@ timeout_seconds = 900
 requires = ["seed"]
 command = ["/bin/bash", "-c", "exec /usr/bin/corepack pnpm --filter @aerodb/db exec vitest run test/campaign-profile-enrollment.test.ts -t 'terminal evidence inventory preserves exact ownership|recovers an authenticated mixed RANS promotion from a fresh stage-2 execution|progressive remote dispatch pins one exact request' --reporter=default --reporter=junit --outputFile.junit=\"$DEVCOORDINATOR_DIAGNOSTICS_DIR/report.xml\""]
 diagnostic_sources = [{ format = "junit", path = "report.xml" }]
+
+# Exact per-attempt shortening boundary: disposable schema, real 0207/0208,
+# verified compressed object transport and the installed app/consumer contracts.
+[test.attempt-history-settlement]
+timeout_seconds = 1200
+
+[test.attempt-history-settlement.postgres]
+image = "postgres:16-alpine"
+database = "aerodb"
+user = "aerodb"
+
+[[test.attempt-history-settlement.check]]
+name = "workspace"
+tier = "development"
+timeout_seconds = 600
+command = ["/usr/bin/corepack", "pnpm", "install", "--frozen-lockfile", "--ignore-scripts", "--offline"]
+
+[[test.attempt-history-settlement.check]]
+name = "schema"
+tier = "development"
+timeout_seconds = 300
+requires = ["workspace"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "migrate"]
+
+[[test.attempt-history-settlement.check]]
+name = "types"
+tier = "development"
+timeout_seconds = 600
+requires = ["workspace"]
+command = ["/usr/bin/corepack", "pnpm", "-r", "--filter", "@aerodb/core", "--filter", "@aerodb/db", "--filter", "@aerodb/sweeper", "--filter", "@aerodb/api", "typecheck"]
+
+[[test.attempt-history-settlement.check]]
+name = "transition"
+tier = "development"
+timeout_seconds = 300
+requires = ["schema"]
+command = ["/bin/bash", "-c", "exec /usr/bin/corepack pnpm --filter @aerodb/sweeper exec vitest run test/attempt-evidence-settlement.test.ts test/attempt-evidence-archive.test.ts test/attempt-evidence-gcs.test.ts --reporter=default --reporter=junit --outputFile.junit=\"$DEVCOORDINATOR_DIAGNOSTICS_DIR/report.xml\""]
+diagnostic_sources = [{ format = "junit", path = "report.xml" }]
+
+[[test.attempt-history-settlement.check]]
+name = "reset-classification"
+tier = "development"
+timeout_seconds = 120
+command = ["/bin/bash", "-c", "exec /home/holyglory/XFoilFOAM/.venv/bin/python -m pytest tests/test_solver_domain_reset.py -q --junitxml=\"$DEVCOORDINATOR_DIAGNOSTICS_DIR/reset.xml\""]
+diagnostic_sources = [{ format = "junit", path = "reset.xml" }]

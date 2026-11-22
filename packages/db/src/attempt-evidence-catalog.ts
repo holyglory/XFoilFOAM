@@ -2,6 +2,7 @@ import { sql, type SQL } from "drizzle-orm";
 import type { DB } from "./client";
 import {
   MAX_ATTEMPT_EVIDENCE_BYTES,
+  hasAttemptEvidenceStoragePointer,
   type AttemptEvidenceCopyPlan,
   type AttemptEvidenceCopySource,
 } from "./attempt-evidence-storage";
@@ -158,10 +159,13 @@ export async function registerAttemptEvidenceArchive(
 export function attemptEvidenceArchiveCandidatesSql(
   after: string | null = null,
   sourceInstance?: string,
+  readThroughReady = false,
 ): SQL {
   if (after !== null && !UUID.test(after))
     throw new Error("Invalid attempt evidence archive cursor");
-  return sql`WITH ids AS MATERIALIZED (SELECT id FROM result_attempts ${after ? sql`WHERE id>${after}::uuid` : sql``} ORDER BY id LIMIT 32),
+  return sql`WITH ids AS MATERIALIZED (SELECT id FROM result_attempts WHERE true
+    ${after ? sql`AND id>${after}::uuid` : sql``}
+    ${readThroughReady ? sql`AND evidence_archive_id IS NULL` : sql``} ORDER BY id LIMIT 32),
     sources AS MATERIALIZED (
       SELECT a.id,a.result_id,a.sim_job_id,
         (a.status IN ('done','failed') AND (a.sim_job_id IS NULL OR (job.id IS NOT NULL AND job.status IN ('done','failed','cancelled')
@@ -190,8 +194,11 @@ export async function attemptEvidenceArchiveCandidates(
     await tx.execute(sql`SET TRANSACTION READ ONLY`);
     await tx.execute(sql`SET LOCAL statement_timeout='5s'`);
     await tx.execute(sql`SET LOCAL lock_timeout='500ms'`);
+    const hasPointer = await hasAttemptEvidenceStoragePointer(
+      tx as unknown as DB,
+    );
     return tx.execute(
-      attemptEvidenceArchiveCandidatesSql(after, sourceInstance),
+      attemptEvidenceArchiveCandidatesSql(after, sourceInstance, hasPointer),
     ) as unknown as Promise<
       Array<{
         id: string;

@@ -20,6 +20,18 @@ import {
 } from "./attempt-evidence-service";
 import { AttemptEvidenceStore } from "./attempt-evidence-store";
 import { writeFile } from "node:fs/promises";
+import {
+  attemptEvidenceShorteningCandidates,
+  attemptEvidenceSettlementTotals,
+  getAttemptEvidenceStoragePolicy,
+  setAttemptEvidenceStoragePolicy,
+  restoreAttemptEvidence,
+} from "@aerodb/db/attempt-evidence-projection";
+import {
+  createAttemptEvidenceSettlementDependencies,
+  runAttemptEvidenceSettlementPass,
+  settleAttemptEvidenceHistory,
+} from "./attempt-evidence-settlement";
 
 function integer(text: string | undefined, fallback: number): number {
   if (text === undefined) return fallback;
@@ -48,6 +60,8 @@ export async function attemptEvidenceStorageMain(
         "--rows",
         "--bytes",
         "--catalog",
+        "--consumer-contract",
+        "--archive-id",
       ].includes(flag) ||
       !args[index + 1] ||
       flags.has(flag)
@@ -89,12 +103,24 @@ export async function attemptEvidenceStorageMain(
     return;
   }
   if (
-    !["audit", "use-audit", "copy", "archive", "backfill", "restore"].includes(
-      command ?? "",
-    )
+    ![
+      "audit",
+      "use-audit",
+      "copy",
+      "archive",
+      "backfill",
+      "restore",
+      "shortening-status",
+      "shortening-candidates",
+      "enable-shortening",
+      "disable-shortening",
+      "shorten",
+      "shorten-pass",
+      "restore-inline",
+    ].includes(command ?? "")
   )
     throw new Error(
-      "Usage: attempt-evidence-storage-cli.ts sql|use-sql|audit|use-audit|copy|archive|backfill|restore [--after UUID] [--limit 1..128] [--pages 1..2048] [--id UUID] [--output NEW_FILE] [--bucket BUCKET] [--source-instance INSTANCE]",
+      "Usage: attempt-evidence-storage-cli.ts sql|use-sql|audit|use-audit|copy|archive|backfill|restore|shortening-status|shortening-candidates|enable-shortening|disable-shortening|shorten|shorten-pass|restore-inline [--consumer-contract 1] [--id ATTEMPT_UUID --archive-id ARCHIVE_UUID] [--after UUID] [--rows N] [--pages N] [--output NEW_FILE] [--bucket BUCKET] [--source-instance INSTANCE]",
     );
   if (!process.env.DATABASE_URL)
     throw new Error("An explicit DATABASE_URL is required");
@@ -104,6 +130,159 @@ export async function attemptEvidenceStorageMain(
   const { createClient } = await import("@aerodb/db/client");
   const client = createClient({ max: 1 });
   try {
+    if (
+      [
+        "shortening-status",
+        "shortening-candidates",
+        "enable-shortening",
+        "disable-shortening",
+        "shorten",
+        "shorten-pass",
+        "restore-inline",
+      ].includes(command!)
+    ) {
+      const policy = await getAttemptEvidenceStoragePolicy(client.db);
+      if (!policy)
+        throw new Error(
+          "Attempt history shortening requires forward migration 0208",
+        );
+      if (command === "shortening-status") {
+        process.stdout.write(
+          `${JSON.stringify({ policy, current: await attemptEvidenceSettlementTotals(client.db), automaticWorker: "report-storage-worker", emergencyDisabled: process.env.AIRFOILFOAM_ATTEMPT_HISTORY_SHORTENING === "false" })}\n`,
+        );
+        return;
+      }
+      if (command === "shortening-candidates") {
+        let after = options.after ?? null,
+          scanned = 0,
+          complete = false;
+        const eligible: Array<{ attemptId: string; archiveId: string }> = [];
+        const limits = new Map<string, number>();
+        for (let page = 0; page < pages; page++) {
+          const rows = await attemptEvidenceShorteningCandidates(
+            client.db,
+            after,
+          );
+          for (const row of rows) {
+            const reason =
+              row.limiter ?? (row.archive_id ? null : "missing-exact-archive");
+            if (reason) limits.set(reason, (limits.get(reason) ?? 0) + 1);
+            else
+              eligible.push({ attemptId: row.id, archiveId: row.archive_id! });
+          }
+          scanned += rows.length;
+          after = rows.at(-1)?.id ?? null;
+          if (rows.length < 32) {
+            complete = true;
+            after = null;
+            break;
+          }
+        }
+        process.stdout.write(
+          `${JSON.stringify({ scanned, eligible, limited: Object.fromEntries(limits), next: after, complete })}\n`,
+        );
+        return;
+      }
+      if (command === "disable-shortening") {
+        process.stdout.write(
+          `${JSON.stringify(await setAttemptEvidenceStoragePolicy(client.db, { enabled: false }))}\n`,
+        );
+        return;
+      }
+      const bucket = process.env.AIRFOILFOAM_EVIDENCE_BUCKET?.trim();
+      if (
+        !bucket ||
+        process.env.AIRFOILFOAM_DEPLOYMENT_ROLE === "remote-solver"
+      )
+        throw new Error(
+          "Attempt shortening requires the canonical hub bucket and existing server credentials",
+        );
+      if (command === "enable-shortening") {
+        if (flags.get("--consumer-contract") !== "1")
+          throw new Error(
+            "Enablement requires deployed v1 readers: --consumer-contract 1",
+          );
+        // Resolve the actual installed consumer/app contracts before changing
+        // SQL policy. No cloud request or permission change is made here.
+        const { readApiAttemptEvidenceForApp } =
+          await import("../../api/src/attempt-evidence-reader");
+        createAttemptEvidenceSettlementDependencies(client.db, (request) =>
+          readApiAttemptEvidenceForApp(client.db, request),
+        );
+        process.stdout.write(
+          `${JSON.stringify(await setAttemptEvidenceStoragePolicy(client.db, { enabled: true, consumerContractVersion: 1, canaryAttemptId: flags.get("--id") }))}\n`,
+        );
+        return;
+      }
+      if (command === "restore-inline") {
+        const id = flags.get("--id"),
+          archiveId = flags.get("--archive-id");
+        if (!id || !archiveId)
+          throw new Error(
+            "restore-inline requires stable --id and --archive-id",
+          );
+        const archive = await getAttemptEvidenceArchive(client.db, archiveId);
+        if (archive.attemptId !== id.toLowerCase())
+          throw new Error("Restore archive belongs to another attempt");
+        const source = await new AttemptEvidenceStore().read(archive);
+        const result = await restoreAttemptEvidence(
+          client.db,
+          id,
+          archiveId,
+          source.payloadText,
+          "explicit exact-source operator restore",
+        );
+        process.stdout.write(`${JSON.stringify(result)}\n`);
+        return;
+      }
+      if (!policy.shorteningEnabled || policy.consumerContractVersion !== 1)
+        throw new Error("Attempt history shortening is not enabled");
+      const { readApiAttemptEvidenceForApp } =
+        await import("../../api/src/attempt-evidence-reader");
+      const deps = createAttemptEvidenceSettlementDependencies(
+        client.db,
+        (request) => readApiAttemptEvidenceForApp(client.db, request),
+      );
+      if (command === "shorten") {
+        const id = flags.get("--id"),
+          archiveId = flags.get("--archive-id");
+        if (!id || !archiveId)
+          throw new Error("shorten requires stable --id and --archive-id");
+        process.stdout.write(
+          `${JSON.stringify(await settleAttemptEvidenceHistory(client.db, deps, { attemptId: id, archiveId }))}\n`,
+        );
+        return;
+      }
+      if (policy.canaryAttemptId)
+        throw new Error("Use shorten with the configured canary attempt ID");
+      let after = options.after ?? null,
+        processed = 0,
+        shortened = 0,
+        payloadBytesReclaimed = 0,
+        netValueBytesReclaimed = 0,
+        scanComplete = false;
+      const failures: Array<{ attemptId: string; error: string }> = [];
+      for (let page = 0; page < pages; page++) {
+        const result = await runAttemptEvidenceSettlementPass(client.db, deps, {
+          after,
+          maxRows: integer(flags.get("--rows"), 4),
+        });
+        processed += result.processed;
+        shortened += result.shortened;
+        payloadBytesReclaimed += result.payloadBytesReclaimed;
+        netValueBytesReclaimed += result.netValueBytesReclaimed;
+        failures.push(...result.failures);
+        after = result.next;
+        if (after === null) {
+          scanComplete = true;
+          break;
+        }
+      }
+      process.stdout.write(
+        `${JSON.stringify({ processed, shortened, payloadBytesReclaimed, netValueBytesReclaimed, next: after, scanComplete, failures })}\n`,
+      );
+      return;
+    }
     if (command === "use-audit") {
       const catalogReady = await attemptEvidenceCatalogReady(client.db);
       let after = options.after,

@@ -1,0 +1,118 @@
+# Shortening settled attempt histories
+
+Migration `0208_attempt_history_readthrough.sql` installs the forward transition
+with shortening disabled. The existing hub report-storage worker runs the writer
+using the configured evidence bucket and server credentials. Migration `0207`
+continues to create and verify the original GCS copies.
+
+The first cohort covers local, settled RANS attempts with an acknowledged mesh
+recovery contract, four aligned `steady_history` arrays and no scientific or
+replay dependency that still needs those arrays online. The SQL candidate query
+returns a reason for each exclusion. Canonical selections, progressive fitting,
+continuation and remote delivery are among the exclusions. The initial bounds
+are 256 KiB of original JSON text, at least 4 KiB of removable history and at
+least 1 KiB of net stored value savings.
+
+## Rollout and one-attempt canary
+
+Integrate the stable-ID API reader, the server consumer changes and the writer in
+the same Node release. Use the normal control-plane deployment. Its migration
+entry point is `scripts/deploy/vps-redeploy.sh`, which quiesces old writers and
+runs this command with the configured Compose profile before starting the new
+API and sweeper.
+
+```sh
+compose run --rm --no-deps node-api node --import tsx packages/db/src/migrate.ts
+```
+
+After confirming the serving API and sweeper are on the integrated revision,
+run the following on the hub. `attempt_history` runs the installed CLI inside the
+sweeper with its existing database and GCS configuration.
+
+```sh
+cd /opt/airfoils-pro/app
+attempt_history() {
+  docker compose --env-file /opt/airfoils-pro/state/.env.deploy -p app \
+    -f docker-compose.deploy.yml exec -T sweeper \
+    node --import tsx apps/sweeper/src/attempt-evidence-storage-cli.ts "$@"
+}
+attempt_history shortening-status
+attempt_history shortening-candidates --pages 1
+```
+
+Follow `next` with `--after UUID` until an eligible pair appears or `complete`
+is true. Each page examines at most 32 distinct archived attempts. An empty
+complete scan means that the current cohort has no canary. Use a returned
+`attemptId` and `archiveId` from the same pair for the following commands.
+
+```sh
+: "${ATTEMPT_ID:?set the eligible attemptId}"
+: "${ARCHIVE_ID:?set its archiveId}"
+attempt_history enable-shortening --consumer-contract 1 --id "$ATTEMPT_ID"
+attempt_history shorten --id "$ATTEMPT_ID" --archive-id "$ARCHIVE_ID"
+attempt_history shorten --id "$ATTEMPT_ID" --archive-id "$ARCHIVE_ID"
+```
+
+The canary policy permits new shortening only for the named attempt. The first
+successful call returns a completed storage event and byte counts. The second
+reads the active GCS generation through the app again and reports
+`alreadyShortened: true` and zero additional bytes reclaimed. A normal
+read of the attempt must return the archived full point after the switch.
+
+## Automatic mode and recovery
+
+After a successful canary, enable the bounded automatic writer with the same
+contract version and an unrestricted attempt scope.
+
+```sh
+attempt_history enable-shortening --consumer-contract 1
+attempt_history shortening-status
+```
+
+`report-storage-worker.ts` starts `runConfiguredAttemptEvidenceSettlementService`
+on the hub. It takes at most four attempts per pass by default. The policy is
+checked again inside the shortening transaction. A manual pass uses the same
+writer and returns its cursor, failures and measured bytes.
+
+```sh
+attempt_history shorten-pass --rows 1 --pages 1
+```
+
+To stop new removals and restore a canary to its original inline representation:
+
+```sh
+attempt_history disable-shortening
+attempt_history restore-inline --id "$ATTEMPT_ID" --archive-id "$ARCHIVE_ID"
+```
+
+Disabling new removals preserves both the GCS originals and the app readers.
+Before rolling back to an older reader release, restore **every** current
+`result_attempts.evidence_archive_id` through `restore-inline` and verify the
+pointer count is zero. Record run-specific receipts privately.
+
+## Integrity and accounting
+
+Each attempt gets a fresh full read of the pinned compressed generation, including
+CRC32C, SHA-256, owner and original PostgreSQL text verification. The stable-ID app
+reader is exercised before shortening. The server consumer verifier compares the
+job's original and projected classifications and fit and verifies source equality.
+SQL locks the job, result and attempt, repeats eligibility, and derives the
+immutable projection from the exact full SQL source. The projection preserves
+presence, JSON type, length and exact/semantic hashes. Ordinary metadata reads
+use a single joined projection. Explicit equality checks normalize numeric scale
+in PostgreSQL, preserving decimal equality and original GCS text.
+
+A successful transition removes only the inventoried arrays. It records the
+original and remaining stored payload sizes and the stored projection and
+verification sizes. `payloadBytesReclaimed` measures the reduction in the live
+JSONB payload. `netValueBytesReclaimed` also deducts the two metadata value sizes.
+Heap, index and filesystem allocation are separate measurements. Insufficient
+savings rolls back the whole SQL transition.
+
+After commit the writer reads the normal app path and acknowledges that exact
+event. A crash in this interval leaves a pending event for the worker to replay.
+If the app cannot restore the exact bytes after a verified GCS read, the writer
+restores the original inline source against the same event ID. Generation,
+scientific, scope and usable-read failures before shortening retain the full
+inline point. Receipts identify representation changes independently of scientific
+changes, so a storage transition preserves the existing fit and classification.
