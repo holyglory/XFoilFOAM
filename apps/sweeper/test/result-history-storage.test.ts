@@ -562,3 +562,8 @@ describe("canonical result history representation", () => {
     expect((await stored(sources[1]!.id)).frameTrackArchiveId).toBeTruthy();
   });
 });
+
+it("authenticates exact 0208 public fields through same-owner inline or historical 0206 sources", async () => {
+  const { verifyPublicAttemptFieldSources } = await import("../test-support/public-attempt-fields");
+  await verifyPublicAttemptFieldSources(new ResultHistoryGcsStore(new MemoryGcs()));
+}, 90_000);
