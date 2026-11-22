@@ -1,5 +1,65 @@
 schema = 2
 
+# Compare the native and 0208 readers on temporary settled-row data.
+[test.attempt-inline-explain]
+timeout_seconds = 600
+
+[test.attempt-inline-explain.postgres]
+image = "postgres:16-alpine"
+database = "aerodb"
+user = "aerodb"
+
+[[test.attempt-inline-explain.check]]
+name = "schema"
+tier = "development"
+timeout_seconds = 600
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "migrate"]
+
+[[test.attempt-inline-explain.check]]
+name = "inline-classifier-explain"
+tier = "development"
+requires = ["schema"]
+timeout_seconds = 300
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "node", "--import", "tsx", "test-support/attempt-evidence-inline-explain.ts"]
+
+[test.attempt-server-consumers]
+timeout_seconds = 900
+
+[test.attempt-server-consumers.postgres]
+image = "postgres:16-alpine"
+database = "aerodb"
+user = "aerodb"
+
+[[test.attempt-server-consumers.check]]
+name = "schema"
+tier = "development"
+timeout_seconds = 600
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "migrate"]
+
+[[test.attempt-server-consumers.check]]
+name = "seed"
+tier = "development"
+requires = ["schema"]
+timeout_seconds = 600
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "seed"]
+
+[[test.attempt-server-consumers.check]]
+name = "server-consumers"
+tier = "development"
+requires = ["schema"]
+timeout_seconds = 300
+command = ["/bin/bash", "-c", "exec /usr/bin/corepack pnpm --filter @aerodb/db exec vitest run test/attempt-evidence-consumers.test.ts test/attempt-evidence-reader.test.ts --reporter=default --reporter=junit --outputFile.junit=\"$DEVCOORDINATOR_DIAGNOSTICS_DIR/report.xml\""]
+diagnostic_sources = [{ format = "junit", path = "report.xml" }]
+
+[[test.attempt-server-consumers.check]]
+name = "consumer-integration"
+tier = "development"
+requires = ["seed", "server-consumers"]
+env = { PROGRESSIVE_REPORT_ARCHIVE_DISPOSABLE_DB = "1" }
+timeout_seconds = 300
+command = ["/bin/bash", "-c", "exec /usr/bin/corepack pnpm --filter @aerodb/sweeper exec vitest run test/attempt-evidence-consumer-integration.test.ts --reporter=default --reporter=junit --outputFile.junit=\"$DEVCOORDINATOR_DIAGNOSTICS_DIR/report.xml\""]
+diagnostic_sources = [{ format = "junit", path = "report.xml" }]
+
 [test.stopped-canonical-retirement]
 timeout_seconds = 900
 
