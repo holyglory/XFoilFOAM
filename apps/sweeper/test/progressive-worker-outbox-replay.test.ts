@@ -13,7 +13,16 @@ import {
   type ProgressiveExecutionScope,
 } from "@aerodb/engine-client";
 import { sql } from "drizzle-orm";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { Readable } from "node:stream";
+import { gzipSync } from "node:zlib";
+import { crc32c } from "@aerodb/core/result-history-storage";
+import { reportTextIdentity } from "@aerodb/db/progressive-report-archive";
+import { readStoredAttemptEvidenceText } from "../../api/src/attempt-evidence-reader";
+import { storeWorkerReportVolume } from "../src/worker-report-volume";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
@@ -79,7 +88,12 @@ async function withFixture(
   {
     pendingCount = 2,
     failedPoints = false,
-  }: { pendingCount?: number; failedPoints?: boolean } = {},
+    includeHistory = false,
+  }: {
+    pendingCount?: number;
+    failedPoints?: boolean;
+    includeHistory?: boolean;
+  } = {},
 ) {
   await client.db.transaction(async (transaction) => {
     const connection = transaction as unknown as DB;
@@ -282,6 +296,19 @@ async function withFixture(
               converged: !(failedPoints && alpha >= 7),
               unsteady: false,
               first_order_fallback: false,
+              ...(includeHistory
+                ? {
+                    steady_history: {
+                      iterations: [1, 2],
+                      cl: [0.12, 0.13],
+                      cd: [0.03, 0.02],
+                      cm: [-0.02, -0.01],
+                      window: { start_iter: 1, end_iter: 2 },
+                      mean_stable: false,
+                      note: "",
+                    },
+                  }
+                : {}),
               ...(failedPoints && alpha >= 7
                 ? {
                     error: "Fixture solver failed after retaining evidence",
@@ -1208,3 +1235,98 @@ it("runs CLI help and refuses ambiguous flags before connecting to a database", 
     stderr: expect.stringContaining("Usage:"),
   });
 }, 30000);
+
+it("reads a settled worker attempt by its original ID through the local report and refuses stale or missing custody", async () => {
+  const root = await mkdtemp(join(tmpdir(), "hz-attempt-report-"));
+  vi.stubEnv("AIRFOILFOAM_REPORT_VOLUME_DIR", root);
+  const network = vi.spyOn(globalThis, "fetch");
+  try {
+    await withFixture(
+      async ({ connection: db, input, receipt }) => {
+        const p = input.points[0]!;
+        const id = p.resultAttemptId;
+        const [body] =
+          await db.execute(sql`SELECT report::text AS text,content_signature AS signature
+        FROM progressive_worker_reports WHERE sim_job_id=${input.executionId}::uuid AND sequence=${p.sequence}`);
+        const full = String(body.text);
+        const proof = reportTextIdentity(full);
+        const head = {
+          sourceKind: "worker",
+          kind: "report",
+          executionId: input.executionId,
+          sequence: p.sequence,
+          contentSignature: body.signature,
+          reportSha256: proof.sha256,
+          reportByteSize: proof.byteSize,
+        };
+        const bytes = gzipSync(
+          JSON.stringify(head).slice(0, -1) + ',"report":' + full + "}\n",
+        );
+        const sha = createHash("sha256").update(bytes).digest("hex"),
+          bundle = randomUUID();
+        await db.execute(sql`CREATE TEMP TABLE progressive_report_archive_bundles
+        (LIKE public.progressive_report_archive_bundles INCLUDING DEFAULTS) ON COMMIT DROP`);
+        await db.execute(sql`CREATE TEMP TABLE progressive_report_archive_members
+        (LIKE public.progressive_report_archive_members INCLUDING DEFAULTS) ON COMMIT DROP`);
+        await db.execute(sql`INSERT INTO progressive_report_archive_bundles(id,source_kind,sim_job_id,bucket,object_key,
+        generation,stored_sha256,stored_byte_size,crc32c,member_count,first_sequence,last_sequence,verified_at)
+        VALUES (${bundle}::uuid,'worker',${input.executionId}::uuid,'report-test',${"progressive-reports/v1/worker/" + input.executionId + "/" + sha + ".jsonl.gz"},
+        '17',${sha},${bytes.length},${crc32c(bytes)},1,${p.sequence},${p.sequence},clock_timestamp())`);
+        await db.execute(sql`INSERT INTO progressive_report_archive_members(bundle_id,source_kind,sim_job_id,sequence,
+        member_kind,content_signature,report_sha256,report_byte_size) VALUES(${bundle}::uuid,'worker',${input.executionId}::uuid,
+        ${p.sequence},'report',${body.signature},${proof.sha256},${proof.byteSize})`);
+        await db.execute(
+          sql`ALTER TABLE progressive_worker_reports ADD COLUMN archived_at timestamptz, ADD COLUMN archive_bundle_id uuid`,
+        );
+        await db.execute(sql`UPDATE progressive_worker_reports SET report=public.progressive_report_compact_header(report),
+        archived_at=clock_timestamp(),archive_bundle_id=${bundle}::uuid WHERE sim_job_id=${input.executionId}::uuid AND sequence=${p.sequence}`);
+        await db.execute(sql`UPDATE sim_jobs SET status='cancelled',engine_state='cancelled',"ingestedAt"=clock_timestamp()
+        WHERE id=${input.executionId}::uuid`);
+        await db.execute(
+          sql`UPDATE sync_sweep_promises SET status='cancelled'`,
+        );
+        await db.execute(
+          sql`UPDATE result_attempts SET regime='rans' WHERE id=${id}::uuid`,
+        );
+        const ack = { ...receipt(p), storageOnly: true };
+        await db.execute(sql`INSERT INTO progressive_worker_hub_receipts VALUES(${input.executionId}::uuid,${p.sequence},
+        ${id}::uuid,${p.pointContentSignature},${JSON.stringify(ack)}::jsonb)`);
+        const source = await readStoredAttemptEvidenceText(db, id);
+        const read = () =>
+          readStoredAttemptEvidenceText(db, id, { source: "worker-report" });
+        await expect(read()).rejects.toThrow("archive");
+        await storeWorkerReportVolume(
+          Readable.from([bytes]),
+          { storedSha256: sha, storedByteSize: bytes.length },
+          root,
+        );
+        expect(await read()).toBe(source);
+        expect(JSON.parse(source).steady_history.iterations).toEqual([1, 2]);
+        await db.execute(sql`UPDATE progressive_worker_hub_receipts SET receipt=receipt||jsonb_build_object('remoteResultAttemptId',${randomUUID()}::text)
+        WHERE result_attempt_id=${id}::uuid`);
+        await expect(read()).rejects.toThrow("scope");
+        await db.execute(
+          sql`UPDATE progressive_worker_hub_receipts SET receipt=${JSON.stringify(ack)}::jsonb WHERE result_attempt_id=${id}::uuid`,
+        );
+        await db.execute(
+          sql`UPDATE result_attempts SET evidence_payload=evidence_payload||'{"extra":null}'::jsonb WHERE id=${id}::uuid`,
+        );
+        await expect(read()).rejects.toThrow("replay");
+        // PostgreSQL retains numeric scale in ::text even when jsonb equality
+        // and a JavaScript round trip would treat both numbers as identical.
+        await db.execute(sql`UPDATE result_attempts SET evidence_payload=
+          jsonb_set(${source}::jsonb,'{steady_history,cl,0}','0.1200'::jsonb)
+          WHERE id=${id}::uuid`);
+        expect(JSON.parse(await readStoredAttemptEvidenceText(db, id))).toEqual(
+          JSON.parse(source),
+        );
+        await expect(read()).rejects.toThrow("replay");
+        expect(network).not.toHaveBeenCalled();
+      },
+      { includeHistory: true, pendingCount: 1 },
+    );
+  } finally {
+    network.mockRestore();
+    await rm(root, { recursive: true, force: true });
+  }
+});

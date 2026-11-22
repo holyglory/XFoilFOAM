@@ -77,11 +77,26 @@ export function readStoredAttemptEvidenceBatch<
     bounded(options),
   );
 }
-export function readStoredAttemptEvidenceText(
+export async function readStoredAttemptEvidenceText(
   db: DB,
   attemptId: string,
-  options?: AttemptEvidenceTextReadOptions,
+  options?: AttemptEvidenceTextReadOptions & { source?: "worker-report" },
 ): Promise<string> {
+  if (options?.source === "worker-report") {
+    if (options.archiveId || options.forceArchive)
+      throw new AttemptEvidenceReadError(
+        "invalid",
+        "Select one exact attempt archive source",
+      );
+    const { readHzAttemptFromWorkerReport } =
+      await import("../../sweeper/src/hz-attempt-report-reader");
+    const { payloadText } = await readHzAttemptFromWorkerReport(
+      db,
+      attemptId,
+      bounded(options).signal,
+    );
+    return payloadText;
+  }
   return readAttemptEvidenceText(
     db,
     apiAttemptEvidenceReader,

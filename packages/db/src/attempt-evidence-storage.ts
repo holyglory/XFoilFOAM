@@ -111,7 +111,7 @@ export function attemptEvidenceAuditSql(
       'inspectedPayloadTextBytes',coalesce(sum(octet_length(payload::text)::bigint),0)::text,
       'fields',coalesce((SELECT jsonb_agg(to_jsonb(fields) ORDER BY "jsonTextBytes"::bigint DESC,path) FROM fields),'[]'::jsonb),
       'next',CASE WHEN count(*)=${limit} THEN (SELECT id::text FROM ids ORDER BY id DESC LIMIT 1) END,
-      'complete',count(*) < ${limit},'inlineRequired',${ATTEMPT_EVIDENCE_INLINE_REQUIRED}) AS audit
+      'complete',count(*) < ${limit},'inlineRequired',${ATTEMPT_EVIDENCE_INLINE_REQUIRED}::text) AS audit
     FROM measured`;
 }
 

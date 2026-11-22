@@ -6,6 +6,8 @@ import {
   registerAttemptEvidenceArchive,
 } from "@aerodb/db/attempt-evidence-catalog";
 import {
+  ATTEMPT_EVIDENCE_INLINE_REQUIRED,
+  auditAttemptEvidencePage,
   loadSettledAttemptEvidenceCopy,
   prepareAttemptEvidenceCopy,
 } from "@aerodb/db/attempt-evidence-storage";
@@ -238,6 +240,9 @@ describe("settled attempt GCS retention and immutable SQL receipts", () => {
     const ids = await seed({ canonical: true, model: true }),
       memory = new MemoryGcs(),
       store = memoryStore(memory);
+    const audit = await auditAttemptEvidencePage(db, { limit: 1 });
+    expect(audit.inlineRequired).toBe(ATTEMPT_EVIDENCE_INLINE_REQUIRED);
+    expect(audit.inspectedRows).toBe("1");
     const source = await loadSettledAttemptEvidenceCopy(db, ids.attemptId);
     const before = await auditAttemptEvidenceUsePage(db, {
       catalogReady: true,
