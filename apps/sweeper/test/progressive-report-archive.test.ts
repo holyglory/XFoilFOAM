@@ -33,9 +33,13 @@ import {
 } from "vitest";
 import {
   archiveProgressiveReportBatch,
+  nextProgressiveReportArchiveJob,
   runProgressiveReportArchiveService,
 } from "../src/progressive-report-archive-service";
-import type { ProgressiveReportArchiveIdentity } from "../src/progressive-report-archive-store";
+import {
+  ProgressiveReportArchiveStore,
+  type ProgressiveReportArchiveIdentity,
+} from "../src/progressive-report-archive-store";
 import {
   readWorkerReportArchiveText,
   WorkerReportFetchDisabled,
@@ -74,6 +78,7 @@ afterEach(() => {
 });
 
 type PutFile = Parameters<typeof archiveProgressiveReportBatch>[3];
+type StorePutFile = ProgressiveReportArchiveStore["putFile"];
 
 /** Only the object-store boundary is substituted. Every bundle is read back
  * from disk, independently hashed, decompressed and verified before the real
@@ -81,7 +86,7 @@ type PutFile = Parameters<typeof archiveProgressiveReportBatch>[3];
 function cloudFixture() {
   const objects = new Map<string, Buffer>();
   const paths: string[] = [];
-  const putFile = vi.fn<PutFile>(async (path, local, source, executionId) => {
+  const putFile = vi.fn<StorePutFile>(async (path, local, source, executionId) => {
     paths.push(path);
     const bytes = await readFile(path);
     expect(archiveSha256(bytes)).toBe(local.sha256);
@@ -530,8 +535,8 @@ describe.each<ArchiveSource>(["remote", "worker"])(
         await withArchiveFixture(client, source, async (fixture) => {
           const before = await archiveSnapshot(fixture);
           const cloud = cloudFixture();
-          const put: PutFile = async (...args) => {
-            const identity = await cloud.putFile(...args);
+          const put: PutFile = async (path, local, source, id) => {
+            const identity = await cloud.putFile(path, local, source, id);
             return {
               ...identity,
               ...(field === "hash"
@@ -567,7 +572,7 @@ describe.each<ArchiveSource>(["remote", "worker"])(
             );
           if (reason === "not-ingested")
             await db.execute(
-              sql`UPDATE sim_jobs SET "ingestedAt"=NULL WHERE id=${executionId}::uuid`,
+              sql`UPDATE sim_jobs SET status='cancelled',"ingestedAt"=NULL WHERE id=${executionId}::uuid`,
             );
           if (reason === "active-promise")
             await db.execute(
@@ -578,6 +583,12 @@ describe.each<ArchiveSource>(["remote", "worker"])(
         ingest_lease_expires_at=clock_timestamp()+interval '1 hour' WHERE id=${executionId}::uuid`);
           const before = await archiveSnapshot(fixture);
           const cloud = cloudFixture();
+          if (source === "remote") {
+            const cursor = executionId.slice(0, 14) + "0000-0000-000000000000";
+            const page = await nextProgressiveReportArchiveJob(db, source, cursor);
+            expect(page?.id).not.toBe(executionId);
+            expect(page?.last_id).toBeTruthy();
+          }
           expect(
             await archiveProgressiveReportBatch(
               db,
@@ -1117,28 +1128,57 @@ it.each(["identical", "distinct"] as const)(
   },
 );
 
-it("continues bounded batches without losing repeated-history members or uploading exhausted work", async () => {
+it("finds a warm hub execution beyond cold jobs and restores all members across two service passes", async () => {
   await withArchiveFixture(
     client,
     "remote",
     async (fixture) => {
+      const { db, executionId } = fixture;
+      // The generated UUIDv4 sorts after this private set of 96 cold owners.
+      const prefix = executionId.slice(0, 14) + "0000-0000-";
+      const cursor = prefix + "000000000000";
+      await db.execute(
+        sql`CREATE TEMP TABLE archive_discovery_jobs (id uuid PRIMARY KEY) ON COMMIT DROP`,
+      );
+      await db.execute(sql`INSERT INTO archive_discovery_jobs SELECT ${executionId}::uuid
+        UNION ALL SELECT (${prefix} || lpad(to_hex(n),12,'0'))::uuid FROM generate_series(1,96) n`);
+      await db.execute(sql`INSERT INTO sim_jobs (id,airfoil_id,bc_ids,reference_chord_m,status,"ingestedAt")
+        SELECT scope.id,job.airfoil_id,job.bc_ids,job.reference_chord_m,'done',job."ingestedAt"
+        FROM archive_discovery_jobs scope CROSS JOIN sim_jobs job
+        WHERE job.id=${executionId}::uuid AND scope.id<>job.id`);
+      // Scope only the service's job ownership to this rollback fixture.
+      // The real report index, locking, payload references and archive triggers are exercised.
+      await db.execute(sql`CREATE TEMP VIEW sim_jobs AS SELECT job.* FROM public.sim_jobs job
+        WHERE job.id IN (SELECT id FROM archive_discovery_jobs)`);
+      expect(
+        (await nextProgressiveReportArchiveJob(db, "remote", cursor))?.id,
+      ).toBe(executionId);
+
       const before = await archiveSnapshot(fixture);
       const cloud = cloudFixture();
-      const first = await archiveProgressiveReportBatch(
-        fixture.db,
-        "remote",
-        fixture.executionId,
-        cloud.putFile,
+      vi.stubEnv("AIRFOILFOAM_DEPLOYMENT_ROLE", "hub");
+      vi.stubEnv("AIRFOILFOAM_EVIDENCE_BUCKET", "disposable-report-archive");
+      vi.spyOn(ProgressiveReportArchiveStore.prototype, "putFile")
+        .mockImplementation(cloud.putFile);
+      const controller = new AbortController();
+      const batches: number[] = [];
+      vi.spyOn(console, "info").mockImplementation((message) => {
+        const batch = JSON.parse(String(message));
+        expect(batch.executionId).toBe(executionId);
+        batches.push(batch.members);
+        if (batches.length === 2) controller.abort();
+      });
+      const errors = vi.spyOn(console, "error")
+        .mockImplementation(() => controller.abort());
+      await runProgressiveReportArchiveService(
+        db,
+        AbortSignal.any([controller.signal, AbortSignal.timeout(20_000)]),
       );
-      expect(first).toBeGreaterThan(0);
-      expect(first).toBeLessThan(fixture.reports.length);
-      const remaining = await archiveProgressiveReportBatch(
-        fixture.db,
-        "remote",
-        fixture.executionId,
-        cloud.putFile,
-      );
-      expect(first + remaining).toBe(fixture.reports.length);
+      expect(errors.mock.calls).toEqual([]);
+      expect(batches).toEqual([128, 1]);
+      expect(
+        (await nextProgressiveReportArchiveJob(db, "remote", cursor))?.id,
+      ).toBeNull();
       expect(
         await archiveProgressiveReportBatch(
           fixture.db,
