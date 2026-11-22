@@ -27,12 +27,12 @@ const tableDefinitions = [
   "progressive_cfd_attempts(sim_job_id uuid,outcome text)",
   "progressive_worker_reports(sim_job_id uuid,acknowledged_at timestamptz,stopped_engine_job_id text)",
   "sim_urans_requests(continue_from_result_id uuid,state text)",
-  "results(id uuid,sim_job_id uuid)",
+  "results(id uuid,sim_job_id uuid,current_result_attempt_id uuid)",
   "sim_precalc_obligation_attempts(obligation_id uuid,result_attempt_id uuid)",
   "sim_precalc_obligations(id uuid,state text)",
   "sim_urans_verify_queue(latest_result_attempt_id uuid,state text,last_outcome text)",
-  "result_attempts(id uuid,result_id uuid,sim_job_id uuid,engine_job_id text,engine_case_slug text,aoa_deg double precision,cl double precision,cd double precision,cm double precision,status text,regime text,evidence_payload jsonb DEFAULT '{}')",
-  "result_media(id uuid,result_attempt_id uuid,storage_key text,sha256 text,byte_size bigint,mime_type text)",
+  "result_attempts(id uuid,result_id uuid,sim_job_id uuid,engine_job_id text,engine_case_slug text,aoa_deg double precision,cl double precision,cd double precision,cm double precision,status text,regime text,evidence_payload jsonb DEFAULT '{}',airfoil_id uuid)",
+  "result_media(id uuid,result_attempt_id uuid,storage_key text,sha256 text,byte_size bigint,mime_type text,result_id uuid,engine_url text,field text,kind text,role text,evidence_sha256 text,color_scale_id uuid,scale_vmin float8,scale_vmax float8,color_scale_version int,scale_policy text)",
   "result_media_storage_bindings(result_media_id uuid,blob_id uuid,local_storage_key text)",
   'result_media_blobs(id uuid,backend text,"verifiedAt" timestamptz,sha256 text,byte_size bigint,mime_type text)',
   "progressive_worker_evidence_attempts(sim_job_id uuid,result_attempt_id uuid,point_content_signature text)",
@@ -40,7 +40,11 @@ const tableDefinitions = [
   "progressive_worker_archive_receipts(sim_job_id uuid,point_content_signature text,brokered_upload_id uuid,receipt jsonb)",
   "progressive_worker_archive_reclaims(sim_job_id uuid,point_content_signature text,completed_at timestamptz)",
   "solver_evidence_artifacts(id uuid,kind text,result_id uuid,result_attempt_id uuid,engine_job_id text,storage_key text,metadata jsonb,sha256 text,byte_size bigint,mime_type text)",
-  "remote_asset_references(local_row_id uuid,local_kind text,result_attempt_id uuid,result_id uuid,local_storage_key text,sha256 text,byte_size bigint,mime_type text,availability text,metadata jsonb,remote_result_id text,remote_artifact_id text,remote_download_url text)",
+  "remote_asset_references(local_row_id uuid,local_kind text,result_attempt_id uuid,result_id uuid,local_storage_key text,sha256 text,byte_size bigint,mime_type text,availability text,metadata jsonb,remote_result_id text,remote_artifact_id text,remote_download_url text,cached_storage_key text)",
+  "airfoils(id uuid,slug text)",
+  "field_color_scales(id uuid,vmin float8,vmax float8,scale_policy text,version int,status text)",
+  "field_render_cache(storage_key text)",
+  "result_media_storage_uploads(result_media_id uuid)",
   "sync_api_settings(id int,remote_solver_registered_id uuid,remote_solver_auth_token text,upstream_base_url text)",
   "sync_sweep_promises(id uuid,source_base_url text,registered_solver_id uuid)",
 ];
@@ -304,6 +308,190 @@ it("rotates blocked and 409 jobs, authenticates every object before reclaim and 
       expect(engine.stripJob).not.toHaveBeenCalled();
     } finally {
       fetchSpy.mockRestore();
+    }
+  });
+}, 30000);
+
+it("keeps path-owned images unbound and checks all image routes, their legend and working-file references", async () => {
+  await client.db.transaction(async (transaction) => {
+    const db = transaction as unknown as DB;
+    for (const def of tableDefinitions)
+      await db.execute(sql.raw("CREATE TEMP TABLE " + def + " ON COMMIT DROP"));
+    await db.execute(
+      sql`INSERT INTO sync_api_settings VALUES(1,${solver},${token},${root})`,
+    );
+    await db.execute(
+      sql`INSERT INTO sync_sweep_promises VALUES(${promiseId},${root},${solver})`,
+    );
+    const id = randomUUID(),
+      media = randomUUID(),
+      foil = randomUUID(),
+      scale = randomUUID();
+    const [item] = await fixture(db, id, 1);
+    const [owner] = await db.execute(
+      sql`SELECT result_id FROM result_attempts WHERE id=${item!.attempt}::uuid`,
+    );
+    const rid = String(owner!.result_id);
+    await db.execute(
+      sql`UPDATE result_attempts SET airfoil_id=${foil},regime='rans',status='done' WHERE id=${item!.attempt}`,
+    );
+    await db.execute(
+      sql`INSERT INTO results(id,sim_job_id,current_result_attempt_id) VALUES(${rid},${id},${item!.attempt})`,
+    );
+    await db.execute(sql`INSERT INTO airfoils VALUES(${foil},'real-foil')`);
+    const field = "pressure",
+      nativePath = "cases/foil/a0/images/pressure.png",
+      scaledPath = "cases/foil/a0/evidence/scaled_media/view/v1/pressure.png";
+    const locals = [
+      { path: nativePath, sha256: sha("engine"), byteSize: 6 },
+      { path: scaledPath, sha256: sha("scaled"), byteSize: 6 },
+    ];
+    const candidate = "cases/foil/postProcessing/forceCoeffs/0/coefficient.dat";
+    const legend = {
+      mode: "track",
+      vmin: -1,
+      vmax: 1,
+      policy: "linear",
+      version: 1,
+      status: "active",
+    };
+    await db.execute(
+      sql`INSERT INTO field_color_scales VALUES(${scale},-1,1,'linear',1,'active')`,
+    );
+    await db.execute(sql`INSERT INTO result_media(id,result_id,result_attempt_id,storage_key,kind,role,field,mime_type,sha256,byte_size,evidence_sha256,color_scale_id)
+      VALUES(${media},${rid},${item!.attempt},${`jobs/${id}/${scaledPath}`},'image','instantaneous',${field},'image/png',${sha("scaled")},6,${item!.remote.manifestSha256},${scale})`);
+    let applied = 0,
+      brokenPath = false,
+      wrongLegend = false;
+    const routes: string[] = [];
+    const native: ClosedProgressiveBackend = {
+      async reclaimClosedProgressiveFiles(job, manifests, plan, readbacks) {
+        expect(job).toBe(id);
+        expect(manifests[0]?.keepMedia?.map((row) => row.id)).toEqual([media]);
+        if (plan) {
+          expect(readbacks?.[0]?.brokeredUploadId).toBe(item!.upload);
+          applied++;
+        }
+        return {
+          job_id: id,
+          state: plan ? "reclaimed" : "planned",
+          replayed: !plan && applied > 0,
+          plan: "c".repeat(64),
+          files: 1,
+          bytes: 32,
+          mediaFiles: locals,
+          workingPaths: [candidate],
+          plannedAllocatedBytes: 4096,
+        };
+      },
+    };
+    const spy = vi
+      .spyOn(globalThis, "fetch")
+      .mockImplementation(async (input) => {
+        const u = new URL(String(input));
+        const path = u.pathname;
+        routes.push(path);
+        if (path.endsWith("/download"))
+          return new Response(item!.upload, {
+            headers: {
+              "content-type": "application/zstd",
+              "content-length": String(item!.upload.length),
+              "x-content-sha256": item!.remote.storedSha256,
+              "x-gcs-generation": item!.remote.generation,
+            },
+          });
+        if (path.endsWith("/sim"))
+          return Response.json({
+            resultId: rid,
+            media: {
+              pressure: {
+                url: `/api/result-media/${media}`,
+                scale: wrongLegend ? { ...legend, vmax: 2 } : legend,
+              },
+            },
+          });
+        const value = path.endsWith(nativePath) ? "engine" : "scaled";
+        if (brokenPath && path.startsWith("/api/media/"))
+          return new Response("broken", {
+            headers: { "content-type": "image/png", "content-length": "6" },
+          });
+        return new Response(value, {
+          headers: { "content-type": "image/png", "content-length": "6" },
+        });
+      });
+    const opts = { now: clock, ageMs: 1, timeoutMs: 3000, keepMedia: true };
+    try {
+      await expect(
+        closedProgressiveJob(db, native, id, {
+          ...opts,
+          keepMedia: false,
+          inspect: true,
+        }),
+      ).rejects.toThrow(/unbound|eligibility|ownership/);
+      const preview = await closedProgressiveJob(db, native, id, {
+        ...opts,
+        inspect: true,
+      });
+      expect(preview.mediaSha256).toMatch(/^[0-9a-f]{64}$/);
+      for (const expected of [
+        `/api/result-media/${media}`,
+        `/jobs/${id}/files/${nativePath}`,
+        `/api/media/jobs/${id}/${scaledPath}`,
+        "/api/airfoils/real-foil/sim",
+      ])
+        expect(routes).toContain(expected);
+      brokenPath = true;
+      await expect(closedProgressiveJob(db, native, id, opts)).rejects.toThrow(
+        /different bytes/,
+      );
+      brokenPath = false;
+      wrongLegend = true;
+      await expect(closedProgressiveJob(db, native, id, opts)).rejects.toThrow(
+        /legend/,
+      );
+      wrongLegend = false;
+      await db.execute(
+        sql`INSERT INTO field_render_cache VALUES(${`jobs/${id}/${candidate}`})`,
+      );
+      await expect(closedProgressiveJob(db, native, id, opts)).rejects.toThrow(
+        /reference/,
+      );
+      await db.execute(sql`DELETE FROM field_render_cache`);
+      await db.execute(
+        sql`INSERT INTO result_media(id,storage_key) VALUES(${randomUUID()},${`jobs/${id}/foreign.png`})`,
+      );
+      await expect(closedProgressiveJob(db, native, id, opts)).rejects.toThrow(
+        /exact current-job/,
+      );
+      await db.execute(
+        sql`DELETE FROM result_media WHERE result_attempt_id IS NULL`,
+      );
+      expect(applied).toBe(0);
+      const result = await closedProgressiveJob(db, native, id, {
+        ...opts,
+        expectedPlan: preview.plan.plan!,
+        expectedMediaSha256: preview.mediaSha256,
+      });
+      expect(result.settled).toBe(true);
+      expect(applied).toBe(1);
+      const post = await closedProgressiveJob(db, native, id, {
+        ...opts,
+        inspect: true,
+        verifyCompleted: true,
+        expectedPlan: preview.plan.plan!,
+        expectedMediaSha256: preview.mediaSha256,
+      });
+      expect(post.mediaSha256).toBe(preview.mediaSha256);
+      expect(post.plan.mediaFiles).toEqual(preview.plan.mediaFiles);
+      const [saved] = await db.execute(
+        sql`SELECT strip_report->'closedProgressiveFiles' AS receipt FROM sim_jobs WHERE id=${id}`,
+      );
+      expect(saved!.receipt).toMatchObject({
+        mediaSha256: preview.mediaSha256,
+        verifiedArchives: 1,
+      });
+    } finally {
+      spy.mockRestore();
     }
   });
 }, 30000);

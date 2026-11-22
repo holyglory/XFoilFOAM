@@ -113,3 +113,33 @@ PLAN_SHA256` command independently rechecks an already settled job.
 unlinked file allocation, and allocation after accounting for receipt files
 and directory blocks. Per-job receipts also record the volume's observed free
 bytes. Concurrent solver writes can change that volume-wide measurement.
+
+## Preserve local PNG media for one named job
+
+The single-job commands support `--keep-media` for closed RANS jobs with
+current, path-owned instantaneous PNG rows and a complete signed archive for
+every attempt. The inventory-run and automatic selection use their existing
+rules. The keep-set comprises the exact scaled files registered in PostgreSQL
+and the original images declared by each matching engine result and archived
+manifest. Uncovered media, a changed file, an unexpected link or directory,
+a forensic package, an active writer or a live continuation refuses the job.
+
+```sh
+python3 scripts/deploy/hz-closed-job-maintenance.py proof --keep-media "$job" >"$private_proof"
+plan=$(jq -er 'select(.status=="proved" and .databaseReadOnly and .plan.files>0 and .mediaSha256) | .plan.plan' "$private_proof")
+python3 scripts/deploy/hz-closed-job-maintenance.py reclaim --keep-media \
+  --proof-receipt "$private_proof" "$job" "$plan"
+python3 scripts/deploy/hz-closed-job-maintenance.py verify --keep-media "$job" "$plan"
+```
+
+The proof binds each image path, SHA-256 and length, the original media ID and
+display metadata, and the working-file plan. It reads the stable media IDs,
+legacy paths, engine file paths and point-detail links/legends. A
+`reclaim` repeats the complete proof, including every pinned CFD archive,
+takes the original SQL and engine locks, and removes only unreferenced,
+hash-identical older saved fields and postprocessing files. It preserves the
+latest restart fields and the job's shared mesh. The native peer inventories
+the surviving images again before completing its durable receipt. A separate
+read-only pass verifies the served bytes, point evidence and legends after
+commit. The file allocation in the proof is gross; the completed receipt also
+measures the filesystem allocation occupied by the durable controls.

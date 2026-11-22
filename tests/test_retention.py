@@ -1035,7 +1035,8 @@ def test_api_running_guard_and_delete_status_codes():
     assert client.delete("/jobs/retention-api-missing").status_code == 404
 
 
-def test_closed_progressive_exact_duplicates_require_whole_job_proof(tmp_path, monkeypatch):
+@pytest.mark.parametrize('keep_media', [False, True])
+def test_closed_progressive_exact_duplicates_require_whole_job_proof(tmp_path, monkeypatch, keep_media):
     from datetime import datetime, timezone
     import runpy
     peer = runpy.run_path(str(Path(__file__).resolve().parents[1] / "scripts/deploy/hz-closed-job-engine.py"))
@@ -1058,12 +1059,19 @@ def test_closed_progressive_exact_duplicates_require_whole_job_proof(tmp_path, m
     members.append({"path": "openfoam/postProcessing/forceCoeffs/0/coefficient.dat", "byteSize": len(archived), "sha256": sha(archived)})
     members.append({"path": "openfoam/mesh_evidence/log.blockMesh", "byteSize": 3, "sha256": sha(b"log")})
     proofs, points = [], []
+    retained = {}
     for index in (0, 1):
         base = f"a{index}/evidence"
         directory = f"cases/foil/{base}"
         folder = root / directory
+        original = case / f"a{index}/images/pressure.png"
+        scaled = folder / "scaled_media/default_v1_zoom2/v8/pressure.png"
+        for picture, data in ((original, b"engine image"), (scaled, b"scaled image")) if keep_media else ():
+            _write(picture, data + str(index).encode())
+            retained[picture] = picture.read_bytes()
+        native_images = {"pressure": f"a{index}/images/pressure.png"} if keep_media else {}
         mf = _write_json(folder / "evidence_manifest.json", {"casePath": str(case), "postPath": str(post),
-                          "files": members if not index else []})
+                          "files": members if not index else [], "media": {"instantaneous": native_images}})
         mf_sha = sha(mf.read_bytes())
         upload = f"upload-{index}"
         proof = {"directory": directory, "manifestSha256": mf_sha, "manifestByteSize": mf.stat().st_size,
@@ -1084,18 +1092,22 @@ def test_closed_progressive_exact_duplicates_require_whole_job_proof(tmp_path, m
         catalog = sorted(f"{'mesh' if a['kind'] == 'mesh_evidence' else a['kind']}\tjobs/{job}/cases/foil/{a['path']}\t{a['byte_size']}\t{a['sha256']}" for a in artifacts)
         proof["catalogSha256"] = sha("\n".join(catalog).encode())
         points.append({"case_slug": "foil", "evidence_artifacts": artifacts})
+        if keep_media:
+            proof["keepMedia"] = [{"path": scaled.relative_to(root).as_posix(), "sha256": sha(retained[scaled]),
+                                   "byteSize": len(retained[scaled]), "field": "pressure"}]
+            points[-1]["images"] = {"pressure": "/jobs/" + job + "/files/" + original.relative_to(root).as_posix()}
         proofs.append(proof)
     _write_json(root / "result.json", {"job_id": job, "state": "completed", "polars": [{"points": points}]})
     status = _write_json(root / "status.json", {"job_id": job, "state": "completed"})
     lockpath = _write(root / ".execute.lock", b"")
-    scope = {"nonce": "test-session", "id": job, "helper": sha(native.encode()), "jobsInode": peer["inode"](root.parent),
+    scope = {"keepMedia": keep_media, "nonce": "test-session", "id": job, "helper": sha(native.encode()), "jobsInode": peer["inode"](root.parent),
              "jobInode": peer["inode"](root), "lockInode": peer["inode"](lockpath)}
     readbacks = [dict(brokeredUploadId=p["brokeredUploadId"], generation=p["generation"], storedSha256=sha(b"gzip"),
                       storedByteSize=4, verifiedAt=datetime.now(timezone.utc).isoformat()) for p in proofs]
     def request(proof_list=proofs, plan=None, objects=readbacks, mode=None, token="fixture-control", peer_scope=None):
         mode = mode or ("reclaim" if plan else "proof")
         ctx = {**scope, "mode": mode, "plan": plan, **(peer_scope or {})}
-        body = json.dumps({"id": job, "step": 2 if plan else 1, "helper": scope["helper"], "mode": mode,
+        body = json.dumps({"keepMedia":keep_media,"id": job, "step": 2 if plan else 1, "helper": scope["helper"], "mode": mode,
                            "expectedPlan": plan, "manifests": proof_list, "readbacks": objects if plan else []})
         packet = {"body": body, "mac": peer["signature"](token, "request", ctx["nonce"], body)}
         answer = peer["run_engine"](ctx, packet, native, settings)
@@ -1113,6 +1125,18 @@ def test_closed_progressive_exact_duplicates_require_whole_job_proof(tmp_path, m
         request(peer_scope={"lockInode": [0, 0]})
     with pytest.raises(ValueError, match="authorized plan"):
         request(mode="proof", plan="0" * 64)
+    if keep_media:
+        with pytest.raises(ValueError, match="explicitly named"):
+            request(peer_scope={"keepMedia":False})
+        symlink = next(iter(retained)).parent / "other.png"
+        symlink.symlink_to(next(iter(retained)))
+        assert "symlink" in refused() or "unaccounted" in refused()
+        symlink.unlink()
+        # The previously supported, job-owned polyMesh link is never unlinked.
+        mesh = root / "meshes/recipe/constant/polyMesh"
+        mesh.mkdir(parents=True)
+        (case / "constant").mkdir()
+        (case / "constant/polyMesh").symlink_to(mesh, target_is_directory=True)
     refused(proofs[:1])
     refused([proofs[0], {**proofs[1], "catalogSha256": "0" * 64}])
     stored_result = json.loads((root / "result.json").read_bytes())
@@ -1129,6 +1153,14 @@ def test_closed_progressive_exact_duplicates_require_whole_job_proof(tmp_path, m
     plan = request()
     assert plan["state"] == "planned" and plan["bytes"] == 2 * len(archived) and plan["files"] == 2
     assert all(p.is_file() for p in copies)
+    if keep_media:
+        assert len(plan["mediaFiles"]) == 4 and len(plan["workingPaths"]) == 2
+        assert plan["plannedAllocatedBytes"] == sum(p.stat().st_blocks * 512 for p in (copies[0],force))
+        image = next(iter(retained))
+        image.write_bytes(b"changed original image")
+        refused(plan=plan["plan"])
+        image.write_bytes(retained[image])
+        assert copies[0].is_file()
     refused(plan=plan["plan"], objects=readbacks[:1])
     refused(plan=plan["plan"], objects=[readbacks[0], {**readbacks[1], "generation": "8"}])
     assert copies[0].is_file()
@@ -1174,6 +1206,9 @@ def test_closed_progressive_exact_duplicates_require_whole_job_proof(tmp_path, m
     retry = request(plan=plan["plan"])
     retry.pop("allocation")
     assert retry == {**plan, "state": "reclaimed", "replayed": True}
+    if keep_media:
+        assert all(p.read_bytes()==data for p,data in retained.items())
+        assert (case / "constant/polyMesh").is_symlink()
     _write(copies[0], archived)
     refused(plan=plan["plan"])
     assert copies[0].is_file()

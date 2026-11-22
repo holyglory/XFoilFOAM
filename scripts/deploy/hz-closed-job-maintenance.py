@@ -136,6 +136,12 @@ def host_job(package):
     scope = selection(target["mode"], target["id"], target["plan"])
     scope.update(helper=validate_sources(package), nonce=secrets.token_hex(32), expectedScience=target.get("science"),dependencies=target.get("dependencies"),nodePackages=target.get("nodePackages"))
     require(scope["expectedScience"] is None or SHA.fullmatch(scope["expectedScience"]), "invalid scientific source digest")
+    if target.get("keepMedia"):
+        require(target["keepMedia"] is True, "invalid keep-media selection")
+        scope["keepMedia"] = True
+        scope["expectedMedia"] = target.get("media")
+        require(scope["expectedMedia"] is None or SHA.fullmatch(scope["expectedMedia"]), "invalid media proof digest")
+        require(scope["mode"] != "reclaim" or scope["expectedMedia"] is not None, "keep-media removal needs the served-media proof")
     lock_fd = os.open(DEPLOY_LOCK, os.O_RDONLY | os.O_NOFOLLOW)
     with os.fdopen(lock_fd, "rb") as lock:
         fcntl.flock(lock, fcntl.LOCK_SH | fcntl.LOCK_NB)
@@ -276,12 +282,18 @@ def confirm_reclaim(package, target, effect, qualified=None):
     science = effect.get("scientificSha256") or prior.get("scientificSha256")
     require(isinstance(science, str) and SHA.fullmatch(science), "completed job lacks its pre-removal scientific signature")
     check = {**selection("verify", target["id"], target["plan"]), "science": science}
+    kept = effect.get("mediaSha256") or prior.get("mediaSha256")
+    if target.get("keepMedia"):
+        require(isinstance(kept, str) and SHA.fullmatch(kept), "completed keep-set lacks a served-media signature")
+        check.update(keepMedia=True, media=kept)
     after = qualified(check) if qualified is not None else run_remote(package, {**check,
         "dependencies":effect.get("dependenciesSha256"), "nodePackages":effect.get("nodePackagesSha256"),
         "nativePackages":effect.get("nativePackages")})
     require(after["status"]=="verified" and after["databaseReadOnly"] is True and after["plan"].get("replayed") is True and
             after["scientificSha256"]==science and after["readbacks"] and after["points"],
             "post-operation point, native receipt or GCS verification refused: "+str(after.get("reason","missing proof"))[:300])
+    if target.get("keepMedia"):
+        require(after.get("mediaSha256")==kept, "media bytes, served links or legend changed after removal")
     if effect["status"]=="settled":
         identity = lambda rows: sorted((r["brokeredUploadId"],r["generation"],r["storedSha256"],r["storedByteSize"]) for r in rows)
         require(effect["points"]==after["points"] and identity(effect["readbacks"])==identity(after["readbacks"]),
@@ -409,6 +421,7 @@ def main():
     for name in ("proof", "verify", "reclaim"):
         sub = modes.add_parser(name)
         sub.add_argument("job")
+        sub.add_argument("--keep-media", action="store_true", help="retain all proven instantaneous PNGs and verify stable, legacy and engine reads")
         sub.add_argument("plan", nargs="?" if name == "proof" else None)
         if name=="reclaim":
             sub.add_argument("--proof-receipt", type=Path, help="pin an earlier current read-only canary proof")
@@ -439,11 +452,19 @@ def main():
                  for r in map(json.loads, rows[offset:offset + args.limit])]
     else:
         item=selection(args.mode, args.job, args.plan)
+        if args.keep_media:
+            item["keepMedia"] = True
+            require(args.mode != "reclaim" or args.proof_receipt is not None,
+                    "use the prior served-media proof receipt for a keep-media removal")
         if getattr(args, "proof_receipt", None):
             proof=json.loads(args.proof_receipt.read_bytes())
             require(proof["status"]=="proved" and proof["databaseReadOnly"] is True and proof["settled"] is False and
                     proof["job"]==args.job and proof["plan"]["plan"]==args.plan and proof["plan"]["bytes"]>0 and
                     proof["readbacks"] and SHA.fullmatch(proof["scientificSha256"]), "invalid pinned pre-removal proof")
+            require(bool(proof.get("mediaSha256")) == bool(args.keep_media), "proof belongs to another retention mode")
+            if args.keep_media:
+                require(SHA.fullmatch(proof["mediaSha256"]), "invalid keep-media proof")
+                item["media"] = proof["mediaSha256"]
             item["science"]=proof["scientificSha256"]
             item["proof"]={"helper":proof["helperSha256"], "containers":proof["containers"],
                            **{key:proof[key] for key in ("lockInode","jobInode","jobsInode","deployLockInode")}}

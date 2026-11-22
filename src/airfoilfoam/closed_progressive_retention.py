@@ -42,7 +42,56 @@ def _case_path(job_id, value, case):
     return path
 
 
-def _result_manifests(root):
+def _images(job, directory, images):
+    """Normalize the two actual spellings used by engine results and manifests."""
+    _require(isinstance(images, dict) and images, "point has no instantaneous image inventory")
+    case = PurePosixPath(*directory.parts[:2])
+    prefix = f"/jobs/{job}/files/"
+    paths = {}
+    for field, name in images.items():
+        _require(isinstance(field, str) and isinstance(name, str), "invalid image declaration")
+        path = _relative(name[len(prefix):]) if name.startswith(prefix) else case / _relative(name)
+        _require(path.parent == directory.parent / "images" and path.suffix.lower() == ".png",
+                 "image declaration escapes its exact point")
+        paths[field] = path.as_posix()
+    _require(len(set(paths.values())) == len(paths), "ambiguous image declaration")
+    return paths
+
+
+def _kept_images(root, proofs, declared):
+    expected = {}
+    for proof in proofs:
+        directory = _relative(proof["directory"])
+        images = declared[directory.as_posix()]
+        rows = proof["keepMedia"]
+        _require(isinstance(rows, list) and len(rows) == len(images) and
+                 {row["field"] for row in rows} == set(images), "registered image fields differ from engine result")
+        for name in images.values():
+            _require(name not in expected, "image overlaps another owner")
+            expected[name] = None
+        for row in rows:
+            path = _relative(row["path"])
+            _require(path.is_relative_to(directory / "scaled_media") and path.suffix.lower() == ".png" and
+                     path.as_posix() not in expected, "scaled image has a different or duplicate owner")
+            expected[path.as_posix()] = (row["byteSize"], row["sha256"])
+    _require(0 < len(expected) <= 512, "media inventory exceeds the bounded job proof")
+    kept = {}
+    total_bytes = 0
+    for name, identity in sorted(expected.items()):
+        path = root / name
+        _require(path.resolve() == path, "symlink in retained media path")
+        st = path.lstat()
+        _require(stat.S_ISREG(st.st_mode) and st.st_nlink == 1, "retained image is not a distinct regular file")
+        total_bytes += st.st_size
+        _require(total_bytes <= 128 * 1024**2, "retained-image inventory exceeds the bounded byte budget")
+        size, digest = _size_and_sha256(path)
+        _require((identity is None or identity == (size, digest)) and size > 0 and _same_file(path, st),
+                 "retained media bytes or inode differ")
+        kept[name] = ({"path": name, "sha256": digest, "byteSize": size}, st)
+    return kept
+
+
+def _result_manifests(root, declared=None):
     result = _json(root / "result.json", 128 * 1024**2)
     for record in (result, _json(root / "status.json", 1024**2)):
         _require(record.get("job_id") == root.name and record.get("state") in {"completed", "failed", "cancelled"},
@@ -50,7 +99,8 @@ def _result_manifests(root):
     inventory = {}
     for polar in result["polars"]:
         for point in (polar.get("points") or []) + (polar.get("attempts") or []):
-            _require(not any(point.get(k) for k in ("images", "mean_images", "video")), "result declares separate local media")
+            _require(not any(point.get(k) for k in ("mean_images", "video")), "result declares separate local media")
+            _require(declared is not None or not point.get("images"), "result declares separate local media")
             artifacts = point.get("evidence_artifacts") or []
             items = [a for a in artifacts if a.get("kind") == "manifest"]
             _require(len(items) == 1 and sum(a.get("kind") == "engine_bundle" for a in artifacts) == 1,
@@ -58,6 +108,9 @@ def _result_manifests(root):
             path = _relative(f"cases/{point['case_slug']}/{items[0]['path']}")
             _require(path.name == "evidence_manifest.json", "invalid result manifest path")
             directory = path.parent
+            if declared is not None:
+                images = _images(root.name, directory, point.get("images"))
+                _require(declared.setdefault(directory.as_posix(), images) == images, "point image declarations differ")
             members = set()
             for item in artifacts:
                 item_path = _relative(f"cases/{point['case_slug']}/{item['path']}")
@@ -89,7 +142,7 @@ def _live_member(member, latest):
     return None
 
 
-def _local_manifest(root, folder, proof, reported, readbacks):
+def _local_manifest(root, folder, proof, reported, readbacks, declared=None):
     mf = folder / "evidence_manifest.json"
     _require(mf.stat().st_size == proof["manifestByteSize"] <= MAX_EVIDENCE_MANIFEST_BYTES, "manifest size differs")
     data = mf.read_bytes()
@@ -126,7 +179,11 @@ def _local_manifest(root, folder, proof, reported, readbacks):
                  readback["storedByteSize"] == receipt["remote"]["storedByteSize"], "fresh complete object readback differs")
     manifest = json.loads(data)
     media = manifest.get("media") or {}
-    _require(not any(media.get(k) for k in ("instantaneous", "mean", "video")), "manifest declares separate media")
+    _require(not any(media.get(k) for k in ("mean", "video")), "manifest declares separate media")
+    if declared is None:
+        _require(not media.get("instantaneous"), "manifest declares separate media")
+    else:
+        _require(_images(root.name, rel, media.get("instantaneous")) == declared, "manifest and result image paths differ")
     # Sweeper ingestion registers mesh_evidence as mesh and retains its original engine kind in metadata.
     catalog = sorted(f"{'mesh' if kind == 'mesh_evidence' else kind}\tjobs/{root.name}/{rel.as_posix()}/{name}\t{size}\t{sha}"
                      for kind, name, size, sha in reported)
@@ -147,13 +204,19 @@ def _local_manifest(root, folder, proof, reported, readbacks):
     return case, _case_path(root.name, manifest["postPath"], case), manifest["files"]
 
 
-def _inventory(root, proofs, readbacks):
+def _inventory(root, proofs, readbacks, kept=None):
     expected = {str(_relative(p["directory"])): p for p in proofs}
     _require(expected and len(expected) == len(proofs), "empty or duplicate evidence identity")
-    reported = _result_manifests(root)
+    declared = {} if kept is not None else None
+    reported = _result_manifests(root, declared)
     _require(set(reported) == set(expected),
              "engine result and proven point inventory differ")
     cases, solvers, declared_cases, declared_solvers, found = set(), set(), set(), set(), set()
+    if kept is not None:
+        kept.update(_kept_images(root, proofs, declared))
+    protected = kept or {}
+    protected_dirs = {p.as_posix() for name in protected for p in PurePosixPath(name).parents}
+    protected_identities = {(entry["byteSize"], entry["sha256"]) for entry, _ in protected.values()}
     candidates = {}
     seen = 0
 
@@ -171,25 +234,38 @@ def _inventory(root, proofs, readbacks):
             solvers.add(relative)
         for name in dirs:
             path = folder / name
-            _require(not path.is_symlink() or (name == "polyMesh" and path.resolve().is_relative_to(root / "meshes")),
-                     "unaccounted directory symlink")
-        if names and any(part in {"images", "frames", "scaled_media", "custom_renders"} for part in relative.parts):
-            raise JobRetentionRefused("local media remains")
+            if path.is_symlink():
+                actual = path.resolve(strict=True) if protected else path.resolve()
+                _require(name == "polyMesh" and actual.is_relative_to(root / "meshes"), "unaccounted directory symlink")
+                if protected:
+                    lexical = Path(os.path.abspath(path.parent / os.readlink(path)))
+                    _require(relative.parts[:1] == ("cases",) and relative.name == "constant" and
+                             actual.parts[-2:] == ("constant", "polyMesh") and lexical == actual and actual.is_dir(),
+                             "unverified shared-mesh link")
+        if any(part in {"images", "frames", "scaled_media", "custom_renders"} for part in relative.parts):
+            _require(all((relative / name).as_posix() in protected for name in names), "unaccounted local media remains")
+            if protected:
+                _require(relative.as_posix() in protected_dirs and
+                         all((relative / name).as_posix() in protected_dirs for name in dirs), "unknown media directory")
         for name in names:
             _require(not (folder / name).is_symlink(), "unaccounted file symlink")
+            if protected:
+                _require(stat.S_ISREG((folder / name).lstat().st_mode), "unaccounted special file")
         for name in (*dirs, *names):
             _require("quarantine" not in name and name not in {"engine_evidence.tar.gz", "openfoam_evidence.tar.gz",
                      "engine_evidence.tar.zst"}, "local package or forensic evidence remains")
             _require(not name.lower().endswith((".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".svg", ".mp4",
-                     ".webm", ".mov", ".avi", ".tiff", ".tif")), "local media remains")
+                     ".webm", ".mov", ".avi", ".tiff", ".tif")) or (relative / name).as_posix() in protected, "local media remains")
         if folder.name != "evidence" and "evidence_manifest.json" not in names:
             continue
         key = relative.as_posix()
         _require(key in expected and "evidence_manifest.json" in names, "unowned evidence directory")
-        _require(not dirs and set(names) == {"evidence_manifest.json", "brokered_hub_binding.database.json",
+        _require(all(d == "scaled_media" and (relative / d).as_posix() in protected_dirs for d in dirs)
+                 and set(names) == {"evidence_manifest.json", "brokered_hub_binding.database.json",
                  "brokered_local_reclaim.intent.json", "brokered_local_reclaim.json"}, "extra local evidence remains")
         found.add(key)
-        case, post, members = _local_manifest(root, folder, expected[key], reported[key], readbacks)
+        case, post, members = _local_manifest(root, folder, expected[key], reported[key], readbacks,
+                                              declared[key] if declared is not None else None)
         declared_cases.add(case)
         declared_solvers.add(post)
         post_dir = root / post
@@ -200,7 +276,9 @@ def _inventory(root, proofs, readbacks):
             if live is None:
                 continue
             path = root / post / live
-            if path in candidates or not path.is_file() or path.resolve() != path:
+            if ((kept is not None and (member["byteSize"], member["sha256"]) in protected_identities) or
+                    path.relative_to(root).as_posix() in protected or path in candidates or
+                    not path.is_file() or path.resolve() != path):
                 continue
             info = path.stat()
             if info.st_nlink != 1 or not stat.S_ISREG(info.st_mode) or info.st_size != member["byteSize"]:
@@ -256,15 +334,23 @@ def reclaim_closed_progressive_files(job_root: Path, proofs: list[dict], expecte
                 authenticated = {r["brokeredUploadId"]: r for r in readbacks or []}
                 _require(len(authenticated) == len(proofs) == len(readbacks or []) and
                          set(authenticated) == {p["brokeredUploadId"] for p in proofs}, "missing exhaustive fresh readback")
-            files = _inventory(job_root, proofs, authenticated)
+            keep_requested = any("keepMedia" in p for p in proofs)
+            _require(not keep_requested or all("keepMedia" in p for p in proofs), "incomplete media keep-set")
+            kept = {} if keep_requested else None
+            files = _inventory(job_root, proofs, authenticated, kept)
+            kept_rows = [entry for entry, _ in (kept or {}).values()]
             current = {path.relative_to(job_root).as_posix(): [sha, st.st_size] for path, (sha, st) in files.items()}
             intent_file = job_root / "closed_progressive_duplicate_files.intent.json"
             done_file = job_root / "closed_progressive_duplicate_files.complete.json"
             stored = _json(intent_file, 32 * 1024**2) if intent_file.exists() else None
             rows = stored["files"] if stored is not None else [[name, *current[name]] for name in sorted(current)]
-            digest = hashlib.sha256(json.dumps([proofs, rows], sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+            fingerprint = [proofs, rows, kept_rows] if keep_requested else [proofs, rows]
+            digest = hashlib.sha256(json.dumps(fingerprint, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
             total = sum(row[2] for row in rows)
             receipt = {"job_id": job_root.name, "plan": digest, "bytes": total, "files": len(rows)}
+            extra = {"mediaFiles": kept_rows, "workingPaths": [name for name, _, _ in rows],
+                     "plannedAllocatedBytes": sum(info.st_blocks * 512 for _, info in files.values())
+                     if stored is None else stored["allocationBaseline"]["fileAllocatedBytes"]} if keep_requested else {}
             if stored is not None:
                 _require(stored.get("job_id") == job_root.name and stored.get("plan") == digest, "reclaim intent changed")
                 intended = {name: [sha, size] for name, sha, size in rows}
@@ -275,13 +361,15 @@ def reclaim_closed_progressive_files(job_root: Path, proofs: list[dict], expecte
             if done_file.exists():
                 _require(stored is not None and not files and _json(done_file, 65536) == receipt, "completed receipt or files changed")
                 _require(expected_plan is None or expected_plan == digest, "completed plan mismatch")
-                return {**receipt, "state": "planned" if expected_plan is None else "reclaimed", "replayed": True,
+                return {**receipt, **extra, "state": "planned" if expected_plan is None else "reclaimed", "replayed": True,
                         "allocation": _allocation(job_root, rows, files, stored)}
             if expected_plan is None:
-                return {**receipt, "state": "planned", "replayed": False}
+                return {**receipt, **extra, "state": "planned", "replayed": False}
             _require(digest == expected_plan, "job changed after preflight")
             for path, (_, info) in files.items():
                 _require(_same_file(path, info), "source changed before unlink")
+            for name, (_, st) in (kept or {}).items():
+                _require(_same_file(job_root / name, st), "retained image changed before reclaim")
             if stored is None:
                 stored = {"job_id": job_root.name, "plan": digest, "files": rows,
                           "allocationBaseline": _allocation(job_root, rows, files, None)}
@@ -296,8 +384,14 @@ def reclaim_closed_progressive_files(job_root: Path, proofs: list[dict], expecte
                     os.fsync(fd)
                 finally:
                     os.close(fd)
+            if kept is not None:
+                after = {}
+                _require(not _inventory(job_root, proofs, authenticated, after) and
+                         [entry for entry, _ in after.values()] == kept_rows and
+                         all(_same_file(job_root / name, st) for name, (_, st) in kept.items()),
+                         "retained media or working-file set changed during reclaim")
             _atomic_create_json(done_file, receipt)
-            return {**receipt, "state": "reclaimed", "replayed": False,
+            return {**receipt, **extra, "state": "reclaimed", "replayed": False,
                     "allocation": _allocation(job_root, rows, files, stored)}
     except (OSError, KeyError, ValueError, TypeError, EvidenceCleanupError) as exc:
         raise JobRetentionRefused(f"closed progressive inventory could not be proven: {exc}") from exc
