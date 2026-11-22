@@ -1,3 +1,4 @@
+import {verifyOriginalCopyJourney} from "./hz-attempt-originals-fixture";
 import { getAttemptEvidenceArchive } from "@aerodb/db/attempt-evidence-catalog";
 import { readHzAttemptWorkingCopy } from "../src/hz-attempt-volume";
 import {
@@ -37,7 +38,7 @@ import { join } from "node:path";
 import { writeFile } from "node:fs/promises";
 import { HistoryOperationError } from "@aerodb/core/point-history-protocol";
 
-function objectStore() {
+function objectStore(originalCopy=false) {
   const objects = new Map<string, { bytes: Buffer; metadata: any }>();
   const account = "fixture@attempt-test.iam.gserviceaccount.com",
     bucket = "attempt-fixture";
@@ -96,7 +97,7 @@ function objectStore() {
     }
     return Response.json(entry.metadata);
   };
-  return { objects, store: new HzAttemptHubStore(bucket, account, request) };
+  return { objects, store: new HzAttemptHubStore(bucket, account, request,originalCopy) };
 }
 
 export async function verifyHzAttemptTransition(
@@ -382,6 +383,7 @@ export async function verifyHzAttemptTransition(
         )
       )[0],
     ).toMatchObject({ evidence_archive_id: null, body: original });
+    await verifyOriginalCopyJourney(db,id,objectStore(true).store);
   } finally {
     if (prior === undefined) delete process.env.MEDIA_DIR;
     else process.env.MEDIA_DIR = prior;

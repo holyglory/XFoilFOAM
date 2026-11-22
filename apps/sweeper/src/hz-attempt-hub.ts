@@ -1,3 +1,4 @@
+import { MAX_ATTEMPT_EVIDENCE_BYTES } from "@aerodb/db/attempt-evidence-storage";
 import { Readable } from "node:stream";
 import {
   type AttemptEvidenceArchiveIdentity,
@@ -27,11 +28,27 @@ function custom(p: AttemptEvidenceCopyIdentity, instance: string) {
   };
 }
 export class HzAttemptHubStore extends HubWorkloadGcs {
+  constructor(
+    bucket: string,
+    account: string,
+    request: typeof fetch = fetch,
+    private readonly originalCopy = false,
+  ) {
+    super(bucket, account, request);
+  }
+  private withinBounds(source: number, packed: number) {
+    const max = this.originalCopy ? MAX_ATTEMPT_EVIDENCE_BYTES : 262144;
+    return (
+      source > 0 &&
+      source <= max &&
+      packed > 0 &&
+      packed <= (this.originalCopy ? max * 2 + 196608 : 1048576)
+    );
+  }
   async put(instance: string, p: AttemptEvidenceCopyIdentity, packed: Buffer) {
     if (
       !/^[a-f0-9-]{36}$/.test(instance) ||
-      packed.length > 1048576 ||
-      p.sourceByteSize > 262144
+      !this.withinBounds(p.sourceByteSize, packed.length)
     )
       throw new Error("Invalid worker attempt transfer");
     await readAttemptEvidenceCopy(Readable.from([packed]), p);
@@ -94,8 +111,7 @@ export class HzAttemptHubStore extends HubWorkloadGcs {
     assertAttemptEvidenceArchive(identity);
     if (
       identity.bucket !== this.bucket ||
-      identity.sourceByteSize > 262144 ||
-      identity.storedByteSize > 1048576 ||
+      !this.withinBounds(identity.sourceByteSize, identity.storedByteSize) ||
       identity.objectKey !== hzAttemptKey(identity.sourceInstance, identity)
     )
       throw new Error("Invalid attempt generation");
