@@ -10,6 +10,8 @@ import {
   type ProgressiveRemoteReport,
 } from "@aerodb/db";
 import { sql } from "drizzle-orm";
+import { readSweeperAttemptEvidence } from "./attempt-evidence-consumer-reader";
+import { workerEvidenceStorageColumns } from "./progressive-delivery-selection";
 
 const fields = [
   "aoaDeg",
@@ -52,6 +54,7 @@ export async function existingProgressiveReportAttempts(
     return null;
   const sources = progressiveReportedPointSources(report.result);
   if (!sources.length || sources.length > 512) return null;
+  const columns = await workerEvidenceStorageColumns(db);
   // Bound distinct evidence identities, not the number of heartbeat reports
   // repeating them. Different attempts for one point must remain distinguishable.
   const rows = await db.execute(sql`WITH candidates AS MATERIALIZED (
@@ -80,7 +83,11 @@ export async function existingProgressiveReportAttempts(
       ORDER BY candidate.point_content_signature,candidate.sequence DESC
     )
     SELECT chosen.point_content_signature,chosen.result_attempt_id,
-      resolve_progressive_report(to_jsonb(original.*)) AS report,chosen.content_signature,to_jsonb(attempt) AS attempt
+      resolve_progressive_report(to_jsonb(original.*)) AS report,chosen.content_signature,
+      attempt.result_id,attempt.sim_job_id,
+      ${columns.attempts ? sql`attempt.evidence_archive_id,attempt.evidence_storage_event_id` : sql`NULL::uuid AS evidence_archive_id,NULL::uuid AS evidence_storage_event_id`},
+      attempt.evidence_payload,attempt.quality_warnings,
+      ${sql.join(fields.map((field) => sql`attempt.${sql.identifier(field.replace(/[A-Z]/g, letter => "_" + letter.toLowerCase()))}`), sql`, `)}
     FROM chosen
     JOIN progressive_worker_reports original ON original.sim_job_id=chosen.sim_job_id
       AND original.sequence=chosen.sequence AND original.content_signature=chosen.content_signature
@@ -133,7 +140,7 @@ export async function existingProgressiveReportAttempts(
       )
     )
       return null;
-    const attempt = candidate.attempt as Record<string, unknown>;
+    const attempt = candidate;
     const expectedWarnings = projection.qualityWarnings ?? [];
     const storedWarnings = attempt.quality_warnings ?? [];
     if (
@@ -148,9 +155,14 @@ export async function existingProgressiveReportAttempts(
         )
     )
       return null;
+    if (!attempt.result_id) return null;
+    const hydrated = await readSweeperAttemptEvidence(db, { id: String(attempt.result_attempt_id),
+      resultId: String(attempt.result_id), simJobId: String(attempt.sim_job_id),
+      evidenceArchiveId: attempt.evidence_archive_id == null ? null : String(attempt.evidence_archive_id),
+      evidenceStorageEventId: attempt.evidence_storage_event_id == null ? null : String(attempt.evidence_storage_event_id),
+      evidencePayload: attempt.evidence_payload });
     if (
-      !attempt.result_id ||
-      analysisContentHash(attempt.evidence_payload) !==
+      analysisContentHash(hydrated.evidencePayload) !==
         analysisContentHash(projection.evidencePayload)
     )
       return null;

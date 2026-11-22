@@ -69,7 +69,7 @@ import {
   type RenderedDefaultMedia,
   type UransFidelity,
 } from "@aerodb/engine-client";
-import { and, desc, eq, inArray, lt, or, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, isNull, lt, or, sql } from "drizzle-orm";
 import { constants, createReadStream } from "node:fs";
 import { access, readFile, stat } from "node:fs/promises";
 import { execFile } from "node:child_process";
@@ -81,6 +81,7 @@ import { touchHeartbeat } from "./heartbeat";
 import {
   prepareAttemptPublicationEvidence,
   publicationAttemptPayload,
+  readOriginalAttemptForProjection,
   readSweeperAttemptEvidence,
 } from "./attempt-evidence-consumer-reader";
 import {
@@ -1485,25 +1486,49 @@ async function insertResultAttempt(opts: {
     // that evidence key. If another replay wins the race, require its complete
     // payload to equal ours; a competing version remains an immutable-evidence
     // violation.
+    const originalText = existing.evidenceArchiveId
+      ? await readOriginalAttemptForProjection(db, existing.id, existing.evidenceArchiveId)
+      : undefined;
+    if (originalText !== undefined) {
+      await db.execute(sql`SELECT attempt_evidence_restore(a.id, a.evidence_archive_id, ${originalText},
+        'exact engine replay supplied a mesh recovery acknowledgement')
+        FROM result_attempts a WHERE a.id=${existing.id}::uuid AND a.result_id=${resultId}::uuid
+          AND a.sim_job_id=${simJobId}::uuid AND a.evidence_archive_id=${existing.evidenceArchiveId}::uuid`);
+    }
     const [enriched] = await db
       .update(resultAttempts)
-      .set({ evidencePayload })
+      .set({
+        evidencePayload: sql`jsonb_set(${resultAttempts.evidencePayload}, '{mesh_recovery_version}',
+          ${JSON.stringify(incomingMeshRecoveryVersion)}::jsonb, true)`,
+      })
       .where(
         and(
           eq(resultAttempts.id, existing.id),
-          eq(resultAttempts.evidencePayload, existingPayload),
+          isNull(resultAttempts.evidenceArchiveId),
+          originalText === undefined
+            ? eq(resultAttempts.evidencePayload, existingPayload)
+            : sql`${resultAttempts.evidencePayload}=${originalText}::jsonb`,
         ),
       )
       .returning({ id: resultAttempts.id });
     if (!enriched) {
       const [raced] = await db
-        .select({ evidencePayload: resultAttempts.evidencePayload })
+        .select({
+          id: resultAttempts.id,
+          resultId: resultAttempts.resultId,
+          simJobId: resultAttempts.simJobId,
+          evidenceArchiveId: resultAttempts.evidenceArchiveId,
+          evidencePayload: resultAttempts.evidencePayload,
+        })
         .from(resultAttempts)
         .where(eq(resultAttempts.id, existing.id))
         .limit(1);
+      const racedOriginal = raced?.evidenceArchiveId
+        ? await readSweeperAttemptEvidence(db, raced)
+        : raced;
       if (
-        !raced ||
-        stableHash(raced.evidencePayload ?? null) !==
+        !racedOriginal ||
+        stableHash(racedOriginal.evidencePayload ?? null) !==
           stableHash(evidencePayload)
       ) {
         throw new Error(

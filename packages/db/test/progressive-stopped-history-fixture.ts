@@ -31,6 +31,7 @@ import {
 import { apiAttemptEvidenceReader } from "../../../apps/api/src/attempt-evidence-reader";
 import { env } from "../../../apps/api/src/env";
 import { reportTextIdentity } from "../src/progressive-report-archive";
+import { assertAttemptSourcePins, attemptSourceApplicationSha256, loadAttemptSourcePins, prepareAttemptSources } from "../src/attempt-receipt-source";
 
 export function stoppedHistoryFixture() {
   const iterations = Array.from({ length: 1500 }, (_, index) => index + 1);
@@ -205,6 +206,9 @@ export async function verifyStoppedAttemptHistory(
       await db.execute(sql`SELECT a.evidence_payload,a.evidence_archive_id,e.verification,e.app_readback_at
       FROM result_attempts a JOIN attempt_evidence_storage_events e ON e.id=a.evidence_storage_event_id WHERE a.id=${attemptId}::uuid`);
     expect(row.evidence_archive_id).toBe(archive.id);
+    const stoppedPin = (await loadAttemptSourcePins(db, [attemptId])).get(attemptId)!;
+    expect(attemptSourceApplicationSha256(stoppedPin)).toBe(analysisContentHash(JSON.parse(original)));
+    await db.transaction(tx => assertAttemptSourcePins(tx as unknown as DB, [stoppedPin]));
     expect(row.evidence_payload).not.toHaveProperty("steady_history.cl");
     expect(row.evidence_payload).toHaveProperty("mesh_recovery_version", 3);
     expect(row.app_readback_at).not.toBeNull();
@@ -272,6 +276,13 @@ export async function verifyStoppedAttemptHistory(
       verified.payload,
     );
     expect(await limit()).toBe("returned-to-publication");
+    await expect(db.transaction(tx => assertAttemptSourcePins(tx as unknown as DB, [stoppedPin]))).rejects.toThrow(/binding changed/);
+    const restoredPin = (await loadAttemptSourcePins(db, [attemptId])).get(attemptId)!;
+    expect(restoredPin.archiveId).toBeNull();
+    expect(restoredPin.storageEventId).not.toBe(stoppedPin.storageEventId);
+    const rebound = (await prepareAttemptSources(db, store, [restoredPin])).get(attemptId)!;
+    expect(rebound.payloadText).toBe(original);
+    await db.transaction(tx => assertAttemptSourcePins(tx as unknown as DB, [rebound.pin]));
     expect(
       await readAttemptEvidenceText(db, apiAttemptEvidenceReader, attemptId),
     ).toBe(original);
@@ -284,6 +295,8 @@ export async function verifyStoppedAttemptHistory(
         },
       }),
     );
+    const { verifyRemoteReceiptOnlyHistory } = await import("./attempt-receipt-source-fixture");
+    await verifyRemoteReceiptOnlyHistory(db, attemptId, archive.id, original, store);
   } finally {
     read.mockRestore();
     env.evidenceBucket = bucket;

@@ -1,3 +1,5 @@
+import { readSweeperAttemptEvidence, sweeperAttemptArchiveReader } from "./attempt-evidence-consumer-reader";
+import { installProgressiveRetentionReader } from "@aerodb/db/progressive-remote-retention";
 import { runRemoteTransferSteps } from "./remote-transfer-steps";
 import { activeReconcileConcurrency, runWithConcurrency } from "./reconcile";
 import { renewIndependentPromises } from "./remote-promise-renewal";
@@ -125,6 +127,7 @@ import { submitPendingJobWithLifecycleGuard } from "./submit-lifecycle";
 import { submitRemotePromisePrecalcRecoveries } from "./urans-ladder";
 import { parseEvidenceManifest } from "./evidence-manifest";
 
+installProgressiveRetentionReader(sweeperAttemptArchiveReader());
 const MEDIA_DIR = process.env.MEDIA_DIR ?? "/data/airfoilfoam";
 
 // Remote-hub HTTP calls run INSIDE the sweeper tick — a hung fetch here would
@@ -3446,7 +3449,7 @@ async function currentAttemptForResult(
       `remote result ${result.id} current-attempt ownership is invalid`,
     );
   }
-  return attempt;
+  return readSweeperAttemptEvidence(db, attempt);
 }
 
 export interface DeliveryClaim {
@@ -4463,7 +4466,7 @@ export async function processRestartableRemotePrecalcCheckpoint(
     }
     let transferLease: RemotePromiseTransferLease | null = null;
     try {
-      const [attempt] = await db
+      const [storedAttempt] = await db
         .select()
         .from(resultAttempts)
         .where(
@@ -4473,6 +4476,7 @@ export async function processRestartableRemotePrecalcCheckpoint(
           ),
         )
         .limit(1);
+      const attempt = storedAttempt && await readSweeperAttemptEvidence(db, storedAttempt);
       const attemptEvidence =
         attempt?.evidencePayload &&
         typeof attempt.evidencePayload === "object" &&
@@ -4808,7 +4812,7 @@ export async function deliverNextProgressiveWorkerArchive(
       .select()
       .from(syncApiSettings)
       .where(eq(syncApiSettings.id, 1));
-    const [attempt] = await db
+    const [storedAttempt] = await db
       .select()
       .from(resultAttempts)
       .where(eq(resultAttempts.id, claim.resultAttemptId));
@@ -4822,12 +4826,13 @@ export async function deliverNextProgressiveWorkerArchive(
       !settings?.upstreamBaseUrl ||
       !settings.remoteSolverAuthToken ||
       !settings.remoteSolverRegisteredId ||
-      !attempt?.resultId ||
-      attempt.simJobId !== claim.executionId ||
-      attempt.engineJobId !== claim.executionId ||
+      !storedAttempt?.resultId ||
+      storedAttempt.simJobId !== claim.executionId ||
+      storedAttempt.engineJobId !== claim.executionId ||
       typeof promiseId !== "string"
     )
       throw new Error("Progressive archive source ownership is unavailable");
+    const attempt = { ...await readSweeperAttemptEvidence(db, storedAttempt), resultId: storedAttempt.resultId };
     const progressiveEvidence = await progressiveWorkerEvidenceReference(
       db,
       claim.executionId,

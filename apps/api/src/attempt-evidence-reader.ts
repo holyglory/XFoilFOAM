@@ -17,6 +17,7 @@ import type {
 } from "@aerodb/db/attempt-evidence-projection";
 import { AttemptEvidenceStore } from "../../sweeper/src/attempt-evidence-store";
 import { env } from "./env";
+import { installProgressiveRetentionReader } from "@aerodb/db/progressive-remote-retention";
 
 let store: AttemptEvidenceStore | undefined;
 /** Existing canonical bucket/credentials only. A bucketless HZ must keep its
@@ -38,6 +39,7 @@ export const apiAttemptEvidenceReader: AttemptEvidenceArchiveReader = {
     return store.read(identity, signal);
   },
 };
+installProgressiveRetentionReader(apiAttemptEvidenceReader);
 
 function bounded<T extends AttemptEvidenceReadOptions>(
   options?: T,

@@ -11591,6 +11591,7 @@ describe("progressive CFD evidence accounting", () => {
     fixture: Awaited<ReturnType<typeof cfdEvidenceFixture>>,
     solverId: string,
     steadyHistory?: SteadyHistory,
+    bindArchive: typeof retainStorageRecoveryArchive = retainStorageRecoveryArchive,
   ) {
     const lease = fixture.leases[0];
     const [job] = await connection
@@ -11767,12 +11768,11 @@ describe("progressive CFD evidence accounting", () => {
       ...delivery,
       storageOnly: true,
     });
-    await retainStorageRecoveryArchive(connection, delivery);
+    await bindArchive(connection, delivery);
     return { jobId: job.id, promiseId, resultAttemptId: attempt.id, delivery };
   }
 
-  it("shortens and replays a stopped progressive stage-3 history with the same fit and source bytes", async () => {
-    const fixture = await cfdEvidenceFixture(33.732, 3, [], [0, 2], false, undefined, {}, 2, true, true);
+  async function withHistoryDatabaseCopy<T>(run: (connection: DB) => Promise<T>): Promise<T> {
     // Retained broker and report ownership is intentionally immutable. Exercise
     // real committed transactions and recovery in a disposable database copy.
     const copy = `stopped_history_${randomUUID().replaceAll("-", "")}`;
@@ -11783,13 +11783,7 @@ describe("progressive CFD evidence accounting", () => {
       url.pathname = `/${copy}`;
       const owned = createClient({ url: url.toString(), max: 4 });
       try {
-        const { verifyStoppedAttemptHistory, stoppedHistoryFixture } = await import("./progressive-stopped-history-fixture");
-        const solverId = randomUUID();
-        await owned.db.execute(sql`UPDATE sweeper_state SET enabled=true,admission_fence_active=false,disk_admission_blocked=false WHERE id=1`);
-        await owned.db.execute(sql`INSERT INTO registered_remote_solvers(id,instance_id,instance_name,cpu_capacity,cpu_budget,max_active_polar_promises,auth_token_hash)
-          VALUES (${solverId}::uuid,${randomUUID()},'stopped history fixture',96,96,96,${analysisContentHash(randomUUID())})`);
-        const { delivery } = await prepareStorageRecoveryProbeFixture(owned.db, fixture, solverId, stoppedHistoryFixture());
-        await verifyStoppedAttemptHistory(owned.db, delivery, fixture.leases[0], fitUsingPython);
+        return await run(owned.db);
       } finally {
         await owned.sql.end();
       }
@@ -11797,6 +11791,55 @@ describe("progressive CFD evidence accounting", () => {
       await admin.unsafe(`DROP DATABASE IF EXISTS "${copy}"`);
       client = createClient({ url: targetUrl.toString(), max: 4 });
       db = client.db;
+    }
+  }
+
+  it("shortens and replays a stopped progressive stage-3 history with the same fit and source bytes", async () => {
+    const fixture = await cfdEvidenceFixture(33.732, 3, [], [0, 2], false, undefined, {}, 2, true, true);
+    await withHistoryDatabaseCopy(async (connection) => {
+      const { verifyStoppedAttemptHistory, stoppedHistoryFixture } = await import("./progressive-stopped-history-fixture");
+      const solverId = randomUUID();
+      await connection.execute(sql`UPDATE sweeper_state SET enabled=true,admission_fence_active=false,disk_admission_blocked=false WHERE id=1`);
+      await connection.execute(sql`INSERT INTO registered_remote_solvers(id,instance_id,instance_name,cpu_capacity,cpu_budget,max_active_polar_promises,auth_token_hash)
+        VALUES (${solverId}::uuid,${randomUUID()},'stopped history fixture',96,96,96,${analysisContentHash(randomUUID())})`);
+      const { delivery } = await prepareStorageRecoveryProbeFixture(connection, fixture, solverId, stoppedHistoryFixture());
+      await verifyStoppedAttemptHistory(connection, delivery, fixture.leases[0], fitUsingPython);
+    });
+  }, 120_000);
+
+  it("shortens current and historical receipt-bearing RANS histories with identical fit and replay", async () => {
+    const fixture = await cfdEvidenceFixture(33.741, 2, [], [0, 2], false, undefined, {}, 2);
+    const { verifyReceiptBearingHistory } = await import("./attempt-receipt-source-fixture");
+    await withHistoryDatabaseCopy((connection) => verifyReceiptBearingHistory(connection, fixture, fitUsingPython));
+  }, 120_000);
+
+  it("replays a signed remote point after its receipt-bearing RANS history moves to storage", async () => {
+    const fixture = await cfdEvidenceFixture(33.749, 2, [], [0, 2], false, undefined, {}, 2, true);
+    const priorRole = process.env.AIRFOILFOAM_DEPLOYMENT_ROLE;
+    process.env.AIRFOILFOAM_DEPLOYMENT_ROLE = "hub";
+    try {
+      await withHistoryDatabaseCopy(async (connection) => {
+        const { stoppedHistoryFixture } = await import("./progressive-stopped-history-fixture");
+        const { bindReceiptBearingSignedArchive, verifyReceiptBearingSignedTransition } = await import("./receipt-bearing-signed-replay-fixture");
+        const solverId = randomUUID();
+        await connection.execute(sql`UPDATE sweeper_state SET enabled=true,admission_fence_active=false,disk_admission_blocked=false WHERE id=1`);
+        await connection.execute(sql`INSERT INTO registered_remote_solvers(id,instance_id,instance_name,cpu_capacity,cpu_budget,max_active_polar_promises,auth_token_hash)
+          VALUES (${solverId}::uuid,${randomUUID()},'signed history fixture',96,96,96,${analysisContentHash(randomUUID())})`);
+        const { delivery } = await prepareStorageRecoveryProbeFixture(
+          connection, fixture, solverId, stoppedHistoryFixture(), bindReceiptBearingSignedArchive,
+        );
+        const [campaignRow] = await connection.execute(sql`SELECT current_plan_revision_id FROM sim_campaigns WHERE id=${fixture.campaignId}::uuid`);
+        const lease = fixture.leases[0]!;
+        const recovery = await recoverProgressiveStorageOnlyEvidence(connection, {
+          campaignId: fixture.campaignId, epochId: lease.epochId, generationId: lease.generationId,
+          planRevisionId: String(campaignRow.current_plan_revision_id), stage: 2,
+        }, { limit: 1 });
+        expect(recovery).toMatchObject({ selected: 1, linked: 1, errors: 0 });
+        await verifyReceiptBearingSignedTransition(connection, delivery);
+      });
+    } finally {
+      if (priorRole === undefined) delete process.env.AIRFOILFOAM_DEPLOYMENT_ROLE;
+      else process.env.AIRFOILFOAM_DEPLOYMENT_ROLE = priorRole;
     }
   }, 120_000);
 

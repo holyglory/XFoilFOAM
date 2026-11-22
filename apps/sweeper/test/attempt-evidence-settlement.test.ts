@@ -23,6 +23,13 @@ import {
   type AttemptEvidenceFreshVerification,
 } from "@aerodb/db/attempt-evidence-projection";
 import { createAttemptServerDependencyVerifier } from "@aerodb/db/attempt-evidence-dependency-verifier";
+import { analysisContentHash } from "@aerodb/db/analysis-target";
+import {
+  assertAttemptSourcePins,
+  attemptSourceApplicationSha256,
+  loadAttemptSourcePins,
+  prepareAttemptSources,
+} from "@aerodb/db/attempt-receipt-source";
 import {
   readApiAttemptEvidenceForApp,
   apiAttemptEvidenceReader,
@@ -103,6 +110,42 @@ describe("verified settled attempt history transition", () => {
       consumerContractVersion: 1,
     });
   }
+
+  it("authenticates a 0208 source on its original schema and rebinds after restore", async () => {
+    const { db, namespace } = fixture;
+    const source = await seedSettledHistory(db);
+    const id = source.attemptId;
+    await enabled();
+    const full = (await row(id)).text as string;
+    const digest = analysisContentHash(JSON.parse(full));
+    await settleAttemptEvidenceHistory(db, dependencies(source), { attemptId: id, archiveId: source.archive.id });
+    const [session] = await db.execute(sql`SELECT current_setting('search_path') AS path`);
+    try {
+      // Use only the actual 0208 fixture schema. The enclosing database has
+      // newer migrations in public that would otherwise hide missing readers.
+      await db.execute(sql`SET search_path=${sql.identifier(namespace)},pg_catalog`);
+      const [schema] = await db.execute(sql`SELECT to_regprocedure('attempt_evidence_archived_application_sha256(uuid,uuid,uuid)') IS NULL AS original_schema`);
+      expect(schema.original_schema).toBe(true);
+      const cold = (await loadAttemptSourcePins(db, [id])).get(id)!;
+      expect(cold).toMatchObject({ archiveId: source.archive.id, applicationSha256: null, cfdAttemptToken: null });
+      expect(() => attemptSourceApplicationSha256(cold)).toThrow(/unavailable/);
+      const prepared = (await prepareAttemptSources(db, source.store, [cold])).get(id)!;
+      expect(prepared.payloadText).toBe(full);
+      expect(attemptSourceApplicationSha256(prepared.pin)).toBe(digest);
+      await db.transaction(tx => assertAttemptSourcePins(tx as unknown as DB, [prepared.pin]));
+      await restoreAttemptEvidence(db, id, source.archive.id, full, "test original restored");
+      await expect(db.transaction(tx => assertAttemptSourcePins(tx as unknown as DB, [prepared.pin]))).rejects.toThrow(/binding changed/);
+      const current = (await loadAttemptSourcePins(db, [id])).get(id)!;
+      expect(current.archiveId).toBeNull();
+      expect(current.storageEventId).not.toBe(cold.storageEventId);
+      const restored = (await prepareAttemptSources(db, source.store, [current])).get(id)!;
+      expect(restored.payloadText).toBe(full);
+      expect(attemptSourceApplicationSha256(restored.pin, restored.payload)).toBe(digest);
+      await db.transaction(tx => assertAttemptSourcePins(tx as unknown as DB, [restored.pin]));
+    } finally {
+      await db.execute(sql`SELECT set_config('search_path',${String(session.path)},false)`);
+    }
+  });
 
   it("removes real online arrays with measurable savings and preserves exact app reads, scalar decisions and replay", async () => {
     const source = await seedSettledHistory(fixture.db),
