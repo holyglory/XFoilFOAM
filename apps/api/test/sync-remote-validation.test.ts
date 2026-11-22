@@ -12,6 +12,17 @@ import { join } from "node:path";
 import { and, eq, inArray, sql as query } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { sourceAirModel } from "../../../packages/core/test/fixtures/source-air-model";
+import type { DB } from "@aerodb/db/client";
+
+const attemptReadScope = vi.hoisted(() => ({ connection: null as DB | null }));
+vi.mock("../src/db", async (original) => {
+  const actual = await original<typeof import("../src/db")>();
+  return { ...actual, db: new Proxy(actual.db, { get(target, property) {
+    const connection = attemptReadScope.connection ?? target;
+    const value = Reflect.get(connection, property);
+    return typeof value === "function" ? value.bind(connection) : value;
+  } }) };
+});
 import { SolverHistoryGcsStore } from "@aerodb/core/solver-history-gcs";
 import { decodeSolverHistory, encodeSolverHistory, type SolverHistoryArchiveIdentity } from "@aerodb/core/solver-history-storage";
 import { loadSolverHistorySource } from "@aerodb/db/solver-history-storage";
@@ -2701,6 +2712,26 @@ describe("remote solver sync validation regressions", () => {
       .from(resultAttempts)
       .where(eq(resultAttempts.resultId, canonical!.id));
     expect(storedAttempts).toHaveLength(1);
+  });
+
+  it("replays full attempt evidence from its exact archive without adding a generation or changing the compact source", async () => {
+    // Preserve this suite's delayed API import: MEDIA_DIR is configured above
+    // before any module may capture the API environment/media store.
+    const { verifyAttemptEvidenceSyncReplay } = await import("./attempt-evidence-readthrough-fixture");
+    const aoaDeg = 703.122;
+    const point = makePoint(aoaDeg, { cl: 0.45, cd: 0.025, cm: -0.02, clCd: 18, clStd: 0.05, cdStd: 0.005,
+      forceHistory: { t: [0, 1, 2, 3], cl: [0.4, 0.5, 0.4, 0.5], cd: [0.02, 0.03, 0.02, 0.03], cm: [-0.02, -0.02, -0.02, -0.02],
+        clMean: 0.45, clRms: 0.05, cdMean: 0.025, cdRms: 0.005, strouhal: null, sheddingFreqHz: null, sampleCount: 4 },
+    });
+    const payload = polarPayload([point]);
+    const first = await postPolars(payload);
+    expect(first.statusCode, first.body).toBe(200);
+    expect(first.json()).toMatchObject({ imported: 1, attempts: 1, conflictIds: [] });
+    const canonical = await resultAt(aoaDeg);
+    const [attempt] = await db.select().from(resultAttempts).where(eq(resultAttempts.resultId, canonical!.id)).limit(1);
+    await verifyAttemptEvidenceSyncReplay({ db, resultId: canonical!.id, attemptId: attempt.id,
+      replay: () => postPolars(payload), setConnection: (connection) => { attemptReadScope.connection = connection; },
+    });
   });
 
   it("replays an offloaded force history without changing evidence or creating an immutable-value conflict", async () => {
