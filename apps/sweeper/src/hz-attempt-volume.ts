@@ -26,6 +26,10 @@ export function hzAttemptKey(
  * A foreign generation with identical content gets a different location. */
 function location(i: AttemptEvidenceArchiveIdentity) {
   assertAttemptEvidenceArchive(i);
+  if (!/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(i.sourceInstance))
+    throw new Error(
+      "HZ attempt working storage is not configured for this source instance",
+    );
   if (
     process.env.AIRFOILFOAM_DEPLOYMENT_ROLE !== "remote-solver" ||
     i.objectKey !== hzAttemptKey(i.sourceInstance, i)

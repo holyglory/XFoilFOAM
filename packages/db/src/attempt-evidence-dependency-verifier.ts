@@ -149,6 +149,10 @@ function decisions(classified: ReturnType<typeof classifyPolarEvidence>) {
 export function createAttemptServerDependencyVerifier(
   db: DB,
   reader: AttemptEvidenceArchiveReader,
+  verifyWorker?: (
+    attemptId: string,
+    original: string,
+  ) => Promise<Record<string, unknown>>,
 ): AttemptEvidenceDependencyVerifier {
   return async (input): Promise<AttemptEvidenceDependencyProof> => {
     const { attemptId, archive, preview, originalPayloadText } = input;
@@ -211,18 +215,22 @@ export function createAttemptServerDependencyVerifier(
       "archive read did not restore the exact original owner and PG text",
     );
 
+    const workerScope = verifyWorker
+      ? await verifyWorker(attemptId, originalPayloadText)
+      : null;
     const policy = await getAttemptEvidenceStoragePolicy(db);
     const broad =
-      policy?.progressiveSourceScope === "receipt-bearing"
+      !workerScope && policy?.progressiveSourceScope === "receipt-bearing"
         ? await verifyProgressiveAttemptReceipt(
             db,
             attemptId,
             originalPayloadText,
           )
         : null;
-    const stopped = broad
-      ? null
-      : await verifyStoppedSource(db, attemptId, originalPayloadText);
+    const stopped =
+      workerScope || broad
+        ? null
+        : await verifyStoppedSource(db, attemptId, originalPayloadText);
     return db.transaction(async (rawTx) => {
       const tx = rawTx as unknown as DB;
       await tx.execute(sql`SET TRANSACTION READ ONLY`);
@@ -231,11 +239,13 @@ export function createAttemptServerDependencyVerifier(
       const [row] =
         await tx.execute(sql`SELECT a.result_id,a.sim_job_id,a.airfoil_id,a.simulation_preset_revision_id,
         ${
-          broad
-            ? sql`attempt_evidence_receipt_scope(a.id)=${JSON.stringify(broad.progressiveScope)}::jsonb`
-            : stopped
-              ? sql`attempt_evidence_stopped_scope(a.id)=${JSON.stringify(stopped.progressiveScope)}::jsonb`
-              : attemptEvidenceColdCohortSql(sql`a`)
+          workerScope
+            ? sql`attempt_evidence_hz_scope(a.id)=${JSON.stringify(workerScope)}::jsonb`
+            : broad
+              ? sql`attempt_evidence_receipt_scope(a.id)=${JSON.stringify(broad.progressiveScope)}::jsonb`
+              : stopped
+                ? sql`attempt_evidence_stopped_scope(a.id)=${JSON.stringify(stopped.progressiveScope)}::jsonb`
+                : attemptEvidenceColdCohortSql(sql`a`)
         } AS eligible,
         CASE WHEN octet_length(a.evidence_payload::text)<=33554432 THEN
           attempt_evidence_make_projection(a.evidence_payload,a.id,${archive.id}::uuid)
@@ -351,8 +361,20 @@ export function createAttemptServerDependencyVerifier(
         equalityEquivalent: true,
         scientificEquivalent: true,
         readDependenciesSatisfied: true,
-        verifier: stopped ? STOPPED_VERIFIER : ATTEMPT_SERVER_CONSUMER_VERIFIER,
+        verifier: workerScope
+          ? "server-consumers/hz-worker-steady-rans-v1"
+          : stopped
+            ? STOPPED_VERIFIER
+            : ATTEMPT_SERVER_CONSUMER_VERIFIER,
         ...stopped,
+        ...(workerScope
+          ? {
+              workerScope,
+              applicationSha256: analysisContentHash(
+                JSON.parse(originalPayloadText),
+              ),
+            }
+          : {}),
       };
     });
   };

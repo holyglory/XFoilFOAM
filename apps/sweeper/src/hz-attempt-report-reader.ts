@@ -173,9 +173,9 @@ export async function readHzAttemptFromWorkerReport(
   signal?.throwIfAborted();
   const rows =
     (await db.execute(sql`SELECT a.id::text AS attempt, a.result_id::text AS result, a.sim_job_id::text AS job,
-        a.aoa_deg AS alpha, a.engine_case_slug AS slug, encode(sha256(convert_to(a.evidence_payload::text,'UTF8')),'hex') AS source_sha256,
-        octet_length(a.evidence_payload::text)::int AS source_bytes,
-        pg_column_size(a.evidence_payload)::int AS pgbytes, attempt_evidence_series_inventory(a.evidence_payload) AS series,
+        a.aoa_deg AS alpha, a.engine_case_slug AS slug, CASE WHEN a.evidence_archive_id IS NULL THEN encode(sha256(convert_to(a.evidence_payload::text,'UTF8')),'hex') ELSE ar.source_sha256 END AS source_sha256,
+        coalesce(ar.source_byte_size,octet_length(a.evidence_payload::text))::int AS source_bytes,
+        pg_column_size(a.evidence_payload)::int AS pgbytes, coalesce(ar.history_series,attempt_evidence_series_inventory(a.evidence_payload)) AS series,
         s.instance_id::text AS instance, s.remote_solver_registered_id::text AS solver, p.id::text AS promise,
         j.request_payload->'remoteProgressiveExecution' AS envelope,
         h.receipt->>'resultAttemptId' AS hub_attempt, h.receipt->>'resultId' AS hub_result,
@@ -202,7 +202,9 @@ export async function readHzAttemptFromWorkerReport(
       JOIN progressive_report_archive_members m ON m.bundle_id=wr.archive_bundle_id AND m.sim_job_id=w.sim_job_id
         AND m.sequence=w.sequence AND m.content_signature=e.content_signature AND m.source_kind='worker' AND m.member_kind='report'
       JOIN progressive_report_archive_bundles b ON b.id=m.bundle_id AND b.sim_job_id=j.id AND b.source_kind=m.source_kind
-      WHERE a.id=${attemptId}::uuid AND a.evidence_archive_id IS NULL AND a.status='done' AND a.source='solved' AND a.regime='rans'
+      LEFT JOIN attempt_evidence_archives ar ON ar.id=a.evidence_archive_id AND ar.result_attempt_id=a.id
+        AND ar.result_id=a.result_id AND ar.sim_job_id=a.sim_job_id AND ar.source_instance=s.instance_id::text
+      WHERE a.id=${attemptId}::uuid AND (a.evidence_archive_id IS NULL OR ar.id IS NOT NULL) AND a.status='done' AND a.source='solved' AND a.regime='rans'
         AND NOT a.unsteady AND r.current_result_attempt_id IS DISTINCT FROM a.id AND j.status='cancelled' AND j."ingestedAt" IS NOT NULL
         AND (j.ingest_lease_token IS NULL OR j.ingest_lease_expires_at<=statement_timestamp())
         AND j.request_payload->>'remoteSolver'='true' AND p.status IN ('cancelled','expired','fulfilled')

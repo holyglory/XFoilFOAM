@@ -30,6 +30,55 @@ ssh -T -o BatchMode=yes -o StrictHostKeyChecking=yes -o ForwardAgent=no hz-solve
 
 Server code can call `readStoredAttemptEvidenceText(db, hzAttemptId, { source: "worker-report" })`. It follows the attempt’s worker acknowledgment and staged association to the exact report bundle and member on the HZ volume. It verifies the assignment and point signature, applies the normal delivery projector, and asks PostgreSQL to serialize the result. It compares the bytes and digest with the original HZ source. No sampling, unit conversion, numeric token substitution or new delivery occurs.
 
-The existing HZ rows already identify the report member through execution, sequence, report signature and point signature. This release uses the inline attempt as the independent full-source digest and length. Releasing that inline source would additionally require durable custody binding the HZ attempt and result, hub attempt and result, exact object generation and full-source digest, plus a guaranteed local working copy. Check the real stable-ID application read before and after a transition. Retain a working-volume reference independent of report-file reclamation before relying on the file as the last accessible copy.
+An HZ source is the HZ result, attempt and execution recorded in the worker acknowledgment. Its staged point signature and the immutable worker-report member establish provenance independently of the hub's attempt ID. The HZ transition requires the original registered worker, closed promise, terminal acknowledged report and exact delivered point. It does not depend on a copy of the hub dispatch table on the worker.
 
-Attempt shortening also requires the 0208 scientific checks for classification, payload equality, replay and the fitted polar. The HZ writer must account for worker delivery, outbox replay and existing interpretations of the exact attempt. The 0210 stopped-progressive predicate uses the hub's dispatch, stop and superseding attempt. A storage-only acknowledgment on HZ alone cannot establish that predicate. The operator here performs readback only. PostgreSQL continues serving its full original attempt and the existing point-history watcher runs independently.
+## Move HZ originals out of PostgreSQL
+
+Deploy the integrated reader, sweeper and migrations on both hosts first. Migration `0212_hz_attempt_history_custody.sql` follows `0211_progressive_attempt_receipt_sources.sql`. The controller runs in the operator's checkout and uses the same SSH aliases and hub-account file as the independent proof above. `HUB_BUCKET` must name the bucket configured on the hub sweeper. Use a separate private checkpoint directory for this operator.
+
+```sh
+attempt_history() {
+  node --import tsx apps/sweeper/src/hz-attempt-storage-cli.ts "$@"
+}
+attempt_history plan --until-complete
+attempt_history plan --id "$HZ_ATTEMPT_ID"
+attempt_history migrate --apply --id "$HZ_ATTEMPT_ID" \
+  --bucket "$HUB_BUCKET" --hub-account-file "$HUB_ACCOUNT_FILE"
+attempt_history status
+```
+
+A successful first canary returns the local attempt ID, local archive ID, exact GCS generation, storage event and reclaimed value bytes. Run the identical canary a second time. It should verify the existing event and report zero additional bytes. `status` reads the active HZ storage events directly and exposes confirmed and pending rows and their physical value-byte totals. These are PostgreSQL datum savings. Filesystem space depends on PostgreSQL vacuum and relation reuse.
+
+For the finite initial pass and ongoing work, use the two commands below. The watcher rescans new UUIDs and attempts that settle behind an older scan cursor. Multiple controllers sharing one checkpoint directory are excluded by a local file lock.
+
+```sh
+attempt_history migrate --apply --until-complete --limit 8 \
+  --directory "$HZ_ATTEMPT_STATE" --bucket "$HUB_BUCKET" --hub-account-file "$HUB_ACCOUNT_FILE"
+attempt_history watch --apply --limit 8 --poll-seconds 300 \
+  --directory "$HZ_ATTEMPT_STATE" --bucket "$HUB_BUCKET" --hub-account-file "$HUB_ACCOUNT_FILE"
+```
+
+The finite scan freezes the high-water UUID and binds the checkpoint to both SSH endpoints, containers, registered solver and hub identity. Each source comparison and commit handles one attempt. A page contains up to 64 candidate keys. The default is eight. `--pages N` limits a single invocation unless `--until-complete` or `watch` is selected. SIGTERM finishes or checkpoints the current bounded operation. Deploy-lock pauses and confirmed transient transport failures retry with backoff in the continuous modes. A source, credential or generation mismatch stops the pass.
+
+The first apply registers the HZ 0207 receipt and enables only the worker cohort on HZ. An already enabled incompatible policy blocks the transition. The writer creates the native 0207 gzip from the original HZ PostgreSQL text. The GCS prefix, object metadata and HZ catalog bind the source instance, HZ attempt and result IDs, execution, sizes and hashes. The hub verifies the registered worker before creating an immutable object with a generation-zero precondition. It reads the exact recorded generation again after scientific verification. The HZ volume holds one fsynced gzip per complete receipt under `attempt-histories/v1`, independently of worker-report volume cleanup.
+
+Before shortening, both the node API and sweeper must reconstruct the original. The writer replays the signed report, checks the 0208 immutable projection, compares job-scoped classification, promotion and fitted polar, then runs the locked 0208 shortening transaction. Only the four aligned steady-history arrays are eligible. The original source is capped at 256 KiB and the configured logical and physical savings floors still apply. Rejected rows stay inline. The ordinary HZ API, sweeper and 0211 projection readers all use the HZ working copy. Hub-side receipt-bearing RANS keeps its own policy and storage path.
+
+## 0211 reader interface
+
+The HZ adapter exports `readHzAttemptWorkingCopy(identity: AttemptEvidenceArchiveIdentity, signal?: AbortSignal): Promise<AttemptEvidenceCopySource>` from `apps/sweeper/src/hz-attempt-volume.ts`. It implements `AttemptEvidenceArchiveReader.read` using the exact locally admitted receipt. Timestamp changes during a fresh verification leave the storage identity intact. A change in bucket, generation, owner, checksum or size selects a different working copy and fails closed.
+
+The existing signatures of `sweeperAttemptArchiveReader()` and `readOriginalAttemptForProjection(db, id, archiveId)` stay intact. The shared sweeper and API adapters choose this local implementation on the remote-solver role. Canonical repair, publication, fitting, signed delivery replay and pending-event recovery can therefore use the same source. The source pin retains both the PostgreSQL original hash and the application-level replay digest. The signed worker acknowledgment and exact report member remain independent provenance.
+
+## Recovery
+
+An interruption before registration is safe to repeat through conditional upload. A registered copy is reused by its recorded generation. After a SQL commit, an unconfirmed event is processed before the next scan page. The operator refreshes its working copy from the hub, reads the published stable ID from the node API, and checks the original again through the normal sweeper reader. A permanent failed post-commit probe restores the exact inline original. Each bounded HZ write RPC takes the worker host's shared deployment lock.
+
+For operator-directed restoration, use the original HZ attempt ID. Restoration checks the current event under the normal job, result and attempt locks and reads the pinned GCS generation before restoring PostgreSQL.
+
+```sh
+attempt_history restore --apply --id "$HZ_ATTEMPT_ID" \
+  --bucket "$HUB_BUCKET" --hub-account-file "$HUB_ACCOUNT_FILE"
+```
+
+The restored row becomes eligible again when a new apply or watch pass reaches it. Stop the watch before restoring a row intended to stay inline. The catalog retains its immutable history. The accepted roll-forward and rollback evidence is the PostgreSQL event together with its confirmed product readback.

@@ -1,3 +1,4 @@
+import {verifyHzAttemptTransition} from "../test-support/hz-attempt-transition";
 import {
   analysisContentHash,
   createClient,
@@ -280,6 +281,7 @@ async function withFixture(
         job_id: executionId,
         state: "completed",
         engine: runtime,
+        ...(includeHistory?{mesh_recovery_version:3}:{}),
         execution_pool: "replay-test-pool",
         polars: [
           {
@@ -299,10 +301,10 @@ async function withFixture(
               ...(includeHistory
                 ? {
                     steady_history: {
-                      iterations: [1, 2],
-                      cl: [0.12, 0.13],
-                      cd: [0.03, 0.02],
-                      cm: [-0.02, -0.01],
+                      iterations: Array.from({length:1100},(_,i)=>i+1),
+                      cl: Array.from({length:1100},(_,i)=>i===0?0.12:Math.sin(i/7)),
+                      cd: Array.from({length:1100},(_,i)=>0.03+Math.sin(i)/1000),
+                      cm: Array.from({length:1100},(_,i)=>Math.cos(i/3)/50),
                       window: { start_iter: 1, end_iter: 2 },
                       mean_stable: false,
                       note: "",
@@ -1301,7 +1303,8 @@ it("reads a settled worker attempt by its original ID through the local report a
           root,
         );
         expect(await read()).toBe(source);
-        expect(JSON.parse(source).steady_history.iterations).toEqual([1, 2]);
+        expect(JSON.parse(source).steady_history.iterations).toHaveLength(1100);
+        await verifyHzAttemptTransition(db, id, input, source, root);
         await db.execute(sql`UPDATE progressive_worker_hub_receipts SET receipt=receipt||jsonb_build_object('remoteResultAttemptId',${randomUUID()}::text)
         WHERE result_attempt_id=${id}::uuid`);
         await expect(read()).rejects.toThrow("scope");
@@ -1329,4 +1332,4 @@ it("reads a settled worker attempt by its original ID through the local report a
     network.mockRestore();
     await rm(root, { recursive: true, force: true });
   }
-});
+}, 60000);

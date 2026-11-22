@@ -83,7 +83,7 @@ export interface AttemptEvidenceAppReadback {
   archiveId: string;
   sourceSha256: string;
   sourceByteSize: number;
-  source: "gcs";
+  source: "gcs" | "worker-volume";
   payloadText: string;
 }
 

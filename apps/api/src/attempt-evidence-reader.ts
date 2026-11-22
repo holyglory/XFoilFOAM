@@ -20,14 +20,15 @@ import { env } from "./env";
 
 let store: AttemptEvidenceStore | undefined;
 /** Existing canonical bucket/credentials only. A bucketless HZ must keep its
- * full payload inline; this adapter never adds a proxy or permission grant. */
+ * verified working copy on its own persistent volume. */
 export const apiAttemptEvidenceReader: AttemptEvidenceArchiveReader = {
   async read(identity, signal) {
-    if (
-      !env.evidenceBucket ||
-      identity.bucket !== env.evidenceBucket.trim() ||
-      process.env.AIRFOILFOAM_DEPLOYMENT_ROLE === "remote-solver"
-    )
+    if (process.env.AIRFOILFOAM_DEPLOYMENT_ROLE === "remote-solver") {
+      const { readHzAttemptWorkingCopy } =
+        await import("../../sweeper/src/hz-attempt-volume");
+      return readHzAttemptWorkingCopy(identity, signal);
+    }
+    if (!env.evidenceBucket || identity.bucket !== env.evidenceBucket.trim())
       throw new AttemptEvidenceReadError(
         "unavailable",
         "Canonical attempt archive storage is not configured for this API",
@@ -131,7 +132,10 @@ export async function readApiAttemptEvidenceForApp(
     archiveId: request.archiveId,
     sourceSha256: proof.sha256,
     sourceByteSize: proof.byteSize,
-    source: "gcs",
+    source:
+      process.env.AIRFOILFOAM_DEPLOYMENT_ROLE === "remote-solver"
+        ? "worker-volume"
+        : "gcs",
     payloadText: text,
   };
 }
