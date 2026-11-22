@@ -102,6 +102,8 @@ export interface AttemptEvidenceDependencyProof {
   readDependenciesSatisfied: boolean;
   /** Identifies the verified consumer implementation, not a user approval. */
   verifier: string;
+  progressiveScope?: Record<string, unknown>;
+  applicationSha256?: string;
 }
 
 export interface AttemptEvidencePreview {
@@ -327,6 +329,7 @@ export function attemptEvidenceValueMatchesSql(
 
 export interface AttemptEvidenceStoragePolicy {
   shorteningEnabled: boolean;
+  stoppedProgressiveEnabled: boolean;
   canaryAttemptId: string | null;
   consumerContractVersion: number;
   minLogicalBytes: number;
@@ -366,8 +369,9 @@ export async function getAttemptEvidenceStoragePolicy(
   if (ready?.ready !== true) return null;
   const [row] =
     await db.execute(sql`SELECT shortening_enabled AS "shorteningEnabled",canary_attempt_id AS "canaryAttemptId",consumer_contract_version AS "consumerContractVersion",
-    min_logical_bytes AS "minLogicalBytes",min_net_value_bytes AS "minNetValueBytes",max_source_bytes AS "maxSourceBytes",initial_subset AS "initialSubset"
-    FROM attempt_evidence_storage_policy WHERE id=1`);
+    min_logical_bytes AS "minLogicalBytes",min_net_value_bytes AS "minNetValueBytes",max_source_bytes AS "maxSourceBytes",initial_subset AS "initialSubset",
+    coalesce((to_jsonb(policy)->>'stopped_progressive_enabled')::boolean,false) AS "stoppedProgressiveEnabled"
+    FROM attempt_evidence_storage_policy policy WHERE id=1`);
   return row as unknown as AttemptEvidenceStoragePolicy;
 }
 
@@ -377,12 +381,20 @@ export async function setAttemptEvidenceStoragePolicy(
     enabled: boolean;
     consumerContractVersion?: 1;
     canaryAttemptId?: string;
+    stoppedProgressive?: boolean;
   },
 ) {
   if (options.enabled && options.consumerContractVersion !== 1)
     throw new Error("Shortening requires consumer contract v1");
   if (options.canaryAttemptId !== undefined) assertId(options.canaryAttemptId);
-  await db.execute(sql`UPDATE attempt_evidence_storage_policy SET shortening_enabled=${options.enabled},
+  const [schema] = await db.execute(sql`SELECT EXISTS(SELECT FROM pg_attribute
+    WHERE attrelid=to_regclass('attempt_evidence_storage_policy') AND attname='stopped_progressive_enabled'
+      AND NOT attisdropped) AS installed`);
+  if (options.stoppedProgressive && (!options.enabled || !schema?.installed))
+    throw new Error("Stopped progressive shortening requires 0210 and enabled readers");
+  const stopped = schema?.installed
+    ? sql`stopped_progressive_enabled=${options.stoppedProgressive === true},` : sql``;
+  await db.execute(sql`UPDATE attempt_evidence_storage_policy SET ${stopped} shortening_enabled=${options.enabled},
     consumer_contract_version=${options.consumerContractVersion ?? 0},canary_attempt_id=${options.canaryAttemptId ?? null}::uuid WHERE id=1`);
   return getAttemptEvidenceStoragePolicy(db);
 }
@@ -510,17 +522,23 @@ export async function restoreAttemptEvidence(
 export async function attemptEvidenceShorteningCandidates(
   db: DB,
   after: string | null = null,
+  stoppedProgressiveOnly = false,
 ) {
   if (after !== null) assertId(after);
   return db.transaction(async (tx) => {
     await tx.execute(sql`SET TRANSACTION READ ONLY`);
     await tx.execute(sql`SET LOCAL statement_timeout='5s'`);
     await tx.execute(sql`SET LOCAL lock_timeout='500ms'`);
+    const retained = stoppedProgressiveOnly
+      ? sql`JOIN progressive_remote_evidence_receipts rr ON rr.result_attempt_id=ar.result_attempt_id AND rr.storage_only`
+      : sql``;
+    const limiter = stoppedProgressiveOnly
+      ? sql`attempt_evidence_stopped_shortening_limiter(a.id)` : sql`attempt_evidence_shortening_limiter(a.id)`;
     return tx.execute(sql`WITH ids AS MATERIALIZED (
-      SELECT DISTINCT result_attempt_id AS id FROM attempt_evidence_archives
-      ${after ? sql`WHERE result_attempt_id>${after}::uuid` : sql``} ORDER BY result_attempt_id LIMIT 32
+      SELECT DISTINCT ar.result_attempt_id AS id FROM attempt_evidence_archives ar ${retained}
+      ${after ? sql`WHERE ar.result_attempt_id>${after}::uuid` : sql``} ORDER BY ar.result_attempt_id LIMIT 32
     ), candidates AS MATERIALIZED (
-      SELECT a.id,a.result_id,a.sim_job_id,attempt_evidence_shortening_limiter(a.id) AS limiter
+      SELECT a.id,a.result_id,a.sim_job_id,${limiter} AS limiter
       FROM ids JOIN result_attempts a USING(id)
     ) SELECT c.id,c.limiter,origin.id AS archive_id FROM candidates c
       LEFT JOIN LATERAL (SELECT ar.id FROM attempt_evidence_archives ar

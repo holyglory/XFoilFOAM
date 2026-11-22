@@ -1,6 +1,9 @@
 import type { DB } from "@aerodb/db/client";
-import { resultAttempts } from "@aerodb/db/schema";
-import { and, inArray, isNotNull } from "drizzle-orm";
+import {
+  attemptEvidenceStorageEvents,
+  resultAttempts,
+} from "@aerodb/db/schema";
+import { and, eq, inArray, isNotNull, sql } from "drizzle-orm";
 import {
   hydrateAttemptEvidence,
   hydrateAttemptEvidenceBatch,
@@ -50,8 +53,25 @@ export async function prepareAttemptPublicationEvidence(
         resultId: resultAttempts.resultId,
         simJobId: resultAttempts.simJobId,
         evidenceArchiveId: resultAttempts.evidenceArchiveId,
+        stoppedReceipt: sql<boolean>`${attemptEvidenceStorageEvents.verification}#>>'{dependencies,verifier}'='server-consumers/stopped-progressive-rans-v1'`,
       })
       .from(resultAttempts)
+      .innerJoin(
+        attemptEvidenceStorageEvents,
+        and(
+          eq(
+            attemptEvidenceStorageEvents.id,
+            resultAttempts.evidenceStorageEventId,
+          ),
+          eq(attemptEvidenceStorageEvents.resultAttemptId, resultAttempts.id),
+          eq(
+            attemptEvidenceStorageEvents.archiveId,
+            resultAttempts.evidenceArchiveId,
+          ),
+          eq(attemptEvidenceStorageEvents.action, "shorten"),
+          eq(attemptEvidenceStorageEvents.completed, true),
+        ),
+      )
       .where(
         and(
           inArray(resultAttempts.id, ids.slice(offset, offset + 32)),
@@ -65,7 +85,21 @@ export async function prepareAttemptPublicationEvidence(
       cold.map((row) => ({ ...row, evidencePayload: null as unknown })),
       { signal: AbortSignal.timeout(30_000) },
     );
-    for (const row of restored) prepared.set(row.id, row);
+    for (const row of restored) {
+      // A closed progressive source re-entering publication must supply full
+      // history to subsequent SQL reprojection of its selected result. Only
+      // this cohort proved that this JSON round-trip preserves exact PG text.
+      // Acquire the ordinary job/cell/attempt locks before publication starts.
+      if (row.stoppedReceipt)
+        await db.execute(sql`SELECT attempt_evidence_restore(a.id,e.archive_id,(${JSON.stringify(row.evidencePayload)}::jsonb)::text,
+        'original required for result publication')
+        FROM result_attempts a JOIN attempt_evidence_storage_events e
+          ON e.id=a.evidence_storage_event_id AND e.result_attempt_id=a.id AND e.archive_id=a.evidence_archive_id
+        WHERE a.id=${row.id}::uuid AND a.result_id=${row.resultId}::uuid AND a.sim_job_id IS NOT DISTINCT FROM ${row.simJobId}::uuid
+          AND e.archive_id=${row.evidenceArchiveId}::uuid AND e.action='shorten' AND e.completed
+          AND e.verification#>>'{dependencies,verifier}'='server-consumers/stopped-progressive-rans-v1'`);
+      prepared.set(row.id, row);
+    }
   }
   return prepared;
 }

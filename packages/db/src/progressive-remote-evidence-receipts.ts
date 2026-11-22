@@ -105,6 +105,28 @@ export async function assertProgressiveRemoteEvidenceAttempt(
       "Progressive receipt requires exact owned local attempt evidence",
     );
   const projection = progressiveRemotePointProjection(source);
+  // A storage-only replay still authenticates the independently reconstructed
+  // report point. The sealed digest is the application's original numerical
+  // JSON identity, distinct from PostgreSQL's exact source-text fingerprint.
+  let sourceHash: unknown;
+  if (attempt.evidenceArchiveId) {
+    const [sealed] = await db.execute(sql`WITH candidate AS MATERIALIZED (
+        SELECT (${JSON.stringify(projection.evidencePayload)}::jsonb)::text AS original
+      ) SELECT e.verification#>>'{dependencies,applicationSha256}' AS digest
+      FROM attempt_evidence_storage_events e JOIN attempt_evidence_history_projections p
+        ON p.result_attempt_id=e.result_attempt_id AND p.archive_id=e.archive_id CROSS JOIN candidate
+      WHERE e.id=${attempt.evidenceStorageEventId}::uuid AND e.result_attempt_id=${attempt.id}::uuid
+        AND e.archive_id=${attempt.evidenceArchiveId}::uuid AND e.action='shorten' AND e.completed
+        AND e.verification#>>'{dependencies,verifier}'='server-consumers/stopped-progressive-rans-v1'
+        AND e.verification#>>'{dependencies,sourceSha256}'=p.projection->>'sourceSha256'
+        AND p.projection->>'sourceSha256'=encode(sha256(convert_to(candidate.original,'UTF8')),'hex')
+        AND (p.projection->>'sourceByteSize')::bigint=octet_length(candidate.original)
+        AND e.verification#>>'{dependencies,progressiveScope,pointContentSignature}'=${source.contentSignature}
+        AND e.verification#>>'{dependencies,progressiveScope,executionId}'=${input.engineJobId}`);
+    sourceHash = sealed?.digest;
+  } else {
+    sourceHash = analysisContentHash(attempt.evidencePayload);
+  }
   const sourceFields = [
     "aoaDeg",
     "status",
@@ -139,8 +161,7 @@ export async function assertProgressiveRemoteEvidenceAttempt(
         analysisContentHash(attempt[key] ?? null) !==
         analysisContentHash(projection[key] ?? null),
     ) ||
-    analysisContentHash(attempt.evidencePayload) !==
-      analysisContentHash(projection.evidencePayload)
+    sourceHash !== analysisContentHash(projection.evidencePayload)
   )
     throw new Error(
       "Progressive local attempt differs from its reported source values",
@@ -161,6 +182,7 @@ export async function assertProgressiveRemoteEvidenceAttempt(
       >[1],
     );
   }
+  return { archiveId: attempt.evidenceArchiveId, payload: projection.evidencePayload };
 }
 
 export async function recordProgressiveRemoteEvidenceReceipt(
@@ -190,7 +212,15 @@ export async function recordProgressiveRemoteEvidenceReceipt(
       throw new ProgressiveRemoteEvidenceConflict(
         "Historical recovery requires an existing immutable storage-only receipt",
       );
-    await assertProgressiveRemoteEvidenceAttempt(connection, input);
+    const verified = await assertProgressiveRemoteEvidenceAttempt(connection, input);
+    if (input.recoveryScope && verified.archiveId) {
+      // The already authenticated report point had to reproduce the original
+      // PG text at shortening. Restore under the same transaction before
+      // recording any numerical signature. All normal recovery gates follow.
+      await connection.execute(sql`SELECT attempt_evidence_restore(${input.resultAttemptId}::uuid,
+        ${verified.archiveId}::uuid,(${JSON.stringify(verified.payload)}::jsonb)::text,
+        'original reported point required for progressive scientific recovery')`);
+    }
     if (input.storageOnly) {
       const admission = await assertStoppedProgressiveStorageAdmission(connection, input);
       if (admission.kind === "current-failed")

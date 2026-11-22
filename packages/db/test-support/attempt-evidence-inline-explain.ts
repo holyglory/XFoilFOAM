@@ -20,6 +20,7 @@ const inputs = [
   "../src/polar-cache.ts",
   "../src/precalc-obligations.ts",
   "../migrations/0208_attempt_history_readthrough.sql",
+  "../migrations/0210_stopped_progressive_attempt_history.sql",
 ];
 const sourceIdentity = async () =>
   Object.fromEntries(
@@ -195,6 +196,46 @@ try {
       "mixed-32-cold",
     ))
       await measure(entry);
+    // Exercise the migrated recovery index on synthetic recipe rows.
+    await tx.execute(sql`CREATE TEMP TABLE attempt_recovery_cost
+      (LIKE progressive_cfd_recovery_plans INCLUDING DEFAULTS INCLUDING INDEXES) ON COMMIT DROP`);
+    await tx.execute(sql`INSERT INTO attempt_recovery_cost(unit_id,ordinal,parent_attempt_token,parent_job_id,
+      diagnostic_attempt_id,diagnostic_signature,scope,reason,recipe) SELECT gen_random_uuid(),1,gen_random_uuid(),gen_random_uuid(),
+      gen_random_uuid(),repeat('a',64),'targeted','needs_urans',jsonb_build_object('padding',repeat('x',1400))
+      FROM generate_series(1,32768)`);
+    await tx.execute(sql`ANALYZE attempt_recovery_cost`);
+    const [summary] = await tx.execute(sql`SELECT idx.oid::regclass::text AS name
+      FROM pg_index i JOIN pg_class idx ON idx.oid=i.indexrelid JOIN pg_am am ON am.oid=idx.relam
+      WHERE i.indrelid='attempt_recovery_cost'::regclass AND am.amname='brin'`);
+    await tx.execute(sql`SELECT brin_summarize_new_values(${summary.name}::regclass)`);
+    const [size] = await tx.execute(sql`SELECT pg_relation_size(${summary.name}::regclass)::integer AS bytes`);
+    const missingDiagnostic = sql`SELECT 1 FROM attempt_recovery_cost
+      WHERE diagnostic_attempt_id='00000000-0000-0000-0000-000000000000'::uuid`;
+    const [lookup] = await tx.execute(sql`SELECT proconfig FROM pg_proc
+      WHERE oid='attempt_evidence_has_recovery_plan(uuid)'::regprocedure`);
+    assert.ok((lookup.proconfig as string[]).includes("enable_seqscan=off"));
+    for (const indexed of [false, true]) {
+      if (indexed) {
+        // Match the worker's single-ID lookup settings for this EXPLAIN.
+        await tx.execute(sql`SET LOCAL enable_seqscan=off`);
+        await tx.execute(sql`SET LOCAL enable_indexscan=on`);
+        await tx.execute(sql`SET LOCAL enable_bitmapscan=on`);
+      } else {
+        await tx.execute(sql`SET LOCAL enable_indexscan=off`);
+        await tx.execute(sql`SET LOCAL enable_bitmapscan=off`);
+      }
+      const [row] = await tx.execute(sql`EXPLAIN (ANALYZE,BUFFERS,FORMAT JSON) ${missingDiagnostic}`);
+      const raw = row["QUERY PLAN"];
+      const plan = (typeof raw === "string" ? JSON.parse(raw) : raw)[0];
+      const root = plan.Plan;
+      assert.equal(root["Actual Rows"], 0);
+      assert.match(root["Node Type"], indexed ? /Index|Bitmap/ : /Seq Scan/);
+      const timing = { indexed, indexBytes: size.bytes, node: root["Node Type"], executionMs: plan["Execution Time"],
+        blocks: root["Local Hit Blocks"] + root["Local Read Blocks"] };
+      if (indexed) assert.ok(timing.blocks < 300 && Number(size.bytes) < 262144);
+      console.info("STOPPED_DIAGNOSTIC_LOOKUP", JSON.stringify(timing));
+      reports.push({ name: "stopped-diagnostic-lookup", ...timing, plan });
+    }
     assert.deepEqual(
       regressions,
       [],

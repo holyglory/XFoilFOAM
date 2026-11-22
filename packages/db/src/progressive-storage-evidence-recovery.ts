@@ -194,6 +194,8 @@ export async function recoverProgressiveStorageOnlyEvidence(
       JOIN progressive_work work ON work.id = unit.work_id
       JOIN progressive_generations generation ON generation.id = work.generation_id
       JOIN calculation_epochs epoch ON epoch.id = generation.epoch_id
+      JOIN progressive_cfd_execution_stops stopped ON stopped.sim_job_id=job.id
+        AND stopped.engine_job_id=job.engine_job_id AND stopped.epoch_id=epoch.id
       JOIN sim_campaigns campaign ON campaign.id = generation.campaign_id
       JOIN LATERAL (
         SELECT latest.report, latest.sequence

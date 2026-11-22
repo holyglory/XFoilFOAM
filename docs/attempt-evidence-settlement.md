@@ -59,6 +59,38 @@ reads the active GCS generation through the app again and reports
 `alreadyShortened: true` and zero additional bytes reclaimed. A normal
 read of the attempt must return the archived full point after the switch.
 
+## Stopped progressive RANS histories
+
+Migration 0210 adds a separately enabled cohort. It requires a solved historical
+RANS point with mesh version 3, a cancelled and ingested hub dispatch, an exact
+recorded execution stop, a bound broker upload, a storage-only point receipt and
+a later attempt on the same stage-3 unit. The writer verifies the signed report
+sequence and point against the original attempt. The report projection must
+reproduce both the application digest and every byte of the PostgreSQL source
+text. Each transition retains the 0208 size floor and GCS and app readbacks.
+
+The migration adds a BRIN Bloom index for the diagnostic-attempt lookup. The
+writer records per-attempt storage savings when a transition completes.
+
+Use the 0210 API, sweeper and isolated report-storage worker together. The
+worker needs its existing hub reader for both archived reports and attempts.
+The following preview works with shortening disabled. Page with `--after` and
+use a returned attempt and archive ID for the canary.
+
+```sh
+attempt_history shortening-candidates --stopped-progressive true --pages 1
+attempt_history enable-shortening --consumer-contract 1 --stopped-progressive true --id "$ATTEMPT_ID"
+attempt_history shorten --id "$ATTEMPT_ID" --archive-id "$ARCHIVE_ID"
+```
+
+The progressive fitter and its stored model memberships require a CFD receipt.
+These storage-only attempts have none. The job classifier and its polar fit
+are compared before each removal. A future numerical link requires an exact
+inline restore. Preparing an archived candidate for result publication restores
+its original and removes it from the automatic cohort. To enable automatic
+processing after the canary, repeat the enable command without `--id`. Omitting
+`--stopped-progressive true` returns enablement to the original 0208 cohort.
+
 ## Automatic mode and recovery
 
 After a successful canary, enable the bounded automatic writer with the same

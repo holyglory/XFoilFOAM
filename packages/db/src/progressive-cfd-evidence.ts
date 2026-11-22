@@ -422,13 +422,20 @@ export async function assertProgressiveStorageEvidenceRecoveryJob(
       "Historical progressive evidence is outside the requested low-Mach scope",
     );
   const [dispatch] = await db.execute(sql`
-    SELECT solver_id, promise_id, envelope, content_signature FROM progressive_remote_dispatches
-    WHERE sim_job_id = ${simJobId}::uuid FOR SHARE
+    SELECT dispatch.solver_id,dispatch.promise_id,dispatch.envelope,dispatch.content_signature,stopped.proof,stopped.proof_signature
+    FROM progressive_remote_dispatches dispatch JOIN progressive_cfd_execution_stops stopped
+      ON stopped.sim_job_id=dispatch.sim_job_id AND stopped.engine_job_id=dispatch.sim_job_id::text AND stopped.epoch_id=${recoveryScope.epochId}::uuid
+    WHERE dispatch.sim_job_id=${simJobId}::uuid FOR SHARE OF dispatch,stopped
   `);
   if (!dispatch)
     throw new ProgressiveCfdEvidenceScopeClosed(
-      "Historical progressive recovery has no original remote dispatch",
+      "Historical progressive recovery requires its original remote dispatch and recorded stop",
     );
+  const { validateProgressiveExecutionStopProof } = await import("./progressive-cfd-settlement");
+  const stop = dispatch.proof as Parameters<typeof validateProgressiveExecutionStopProof>[0];
+  validateProgressiveExecutionStopProof(stop);
+  if (stop.job_id !== simJobId || analysisContentHash(stop) !== dispatch.proof_signature)
+    throw new ProgressiveCfdEvidenceScopeClosed("Historical progressive recovery stop differs from its exact execution");
   const envelope = verifyProgressiveRemoteExecution(dispatch.envelope, {
     solverId: String(dispatch.solver_id),
     promiseId: String(dispatch.promise_id),
