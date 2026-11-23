@@ -183,6 +183,25 @@ export async function verifyCancelledReportCopyReplay(
   const page = await nextCancelledReportCopies(db, cursor);
   expect(page.executionId).toBe(id);
   expect(page.sequences).toEqual([copy.sequence,dependent.sequence]);
+  const scanned=new Error("rollback metadata-only discovery window");
+  await expect(db.transaction(async tx=>{
+    const conn=tx as unknown as DB;
+    // A separate key-only prefix has no point, inventory or scientific receipt.
+    // Preserve the actual signed candidates from the normal caller.
+    await conn.execute(sql`CREATE TEMP TABLE progressive_remote_reports ON COMMIT DROP AS
+      SELECT sim_job_id,sequence,content_signature,archived_at,archive_bundle_id FROM public.progressive_remote_reports
+      WHERE sim_job_id=${id}::uuid`);
+    const empty="00000000-0000-0000-0000-000000000000";
+    await conn.execute(sql`INSERT INTO progressive_remote_reports(sim_job_id,sequence) SELECT ${empty}::uuid,n FROM generate_series(1,540)n`);
+    const gap=await nextCancelledReportCopies(conn,null);
+    expect(gap.sequences).toEqual([]);
+    expect(gap.after).toEqual({executionId:empty,sequence:512});
+    const found=await nextCancelledReportCopies(conn,gap.after);
+    expect(found.executionId).toBe(id);
+    expect(found.sequences).toEqual(page.sequences);
+    throw scanned;
+  })).rejects.toBe(scanned);
+
   const [original] =
     await db.execute(sql`SELECT report::text AS text, result_payload_hash AS hash
     FROM progressive_remote_reports WHERE sim_job_id=${id}::uuid AND sequence=${copy.sequence}`);
