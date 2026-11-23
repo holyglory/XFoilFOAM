@@ -1,9 +1,10 @@
+import { registeredArchiveAdmissionDelay } from "@aerodb/core/registered-archive-read";
 import { readSweeperAttemptEvidence, sweeperAttemptArchiveReader } from "./attempt-evidence-consumer-reader";
 import { installProgressiveRetentionReader } from "@aerodb/db/progressive-remote-retention";
 import { runRemoteTransferSteps } from "./remote-transfer-steps";
 import { reconcileTerminalProgressiveMirror } from "./progressive-terminal-mirror";
 import { activeReconcileConcurrency, runWithConcurrency } from "./reconcile";
-import { renewIndependentPromises } from "./remote-promise-renewal";
+import { promiseRenewalRetries, remotePromiseRenewalConcurrency, renewIndependentPromises } from "./remote-promise-renewal";
 import { measureRemoteReconciliationStep } from "./remote-reconciliation-timing";
 import {
   airfoils,
@@ -86,7 +87,7 @@ import {
   progressiveWorkerCapabilityMetadata,
   refreshProgressiveWorkerCapabilities,
 } from "./progressive-worker-capabilities";
-import { and, eq, getTableColumns, gt, inArray, or, sql } from "drizzle-orm";
+import { and, eq, getTableColumns, gt, inArray, notInArray, or, sql } from "drizzle-orm";
 import {
   createHash,
   createHmac,
@@ -175,22 +176,12 @@ const REMOTE_RECLAIM_CLAIM_RENEW_INTERVAL_MS = Math.min(
   ),
 );
 const REMOTE_RECLAIM_MAX_CONCURRENCY = 8;
-const REMOTE_PROMISE_RENEWAL_DEFAULT_CONCURRENCY = 16;
-const REMOTE_PROMISE_RENEWAL_MAX_CONCURRENCY = 16;
+// The hub admits eight simultaneous control requests. Leave capacity for
+// lease renewals, the fleet heartbeat and execution control during a refill.
+const MAX_PROGRESSIVE_START_CONCURRENCY = 4;
 const HUB_BINDING_RECEIPT_HMAC_DOMAIN =
   "xfoilfoam-hub-canonical-evidence-binding-v1\n";
 const BROKER_UPLOAD_IDEMPOTENCY_DOMAIN = "xfoilfoam:broker-upload:v1\0";
-
-function remotePromiseRenewalConcurrency(
-  raw = process.env.SWEEPER_REMOTE_PROMISE_RENEWAL_CONCURRENCY,
-): number {
-  if (raw == null || raw.trim() === "")
-    return REMOTE_PROMISE_RENEWAL_DEFAULT_CONCURRENCY;
-  const parsed = Number(raw);
-  if (!Number.isInteger(parsed) || parsed < 1)
-    return REMOTE_PROMISE_RENEWAL_DEFAULT_CONCURRENCY;
-  return Math.min(parsed, REMOTE_PROMISE_RENEWAL_MAX_CONCURRENCY);
-}
 
 function remoteAdmissionsPerTick(
   raw = process.env.SWEEPER_REMOTE_MAX_ADMISSIONS_PER_TICK,
@@ -1909,6 +1900,12 @@ async function renewMirroredPromiseLeases(
     5_000,
     settings.remoteSolverHeartbeatIntervalSeconds * 1_000,
   );
+  const retries = promiseRenewalRetries(
+    db,
+    syncBase(settings),
+    settings.remoteSolverRegisteredId,
+  );
+  const coolingDown = retries.deferredIds();
   const rows = await db
     .select({
       id: syncSweepPromises.id,
@@ -1922,6 +1919,9 @@ async function renewMirroredPromiseLeases(
         eq(syncSweepPromises.sourceBaseUrl, syncBase(settings)),
         sql`${syncSweepPromises.requestPayload} ->> 'remoteSolver' = 'true'`,
         remotePromiseOwnerSql(settings),
+        coolingDown.length
+          ? notInArray(syncSweepPromises.id, coolingDown)
+          : undefined,
         sql`(
           ${syncSweepPromises.lastHeartbeatAt} IS NULL
           OR ${syncSweepPromises.lastHeartbeatAt} <= now() - (${intervalMs}::double precision * interval '1 millisecond')
@@ -1949,6 +1949,9 @@ async function renewMirroredPromiseLeases(
     .limit(100);
   const started = performance.now();
   const concurrency = remotePromiseRenewalConcurrency();
+  let renewed = 0;
+  let rejected = 0;
+  let retryable = 0;
   const renewal = await renewIndependentPromises(
     rows,
     concurrency,
@@ -1966,11 +1969,27 @@ async function renewMirroredPromiseLeases(
           },
         );
       } catch (error) {
-        throw new Error(
-          `remote promise ${promise.id} heartbeat failed transiently: ${
-            error instanceof Error ? error.message : String(error)
-          }`,
-        );
+        if (
+          !(
+            error instanceof TypeError ||
+            (error instanceof Error && error.name === "TimeoutError")
+          )
+        )
+          throw error;
+        retries.defer(promise.id);
+        retryable++;
+        return;
+      }
+      const busyDelay = await registeredArchiveAdmissionDelay(response);
+      if (
+        busyDelay !== null ||
+        [408, 429, 502, 504].includes(response.status)
+      ) {
+        // A refused transport attempt conveys no new lease or start authority.
+        retries.defer(promise.id, busyDelay ?? undefined);
+        await response.body?.cancel();
+        retryable++;
+        return;
       }
       if (response.status === 404 || response.status === 409) {
         await cancelAuthoritativelyExpiredPromise(
@@ -1979,6 +1998,8 @@ async function renewMirroredPromiseLeases(
           promise.id,
           `up-tier rejected promise lease renewal (${response.status})`,
         );
+        rejected++;
+        retries.settled(promise.id);
         return;
       }
       if (!response.ok) {
@@ -1998,23 +2019,32 @@ async function renewMirroredPromiseLeases(
           `remote promise ${promise.id} heartbeat omitted a valid expiry`,
         );
       }
-      await db
+      const changed = await db
         .update(syncSweepPromises)
         .set({ expiresAt, lastHeartbeatAt: new Date(), updatedAt: new Date() })
         .where(
           and(
             eq(syncSweepPromises.id, promise.id),
+            eq(syncSweepPromises.sourceBaseUrl, syncBase(settings)),
+            remotePromiseOwnerSql(settings),
             eq(syncSweepPromises.status, "active"),
           ),
-        );
+        )
+        .returning({ id: syncSweepPromises.id });
+      renewed += changed.length;
+      retries.settled(promise.id);
     },
   );
-  if (rows.length)
+  if (rows.length || coolingDown.length)
     console.log(
       JSON.stringify({
         component: "remote-promise-renewal",
         selected: rows.length,
         ...renewal,
+        renewed,
+        rejected,
+        retryable,
+        coolingDown: coolingDown.length,
         concurrency,
         durationMs: performance.now() - started,
         checkedAt: new Date().toISOString(),
@@ -7661,6 +7691,8 @@ export async function admitRemoteSolverTick(
       }
       const concurrency = Math.min(
         activeReconcileConcurrency(),
+        MAX_PROGRESSIVE_START_CONCURRENCY,
+        maxAdmissionsPerTick - submittedCount,
         MAX_ASSIGNMENT_INSPECTIONS_PER_TICK - attempt,
       );
       const assigned = await db.execute(sql`

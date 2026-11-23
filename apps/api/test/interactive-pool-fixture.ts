@@ -1,3 +1,4 @@
+import { registeredArchiveAdmissionDelay } from "@aerodb/core/registered-archive-read";
 import { SYNC_REPORT_LIMIT } from "../src/sync-admission";
 import { request as httpRequest } from "node:http";
 import { createHash, randomUUID } from "node:crypto";
@@ -84,7 +85,25 @@ export async function verifyInteractivePool(input: {
       bothHeaders();
     return payload;
   });
+  let heldControls = 0;
+  let signalFull!: () => void;
+  const allControlsHeld = new Promise<void>((resolve) => {
+    signalFull = resolve;
+  });
+  let releaseFirst!: () => void;
+  let releaseRest!: () => void;
+  const firstControls = new Promise<void>((resolve) => {
+    releaseFirst = resolve;
+  });
+  const otherControls = new Promise<void>((resolve) => {
+    releaseRest = resolve;
+  });
   app.addHook("onSend", async (req, _reply, body) => {
+    const group = req.headers["x-fixture-held-control"];
+    if (group && _reply.statusCode === 200) {
+      if (++heldControls === 8) signalFull();
+      await (group === "first" ? firstControls : otherControls);
+    }
     if (req.headers["x-fixture-hold-ack"] === "yes") {
       sawCommitted();
       await ackGate;
@@ -222,6 +241,89 @@ export async function verifyInteractivePool(input: {
           signal: AbortSignal.timeout(5000),
         },
       );
+    // Hold eight completed, authenticated controls at their response boundary.
+    // A ninth heartbeat is rejected before it touches the lease. Two released
+    // slots must be usable for a sibling heartbeat and an exact start decision.
+    const held = Array.from({ length: 8 }, (_, i) =>
+      fetch(
+        `${base}/api/sync/v1/progressive-executions/${report.executionId}/control`,
+        {
+          headers: {
+            "x-xfoilfoam-solver-token": token,
+            "x-fixture-held-control": i < 2 ? "first" : "rest",
+          },
+          signal: AbortSignal.timeout(15000),
+        },
+      ).then(async (r) => {
+        await r.arrayBuffer();
+        return r.status;
+      }),
+    );
+    try {
+      await Promise.race([
+        allControlsHeld,
+        sleep(10000).then(() => {
+          throw Error("Eight registered control responses did not overlap");
+        }),
+      ]);
+      const lease = () =>
+        observer.sql`SELECT "expiresAt"::text, "lastHeartbeatAt"::text FROM sync_sweep_promises WHERE id=${promiseId}`;
+      const beforeBusy = await lease();
+      const busy = await heartbeat();
+      const hint = await registeredArchiveAdmissionDelay(busy);
+      expect(hint).toBeGreaterThanOrEqual(2000);
+      expect(hint).toBeLessThanOrEqual(4000);
+      await busy.arrayBuffer();
+      expect(await lease()).toEqual(beforeBusy);
+      releaseFirst();
+      expect(await Promise.all(held.slice(0, 2))).toEqual([200, 200]);
+      const siblingBeat = await fetch(
+        `${base}/api/sync/v1/sweeps/${siblingPromise}/heartbeat`,
+        {
+          method: "POST",
+          headers: {
+            "x-xfoilfoam-solver-token": token,
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({ ttlHours: 1 }),
+          signal: AbortSignal.timeout(5000),
+        },
+      );
+      expect(siblingBeat.status).toBe(200);
+      const siblingLease = (await siblingBeat.json()) as { expiresAt: string };
+      const [storedLease] =
+        await observer.sql`SELECT "expiresAt" FROM sync_sweep_promises WHERE id=${siblingPromise}`;
+      expect(new Date(storedLease!.expiresAt).toISOString()).toBe(
+        new Date(siblingLease.expiresAt).toISOString(),
+      );
+      const start = await fetch(
+        `${base}/api/sync/v1/progressive-executions/${live.executionId}/start`,
+        {
+          method: "POST",
+          headers: {
+            "x-xfoilfoam-solver-token": token,
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({
+            contentSignature: live.envelope.contentSignature,
+          }),
+          signal: AbortSignal.timeout(5000),
+        },
+      );
+      expect(start.status).toBe(409);
+      expect(
+        ((await start.json()) as { decision: { kind: string; reason: string } })
+          .decision,
+      ).toMatchObject({
+        kind: "stop",
+        reason: "The campaign no longer owns this execution stage",
+      });
+      expect(await lease()).toEqual(beforeBusy);
+    } finally {
+      releaseFirst();
+      releaseRest();
+      await Promise.allSettled(held);
+    }
     const abort = new AbortController();
     let rejected = 0,
       acks = 0,

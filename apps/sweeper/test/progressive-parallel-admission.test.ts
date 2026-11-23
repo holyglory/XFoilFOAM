@@ -76,9 +76,8 @@ function fixture(reserved = 0, cpuBudget = 4, jobCount = 4) {
       }
       if (query.sql.includes("SELECT job.id FROM sim_jobs job")) {
         const limit = Number(query.params.at(-1));
-        expect(limit).toBe(
-          Number(process.env.SWEEPER_ACTIVE_RECONCILE_CONCURRENCY),
-        );
+        expect(limit).toBeGreaterThan(0);
+        expect(limit).toBeLessThanOrEqual(4);
         assignmentLimits.push(limit);
         expect(limit).toBeLessThanOrEqual(
           cpuBudget - Math.max(reserved, hooks.submit.mock.calls.length),
@@ -228,6 +227,7 @@ it("continues past stale assignment cleanup to reach later fresh assignments", a
 });
 
 it("applies the default per-tick admission bound across assignment batches", async () => {
+  vi.stubEnv("SWEEPER_ACTIVE_RECONCILE_CONCURRENCY", "16");
   const scope = fixture(0, 96, 72);
   hooks.submit.mockResolvedValue({ kind: "submitted" });
 
@@ -243,4 +243,21 @@ it("applies the default per-tick admission bound across assignment batches", asy
     scope.expectedIds.slice(0, 64),
   );
   expect(Math.max(...scope.reservedSnapshots)).toBeLessThanOrEqual(96);
+});
+
+it("respects a smaller per-tick budget before issuing any start requests", async () => {
+  vi.stubEnv("SWEEPER_ACTIVE_RECONCILE_CONCURRENCY", "16");
+  vi.stubEnv("SWEEPER_REMOTE_MAX_ADMISSIONS_PER_TICK", "2");
+  const scope = fixture(0, 24, 8);
+  hooks.submit.mockResolvedValue({ kind: "submitted" });
+  expect(
+    await admitRemoteSolverTick(scope.db, scope.engine, {
+      kind: "allow",
+      meshRecoveryVersion: 1,
+    }),
+  ).toBe(true);
+  expect(scope.assignmentLimits).toEqual([2]);
+  expect(hooks.submit.mock.calls.map((call) => call[2])).toEqual(
+    scope.expectedIds.slice(0, 2),
+  );
 });
