@@ -71,20 +71,21 @@ async function transaction<T>(
   }
 }
 
-export async function backfillWorkerStagingKeyPage(
-  client: Sql,
-  limit = 128,
-  instance?: string,
-) {
+function validatePageSize(limit: number) {
   if (!Number.isSafeInteger(limit) || limit < 1 || limit > 512)
     throw new RangeError("Staging key page size must be between 1 and 512");
+}
+
+async function backfillPage(
+  session: Connection,
+  limit: number,
+  instance?: string,
+) {
   try {
     if (instance)
-      await client`SELECT public.start_progressive_worker_staging_key_tracking(${instance}::uuid)`;
-    const [r] = await client.begin(
-      "isolation level repeatable read",
-      async (tx) =>
-        tx<{ visited: number; changed: number; complete: boolean }[]>`
+      await session`SELECT public.start_progressive_worker_staging_key_tracking(${instance}::uuid)`;
+    const [r] = await transaction(session, false, async () =>
+        session<{ visited: number; changed: number; complete: boolean }[]>`
         SELECT * FROM public.backfill_progressive_worker_staging_keys(${limit})`,
     );
     return { busy: false, ...r };
@@ -96,6 +97,54 @@ export async function backfillWorkerStagingKeyPage(
       return { busy: true, visited: 0, changed: 0, complete: false };
     }
     throw error;
+  }
+}
+
+export async function backfillWorkerStagingKeyPage(client: Sql, limit = 128, instance?: string) {
+  validatePageSize(limit);
+  const session = await client.reserve();
+  try {
+    return await backfillPage(session, limit, instance);
+  } finally {
+    session.release();
+  }
+}
+
+export async function backfillWorkerStagingKeyBatch(
+  client: Sql, instance: string, limit: number, maxPages: number, signal: AbortSignal,
+) {
+  validatePageSize(limit);
+  if (!Number.isSafeInteger(maxPages) || maxPages < 1 || maxPages > 32)
+    throw new RangeError("Staging key batch must contain between 1 and 32 pages");
+  const started = performance.now();
+  const session = await client.reserve();
+  let locked = false;
+  let visited = 0, changed = 0, pages = 0;
+  const receipt = (stopped: "signal" | "time" | "limit" | "busy" | "complete") => ({
+    visited, changed, pages, busy: stopped === "busy", complete: stopped === "complete",
+    stopped, elapsedMs: Math.round(performance.now() - started),
+  });
+  try {
+    const [owner] = await session`SELECT pg_try_advisory_lock(218,1) AS held`;
+    locked = owner.held === true;
+    if (!locked) return receipt("busy");
+    while (pages < maxPages) {
+      if (signal.aborted) return receipt("signal");
+      if (performance.now() - started >= 5000) return receipt("time");
+      const page = await backfillPage(session, limit, instance);
+      if (page.busy) return receipt("busy");
+      pages++;
+      visited += page.visited;
+      changed += page.changed;
+      if (page.complete) return receipt("complete");
+    }
+    return receipt("limit");
+  } finally {
+    try {
+      if (locked) await session`SELECT pg_advisory_unlock(218,1)`;
+    } finally {
+      session.release();
+    }
   }
 }
 
@@ -402,7 +451,9 @@ export async function maintainWorkerStagingKeys(
 }
 
 async function runCli() {
-  const [operation = "status", instance, parameter] = process.argv.slice(2);
+  const [operation = "status", instance, parameter, pagesParameter, ...extra] = process.argv.slice(2);
+  if (extra.length || (pagesParameter !== undefined && operation !== "backfill"))
+    throw new Error("Unexpected staging key operator argument");
   const { sql } = createClient({ max: 1 });
   try {
     if (operation === "backfill") {
@@ -412,11 +463,21 @@ async function runCli() {
         WHERE id=1 AND remote_solver_enabled AND remote_solver_registered_id IS NOT NULL`;
       if (!instance || instance !== host?.id)
         throw new Error("Expected the exact registered worker instance");
-      console.log(
-        JSON.stringify(
-          await backfillWorkerStagingKeyPage(sql, limit, instance),
-        ),
-      );
+      if (pagesParameter === undefined) {
+        console.log(JSON.stringify(await backfillWorkerStagingKeyPage(sql, limit, instance)));
+      } else {
+        const stop = new AbortController();
+        const abort = () => stop.abort();
+        const watchParent = process.env.STAGING_KEY_PARENT_PIPE === "1";
+        for (const name of ["SIGINT", "SIGTERM", "SIGHUP"] as const) process.on(name, abort);
+        if (watchParent) process.stdin.once("end", abort).once("error", abort).resume();
+        try {
+          console.log(JSON.stringify(await backfillWorkerStagingKeyBatch(sql, instance, limit, Number(pagesParameter), stop.signal)));
+        } finally {
+          for (const name of ["SIGINT", "SIGTERM", "SIGHUP"] as const) process.off(name, abort);
+          if (watchParent) process.stdin.off("end", abort).off("error", abort).destroy();
+        }
+      }
     } else {
       if (
         ![

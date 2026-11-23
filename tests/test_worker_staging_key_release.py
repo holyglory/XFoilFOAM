@@ -84,6 +84,10 @@ elif a[0]=='compose' and 'exec' in a:
     if os.environ.get('PAUSE_OPERATOR'):
         print('operator entered',flush=True)
         assert sys.stdin.readline().strip()=='release'
+    if os.environ.get('WAIT_FOR_BATCH_STOP') and 'STAGING_KEY_PARENT_PIPE=1' in a:
+        print('batch entered',flush=True)
+        assert sys.stdin.read()==''
+        print('batch parent closed',flush=True)
 else: sys.exit(2)
 """)
     docker.chmod(0o700)
@@ -114,7 +118,7 @@ else: sys.exit(2)
     assert retire() == 0
     assert calls.read_text().splitlines() == [f"retire {instance} {revision}"]
 
-    metadata = [("start", instance), ("backfill", instance, "128"), ("verify",),
+    metadata = [("start", instance), ("backfill", instance, "128"), ("backfill", instance, "512", "32"), ("verify",),
                 ("enable", instance), ("disable", instance), ("stop", instance)]
     command = str(app / WRAPPER)
     with lock.open("r") as archive_reader:
@@ -148,7 +152,18 @@ else: sys.exit(2)
         assert subprocess.run([command, "verify"], env=env, capture_output=True, timeout=5).returncode == 0
         blocked = subprocess.run(promote, env=deploy_env, capture_output=True, text=True, timeout=5)
         assert blocked.returncode == 9 and "deploy is already running" in blocked.stderr
-    print("Shared archive readers admitted all six metadata operations; exclusive deployment and index maintenance guards verified.")
+    with subprocess.Popen([command, "backfill", instance, "512", "32"], env={**env, "WAIT_FOR_BATCH_STOP": "1"},
+                          stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as batch:
+        try:
+            assert select.select([batch.stdout], [], [], 8)[0] and batch.stdout.readline().strip() == "batch entered"
+            assert subprocess.run(promote, env=deploy_env, capture_output=True, timeout=5).returncode == 9
+        finally:
+            batch.terminate()
+            output, error = batch.communicate(timeout=5)
+        assert batch.returncode == 0 and "batch parent closed" in output, error
+    with lock.open("r") as released:
+        fcntl.flock(released, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    print("Shared readers coexist with metadata; deployment, retirement and batch signal lock boundaries verified.")
 
 if __name__ == "__main__":
     from tempfile import TemporaryDirectory

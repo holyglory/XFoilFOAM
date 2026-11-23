@@ -1,4 +1,7 @@
 import { randomUUID } from "node:crypto";
+import { execFile } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
 import { readFileSync } from "node:fs";
 import { afterAll, beforeAll, expect, it } from "vitest";
 import { createClient } from "../src/client";
@@ -24,6 +27,10 @@ const instance = randomUUID();
 const job = "41b4fe09-1254-43b8-961f-6d8a5e9b8e59";
 const otherJob = "f7941109-6862-46ba-a5cd-274166566c9b";
 const timestamp = "2026-01-01T00:00:00.123456Z";
+const operatorCli = fileURLToPath(new URL("../src/worker-staging-key-maintenance.ts", import.meta.url));
+const runBatch = (size: number, pages: number) =>
+  promisify(execFile)(process.execPath, ["--import","tsx",operatorCli,"backfill",instance,String(size),String(pages)],
+    { env: { ...process.env, DATABASE_URL: targetUrl.toString(), STAGING_KEY_PARENT_PIPE: "1" }, timeout: 18000 });
 
 async function report(
   sequence: number,
@@ -192,11 +199,17 @@ it("keeps the original read view until a lossless, restartable bootstrap and han
     existingWriter.release();
   }
   await maintainWorkerStagingKeys(sql, "start", { instance });
-  expect(await backfill(1)).toMatchObject({
-    visited: 1,
-    changed: 1,
-    complete: false,
-  });
+  const contender = await sql.reserve();
+  try {
+    await contender`BEGIN`;
+    await contender`SELECT 1 FROM progressive_worker_reports WHERE sim_job_id=${job} AND sequence=3 FOR UPDATE`;
+    const { stdout } = await runBatch(1, 8);
+    expect(JSON.parse(stdout)).toMatchObject({ stopped: "busy", busy: true, visited: 1, changed: 1, pages: 1, complete: false });
+    expect((await sql`SELECT after_sequence::int AS seq FROM progressive_worker_staging_key_backfill`)[0].seq).toBe(2);
+  } finally {
+    await contender`ROLLBACK`;
+    contender.release();
+  }
   // An acknowledged source behind the cursor must enter through the insert trigger.
   await report(1, { result: { state: "running" } });
 
@@ -302,7 +315,7 @@ it("keeps the original read view until a lossless, restartable bootstrap and han
   await maintainWorkerStagingKeys(sql, "disable", { instance });
   await expectParity();
   await verifyIndexRetirement();
-});
+}, 60_000);
 
 async function verifyIndexRetirement() {
   const revision = "ab".repeat(20);
@@ -414,8 +427,49 @@ async function verifyIndexRetirement() {
   await expect(act("start")).rejects.toThrow(/exact registered worker/);
   await sql`UPDATE sync_api_settings SET remote_solver_enabled=true WHERE id=1`;
   await act("start");
-  while (!(await backfill(2)).complete) {
-    /* each call commits one bounded page */
-  }
+  await verifyBatchStops();
+  const { stdout } = await runBatch(2,32);
+  expect(JSON.parse(stdout)).toMatchObject({ complete: true, stopped: "complete" });
   await expectParity();
+}
+
+async function verifyBatchStops() {
+  // Hold only a fixture key insertion in the second page. The first page
+  // must already be visible on another backend, while the batch owns 218/1.
+  await sql`CREATE FUNCTION fixture_wait_for_batch() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN IF NEW.sequence=4 THEN PERFORM pg_advisory_xact_lock(218,99); END IF; RETURN NEW; END $$`;
+  await sql`CREATE TRIGGER fixture_wait BEFORE INSERT ON progressive_worker_staging_keys
+    FOR EACH ROW EXECUTE FUNCTION fixture_wait_for_batch()`;
+  const gate = await sql.reserve();
+  try {
+    for (const stop of ["pipe","signal","time"] as const) {
+      await maintainWorkerStagingKeys(sql, "stop", { instance });
+      await maintainWorkerStagingKeys(sql, "start", { instance });
+      await gate`SELECT pg_advisory_lock(218,99)`;
+      const command = runBatch(1,32);
+      try {
+        await expect.poll(async () => (await sql`SELECT EXISTS(SELECT FROM pg_locks WHERE locktype='advisory'
+          AND classid=218 AND objid=99 AND objsubid=2 AND NOT granted) AS waiting`)[0].waiting, { timeout: 8000 }).toBe(true);
+        expect((await sql`SELECT after_sequence::int AS seq FROM progressive_worker_staging_key_backfill`)[0].seq).toBe(1);
+        await expect(maintainWorkerStagingKeys(sql, "stop", { instance })).rejects.toThrow("Another staging key maintenance is active");
+        if (stop === "pipe") command.child.stdin!.end();
+        if (stop === "signal") command.child.kill("SIGTERM");
+        if (stop === "time") await new Promise(resolve => setTimeout(resolve, 5100));
+      } finally {
+        await gate`SELECT pg_advisory_unlock(218,99)`;
+      }
+      const { stdout } = await command;
+      expect(JSON.parse(stdout)).toMatchObject({ stopped: stop === "time" ? "time" : "signal",
+        pages: 2, visited: 2, complete: false });
+      const [state] = await sql`SELECT after_sequence::int AS seq,reads_enabled FROM progressive_worker_staging_key_backfill`;
+      expect(state).toEqual({ seq: 4, reads_enabled: false });
+    }
+  } finally {
+    await gate`SELECT pg_advisory_unlock_all()`;
+    gate.release();
+    await sql`DROP TRIGGER fixture_wait ON progressive_worker_staging_keys`;
+  }
+  await expect(runBatch(513,32)).rejects.toThrow(/page size/);
+  await expect(runBatch(1,33)).rejects.toThrow(/between 1 and 32/);
+  expect(JSON.parse((await runBatch(1,1)).stdout)).toMatchObject({ stopped: "limit", pages: 1, visited: 1 });
 }
