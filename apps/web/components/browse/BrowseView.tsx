@@ -276,6 +276,10 @@ export function BrowseView({
   const refreshWindow = useRef<{ filter: string; count: number } | null>(null);
   const request = useRef<AbortController | null>(null);
   const fetchingMore = useRef<number | null>(null);
+  const nextRowFocus = useRef<{
+    slug: string;
+    trigger: HTMLButtonElement;
+  } | null>(null);
   const latestPreview = useRef(preview);
   const latestSelection = useRef(selectedIds);
   useEffect(() => {
@@ -287,6 +291,23 @@ export function BrowseView({
   const loadingPage = page.key !== queryKey;
   const items = loadingPage ? [] : page.items;
   const selectedVisibleCount = loadingPage ? 0 : selectedIds.size;
+
+  useEffect(() => {
+    const pending = nextRowFocus.current;
+    nextRowFocus.current = null;
+    if (!pending) return;
+    const focus = document.activeElement;
+    if (
+      focus !== pending.trigger &&
+      (pending.trigger.isConnected || focus !== document.body)
+    )
+      return;
+    const row = document.querySelector<HTMLElement>(
+      `[data-testid="${CSS.escape("airfoil-row-" + pending.slug)}"]`,
+    );
+    row?.focus({ preventScroll: true });
+    row?.scrollIntoView({ block: "nearest" });
+  }, [page]);
 
   useEffect(() => {
     setHydrated(true);
@@ -366,7 +387,7 @@ export function BrowseView({
     };
   }, [filter, queryKey]);
 
-  const loadMore = async () => {
+  const loadMore = async (trigger: HTMLButtonElement) => {
     const seq = browseRequestSeq.current;
     const signal = request.current?.signal;
     if (
@@ -417,6 +438,14 @@ export function BrowseView({
       }
       if (signal?.aborted || seq !== browseRequestSeq.current) return;
       const rows = replace ? next.items : [...page.items, ...next.items];
+      if (
+        document.activeElement === trigger &&
+        rows.length > page.items.length
+      ) {
+        const loaded = new Set(page.items.map((item) => item.id));
+        const firstNew = rows.find((item) => !loaded.has(item.id));
+        if (firstNew) nextRowFocus.current = { slug: firstNew.slug, trigger };
+      }
       setPage({
         key: queryKey,
         items: rows,
@@ -1243,8 +1272,9 @@ export function BrowseView({
             {!loadingPage && items.length < page.total && (
               <button
                 type="button"
-                onClick={loadMore}
-                disabled={loadingMore}
+                data-testid="browse-load-more"
+                onClick={(event) => void loadMore(event.currentTarget)}
+                aria-disabled={loadingMore}
                 aria-busy={loadingMore}
                 style={smallButton}
               >
