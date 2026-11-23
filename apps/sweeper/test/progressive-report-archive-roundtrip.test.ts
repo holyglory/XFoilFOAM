@@ -75,6 +75,42 @@ it("restores exact PG results across shared pages including unknown, wide and nu
 });
 
 const temporaryDirectories: string[] = [];
+
+it("checks each cancelled report's signature and point inventory even when the PG result repeats", async () => {
+  const { cancelledReportSourceVerifier } = await import("../src/report-archive-source-proof");
+  const { retainedReportInventory } = await import("@aerodb/db/retained-solver-reports");
+  const { reportJsonObject } = await import("@aerodb/db/progressive-report-archive");
+  const job = randomUUID();
+  const science = `{"job_id":"${job}","polars":[{"speed":20,"reynolds":100000,"mach":0,"points":[],"attempts":[{"case_slug":"failed","aoa_deg":5,"converged":false,"wide":90071992547409931235}]}]}`;
+  const make = (sequence: number, result: string, extra = "") =>
+    `{"nested":{"result":"unrelated"},"result":${result},"sequence":${sequence},"executionId":"${job}"${extra}}`;
+  const documents = [make(1, science), make(2, science, ',"status":{"unknown":"result"}'),
+    make(3, science.replace("31235", "31236")), make(4, "null")];
+  const expected = documents.map(raw => {
+    const report = reportJsonObject(parseReportJson(raw));
+    const signature = reportTextIdentity(canonicalReportJson(report)).sha256;
+    const inv = retainedReportInventory(report, signature);
+    return { signature, inventory: inv.signature, sources: canonicalReportJson(inv.sources) };
+  });
+  const verify = cancelledReportSourceVerifier(job);
+  for (const [i, raw] of documents.entries()) {
+    const e = expected[i];
+    expect(verify(raw, i+1, e.signature, e.inventory)).toBe(e.sources);
+  }
+  expect(expected[0].sources).toBe(expected[1].sources);
+  expect(expected[2].sources).not.toBe(expected[1].sources);
+  expect(expected[3].sources).toBe("[]");
+  for (const [raw, signature, inventory] of [
+    [documents[1], expected[0].signature, expected[1].inventory],
+    [documents[1], expected[1].signature, expected[0].inventory],
+    [documents[1].replace('"unknown":"result"', '"unknown":"changed"'), expected[1].signature, expected[1].inventory],
+    [make(2, science.replace("31235", "31236")), expected[1].signature, expected[1].inventory],
+    [make(2, science, ',"result":null'), expected[1].signature, expected[1].inventory],
+  ]) {
+    verify(documents[0], 1, expected[0].signature, expected[0].inventory);
+    expect(() => verify(raw, 2, signature, inventory)).toThrow();
+  }
+});
 afterEach(async () => {
   await Promise.all(
     temporaryDirectories

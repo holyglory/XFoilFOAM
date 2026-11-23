@@ -13,6 +13,7 @@ import {
   type ReportJson,
 } from "@aerodb/db/progressive-report-archive";
 import { retainedReportInventory } from "@aerodb/db/retained-solver-reports";
+import { reportEnvelopeSignature, reportSourceInventorySignature } from "./report-archive-source-proof";
 import {
   checkReportObjectPin,
   hashPattern,
@@ -213,15 +214,7 @@ function restore(
     canonicalReportJson(v.sequence) !== String(m.sequence)
   )
     throw new Error("Shared report dispatch or sequence changed");
-  const keys = Object.keys(v).sort((a, b) => a.localeCompare(b, "en"));
-  const app = createHash("sha256").update("{");
-  for (const [i, k] of keys.entries()) {
-    app.update((i ? "," : "") + JSON.stringify(k) + ":");
-    app.update(
-      res && k === "result" ? res.canonical : canonicalReportJson(v[k]),
-    );
-  }
-  if (app.update("}").digest("hex") !== m.signature)
+  if (reportEnvelopeSignature(v, res?.canonical) !== m.signature)
     throw new Error("Shared report application signature changed");
   const sources = res
     ? (res.sources ??= retainedReportInventory(
@@ -230,15 +223,7 @@ function restore(
       ).sources)
     : [];
   if (res && res.sources) res.parsed = undefined;
-  const inventory = sha256(
-    canonicalReportJson({
-      kind: "progressive-remote-report-inventory-v1",
-      executionId: v.executionId,
-      sequence: v.sequence,
-      reportContentSignature: m.signature,
-      sources,
-    }),
-  );
+  const inventory = reportSourceInventorySignature(v, m.signature, sources);
   if (
     inventory !== m.inventorySignature ||
     sources.length !== m.sourceCount ||
