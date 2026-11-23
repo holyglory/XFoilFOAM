@@ -7,6 +7,7 @@ import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { createClient } from "@aerodb/db/client";
 import {
   legacyInventorySql,
+  legacyMemberSql,
   legacyNormalizeSql,
   type LegacyReportScope,
 } from "@aerodb/db/legacy-report-storage";
@@ -222,6 +223,28 @@ async function directory() {
   const path = await mkdtemp(join(tmpdir(), "legacy-reports-"));
   paths.push(path);
   return path;
+}
+function signal() {
+  let release!: () => void;
+  const reached = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  return { reached, release };
+}
+function observeMember(
+  after: (sequence: number) => void | Promise<void>,
+): LegacySqlReader {
+  return {
+    ...source,
+    async readMember(executionId, kind, sequence, bytes) {
+      const member = await source.query(
+        legacyMemberSql(executionId, kind, sequence, bytes),
+        bytes * 6 + 1024 ** 2,
+      );
+      await after(sequence);
+      return member;
+    },
+  };
 }
 async function execute(query: string) {
   try {
@@ -1294,6 +1317,211 @@ describe.sequential("worker-only legacy backup and 0198 representation", () => {
       legacyNormalizeSql(page.members, { apply: true, readersReady: true }),
     );
     expect(await logical(executionId)).toEqual(current);
+  });
+
+  it("rechecks a prepared page after commit and exports identical sparse reports, conflicts, and receipts", async () => {
+    const scope = await fixture(),
+      id = scope.executions[0].executionId;
+    const input = {
+      scope,
+      sourceBinding: "versioned-lookahead",
+      pages: 4,
+      rows: 2,
+    };
+    const acknowledge =
+      () => client.sql`UPDATE progressive_worker_reports SET acknowledged_at='2026-11-21T00:00:00Z'
+      WHERE sim_job_id=${id} AND sequence=8`;
+    const nextRead = signal(),
+      reads: number[] = [];
+    const store = new MemoryBackup(),
+      path = await directory();
+    const result = await exportLegacyReports({
+      ...input,
+      directory: path,
+      store,
+      prepareNextPage: true,
+      source: observeMember((sequence) => {
+        reads.push(sequence);
+        if (sequence === 9) nextRead.release();
+      }),
+      applyVerifiedPage: async (page) => {
+        if (page.start.after !== 0) return;
+        await nextRead.reached;
+        expect(store.objects.size).toBe(1);
+        expect(
+          JSON.parse(await readFile(join(path, "checkpoint.json"), "utf8")).next
+            .after,
+        ).toBe(0);
+        expect(
+          inspectLegacyPage(await readFile(join(path, "pending.jsonl.gz"))).page
+            .next,
+        ).toEqual(page.next);
+        await acknowledge(); // Same report signature, different exact source-row bytes.
+      },
+    });
+    expect(reads.filter((seq) => seq === 8)).toHaveLength(2);
+    const baselineStore = new MemoryBackup();
+    const baselinePath = await directory();
+    const baseline = await exportLegacyReports({
+      ...input,
+      source,
+      store: baselineStore,
+      directory: baselinePath,
+      applyVerifiedPage: async () => {},
+    });
+    expect(result).toEqual(baseline);
+    expect([...store.objects.keys()]).toEqual([
+      ...baselineStore.objects.keys(),
+    ]);
+    for (const [key, bytes] of store.objects)
+      expect(bytes.equals(baselineStore.objects.get(key)!)).toBe(true);
+    expect(await readFile(join(path, "checkpoint.json"))).toEqual(
+      await readFile(join(baselinePath, "checkpoint.json")),
+    );
+  });
+
+  it("rereads whole-row JSON when a column is added without rewriting the source tuple", async () => {
+    const scope = await fixture(false),
+      directoryPath = await directory(),
+      store = new MemoryBackup();
+    const successor = signal();
+    try {
+      const result = await exportLegacyReports({
+        scope,
+        directory: directoryPath,
+        store,
+        rows: 2,
+        pages: 2,
+        sourceBinding: "row-layout",
+        prepareNextPage: true,
+        source: observeMember((sequence) => {
+          if (sequence === 9) successor.release();
+        }),
+        applyVerifiedPage: async (page) => {
+          if (page.start.after !== 0) return;
+          await successor.reached;
+          await client.sql`ALTER TABLE progressive_worker_reports ADD COLUMN lookahead_fixture_value integer DEFAULT 17`;
+        },
+      });
+      const receipt: LegacyBackupReceipt = JSON.parse(
+        await readFile(join(directoryPath, result.receipts[1]!), "utf8"),
+      );
+      const page = decodeLegacyPage(await store.read(receipt.object), receipt);
+      expect(
+        page.members.map(
+          (member) => JSON.parse(member.rowText).lookahead_fixture_value,
+        ),
+      ).toEqual([17, 17]);
+    } finally {
+      await client.sql`ALTER TABLE progressive_worker_reports DROP COLUMN IF EXISTS lookahead_fixture_value`;
+    }
+  });
+
+  it.each(["source failure", "stop"] as const)(
+    "commits only the current page on a speculative %s and resumes from its receipt",
+    async (reason) => {
+      const scope = await fixture(false),
+        path = await directory(),
+        store = new MemoryBackup();
+      const entered = signal();
+      const input = {
+        scope,
+        directory: path,
+        store,
+        rows: 2,
+        pages: 3,
+        sourceBinding: reason,
+        prepareNextPage: true,
+      };
+      let stopping = false;
+      const run = exportLegacyReports({
+        ...input,
+        source: observeMember((sequence) => {
+          if (sequence === 8) {
+            entered.release();
+            if (reason === "source failure")
+              throw new Error("next page source interrupted");
+            stopping = true;
+          }
+        }),
+        shouldStop: () => stopping,
+        applyVerifiedPage: async () => {
+          await entered.reached;
+        },
+      });
+      if (reason === "source failure")
+        await expect(run).rejects.toThrow("next page source interrupted");
+      else
+        expect(await run).toMatchObject({
+          reportRowsVerified: 2,
+          complete: false,
+        });
+      const state = JSON.parse(
+        await readFile(join(path, "checkpoint.json"), "utf8"),
+      );
+      expect(state.next).toMatchObject({ after: 3, copied: 2 });
+      expect(store.objects.size).toBe(1);
+      expect(await readdir(path)).not.toContain("pending.jsonl.gz");
+      expect(await exportLegacyReports({ ...input, source })).toMatchObject({
+        complete: true,
+        reportRowsVerified: 3,
+      });
+    },
+  );
+
+  it("holds the single writer lock until a failed upload's speculative read has drained", async () => {
+    const scope = await fixture(false),
+      path = await directory();
+    const entered = signal(),
+      finish = signal(),
+      failed = signal(),
+      store = new MemoryBackup();
+    const input = {
+      scope,
+      directory: path,
+      store,
+      rows: 2,
+      pages: 2,
+      sourceBinding: "drain-read",
+      prepareNextPage: true,
+    };
+    const put = vi.spyOn(store, "put").mockImplementationOnce(async () => {
+      await entered.reached;
+      failed.release();
+      throw new Error("current upload refused");
+    });
+    const run = exportLegacyReports({
+      ...input,
+      source: observeMember(async (seq) => {
+        if (seq === 8) {
+          entered.release();
+          await finish.reached;
+        }
+      }),
+    });
+    const rejected = expect(run).rejects.toThrow("current upload refused");
+    try {
+      await failed.reached;
+      await expect(exportLegacyReports({ ...input, source })).rejects.toThrow(
+        "Another copy holds",
+      );
+    } finally {
+      finish.release();
+    }
+    await rejected;
+    expect(put).toHaveBeenCalledTimes(1);
+    expect(
+      JSON.parse(await readFile(join(path, "checkpoint.json"), "utf8")).next
+        .after,
+    ).toBe(0);
+    const pending = await readFile(join(path, "pending.jsonl.gz"));
+    expect(
+      inspectLegacyPage(pending).page.members.map((item) => item.sequence),
+    ).toEqual([1, 3]);
+    expect(
+      await exportLegacyReports({ ...input, source, pages: 1 }),
+    ).toMatchObject({ next: { after: 3, copied: 2 } });
+    expect([...store.objects.values()][0].equals(pending)).toBe(true);
   });
 
   it("keeps short byte pages resumable and detects a missing source row without skipping it", async () => {
