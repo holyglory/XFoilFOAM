@@ -1,7 +1,7 @@
 // Retain the reviewed, authenticated preview and the ordinary public VPS
 // journey together. Production Google credentials stay in the user's browser.
 import assert from "node:assert/strict";
-import { cp, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { cp, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { chromium, expect, request } from "@playwright/test";
 import {
@@ -96,6 +96,9 @@ try {
   await publishDirectory(
     join(qa, "campaign-evidence-delivery"),
     async (directory) => {
+      const evidencePath = "journey/campaign-selected-evidence";
+      const evidenceDir = join(directory, evidencePath);
+      await mkdir(evidenceDir, { recursive: true });
       const preview = await browser.newPage({
         storageState: await api.storageState(),
         viewport: { width: 1206, height: 954 },
@@ -139,8 +142,15 @@ try {
           await expect(
             modal.getByRole("button", { name: "custom render", exact: true }),
           ).toHaveCount(0);
+        const screenshot = stage + "-selected.png";
+        const png = await preview.screenshot({
+          path: join(evidenceDir, screenshot),
+          animations: "disabled",
+        });
         observed.push({
           stage,
+          screenshot,
+          screenshotSha256: sha(png),
           resultId: data.resultId,
           attemptId: data.resultAttemptId,
           cl: data.cl,
@@ -219,7 +229,8 @@ try {
         path: join(directory, "live-selected-solver-result.png"),
         animations: "disabled",
       });
-      await writeJson(join(directory, "journeys.json"), {
+      await writeJson(join(evidenceDir, "downstream.json"), {
+        source_sha256: local.sourceSha256,
         fixture: {
           deployment: before.data.deployment_id,
           generation: before.data.current_generation,
@@ -286,11 +297,17 @@ try {
             expected_result:
               "The authenticated campaign preview reads the chosen fast or final attempt. The public VPS reads an exact stored production history and enforces Google authentication on the administration route.",
             evidence_refs: [
-              "journeys.json",
+              evidencePath + "/downstream.json",
               "formal-receipt.json",
               "manual-review.json",
               "product-design.json",
               "vps-deployment.json",
+              "live-selected-solver-result.png",
+            ],
+            rendered_evidence_refs: [
+              evidencePath + "/downstream.json",
+              evidencePath + "/fast-selected.png",
+              evidencePath + "/final-selected.png",
               "live-selected-solver-result.png",
             ],
           },
