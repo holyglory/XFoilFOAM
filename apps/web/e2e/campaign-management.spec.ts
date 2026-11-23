@@ -1242,7 +1242,7 @@ test.describe
     );
 
     const recalculate = management.getByTestId("campaign-point-recalculate");
-    await recalculate.locator("summary").click();
+    await recalculate.locator(":scope > summary").click();
     const correctionForm = management.getByTestId("point-correction-form");
     await expect(correctionForm).toBeVisible();
     await expect(
@@ -1419,7 +1419,7 @@ test.describe
     await expect(
       panel.getByRole("button", { name: "Ensure final verification" }),
     ).toBeHidden();
-    await operatorOverrides.locator("summary").click();
+    await operatorOverrides.locator(":scope > summary").click();
     await expect(
       panel.getByText("Manual whole-polar verification"),
     ).toBeVisible();
