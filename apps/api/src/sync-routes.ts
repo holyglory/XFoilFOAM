@@ -140,6 +140,7 @@ import { mediaStore } from "./media-store";
 import { readStoredForceHistory } from "./solver-history-reader";
 import { readStoredResultHistories } from "./result-history-reader";
 import { apiAttemptEvidenceReader, readStoredAttemptEvidenceBatch } from "./attempt-evidence-reader";
+import { isPolarReceiptReplayRequest, readBoundPolarReplayReceipt } from "./progressive-polar-receipt-replay";
 import { prepareProgressiveRemoteEvidence } from "@aerodb/db/progressive-remote-evidence";
 import { prepareProgressiveRemoteReceiptReplay } from "@aerodb/db/progressive-remote-evidence-receipts";
 import {
@@ -4400,7 +4401,7 @@ export async function importPolarPush(
   payload: PolarPushPayload,
   files: Map<string, UploadedFileRef>,
   capacityReservation?: SyncUploadCapacityReservation | null,
-  options: { stoppedStorageOnly?: boolean } = {},
+  options: { stoppedStorageOnly?: boolean; referenceOnlyReplay?: boolean } = {},
 ): Promise<{
   imported: number;
   attempts: number;
@@ -4596,6 +4597,15 @@ export async function importPolarPush(
       );
     bcId = job.bcIds[0];
     await assertProgressivePolarImportScope(db, progressive);
+    if (options.referenceOnlyReplay && promise?.status === "cancelled" && payload.sourceInstanceId && progressive.size === 1) {
+      const entry = progressive.values().next().value!;
+      const original = await readBoundPolarReplayReceipt(db, entry, payload.sourceInstanceId);
+      if (original) return {
+        imported: 0, attempts: 0, artifacts: 0, media: 0, fieldExtents: 0, fieldColorScales: 0,
+        conflictIds: [], promiseId: promise.id, fulfilledAoas: [], unfulfilledAoas: [entry.delivery.aoaDeg],
+        bindingReceipts: [], progressiveArchiveReceipts: [], progressiveEvidenceReceipts: [original],
+      };
+    }
   }
   // Never trust a pushing instance's bc id blindly: remote solvers send THEIR
   // database's uuid (validation incident 2026-07-11 — the Mac's local bc id
@@ -8779,6 +8789,8 @@ export async function registerSyncRoutes(app: FastifyInstance): Promise<void> {
               {
                 stoppedStorageOnly:
                   polarRoute === "/api/sync/v1/retained-progressive-evidence",
+                referenceOnlyReplay: Boolean(authenticatedSolver) && polarRoute === "/api/sync/v1/polars" &&
+                  !req.isMultipart() && isPolarReceiptReplayRequest(req.body),
               },
             );
           }
