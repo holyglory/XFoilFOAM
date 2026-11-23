@@ -36,8 +36,8 @@ export class HzAttemptHubStore extends HubWorkloadGcs {
   ) {
     super(bucket, account, request);
   }
-  private withinBounds(source: number, packed: number) {
-    const max = this.originalCopy ? MAX_ATTEMPT_EVIDENCE_BYTES : 262144;
+  private withinBounds(source: number, packed: number, existingGeneration = false) {
+    const max = this.originalCopy ? MAX_ATTEMPT_EVIDENCE_BYTES : existingGeneration ? 8 * 1024 * 1024 : 262144;
     return (
       source > 0 &&
       source <= max &&
@@ -111,7 +111,7 @@ export class HzAttemptHubStore extends HubWorkloadGcs {
     assertAttemptEvidenceArchive(identity);
     if (
       identity.bucket !== this.bucket ||
-      !this.withinBounds(identity.sourceByteSize, identity.storedByteSize) ||
+      !this.withinBounds(identity.sourceByteSize, identity.storedByteSize, true) ||
       identity.objectKey !== hzAttemptKey(identity.sourceInstance, identity)
     )
       throw new Error("Invalid attempt generation");

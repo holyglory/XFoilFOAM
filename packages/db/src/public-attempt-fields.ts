@@ -110,7 +110,7 @@ async function readFields(
               'sourceSha256',ar.source_sha256,'sourceByteSize',ar.source_byte_size)
         AND (CASE
           WHEN e.verification#>>'{dependencies,verifier}' IN
-                ('server-consumers/hz-worker-steady-rans-v1','server-consumers/hz-retained-original-v2') THEN
+                ('server-consumers/hz-worker-steady-rans-v1','server-consumers/hz-retained-original-v2','server-consumers/hz-settled-receipt-v3') THEN
             e.verification#>>'{app,source}'='worker-volume' AND e.verification#>>'{dependencies,applicationSha256}' ~ '^[0-9a-f]{64}$'
             AND e.verification#>'{dependencies,workerScope}' @>
               jsonb_build_object('job',ar.sim_job_id,'attempt',a.id,'result',a.result_id,'instance',ar.source_instance)

@@ -1569,6 +1569,13 @@
       "when": 1795363913054,
       "tag": "0223_report_payload_reference_indexes",
       "breakpoints": true
+    },
+    {
+      "idx": 224,
+      "version": "7",
+      "when": 1795363913055,
+      "tag": "0224_hz_settled_attempt_receipts",
+      "breakpoints": true
     }
   ]
 }

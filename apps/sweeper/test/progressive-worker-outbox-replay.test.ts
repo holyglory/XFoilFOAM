@@ -1342,13 +1342,13 @@ it.each(["steady", "periodic"])(
           if (periodic) {
             expect(JSON.parse(source).force_history.t).toHaveLength(6 * 80);
             expect(JSON.parse(source).frame_track.frames).toHaveLength(6 * 24);
-            await verifyHzAttemptTransition(db, id, input, source, root, true);
+            await verifyHzAttemptTransition(db, id, input, source, root, full, true);
             return;
           }
           expect(JSON.parse(source).steady_history.iterations).toHaveLength(
             1100,
           );
-          await verifyHzAttemptTransition(db, id, input, source, root);
+          await verifyHzAttemptTransition(db, id, input, source, root, full);
           await db.execute(sql`UPDATE progressive_worker_hub_receipts SET receipt=receipt||jsonb_build_object('remoteResultAttemptId',${randomUUID()}::text)
         WHERE result_attempt_id=${id}::uuid`);
           await expect(read()).rejects.toThrow("scope");

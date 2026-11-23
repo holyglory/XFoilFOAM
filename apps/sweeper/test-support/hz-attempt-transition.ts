@@ -1,4 +1,6 @@
 import { checkHzTransferFence } from "../src/hz-attempt-transfer-fence";
+import { analysisContentHash, type ProgressiveRemoteReport } from "@aerodb/db";
+import { replayProgressiveWorkerOutbox, ProgressiveWorkerReplayNeedsFinalReport } from "../src/progressive-worker-outbox-replay";
 import { verifyOriginalCopyJourney } from "./hz-attempt-originals-fixture";
 import { getAttemptEvidenceArchive } from "@aerodb/db/attempt-evidence-catalog";
 import { readHzAttemptWorkingCopy } from "../src/hz-attempt-volume";
@@ -110,6 +112,7 @@ export async function verifyHzAttemptTransition(
   input: ProgressiveWorkerOutboxReplayInput,
   original: string,
   root: string,
+  fullReport: string,
   periodic = false,
 ) {
   const fixture = await createSettlementFixture(true),
@@ -229,6 +232,59 @@ export async function verifyHzAttemptTransition(
       relay,
       report: (value: unknown) => reports.push(value as Record<string, any>),
     };
+    async function verifySettledPoint() {
+      // A normal running report delivered the point. Its assignment stopped at
+      // a later sequence. Both signed reports are still inline on this worker.
+      const stopped: ProgressiveRemoteReport = JSON.parse(fullReport);
+      const earlier = {
+        ...stopped, status: { ...stopped.status, state: "running" },
+        result: { ...stopped.result!, state: "running" }, stopProof: null,
+      };
+      const final = { ...stopped, sequence: stopped.sequence + 1 };
+      const firstSha = analysisContentHash(earlier);
+      await db.execute(sql`INSERT INTO progressive_worker_reports
+        (sim_job_id,sequence,report,content_signature,assignment_signature,stopped_engine_job_id,acknowledged_at)
+        SELECT sim_job_id,${final.sequence},${JSON.stringify(final)}::jsonb,${analysisContentHash(final)},
+          assignment_signature,stopped_engine_job_id,acknowledged_at FROM progressive_worker_reports
+        WHERE sim_job_id=${input.executionId}::uuid AND sequence=${earlier.sequence}`);
+      await db.execute(sql`UPDATE progressive_worker_reports SET report=${JSON.stringify(earlier)}::jsonb,
+        content_signature=${firstSha},archived_at=NULL,archive_bundle_id=NULL,result_payload_hash=NULL,stopped_engine_job_id=NULL
+        WHERE sim_job_id=${input.executionId}::uuid AND sequence=${earlier.sequence}`);
+      await db.execute(sql`UPDATE progressive_worker_evidence_receipts SET content_signature=${firstSha}
+        WHERE sim_job_id=${input.executionId}::uuid AND sequence=${earlier.sequence}`);
+      if (!periodic) await db.execute(sql`UPDATE results SET current_result_attempt_id=${id}::uuid WHERE id=(SELECT result_id FROM result_attempts WHERE id=${id}::uuid)`);
+      expect((await relay.worker({ operation: "one", retained: true, attemptId: id })).limiter).not.toBeNull();
+      const candidate = () => relay.worker({ operation: "one", settled: true, retained: true, attemptId: id });
+      await db.execute(sql`INSERT INTO result_media_repairs(id,result_id,result_attempt_id,state)
+        SELECT gen_random_uuid(),result_id,id,'blocked' FROM result_attempts WHERE id=${id}::uuid`);
+      expect((await candidate()).limiter).toBeNull();
+      await db.execute(sql`UPDATE result_media_repairs SET state='running',claim_expires_at=clock_timestamp()+interval '5 minutes' WHERE result_attempt_id=${id}::uuid`);
+      expect((await candidate()).limiter).not.toBeNull();
+      await db.execute(sql`UPDATE result_media_repairs SET state='blocked',claim_expires_at=NULL WHERE result_attempt_id=${id}::uuid`);
+      await db.execute(sql`UPDATE progressive_worker_reports SET acknowledged_at=NULL WHERE sim_job_id=${input.executionId}::uuid AND sequence=${final.sequence}`);
+      expect((await candidate()).limiter).not.toBeNull();
+      await db.execute(sql`UPDATE progressive_worker_reports SET acknowledged_at=clock_timestamp() WHERE sim_job_id=${input.executionId}::uuid AND sequence=${final.sequence}`);
+      await db.execute(sql`UPDATE progressive_worker_hub_receipts SET receipt=jsonb_set(receipt,'{remoteResultAttemptId}',to_jsonb(gen_random_uuid())) WHERE result_attempt_id=${id}::uuid`);
+      expect((await candidate()).limiter).not.toBeNull();
+      await db.execute(sql`UPDATE progressive_worker_hub_receipts SET receipt=jsonb_set(receipt,'{remoteResultAttemptId}',to_jsonb(result_attempt_id)) WHERE result_attempt_id=${id}::uuid`);
+      await expect(replayProgressiveWorkerOutbox(db, input)).rejects.toBeInstanceOf(ProgressiveWorkerReplayNeedsFinalReport);
+      await hzAttemptStorage(["migrate", ...config, "--id", id, "--include-settled-receipts"], io);
+      const [confirmed] = await db.execute(sql`SELECT r.current_result_attempt_id,a.status,a.source,
+        e.app_readback_at,e.verification->'dependencies' AS deps FROM result_attempts a JOIN results r ON r.id=a.result_id
+        JOIN attempt_evidence_storage_events e ON e.id=a.evidence_storage_event_id AND e.archive_id=a.evidence_archive_id WHERE a.id=${id}::uuid`);
+      expect(confirmed).toMatchObject({ current_result_attempt_id: periodic ? null : id, status: periodic ? "failed" : "done", source: periodic ? "queued" : "solved",
+        deps: { verifier: "server-consumers/hz-settled-receipt-v3",
+          workerScope: { sequence: earlier.sequence, stopSequence: final.sequence, report: firstSha, stopReport: analysisContentHash(final) } } });
+      expect(confirmed.app_readback_at).toBeTruthy();
+      const [media] = await db.execute(sql`SELECT m.state,a.evidence_payload->>'fidelity' AS fidelity
+        FROM result_media_repairs m JOIN result_attempts a ON a.id=m.result_attempt_id WHERE a.id=${id}::uuid`);
+      expect(media).toMatchObject({state: "blocked", fidelity: JSON.parse(original).fidelity ?? null});
+      expect(await readStoredAttemptEvidenceText(db, id)).toBe(original);
+      expect(await readStoredAttemptEvidenceText(db, id, {source: "worker-report"})).toBe(original);
+      await expect(replayProgressiveWorkerOutbox(db, input, {apply: true})).rejects.toBeInstanceOf(ProgressiveWorkerReplayNeedsFinalReport);
+      await hzAttemptStorage(["restore", ...config, "--id", id], io);
+      expect(await readStoredAttemptEvidenceText(db, id)).toBe(original);
+    }
     if (periodic) {
       // A finished assigned job may contain rejected individual points. The
       // signed original and measured stop establish custody for a closed promise.
@@ -295,6 +351,7 @@ export async function verifyHzAttemptTransition(
       });
       await hzAttemptStorage(["restore", ...config, "--id", id], io);
       expect(await readStoredAttemptEvidenceText(db, id)).toBe(original);
+      await verifySettledPoint();
       return;
     }
     await hzAttemptStorage(["plan", "--until-complete", "--limit", "1"], io);
@@ -634,6 +691,7 @@ export async function verifyHzAttemptTransition(
       )[0],
     ).toMatchObject({ evidence_archive_id: null, body: original });
     await verifyOriginalCopyJourney(db, id, objectStore(true).store);
+    await verifySettledPoint();
   } finally {
     if (prior === undefined) delete process.env.MEDIA_DIR;
     else process.env.MEDIA_DIR = prior;

@@ -129,26 +129,35 @@ function normalizedHistory(
     : (payload[camel] ?? null);
 }
 
-function decisions(classified: ReturnType<typeof classifyPolarEvidence>) {
+function decisions(classified: ReturnType<typeof classifyPolarEvidence>, keyed = false) {
+  const classifications = classified.classifications.map(entry => ({
+    attemptId: (entry.evidence as { resultAttemptId?: string | null }).resultAttemptId,
+    state: entry.state,
+    reasons: entry.reasons,
+    region: entry.region,
+    confidence: entry.confidence,
+  }));
+  // SQL heap order can change when one of two generations at the same angle
+  // moves to TOAST or back. Only the per-attempt verdicts are keyed; the actual
+  // fitter still receives the classifier's original input and ordering.
+  if (keyed) {
+    if (classifications.some(c => typeof c.attemptId !== "string") ||
+        new Set(classifications.map(c => c.attemptId)).size !== classifications.length)
+      throw new Error("Scientific classification has a missing or duplicate attempt owner");
+    classifications.sort((a, b) => a.attemptId!.localeCompare(b.attemptId!));
+  }
   return {
     lowAoaFailure: classified.lowAoaFailure,
     needsUransAoas: classified.needsUransAoas,
     hardRejectedAoas: classified.hardRejectedAoas,
-    classifications: classified.classifications.map((entry) => ({
-      attemptId: (entry.evidence as { resultAttemptId?: string | null })
-        .resultAttemptId,
-      state: entry.state,
-      reasons: entry.reasons,
-      region: entry.region,
-      confidence: entry.confidence,
-    })),
+    classifications,
     fit: buildPolarFit(classified.classifications),
   };
 }
 
 /** Use the same classifier, sibling job and fitted-curve decisions for the
  * post-commit worker readback as for the pre-commit projection proof. */
-export async function storedJobDecisionSha256(db: DB, id: string) {
+export async function storedJobDecisionSha256(db: DB, id: string, keyed = false) {
   const [a] = await db.execute(
     sql`SELECT airfoil_id,simulation_preset_revision_id,sim_job_id FROM result_attempts WHERE id=${id}::uuid`,
   );
@@ -169,7 +178,7 @@ export async function storedJobDecisionSha256(db: DB, id: string) {
     rows.filter((p) => p.resultAttemptId === id).length === 1,
     "job does not contain the exact replay attempt",
   );
-  return analysisContentHash(decisions(classifyPolarEvidence(rows)));
+  return analysisContentHash(decisions(classifyPolarEvidence(rows), keyed));
 }
 
 /** Actual archive access happens BEFORE the bounded read-only SQL snapshot.
@@ -323,7 +332,8 @@ export function createAttemptServerDependencyVerifier(
         forcePresent(original, new Map()) === hasForceHistory,
         "force-history existence changed",
       );
-      const extendedWorker = workerScope?.contract === "retained-original-v2";
+      const settledWorker = workerScope?.contract === "settled-receipt-v3";
+      const extendedWorker = settledWorker || workerScope?.contract === "retained-original-v2";
       // 0213 owns the cycle/time/frame continuation contract on both roles.
       if ((broad && urans) || extendedWorker) {
         requireProof(
@@ -401,8 +411,8 @@ export function createAttemptServerDependencyVerifier(
               ) as typeof point.steadyHistory,
             },
       );
-      const originalDecision = decisions(classifyPolarEvidence(before));
-      const projectedDecision = decisions(classifyPolarEvidence(after));
+      const originalDecision = decisions(classifyPolarEvidence(before), settledWorker);
+      const projectedDecision = decisions(classifyPolarEvidence(after), settledWorker);
       requireProof(
         canonicalAnalysisJson(originalDecision) ===
           canonicalAnalysisJson(projectedDecision),
@@ -417,7 +427,9 @@ export function createAttemptServerDependencyVerifier(
         equalityEquivalent: true,
         scientificEquivalent: true,
         readDependenciesSatisfied: true,
-        verifier: extendedWorker
+        verifier: settledWorker
+          ? "server-consumers/hz-settled-receipt-v3"
+          : extendedWorker
           ? "server-consumers/hz-retained-original-v2"
           : workerScope
             ? "server-consumers/hz-worker-steady-rans-v1"

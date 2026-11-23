@@ -1,5 +1,21 @@
 # Reading HZ attempt histories from immutable worker reports
 
+With migration 0224 the same watcher accepts `--include-settled-receipts`.
+It keeps earlier supported receipts eligible and checks the immutable point
+at its own acknowledged sequence plus the independently acknowledged final
+stop of that assignment. The registered worker's native 0207 original,
+generation, original byte length and SHA must match the signed projection.
+The operator reads existing objects up to 8 MiB of original text and 1 MiB
+compressed. Each report read is bounded at 32 MiB. A current selection and a
+historical generation go through the same pre- and post-transition checks.
+
+Use `plan --id UUID --include-settled-receipts` for a read-only preview.
+At handoff, change the existing singleton watcher's mode. Its directory lock
+also covers the new checkpoint. Pending events from all three worker recipes
+are verified first. An earlier running report can prove an already received
+point even when the normal final-only requeue command refuses that sequence.
+An absent point receipt or an open claim keeps the original inline.
+
 An attempt has an HZ attempt ID, an HZ result ID and an execution ID. The hub assigns its own IDs when it retains the delivered point. The worker acknowledgment records both pairs. A hub 0207 object contains the hub pair in its compressed envelope. Keep both pairs and their original roles when comparing or restoring the payload.
 
 ## Read one settled attempt
