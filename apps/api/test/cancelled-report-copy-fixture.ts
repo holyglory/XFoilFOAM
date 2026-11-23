@@ -16,6 +16,10 @@ import { prepareProgressiveRemoteEvidence, resolveProgressiveRemoteEvidence } fr
 import { readProgressiveRemoteRetention } from "@aerodb/db/progressive-remote-retention";
 import { resolveProgressiveReportedPoint } from "@aerodb/db/progressive-remote-report";
 import {
+  backfillProgressiveReportPayloads,
+  setProgressiveReportNormalization,
+} from "@aerodb/db/progressive-report-payloads";
+import {
   readProgressiveReportArchiveText,
   verifyProgressiveReportArchive,
 } from "@aerodb/db/progressive-report-archive";
@@ -58,6 +62,9 @@ export async function verifyCancelledReportCopyReplay(
     ...anchor,
     sequence: anchorSequence + 1,
   };
+  // This fixture runs inside the caller's rolled-back transaction. Start with
+  // the historical inline representation even on a normalized-write backend.
+  await setProgressiveReportNormalization(db, { enabled: false, readersReady: true });
   const copyReceipt = await storeProgressiveRemoteReport(db, {
     ...sender,
     report: copy,
@@ -159,15 +166,34 @@ export async function verifyCancelledReportCopyReplay(
   const warmBody = warm.json();
   expect(warmBody.fulfilledAoas).toEqual([]);
   expect(warmBody.progressiveEvidenceReceipts[0].sequence).toBe(anchorSequence);
-  const page = await nextCancelledReportCopies(db, {
+  const cursor = {
     executionId: id,
     sequence: anchorSequence - 1,
-  });
+  };
+  const page = await nextCancelledReportCopies(db, cursor);
   expect(page.executionId).toBe(id);
   expect(page.sequences).toEqual([copy.sequence]);
   const [original] =
-    await db.execute(sql`SELECT public.resolve_progressive_report(report,result_payload_hash)::text AS text
+    await db.execute(sql`SELECT report::text AS text, result_payload_hash AS hash
     FROM progressive_remote_reports WHERE sim_job_id=${id}::uuid AND sequence=${copy.sequence}`);
+  expect(original.hash).toBeNull();
+  await setProgressiveReportNormalization(db, { enabled: true, readersReady: true });
+  const sharing = await backfillProgressiveReportPayloads(db, {
+    table: "progressive_remote_reports", after: { executionId: id, sequence: anchorSequence },
+    rows: 1, apply: true,
+  });
+  expect(sharing.proofs).toEqual([{
+    executionId: id, sequence: copy.sequence, contentSignature: copyReceipt.contentSignature,
+    digest: createHash("sha256").update(String(original.text)).digest("hex"),
+  }]);
+  expect(sharing.normalized).toBe(1);
+  expect(await nextCancelledReportCopies(db, cursor)).toEqual(page);
+  const shared = await post();
+  expect(shared.statusCode, shared.body).toBe(200);
+  expect(shared.json().progressiveEvidenceReceipts).toEqual(warmBody.progressiveEvidenceReceipts);
+  expect(shared.json().progressiveArchiveReceipts).toEqual(warmBody.progressiveArchiveReceipts);
+  expect(shared.json().fulfilledAoas).toEqual([]);
+  expect(await readProgressiveRemoteRetention(db, id)).toEqual(waiting);
   let bytes = Buffer.alloc(0);
   const put: Parameters<typeof archiveProgressiveReportBatch>[3] = async (
     path,
