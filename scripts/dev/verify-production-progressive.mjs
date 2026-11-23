@@ -1,3 +1,4 @@
+import { observePolarBrowser } from "./observe-polar-browser.mjs";
 import assert from "node:assert/strict";
 import { chromium } from "@playwright/test";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
@@ -102,8 +103,10 @@ try {
     { width: 390, height: 844 },
   ]) {
     const context = await browser.newContext({ viewport });
+    let observeFailure;
     try {
       const page = await context.newPage();
+      observeFailure = observePolarBrowser(page, origin);
       const errors = [];
       page.on("pageerror", (error) => errors.push(String(error)));
       const navigation = await page.goto(`${origin}/airfoils/${slug}`, {
@@ -229,6 +232,9 @@ try {
         controls: "passed",
         reload: "passed",
       });
+    } catch (error) {
+      await observeFailure?.();
+      throw error;
     } finally {
       await context.close();
     }

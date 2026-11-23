@@ -1,3 +1,4 @@
+import { observePolarBrowser } from "./observe-polar-browser.mjs";
 import assert from "node:assert/strict";
 import { chromium, expect } from "@playwright/test";
 import { progressivePreviewOrigin } from "./progressive-preview-origin.mjs";
@@ -17,12 +18,14 @@ const evidenceDirectory = values.target ? `.codex-artifacts/fair-fit-browser-202
 if (evidenceDirectory) await mkdir(evidenceDirectory,{recursive:true});
 const browser = await chromium.launch({ headless: true });
 const outcomes = [];
+let observeFailure;
 try {
   for (const viewport of [
     { width: 1440, height: 1000 },
     { width: 390, height: 844 },
   ]) {
     const page = await browser.newPage({ viewport });
+    observeFailure = observePolarBrowser(page, origin);
     const errors = [];
     page.on("pageerror", (error) => errors.push(error.message));
     await page.goto(`${origin}/airfoils/${slug}`, {
@@ -208,6 +211,9 @@ try {
     });
     await page.close();
   }
+} catch (error) {
+  await observeFailure?.();
+  throw error;
 } finally {
   await browser.close();
 }
