@@ -247,16 +247,17 @@ def _checked_point_manifest(root, rel, proof, reported, declared, data, stored_s
 _RAW_DIRS = {"openfoam", "time_directories", "VTK"}
 
 
-def _checked_job_tree(root, protected, authenticated, urans_solvers, historical_dirs=()):
+def _checked_job_tree(root, protected, authenticated, urans_solvers, historical_dirs=(), preserve_solver=None):
     """Apply the same source, media, continuation and case-ownership checks to both stock operations."""
     check_media = protected is not None
     protected = protected or {}
     owned_cases = {case for case, _, _ in authenticated.values()}
     owned_solvers = {solver for _, solver, _ in authenticated.values()}
+    walked_solvers = urans_solvers | ({preserve_solver} if preserve_solver is not None else set())
     # The original (steady) case can retain its own decomposed state after
     # per-angle URANS runs. Its time directories are outside every removal plan
     # when no manifest selects that case itself as a postprocessing root.
-    uniform_roots = urans_solvers | {solver.parent for solver in urans_solvers
+    uniform_roots = walked_solvers | {solver.parent for solver in urans_solvers
                                      if solver.parent in owned_cases and solver.parent not in owned_solvers}
     historical_roots = {directory / name for directory in historical_dirs for name in _RAW_DIRS}
     protected_dirs = {p.as_posix() for name in protected for p in PurePosixPath(name).parents}
@@ -269,7 +270,7 @@ def _checked_job_tree(root, protected, authenticated, urans_solvers, historical_
         folder = Path(parent)
         relative = folder.relative_to(root)
         solver = PurePosixPath(*relative.parts[:3])
-        if solver in urans_solvers:
+        if solver in walked_solvers:
             # os.walk consumes one directory at a time, with bounded per-point
             # manifest candidates. Keep the original bound on unrelated trees.
             _require(len(names) + len(dirs) <= 100_000, "solver directory exceeds bounded filesystem inventory")
@@ -281,10 +282,10 @@ def _checked_job_tree(root, protected, authenticated, urans_solvers, historical_
         if folder.name == "transient" or folder.name.startswith("transient_a"):
             # foamToVTK names time exports after the solver and time index.
             # Only this exact layout below the authenticated solver is an export.
-            vtk_time = (solver in urans_solvers and relative.parent == solver / "VTK" and
+            vtk_time = (solver in walked_solvers and relative.parent == solver / "VTK" and
                         re.fullmatch(re.escape(solver.name) + r"_[0-9]+", folder.name))
             packaged = any(parent in historical_roots for parent in (relative, *relative.parents))
-            _require(vtk_time or packaged or relative in owned_solvers, "unarchived case state")
+            _require(vtk_time or packaged or relative in owned_solvers or relative == preserve_solver, "unarchived case state")
         for name in dirs:
             path = folder / name
             if path.is_symlink():
@@ -319,7 +320,55 @@ def _checked_job_tree(root, protected, authenticated, urans_solvers, historical_
         yield folder, relative, dirs, names
 
 
-def _inventory(root, proofs, readbacks, kept=None):
+def _preserved_solver_tree(root, directory):
+    """Pin every original entry in one unreported solver; it has no cloud disposition."""
+    tree = root / directory
+    _require(tree.is_dir() and tree.resolve(strict=True) == tree, "preserved solver is absent or linked")
+    digest = hashlib.sha256()
+    root_stat = tree.lstat()
+    digest.update(json.dumps([".", root_stat.st_mode, root_stat.st_dev, root_stat.st_ino]).encode() + b"\n")
+    samples = []
+    entries = files = logical = allocated = 0
+    def walk_error(exc):
+        raise exc
+    for parent, dirs, names in os.walk(tree, followlinks=False, onerror=walk_error):
+        folder = Path(parent)
+        dirs.sort()
+        for name in sorted([*dirs, *names]):
+            path = folder / name
+            rel = path.relative_to(tree)
+            st = path.lstat()
+            if re.fullmatch(r"core\.[0-9]+", name):
+                _require(stat.S_ISREG(st.st_mode), "unexpected forensic path type")
+                continue
+            entries += 1
+            _require(entries <= 100_000, "preserved solver exceeds the named inventory")
+            identity = [rel.as_posix(), st.st_mode, st.st_dev, st.st_ino]
+            if stat.S_ISREG(st.st_mode):
+                _require(st.st_nlink == 1 and path.resolve() == path, "shared or redirected preserved source")
+                size, sha = _size_and_sha256(path)
+                _require(size == st.st_size and _same_file(path, st), "preserved source changed during inventory")
+                files += 1
+                logical += size
+                allocated += st.st_blocks * 512
+                identity.extend([size, sha, st.st_mtime_ns, st.st_ctime_ns])
+                if size and "postProcessing" in rel.parts and name in ("coefficient.dat", "forceCoeffs.dat"):
+                    samples.append({"path": path.relative_to(root).as_posix(), "sha256": sha, "byteSize": size})
+            elif stat.S_ISLNK(st.st_mode):
+                target = path.resolve(strict=True)
+                _require(target.is_relative_to(tree) or (name == "polyMesh" and target.is_relative_to(root / "meshes")),
+                         "preserved solver links into another working source")
+                identity.extend([os.readlink(path), target.relative_to(root).as_posix()])
+            else:
+                _require(stat.S_ISDIR(st.st_mode), "special file in preserved solver")
+            digest.update(json.dumps(identity, separators=(",", ":")).encode() + b"\n")
+    _require(samples, "unreported solver has no readable original coefficient history")
+    return {"directory": directory.as_posix(), "treeSha256": digest.hexdigest(), "entries": entries,
+            "files": files, "byteSize": logical, "allocatedBytes": allocated,
+            "sample": min(samples, key=lambda f: ("/steady_initialization/" in f["path"], f["byteSize"], f["path"]))}
+
+
+def _inventory(root, proofs, readbacks, kept=None, preserved=None):
     expected = {str(_relative(p["directory"])): p for p in proofs}
     _require(expected and len(expected) == len(proofs), "empty or duplicate evidence identity")
     declared = {} if kept is not None else None
@@ -335,11 +384,20 @@ def _inventory(root, proofs, readbacks, kept=None):
     authenticated = {key: _local_manifest(root, root / key, expected[key], reported[key], readbacks,
                                           declared[key] if declared is not None else None) for key in expected}
     urans_solvers = {authenticated[key][1] for key in urans}
+    keep_root = None
+    if preserved is not None:
+        keep_root = _relative(preserved["directory"])
+        case = keep_root.parent
+        n = len(expected)
+        _require(kept is not None and len(urans) == n and
+                 keep_root.name == f"transient_a{n}" and len(case.parts) == 2 and case.parts[0] == "cases" and
+                 urans_solvers == {case / f"transient_a{i}" for i in range(n)},
+                 "preserved solver is not the next sibling of the fully owned URANS points")
     protected = kept or {}
     protected_dirs = {p.as_posix() for name in protected for p in PurePosixPath(name).parents}
     protected_identities = {(entry["byteSize"], entry["sha256"]) for entry, _ in protected.values()}
     candidates = {}
-    for folder, relative, dirs, names in _checked_job_tree(root, kept, authenticated, urans_solvers):
+    for folder, relative, dirs, names in _checked_job_tree(root, kept, authenticated, urans_solvers, preserve_solver=keep_root):
         if folder.name != "evidence" and "evidence_manifest.json" not in names:
             continue
         key = relative.as_posix()
@@ -367,6 +425,10 @@ def _inventory(root, proofs, readbacks, kept=None):
             if _size_and_sha256(path) == (info.st_size, member["sha256"]):
                 candidates[path] = (member["sha256"], info)
     _require(found == set(expected), "expected evidence directory missing")
+    if keep_root is not None:
+        _require(all(path.relative_to(root).parts[:3] != keep_root.parts for path in candidates),
+                 "candidate overlaps the preserved solver")
+        preserved.update(_preserved_solver_tree(root, keep_root))
     return candidates
 
 
@@ -511,7 +573,8 @@ def _allocation(root, rows, files, stored, receipt_files=None):
 
 
 def reclaim_closed_progressive_files(job_root: Path, proofs: list[dict], expected_plan: str | None = None,
-                                     readbacks: list[dict] | None = None, *, lock_identity: list[int] | None = None):
+                                     readbacks: list[dict] | None = None, *, lock_identity: list[int] | None = None,
+                                     preserve_solver: str | None = None):
     """Preview without writes. Apply rechecks the entire plan under the active solver's lock."""
     if not job_root.exists() and not job_root.is_symlink():
         return {"job_id": job_root.name, "state": "absent", "bytes": 0, "files": 0, "plan": None}
@@ -525,6 +588,10 @@ def reclaim_closed_progressive_files(job_root: Path, proofs: list[dict], expecte
 
             historic = [p for p in proofs if p.get("historicalRaw")]
             prefix = "closed_progressive_historical_raw_files" if historic else "closed_progressive_duplicate_files"
+            if preserve_solver is not None:
+                _require(not historic and all(p.get("regime") == "urans" and "keepMedia" in p for p in proofs),
+                         "preserving a solver requires all ordinary named URANS source proofs")
+                prefix = "closed_progressive_sibling_files"
             intent_file = job_root / (prefix+".intent.json")
             done_file = job_root / (prefix+".complete.json")
             stored = _json(intent_file, 32 * 1024**2) if intent_file.exists() else None
@@ -540,17 +607,22 @@ def reclaim_closed_progressive_files(job_root: Path, proofs: list[dict], expecte
             _require(not keep_requested or all("keepMedia" in p for p in proofs), "incomplete media keep-set")
             kept = {} if keep_requested else None
             samples={}
-            def inventory(keep):
+            preserved = {"directory": preserve_solver} if preserve_solver is not None else None
+            def inventory(keep, original=None):
                 return (_historical_inventory(job_root, proofs, authenticated, keep, intent_file.exists(), samples)
-                        if historic else _inventory(job_root, proofs, authenticated, keep))
-            files = inventory(kept)
+                        if historic else _inventory(job_root, proofs, authenticated, keep, original))
+            files = inventory(kept, preserved)
             kept_rows = [entry for entry, _ in (kept or {}).values()]
             current = {path.relative_to(job_root).as_posix(): [sha, st.st_size] for path, (sha, st) in files.items()}
             rows = stored["files"] if stored is not None else [[name, *current[name]] for name in sorted(current)]
             fingerprint = [proofs, rows, kept_rows] if keep_requested else [proofs, rows]
+            if preserved is not None:
+                fingerprint.append({"preservedSolver": preserved})
             digest = hashlib.sha256(json.dumps(fingerprint, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
             total = sum(row[2] for row in rows)
             receipt = {"job_id": job_root.name, "plan": digest, "bytes": total, "files": len(rows)}
+            if preserved is not None:
+                receipt["preservedSolver"] = preserved
             extra = {"mediaFiles": kept_rows, "workingPaths": [name for name, _, _ in rows],
                      "plannedAllocatedBytes": sum(info.st_blocks * 512 for _, info in files.values())
                      if stored is None else stored["allocationBaseline"]["fileAllocatedBytes"]} if keep_requested else {}
@@ -561,7 +633,8 @@ def reclaim_closed_progressive_files(job_root: Path, proofs: list[dict], expecte
                 extra["plannedAllocatedBytes"]=(sum(st.st_blocks*512 for _,st in files.values()) if stored is None else
                                                 stored["allocationBaseline"]["fileAllocatedBytes"])
             if stored is not None:
-                _require(stored.get("job_id") == job_root.name and stored.get("plan") == digest, "reclaim intent changed")
+                _require(stored.get("job_id") == job_root.name and stored.get("plan") == digest and
+                         stored.get("preservedSolver") == preserved, "reclaim intent changed")
                 intended = {name: [sha, size] for name, sha, size in rows}
                 _require(all(intended.get(name) == identity for name, identity in current.items()), "reclaim plan grew or changed")
                 for name in intended.keys() - current.keys():
@@ -579,15 +652,20 @@ def reclaim_closed_progressive_files(job_root: Path, proofs: list[dict], expecte
                 _require(_same_file(path, info), "source changed before unlink")
             for name, (_, st) in (kept or {}).items():
                 _require(_same_file(job_root / name, st), "retained image changed before reclaim")
-            if historic:
+            if historic or preserved is not None:
                 now = datetime.now(timezone.utc)
                 for readback in authenticated.values():
                     verified_at = datetime.fromisoformat(readback["verifiedAt"].replace("Z", "+00:00"))
                     _require(-5 <= (now - verified_at).total_seconds() <= 1200,
                              "registered restore proof expired during filesystem preflight")
+            if preserved is not None:
+                _require(_preserved_solver_tree(job_root, _relative(preserve_solver)) == preserved,
+                         "unreported solver changed before signed sibling removal")
             if stored is None:
                 stored = {"job_id": job_root.name, "plan": digest, "files": rows,
                           "allocationBaseline": _allocation(job_root, rows, files, None, receipt_files)}
+                if preserved is not None:
+                    stored["preservedSolver"] = preserved
             _atomic_create_json(intent_file, stored)
             # All folders, files and remote readbacks have passed under this job lock.
             for marker,payload in markers.items():
@@ -605,7 +683,8 @@ def reclaim_closed_progressive_files(job_root: Path, proofs: list[dict], expecte
                     os.close(fd)
             if kept is not None:
                 after = {}
-                _require(not inventory(after) and
+                retained_after = {"directory": preserve_solver} if preserved is not None else None
+                _require(not inventory(after, retained_after) and retained_after == preserved and
                          [entry for entry, _ in after.values()] == kept_rows and
                          all(_same_file(job_root / name, st) for name, (_, st) in kept.items()),
                          "retained media or working-file set changed during reclaim")

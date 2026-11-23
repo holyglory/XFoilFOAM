@@ -1035,7 +1035,7 @@ def test_api_running_guard_and_delete_status_codes():
     assert client.delete("/jobs/retention-api-missing").status_code == 404
 
 
-@pytest.mark.parametrize("mode", ["no-media", "rans-images", "urans-images", "urans-empty", "urans-foreign-method", "urans-foreign-solver"])
+@pytest.mark.parametrize("mode", ["no-media", "rans-images", "urans-images", "urans-empty", "urans-preserve-next", "urans-foreign-method", "urans-foreign-solver"])
 def test_closed_progressive_exact_duplicates_require_whole_job_proof(tmp_path, monkeypatch, mode):
     keep_media = mode != "no-media"
     urans = mode.startswith("urans-")
@@ -1144,10 +1144,12 @@ def test_closed_progressive_exact_duplicates_require_whole_job_proof(tmp_path, m
              "jobInode": peer["inode"](root), "lockInode": peer["inode"](lockpath)}
     readbacks = [dict(brokeredUploadId=p["brokeredUploadId"], generation=p["generation"], storedSha256=sha(b"gzip"),
                       storedByteSize=4, verifiedAt=datetime.now(timezone.utc).isoformat()) for p in proofs]
-    def request(proof_list=proofs, plan=None, objects=readbacks, mode=None, token="fixture-control", peer_scope=None):
+    preserve_directory = "cases/foil/transient_a2" if mode == "urans-preserve-next" else None
+    def request(proof_list=proofs, plan=None, objects=readbacks, mode=None, token="fixture-control", peer_scope=None,
+                preserve=preserve_directory):
         mode = mode or ("reclaim" if plan else "proof")
-        ctx = {**scope, "mode": mode, "plan": plan, **(peer_scope or {})}
-        body = json.dumps({"keepMedia":keep_media,"id": job, "step": 2 if plan else 1, "helper": scope["helper"], "mode": mode,
+        ctx = {**scope, "mode": mode, "plan": plan, "preserveSolver": preserve, **(peer_scope or {})}
+        body = json.dumps({"keepMedia":keep_media,"preserveSolver":preserve,"id": job, "step": 2 if plan else 1, "helper": scope["helper"], "mode": mode,
                            "expectedPlan": plan, "manifests": proof_list, "readbacks": objects if plan else []})
         packet = {"body": body, "mac": peer["signature"](token, "request", ctx["nonce"], body)}
         answer = peer["run_engine"](ctx, packet, native, settings)
@@ -1159,6 +1161,82 @@ def test_closed_progressive_exact_duplicates_require_whole_job_proof(tmp_path, m
             request(*args, **kwargs)
         return str(caught.value)
 
+    if preserve_directory:
+        next_solver = root / preserve_directory
+        coefficient = _write(next_solver / "postProcessing/forceCoeffs/0/coefficient.dat", b"0.1 0.2 0.015 0.001\\n")
+        original_bytes = coefficient.read_bytes()
+        unique = _write(next_solver / "1/U", b"unreported flow field")
+        assert "unarchived case state" in refused(preserve=None)
+        assert "next sibling" in refused(preserve="cases/foil/transient_a3")
+        with pytest.raises(ValueError, match="scope differs"):
+            request(peer_scope={"preserveSolver": None})
+        plan = request()
+        assert plan["preservedSolver"]["sample"] == {"path": coefficient.relative_to(root).as_posix(),
+                                                      "sha256": sha(original_bytes), "byteSize": len(original_bytes)}
+        assert {p.relative_to(root).as_posix() for p in duplicates} == set(plan["workingPaths"])
+        assert plan["preservedSolver"]["files"] == 2
+        coefficient.write_bytes(b"changed original")
+        refused(plan=plan["plan"])
+        assert all(p.exists() for p in duplicates)
+        coefficient.write_bytes(original_bytes)
+        escape = next_solver / "foreign"
+        escape.symlink_to(copies[0])
+        assert "symlink" in refused()
+        escape.unlink()
+        unowned = _write(next_solver / "evidence/evidence_manifest.json", b"unowned manifest")
+        assert "unowned evidence" in refused()
+        unowned.unlink()
+        unowned.parent.rmdir()
+        plan = request()
+        with monkeypatch.context() as interrupted:
+            normal_unlink = Path.unlink
+            def lose_process(path, *args, **kwargs):
+                if path == force:
+                    raise OSError("lost worker after recording the sibling intent")
+                return normal_unlink(path, *args, **kwargs)
+            interrupted.setattr(Path, "unlink", lose_process)
+            refused(plan=plan["plan"])
+        assert coefficient.read_bytes() == original_bytes and unique.is_file() and force.is_file()
+        assert (root / "closed_progressive_sibling_files.intent.json").is_file()
+        assert not (root / "closed_progressive_sibling_files.complete.json").exists()
+        done = request(plan=plan["plan"])
+        assert done["preservedSolver"] == plan["preservedSolver"] and done["allocation"]["fileAllocatedBytes"] > 0
+        assert request()["replayed"] and not any(p.exists() for p in duplicates)
+        assert coefficient.read_bytes() == original_bytes and unique.read_bytes() == b"unreported flow field"
+        assert not (root / "closed_progressive_duplicate_files.complete.json").exists()
+        assert "unarchived case state" in refused(preserve=None)
+        # A later real source for this third point must still enter the ordinary full-job workflow.
+        folder = case / "a2/evidence"
+        member = {"path": "openfoam/postProcessing/forceCoeffs/0/coefficient.dat", "byteSize": len(original_bytes), "sha256": sha(original_bytes)}
+        mf = _write_json(folder / "evidence_manifest.json", {"casePath": str(case), "postPath": str(next_solver),
+                         "methodKey": "openfoam.urans", "unsteady": True, "files": [member], "media": {"instantaneous": {}}})
+        new_sha, new_size = sha(mf.read_bytes()), mf.stat().st_size
+        arts = [{"path": "a2/evidence/evidence_manifest.json", "kind": "manifest", "sha256": new_sha, "byte_size": new_size},
+                {"path": "a2/evidence/engine_evidence.tar.zst", "kind": "engine_bundle", "sha256": sha(b"gzip"), "byte_size": 4}]
+        catalog = sorted(f"{a['kind']}\\tjobs/{job}/cases/foil/{a['path']}\\t{a['byte_size']}\\t{a['sha256']}" for a in arts)
+        third = {**proofs[1], "directory": "cases/foil/a2/evidence", "manifestSha256": new_sha, "manifestByteSize": new_size,
+                 "brokeredUploadId": "third-upload", "keepMedia": [], "catalogSha256": sha("\\n".join(catalog).encode())}
+        authorization = json.loads((case / "a1/evidence/brokered_hub_binding.database.json").read_bytes())["authorization"]
+        authorization["evidenceBase"] = "a2/evidence"
+        authorization["receipt"]["brokeredUploadId"] = third["brokeredUploadId"]
+        authorization["receipt"]["remote"]["manifestSha256"] = new_sha
+        _write_json(folder / "brokered_hub_binding.database.json", {"schemaVersion": 1, "state": "hub_progressive_custody", "authorization": authorization})
+        intent = {"schemaVersion": 1, "kind": "brokered-local-evidence-reclaim-intent", "authorization": authorization,
+                  "paths": [], "plannedPathCount": 0, "plannedBytes": 0}
+        _write_json(folder / "brokered_local_reclaim.intent.json", intent)
+        _write_json(folder / "brokered_local_reclaim.json", {"schemaVersion": 1, "state": "complete", "authorization": authorization,
+                    "bytesDeleted": 0, "deletedPaths": [], "intentSha256": sha(json.dumps(intent, sort_keys=True, separators=(",", ":")).encode())})
+        points.append({"case_slug": "foil", "images": {}, "evidence_artifacts": arts})
+        _write_json(root / "result.json", {"job_id": job, "state": "completed", "polars": [{"points": points}]})
+        full = request(proof_list=[*proofs, third], preserve=None)
+        assert full["workingPaths"] == [coefficient.relative_to(root).as_posix()]
+        refused(proof_list=[*proofs,third], plan=full["plan"], preserve=None, objects=readbacks)
+        assert coefficient.is_file()
+        complete = request(proof_list=[*proofs,third], plan=full["plan"], preserve=None,
+                           objects=[*readbacks, {**readbacks[1], "brokeredUploadId": third["brokeredUploadId"]}])
+        assert complete["state"] == "reclaimed" and not coefficient.exists() and unique.is_file()
+        assert (root / "closed_progressive_sibling_files.complete.json").is_file()
+        return
     if mode == "urans-empty":
         plan = request()
         assert plan["mediaFiles"] == [] and set(plan["workingPaths"]) == {p.relative_to(root).as_posix() for p in duplicates}

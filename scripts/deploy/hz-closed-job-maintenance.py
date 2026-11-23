@@ -152,6 +152,12 @@ def host_job(package):
     scope = selection(target["mode"], target["id"], target["plan"])
     scope.update(helper=validate_sources(package), nonce=secrets.token_hex(32), expectedScience=target.get("science"),dependencies=target.get("dependencies"),nodePackages=target.get("nodePackages"))
     require(scope["expectedScience"] is None or SHA.fullmatch(scope["expectedScience"]), "invalid scientific source digest")
+    if target.get("preserveSolver") is not None:
+        name = target["preserveSolver"]
+        require(isinstance(name,str) and re.fullmatch(r"cases/[A-Za-z0-9_.-]+/transient_a[0-9]+",name) and
+                not any(part in (".","..") for part in name.split("/")) and target.get("keepMedia") is True and
+                not target.get("historicalRaw"), "invalid signed sibling preservation scope")
+        scope["preserveSolver"] = name
     if target.get("historicalRaw"):
         require(target["historicalRaw"] is True,"invalid historical source mode")
         scope["historicalRaw"] = True
@@ -246,6 +252,7 @@ def host_job(package):
                 if msg["type"] == "refusal":
                     return {"status": "refused", "reason": str(msg["reason"])[:400], "job": scope["id"]}
                 receipt = msg["value"]
+                require(receipt.get("preserveSolver") == scope.get("preserveSolver"), "unreported solver scope changed")
                 if scope["mode"] in ("proof","verify"):
                     require(count == 1 and receipt["status"] == ("proved" if scope["mode"]=="proof" else "verified") and receipt["databaseReadOnly"] is True and
                             receipt["settled"] is False, "proof peer returned an invalid receipt")
@@ -331,6 +338,8 @@ def confirm_reclaim(package, target, effect, qualified=None):
     if target.get("historicalRaw"):
         require(effect.get("historicalRaw") is True, "result belongs to another custody mode")
         check["historicalRaw"] = True
+    if target.get("preserveSolver"):
+        check["preserveSolver"] = target["preserveSolver"]
     kept = effect.get("mediaSha256") or prior.get("mediaSha256")
     if target.get("keepMedia"):
         require(isinstance(kept, str) and SHA.fullmatch(kept), "completed keep-set lacks a served-media signature")
@@ -343,6 +352,10 @@ def confirm_reclaim(package, target, effect, qualified=None):
             "post-operation point, native receipt or GCS verification refused: "+str(after.get("reason","missing proof"))[:300])
     if target.get("keepMedia"):
         require(after.get("mediaSha256")==kept, "media bytes, served links or legend changed after removal")
+    if target.get("preserveSolver"):
+        before = effect.get("plan", {}).get("preservedSolver") or prior.get("preservedSolver")
+        require(before and before["directory"] == target["preserveSolver"] and after["plan"].get("preservedSolver") == before,
+                "unreported working source changed after the sibling operation")
     if effect["status"]=="settled":
         identity = lambda rows: sorted((r.get("brokeredUploadId",""),r.get("historicalPointSignature",""),r["generation"],r["storedSha256"],r["storedByteSize"],
                                         json.dumps(r.get("verifiedMember"),sort_keys=True)) for r in rows)
@@ -472,6 +485,7 @@ def main():
         sub = modes.add_parser(name)
         sub.add_argument("job")
         sub.add_argument("--historical-raw",action="store_true",help="verify historical physical custody and retire only the exact original bundle and its authenticated unpacked raw members")
+        sub.add_argument("--preserve-solver", help="pin and retain one unreported next URANS solver while releasing only verified copies in signed siblings")
         sub.add_argument("--keep-media", action="store_true", help="retain all proven instantaneous PNGs and verify stable, legacy and engine reads")
         sub.add_argument("plan", nargs="?" if name == "proof" else None)
         if name=="reclaim":
@@ -503,6 +517,9 @@ def main():
                  for r in map(json.loads, rows[offset:offset + args.limit])]
     else:
         item=selection(args.mode, args.job, args.plan)
+        if args.preserve_solver is not None:
+            require(args.keep_media and not args.historical_raw, "signed sibling release requires the complete local media inventory")
+            item["preserveSolver"] = args.preserve_solver
         if args.historical_raw:
             item["historicalRaw"] = True
             require(args.mode != "reclaim" or args.proof_receipt is not None, "historical raw removal needs the live original-file restore proof")
@@ -515,6 +532,10 @@ def main():
             require(proof["status"]=="proved" and proof["databaseReadOnly"] is True and proof["settled"] is False and
                     proof["job"]==args.job and proof["plan"]["plan"]==args.plan and proof["plan"]["bytes"]>0 and
                     proof["readbacks"] and SHA.fullmatch(proof["scientificSha256"]), "invalid pinned pre-removal proof")
+            require(proof.get("preserveSolver") == args.preserve_solver, "proof belongs to another sibling custody scope")
+            if args.preserve_solver:
+                require(proof["plan"].get("preservedSolver",{}).get("directory")==args.preserve_solver,
+                        "named remaining solver differs from the file proof")
             require(bool(proof.get("historicalRaw")) == args.historical_raw, "proof belongs to another custody mode")
             require(bool(proof.get("mediaSha256")) == bool(args.keep_media), "proof belongs to another retention mode")
             if args.keep_media:
