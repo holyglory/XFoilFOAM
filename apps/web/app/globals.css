@@ -112,7 +112,8 @@ html {
   --aero-dimmest: var(--aero-muted);
   --aero-red-text: var(--aero-red);
 }
-[data-theme="light"] .simulation-evidence-dialog {
+[data-theme="light"] .simulation-evidence-dialog,
+[data-theme="light"] .campaign-evidence-drawer {
   --aero-violet: #6345b3;
 }
 .catalog-page-shell {

@@ -22,6 +22,11 @@ const config: NextConfig = {
     return {
       beforeFiles: [
         {
+          source: "/admin",
+          has: [{ type: "query", key: "campaign", value: "[0-9a-fA-F-]{36}" }],
+          destination: "/admin-page/campaign",
+        },
+        {
           source: "/",
           missing: [{ type: "query", key: "condition" }],
           destination: "/catalog-page/default",
