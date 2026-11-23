@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { chromium, expect } from "@playwright/test";
 import { webSourceIdentity } from "../../apps/web/source-identity.mjs";
@@ -16,10 +16,9 @@ const origin = originFromDeployment({ ok: true, data: before });
 const source = webSourceIdentity(root);
 const directory = join(root, ".codex-artifacts", "catalog-design-audit");
 await mkdir(directory, { recursive: true });
-const browser = await chromium.launch({
-  executablePath: "/usr/bin/chromium",
-  headless: true,
-});
+// Chromium's process singleton uses an AF_UNIX path with a 108-byte limit.
+const socketDirectory = await mkdtemp("/tmp/airfoil-catalog-audit-");
+let browser;
 const steps = [];
 
 async function open(page, path) {
@@ -56,6 +55,11 @@ async function capture(page, label, control) {
 }
 
 try {
+  browser = await chromium.launch({
+    executablePath: "/usr/bin/chromium",
+    headless: true,
+    env: { ...process.env, TMPDIR: socketDirectory },
+  });
   const page = await browser.newPage({
     viewport: { width: 1440, height: 1000 },
   });
@@ -138,5 +142,9 @@ try {
     }),
   );
 } finally {
-  await browser.close();
+  try {
+    await browser?.close();
+  } finally {
+    await rm(socketDirectory, { recursive: true, force: true });
+  }
 }
