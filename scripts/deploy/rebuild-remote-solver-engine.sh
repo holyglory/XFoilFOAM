@@ -8,8 +8,23 @@ set -Eeuo pipefail
 ACTION="${1:-}"
 DRAIN_MODE=false
 DRAIN_REBIND=false
+DRAIN_KIND=engine
+GATEWAY_ACTION=""
+GATEWAY_CANARY=""
+GATEWAY_RECOVERY_QUEUE=false
+OPERATOR_LOCK_HELD=false
 NUMERICS2_TRANSITION=false
-if [[ "$ACTION" == "--drain" ]]; then
+if [[ "$ACTION" == "--historical-raw-gateway" ]]; then
+  GATEWAY_ACTION="${2:-}"
+  ACTION="${3:-}"
+  GATEWAY_CANARY="${4:-}"
+  DRAIN_MODE=true
+  DRAIN_KIND=historical-raw-gateway
+  case "$GATEWAY_ACTION:$#" in
+    prepare:3|recover:3|install:4) ;;
+    *) echo "Usage: $0 --historical-raw-gateway {prepare|recover} <current-build> | --historical-raw-gateway install <current-build> <private-canary.json>" >&2; exit 2 ;;
+  esac
+elif [[ "$ACTION" == "--drain" ]]; then
   DRAIN_MODE=true
   ACTION="${2:-}"
   if (($# != 2)); then
@@ -53,6 +68,9 @@ DEPLOYMENT_MANIFEST_FILE="${DEPLOYMENT_MANIFEST_FILE:-$APP_DIR/.deployment-sourc
 DEPLOY_SOURCE_REVISION="${DEPLOY_SOURCE_REVISION:-}"
 DEPLOY_SOURCE_TREE_SHA256="${DEPLOY_SOURCE_TREE_SHA256:-}"
 source "$DEPLOY_SCRIPT_DIR/numerics2-maintenance.sh"
+if [[ -n "$GATEWAY_ACTION" ]]; then
+  source "$DEPLOY_SCRIPT_DIR/historical-raw-gateway-maintenance.sh"
+fi
 RECEIPT_FILE="$AIRFOILS_PRO_STATE_DIR/remote-solver-2606-canary-receipt.json"
 ATTESTATION_FILE="$AIRFOILS_PRO_STATE_DIR/remote-solver-2606-attestation.json"
 BACKUP_MANIFEST_FILE="$AIRFOILS_PRO_STATE_DIR/remote-solver-2606-backup-manifest.json"
@@ -235,7 +253,13 @@ openfoam_processes() {
 }
 
 queue_activity() {
-  curl -fsS --max-time 15 http://127.0.0.1:8000/queue | python3 -c '
+  if [[ "${GATEWAY_RECOVERY_QUEUE:-false}" == "true" ]]; then
+    # The named API may be unavailable after an interrupted image switch. The
+    # original worker reads the same broker with the installed /queue endpoint.
+    historical_gateway_recovery_queue
+  else
+    curl -fsS --max-time 15 http://127.0.0.1:8000/queue
+  fi | python3 -c '
 import json, sys
 queue = json.load(sys.stdin)
 modern = "worker_queues_error" in queue
@@ -289,7 +313,7 @@ WITH executable_jobs AS (
   SELECT job.id
   FROM sim_jobs job
   WHERE job.status IN ('pending','submitted','running','ingesting')
-    AND NOT (
+    AND (
       (
         job.engine_state IN ('completed','failed','cancelled')
       )
@@ -320,7 +344,7 @@ WITH executable_jobs AS (
         )
       )
       )
-    )
+    ) IS NOT TRUE
 ), activity AS (
   SELECT
     (SELECT count(*) FROM executable_jobs)::int AS live_jobs,
@@ -421,6 +445,12 @@ load_drain_state() {
     echo "No durable HZ remote-solver drain is pending." >&2
     return 14
   }
+  local kind
+  kind="$(read_env_var REMOTE_SOLVER2606_DRAIN_KIND)"
+  [[ "${kind:-engine}" == "${DRAIN_KIND:-engine}" ]] || {
+    echo "The durable HZ drain belongs to a different maintenance operation." >&2
+    return 14
+  }
   phase="$(read_env_var REMOTE_SOLVER2606_DRAIN_PHASE)"
   case "$phase" in
     prepared|draining|drained|maintenance) ;;
@@ -479,6 +509,7 @@ persist_drain_state() {
   local phase="$1"
   set_env_vars_atomic \
     "REMOTE_SOLVER2606_DRAIN_PENDING=1" \
+    "REMOTE_SOLVER2606_DRAIN_KIND=${DRAIN_KIND:-engine}" \
     "REMOTE_SOLVER2606_DRAIN_PHASE=$phase" \
     "REMOTE_SOLVER2606_DRAIN_TARGET_BUILD_ID=$ACTION" \
     "REMOTE_SOLVER2606_DRAIN_SOURCE_REVISION=$DEPLOY_SOURCE_REVISION" \
@@ -495,6 +526,7 @@ persist_drain_state() {
 clear_drain_state() {
   set_env_vars_atomic \
     "REMOTE_SOLVER2606_DRAIN_PENDING=0" \
+    "REMOTE_SOLVER2606_DRAIN_KIND=" \
     "REMOTE_SOLVER2606_DRAIN_PHASE=" \
     "REMOTE_SOLVER2606_DRAIN_TARGET_BUILD_ID=" \
     "REMOTE_SOLVER2606_DRAIN_SOURCE_REVISION=" \
@@ -1215,7 +1247,12 @@ if payload.get("evidence_storage") != expected_storage:
 }
 
 fail_safe() {
-  local rc=$?
+  local rc=$? kind
+  if [[ "${OPERATOR_LOCK_HELD:-true}" != true ]]; then return "$rc"; fi
+  if [[ "$DRAIN_MODE" == true && $rc -ne 0 && "$(read_env_var REMOTE_SOLVER2606_DRAIN_PENDING)" == 1 ]]; then
+    kind="$(read_env_var REMOTE_SOLVER2606_DRAIN_KIND)"
+    if [[ "${kind:-engine}" != "${DRAIN_KIND:-engine}" ]]; then return "$rc"; fi
+  fi
   if [[ -n "$CANARY_TEMP_FILE" ]]; then
     rm -f "$CANARY_TEMP_FILE" || true
     CANARY_TEMP_FILE=""
@@ -1546,6 +1583,7 @@ perform_drain_and_maintenance() {
 
 main() {
   exec 9>"$LOCK_FILE"; flock -n 9 || { echo "Another deployment is running." >&2; exit 9; }
+  OPERATOR_LOCK_HELD=true
   verify_deployment_source
   validate_compose_profile
   if [[ "$ACTION" == "--rollback" ]]; then perform_rollback; return; fi
@@ -1560,7 +1598,11 @@ main() {
       echo "HZ drain mode requires a completed, attested OpenCFD 2606 cutover." >&2
       exit 14
     }
-    perform_drain_and_maintenance
+    if [[ -n "$GATEWAY_ACTION" ]]; then
+      historical_gateway_operation
+    else
+      perform_drain_and_maintenance
+    fi
     return
   fi
   if [[ "$state" == "complete" ]]; then

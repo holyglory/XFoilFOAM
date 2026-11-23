@@ -169,6 +169,15 @@ def host_job(package):
                 "deployment lock identity changed")
         keep_media = scope.get("keepMedia") is True
         historical = scope.get("historicalRaw") is True
+        if historical and scope["mode"] == "reclaim":
+            # The gateway may be returning to its previous image until its reader
+            # proof and exact control-plane restoration have both completed.
+            state = Path("/opt/airfoils-pro/state/.env.deploy")
+            flags = {key: value.strip().strip("\"'") for line in state.read_text().splitlines()
+                     if "=" in line for key, value in [line.split("=", 1)]
+                     if key in {"REMOTE_SOLVER2606_DRAIN_KIND", "REMOTE_SOLVER2606_DRAIN_PENDING"}}
+            require(flags.get("REMOTE_SOLVER2606_DRAIN_KIND") != "historical-raw-gateway" or
+                    flags.get("REMOTE_SOLVER2606_DRAIN_PENDING") != "1", "file gateway cutover or recovery is pending")
         include_node = keep_media or historical
         topology = containers(include_node)
         if historical:
