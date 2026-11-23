@@ -18,6 +18,7 @@ const handle = app.getRequestHandler();
 const compress = promisify(gzip);
 const refreshId = randomUUID();
 const freshMs = 5_000;
+const maxAgeMs = 60_000;
 const vary = [
   "accept-encoding",
   "rsc",
@@ -135,9 +136,9 @@ async function serve(req, res) {
     (!h.accept || /text\/html|\*\/\*/i.test(h.accept));
   const encoding = ordinary && acceptedEncoding(h["accept-encoding"]);
   if (encoding) {
-    if (!cached || Date.now() - cached.at > 60_000) await refreshOnce();
+    if (!cached || Date.now() - cached.at > maxAgeMs) await refreshOnce();
     const entry = cached;
-    if (entry && Date.now() - entry.at <= 60_000) {
+    if (entry && Date.now() - entry.at <= maxAgeMs) {
       if (Date.now() - entry.at >= freshMs) void refreshOnce();
       const body = encoding === "gzip" ? entry.compressed : entry.body;
       for (const [key, value] of Object.entries(entry.headers))
@@ -174,4 +175,13 @@ const server = createServer((req, res) => {
 server.on("upgrade", app.getUpgradeHandler());
 server.listen(port, values.hostname, () => {
   void refreshOnce();
+  // A quiet catalog still has a recent document ready for the next visitor.
+  // Active traffic already refreshes it more frequently through the request path.
+  const idleRefreshMs = Math.floor(maxAgeMs / 2);
+  const timer = setInterval(() => {
+    if (!cached || Date.now() - cached.at >= idleRefreshMs - freshMs)
+      void refreshOnce();
+  }, idleRefreshMs);
+  timer.unref();
+  server.once("close", () => clearInterval(timer));
 });
