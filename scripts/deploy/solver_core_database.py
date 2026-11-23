@@ -81,14 +81,29 @@ class Database:
         vals=",".join("('%s'::uuid,'%s'::uuid)"%(uuid.UUID(j),uuid.UUID(db)) for j,db in mapping.items())
         # Case-scoped catalogs are authoritative even if raw data was already
         # moved. Only potentially relevant path declarations leave the database.
-        return self.query(f"""WITH k(native,id) AS(VALUES {vals}), matched AS MATERIALIZED(
-           SELECT a.id,a.sim_job_id,a.engine_job_id,a.engine_case_slug,a.storage_key,a.engine_url,a.metadata
-           FROM public.solver_evidence_artifacts a WHERE a.sim_job_id IN (SELECT id FROM k)
-             OR a.engine_job_id IN (SELECT native::text FROM k)
-        ), artifacts AS MATERIALIZED(
-           SELECT k.native,a.id,a.engine_case_slug AS slug,a.storage_key,a.engine_url,a.metadata
-           FROM matched a JOIN k ON a.sim_job_id=k.id OR a.engine_job_id=k.native::text
-        ), attempts AS MATERIALIZED(
+        indexed=self.query("""SELECT to_jsonb(count(DISTINCT att.attname)=2) FROM pg_catalog.pg_index i
+          JOIN pg_catalog.pg_class c ON c.oid=i.indexrelid JOIN pg_catalog.pg_am am ON am.oid=c.relam
+          JOIN pg_catalog.pg_attribute att ON att.attrelid=i.indrelid AND att.attnum=i.indkey[0]
+          WHERE i.indrelid='public.solver_evidence_artifacts'::regclass AND am.amname='btree'
+          AND att.attname IN ('sim_job_id','engine_job_id') AND i.indisvalid AND i.indisready AND i.indislive
+          AND (i.indpred IS NULL OR pg_get_expr(i.indpred,i.indrelid)='('||att.attname||' IS NOT NULL)')""")[0]
+        if indexed:
+            owners="""artifacts AS MATERIALIZED(
+                SELECT k.native,a.id,a.engine_case_slug AS slug,a.storage_key,a.engine_url,a.metadata
+                FROM k CROSS JOIN LATERAL (
+                  SELECT f.id FROM public.solver_evidence_artifacts f WHERE f.sim_job_id=k.id AND f.sim_job_id IS NOT NULL
+                  UNION SELECT f.id FROM public.solver_evidence_artifacts f
+                     WHERE f.engine_job_id=k.native::text AND f.engine_job_id IS NOT NULL
+                ) exact JOIN public.solver_evidence_artifacts a ON a.id=exact.id)"""
+        else:
+            owners="""matched AS MATERIALIZED(
+                SELECT a.id,a.sim_job_id,a.engine_job_id,a.engine_case_slug,a.storage_key,a.engine_url,a.metadata
+                FROM public.solver_evidence_artifacts a WHERE a.sim_job_id IN (SELECT id FROM k)
+                  OR a.engine_job_id IN (SELECT native::text FROM k)
+              ), artifacts AS MATERIALIZED(
+                SELECT k.native,a.id,a.engine_case_slug AS slug,a.storage_key,a.engine_url,a.metadata
+                FROM matched a JOIN k ON a.sim_job_id=k.id OR a.engine_job_id=k.native::text)"""
+        return self.query(f"""WITH k(native,id) AS(VALUES {vals}), {owners}, attempts AS MATERIALIZED(
            SELECT k.native,a.id,a.result_id FROM k JOIN public.result_attempts a ON a.sim_job_id=k.id OR a.engine_job_id=k.native::text
         ), refs AS (
            SELECT a.native,a.slug,t.ref FROM artifacts a CROSS JOIN LATERAL(VALUES

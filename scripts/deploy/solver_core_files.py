@@ -272,6 +272,7 @@ def core_action(volume, state, subject_row, job_fds, documents, db_paths, action
     key=hashlib.sha256(json.dumps([job,subject_row["r"],*[subject_row[k]for k in FIELDS]],separators=(",",":")).encode()).hexdigest()
     receipt=state/"files"/(key+".json")
     record=load_json(receipt) if receipt.exists() else {"state":"new","source":subject_row,"key":key}
+    original_state=record["state"]
     require(record["source"]==subject_row, "retirement intent has different ownership")
     with ExitStack() as stack:
         cf=_enter(stack,case,DIR,cases)
@@ -348,8 +349,11 @@ def core_action(volume, state, subject_row, job_fds, documents, db_paths, action
             if action != "restore":
                 require(not holders(), "process holds the quarantined core or job")
                 science_check()
+            if detached is not None and original_state in ("intent","restore-intent") and action!="restore":
+                restore()
+                return {"state":"restored-retry","key":key,"allocated":0}
             if action == "stage":
-                require(record["state"] == "quarantined", "incomplete claim; restore before retry")
+                require(record["state"] in ("quarantined","release-intent"), "incomplete claim; restore before retry")
                 return {"state":"quarantined","key":key,"allocated":0}
             if action in ("canary","restore"):
                 if "sha256" in record:require(full_hash(f)==record["sha256"],"quarantined core content changed")
