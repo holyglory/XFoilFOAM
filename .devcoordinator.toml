@@ -6174,3 +6174,38 @@ name = "capture"
 tier = "release"
 command = ["node", "scripts/dev/capture-catalog-audit.mjs"]
 retained_artifacts = [{ name = "catalog-audit-captures", path = ".codex-artifacts/catalog-design-audit", max_bytes = 16777216 }]
+
+# Private stopped-solver variant of the catalog deployment for campaign attempt navigation.
+[deployment.campaign-stage-preview]
+source = ["worktree"]
+components = ["db", "api", "web"]
+public = false
+ttl_seconds = 86400
+
+[deployment.campaign-stage-preview.component.db]
+type = "postgres"
+image = "postgres:16-alpine"
+database = "aerodb_campaign_stage"
+user = "aerodb"
+
+[deployment.campaign-stage-preview.component.api]
+type = "process"
+command = ["bash", "scripts/dev/catalog-paging-api.sh", "--campaign-stage-fixture"]
+port = true
+depends_on = ["db"]
+health = { path = "/health", timeout_seconds = 240 }
+
+[deployment.campaign-stage-preview.component.web]
+type = "process"
+command = ["bash", "scripts/dev/progressive-preview.sh", "web"]
+port = true
+depends_on = ["api"]
+health = { path = "/", timeout_seconds = 600 }
+
+[test.campaign-stage-preview]
+timeout_seconds = 90
+
+[[test.campaign-stage-preview.check]]
+name = "authenticated-stage-reads"
+tier = "development"
+command = ["node", "scripts/dev/verify-campaign-stage-fixture.mjs"]
