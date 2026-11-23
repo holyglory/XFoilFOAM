@@ -95,7 +95,17 @@ function signedFacts(text, key, owner, resultMeta) {
   };
 }
 
-async function workerSource(db, key, scope, lock = false, coldPin = null) {
+// A source may be reused only inside this process. Each subsequent committed product
+// read still goes through the real installed reader and authenticates the physical generation.
+const authenticatedSources = new WeakSet();
+async function workerSource(
+  db,
+  key,
+  scope,
+  lock = false,
+  coldPin = null,
+  previous = null,
+) {
   const id = key.executionId,
     seq = key.sequence;
   const owner = await nativeReportOwner(db, id);
@@ -142,7 +152,17 @@ async function workerSource(db, key, scope, lock = false, coldPin = null) {
     await verifyRegistration(db, key, row.archive_bundle_id, coldPin);
   }
   let text;
-  if (row.archived_at) {
+  const reuse =
+    row.archived_at && previous && authenticatedSources.has(previous);
+  if (reuse) {
+    validatePin(coldPin, key, previous);
+    eq(
+      previous.owner,
+      owner,
+      "Authenticated original belongs to another owner",
+    );
+    text = previous.text;
+  } else if (row.archived_at) {
     text = await readStoredWorkerArchiveText(db, coldPin);
   } else {
     const prior =
@@ -159,15 +179,17 @@ async function workerSource(db, key, scope, lock = false, coldPin = null) {
     );
     text = source.text;
   }
-  const resultMeta = {};
-  const facts = signedFacts(text, key, owner, resultMeta);
+  const resultMeta = reuse ? previous.resultMeta : {};
+  const facts = reuse
+    ? previous.facts
+    : signedFacts(text, key, owner, resultMeta);
   const anchors =
     await db.execute(sql`SELECT h.point_content_signature AS signature,h.sequence::int AS sequence,
     a.id::text AS "workerAttempt",a.result_id::text AS "workerResult",h.receipt->>'resultAttemptId' AS "hubAttempt",h.receipt->>'resultId' AS "hubResult",
     a.aoa_deg AS aoa,a.engine_case_slug AS "caseSlug",a.status AS "workerStatus",a.valid_for_polar AS "workerValidForPolar",a.cl::text AS "workerCl",a.cd::text AS "workerCd",a.cm::text AS "workerCm",
     (SELECT jsonb_agg(to_jsonb(c) ORDER BY c.id) FROM result_classifications c WHERE c.result_attempt_id=a.id) AS "workerClassification"
     FROM jsonb_to_recordset(${JSON.stringify(facts.points)}::jsonb) pt(signature text,aoa double precision,"caseSlug" text)
-    JOIN progressive_worker_hub_receipts h ON h.sim_job_id=${id}::uuid AND h.point_content_signature=pt.signature AND h.sequence<${seq}
+    JOIN progressive_worker_hub_receipts h ON h.sim_job_id=${id}::uuid AND h.point_content_signature=pt.signature AND h.sequence<>${seq}
     JOIN progressive_worker_evidence_attempts e USING(sim_job_id,sequence,point_content_signature,result_attempt_id)
     JOIN progressive_worker_evidence_receipts st ON st.sim_job_id=e.sim_job_id AND st.sequence=e.sequence
     JOIN progressive_worker_reports origin ON origin.sim_job_id=st.sim_job_id AND origin.sequence=st.sequence AND origin.content_signature=st.content_signature
@@ -175,6 +197,8 @@ async function workerSource(db, key, scope, lock = false, coldPin = null) {
     JOIN result_attempts a ON a.id=h.result_attempt_id AND a.sim_job_id=h.sim_job_id AND a.engine_job_id=h.sim_job_id::text
       AND a.aoa_deg=pt.aoa AND a.engine_case_slug IS NOT DISTINCT FROM pt."caseSlug" AND a.result_id IS NOT NULL
     JOIN sim_jobs j ON j.id=a.sim_job_id AND j.airfoil_id=a.airfoil_id AND j.simulation_preset_revision_id=a.simulation_preset_revision_id AND j.bc_ids ? a.bc_id::text
+    WHERE EXISTS(SELECT FROM progressive_worker_reports stop WHERE stop.sim_job_id=j.id AND stop.stopped_engine_job_id=j.engine_job_id
+      AND stop.assignment_signature=origin.assignment_signature AND stop.acknowledged_at IS NOT NULL AND stop.sequence>=h.sequence)
     ORDER BY h.point_content_signature COLLATE "C" ${lock ? sql`FOR SHARE OF h,e,st,origin,a NOWAIT` : sql``}`);
   matchingScience(
     Array.from(anchors, (a) => ({
@@ -183,13 +207,13 @@ async function workerSource(db, key, scope, lock = false, coldPin = null) {
       caseSlug: a.caseSlug,
     })),
     facts.points,
-    "Missing or ambiguous earlier native science",
+    "Missing or ambiguous settled native science",
   );
   eligible(
     anchors.every((a) => a.hubAttempt && a.hubResult),
     "Incomplete hub receipt",
   );
-  return {
+  const measured = {
     owner,
     facts,
     anchors: [...anchors],
@@ -200,6 +224,8 @@ async function workerSource(db, key, scope, lock = false, coldPin = null) {
     archivedBundle: row.archive_bundle_id,
     text,
   };
+  authenticatedSources.add(measured);
+  return measured;
 }
 
 async function hubScience(db, key, source) {
@@ -238,7 +264,7 @@ async function hubScience(db, key, source) {
     FROM jsonb_to_recordset(${JSON.stringify(source.anchors)}::jsonb) pt(signature text,sequence int,aoa double precision,"caseSlug" text,
       "workerAttempt" uuid,"workerResult" uuid,"hubAttempt" uuid,"hubResult" uuid)
     JOIN progressive_remote_evidence_receipts e ON e.sim_job_id=${id}::uuid AND e.point_content_signature=pt.signature
-      AND e.sequence=pt.sequence AND e.sequence<${seq} AND e.remote_result_attempt_id=pt."workerAttempt" AND e.remote_result_id=pt."workerResult"
+      AND e.sequence=pt.sequence AND e.sequence<>${seq} AND e.remote_result_attempt_id=pt."workerAttempt" AND e.remote_result_id=pt."workerResult"
     JOIN progressive_remote_report_sources s ON s.sim_job_id=e.sim_job_id AND s.sequence=e.sequence AND s.point_content_signature=e.point_content_signature
     JOIN progressive_remote_reports origin ON origin.sim_job_id=s.sim_job_id AND origin.sequence=s.sequence
     JOIN progressive_remote_report_inventories i ON i.sim_job_id=s.sim_job_id AND i.sequence=s.sequence AND i.report_content_signature=origin.content_signature
@@ -251,9 +277,9 @@ async function hubScience(db, key, source) {
   matchingScience(
     Array.from(prior, (a) => a.signature),
     source.facts.points.map((p) => p.signature),
-    "Hub does not retain every earlier scientific source",
+    "Hub does not retain every settled scientific source",
   );
-  return { instance: r.instance, earlier: [...prior] };
+  return { instance: r.instance, witnesses: [...prior] };
 }
 
 function identity(source) {
@@ -286,7 +312,12 @@ function validatePin(pin, key, source) {
       pin.memberCount > 0 &&
       pin.memberCount <= 8,
   );
-  assert.equal(pin.lastSequence - pin.firstSequence + 1, pin.memberCount);
+  assert.ok(
+    Number.isSafeInteger(pin.firstSequence) &&
+      Number.isSafeInteger(pin.lastSequence) &&
+      pin.firstSequence > 0 &&
+      pin.memberCount <= pin.lastSequence - pin.firstSequence + 1,
+  );
   assert.ok(
     pin.firstSequence <= key.sequence && key.sequence <= pin.lastSequence,
   );
@@ -319,7 +350,12 @@ async function verifyRegistration(db, key, bundle, p) {
     "Native SQL pointer differs from the saved verified generation",
   );
 }
-async function productRead(db, key, source, pin, reader, committed) {
+async function productRead(db, key, native, pin, reader, committed) {
+  assert.ok(
+    authenticatedSources.has(native),
+    "Independent PostgreSQL source required",
+  );
+  validatePin(pin, key, native);
   if (reader === "api") {
     const { installApiReportArchiveReader } =
       await import("../../api/src/progressive-report-archive-reader.ts");
@@ -330,25 +366,30 @@ async function productRead(db, key, source, pin, reader, committed) {
       read: (i, conn) => readStoredWorkerArchiveText(conn, i),
     });
   }
-  const text = await readStoredWorkerArchiveText(db, {
-    ...pin,
-    signal: AbortSignal.timeout(30000),
-  });
-  eq(
-    signedFacts(text, key, source.owner),
-    source.facts,
-    "Restored HZ member differs from the native original",
-  );
-  if (committed) {
-    const full = await readProgressiveReport(db, {
-      sourceKind: "worker",
-      executionId: key.executionId,
-      sequence: key.sequence,
-      contentSignature: key.signature,
+  if (!committed) {
+    const text = await readStoredWorkerArchiveText(db, {
+      ...pin,
+      signal: AbortSignal.timeout(30000),
     });
+    assert.ok(
+      text === native.text,
+      "Restored HZ member differs from the authenticated original",
+    );
+  } else {
+    assert.ok(native.archivedBundle, "Native archive pointer missing");
+    const full = await readProgressiveReport(
+      db,
+      {
+        sourceKind: "worker",
+        executionId: key.executionId,
+        sequence: key.sequence,
+        contentSignature: key.signature,
+      },
+      native.owner,
+    );
     eq(
       full,
-      reportValidationValue(parseReportJson(text)),
+      reportValidationValue(parseReportJson(native.text)),
       "Ordinary report read differs from authenticated PostgreSQL text",
     );
   }
@@ -497,7 +538,7 @@ async function settle(db, m, admitted) {
       "Worker evidence or scheduling eligibility changed",
     );
     if (before.archivedBundle) {
-      await productRead(tx, key, source, pin, "sweeper", true);
+      await productRead(tx, key, before, pin, "sweeper", true);
       return {
         outcome: "already_retired",
         bundle: before.archivedBundle,
@@ -528,13 +569,13 @@ async function settle(db, m, admitted) {
       archived_at=clock_timestamp(),archive_bundle_id=${bundle.id}::uuid WHERE sim_job_id=${key.executionId}::uuid AND sequence=${key.sequence}
       AND content_signature=${key.signature} AND archived_at IS NULL AND archive_bundle_id IS NULL RETURNING sequence`);
     assert.ok(changed, "Native report changed before retirement");
-    const after = await workerSource(tx, key, scope, false, pin);
+    const after = await workerSource(tx, key, scope, false, pin, before);
     eq(
       identity(after),
       source,
       "Retirement changed native scientific eligibility",
     );
-    await productRead(tx, key, source, pin, "sweeper", true);
+    await productRead(tx, key, after, pin, "sweeper", true);
     let dictionaryBytes = 0;
     if (before.fk) {
       const retired =
@@ -553,10 +594,10 @@ async function settle(db, m, admitted) {
     };
   });
 }
-async function runClosedReportPeer(db, m) {
+async function runClosedReportPeer(db, m, readBasis) {
   if (m.op === "discover-worker" || m.op === "discover-hub")
     return discoverOriginals(db, m);
-  if (m.items) return runClosedPage(db, m);
+  if (m.items) return runClosedPage(db, m, readBasis);
   const { op, key, scope } = m;
   assertSourceKey(key);
   assert.ok(
@@ -598,17 +639,22 @@ async function runClosedReportPeer(db, m) {
   if (op === "settle") return settle(db, m);
   if (op === "read") {
     validatePin(m.pin, key, m.source);
-    const actual = await workerSource(db, key, scope, false, m.pin);
+    const saved = m.committed ? readBasis?.get(key.sequence) : undefined;
+    const prior =
+      saved && isDeepStrictEqual(saved.pin, m.pin) ? saved.original : null;
+    const actual = await workerSource(db, key, scope, false, m.pin, prior);
     eq(identity(actual), m.source, "Native scientific evidence changed");
     if (m.committed) assert.ok(actual.archivedBundle);
     const proof = await productRead(
       db,
       key,
-      m.source,
+      actual,
       m.pin,
       m.reader,
       !!m.committed,
     );
+    if (!m.committed && readBasis)
+      readBasis.set(key.sequence, { pin: m.pin, original: actual });
     return { ...proof, storedFieldBytes: actual.stored };
   }
   const native = await workerSource(db, key, scope, false, m.pin);
@@ -631,7 +677,7 @@ async function runClosedReportPeer(db, m) {
   assert.ok(!native.archivedBundle, "Existing archive must be resumed");
   return uploadOriginal(db, key, native);
 }
-async function invokeClosedReport(m) {
+async function verifyInstalledReportFiles(m) {
   // The controller pins the installed product dependencies on each role, including the actual API reader.
   for (const [filename, sha] of Object.entries(m.runtime)) {
     assert.ok(
@@ -644,8 +690,10 @@ async function invokeClosedReport(m) {
       `Installed report dependency differs: ${filename}`,
     );
   }
-  const writer = m.op === "settle";
-  const client = createClient({
+}
+
+function closedReportClient(writer) {
+  return createClient({
     max: 1,
     connection: {
       application_name: "closed_worker_report_custody",
@@ -654,6 +702,11 @@ async function invokeClosedReport(m) {
       ...(writer ? {} : { default_transaction_read_only: "on" }),
     },
   });
+}
+
+async function invokeClosedReport(m) {
+  await verifyInstalledReportFiles(m);
+  const client = closedReportClient(m.op === "settle");
   try {
     return await runClosedReportPeer(client.db, m);
   } finally {
@@ -731,15 +784,18 @@ class ClosedWorkerCloud extends HubWorkloadGcs {
     assert.equal(seen, items.length, "Incomplete pinned worker page");
   }
 }
-async function runClosedPage(db, m) {
+async function runClosedPage(db, m, readBasis) {
   const { op, items, scope } = m,
     keys = items.map((i) => i.key);
   assert.ok(keys.length >= 2 && keys.length <= 8);
   for (const [i, k] of keys.entries()) {
     assertSourceKey(k);
     assert.ok(
-      k.executionId === m.key.executionId && k.sequence === m.key.sequence + i,
-      "Expected adjacent source keys from one execution",
+      k.executionId === m.key.executionId &&
+        (i === 0
+          ? k.sequence === m.key.sequence
+          : k.sequence > keys[i - 1].sequence),
+      "Expected strictly ordered signed keys from one execution",
     );
     assert.ok(
       !scope.range ||
@@ -836,13 +892,17 @@ async function runClosedPage(db, m) {
     const rows = [];
     for (const item of items)
       rows.push(
-        await runClosedReportPeer(db, {
-          op,
-          scope,
-          ...item,
-          reader: m.reader,
-          committed: m.committed,
-        }),
+        await runClosedReportPeer(
+          db,
+          {
+            op,
+            scope,
+            ...item,
+            reader: m.reader,
+            committed: m.committed,
+          },
+          readBasis,
+        ),
       );
     return { rows };
   }
@@ -922,4 +982,85 @@ async function discoverOriginals(db, m) {
       AND NOT EXISTS(SELECT FROM progressive_remote_report_inventories i WHERE i.sim_job_id=j.id AND i.sequence=k.sequence)
     ORDER BY k."executionId",k.sequence`);
   return { keys: [...matches] };
+}
+async function serveClosedReportReads(role) {
+  // A read peer cannot publish or settle. The native writer retains a separate short-lived
+  // process and takes the existing deployment lock for every transaction and upload.
+  const operations = {
+    hub: ["hub", "cloud", "discover-hub"],
+    api: ["read"],
+    worker: ["source", "read", "discover-worker"],
+  };
+  assert.ok(Object.hasOwn(operations, role));
+  const client = closedReportClient(false);
+  const basis = new Map();
+  const { createInterface } = await import("node:readline");
+  const input = createInterface({ input: process.stdin, crlfDelay: Infinity });
+  const emit = (value) =>
+    new Promise((resolve, reject) => {
+      const line = JSON.stringify(value);
+      if (Buffer.byteLength(line) > 2 * 1024 ** 2 - 1) {
+        reject(new Error("Oversized native read response"));
+        return;
+      }
+      process.stdout.write(line + "\n", (e) => (e ? reject(e) : resolve()));
+    });
+  let n = 0;
+  try {
+    await emit({ ready: role, bootMs: performance.now() });
+    for await (const line of input) {
+      assert.ok(Buffer.byteLength(line) <= 1024 ** 2);
+      const message = JSON.parse(line),
+        m = message.request;
+      assert.ok(
+        ++n <= 128 && message.n === n && operations[role].includes(m.op),
+        "Invalid read session request",
+      );
+      if (m.op === "read")
+        assert.equal(m.reader, role === "api" ? "api" : "sweeper");
+      const start = performance.now(),
+        cpu = process.cpuUsage();
+      try {
+        // Keep at most one pre-commit snapshot page per native role. Neither a
+        // generation proof nor a parsed ordinary read result survives in this map.
+        if (m.op !== "read" || !m.committed) basis.clear();
+        await verifyInstalledReportFiles(m);
+        let value;
+        try {
+          value = await runClosedReportPeer(client.db, m, basis);
+        } catch (e) {
+          if (
+            !["source", "hub"].includes(m.op) ||
+            e.name !== "ClosedReportHeld"
+          )
+            throw e;
+          value = { held: e.message };
+        } finally {
+          if (m.committed) basis.clear();
+        }
+        const used = process.cpuUsage(cpu);
+        await emit({
+          n,
+          value,
+          workMs: performance.now() - start,
+          cpuMs: (used.user + used.system) / 1000,
+          peakRssKiB: process.resourceUsage().maxRSS,
+        });
+      } catch (e) {
+        // Driver errors can carry statements or credentials. Preserve only an established failure class.
+        const state = e.cause?.code ?? e.code;
+        await emit({
+          n,
+          error: /^[A-Z0-9_]{1,32}$/.test(String(state))
+            ? String(state)
+            : "read_verification_failed",
+        });
+        break;
+      }
+    }
+  } finally {
+    basis.clear();
+    input.close();
+    await client.sql.end({ timeout: 2 });
+  }
 }

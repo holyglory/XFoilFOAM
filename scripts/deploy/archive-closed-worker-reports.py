@@ -17,7 +17,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from closed_worker_report_pages import process_page
-from closed_worker_report_discovery import discovery_step
+from closed_worker_report_sessions import ReportReadSessions, ROLE_READS
+from closed_worker_report_discovery import discovery_step, revisit_held, revisit_prefix
 
 ROOT = Path(__file__).resolve().parents[2]
 PEER = ROOT / "apps/sweeper/src/closed-worker-report-peer.mjs"
@@ -88,6 +89,30 @@ def check_key(key, ranges):
 
 
 def run_peer(args, role, message, source):
+    started = time.monotonic()
+    sessions = getattr(args,"read_sessions",None)
+    if sessions and message["op"] in ROLE_READS[role]:
+        record = sessions.ask(args,role,message,source)
+    else:
+        record = single_request(args,role,message,source)
+    value = record.pop("value")
+    if args.measure_rpc:
+        items=message.get("items") or []
+        observed=message.get("pin") or (items[0].get("pin") if items else None) or value.get("pin") or (value.get("pins") or [value])[0]
+        record.update(role=role,op=message["op"],sequence=(message.get("key") or {}).get("sequence"),members=len(items or message.get("keys") or [message.get("key")]),committed=message.get("committed"),
+                      generation=observed.get("generation"), pinnedReads=value.get("generationDownloads"),
+                      storedBytes=observed.get("storedByteSize"),deltaMembers=value.get("deltaMembers"),
+                      busy=value.get("retryableBrokerStatus"),wallMs=round((time.monotonic()-started)*1000,2))
+        fd=os.open(args.measure_rpc, os.O_WRONLY|os.O_CREAT|os.O_APPEND, 0o600)
+        try:
+            os.write(fd,compact(record)+b"\n")
+        finally:
+            os.close(fd)
+    return value
+
+
+
+def single_request(args, role, message, source):
     host, container = {
         "hub": (args.hub_host, args.hub_sweeper),
         "api": (args.hz_host, args.hz_api),
@@ -126,26 +151,11 @@ catch (e) {
 """
     cmd = ["ssh", "-T", "-C", "-oBatchMode=yes", "-oForwardAgent=no", "-oClearAllForwardings=yes",
            "-oStrictHostKeyChecking=yes", "-oConnectTimeout=10", host, shlex.join(argv)]
-    started = time.monotonic()
     process = subprocess.run(cmd, input=program, text=True, capture_output=True, timeout=170)
     if process.returncode:
         raise RuntimeError(f"{role} {message['op']} refused ({process.returncode}): {process.stderr[-340:]}")
     require(len(process.stdout) < 2 * 1024**2, "Oversized peer response")
-    record = json.loads(process.stdout)
-    value = record.pop("value")
-    if args.measure_rpc:
-        items=message.get("items") or []
-        observed=message.get("pin") or (items[0].get("pin") if items else None) or value.get("pin") or (value.get("pins") or [value])[0]
-        record.update(role=role,op=message["op"],sequence=(message.get("key") or {}).get("sequence"),members=len(items or message.get("keys") or [message.get("key")]),committed=message.get("committed"),
-                      generation=observed.get("generation"), pinnedReads=value.get("generationDownloads"),
-                      storedBytes=observed.get("storedByteSize"),deltaMembers=value.get("deltaMembers"),
-                      busy=value.get("retryableBrokerStatus"),wallMs=round((time.monotonic()-started)*1000,2))
-        fd=os.open(args.measure_rpc, os.O_WRONLY|os.O_CREAT|os.O_APPEND, 0o600)
-        try:
-            os.write(fd,compact(record)+b"\n")
-        finally:
-            os.close(fd)
-    return value
+    return json.loads(process.stdout)
 
 
 def inputs(args):
@@ -170,6 +180,8 @@ def inputs(args):
 def run(args):
     shared=inputs(args)
     s,ranges,bind,runtime,peer=shared
+    if getattr(args,"pause_file",None) and args.pause_file.exists():
+        return
     args.state.mkdir(mode=0o700, parents=True, exist_ok=True)
     receipt_dir = args.state / "receipts"
     receipt_dir.mkdir(mode=0o700, exist_ok=True)
@@ -180,6 +192,15 @@ def run(args):
         path = args.state / "progress.json"
         progress = json.loads(path.read_bytes()) if path.exists() else dict(binding=bind, after=0, completed=0, pending=None)
         require(progress["binding"] == bind, "Controller scope or role binding changed")
+        index = getattr(args,"recheck_held_index",None)
+        if index is not None and args.apply and not progress.get("pending") and not progress.get("group"):
+            require(0 <= index < progress["completed"],"Recheck requires a visited held source")
+            if revisit_held(args,index,bind,run,durable,compact,require):
+                return
+        through=getattr(args,"recheck_held_through",None)
+        if through is not None and args.apply and not progress.get("pending") and not progress.get("group"):
+            if revisit_prefix(args,through,progress,bind,run,durable,compact,require):
+                return
         if (getattr(args,"discover_after_seed",False) and args.apply and progress["after"]==os.fstat(keys.fileno()).st_size
                 and not progress.get("pending") and not progress.get("group")):
             require(1<=args.scan_rows<=1024 and args.discovery_interval>=1,"Invalid bounded discovery parameters")
@@ -203,6 +224,8 @@ def run(args):
             return run_peer(args,role,{**message,"runtime":runtime},peer)
         left = args.limit
         while left>0:
+            if getattr(args,"pause_file",None) and args.pause_file.exists():
+                return
             if args.apply and not progress.get("pending") and (progress.get("group") or min(getattr(args,"page_members",1),left)>1):
                 used=process_page(args, keys, min(getattr(args,"page_members",1),left), progress, path, bind, runtime, digest(peer.encode()),
                                   scope_for, ask, durable, require)
@@ -301,21 +324,46 @@ def run(args):
             advance(receipt, done)
 
 
+def run_invocations(args):
+    passes = args.reuse_read_passes
+    require(0 <= passes <= 4, "Expected zero to four bounded read-session passes")
+    if not passes:
+        return run(args)
+    # Release role sockets and DB handles after a finite number of original-size chunks.
+    # Pause markers are also checked after every durable member/page and before each new pass.
+    require(args.pause_file and args.pause_file.is_absolute(), "Read reuse needs the existing controller pause path")
+    args.read_sessions=ReportReadSessions()
+    try:
+        for _ in range(passes):
+            if args.pause_file.exists():
+                break
+            run(args)
+            if not args.apply:
+                break
+    finally:
+        args.read_sessions.close()
+
+
 if __name__ == "__main__":
     parser=argparse.ArgumentParser(description=__doc__)
     for opt in ("frozen-scope","keys","state"):
         parser.add_argument("--"+opt,required=True,type=Path)
     for opt in ("frozen-sha256","keys-sha256","runtime-revision","hub-host","hz-host","hub-sweeper","hz-sweeper","hz-api"):
         parser.add_argument("--"+opt,required=True)
+    parser.add_argument("--recheck-held-through",type=int,help="Automatically revisit all historical held keys before this verified cursor")
+    parser.add_argument("--recheck-held-index",type=int,help="Recheck one immutable held receipt under the original writer lock")
     parser.add_argument("--discover-after-seed",action="store_true")
     parser.add_argument("--scan-rows",type=int,default=512)
     parser.add_argument("--discovery-interval",type=int,default=900)
+    parser.add_argument("--reuse-read-passes",type=int,default=0)
+    parser.add_argument("--pause-file",type=Path)
+    parser.add_argument("--same-execution-pages",action="store_true",help="Pack consecutive inventory keys from one execution across sequence gaps")
     parser.add_argument("--page-members",type=int,default=1)
     parser.add_argument("--hub-account-file",type=Path,help="Confirmed workload identity for independent grouped GCS reads on the hub")
     parser.add_argument("--measure-rpc",type=Path,help="Append per-operation timing and generation metadata for a bounded measurement")
     parser.add_argument("--limit",type=int,default=1)
     parser.add_argument("--apply",action="store_true")
     try:
-        run(parser.parse_args())
+        run_invocations(parser.parse_args())
     except (ValueError,RuntimeError,OSError,subprocess.SubprocessError) as exc:
         sys.exit(str(exc))

@@ -4,7 +4,7 @@ import json
 import time
 
 
-def adjacent(stream, limit, validate):
+def adjacent(stream, limit, validate, allow_gaps=False):
     start = stream.tell()
     entries = []
     try:
@@ -16,8 +16,10 @@ def adjacent(stream, limit, validate):
                 raise ValueError("Incomplete inventory line")
             key = json.loads(line)
             validate(key)
-            if entries and (key["executionId"] != entries[0][0]["executionId"] or key["sequence"] != entries[-1][0]["sequence"] + 1):
-                break
+            if entries:
+                step = key["sequence"] - entries[-1][0]["sequence"]
+                if key["executionId"] != entries[0][0]["executionId"] or step <= 0 or (not allow_gaps and step != 1):
+                    break
             entries.append((key, stream.tell()))
     finally:
         stream.seek(start)
@@ -27,7 +29,9 @@ def adjacent(stream, limit, validate):
 def process_page(args, stream, limit, progress, path, bind, runtime, peer_digest,
                  scope_for, ask, durable, require):
     pending = progress.get("group")
-    entries = adjacent(stream, len(pending["items"]) if pending else limit, scope_for)
+    # On resume the saved exact member list owns the page, even if the preferred width or grouping changed.
+    entries = adjacent(stream, len(pending["items"]) if pending else limit, scope_for,
+                       allow_gaps=bool(pending) or getattr(args,"same_execution_pages",False))
     if len(entries) < 2:
         require(not pending, "Pending page is absent from inventory")
         return 0
