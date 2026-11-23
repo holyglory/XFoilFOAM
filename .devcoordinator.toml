@@ -6053,6 +6053,20 @@ cases = [{ id = "disposable-index-and-rewrite", args = [], postgres = "default" 
 [test.catalog-web-delivery]
 timeout_seconds = 300
 
+[test.campaign-stage-attempt-evidence]
+timeout_seconds = 480
+
+[[test.campaign-stage-attempt-evidence.check]]
+name = "modal"
+tier = "release"
+timeout_seconds = 360
+command = ["node", "scripts/dev/verify-admin-attempt-journey.mjs"]
+
+[[test.campaign-stage-attempt-evidence.check]]
+name = "identity-contract"
+tier = "release"
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/web", "exec", "vitest", "run", "test/preliminary-outcome-panel.test.ts"]
+
 [[test.catalog-web-delivery.check]]
 name = "contract"
 tier = "release"
