@@ -3,6 +3,7 @@ import { createServer } from "node:http";
 import { once } from "node:events";
 import { createRequire } from "node:module";
 import { preflightProgressiveArchive } from "../src/progressive-archive-reclaim";
+import { recheckDeferredProgressiveArchive } from "../src/progressive-archive-readback-retry";
 import { afterAll, expect, it, vi } from "vitest";
 import {
   createClient,
@@ -568,6 +569,48 @@ it("binds an explicitly empty URANS image set to its normal per-job proof", asyn
     } finally {
       spy.mockRestore();
     }
+  });
+}, 30000);
+
+it("reschedules only one deferred point after an exact registered read, preserving concurrent claims", async () => {
+  await client.db.transaction(async (tx) => {
+    const db = tx as unknown as DB;
+    for (const definition of tableDefinitions)
+      await db.execute(sql.raw("CREATE TEMP TABLE " + definition + " ON COMMIT DROP"));
+    await db.execute(sql`ALTER TABLE sync_api_settings ADD remote_solver_transfer_paused boolean DEFAULT false`);
+    await db.execute(sql`ALTER TABLE progressive_worker_archive_reclaims ADD claim_token uuid,ADD claim_expires_at timestamptz,
+      ADD attempt_count int, ADD retry_after timestamptz,ADD last_error text`);
+    await db.execute(sql`INSERT INTO sync_api_settings VALUES(1,${solver},${token},${root})`);
+    await db.execute(sql`INSERT INTO sync_sweep_promises VALUES(${promiseId},${root},${solver})`);
+    const job = randomUUID(), [point] = await fixture(db,job,1);
+    const target = {jobId:job,pointSignature:sha(point!.attempt),uploadId:point!.upload,attemptCount:11};
+    await db.execute(sql`UPDATE progressive_worker_archive_reclaims SET completed_at=NULL,reclaimed_bytes=NULL,
+      attempt_count=11,retry_after=clock_timestamp()+interval '4 hours',last_error='Progressive archive readback returned HTTP 503'`);
+    const signal = AbortSignal.timeout(6000);let corrupt = true, takeClaim = false;
+    const spy = vi.spyOn(globalThis,"fetch").mockImplementation(async (url,opts) => {
+      expect(String(url)).toBe(root+"/evidence-uploads/"+point!.upload+"/download");
+      expect(new Headers(opts?.headers).get("x-xfoilfoam-solver-token")).toBe(token);
+      if (takeClaim) await db.execute(sql`UPDATE progressive_worker_archive_reclaims SET claim_token=${randomUUID()},
+        claim_expires_at=clock_timestamp()+interval '30 minutes'`);
+      return new Response(corrupt ? "x".repeat(point!.upload.length) : point!.upload, {headers:{
+        "content-type":"application/zstd","content-length":String(point!.upload.length),
+        "x-content-sha256":point!.remote.storedSha256,"x-gcs-generation":point!.remote.generation}});
+    });
+    try {
+      expect((await recheckDeferredProgressiveArchive(db,{...target,uploadId:randomUUID()},signal)).status).toBe("unchanged");
+      expect(spy).not.toHaveBeenCalled();
+      await expect(recheckDeferredProgressiveArchive(db,target,signal)).rejects.toThrow(/byte proof/);
+      corrupt=false;takeClaim=true;
+      expect((await recheckDeferredProgressiveArchive(db,target,signal)).status).toBe("unchanged");
+      const [race]=await db.execute(sql`SELECT retry_after>clock_timestamp()+interval '3 hours' AS deferred,claim_token IS NOT NULL AS held,completed_at FROM progressive_worker_archive_reclaims`);
+      expect(race).toMatchObject({deferred:true,held:true,completed_at:null});
+      takeClaim=false;
+      await db.execute(sql`UPDATE progressive_worker_archive_reclaims SET claim_token=NULL,claim_expires_at=NULL`);
+      expect(await recheckDeferredProgressiveArchive(db,target,signal)).toMatchObject({status:"rescheduled",storedSha256:point!.remote.storedSha256,generation:point!.remote.generation});
+      expect((await recheckDeferredProgressiveArchive(db,target,signal)).status).toBe("unchanged");
+      const [scheduled]=await db.execute(sql`SELECT retry_after<=clock_timestamp() AS due,attempt_count,completed_at,claim_token,reclaimed_bytes FROM progressive_worker_archive_reclaims`);
+      expect(scheduled).toMatchObject({due:true,attempt_count:11,completed_at:null,claim_token:null,reclaimed_bytes:null});
+    } finally { spy.mockRestore(); }
   });
 }, 30000);
 
