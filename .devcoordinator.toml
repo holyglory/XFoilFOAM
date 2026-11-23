@@ -6101,6 +6101,7 @@ depends_on = ["db"]
 health = { path = "/health", timeout_seconds = 240 }
 
 [deployment.catalog-paging.component.web]
+route = true
 type = "process"
 command = ["bash", "scripts/dev/progressive-preview.sh", "web"]
 port = true
