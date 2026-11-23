@@ -572,7 +572,10 @@ export function CellSidePanel({
   if (typeof document === "undefined") return null;
   return createPortal(
     <>
-      <style>{".campaign-evidence-drawer::backdrop { background: transparent; touch-action: none; }"}</style>
+      <style>{`
+        .campaign-evidence-drawer[open] { display: grid; }
+        .campaign-evidence-drawer::backdrop { background: transparent; touch-action: none; }
+      `}</style>
       <dialog
         className="campaign-evidence-drawer"
         ref={panelRef}
@@ -602,7 +605,6 @@ export function CellSidePanel({
           bottom: 0,
           zIndex: 45,
           margin: 0,
-          padding: 0,
           border: 0,
           color: C.text,
           width: "min(780px, 100vw)",
@@ -619,7 +621,6 @@ export function CellSidePanel({
           touchAction: "pan-y",
           WebkitOverflowScrolling: "touch",
           padding: 16,
-          display: "grid",
           gridAutoRows: "max-content",
           gap: 12,
           alignContent: "start",
