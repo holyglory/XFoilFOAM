@@ -19,6 +19,7 @@ import { configuredDeploymentRole } from "./config";
 import {
   cancelledReportOwner,
   nextCancelledReportCopies,
+  verifyColdReceiptSources,
   receiptedReportCopy,
   type ReportCopyCursor,
 } from "./cancelled-report-copies";
@@ -283,6 +284,7 @@ export async function archiveProgressiveReportBatch(
         ({ sequence, kind }) => ({ sequence, kind }),
       );
   if (!keys.length) return 0;
+  if(cancelledSequences)await verifyColdReceiptSources(db,executionId,keys.map(k=>Number(k.sequence)));
   const dir = await mkdtemp(join(tmpdir(), "progressive-reports-"));
   const members: Member[] = [];
   try {

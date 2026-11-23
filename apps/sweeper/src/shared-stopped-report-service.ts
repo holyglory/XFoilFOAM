@@ -10,6 +10,10 @@ import {
   stoppedReportCopyKeys,
   type StoppedCopyReceipt,
 } from "./shared-stopped-report-custody";
+import {
+  retireNextPreservedAnchor,
+  type AnchorWalk,
+} from "./stopped-report-anchor-retirement";
 import { sharedReportTotals } from "./shared-report-totals";
 import { HubReportObjects, sha256 } from "./shared-report-objects";
 
@@ -83,6 +87,7 @@ export async function advanceSharedReportOwner(
   objects: HubReportObjects,
   dir: string,
   id: string,
+  eligibleAnchors = false,
 ) {
   if (!uuid.test(id) || !isAbsolute(dir))
     throw new Error("Invalid stopped report owner or receipt path");
@@ -91,6 +96,72 @@ export async function advanceSharedReportOwner(
   const root = join(dir, id),
     cursorFile = join(root, "cursor.json");
   const prior = await read<Cursor>(cursorFile);
+  const anchorFile = join(root, "anchor-walk.json");
+  const hooks = {
+    beforeCommit: (r: StoppedCopyReceipt) =>
+      write(join(root, "sql-releases", r.object.sha256 + ".json"), r),
+    beforePublish: async (r: StoppedCopyReceipt) => {
+      const file = join(root, "verified", r.object.sha256 + ".json");
+      // Retrying after a crash between readback and SQL commit must still find
+      // the previously preserved original, even when the page pin is reused.
+      if (
+        r.mode === "anchor" &&
+        (await read<StoppedCopyReceipt>(file))?.mode === "preserve"
+      )
+        return;
+      await write(file, r);
+    },
+  };
+  const state = eligibleAnchors
+    ? await read<AnchorWalk & { regular: boolean; frontier: string }>(
+        anchorFile,
+      )
+    : null;
+  if (
+    eligibleAnchors &&
+    (!state?.regular || prior?.complete) &&
+    (!state?.finishedAt ||
+      state.frontier !== frontier ||
+      Date.now() - state.finishedAt >= 600_000)
+  ) {
+    const step = await retireNextPreservedAnchor(
+      db,
+      objects,
+      root,
+      id,
+      state?.frontier === frontier ? state : { after: "", finishedAt: 0 },
+      hooks,
+    );
+    await write(anchorFile, { ...step.walk, frontier, regular: true });
+    if (step.receipt) {
+      const r = step.receipt,
+        hash = await preserveReceipt(root, r);
+      if (prior?.complete)
+        await write(cursorFile, { ...prior, complete: false });
+      console.info(
+        JSON.stringify({
+          component: "stopped-report-cloud-copy",
+          job: id,
+          mode: r.mode,
+          receipt: hash,
+          members: r.members.length,
+          attached: r.released,
+          manifestBytes: r.object.size,
+          resultBytesSubmitted: r.resultBytesSubmitted,
+          sqlReportFieldBytesReleased:
+            r.storedReportFieldsBefore - r.storedReportFieldsAfter,
+          releasedReferenceBytes: r.releasedReferenceBytes,
+          releasedProtectedResults: r.releasedProtectedResults,
+          rssBytes: process.memoryUsage.rss(),
+          peakRssBytes: process.resourceUsage().maxRSS * 1024,
+        }),
+      );
+      return { complete: false, changed: r.released };
+    }
+    if (step.more && prior?.complete) return { complete: false, changed: 0 };
+  } else if (eligibleAnchors && state?.regular) {
+    await write(anchorFile, { ...state, regular: false });
+  }
   if (prior?.complete && prior.frontier === frontier)
     return { complete: true, changed: 0 };
   const after = prior?.frontier === frontier ? prior.after : 0;
@@ -102,7 +173,7 @@ export async function advanceSharedReportOwner(
       JSON.stringify({ component: "stopped-report-cloud-totals", ...totals }),
     );
     await write(cursorFile, { after, frontier, complete: true });
-    return { complete: true, changed: 0 };
+    return { complete: !(eligibleAnchors && state?.finishedAt === 0), changed: 0 };
   }
   if (keys.some((k) => k.mode === "missing"))
     throw new Error("Stopped source inventory or applied progress is missing");
@@ -149,21 +220,17 @@ export async function advanceSharedReportOwner(
         id,
         remaining,
         mode,
-        {
-          beforeCommit: (committed) =>
-            write(
-              join(root, "sql-releases", committed.object.sha256 + ".json"),
-              committed,
-            ),
-          beforePublish: async (verified) => {
-            await write(
-              join(root, "verified", verified.object.sha256 + ".json"),
-              verified,
-            );
-          },
-        },
+        hooks,
       );
       const hash = await preserveReceipt(root, receipt);
+      if (eligibleAnchors && mode === "preserve")
+        await write(anchorFile, {
+          after: "",
+          finishedAt: 0,
+          frontier,
+          regular: false,
+        });
+
       for (const m of receipt.members)
         ledger.members[m.sequence] = { signature: m.signature, receipt: hash };
       await write(ledgerFile, ledger);
@@ -226,6 +293,9 @@ export async function runSharedStoppedReportStorage(
   );
   let after: string | null = null,
     queue: string[] = [];
+  let anchorReader = false;
+  const anchorScope =
+    process.env.AIRFOILFOAM_STOPPED_REPORT_ANCHOR_SCOPE?.trim() || "all";
   let worked = false,
     verifiedUntil = 0;
   while (!signal.aborted) {
@@ -248,6 +318,7 @@ export async function runSharedStoppedReportStorage(
           ? ((await health.json()) as {
               service?: string;
               hubReportArchiveFormats?: string[];
+              hubStoppedReportAnchorReader?: number;
             })
           : null;
         if (
@@ -257,6 +328,7 @@ export async function runSharedStoppedReportStorage(
           throw new Error(
             "Serving hub API has not enabled shared-result reads",
           );
+        anchorReader = v.hubStoppedReportAnchorReader === 1;
         if (!verifiedUntil)
           console.info(
             JSON.stringify({
@@ -290,7 +362,13 @@ export async function runSharedStoppedReportStorage(
       }
       const id = queue[0];
       if (id) {
-        const result = await advanceSharedReportOwner(db, store, directory, id);
+        const result = await advanceSharedReportOwner(
+          db,
+          store,
+          directory,
+          id,
+          anchorReader && (anchorScope === "all" || anchorScope === id),
+        );
         queue.shift();
         if (!result.complete) worked = true;
         if (scope !== "all" && result.complete) wait = 600_000;

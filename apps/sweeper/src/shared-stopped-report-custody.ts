@@ -1,3 +1,4 @@
+import { prepareStoppedAnchorHead } from "./stopped-report-anchor-head";
 import {
   verifySharedReportReaders,
   type SharedReportReaderPair,
@@ -60,7 +61,7 @@ export interface StoppedReportKey {
   signature: string;
 }
 export interface StoppedCopyReceipt {
-  mode: "release" | "preserve";
+  mode: "release" | "preserve" | "anchor";
   owner: SharedReportOwner;
   stop: string;
   object: Awaited<ReturnType<typeof writeSharedReportPage>>["pin"];
@@ -120,9 +121,10 @@ export async function copyStoppedReportBatch(
   objects: ReportObjects,
   job: string,
   keys: readonly StoppedReportKey[],
-  mode: "release" | "preserve",
+  mode: "release" | "preserve" | "anchor",
   options: {
     beforePublish?: (receipt: StoppedCopyReceipt) => Promise<void>;
+    preserved?: StoppedCopyReceipt;
     beforeCommit?: (receipt: StoppedCopyReceipt) => Promise<void>;
     readers?: SharedReportReaderPair;
   } = {},
@@ -142,6 +144,27 @@ export async function copyStoppedReportBatch(
   )
     throw new Error("Invalid exact stopped report page");
   const selected = await ownership(db, job);
+  const saved = options.preserved;
+  let head: { sequence: number; signature: string } | undefined;
+  if (mode === "anchor") {
+    if (
+      !saved ||
+      saved.mode !== "preserve" ||
+      saved.owner.executionId !== job ||
+      saved.owner.solverId !== selected.owner.solverId ||
+      saved.owner.promiseId !== selected.owner.promiseId ||
+      saved.owner.assignmentSignature !== selected.owner.assignmentSignature ||
+      saved.stop !== selected.stop ||
+      saved.bucket !== objects.bucket
+    )
+      throw new Error(
+        "Anchor release requires its verified preserved cloud original",
+      );
+    head = await prepareStoppedAnchorHead(db, selected.owner, selected.stop);
+    // Reopen the previously verified exact generation, even if a new object
+    // now has the same key. No newer or latest generation can stand in for it.
+    await verifySharedReportReaders(saved, options.readers);
+  }
   const inputs: SharedReportInput[] = [];
   const frozen: {
     seq: number;
@@ -196,6 +219,21 @@ export async function copyStoppedReportBatch(
       suffix: cut.suffix,
       resultHash: h,
     };
+    if (mode === "anchor") {
+      const old = saved!.members.find((v) => v.sequence === member.sequence);
+      if (
+        !old ||
+        old.signature !== member.signature ||
+        old.reportSha256 !== member.reportSha256 ||
+        old.reportByteSize !== member.reportByteSize ||
+        old.inventorySignature !== member.inventorySignature ||
+        old.sourceListSha256 !== member.sourceListSha256 ||
+        old.resultHash !== member.resultHash
+      )
+        throw new Error(
+          "Warm anchor differs from its original verified cloud member",
+        );
+    }
     const extra = Buffer.byteLength(JSON.stringify(member));
     if (inputs.length && envelope + extra > 6 * 1024 ** 2) break;
     envelope += extra;
@@ -226,7 +264,14 @@ export async function copyStoppedReportBatch(
       refBytes: Number(r.ref_bytes),
     });
   }
-  const copied = await writeSharedReportPage(objects, selected.owner, inputs);
+  const copied = await writeSharedReportPage(
+    objects,
+    selected.owner,
+    inputs,
+    mode === "anchor" && saved
+      ? { results: saved.results, manifest: saved.object }
+      : undefined,
+  );
   const receipt: StoppedCopyReceipt = {
     mode,
     ...selected,
@@ -259,7 +304,15 @@ export async function copyStoppedReportBatch(
     releasedProtectedResults: [],
     resultBytesSubmitted: copied.resultBytesSubmitted,
   };
-  await verifySharedReportReaders(receipt, options.readers);
+  const sameVerifiedPage =
+    mode === "anchor" &&
+    saved &&
+    saved.object.key === receipt.object.key &&
+    saved.object.generation === receipt.object.generation &&
+    saved.object.sha256 === receipt.object.sha256 &&
+    saved.members.length === receipt.members.length;
+  if (!sameVerifiedPage)
+    await verifySharedReportReaders(receipt, options.readers);
   if (options.beforePublish) await options.beforePublish(receipt);
   // A failed/crashed copy can leave a content-addressed object. Only this
   // transaction attaches its pinned, authenticated manifest to the live rows.
@@ -275,6 +328,13 @@ export async function copyStoppedReportBatch(
       throw new Error(
         "Stopped report dispatch changed during cloud verification",
       );
+    if (head) {
+      const [latest] = await conn.execute(
+        sql`SELECT sequence::int seq,content_signature sig FROM progressive_remote_reports WHERE sim_job_id=${job}::uuid ORDER BY sequence DESC LIMIT 1`,
+      );
+      if (latest?.seq !== head.sequence || latest.sig !== head.signature)
+        throw new Error("Terminal report changed during anchor verification");
+    }
     const entries = JSON.stringify(frozen);
     const locks = await conn.execute(sql`SELECT r.sequence::int AS seq ${base}
       JOIN jsonb_to_recordset(${entries}::jsonb) f(seq bigint,sig text,inventory text,"sourcesText" text,received text,hash text)

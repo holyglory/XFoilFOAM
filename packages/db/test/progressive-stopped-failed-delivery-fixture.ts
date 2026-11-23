@@ -1,3 +1,6 @@
+import {sharedAnchorReaderFixture} from "../../../apps/sweeper/test-support/shared-anchor-reader-fixture";
+import {memoryReportObjects} from "../../../apps/sweeper/test/shared-report-object-fixture";
+import {readSharedReport} from "../../../apps/sweeper/src/shared-report-archive";
 import { installProgressiveReportArchiveReader } from "../src/progressive-report-reader";
 import { archiveReportFixture } from "../test-support/progressive-report-archive-fixture";
 import { createHash, randomUUID } from "node:crypto";
@@ -277,7 +280,7 @@ async function verifyDiagnosticOnlyRemoteSettlement(db: DB, envelope: Progressiv
 export async function verifyDiagnosticMixedPromotionRecovery(
   db: DB,
   envelope: ProgressiveRemoteExecutionEnvelope,
-  options: { archivedEarlyReport?: boolean } = {},
+  options: { archivedEarlyReport?: boolean;sharedAnchors?:boolean } = {},
 ) {
   const restore = new Error("Restore remote promotion trigger custody");
   try {
@@ -480,14 +483,25 @@ export async function verifyDiagnosticMixedPromotionRecovery(
       // deliberately omits it. Missing polars in a header must not erase scope.
       await connection.execute(sql`CREATE TEMP TABLE progressive_remote_reports ON COMMIT DROP AS
         SELECT * FROM public.progressive_remote_reports WHERE sim_job_id=${executionId}::uuid`);
-      const archived = await archiveReportFixture(connection, "remote", executionId, early.sequence);
+      const fixture=memoryReportObjects();
+      const archived = options.sharedAnchors ? null : await archiveReportFixture(connection, "remote", executionId, early.sequence);
+      if(options.sharedAnchors)await sharedAnchorReaderFixture(connection,fixture.store,executionId,[early.sequence,final.sequence]);
       try {
         installProgressiveReportArchiveReader(null);
         await expect(settleProgressiveRemoteJob(connection, executionId)).rejects.toThrow("not installed");
         expect(await connection.execute(sql`SELECT "ingestedAt" FROM sim_jobs WHERE id=${executionId}::uuid`))
           .toEqual([{ ingestedAt: null }]);
         let reads = 0;
-        installProgressiveReportArchiveReader({ read: async () => { reads++; return archived.text; } });
+        installProgressiveReportArchiveReader({ read: async id => { reads++;return archived?archived.text:readSharedReport(fixture.store,id); } });
+        if(options.sharedAnchors){
+          // Only the early diagnostic anchor contains the whole-polar promotion.
+          // A corrupt generation must not become an absent transition.
+          const entry=[...fixture.files.entries()].find(([key])=>key.includes("/results/"))!;
+          fixture.files.delete(entry[0]);
+          await expect(settleProgressiveRemoteJob(connection,executionId)).rejects.toThrow();
+          expect(await connection.execute(sql`SELECT "ingestedAt" FROM sim_jobs WHERE id=${executionId}::uuid`)).toEqual([{ingestedAt:null}]);
+          fixture.files.set(...entry);
+        }
         expect(await settleProgressiveRemoteJob(connection, executionId)).toMatchObject({ kind: "settled" });
         expect(reads).toBeGreaterThan(0);
         const recovered = await connection.execute(sql`SELECT scope,diagnostic_point_content_signature

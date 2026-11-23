@@ -13,7 +13,8 @@ import {
   type ProgressiveRemoteReport,
 } from "@aerodb/db";
 import { prepareProgressiveRemoteEvidence, resolveProgressiveRemoteEvidence } from "@aerodb/db/progressive-remote-evidence";
-import { readProgressiveRemoteRetention } from "@aerodb/db/progressive-remote-retention";
+import { acknowledgeLatestProgressiveRemoteStop } from "../../sweeper/src/progressive-remote-stop-receipt";
+import { readProgressiveRemoteSourceClassifications, readProgressiveRemoteRetention } from "@aerodb/db/progressive-remote-retention";
 import { resolveProgressiveReportedPoint } from "@aerodb/db/progressive-remote-report";
 import {
   backfillProgressiveReportPayloads,
@@ -72,7 +73,9 @@ export async function verifyCancelledReportCopyReplay(
     ...sender,
     report: copy,
   });
-  const gap = structuredClone(copy);
+  const dependent={...copy,sequence:copy.sequence+1};
+  const dependentReceipt=await storeProgressiveRemoteReport(db,{...sender,report:dependent});
+  const gap = structuredClone(dependent);
   gap.sequence++;
   const [sibling] =
     await db.execute(sql`SELECT aoa_deg FROM sync_sweep_promise_points
@@ -116,7 +119,7 @@ export async function verifyCancelledReportCopyReplay(
     fence: "terminal_result",
     ownership_basis: "recorded_execution_namespace",
   };
-  await storeProgressiveRemoteReport(db, { ...sender, report: final });
+  const finalReceipt=await storeProgressiveRemoteReport(db, { ...sender, report: final });
   for (let i = 0; i < final.sequence; i++)
     await applyProgressiveRemoteProgress(db, id);
   await acknowledgeProgressiveCfdExecutionStop(db, {
@@ -179,7 +182,7 @@ export async function verifyCancelledReportCopyReplay(
   };
   const page = await nextCancelledReportCopies(db, cursor);
   expect(page.executionId).toBe(id);
-  expect(page.sequences).toEqual([copy.sequence]);
+  expect(page.sequences).toEqual([copy.sequence,dependent.sequence]);
   const [original] =
     await db.execute(sql`SELECT report::text AS text, result_payload_hash AS hash
     FROM progressive_remote_reports WHERE sim_job_id=${id}::uuid AND sequence=${copy.sequence}`);
@@ -445,6 +448,36 @@ export async function verifyCancelledReportCopyReplay(
       await expect(restore({...member,sourceKind:"worker"})).rejects.toThrow();
       await expect(restore({...member,reportSha256:"0".repeat(64)})).rejects.toThrow();
       await expect(restore({...member,generation:String(BigInt(member.generation)+1n)})).rejects.toThrow();
+      const endKey={sequence:final.sequence,signature:finalReceipt.contentSignature};
+      const originKey={sequence:anchorSequence,signature:delivery.progressiveEvidence.reportContentSignature};
+      const anchors=[originKey,keptKey,endKey];
+      const originalClassification=await readProgressiveRemoteSourceClassifications(db,id);
+      const copyOfOriginals=await copyStoppedReportBatch(db,store,id,anchors,"preserve",adapters);
+      await expect(copyStoppedReportBatch(db,store,id,anchors,"anchor",adapters)).rejects.toThrow("preserved");
+      const corruptPrevious={...copyOfOriginals,object:{...copyOfOriginals.object,generation:String(BigInt(copyOfOriginals.object.generation)+1n)}};
+      await expect(copyStoppedReportBatch(db,store,id,anchors,"anchor",{...adapters,preserved:corruptPrevious})).rejects.toThrow();
+      const heldCount=await db.execute(sql`SELECT count(*)::int n FROM progressive_remote_reports WHERE sim_job_id=${id}::uuid AND sequence IN (${anchorSequence},${gap.sequence},${final.sequence}) AND archived_at IS NULL`);
+      expect(heldCount[0].n).toBe(3);
+      const retired=await copyStoppedReportBatch(db,store,id,anchors,"anchor",{...adapters,preserved:copyOfOriginals});
+      expect(retired.released).toBe(3);expect(retired.object).toEqual(copyOfOriginals.object);expect(retired.resultBytesSubmitted).toBe(0);
+      expect(await readProgressiveRemoteSourceClassifications(db,id)).toEqual(originalClassification);
+      expect(await readProgressiveRemoteRetention(db,id)).toEqual(waiting);
+      const frozenStop=await db.execute(sql`SELECT proof_signature FROM progressive_cfd_execution_stops WHERE sim_job_id=${id}::uuid`);
+      expect(await acknowledgeLatestProgressiveRemoteStop(db,id)).toBe(true);
+      expect(await db.execute(sql`SELECT proof_signature FROM progressive_cfd_execution_stops WHERE sim_job_id=${id}::uuid`)).toEqual(frozenStop);
+      const originalItem={...latePoint,progressiveEvidence:delivery.progressiveEvidence};
+      const originalReplay=await post(originalItem);expect(originalReplay.statusCode,originalReplay.body).toBe(200);
+      expect(originalReplay.json().progressiveEvidenceReceipts).toEqual(warmBody.progressiveEvidenceReceipts);
+      expect((await post({...originalItem,remoteResultAttemptId:randomUUID()})).statusCode).toBe(409);
+      const anchorObject=files.get(retired.object.key)!;files.delete(retired.object.key);
+      await expect(readProgressiveRemoteRetention(db,id)).rejects.toThrow();
+      expect((await deliver()).statusCode).toBeGreaterThanOrEqual(400);
+      await expect(archiveProgressiveReportBatch(db,"remote",id,put,[dependent.sequence])).rejects.toThrow();
+      const [heldDependent]=await db.execute(sql`SELECT archive_bundle_id FROM progressive_remote_reports WHERE sim_job_id=${id}::uuid AND sequence=${dependent.sequence} AND content_signature=${dependentReceipt.contentSignature}`);
+      expect(heldDependent.archive_bundle_id).toBeNull();
+      files.set(retired.object.key,anchorObject);
+      expect(await archiveProgressiveReportBatch(db,"remote",id,put,[dependent.sequence])).toBe(1);
+
       expect(await state()).toEqual(before);
     }
     const late = await deliver();

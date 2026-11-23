@@ -843,7 +843,7 @@ export async function registerRoutes(app: FastifyInstance, publicPoints?: Public
   app.get("/health", async () => ({
     ok: true, service: "aerodb-api",
     ...(env.evidenceBucket && process.env.AIRFOILFOAM_DEPLOYMENT_ROLE !== "remote-solver"
-      ? { hubReportArchiveFormats: ["jsonl", "shared-result-v1"] } : {}),
+      ? { hubReportArchiveFormats: ["jsonl", "shared-result-v1"],hubStoppedReportAnchorReader:1 } : {}),
   }));
 
   // ---- categories ----

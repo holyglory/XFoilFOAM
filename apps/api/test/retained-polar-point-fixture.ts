@@ -25,6 +25,9 @@ import { periodicPoint } from "../../../packages/db/test-support/periodic-urans-
 import { recoverOriginalSignedPoint } from "../src/retained-polar-point";
 import * as reportObject from "../src/progressive-report-archive-reader";
 
+import {sharedAnchorReaderFixture} from "../../sweeper/test-support/shared-anchor-reader-fixture";
+import {memoryReportObjects} from "../../sweeper/test/shared-report-object-fixture";
+
 export async function verifyOriginalPointReceiptReturn(
   db: DB,
   app: FastifyInstance,
@@ -48,8 +51,9 @@ export async function verifyOriginalPointReceiptReturn(
       expect(b).toBe(bucket);
       return store.bucket(b) as unknown as ReturnType<Storage["bucket"]>;
     });
-  let fullReads = 0;
   try {
+    for(const transportFormat of ["jsonl","shared-result-v1"] as const){
+    let fullReads=0;
     env.evidenceBucket = bucket;
     process.env.AIRFOILFOAM_DEPLOYMENT_ROLE = "hub";
     await expect(
@@ -70,6 +74,12 @@ export async function verifyOriginalPointReceiptReturn(
           await conn.execute(sql`SELECT e.result_attempt_id,a.result_id,e.received_at FROM progressive_remote_evidence_receipts e
         JOIN result_attempts a ON a.id=e.result_attempt_id WHERE e.sim_job_id=${job}::uuid AND e.point_content_signature=${delivery.progressiveEvidence.pointContentSignature}`);
         expect(original).toBeDefined();
+        if(transportFormat==="shared-result-v1"){
+          const memory=memoryReportObjects();
+          await sharedAnchorReaderFixture(conn,{...memory.store,bucket},job,[delivery.progressiveEvidence.sequence]);
+          for(const [key,o] of memory.files)store.objects.set(bucket+"/"+key,{bytes:o.bytes,metadata:{
+            generation:o.pin.generation,crc32c:o.pin.crc32c,size:String(o.pin.size),contentType:"application/gzip",metadata:{sha256:o.pin.sha256}}});
+        }else{
         const archived = await archiveProgressiveReportBatch(
           conn,
           "remote",
@@ -109,6 +119,7 @@ export async function verifyOriginalPointReceiptReturn(
           },
         );
         expect(archived).toBeGreaterThan(0);
+        }
         const [report] = await conn.execute(
           sql`SELECT archive_bundle_id FROM progressive_remote_reports WHERE sim_job_id=${job}::uuid AND sequence=${delivery.progressiveEvidence.sequence}`,
         );
@@ -359,6 +370,8 @@ export async function verifyOriginalPointReceiptReturn(
         throw rollback;
       }),
     ).rejects.toBe(rollback);
+    store.failReads=false;
+    }
   } finally {
     installProgressiveReportArchiveReader(null);
     transport.mockRestore();

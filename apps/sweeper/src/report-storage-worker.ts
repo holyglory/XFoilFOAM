@@ -1,3 +1,5 @@
+import { installProgressiveReportArchiveReader } from "@aerodb/db/progressive-report-reader";
+import { ProgressiveReportArchiveStore } from "./progressive-report-archive-store";
 import { createClient } from "@aerodb/db/client";
 import { configuredDeploymentRole, makeReportStorageDatabase } from "./config";
 import {
@@ -14,6 +16,8 @@ import { runConfiguredAttemptEvidenceSettlementService } from "./attempt-evidenc
 
 const client = makeReportStorageDatabase("report-storage-backfill");
 const stop = new AbortController();
+const hubBucket=process.env.AIRFOILFOAM_EVIDENCE_BUCKET?.trim();
+if(configuredDeploymentRole()==="hub" && hubBucket)installProgressiveReportArchiveReader(new ProgressiveReportArchiveStore(hubBucket));
 const attemptEvidence = createClient({
   max: 1,
   connection: {

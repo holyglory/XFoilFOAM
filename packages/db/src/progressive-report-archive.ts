@@ -257,6 +257,7 @@ function exactInteger(value: ReportJson | undefined, minimum: number): number {
 
 export function assertProgressiveReportArchiveIdentity(
   identity: ProgressiveReportArchiveStoredIdentity,
+  format: "jsonl" | "shared-result-v1" = "jsonl",
 ): void {
   if (
     !identity.bucket.trim() ||
@@ -267,7 +268,7 @@ export function assertProgressiveReportArchiveIdentity(
     !positiveInteger(identity.storedByteSize) ||
     identity.mimeType !== "application/gzip" ||
     identity.compression !== "gzip" ||
-    identity.archiveFormat !== "jsonl" ||
+    identity.archiveFormat !== format ||
     [identity.memberCount, identity.firstSequence, identity.lastSequence].some(
       (value) => value !== undefined && !positiveInteger(value),
     ) ||

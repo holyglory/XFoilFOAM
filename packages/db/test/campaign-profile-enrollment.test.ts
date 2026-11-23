@@ -8868,10 +8868,10 @@ describe("bounded progressive numerical recovery", () => {
       verifyDiagnosticOnlyPromotionRecovery(db, envelope, triggerAoaDeg, earlyState));
   }, 240_000);
 
-  it.each([false, true])("recovers an authenticated mixed RANS promotion from a fresh stage-2 execution (archived=%s)", async (archivedEarlyReport) => {
+  it.each(["inline","jsonl","shared-result-v1"] as const)("recovers an authenticated mixed RANS promotion from a fresh stage-2 execution (archived=%s)", async (format) => {
     const { verifyDiagnosticMixedPromotionRecovery } = await import("./progressive-stopped-failed-delivery-fixture");
-    await withFreshDiagnosticExecution(archivedEarlyReport ? 34.19461 : 34.1946, [0, 1], (envelope) =>
-      verifyDiagnosticMixedPromotionRecovery(db, envelope, { archivedEarlyReport }));
+    await withFreshDiagnosticExecution(format==="shared-result-v1"?34.19462:format==="jsonl"?34.19461:34.1946, [0, 1], (envelope) =>
+      verifyDiagnosticMixedPromotionRecovery(db, envelope, { archivedEarlyReport:format!=="inline",sharedAnchors:format==="shared-result-v1" }));
   }, 240_000);
 
   it("composes a sequential stage-2 marched multi-AoA remote execution", async () => {
