@@ -12,6 +12,8 @@ import { settleProgressiveRemoteJob } from "../../sweeper/src/progressive-remote
 import { archiveProgressiveReportBatch } from "../../sweeper/src/progressive-report-archive-service";
 import { SettlementGcs } from "../../sweeper/test-support/attempt-settlement-fixture";
 import { env } from "../src/env";
+import { randomUUID } from "node:crypto";
+import { progressiveArchiveManifestBytes } from "../../../packages/db/test/progressive-archive-data";
 import {
   verifyProgressiveEvidenceCustodyReceipt,
   type ProgressiveEvidenceCustodyReceipt,
@@ -185,6 +187,85 @@ export async function verifyOriginalPointReceiptReturn(
           original.result_attempt_id,
         );
         expect(fullReads).toBe(0);
+
+        const [bundle] = await conn.execute(
+          sql`SELECT metadata FROM solver_evidence_artifacts WHERE id=${signed.canonical.artifactId}::uuid`,
+        );
+        const metadata = { ...(bundle.metadata as Record<string, unknown>) };
+        delete metadata.sourceInstanceId;
+        delete metadata.remoteEvidenceUploadId;
+        const archivePost = (properties: Record<string, unknown>) => {
+          const boundary = "fixture-" + randomUUID();
+          const manifest = JSON.stringify({
+            promiseId: delivery.promiseId,
+            sourceInstanceId,
+            results: [
+              {
+                ...delivery,
+                progressiveArchiveOnly: true,
+                evidenceArtifacts: [
+                  {
+                    kind: "manifest",
+                    mimeType: "application/json",
+                    sha256: archive.remote.manifestSha256,
+                    byteSize: archive.remote.manifestByteSize,
+                    uploadField: "evidence_manifest",
+                  },
+                  {
+                    kind: "engine_bundle",
+                    mimeType: "application/zstd",
+                    sha256: archive.remote.storedSha256,
+                    byteSize: archive.remote.storedByteSize,
+                    remoteEvidenceUploadId: archive.brokeredUploadId,
+                    metadata: properties,
+                  },
+                ],
+              },
+            ],
+          });
+          const payload = Buffer.concat([
+            Buffer.from(
+              `--${boundary}\r\nContent-Disposition: form-data; name="manifest"\r\nContent-Type: application/json\r\n\r\n${manifest}\r\n--${boundary}\r\nContent-Disposition: form-data; name="evidence_manifest"; filename="evidence_manifest.json"\r\nContent-Type: application/json\r\n\r\n`,
+            ),
+            progressiveArchiveManifestBytes,
+            Buffer.from(`\r\n--${boundary}--\r\n`),
+          ]);
+          return app.inject({
+            method: "POST",
+            url: "/api/sync/v1/polars",
+            payload,
+            headers: {
+              "content-type": `multipart/form-data; boundary=${boundary}`,
+              "x-xfoilfoam-solver-token": token,
+            },
+          });
+        };
+        const multipart = await archivePost(metadata);
+        expect(multipart.statusCode, multipart.body).toBe(200);
+        expect(multipart.json()).toMatchObject({
+          conflictIds: [],
+          artifacts: 0,
+          attempts: 0,
+          imported: 0,
+          fulfilledAoas: [],
+          bindingReceipts: [],
+          progressiveArchiveReceipts: [owned.json().progressiveArchiveReceipt],
+          progressiveEvidenceReceipts:
+            recovered.json().progressiveEvidenceReceipts,
+        });
+        expect(fullReads).toBe(0);
+        // A changed generation or custom artifact property cannot borrow the
+        // stored acknowledgement. Both must take full import verification.
+        for (const changed of [
+          { ...metadata, generation: "7" },
+          { ...metadata, proposedChange: true },
+        ]) {
+          const edited = await archivePost(changed);
+          expect(edited.statusCode, edited.body).toBeGreaterThanOrEqual(400);
+          expect(edited.json().progressiveArchiveReceipts).toBeUndefined();
+        }
+        expect(fullReads).toBeGreaterThan(0);
+        fullReads = 0;
 
         // A normalized missing-frame sentinel is reversible only when the original
         // null reproduces the complete point signature in its signed physical polar.

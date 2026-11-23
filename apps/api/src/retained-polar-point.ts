@@ -1,3 +1,7 @@
+import {
+  boundArtifactsMatchSubmission,
+  type SubmittedRawPoint,
+} from "./bound-polar-upload-replay";
 import { eq, sql } from "drizzle-orm";
 import type { DB } from "@aerodb/db/client";
 import { resultAttempts } from "@aerodb/db/schema";
@@ -100,6 +104,7 @@ async function snapshot(
   input: ProgressiveRemoteEvidenceDelivery,
   instance: string,
   bucket: string,
+  proposal?: SubmittedRawPoint,
 ) {
   const ref = input.progressiveEvidence;
   const [row] =
@@ -259,6 +264,18 @@ async function snapshot(
     String(row.upload_id),
     (manifest) => assertProgressiveReportedManifest({ point }, manifest),
   );
+  if (
+    proposal &&
+    (proposal.bundle.remoteEvidenceUploadId !== row.upload_id ||
+      !(await boundArtifactsMatchSubmission(
+        db,
+        proposal,
+        instance,
+        attempt,
+        raw,
+      )))
+  )
+    return null;
   if (typeof row.generation !== "string")
     throw new Error("Missing exact stored report generation");
   const identity: ProgressiveReportArchiveReadIdentity = {
@@ -308,12 +325,13 @@ async function verifyRetainedSource(
   input: ProgressiveRemoteEvidenceDelivery,
   instance: string,
   expectedUpload?: string,
+  proposal?: SubmittedRawPoint,
 ) {
   const bucket = env.evidenceBucket?.trim();
   if (!bucket || process.env.AIRFOILFOAM_DEPLOYMENT_ROLE !== "hub") return null;
   const prepare = () =>
     db.transaction(
-      (tx) => snapshot(tx as unknown as DB, input, instance, bucket),
+      (tx) => snapshot(tx as unknown as DB, input, instance, bucket, proposal),
       { isolationLevel: "repeatable read", accessMode: "read only" },
     );
   const proof = await prepare();
@@ -355,4 +373,28 @@ export async function recoverSignedArchiveCustody(
         ...source.raw,
       }
     : null;
+}
+
+export async function recoverExactPolarArchiveReplay(
+  db: DB,
+  input: ProgressiveRemoteEvidenceDelivery,
+  instance: string,
+  proposal: SubmittedRawPoint,
+) {
+  const proof = await verifyRetainedSource(
+    db,
+    input,
+    instance,
+    proposal.bundle.remoteEvidenceUploadId,
+    proposal,
+  );
+  if (!proof) return null;
+  const custody: ProgressiveEvidenceCustodyReceipt = {
+    schemaVersion: 1,
+    kind: "hub-progressive-evidence-custody",
+    source: input,
+    brokeredUploadId: proof.uploadId,
+    ...proof.raw,
+  };
+  return { receipt: proof.receipt, custody };
 }

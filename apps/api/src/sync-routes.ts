@@ -142,7 +142,8 @@ import { readStoredForceHistory } from "./solver-history-reader";
 import { readStoredResultHistories } from "./result-history-reader";
 import { apiAttemptEvidenceReader, readStoredAttemptEvidenceBatch } from "./attempt-evidence-reader";
 import { isPolarReceiptReplayRequest, readBoundPolarReplayReceipt, originalPolarReceiptResponse } from "./progressive-polar-receipt-replay";
-import { recoverSignedArchiveCustody, recoverSignedPolarReceipt } from "./retained-polar-point";
+import { boundArchiveSubmission, submittedArchiveProof, type BoundArchiveSubmission } from "./bound-polar-upload-replay";
+import { recoverExactPolarArchiveReplay, recoverSignedArchiveCustody, recoverSignedPolarReceipt } from "./retained-polar-point";
 import { prepareProgressiveRemoteEvidence } from "@aerodb/db/progressive-remote-evidence";
 import { prepareProgressiveRemoteReceiptReplay } from "@aerodb/db/progressive-remote-evidence-receipts";
 import {
@@ -2414,6 +2415,7 @@ function declaredInlineUploads(
 
 async function parsePolarRequest(req: FastifyRequest): Promise<{
   payload: PolarPushPayload;
+  boundArchive?: BoundArchiveSubmission;
   files: Map<string, UploadedFileRef>;
   capacityReservation: SyncUploadCapacityReservation | null;
 }> {
@@ -2456,6 +2458,7 @@ async function parsePolarRequest(req: FastifyRequest): Promise<{
   const files = new Map<string, UploadedFileRef>();
   const budget = { decodedBytes: 0 };
   let payload: PolarPushPayload | null = null;
+  let boundArchive: BoundArchiveSubmission | undefined;
   let declared = new Map<string, number>();
   let capacityReservation: SyncUploadCapacityReservation | null = null;
   let partNumber = 0;
@@ -2501,6 +2504,7 @@ async function parsePolarRequest(req: FastifyRequest): Promise<{
           );
         }
         payload = polarPushSchema.parse(manifest);
+        boundArchive = boundArchiveSubmission(manifest);
         declared = declaredMultipartUploads(payload);
         const inline = declaredInlineUploads(payload, new Map());
         const reservedBytes = [...declared.values(), ...inline.values()].reduce(
@@ -2566,7 +2570,7 @@ async function parsePolarRequest(req: FastifyRequest): Promise<{
         "manifest references missing multipart upload field " + missing,
       );
     }
-    return { payload, files, capacityReservation };
+    return { payload, files, capacityReservation, boundArchive };
   } catch (error) {
     await cleanupMultipartTemps(files);
     await capacityReservation?.release();
@@ -8792,7 +8796,15 @@ export async function registerSyncRoutes(app: FastifyInstance): Promise<void> {
           ) {
             permissionError = "push disabled for result_media";
           }
-          if (!permissionError) {
+          if (!permissionError && authenticatedSolver && polarRoute === "/api/sync/v1/polars" && parsed.boundArchive) {
+            const proposal = submittedArchiveProof(parsed.boundArchive, authenticatedSolver.id, files);
+            if (proposal) {
+              const found=await recoverExactPolarArchiveReplay(db,proposal.source,proposal.instance,proposal.point);
+              if (found) response={...originalPolarReceiptResponse(found.receipt,proposal.source.promiseId,proposal.source.aoaDeg),
+                progressiveArchiveReceipts:[found.custody]};
+            }
+          }
+          if (!permissionError && !response) {
             // Hold a shared-process-independent lock from blob publication until
             // the final reference check. A concurrent importer that observes an
             // EEXIST blob can therefore never race a failed owner's cleanup and
