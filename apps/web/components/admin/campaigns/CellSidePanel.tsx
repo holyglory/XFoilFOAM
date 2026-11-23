@@ -487,6 +487,7 @@ export function CellSidePanel({
         re: condition.reynolds,
         aoa: target.aoaDeg,
         resultId: target.resultId,
+        resultAttemptId: target.resultAttemptId,
         mirrored,
         mirroredFromAoaDeg: mirrored ? target.sourceAoaDeg : null,
       });

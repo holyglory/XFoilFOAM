@@ -36,6 +36,7 @@ const angleLabel = (aoaDeg: number) => `α ${f1(aoaDeg)}°`;
 
 export interface PreliminaryResultTarget {
   resultId: string;
+  resultAttemptId: string;
   aoaDeg: number;
   sourceAoaDeg: number;
   tier: "fast" | "final";
@@ -1095,20 +1096,21 @@ export function PreliminaryOutcomePanel({
                     testId={`cell-preliminary-fast-${item.aoaDeg}`}
                     current={currentStage === "fast"}
                     title={
-                      item.fastResultId
+                      item.fastResultId && item.fastResultAttemptId
                         ? `Open preliminary URANS result: ${view.fastLabel}`
                         : `Preliminary URANS: ${view.fastLabel}`
                     }
                     openLabel={
-                      item.fastResultId
+                      item.fastResultId && item.fastResultAttemptId
                         ? `Open preliminary URANS result for ${label}`
                         : undefined
                     }
                     onOpen={
-                      item.fastResultId && onOpenResult
+                      item.fastResultId && item.fastResultAttemptId && onOpenResult
                         ? () =>
                             onOpenResult({
                               resultId: item.fastResultId!,
+                              resultAttemptId: item.fastResultAttemptId!,
                               aoaDeg: item.aoaDeg,
                               sourceAoaDeg: item.sourceAoaDeg,
                               tier: "fast",
@@ -1155,20 +1157,21 @@ export function PreliminaryOutcomePanel({
                     testId={`cell-preliminary-final-${item.aoaDeg}`}
                     current={currentStage === "final"}
                     title={
-                      item.finalResultId
+                      item.finalResultId && item.finalResultAttemptId
                         ? `Open verified URANS result: ${view.finalLabel}`
                         : `Verified URANS: ${view.finalLabel}`
                     }
                     openLabel={
-                      item.finalResultId
+                      item.finalResultId && item.finalResultAttemptId
                         ? `Open verified URANS result for ${label}`
                         : undefined
                     }
                     onOpen={
-                      item.finalResultId && onOpenResult
+                      item.finalResultId && item.finalResultAttemptId && onOpenResult
                         ? () =>
                             onOpenResult({
                               resultId: item.finalResultId!,
+                              resultAttemptId: item.finalResultAttemptId!,
                               aoaDeg: item.aoaDeg,
                               sourceAoaDeg: item.sourceAoaDeg,
                               tier: "final",

@@ -632,10 +632,15 @@ test.describe
     let maxConcurrentSolverFlowRequests = 0;
     const managementResultId = `${state.stamp}-failed-point-result`;
     const managementAttemptId = `${state.stamp}-failed-point-attempt`;
+    const stageTargets = new Map([
+      [managementResultId, { attemptId: managementAttemptId, fidelity: "urans_precalc" }],
+      [`${state.stamp}-fast-result`, { attemptId: `${state.stamp}-fast-attempt`, fidelity: "urans_precalc" }],
+      [`${state.stamp}-final-result`, { attemptId: `${state.stamp}-final-attempt`, fidelity: "urans_full" }],
+    ]);
     let managementRequeuePosts = 0;
     let managementCorrectionPosts = 0;
     await page.route(
-      `**/api/admin/point-history/${managementResultId}/*`,
+      `**/api/admin/point-history/${state.stamp}-*/*`,
       async (route) => {
         const url = new URL(route.request().url());
         if (url.pathname.endsWith("/story")) {
@@ -735,12 +740,14 @@ test.describe
           return;
         }
         if (url.pathname.endsWith("/sim")) {
-          expect(url.searchParams.get("resultAttemptId")).toBe(
-            managementAttemptId,
-          );
+          const resultId = decodeURIComponent(url.pathname.split("/").at(-2)!);
+          const target = stageTargets.get(resultId);
+          expect(target).toBeDefined();
+          expect(url.searchParams.get("resultAttemptId")).toBe(target!.attemptId);
           await route.fulfill({
             json: {
-              resultId: managementResultId,
+              resultId,
+              resultAttemptId: target!.attemptId,
               status: "solved",
               regime: "attached",
               airfoilName: `${state.stamp} cam 4415`,
@@ -754,7 +761,7 @@ test.describe
               media: null,
               availableFields: [],
               history: null,
-              fidelity: "urans_precalc",
+              fidelity: target!.fidelity,
               steadyHistory: null,
               uransVerify: null,
               condition: null,
@@ -1339,22 +1346,24 @@ test.describe
       preliminary.getByTestId("cell-preliminary-incident-0"),
     ).toHaveCount(0);
 
-    const exactFinalResultRequest = page.waitForRequest((request) => {
-      const url = new URL(request.url());
-      return (
-        url.pathname.endsWith(`/api/airfoils/${state.camAirfoil.slug}/sim`) &&
-        url.searchParams.get("resultId") === `${state.stamp}-final-result`
-      );
-    });
-    await preliminary.getByTestId("cell-preliminary-final-0").click();
-    const finalResultRequest = new URL((await exactFinalResultRequest).url());
-    expect(finalResultRequest.searchParams.get("aoa")).toBe("0");
-    await expect(page.getByTestId("sim-modal-dialog")).toBeVisible();
-    await page.keyboard.press("Escape");
-    await expect(page.getByTestId("sim-modal-dialog")).toHaveCount(0);
-    await expect(
-      preliminary.getByTestId("cell-preliminary-final-0"),
-    ).toBeFocused();
+    for (const stage of ["fast", "final"]) {
+      const resultId = `${state.stamp}-${stage}-result`;
+      const attemptId = stageTargets.get(resultId)!.attemptId;
+      const exactAttempt = page.waitForResponse((response) => {
+        const url = new URL(response.url());
+        return url.pathname === `/api/admin/point-history/${resultId}/sim` &&
+          url.searchParams.get("resultAttemptId") === attemptId;
+      });
+      const trigger = preliminary.getByTestId(`cell-preliminary-${stage}-0`);
+      await trigger.click();
+      const response = await exactAttempt;
+      expect(response.status()).toBe(200);
+      expect(await response.json()).toMatchObject({ resultId, resultAttemptId: attemptId });
+      await expect(page.getByTestId("sim-modal-dialog")).toBeVisible();
+      await page.keyboard.press("Escape");
+      await expect(page.getByTestId("sim-modal-dialog")).toHaveCount(0);
+      await expect(trigger).toBeFocused();
+    }
 
     solverFlowPhase = "accepted-disagreed";
     await expect(finalStage).toHaveClass(/comparison-warning/, {
