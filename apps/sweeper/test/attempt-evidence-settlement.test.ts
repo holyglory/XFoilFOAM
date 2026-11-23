@@ -448,6 +448,11 @@ describe("verified settled attempt history transition", () => {
     const isolated = await createSettlementFixture(false, true);
     const { db } = isolated;
     try {
+      // A later schema column must participate automatically in exact
+      // metadata comparison, including SQL array bounds.
+      await db.execute(sql`ALTER TABLE result_attempts ADD COLUMN future_calibration integer[]`);
+      await db.execute(sql`CREATE TRIGGER progressive_attempt_fit_changed AFTER UPDATE OF evidence_payload ON result_attempts
+        FOR EACH ROW EXECUTE FUNCTION invalidate_progressive_attempt_fit()`);
       const source = await seedSettledHistory(db, { detailBytes: 4 * 1024 * 1024 });
       const { attemptId, archive } = source;
       const deps = dependencies(source, db);
@@ -470,6 +475,23 @@ describe("verified settled attempt history transition", () => {
         JOIN attempt_evidence_history_projections p ON p.result_attempt_id=a.id AND p.archive_id=e.archive_id WHERE a.id=${attemptId}::uuid`);
       expect(committed).toEqual({ sealed_first: true, completed: true, normal_read: true, retained_detail: 4 * 1024 * 1024 });
       expect(await readStoredAttemptEvidenceText(db, attemptId)).toBe(before.original);
+      const [checks] = await db.execute(sql`WITH cells AS MATERIALIZED (
+        SELECT a AS cold,jsonb_populate_record(a,jsonb_build_object('evidence_archive_id',null,'evidence_storage_event_id',null,
+          'evidence_payload',${before.original}::text::jsonb)) AS warm FROM result_attempts a WHERE a.id=${attemptId}::uuid)
+        SELECT attempt_evidence_sealed_transition(warm,cold) AS shorten,attempt_evidence_sealed_transition(cold,warm) AS restore,
+          attempt_evidence_sealed_transition(warm,jsonb_populate_record(cold,'{"cl":0.1}')) AS coefficient,
+          attempt_evidence_sealed_transition(warm,jsonb_populate_record(cold,'{"quality_warnings":[]}')) AS warnings,
+          attempt_evidence_sealed_transition(warm,jsonb_populate_record(cold,'{"evidence_archive_id":"00000000-0000-4000-8000-000000000001"}')) AS foreign_archive,
+          attempt_evidence_sealed_transition(warm,jsonb_populate_record(cold,jsonb_build_object('evidence_payload',
+            jsonb_set((cold).evidence_payload,'{cl}','0.60'::jsonb)))) AS compact_scale,
+          attempt_evidence_sealed_transition(jsonb_populate_record(warm,jsonb_build_object('evidence_payload',
+            jsonb_set((warm).evidence_payload,'{cl}','0.60'::jsonb))),cold) AS original_scale,
+          attempt_evidence_sealed_transition(jsonb_populate_record(warm,'{"future_calibration":"[0:0]={1}"}'),
+            jsonb_populate_record(cold,'{"future_calibration":"[1:1]={1}"}')) AS array_bounds
+        FROM cells`);
+      expect(checks).toEqual({shorten:true,restore:true,coefficient:false,warnings:false,foreign_archive:false,
+        compact_scale:false,original_scale:false,array_bounds:false});
+      await expect(db.execute(sql`UPDATE result_attempts SET future_calibration=ARRAY[1] WHERE id=${attemptId}::uuid`)).rejects.toThrow("scientific metadata is immutable");
     } finally {
       await isolated.close();
     }
