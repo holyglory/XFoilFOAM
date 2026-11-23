@@ -143,17 +143,61 @@ interface ScientificResultGroup {
   reports: { sequence: number; contentSignature: string; envelopeText: string }[];
 }
 
+interface VerifiedScientificResult {
+  group: ScientificResultGroup;
+  canonical?: string;
+}
+
+function postgresEnvelope(fields: Map<string, string>, result: string): string {
+  return `{${[...fields].map(([key, value]) =>
+    `${JSON.stringify(key)}: ${key === "result" ? result : value}`).join(", ")}}`;
+}
+
+function appendScientificReport(group: ScientificResultGroup, member: LegacyReportMember, fields: Map<string, string>) {
+  group.reports.push({ sequence: member.sequence, contentSignature: member.contentSignature,
+    envelopeText: postgresEnvelope(fields, "null") });
+}
+
+/** A 0198 row already carries the small envelope and an index into the result
+ * payload table. Treat the index only as a hint. Replacing its result must
+ * reconstruct the complete, independently authenticated PG text byte for byte. */
+function reuseScientificResult(member: LegacyReportMember, storedReport: string, prior: VerifiedScientificResult): boolean {
+  const fields = new Map<string, string>();
+  const envelope = reportJsonObject(parseReportJson(storedReport, fields));
+  if (!fields.has("result") || postgresEnvelope(fields, prior.group.resultText) !== member.reportText)
+    return false;
+
+  // Use the production canonical serializer for every varying envelope. An
+  // additional nested "result":null slot takes the ordinary full verifier.
+  const canonical = canonicalReportJson({ ...envelope, result: null });
+  const slot = '"result":null';
+  const at = canonical.indexOf(slot);
+  if (at < 0 || at !== canonical.lastIndexOf(slot)) return false;
+  const valueAt = at + slot.length - "null".length;
+  prior.canonical ??= canonicalReportJson(parseReportJson(prior.group.resultText));
+  const signature = createHash("sha256").update(canonical.slice(0, valueAt))
+    .update(prior.canonical).update(canonical.slice(valueAt + "null".length)).digest("hex");
+  if (signature !== member.contentSignature)
+    throw new Error("Legacy report canonical signature differs from its stored identity");
+  appendScientificReport(prior.group, member, fields);
+  return true;
+}
+
 // Preserve the PostgreSQL text used for whole-report reconstruction. Only the
 // normal staging point identity uses the application's numerical representation.
-function collectScientificSource(member: LegacyReportMember, groups: Map<string, ScientificResultGroup>) {
+function collectScientificSource(member: LegacyReportMember, groups: Map<string, ScientificResultGroup>,
+  previous: VerifiedScientificResult | undefined, payloadHash: unknown, storedReport: string | undefined): VerifiedScientificResult | undefined {
   if (member.kind !== "report") return;
+  if (previous && previous.group.executionId === member.executionId &&
+    previous.group.resultSha256 === payloadHash && storedReport?.startsWith("{") &&
+    reuseScientificResult(member, storedReport, previous)) return previous;
+
   const fields = new Map<string, string>();
   const report = parseReportJson(member.reportText, fields);
   if (createHash("sha256").update(canonicalReportJson(report)).digest("hex") !== member.contentSignature)
     throw new Error("Legacy report canonical signature differs from its stored identity");
   const resultText = fields.get("result");
   if (!resultText?.startsWith("{")) return;
-
   const { sha256, byteSize } = reportTextIdentity(resultText);
   const key = `${member.executionId}:${sha256}:${byteSize}`;
   let group = groups.get(key);
@@ -170,9 +214,8 @@ function collectScientificSource(member: LegacyReportMember, groups: Map<string,
   } else if (group.resultText !== resultText) {
     throw new Error("Scientific result digest collision");
   }
-  const envelopeText = `{${[...fields].map(([name, text]) =>
-    `${JSON.stringify(name)}: ${name === "result" ? "null" : text}`).join(", ")}}`;
-  group.reports.push({ sequence: member.sequence, contentSignature: member.contentSignature, envelopeText });
+  appendScientificReport(group, member, fields);
+  return previous?.group === group ? previous : {group};
 }
 
 interface BoundPage {
@@ -238,6 +281,7 @@ export async function verifyLegacyReportCustodyPage(
   legacyBound(object.byteSize, 2 * 1024 ** 3, "legacy object bytes");
   const members: LegacyReportCustodyMemberProof[] = [];
   const scientificResults = new Map<string, ScientificResultGroup>();
+  let previousScientific: VerifiedScientificResult | undefined;
   const keys = new Set<string>();
   let bytes = 0;
   for (const member of page.members) {
@@ -250,7 +294,9 @@ export async function verifyLegacyReportCustodyPage(
     const row = reportTextIdentity(member.rowText);
     if (body.sha256 !== member.reportSha256 || body.byteSize !== member.reportByteSize || row.sha256 !== member.rowSha256)
       throw new Error("Legacy member differs from its exact exported PostgreSQL text");
-    const source = reportValidationValue(parseReportJson(member.rowText)) as Record<string, unknown>;
+    const rowFields = previousScientific && member.kind === "report" && member.rowText.length < member.reportText.length
+      ? new Map<string, string>() : undefined;
+    const source = reportValidationValue(parseReportJson(member.rowText, rowFields)) as Record<string, unknown>;
     if (!source || source.sim_job_id !== member.executionId || source.sequence !== member.sequence ||
       source.content_signature !== member.contentSignature)
       throw new Error("Legacy member source row differs from its bound report key");
@@ -262,7 +308,8 @@ export async function verifyLegacyReportCustodyPage(
     members.push({ kind: member.kind, executionId: member.executionId, sequence: member.sequence,
       contentSignature: member.contentSignature, reportSha256: body.sha256, reportByteSize: body.byteSize,
       rowSha256: row.sha256, rowByteSize: row.byteSize });
-    collectScientificSource(member, scientificResults);
+    previousScientific = collectScientificSource(member, scientificResults, previousScientific,
+      source.result_payload_hash, rowFields?.get("report"));
   }
   const memberProofs = Object.freeze(members.map((member) => Object.freeze(member)));
   const startedAt = Date.now();

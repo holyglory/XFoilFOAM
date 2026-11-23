@@ -616,6 +616,99 @@ it("routes new AoA progress, changed coefficients and new failed evidence throug
   );
 });
 
+it("checks each signed envelope and preserves a one-sample history change on repeated normalized results", async () => {
+  await fixture(async (f) => {
+    const sequences = [3510, 3511, 3512, 3513];
+    for (const sequence of sequences) {
+      await f.append(sequence, {
+        mutate(report) {
+          const times = Array.from({ length: 400 }, (_, i) => i / 40);
+          const cl = times.map(() => 0.42);
+          if (sequence === 3513) cl[399] = 0.420001;
+          Object.assign(report.result!.polars[0].attempts![0], {
+            force_history: { t: times, cl, cd: times.map(() => 0.03) },
+          });
+          if (sequence === 3512)
+            Object.assign(report.status, { diagnostics: { result: null } });
+        },
+      });
+    }
+    const whole = await pageFor(f, sequences);
+    type Group = {
+      resultText: string;
+      resultSha256: string;
+      resultByteSize: number;
+      pointSignatures: string[];
+      reports: {
+        sequence: number;
+        contentSignature: string;
+        envelopeText: string;
+      }[];
+    };
+    async function scientificSql(proof: typeof whole.proof): Promise<Group[]> {
+      const query = legacyReportCustodySql(proof)
+        .split("\n")
+        .find((line) =>
+          line.startsWith(
+            "SELECT public.register_legacy_report_archive_custody(",
+          ),
+        )!;
+      const literal = query.slice(
+        "SELECT public.register_legacy_report_archive_custody(".length,
+        -")::text;".length,
+      );
+      const [decoded] = await f.db.execute(
+        sql.raw(`SELECT ${literal} AS page`),
+      );
+      return (decoded.page as { scientificResults: Group[] }).scientificResults;
+    }
+    const joined = await scientificSql(whole.proof);
+    expect(joined.map((x) => x.reports.map((r) => r.sequence))).toEqual([
+      [3510, 3511, 3512],
+      [3513],
+    ]);
+    for (const member of whole.page.members) {
+      const stored = JSON.parse(member.rowText);
+      expect(member.rowText.length).toBeLessThan(member.reportText.length);
+      const group = joined.find((g) =>
+        g.reports.some((r) => r.sequence === member.sequence),
+      )!;
+      expect(stored.result_payload_hash).toBe(group.resultSha256);
+      const [single] = await scientificSql(
+        (await pageFor(f, [member.sequence])).proof,
+      );
+      expect({
+        ...group,
+        reports: group.reports.filter((r) => r.sequence === member.sequence),
+      }).toEqual(single);
+      const envelope = single.reports[0];
+      const [reconstructed] = await f.db.execute(
+        sql`SELECT jsonb_set(${envelope.envelopeText}::jsonb,'{result}',${single.resultText}::jsonb,false)::text AS body`,
+      );
+      expect(reconstructed.body).toBe(member.reportText);
+    }
+
+    const member = whole.page.members[1],
+      original = { ...member };
+    member.contentSignature = "f".repeat(64);
+    member.rowText = member.rowText.replace(
+      `"content_signature": "${original.contentSignature}"`,
+      `"content_signature": "${member.contentSignature}"`,
+    );
+    member.rowSha256 = hash(member.rowText);
+    await expect(whole.verify()).rejects.toThrow("canonical signature");
+    Object.assign(member, original);
+    // Keep the normalized row/hash hint but change the actual restored result.
+    member.reportText = member.reportText.replace("0.42", "0.43");
+    expect(member.reportText).not.toBe(original.reportText);
+    Object.assign(member, {
+      reportSha256: hash(member.reportText),
+      reportByteSize: Buffer.byteLength(member.reportText),
+    });
+    await expect(whole.verify()).rejects.toThrow("canonical signature");
+  });
+});
+
 it("reclaims all 36 original-page duplicates using an already-cold genuinely staged source, preserving scientific identities", async () => {
   await fixture(async (f) => {
     await f.append(3464); // Another real report still references this exact shared result.
