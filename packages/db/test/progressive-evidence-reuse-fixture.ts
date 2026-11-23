@@ -2,6 +2,7 @@ import { sql } from "drizzle-orm";
 import { randomUUID } from "node:crypto";
 import { expect } from "vitest";
 import type { DB } from "../src/client";
+import { fixtureStagingCandidateView } from "../test-support/staging-candidate-view";
 import {
   validateProgressiveRemoteReport,
   type ProgressiveRemoteReport,
@@ -15,6 +16,12 @@ import {
   progressiveReportedPointSources,
   progressiveRemotePointProjection,
 } from "../src/index";
+
+async function shadowExecutionReports(db: Pick<DB, "execute">, executionId: string) {
+  await db.execute(sql`CREATE TEMP TABLE progressive_worker_reports ON COMMIT DROP AS
+    SELECT * FROM public.progressive_worker_reports WHERE sim_job_id=${executionId}::uuid`);
+  await db.execute(fixtureStagingCandidateView);
+}
 
 export async function verifyProgressiveEvidenceReuse(
   db: DB,
@@ -105,8 +112,8 @@ export async function verifyProgressiveEvidenceReuse(
       await expect(
         transaction.transaction(async (nested) => {
           const scoped = nested as unknown as DB;
+          await shadowExecutionReports(nested, executionId);
           for (const table of [
-            "progressive_worker_reports",
             "progressive_worker_evidence_receipts",
             "progressive_worker_evidence_attempts",
             "result_attempts",
@@ -192,6 +199,11 @@ export async function verifyProgressiveEvidenceReuse(
           ).toEqual(before.map((row) => String(row.id)));
           await scoped.execute(sql`INSERT INTO progressive_worker_reports(sim_job_id,sequence,content_signature,report,acknowledged_at)
             VALUES(${executionId}::uuid,${repeated.sequence},${validated.contentSignature},${JSON.stringify(repeated)}::jsonb,clock_timestamp())`);
+          const exactSource = sql`WHERE sim_job_id=${executionId}::uuid AND sequence=${repeated.sequence}`;
+          expect(await scoped.execute(sql`SELECT
+            EXISTS(SELECT 1 FROM progressive_worker_staging_candidates ${exactSource}) AS eligible,
+            EXISTS(SELECT 1 FROM public.progressive_worker_staging_candidates ${exactSource}) AS persisted`))
+            .toEqual([{ eligible: true, persisted: false }]);
           expect(
             await stageProgressiveWorkerEvidence(scoped, engine, executionId, {
               reportSequence: repeated.sequence,
@@ -257,11 +269,12 @@ export async function verifyProgressiveEvidenceReuse(
       ).rejects.toBe(refused);
       await expect(
         transaction.transaction(async (nested) => {
-          await nested.execute(sql`CREATE TEMP TABLE progressive_worker_reports ON COMMIT DROP AS
-            SELECT * FROM public.progressive_worker_reports WHERE sim_job_id=${executionId}::uuid`);
+          await shadowExecutionReports(nested, executionId);
           await nested.execute(
             sql`UPDATE progressive_worker_reports SET acknowledged_at=NULL WHERE sim_job_id=${executionId}::uuid`,
           );
+          expect(await nested.execute(sql`SELECT sequence FROM progressive_worker_staging_candidates
+            WHERE sim_job_id=${executionId}::uuid`)).toHaveLength(0);
           expect(
             await existingProgressiveReportAttempts(
               nested as unknown as DB,
@@ -413,8 +426,7 @@ export async function verifyProgressiveEvidenceReuse(
           expect(await existingProgressiveReportAttempts(scoped, changedSource, envelope)).toBeNull();
           const rollbackTampered = new Error("Restore authenticated cumulative report");
           await expect(nested.transaction(async transaction => {
-            await transaction.execute(sql`CREATE TEMP TABLE progressive_worker_reports ON COMMIT DROP AS
-              SELECT * FROM public.progressive_worker_reports WHERE sim_job_id=${executionId}::uuid`);
+            await shadowExecutionReports(transaction, executionId);
             await transaction.execute(sql`UPDATE progressive_worker_reports SET report=jsonb_set(report,'{result,polars,0,attempts,1,cl}','0.75'::jsonb)
               WHERE sim_job_id=${executionId}::uuid AND sequence=${cumulative.sequence}`);
             expect(await existingProgressiveReportAttempts(transaction as unknown as DB, replay, envelope)).toBeNull();

@@ -1,11 +1,11 @@
 import type { DB } from "../src/client";
 import { sql } from "drizzle-orm";
 
-// A temporary report table shadows the source in these selector fixtures.
-// Bind the candidate view to the same test rows as the claim and receipt reads.
+// PostgreSQL binds a view to its source relation at CREATE VIEW time. Shadow
+// the 0218 view along with the report table so claims and receipts see one source.
 export const fixtureStagingCandidateView = sql`
-  CREATE TEMP VIEW progressive_worker_staging_candidates AS
-  SELECT * FROM pg_temp.progressive_worker_reports
+  CREATE TEMP VIEW progressive_worker_staging_candidates WITH (security_invoker=true) AS
+  SELECT sim_job_id,sequence,created_at,stopped_engine_job_id FROM pg_temp.progressive_worker_reports
   WHERE acknowledged_at IS NOT NULL AND jsonb_typeof(report->'result')='object'
 `;
 
