@@ -78,6 +78,7 @@ const temporaryDirectories: string[] = [];
 
 it("checks each cancelled report's signature and point inventory even when the PG result repeats", async () => {
   const { cancelledReportSourceVerifier } = await import("../src/report-archive-source-proof");
+  const { stoppedReportPageText } = await import("../src/shared-stopped-report-custody");
   const { retainedReportInventory } = await import("@aerodb/db/retained-solver-reports");
   const { reportJsonObject } = await import("@aerodb/db/progressive-report-archive");
   const job = randomUUID();
@@ -93,10 +94,19 @@ it("checks each cancelled report's signature and point inventory even when the P
     return { signature, inventory: inv.signature, sources: canonicalReportJson(inv.sources) };
   });
   const verify = cancelledReportSourceVerifier(job);
+  const split = stoppedReportPageText();
   for (const [i, raw] of documents.entries()) {
     const e = expected[i];
     expect(verify(raw, i+1, e.signature, e.inventory)).toBe(e.sources);
+    const member = split(raw, null, 0);
+    expect(member.prefix + (member.result ?? "") + member.suffix).toBe(raw);
+    if (member.result) expect(member.hash).toBe(reportTextIdentity(member.result).sha256);
   }
+  const scienceHash = reportTextIdentity(science).sha256;
+  const protectedMember = split(make(5, "{}"), scienceHash, Buffer.byteLength(science));
+  expect(protectedMember.result).toBeNull();
+  expect(protectedMember.prefix + science + protectedMember.suffix).toBe(make(5, science));
+  expect(() => split(make(6, "null"), scienceHash, Buffer.byteLength(science))).toThrow("Protected SQL result");
   expect(expected[0].sources).toBe(expected[1].sources);
   expect(expected[2].sources).not.toBe(expected[1].sources);
   expect(expected[3].sources).toBe("[]");

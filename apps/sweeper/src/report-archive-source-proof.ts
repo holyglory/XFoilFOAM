@@ -53,6 +53,18 @@ export function reportSourceInventorySignature(
     .digest("hex");
 }
 
+export function matchingReportResultSuffix(
+  raw: string,
+  prior: { prefix: string; result: string } | undefined,
+) {
+  if (
+    prior &&
+    raw.startsWith(prior.prefix) &&
+    raw.startsWith(prior.result, prior.prefix.length)
+  )
+    return raw.slice(prior.prefix.length + prior.result.length);
+}
+
 /** Keep one authenticated scientific value for this ordered writer page.
  * The prefix includes everything through the start of the original root result
  * token. Both that prefix and the entire token must match the new PG text.
@@ -70,14 +82,10 @@ export function cancelledReportSourceVerifier(executionId: string) {
     let canonical: Buffer | undefined;
     let inventory: string;
     let sourceList: string;
-    if (
-      previous &&
-      raw.startsWith(previous.prefix) &&
-      raw.startsWith(previous.result, previous.prefix.length)
-    ) {
-      const end = previous.prefix.length + previous.result.length;
+    const suffix = matchingReportResultSuffix(raw, previous);
+    if (previous && suffix !== undefined) {
       envelope = reportJsonObject(
-        parseReportJson(previous.prefix + "null" + raw.slice(end)),
+        parseReportJson(previous.prefix + "null" + suffix),
       );
       canonical = previous.canonical;
       inventory = reportSourceInventorySignature(
