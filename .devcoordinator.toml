@@ -6048,6 +6048,30 @@ tier = "development"
 case_command = ["/bin/bash", "-c", "exec psql \"$DATABASE_URL\" -Xq -v ON_ERROR_STOP=1 -f tests/fixtures/hz_cache_index_packing.sql"]
 cases = [{ id = "disposable-index-and-rewrite", args = [], postgres = "default" }]
 
+# The local check can run before release. The final handoff consumes the supplied
+# upstream receipts only after the reviewed catalog has shipped to the public VPS.
+[test.catalog-web-delivery]
+timeout_seconds = 300
+
+[[test.catalog-web-delivery.check]]
+name = "contract"
+tier = "release"
+command = ["node", "--test", "scripts/dev/verify-catalog-web-delivery.test.mjs"]
+
+[[test.catalog-web-delivery.check]]
+name = "local"
+tier = "release"
+requires = ["contract"]
+command = ["node", "scripts/dev/verify-catalog-web-delivery.mjs", "reviewed-local"]
+retained_artifacts = [{name="catalog-paging-public-local",path=".codex-artifacts/catalog-web-delivery/local",max_bytes=67108864}]
+
+[[test.catalog-web-delivery.check]]
+name = "handoff"
+tier = "release"
+requires = ["contract"]
+command = ["node", "scripts/dev/verify-catalog-web-delivery.mjs", "handoff"]
+retained_artifacts = [{name="catalog-paging-public",path=".codex-artifacts/catalog-web-delivery/handoff",max_bytes=67108864}]
+
 # Loopback-only catalog with the full seed geometry and measured NeuralFoil curves.
 [deployment.catalog-paging]
 source = ["worktree"]
