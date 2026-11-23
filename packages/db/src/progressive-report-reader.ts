@@ -85,7 +85,22 @@ export interface ProgressiveReportArchiveReader {
 const UUID = /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i;
 const SHA256 = /^[a-f0-9]{64}$/;
 const MAX_REPORT_BYTES = 512 * 1024 * 1024;
-let installed: { reader: ProgressiveReportArchiveReader; timeoutMs: number } | null = null;
+type ReportOwner = Pick<ProgressiveRemoteReport, "solverId" | "promiseId" | "assignmentSignature">;
+let installed: {
+  reader: ProgressiveReportArchiveReader;
+  timeoutMs: number;
+  pending: Map<string, Promise<ProgressiveRemoteReport>>;
+} | null = null;
+
+export function freezeProgressiveReport(report: ProgressiveRemoteReport): void {
+  const freeze = (v: unknown): void => {
+    if (!v || typeof v !== "object" || Object.isFrozen(v)) return;
+    Object.freeze(v);
+    for (const item of Object.values(v)) freeze(item);
+  };
+  freeze(report);
+}
+
 
 /** Hub installs its exact object reader; workers install the authenticated hub broker.
  * This package neither creates object-store clients nor obtains credentials. */
@@ -96,7 +111,7 @@ export function installProgressiveReportArchiveReader(
   const timeoutMs = options.timeoutMs ?? 15_000;
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 30_000)
     throw new Error("Progressive report reads require a 1..30000ms deadline");
-  installed = reader ? { reader, timeoutMs } : null;
+  installed = reader ? { reader, timeoutMs, pending: new Map() } : null;
 }
 
 function verifyBody(value: unknown, reference: ProgressiveReportReference, signature = analysisContentHash(value)): ProgressiveRemoteReport {
@@ -112,6 +127,7 @@ function verifyBody(value: unknown, reference: ProgressiveReportReference, signa
 export async function readProgressiveReport(
   db: DB,
   reference: ProgressiveReportReference,
+  preparedOwner?: ReportOwner,
 ): Promise<ProgressiveRemoteReport> {
   if (!["remote", "worker"].includes(reference.sourceKind) || !UUID.test(reference.executionId) ||
     !Number.isSafeInteger(reference.sequence) || reference.sequence < 1 || !SHA256.test(reference.contentSignature))
@@ -176,52 +192,79 @@ export async function readProgressiveReport(
   )) throw new Error("Archived legacy report lacks its measured product-read identity");
   const active = installed;
   if (!active) throw new Error("Archived progressive full report reader is not installed");
-  const controller = new AbortController();
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  try {
-    const identity: ProgressiveReportArchiveIdentity = {
-        sourceKind: reference.sourceKind, memberKind: "report", executionId: reference.executionId,
-        sequence: reference.sequence, signature: reference.contentSignature,
-        reportSha256: String(stored.report_sha256), reportByteSize,
-        bucket: String(stored.bucket), objectKey: String(stored.object_key), generation: String(stored.generation),
-        mimeType: String(stored.mime_type), compression: String(stored.compression), archiveFormat: String(stored.archive_format),
-        storedSha256: String(stored.stored_sha256), storedByteSize, crc32c: String(stored.crc32c),
-        memberCount: Number(stored.member_count), firstSequence: Number(stored.first_sequence), lastSequence: Number(stored.last_sequence),
-        ...(stored.archive_format === "legacy-jsonl" ? {
-          legacyInstanceId: String(stored.legacy_instance_id), legacySolverId: String(stored.legacy_solver_id),
-          legacyScopeSha256: String(stored.legacy_scope_sha256), legacyPageMemberCount: Number(stored.legacy_page_member_count),
-          legacyReadMode: stored.legacy_read_mode as "registered-get" | "hub-local-reader",
-          ...(stored.legacy_local_storage_key ? { legacyLocalStorageKey: String(stored.legacy_local_storage_key) } : {}),
-        } : {}),
-        signal: controller.signal,
-    };
-    Object.freeze(identity);
-    const body = await Promise.race([
-      active.reader.read(identity, db),
-      new Promise<never>((_, reject) => {
-        timer = setTimeout(() => {
-          reject(new ProgressiveReportArchiveTimeout(identity));
-          controller.abort();
-        }, active.timeoutMs);
-      }),
-    ]);
-    if (typeof body !== "string")
-      throw new Error("Archived progressive full report reader must return exact JSON text");
-    // PostgreSQL jsonb::text is the archive member identity. It is deliberately
-    // independent of the application's canonical content signature.
-    const raw = reportTextIdentity(body);
-    if (raw.byteSize !== reportByteSize || raw.sha256 !== stored.report_sha256)
-      throw new Error("Archived progressive full report member bytes changed");
-    const parsed = parseReportJson(body);
-    const signature = createHash("sha256").update(canonicalReportJson(parsed), "utf8").digest("hex");
-    const report = verifyBody(reportValidationValue(parsed), reference, signature);
-    if (identity.sourceKind === "remote")
-      archivedMembers.set(report, Object.freeze({ bundleId: String(stored.archive_bundle_id), identity }));
-    return report;
-  } finally {
-    clearTimeout(timer);
-    controller.abort();
-  }
+  const storedIdentity = {
+    sourceKind: reference.sourceKind, memberKind: "report" as const, executionId: reference.executionId,
+    sequence: reference.sequence, signature: reference.contentSignature,
+    reportSha256: String(stored.report_sha256), reportByteSize,
+    bucket: String(stored.bucket), objectKey: String(stored.object_key), generation: String(stored.generation),
+    mimeType: String(stored.mime_type), compression: String(stored.compression), archiveFormat: String(stored.archive_format),
+    storedSha256: String(stored.stored_sha256), storedByteSize, crc32c: String(stored.crc32c),
+    memberCount: Number(stored.member_count), firstSequence: Number(stored.first_sequence), lastSequence: Number(stored.last_sequence),
+    ...(stored.archive_format === "legacy-jsonl" ? {
+      legacyInstanceId: String(stored.legacy_instance_id), legacySolverId: String(stored.legacy_solver_id),
+      legacyScopeSha256: String(stored.legacy_scope_sha256), legacyPageMemberCount: Number(stored.legacy_page_member_count),
+      legacyReadMode: stored.legacy_read_mode as "registered-get" | "hub-local-reader",
+      ...(stored.legacy_local_storage_key ? { legacyLocalStorageKey: String(stored.legacy_local_storage_key) } : {}),
+    } : {}),
+  };
+  const header = stored.report as Partial<ProgressiveRemoteReport> | null;
+  if (preparedOwner && header && (
+    (header.solverId !== undefined && header.solverId !== preparedOwner.solverId) ||
+    (header.promiseId !== undefined && header.promiseId !== preparedOwner.promiseId) ||
+    (header.assignmentSignature !== undefined && header.assignmentSignature !== preparedOwner.assignmentSignature)
+  )) throw new Error("Archived report header belongs to another dispatch");
+  const scoped = reference.sourceKind === "remote" && preparedOwner &&
+    header?.executionId === reference.executionId && header.sequence === reference.sequence &&
+    header.solverId === preparedOwner.solverId && header.promiseId === preparedOwner.promiseId &&
+    header.assignmentSignature === preparedOwner.assignmentSignature;
+
+  const restore = async () => {
+    const controller = new AbortController();
+    const identity = Object.freeze({ ...storedIdentity, signal: controller.signal });
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+        const body = await Promise.race([
+        active.reader.read(identity, db),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => {
+            reject(new ProgressiveReportArchiveTimeout(identity));
+            controller.abort();
+          }, active.timeoutMs);
+        }),
+      ]);
+      if (typeof body !== "string")
+        throw new Error("Archived progressive full report reader must return exact JSON text");
+      // PostgreSQL jsonb::text is the archive member identity. It is deliberately
+      // independent of the application's canonical content signature.
+      const raw = reportTextIdentity(body);
+      if (raw.byteSize !== reportByteSize || raw.sha256 !== stored.report_sha256)
+        throw new Error("Archived progressive full report member bytes changed");
+      const parsed = parseReportJson(body);
+      const signature = createHash("sha256").update(canonicalReportJson(parsed), "utf8").digest("hex");
+      const report = verifyBody(reportValidationValue(parsed), reference, signature);
+      if (preparedOwner && (report.solverId !== preparedOwner.solverId || report.promiseId !== preparedOwner.promiseId ||
+        report.assignmentSignature !== preparedOwner.assignmentSignature))
+        throw new Error("Verified report belongs to another dispatch");
+      if (identity.sourceKind === "remote")
+        archivedMembers.set(report, Object.freeze({ bundleId: String(stored.archive_bundle_id), identity }));
+      if (scoped) freezeProgressiveReport(report);
+      return report;
+    } finally {
+      clearTimeout(timer);
+      controller.abort();
+    }
+  };
+  if (!scoped) return restore();
+  // Each preparer has independently selected this signed owner and catalog
+  // member. Share only concurrent work of this installed reader, with the
+  // original deadline. Nothing is reusable after success, abort or failure.
+  const key = JSON.stringify([preparedOwner.solverId, preparedOwner.promiseId, preparedOwner.assignmentSignature,
+    stored.archive_bundle_id, storedIdentity]);
+  const pending = active.pending.get(key);
+  if (pending) return pending;
+  const read = restore().finally(() => active.pending.delete(key));
+  active.pending.set(key, read);
+  return read;
 }
 
 /** Existing bounded selectors may already have reconstructed an inline body.
@@ -231,6 +274,7 @@ export async function resolveStoredProgressiveReport(
   sourceKind: ProgressiveReportSourceKind,
   stored: { report?: unknown; content_signature?: unknown },
   executionId: string,
+  preparedOwner?: ReportOwner,
 ): Promise<ProgressiveRemoteReport> {
   const value = stored.report as (Partial<ProgressiveRemoteReport> & { archivedReport?: unknown }) | null;
   // New headers carry an explicit marker, including null-result snapshots.
@@ -246,5 +290,5 @@ export async function resolveStoredProgressiveReport(
     throw new Error("Stored progressive report has a foreign execution identity");
   return readProgressiveReport(db, {
     sourceKind, executionId, sequence: Number(value.sequence), contentSignature: String(stored.content_signature),
-  });
+  }, preparedOwner);
 }
