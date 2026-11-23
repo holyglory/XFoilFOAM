@@ -1,5 +1,5 @@
-import { createClient } from "@aerodb/db";
-import { canonicalRemoteHubBaseUrl } from "@aerodb/core";
+import { createClient } from "@aerodb/db/client";
+import { canonicalRemoteHubBaseUrl } from "@aerodb/core/remote-hub-url";
 import {
   EngineClient,
   openFoamEngineIdentityFromConfig,

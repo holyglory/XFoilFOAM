@@ -5,11 +5,14 @@ import {
   attemptEvidenceCatalogReady,
   findAttemptEvidenceArchive,
   registerAttemptEvidenceArchive,
+  type AttemptEvidenceArchiveIdentity,
 } from "@aerodb/db/attempt-evidence-catalog";
 import {
   MAX_ATTEMPT_EVIDENCE_BYTES,
   loadSettledAttemptEvidenceCopy,
   prepareAttemptEvidenceCopy,
+  readHubAttemptVersion,
+  type AttemptEvidenceCopySource,
 } from "@aerodb/db/attempt-evidence-storage";
 import { sql } from "drizzle-orm";
 import { mkdtemp, rm } from "node:fs/promises";
@@ -65,32 +68,42 @@ export async function archiveAttemptEvidence(
       onlineBytesRemoved: 0,
     };
   }
+  const uploaded = await verifiedAttemptObject(store, source, options);
+  checkAbort();
+  const registered = await registerAttemptEvidenceArchive(db, uploaded, plan);
+  const archive = registered.archive;
+  // A concurrent insertion can select another immutable compressed encoding.
+  // Verify the catalog's actual generation before returning its receipt.
+  await store.read(archive, options.signal);
+  return {
+    archive,
+    created: registered.created,
+    sourceBytes: plan.sourceByteSize,
+    historyBytes: archive.historyByteSize,
+    onlineBytesRemoved: 0,
+  };
+}
+
+async function verifiedAttemptObject(
+  store: AttemptEvidenceArchiveStore,
+  source: AttemptEvidenceCopySource,
+  options: { bucket: string; sourceInstance: string; signal?: AbortSignal },
+) {
   const directory = await mkdtemp(join(tmpdir(), "attempt-evidence-gcs-"));
   try {
     const path = join(directory, "point.json.gz");
     const proof = await writeAttemptEvidenceCopy(path, source);
-    checkAbort();
+    options.signal?.throwIfAborted();
     const uploaded = await store.putFile(path, proof, {
       bucket: options.bucket,
       sourceInstance: options.sourceInstance,
     });
-    checkAbort();
+    options.signal?.throwIfAborted();
     const restored = await store.read(uploaded, options.signal);
     if (restored.payloadText !== source.payloadText)
       throw new Error("GCS attempt copy changed the exact source text");
-    checkAbort();
-    const registered = await registerAttemptEvidenceArchive(db, uploaded, plan);
-    const archive = registered.archive;
-    // A concurrent insertion can select another immutable compressed encoding.
-    // Verify the catalog's actual generation before returning its receipt.
-    await store.read(archive, options.signal);
-    return {
-      archive,
-      created: registered.created,
-      sourceBytes: plan.sourceByteSize,
-      historyBytes: archive.historyByteSize,
-      onlineBytesRemoved: 0,
-    };
+    options.signal?.throwIfAborted();
+    return uploaded;
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
@@ -103,6 +116,8 @@ export async function runAttemptEvidenceArchivePass(
     bucket: string;
     sourceInstance: string;
     after?: string | null;
+    /** Presence opts this pass into capturing hub-local point versions from open jobs. */
+    verifiedVersions?: Map<string, string>;
     maxRows?: number;
     maxBytes?: number;
     signal?: AbortSignal;
@@ -124,6 +139,7 @@ export async function runAttemptEvidenceArchivePass(
     db,
     options.after ?? null,
     options.sourceInstance,
+    options.verifiedVersions !== undefined,
   );
   let next = options.after ?? null,
     processed = 0,
@@ -132,9 +148,25 @@ export async function runAttemptEvidenceArchivePass(
     sourceBytes = 0,
     historyBytes = 0;
   const failures: Array<{ attemptId: string; error: string }> = [];
+  const versions: AttemptEvidenceArchiveIdentity[] = [];
   for (const candidate of candidates) {
     if (options.signal?.aborted) break;
-    if (candidate.eligible !== true) {
+    const version = candidate.source_version;
+    const versionKey = version
+      ? JSON.stringify([
+          options.bucket,
+          options.sourceInstance,
+          version.resultId,
+          version.simJobId,
+          version.engineJobId,
+          version.sourceSha256,
+        ])
+      : null;
+    if (
+      candidate.eligible !== true &&
+      (!versionKey ||
+        options.verifiedVersions?.get(candidate.id) === versionKey)
+    ) {
       next = candidate.id;
       continue;
     }
@@ -148,6 +180,14 @@ export async function runAttemptEvidenceArchivePass(
     attemptedBytes += bytes;
     next = candidate.id;
     try {
+      if (version && versionKey && options.verifiedVersions) {
+        const source = await readHubAttemptVersion(db, version);
+        versions.push(await verifiedAttemptObject(store, source, options));
+        const seen = options.verifiedVersions;
+        seen.set(candidate.id, versionKey);
+        if (seen.size > 512) seen.delete(seen.keys().next().value!);
+        continue;
+      }
       const result = await archiveAttemptEvidence(db, store, {
         ...options,
         attemptId: candidate.id,
@@ -171,6 +211,7 @@ export async function runAttemptEvidenceArchivePass(
     historyBytes,
     next,
     failures,
+    versions,
     onlineBytesRemoved: 0,
   };
 }
@@ -209,6 +250,9 @@ export async function runAttemptEvidenceStorageService(
   }
   const sourceInstance = await attemptEvidenceSourceInstance(db),
     store = new AttemptEvidenceStore();
+  // The object is durable. This bounded cache only avoids re-reading unchanged
+  // point versions on every sweep while their parent jobs are still open.
+  const verifiedVersions = new Map<string, string>();
   let after: string | null = null;
   while (!signal.aborted) {
     let pause = 30_000;
@@ -217,11 +261,12 @@ export async function runAttemptEvidenceStorageService(
         bucket,
         sourceInstance,
         after,
+        verifiedVersions,
         signal,
       });
       after = result.next;
       if (after !== null) pause = 250;
-      if (result.copied || result.failures.length)
+      if (result.copied || result.versions.length || result.failures.length)
         console.info("attempt-evidence-storage", result);
     } catch (error) {
       console.error(

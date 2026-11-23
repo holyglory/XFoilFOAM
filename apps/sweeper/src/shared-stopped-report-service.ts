@@ -1,7 +1,6 @@
 import { sql } from "drizzle-orm";
-import { mkdir, open, readFile, rename, unlink } from "node:fs/promises";
-import { dirname, isAbsolute, join } from "node:path";
-import { randomUUID } from "node:crypto";
+import { isAbsolute, join } from "node:path";
+import { readReceipt as read, writeReceipt as write, stoppedReportArchivePrefix, stoppedReportReceiptDirectory } from "./stopped-report-receipt-files";
 import { setTimeout as delay } from "node:timers/promises";
 import type { DB } from "@aerodb/db/client";
 import { cancelledReportOwner, type CancelledReportCopyPriority } from "./cancelled-report-copies";
@@ -28,39 +27,6 @@ interface Cursor {
 }
 interface PageLedger {
   members: Record<string, { signature: string; receipt: string }>;
-}
-async function read<T>(file: string): Promise<T | null> {
-  try {
-    return JSON.parse(await readFile(file, "utf8")) as T;
-  } catch (e) {
-    if ((e as NodeJS.ErrnoException).code === "ENOENT") return null;
-    throw e;
-  }
-}
-async function write(file: string, value: unknown) {
-  const folder = dirname(file);
-  await mkdir(folder, { recursive: true, mode: 0o700 });
-  const tmp = join(folder, ".new-" + randomUUID());
-  const f = await open(tmp, "wx", 0o600);
-  try {
-    try {
-      await f.writeFile(JSON.stringify(value) + "\n");
-      await f.sync();
-    } finally {
-      await f.close();
-    }
-    await rename(tmp, file);
-    const parent = await open(folder, "r");
-    try {
-      await parent.sync();
-    } finally {
-      await parent.close();
-    }
-  } finally {
-    await unlink(tmp).catch((e: NodeJS.ErrnoException) => {
-      if (e.code !== "ENOENT") throw e;
-    });
-  }
 }
 async function ownerFrontier(db: DB, id: string) {
   const [o] =
@@ -323,9 +289,7 @@ export async function runSharedStoppedReportStorage(
     process.env.AIRFOILFOAM_DEPLOYMENT_ROLE === "remote-solver"
   )
     return;
-  const directory =
-    process.env.AIRFOILFOAM_STOPPED_SHARED_REPORT_RECEIPTS ||
-    "/data/airfoilfoam/report-archives/shared-result-v1";
+  const directory = stoppedReportReceiptDirectory();
   const api =
     process.env.AIRFOILFOAM_HUB_REPORT_API_URL || "http://node-api:4000";
   if ((scope !== "all" && !uuid.test(scope)) || !isAbsolute(directory)) {
@@ -336,7 +300,7 @@ export async function runSharedStoppedReportStorage(
   }
   const store = new HubReportObjects(
     bucket,
-    process.env.AIRFOILFOAM_REPORT_ARCHIVE_PREFIX ?? "progressive-reports/v1",
+    stoppedReportArchivePrefix(),
   );
   let after: string | null = null,
     queue: string[] = [];

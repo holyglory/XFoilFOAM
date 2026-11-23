@@ -1,10 +1,12 @@
 import { CRC32C } from "@google-cloud/storage";
 import { createHash, randomUUID } from "node:crypto";
-import { readFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { Readable } from "node:stream";
 import type { FastifyInstance } from "fastify";
 import { sql } from "drizzle-orm";
-import { expect } from "vitest";
+import { expect, onTestFinished } from "vitest";
 import {
   acknowledgeProgressiveCfdExecutionStop,
   storeProgressiveRemoteReport,
@@ -29,9 +31,11 @@ import {
   recheckRemoteReportMember, verifiedProgressiveReportMember,
   readProgressiveReport,
 } from "@aerodb/db/progressive-report-reader";
-import { CancelledReportCopyPriority, nextCancelledReportCopies, selectCancelledReportCopyPage } from "../../sweeper/src/cancelled-report-copies";
+import { CancelledReportCopyPriority, nextCancelledReportCopies, selectCancelledReportCopyPage, verifyColdReceiptSources } from "../../sweeper/src/cancelled-report-copies";
 import { applyProgressiveRemoteProgress } from "../../sweeper/src/progressive-remote-progress";
 import { archiveProgressiveReportBatch } from "../../sweeper/src/progressive-report-archive-service";
+import { ColdReportWitnesses } from "../../sweeper/src/cold-report-witnesses";
+import { CancelledReportScanCheckpoint } from "../../sweeper/src/cancelled-report-scan-checkpoint";
 import { copyStoppedReportBatch, offerNextStoppedCopyPage, stoppedReportCopyKeys } from "../../sweeper/src/shared-stopped-report-custody";
 import { readSharedReport, SHARED_REPORT_FORMAT } from "../../sweeper/src/shared-report-archive";
 import { memoryReportObjects } from "../../sweeper/test/shared-report-object-fixture";
@@ -249,6 +253,11 @@ export async function verifyCancelledReportCopyReplay(
   expect(shared.json().fulfilledAoas).toEqual([]);
   expect(await readProgressiveRemoteRetention(db, id)).toEqual(waiting);
   let bytes = Buffer.alloc(0);
+  const directory = await mkdtemp(join(tmpdir(), "cancelled-report-checkpoint-"));
+  onTestFinished(() => rm(directory, { recursive: true, force: true }));
+  const checkpoint = new CancelledReportScanCheckpoint(directory, "disposable-hub", "reports");
+  const restoredCursor = () => new CancelledReportScanCheckpoint(directory, "disposable-hub", "/reports/").resume(db);
+  expect(await restoredCursor()).toBeNull();
   const put: Parameters<typeof archiveProgressiveReportBatch>[3] = async (
     path,
     local,
@@ -286,9 +295,11 @@ export async function verifyCancelledReportCopyReplay(
         return stored;
       },
       page.sequences,
-      exact,
+      undefined,
+      { checkpoint },
     ),
   ).toBe(0);
+  expect(await restoredCursor()).toBeNull();
   await db.execute(
     sql`UPDATE sim_jobs SET ingest_lease_token=NULL,ingest_lease_expires_at=NULL WHERE id=${id}::uuid`,
   );
@@ -297,8 +308,25 @@ export async function verifyCancelledReportCopyReplay(
     copy.sequence,
     gap.sequence,
     final.sequence,
-  ]);
+  ], undefined, { checkpoint });
   expect(count).toBe(1);
+  const committedCursor = { executionId: id, sequence: copy.sequence };
+  expect(await restoredCursor()).toEqual(committedCursor);
+  expect((await selectCancelledReportCopyPage(db, await restoredCursor())).sequences).toEqual([dependent.sequence]);
+  const checkpointFile = join(directory, "ordinary-chronological.json");
+  const committedBytes = await readFile(checkpointFile);
+  const pin = JSON.parse(committedBytes.toString());
+  for (const changed of [
+    { ...pin, object: { ...pin.object, generation: "123" } },
+    { ...pin, reportSha256: "0".repeat(64) },
+    { ...pin, signature: "0".repeat(64) },
+  ]) {
+    await writeFile(checkpointFile, JSON.stringify(changed));
+    expect(await restoredCursor()).toBeNull();
+  }
+  await writeFile(checkpointFile, committedBytes);
+  expect(await new CancelledReportScanCheckpoint(directory, "another-bucket", "reports").resume(db)).toBeNull();
+  expect(await new CancelledReportScanCheckpoint(directory, "disposable-hub", "other-prefix").resume(db)).toBeNull();
   const cold =
     await db.execute(sql`SELECT sequence::int AS seq FROM progressive_remote_reports
     WHERE sim_job_id=${id}::uuid AND archived_at IS NOT NULL ORDER BY sequence`);
@@ -309,8 +337,9 @@ export async function verifyCancelledReportCopyReplay(
   expect(next.after).toEqual(cursor);
   expect(next.preferred?.keys.map(k=>[k.sequence,k.signature])).toEqual([[dependent.sequence,exact.get(dependent.sequence)]]);
   expect(
-    await archiveProgressiveReportBatch(db, "remote", id, put, [copy.sequence]),
+    await archiveProgressiveReportBatch(db, "remote", id, put, [copy.sequence], undefined, { checkpoint }),
   ).toBe(0);
+  expect(await readFile(checkpointFile)).toEqual(committedBytes);
   let reads = 0;
   try {
     installProgressiveReportArchiveReader({
@@ -525,14 +554,51 @@ export async function verifyCancelledReportCopyReplay(
       const originalReplay=await post(originalItem);expect(originalReplay.statusCode,originalReplay.body).toBe(200);
       expect(originalReplay.json().progressiveEvidenceReceipts).toEqual(warmBody.progressiveEvidenceReceipts);
       expect((await post({...originalItem,remoteResultAttemptId:randomUUID()})).statusCode).toBe(409);
+      const generationReads: string[] = [];
+      let originalReads = 0;
+      installProgressiveReportArchiveReader({ read: async pin => {
+        if (pin.sequence === anchorSequence) originalReads++;
+        return restore(pin);
+      } });
+      const witnesses = new ColdReportWitnesses({ ...store, read: async (pin, limit, signal) => {
+        generationReads.push(pin.key);
+        return store.read(pin, limit, signal);
+      } });
+      await verifyColdReceiptSources(db, id, [dependent.sequence], witnesses);
+      expect(originalReads).toBe(1);
+      expect(generationReads).toEqual([]);
+      await verifyColdReceiptSources(db, id, [dependent.sequence], witnesses);
+      expect(originalReads).toBe(1);
+      expect(generationReads).toHaveLength(2);
+      expect(generationReads[0]).toBe(retired.object.key);
+      const scienceKey = generationReads[1]!;
+      expect(scienceKey).toContain("/results/");
+      // The receipt owner was actually authenticated, including its point. A new
+      // AoA must still be checked against that owner's complete original.
+      const changedPoint = { seq: anchorSequence, sig: originKey.signature,
+        point: delivery.progressiveEvidence.pointContentSignature, aoa: point.aoa_deg + 1, slug: point.case_slug ?? null };
+      await expect(witnesses.verify(db, id, [changedPoint])).rejects.toThrow("exact point");
+      expect(originalReads).toBe(2);
+      const scienceFile = files.get(scienceKey)!;
+      const archiveDependent = () => archiveProgressiveReportBatch(db, "remote", id, put, [dependent.sequence], exact, { checkpoint, witnesses });
+      files.set(scienceKey, { ...scienceFile, bytes: Buffer.from("changed result generation") });
+      await expect(archiveDependent()).rejects.toThrow();
+      files.set(scienceKey, { ...scienceFile, pin: { ...scienceFile.pin, generation: String(BigInt(scienceFile.pin.generation) + 1n) } });
+      await expect(archiveDependent()).rejects.toThrow();
+      files.set(scienceKey, scienceFile);
       const anchorObject=files.get(retired.object.key)!;files.delete(retired.object.key);
       await expect(readProgressiveRemoteRetention(db,id)).rejects.toThrow();
       expect((await deliver()).statusCode).toBeGreaterThanOrEqual(400);
-      await expect(archiveProgressiveReportBatch(db,"remote",id,put,[dependent.sequence])).rejects.toThrow();
+      await expect(archiveProgressiveReportBatch(db,"remote",id,put,[dependent.sequence],undefined,{ checkpoint, witnesses })).rejects.toThrow();
+      expect(await readFile(checkpointFile)).toEqual(committedBytes);
       const [heldDependent]=await db.execute(sql`SELECT archive_bundle_id FROM progressive_remote_reports WHERE sim_job_id=${id}::uuid AND sequence=${dependent.sequence} AND content_signature=${dependentReceipt.contentSignature}`);
       expect(heldDependent.archive_bundle_id).toBeNull();
       files.set(retired.object.key,anchorObject);
-      expect(await archiveProgressiveReportBatch(db,"remote",id,put,[dependent.sequence],exact)).toBe(1);
+      expect(await archiveDependent()).toBe(1);
+      expect(generationReads.slice(-2)).toEqual([retired.object.key, scienceKey]);
+      expect(await readFile(checkpointFile)).toEqual(committedBytes);
+      await checkpoint.save(null);
+      expect(await restoredCursor()).toBeNull();
 
       expect(await state()).toEqual(before);
     }

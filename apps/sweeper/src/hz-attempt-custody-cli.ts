@@ -2,34 +2,31 @@ import { limitSettledReportCandidates } from "./hz-settled-report-bounds";
 import {
   checkHzTransferFence,
   withActiveHzTransfer,
-  hzAttemptRpcFailure,
 } from "./hz-attempt-transfer-fence";
 import { pathToFileURL } from "node:url";
 import { sql } from "drizzle-orm";
-import { createClient, type DB } from "@aerodb/db/client";
-import {
-  HistoryMessages,
-  HistoryOperationError,
-} from "@aerodb/core/point-history-protocol";
+import type { DB } from "@aerodb/db/client";
+import { HistoryOperationError } from "@aerodb/core/point-history-protocol";
 import { getAttemptEvidenceArchive } from "@aerodb/db/attempt-evidence-catalog";
-import {
-  attemptPage,
-  workerAttemptLimiter,
-  commitHzAttempt,
-  confirmHzAttempt,
-  exactId,
-  verifyHzOutboxReplay,
-  hzScience,
-  packedBytes,
-  prepareHzEnvelope,
-  restoreHzAttempt,
-  stageHzEnvelope,
-} from "./hz-attempt-custody";
-import { HzAttemptHubStore } from "./hz-attempt-hub";
+import { attemptRpc, exactId, packedBytes } from "./hz-attempt-wire";
+export { attemptRpc } from "./hz-attempt-wire";
 
 export async function attemptWorkerOperation(db: DB, r: Record<string, any>) {
   if (process.env.AIRFOILFOAM_DEPLOYMENT_ROLE !== "remote-solver")
     throw Error("Unexpected worker role");
+  // A custody RPC starts a fresh process. Load the scientific consumers
+  // only when this process handles a worker operation.
+  const {
+    attemptPage,
+    workerAttemptLimiter,
+    commitHzAttempt,
+    confirmHzAttempt,
+    verifyHzOutboxReplay,
+    hzScience,
+    prepareHzEnvelope,
+    restoreHzAttempt,
+    stageHzEnvelope,
+  } = await import("./hz-attempt-custody");
   const owner = r.owner && {
     instance: exactId(r.owner.instance),
     solver: exactId(r.owner.solver),
@@ -146,10 +143,12 @@ export async function attemptHubOperation(r: Record<string, any>) {
     r.bucket !== process.env.AIRFOILFOAM_EVIDENCE_BUCKET
   )
     throw Error("Unexpected hub role or bucket");
+  const { HzAttemptHubStore } = await import("./hz-attempt-hub");
   const store = new HzAttemptHubStore(r.bucket, r.account);
   if (r.operation === "put") {
     const instance = exactId(r.instance),
       solver = exactId(r.solver);
+    const { createClient } = await import("@aerodb/db/client");
     const c = createClient({
       max: 1,
       connection: {
@@ -175,24 +174,6 @@ export async function attemptHubOperation(r: Record<string, any>) {
     });
   throw Error("Unknown hub operation");
 }
-export async function attemptRpc(
-  handler: (r: Record<string, any>) => Promise<unknown>,
-) {
-  const wire = new HistoryMessages(process.stdin, process.stdout);
-  const r = await wire.read();
-  try {
-    await wire.send({ id: r.id, result: await handler(r) });
-  } catch (e) {
-    const operation =
-      "attempt_" +
-      String(r.operation)
-        .replace(/[^a-z_]/g, "")
-        .slice(0, 20);
-    await wire.send({ id: r.id, error: hzAttemptRpcFailure(operation, e) });
-  } finally {
-    wire.close();
-  }
-}
 if (
   process.argv[1] &&
   import.meta.url === pathToFileURL(process.argv[1]).href
@@ -202,6 +183,7 @@ if (
     const write = ["stage", "commit", "confirm", "restore", "replay"].includes(
       r.operation,
     );
+    const { createClient } = await import("@aerodb/db/client");
     const client = createClient({
       max: 1,
       connection: {

@@ -5,8 +5,7 @@ import {
   readApiAttemptEvidenceForApp,
   readStoredAttemptEvidenceText,
 } from "./attempt-evidence-reader";
-import { attemptRpc } from "../../sweeper/src/hz-attempt-custody-cli";
-import { exactId } from "../../sweeper/src/hz-attempt-custody";
+import { attemptRpc, exactId } from "../../sweeper/src/hz-attempt-wire";
 
 export async function hzAttemptApiProbe(
   db: DB,

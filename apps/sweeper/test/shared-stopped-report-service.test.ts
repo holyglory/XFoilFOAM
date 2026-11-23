@@ -3,7 +3,7 @@ import { archiveProgressiveReportBatch } from "../src/progressive-report-archive
 import { randomUUID } from "node:crypto";
 import { fork } from "node:child_process";
 import { once } from "node:events";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -229,6 +229,9 @@ it("runs the stock recurring hub storage worker and serves both archive formats 
         ),
       ),
     );
+    // An interrupted optional seek hint must leave the ordinary stock writer
+    // and readers operating on their normal catalogue and source checks.
+    await writeFile(join(dir, "ordinary-chronological.json"), "{");
     start(false);
     await until(async () => {
       const rows =
@@ -247,6 +250,7 @@ it("runs the stock recurring hub storage worker and serves both archive formats 
           ),
         ),
     );
+    expect(errors).toContain("reading chronological report checkpoint");
     const ids = originals.map((f) => f.executionId);
     const [row] = await db.sql.unsafe(
       `SELECT (SELECT count(*)::int FROM progressive_remote_evidence_receipts WHERE sim_job_id=ANY($1::uuid[])) AS receipts,
