@@ -40,6 +40,17 @@ const byteLimit = 32 * 1024 ** 2;
 const hash = (value) => createHash("sha256").update(value).digest("hex");
 const eq = (a, b, message) => assert.ok(isDeepStrictEqual(a, b), message);
 
+function eligible(value, reason) {
+  if (!value) {
+    const error = new Error(reason);
+    error.name = "ClosedReportHeld";
+    throw error;
+  }
+}
+function matchingScience(actual, expected, reason) {
+  eligible(isDeepStrictEqual(actual, expected), reason);
+}
+
 function signedFacts(text, key, owner) {
   assert.ok(
     Buffer.byteLength(text) <= byteLimit,
@@ -59,7 +70,7 @@ function signedFacts(text, key, owner) {
   assert.equal(value.status?.job_id, key.executionId);
   assert.equal(value.result?.job_id, key.executionId);
   const inventory = retainedReportInventory(value, key.signature);
-  assert.ok(
+  eligible(
     inventory.sourceCount > 0 && inventory.sourceCount <= 512,
     "Expected a bounded signed point inventory",
   );
@@ -108,7 +119,7 @@ async function workerSource(db, key, scope, lock = false, coldPin = null) {
     AND NOT EXISTS(SELECT FROM result_attempts a WHERE a.sim_job_id=j.id AND a.status='running')
     AND NOT EXISTS(SELECT FROM progressive_worker_delivery_failures f WHERE f.sim_job_id=j.id AND f.state<>'conflict')
     ${lock ? sql`FOR UPDATE OF r NOWAIT FOR SHARE OF j,p NOWAIT` : sql``}`);
-  assert.ok(
+  eligible(
     row,
     "Worker report has an open owner, delivery or another custody path",
   );
@@ -118,7 +129,7 @@ async function workerSource(db, key, scope, lock = false, coldPin = null) {
       row.archive_bundle_id && row.archived_at && !row.fk,
       "Partial native archive",
     );
-    assert.ok(coldPin, "Native report already belongs to another storage path");
+    eligible(coldPin, "Native report already belongs to another storage path");
     await verifyRegistration(db, key, row.archive_bundle_id, coldPin);
   }
   let text;
@@ -128,12 +139,12 @@ async function workerSource(db, key, scope, lock = false, coldPin = null) {
     const prior =
       await db.execute(sql`SELECT 1 FROM progressive_report_archive_members WHERE sim_job_id=${id}::uuid
       AND sequence=${seq} AND member_kind='report' LIMIT 1`);
-    assert.equal(prior.length, 0, "Use the existing archive registration");
+    eligible(prior.length === 0, "Use the existing archive registration");
     const [source] =
       await db.execute(sql`WITH body AS MATERIALIZED (SELECT public.resolve_progressive_report(report,result_payload_hash)::text AS raw
       FROM progressive_worker_reports WHERE sim_job_id=${id}::uuid AND sequence=${seq} AND content_signature=${key.signature} AND archived_at IS NULL)
       SELECT CASE WHEN octet_length(raw)<=${byteLimit} THEN raw END AS text FROM body`);
-    assert.ok(
+    eligible(
       typeof source?.text === "string",
       "Worker original changed or exceeds the reader bound",
     );
@@ -155,7 +166,7 @@ async function workerSource(db, key, scope, lock = false, coldPin = null) {
       AND a.aoa_deg=pt.aoa AND a.engine_case_slug IS NOT DISTINCT FROM pt."caseSlug" AND a.result_id IS NOT NULL
     JOIN sim_jobs j ON j.id=a.sim_job_id AND j.airfoil_id=a.airfoil_id AND j.simulation_preset_revision_id=a.simulation_preset_revision_id AND j.bc_ids ? a.bc_id::text
     ORDER BY h.point_content_signature COLLATE "C" ${lock ? sql`FOR SHARE OF h,e,st,origin,a NOWAIT` : sql``}`);
-  eq(
+  matchingScience(
     Array.from(anchors, (a) => ({
       signature: a.signature,
       aoa: a.aoa,
@@ -164,7 +175,7 @@ async function workerSource(db, key, scope, lock = false, coldPin = null) {
     facts.points,
     "Missing or ambiguous earlier native science",
   );
-  assert.ok(
+  eligible(
     anchors.every((a) => a.hubAttempt && a.hubResult),
     "Incomplete hub receipt",
   );
@@ -198,7 +209,7 @@ async function hubScience(db, key, source) {
       AND NOT EXISTS(SELECT FROM progressive_remote_reports t WHERE t.sim_job_id=j.id AND t.sequence=${seq})
       AND NOT EXISTS(SELECT FROM progressive_report_archive_members m WHERE m.sim_job_id=j.id AND m.sequence=${seq} AND m.member_kind='report')
       AND NOT EXISTS(SELECT FROM progressive_remote_report_inventories i WHERE i.sim_job_id=j.id AND i.sequence=${seq})`);
-  assert.ok(
+  eligible(
     r,
     "Hub already owns this sequence, or its dispatch is open or mismatched",
   );
@@ -226,7 +237,7 @@ async function hubScience(db, key, source) {
       AND a.engine_case_slug IS NOT DISTINCT FROM s.case_slug AND s.case_slug IS NOT DISTINCT FROM pt."caseSlug"
     JOIN sim_jobs j ON j.id=a.sim_job_id AND j.airfoil_id=a.airfoil_id AND j.simulation_preset_revision_id=a.simulation_preset_revision_id AND j.bc_ids ? a.bc_id::text
     ORDER BY e.point_content_signature COLLATE "C"`);
-  eq(
+  matchingScience(
     Array.from(prior, (a) => a.signature),
     source.facts.points.map((p) => p.signature),
     "Hub does not retain every earlier scientific source",
@@ -425,7 +436,7 @@ async function settle(db, m) {
     const [changed] =
       await tx.execute(sql`UPDATE progressive_worker_reports SET report=progressive_report_compact_header(report),result_payload_hash=NULL,
       archived_at=clock_timestamp(),archive_bundle_id=${bundle.id}::uuid WHERE sim_job_id=${key.executionId}::uuid AND sequence=${key.sequence}
-      AND content_signature=${key.signature} AND archived_at IS NULL AND archive_bundle_id IS NULL RETURNING pg_column_size(report) AS stored`);
+      AND content_signature=${key.signature} AND archived_at IS NULL AND archive_bundle_id IS NULL RETURNING sequence`);
     assert.ok(changed, "Native report changed before retirement");
     const after = await workerSource(tx, key, scope, false, pin);
     eq(
@@ -447,7 +458,7 @@ async function settle(db, m) {
       outcome: "retired",
       bundle: bundle.id,
       originalStored: before.stored,
-      stored: Number(changed.stored),
+      stored: after.stored,
       dictionaryBytes,
     };
   });
@@ -497,7 +508,15 @@ async function runClosedReportPeer(db, m) {
     const actual = await workerSource(db, key, scope, false, m.pin);
     eq(identity(actual), m.source, "Native scientific evidence changed");
     if (m.committed) assert.ok(actual.archivedBundle);
-    return productRead(db, key, m.source, m.pin, m.reader, !!m.committed);
+    const proof = await productRead(
+      db,
+      key,
+      m.source,
+      m.pin,
+      m.reader,
+      !!m.committed,
+    );
+    return { ...proof, storedFieldBytes: actual.stored };
   }
   const native = await workerSource(db, key, scope, false, m.pin);
   if (op === "source")
