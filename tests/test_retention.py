@@ -1163,7 +1163,7 @@ def test_closed_progressive_exact_duplicates_require_whole_job_proof(tmp_path, m
 
     if preserve_directory:
         next_solver = root / preserve_directory
-        coefficient = _write(next_solver / "postProcessing/forceCoeffs/0/coefficient.dat", b"0.1 0.2 0.015 0.001\\n")
+        coefficient = _write(next_solver / "postProcessing/forceCoeffs/0/coefficient.dat", b"0.1 0.2 0.015 0.001\n")
         original_bytes = coefficient.read_bytes()
         unique = _write(next_solver / "1/U", b"unreported flow field")
         mesh = root / "meshes/recipe/constant/polyMesh"
@@ -1221,9 +1221,9 @@ def test_closed_progressive_exact_duplicates_require_whole_job_proof(tmp_path, m
         new_sha, new_size = sha(mf.read_bytes()), mf.stat().st_size
         arts = [{"path": "a2/evidence/evidence_manifest.json", "kind": "manifest", "sha256": new_sha, "byte_size": new_size},
                 {"path": "a2/evidence/engine_evidence.tar.zst", "kind": "engine_bundle", "sha256": sha(b"gzip"), "byte_size": 4}]
-        catalog = sorted(f"{a['kind']}\\tjobs/{job}/cases/foil/{a['path']}\\t{a['byte_size']}\\t{a['sha256']}" for a in arts)
+        catalog = sorted(f"{a['kind']}\tjobs/{job}/cases/foil/{a['path']}\t{a['byte_size']}\t{a['sha256']}" for a in arts)
         third = {**proofs[1], "directory": "cases/foil/a2/evidence", "manifestSha256": new_sha, "manifestByteSize": new_size,
-                 "brokeredUploadId": "third-upload", "keepMedia": [], "catalogSha256": sha("\\n".join(catalog).encode())}
+                 "brokeredUploadId": "third-upload", "keepMedia": [], "catalogSha256": sha("\n".join(catalog).encode())}
         authorization = json.loads((case / "a1/evidence/brokered_hub_binding.database.json").read_bytes())["authorization"]
         authorization["evidenceBase"] = "a2/evidence"
         authorization["receipt"]["brokeredUploadId"] = third["brokeredUploadId"]
