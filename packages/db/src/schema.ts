@@ -8464,6 +8464,9 @@ export const progressiveRemoteReports = pgTable(
       .default(sql`clock_timestamp()`),
   },
   (table) => ({
+    resultPayloadReferenceIdx: index("progressive_remote_reports_result_payload_hash_idx")
+      .on(table.resultPayloadHash)
+      .where(sql`${table.resultPayloadHash} IS NOT NULL`),
     primary: primaryKey({ columns: [table.simJobId, table.sequence] }),
     stopCandidateIdx: index("progressive_remote_reports_stop_candidate_idx")
       .on(table.simJobId)
@@ -8622,6 +8625,9 @@ export const progressiveWorkerReports = pgTable(
     acknowledgedAt: timestamp("acknowledged_at", { withTimezone: true }),
   },
   (table) => ({
+    resultPayloadReferenceIdx: index("progressive_worker_reports_result_payload_hash_idx")
+      .on(table.resultPayloadHash)
+      .where(sql`${table.resultPayloadHash} IS NOT NULL`),
     stagingOrderIdx: index("progressive_worker_reports_staging_order_idx")
       .on(table.createdAt, table.simJobId, table.sequence)
       .where(sql`${table.acknowledgedAt} IS NOT NULL AND jsonb_typeof(${table.report}->'result')='object'`),
