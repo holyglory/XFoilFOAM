@@ -5,6 +5,7 @@ import {
   type ProgressiveEvidenceWakeScope,
 } from "./progressive-evidence-wake";
 import { runNotificationDrain } from "./notification-drain";
+import { hasRegisteredWorkerJob } from "./progressive-staging-selection";
 import { deliverNextProgressiveWorkerEvidence } from "./progressive-worker-evidence-delivery";
 import { stageNextProgressiveWorkerEvidence } from "./progressive-worker-evidence";
 import { runSweeperServices } from "./service-lifecycle";
@@ -64,6 +65,7 @@ export async function nextProgressiveEvidenceWakeAt(
   db: DB,
   scope: ProgressiveEvidenceWakeScope | "all" = "all",
 ): Promise<Date | null> {
+  if (!(await hasRegisteredWorkerJob(db))) return null;
   const scopes: ProgressiveEvidenceWakeScope[] =
     scope === "all" ? ["staging", "delivery"] : [scope];
   for (const selected of scopes) {

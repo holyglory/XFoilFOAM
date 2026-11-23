@@ -12,7 +12,11 @@ import {
 import type { SimulationSetupSnapshot } from "@aerodb/db/simulation-setup";
 import type { EngineClient, JobResult } from "@aerodb/engine-client";
 import { assertProgressiveWorkerEvidenceJob } from "./progressive-remote-jobs";
-import { progressiveStagingSelectionSql } from "./progressive-staging-selection";
+import {
+  hasRegisteredWorkerJob,
+  progressiveStagingSelectionSql,
+  withStagingSelection,
+} from "./progressive-staging-selection";
 import { ingestResult } from "./ingest";
 import { coverHistoricalWorkerStagingCopies } from "./progressive-worker-staging-copies";
 import { existingProgressiveReportAttempts } from "./progressive-evidence-reuse";
@@ -316,38 +320,42 @@ export async function stageNextProgressiveWorkerEvidence(
 ): Promise<boolean> {
   let pending: { sim_job_id: string; sequence: number } | undefined;
   try {
-    const claimed = await db.transaction(async (transaction) => {
-      const connection = transaction as unknown as DB;
-      const [selected] = await connection.execute(sql`
+    const preferActive = hooks.preferActive === true;
+    const claimed = await withStagingSelection(db, preferActive, () =>
+      db.transaction(async (transaction) => {
+        const connection = transaction as unknown as DB;
+        if (!(await hasRegisteredWorkerJob(connection))) return undefined;
+        const [selected] = await connection.execute(sql`
         SELECT pick.*, EXISTS(SELECT 1 FROM public.sim_jobs j WHERE j.id=pick.sim_job_id
           AND j.status IN ('done','failed','cancelled') AND j."ingestedAt" IS NOT NULL) AS closed_history
-        FROM (${progressiveStagingSelectionSql(hooks.preferActive === true)}) pick`);
-      if (!selected) return null;
-      pending = {
-        sim_job_id: String(selected.sim_job_id),
-        sequence: Number(selected.sequence),
-      };
-      if (selected.closed_history === true) {
-        const { sim_job_id, sequence } = pending;
-        // An unavailable optional proof must not create a staging-failure
-        // receipt for a usable report. Roll its entire proof page back first.
-        const covered = await connection
-          .transaction((tx) =>
-            coverHistoricalWorkerStagingCopies(
-              tx as unknown as DB,
-              sim_job_id,
-              sequence,
-            ),
-          )
-          .catch(() => 0);
-        if (covered > 0) return { covered };
-      }
-      return claimProgressiveWorkerEvidence(
-        connection,
-        pending.sim_job_id,
-        pending.sequence,
-      );
-    });
+        FROM (${progressiveStagingSelectionSql(preferActive)}) pick`);
+        if (!selected) return undefined;
+        pending = {
+          sim_job_id: String(selected.sim_job_id),
+          sequence: Number(selected.sequence),
+        };
+        if (selected.closed_history === true) {
+          const { sim_job_id, sequence } = pending;
+          // An unavailable optional proof must not create a staging-failure
+          // receipt for a usable report. Roll its entire proof page back first.
+          const covered = await connection
+            .transaction((tx) =>
+              coverHistoricalWorkerStagingCopies(
+                tx as unknown as DB,
+                sim_job_id,
+                sequence,
+              ),
+            )
+            .catch(() => 0);
+          if (covered > 0) return { covered };
+        }
+        return claimProgressiveWorkerEvidence(
+          connection,
+          pending.sim_job_id,
+          pending.sequence,
+        );
+      }),
+    );
     if (!claimed) return false;
     if ("covered" in claimed) return true;
     return (

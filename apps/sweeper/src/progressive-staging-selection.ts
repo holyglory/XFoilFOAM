@@ -1,4 +1,65 @@
+import type { DB } from "@aerodb/db";
 import { sql } from "drizzle-orm";
+
+type StagingScan = {
+  requested: number;
+  emptyThrough: number;
+  running: Promise<void> | null;
+};
+const stagingScans = new WeakMap<DB, Map<boolean, StagingScan>>();
+
+// An empty scan answers only calls already waiting when that scan started.
+// A successful claim belongs to one caller. Its ingestion proceeds independently.
+export async function withStagingSelection<T>(
+  db: DB,
+  preferActive: boolean,
+  scan: () => Promise<T | undefined>,
+): Promise<T | undefined> {
+  let lanes = stagingScans.get(db);
+  if (!lanes) {
+    lanes = new Map();
+    stagingScans.set(db, lanes);
+  }
+  let lane = lanes.get(preferActive);
+  if (!lane) {
+    lane = { requested: 0, emptyThrough: 0, running: null };
+    lanes.set(preferActive, lane);
+  }
+  const state = lane;
+  const ticket = ++state.requested;
+  while (state.running) {
+    await state.running;
+    if (ticket <= state.emptyThrough) return undefined;
+  }
+  const through = state.requested;
+  const result = scan();
+  state.running = result
+    .then(
+      (claimed) => {
+        if (claimed === undefined) state.emptyThrough = through;
+      },
+      () => {
+        /* The caller that selected the report records its failure. */
+      },
+    )
+    .finally(() => {
+      state.running = null;
+    });
+  return result;
+}
+
+// A hub can retain registration settings from an earlier deployment. The
+// existing worker-job index also detects real retained work in that situation.
+export async function hasRegisteredWorkerJob(db: DB): Promise<boolean> {
+  const rows = await db.execute(sql`SELECT 1 FROM sync_api_settings settings
+    WHERE settings.id=1 AND NOT settings.remote_solver_transfer_paused
+      AND settings.remote_solver_auth_token<>'' AND settings.remote_solver_registered_id IS NOT NULL
+      AND settings.upstream_base_url IS NOT NULL AND EXISTS (
+        SELECT 1 FROM sim_jobs job WHERE job.request_payload->>'remoteSolver'='true'
+          AND job.request_payload->>'upstreamBaseUrl'=settings.upstream_base_url
+      )`);
+  return rows.length > 0;
+}
 
 export function progressiveStagingSelectionSql(preferActive: boolean) {
   const settings = sql`SELECT upstream_base_url, remote_solver_registered_id,

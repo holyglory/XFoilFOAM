@@ -1441,6 +1441,7 @@ it("preserves exact eligible deliveries, active priority, fallback and cumulativ
       transaction.execute(sql`
       SELECT source.sim_job_id,source.sequence,source.result_attempt_id,source.point_content_signature,
         report.content_signature AS report_signature,report.report,attempt.result_id,attempt.aoa_deg,attempt.engine_case_slug,attempt.evidence_payload,
+        NULL::uuid AS evidence_archive_id,NULL::uuid AS evidence_storage_event_id,
         job.request_payload,settings.upstream_base_url,settings.remote_solver_auth_token,settings.remote_solver_registered_id,
         settings.instance_id,settings.instance_name,promise.id AS promise_id
       FROM progressive_worker_evidence_attempts source
