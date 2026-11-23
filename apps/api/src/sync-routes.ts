@@ -142,7 +142,7 @@ import { readStoredForceHistory } from "./solver-history-reader";
 import { readStoredResultHistories } from "./result-history-reader";
 import { apiAttemptEvidenceReader, readStoredAttemptEvidenceBatch } from "./attempt-evidence-reader";
 import { isPolarReceiptReplayRequest, readBoundPolarReplayReceipt, originalPolarReceiptResponse } from "./progressive-polar-receipt-replay";
-import { recoverSignedPolarReceipt } from "./retained-polar-point";
+import { recoverSignedArchiveCustody, recoverSignedPolarReceipt } from "./retained-polar-point";
 import { prepareProgressiveRemoteEvidence } from "@aerodb/db/progressive-remote-evidence";
 import { prepareProgressiveRemoteReceiptReplay } from "@aerodb/db/progressive-remote-evidence-receipts";
 import {
@@ -7794,9 +7794,12 @@ export async function registerSyncRoutes(app: FastifyInstance): Promise<void> {
             pointContentSignature: String(row.point_content_signature),
           },
         };
-      await prepareProgressiveRemoteEvidence(db, delivery);
-      await prepareProgressiveRemoteReceiptReplay(db, delivery, apiAttemptEvidenceReader);
-      const receipt = await readProgressiveEvidenceCustodyReceipt(db, delivery, params.id);
+      let receipt = await recoverSignedArchiveCustody(db, delivery, solver.instanceId, params.id);
+      if (!receipt) {
+        await prepareProgressiveRemoteEvidence(db, delivery);
+        await prepareProgressiveRemoteReceiptReplay(db, delivery, apiAttemptEvidenceReader);
+        receipt = await readProgressiveEvidenceCustodyReceipt(db, delivery, params.id);
+      }
       return {
         progressiveArchiveReceipt: signProgressiveEvidenceCustodyReceipt(
           receipt,
