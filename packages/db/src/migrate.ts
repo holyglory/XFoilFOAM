@@ -6,6 +6,7 @@ import { migrate } from "drizzle-orm/postgres-js/migrator";
 import { createClient } from "./client";
 import { prepareMigrationSession } from "./migration-session";
 import { prepareSolverEvidenceOwnerIndexes } from "./solver-evidence-owner-indexes";
+import { preparePreciseCandidateIndex } from "./online-partial-indexes";
 import { prepareReportPayloadReferenceIndexes } from "./report-payload-reference-indexes";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -35,6 +36,7 @@ try {
     }
     await prepareSolverEvidenceOwnerIndexes(sql);
     await prepareReportPayloadReferenceIndexes(sql);
+    await preparePreciseCandidateIndex(sql);
     await prepareMigrationSession(sql);
     await migrate(db, config);
     console.log("✓ migrations applied");

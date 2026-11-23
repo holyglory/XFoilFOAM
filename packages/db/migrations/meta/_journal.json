@@ -1583,6 +1583,13 @@
       "when": 1795363913056,
       "tag": "0225_attempt_projection_sealing",
       "breakpoints": true
+    },
+    {
+      "idx": 226,
+      "version": "7",
+      "when": 1795363913057,
+      "tag": "0226_precise_candidate_lookup",
+      "breakpoints": true
     }
   ]
 }

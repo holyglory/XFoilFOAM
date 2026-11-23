@@ -27,12 +27,46 @@ async function inspect(
   return index;
 }
 
-/** Use one autocommit backend, including the family lock. Only repair an
- * invalid index whose complete catalog definition belongs to this family. */
-export async function prepareNonNullIndexes(
+type PartialIndex = {
+  table: string;
+  name: string;
+  columns: readonly string[];
+  predicate: string;
+};
+
+export function prepareNonNullIndexes(
   sql: Sql,
   migration: number,
   specs: readonly NonNullIndex[],
+) {
+  const indexes = specs.map(({ table, name, column }) => ({
+    table,
+    name,
+    columns: [column],
+    predicate: `(${column} IS NOT NULL)`,
+  }));
+  return preparePartialIndexes(sql, migration, indexes);
+}
+
+export function preparePreciseCandidateIndex(sql: Sql) {
+  return preparePartialIndexes(sql, 226, [
+    {
+      table: "result_attempts",
+      name: "result_attempts_precise_candidate_idx",
+      columns: ["id", "result_id", "sim_job_id"],
+      predicate:
+        "((status = 'done'::result_status) AND valid_for_polar AND " +
+        "((regime = 'rans'::regime) OR ((evidence_payload ->> 'fidelity'::text) = 'urans_full'::text)))",
+    },
+  ]);
+}
+
+/** Use one autocommit backend, including the family lock. Only repair an
+ * invalid index whose complete catalog definition belongs to this family. */
+async function preparePartialIndexes(
+  sql: Sql,
+  migration: number,
+  specs: readonly PartialIndex[],
 ) {
   const session = await sql.reserve();
   const indexes: IndexAction[] = [];
@@ -41,15 +75,15 @@ export async function prepareNonNullIndexes(
   try {
     await session`SELECT pg_advisory_lock(${migration}::int,1)`;
     locked = true;
-    for (const { table, column, name } of specs) {
-      if (![table, column, name].every((s) => /^[a-z][a-z0-9_]{0,62}$/.test(s)))
+    for (const { table, columns, name, predicate } of specs) {
+      if (![table, ...columns, name].every((s) => /^[a-z][a-z0-9_]{0,62}$/.test(s)))
         throw new Error("Invalid migration index identifier");
       const target = "public." + table;
       const [catalog] =
         await session`SELECT to_regclass(${target}) IS NOT NULL AS present`;
       if (!catalog.present) continue;
       tablePresent = true;
-      const suffix = ` ON ${target} USING btree (${column}) WHERE (${column} IS NOT NULL)`;
+      const suffix = ` ON ${target} USING btree (${columns.join(", ")}) WHERE ${predicate}`;
       const expected = "CREATE INDEX " + name + suffix;
       const index = await inspect(session, name, expected);
       if (index?.usable) {

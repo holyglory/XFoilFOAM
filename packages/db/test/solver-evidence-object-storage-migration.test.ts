@@ -906,6 +906,20 @@ it("normal migrate prepares 0223 online, recovers an interrupted build and prese
     ).toBe(false);
     expect(await countJournal()).toBe(n);
     await normal();
+    const [pointLookup] = await db`
+      SELECT i.indisvalid AND i.indisready AND i.indislive AS usable,
+        pg_get_expr(i.indpred, i.indrelid) AS predicate,
+        ARRAY(SELECT a.attname::text FROM unnest(i.indkey) WITH ORDINALITY keys(attnum, position)
+          JOIN pg_attribute a ON a.attrelid=i.indrelid AND a.attnum=keys.attnum
+          ORDER BY keys.position) AS columns
+      FROM pg_index i
+      WHERE i.indexrelid=to_regclass('public.result_attempts_precise_candidate_idx')
+        AND i.indrelid='public.result_attempts'::regclass
+    `;
+    expect(pointLookup).toMatchObject({
+      usable: true, columns: ["id", "result_id", "sim_job_id"],
+      predicate: expect.stringContaining("urans_full"),
+    });
     const installedJournal = await readJournal();
     expect(installedJournal.length).toBeGreaterThan(n);
     expect(installedJournal.filter(row => row.created_at === "1795363913054")).toHaveLength(1);

@@ -1241,6 +1241,10 @@ export const resultAttempts = pgTable(
       sql`${t.methodKey} IS NULL OR btrim(${t.methodKey}) <> ''`,
     ),
     validIdx: index("result_attempts_valid_idx").on(t.validForPolar),
+    preciseCandidateIdx: index("result_attempts_precise_candidate_idx")
+      .on(t.id, t.resultId, t.simJobId)
+      .where(sql`${t.status} = 'done' AND ${t.validForPolar}
+        AND (${t.regime} = 'rans' OR ${t.evidencePayload}->>'fidelity' = 'urans_full')`),
     catalogRejectedIdx: index("result_attempts_catalog_rejected_idx").on(
       t.airfoilId,
       t.simulationPresetRevisionId,

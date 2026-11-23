@@ -7559,18 +7559,6 @@ async function loadCampaignsFast(
         ON condition.id = progress.condition_id
        AND condition.generation = selected.current_condition_generation
       GROUP BY progress.campaign_id
-    ), progressive AS (
-      SELECT generation.campaign_id,
-        coalesce(sum(cardinality(scope.angles)), 0)::int AS requested
-      FROM progressive_generations generation
-      JOIN selected ON selected.id = generation.campaign_id
-      JOIN calculation_epochs epoch
-        ON epoch.id = generation.epoch_id AND epoch.current
-      JOIN progressive_generation_targets scope
-        ON scope.generation_id = generation.id
-      WHERE generation.plan_revision_id = selected.current_plan_revision_id
-        AND generation.status <> 'cancelled'
-      GROUP BY generation.campaign_id
     ), activity AS (
       SELECT job.campaign_id,
         max(greatest(
@@ -7594,10 +7582,16 @@ async function loadCampaignsFast(
       coalesce(legacy.rejected, 0)::int AS rejected,
       coalesce(legacy.blocked, 0)::int AS blocked,
       activity.activity_at,
-      progressive.campaign_id IS NOT NULL AS has_progressive_scope
+      EXISTS (
+        SELECT FROM progressive_generations generation
+        JOIN calculation_epochs epoch ON epoch.id = generation.epoch_id AND epoch.current
+        JOIN progressive_generation_targets scope ON scope.generation_id = generation.id
+        WHERE generation.campaign_id = selected.id
+          AND generation.plan_revision_id = selected.current_plan_revision_id
+          AND generation.status <> 'cancelled'
+      ) AS has_progressive_scope
     FROM selected
     LEFT JOIN legacy ON legacy.campaign_id = selected.id
-    LEFT JOIN progressive ON progressive.campaign_id = selected.id
     LEFT JOIN activity ON activity.campaign_id = selected.id
     ORDER BY (selected.status = 'attention') DESC, selected.updated_at DESC
   `)) as unknown as Array<Record<string, unknown>>;
@@ -7607,28 +7601,9 @@ async function loadCampaignsFast(
     rows
       .filter((row) => Boolean(row.has_progressive_scope))
       .map(async (row) => {
-        const progressiveRows = await campaignProgressiveConditionRows(
-          db,
-          String(row.id),
-        );
-        if (progressiveRows.length === 0) return null;
-        const progressive = progressiveRows.reduce<ProgressiveCoverageCell>(
-          (coverage, progressiveRow) => ({
-            ...coverage,
-            requested: coverage.requested + Number(progressiveRow.requested),
-            preciseComplete:
-              coverage.preciseComplete +
-              Number(progressiveRow.precise_complete),
-          }),
-          {
-            requested: 0,
-            preliminary: 0,
-            cfdEvidence: 0,
-            fastComplete: 0,
-            preciseComplete: 0,
-          },
-        );
-        return [String(row.id), progressiveCoverageTotals(progressive)] as const;
+        const campaignId = String(row.id);
+        const totals = await campaignProgressiveListTotals(db, campaignId);
+        return totals ? ([campaignId, totals] as const) : null;
       }),
   );
   for (const entry of progressiveRowsByCampaign) {
@@ -7936,26 +7911,12 @@ export async function listCampaigns(
     rows
       .filter((r) => Boolean(r.has_progressive_scope))
       .map(async (r) => {
-        const progressiveRows = await campaignProgressiveConditionRows(
-          db,
-          String(r.id),
-        );
-        const progressive = progressiveRows.reduce<ProgressiveCoverageCell>(
-          (totals, row) => ({
-            ...totals,
-            requested: totals.requested + Number(row.requested),
-            preciseComplete:
-              totals.preciseComplete + Number(row.precise_complete),
-          }),
-          {
-            requested: 0,
-            preliminary: 0,
-            cfdEvidence: 0,
-            fastComplete: 0,
-            preciseComplete: 0,
-          },
-        );
-        return [String(r.id), progressiveCoverageTotals(progressive)] as const;
+        const campaignId = String(r.id);
+        const totals = await campaignProgressiveListTotals(db, campaignId);
+        return [
+          campaignId,
+          totals ?? progressiveCoverageTotals({ requested: 0, preciseComplete: 0 }),
+        ] as const;
       }),
   );
   for (const [campaignId, totals] of progressiveRowsByCampaign) {
@@ -8481,7 +8442,7 @@ export interface ProgressiveCoverageCell {
 }
 
 function progressiveCoverageTotals(
-  progressive: ProgressiveCoverageCell,
+  progressive: Pick<ProgressiveCoverageCell, "requested" | "preciseComplete">,
 ): CampaignProgressTotals {
   return {
     requested: progressive.requested,
@@ -8511,7 +8472,7 @@ type ProgressiveConditionCoverageRow = Omit<
   "airfoil_id"
 > & { remote_precise_complete: number };
 
-function campaignProgressiveCoverageCtes(
+function campaignProgressiveSelectedUnitCtes(
   campaignId: string,
   targetFilter: SQL = sql`TRUE`,
 ) {
@@ -8529,7 +8490,7 @@ function campaignProgressiveCoverageCtes(
     ), target_cells AS MATERIALIZED (
       SELECT DISTINCT ON (condition.id, target.airfoil_id)
         target.id AS target_id, target.airfoil_id, generation.id AS generation_id,
-        generation.epoch_id, scope.angles,
+        generation.epoch_id,
         condition.id AS condition_id,
         cardinality(scope.angles)::int AS requested
       FROM current_generations generation
@@ -8555,6 +8516,8 @@ function campaignProgressiveCoverageCtes(
        AND work.generation_id = target_cells.generation_id
        AND work.stage = 3
       JOIN progressive_cfd_units unit ON unit.work_id = work.id
+      JOIN progressive_generation_targets scope
+        ON scope.generation_id = work.generation_id AND scope.target_id = work.target_id
       JOIN progressive_cfd_attempts attempt ON attempt.unit_id = unit.id
       JOIN progressive_cfd_evidence evidence ON evidence.attempt_token = attempt.token
       JOIN result_attempts raw ON raw.id = evidence.result_attempt_id
@@ -8569,14 +8532,43 @@ function campaignProgressiveCoverageCtes(
         LIMIT 1
       ) review ON true
       WHERE unit.state = 'complete'
-        AND unit.aoa_deg = ANY(target_cells.angles)
+        AND unit.aoa_deg = ANY(scope.angles)
         AND raw.status = 'done'
         AND raw.valid_for_polar
         AND classification.state = 'accepted'
         AND (raw.regime = 'rans' OR raw.evidence_payload->>'fidelity' = 'urans_full')
         AND COALESCE(review.verdict, 'waive') NOT IN ('exclude', 'defer')
       GROUP BY target_cells.target_id, target_cells.generation_id, unit.id
-    ), completed_unit_stats AS MATERIALIZED (
+    )
+  `;
+}
+
+async function campaignProgressiveListTotals(db: DB, campaignId: string) {
+  const [row] = await db.execute(sql`
+    ${campaignProgressiveSelectedUnitCtes(campaignId)}, precise_totals AS (
+      SELECT target_id, generation_id, count(*)::int AS solved
+      FROM selected_precise_units GROUP BY target_id, generation_id
+    )
+    SELECT sum(cell.requested)::int AS requested,
+           coalesce(sum(precise.solved), 0)::int AS precise_complete
+    FROM target_cells cell
+    LEFT JOIN precise_totals precise USING (target_id, generation_id)
+    HAVING count(*) > 0
+  `);
+  return row
+    ? progressiveCoverageTotals({
+        requested: Number(row.requested),
+        preciseComplete: Number(row.precise_complete),
+      })
+    : null;
+}
+
+function campaignProgressiveCoverageCtes(
+  campaignId: string,
+  targetFilter: SQL = sql`TRUE`,
+) {
+  return sql`
+    ${campaignProgressiveSelectedUnitCtes(campaignId, targetFilter)}, completed_unit_stats AS MATERIALIZED (
       SELECT target_cells.target_id, target_cells.generation_id,
         count(DISTINCT unit.id) FILTER (WHERE work.stage = 2)::int AS fast_complete,
         count(DISTINCT selected.id)::int AS precise_complete,

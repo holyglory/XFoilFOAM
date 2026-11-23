@@ -15478,7 +15478,28 @@ describe("subsonic through precise priority", () => {
     expect(await db.execute(sql`SELECT cohort, stage, status FROM progressive_generation_cohorts WHERE generation_id = ${fixture.generationId} ORDER BY cohort`))
       .toEqual([{ cohort: "high", stage: 2, status: "active" }, { cohort: "low", stage: 3, status: "active" }]);
     expect(await claimCfd()).toBeNull();
-    expect((await finish(low, true)).settlement).toMatchObject({ complete: 1 });
+    const finished = await finish(low, true);
+    expect(finished.settlement).toMatchObject({ complete: 1 });
+    const rollback = new Error("restore campaign review fixture");
+    await expect(db.transaction(async (transaction) => {
+      const [point] = await transaction.execute(sql`
+        UPDATE results r SET current_result_attempt_id = a.id
+        FROM result_attempts a WHERE a.id = ${finished.evidenceId} AND r.id = a.result_id
+        RETURNING r.id
+      `);
+      const checkLists = async (solved: number) => {
+        for (const list of [listCampaignsFast, listCampaigns]) {
+          const page = await list(transaction as unknown as DB, { statuses: ["active"], limit: 100 });
+          expect(page.items.find((item) => item.id === fixture.campaignId)?.totals)
+            .toMatchObject({ requested: 3, solved, remaining: 3 - solved });
+        }
+      };
+      await checkLists(1);
+      await transaction.execute(sql`INSERT INTO result_review_verdicts (result_id, verdict, reviewer)
+        VALUES (${point.id}, 'exclude', 'campaign-list-test')`);
+      await checkLists(0);
+      throw rollback;
+    })).rejects.toBe(rollback);
     expect(await claimCfd()).toBeNull();
     expect(await advanceProgressiveCfdStages(db)).toMatchObject({ closed: 1 });
     const high = (await claimCfd())!;
