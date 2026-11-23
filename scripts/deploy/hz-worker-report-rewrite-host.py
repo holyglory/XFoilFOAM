@@ -18,6 +18,7 @@ import time
 HERE = Path(__file__).resolve().parent
 TABLE = "public.progressive_worker_reports"
 VACUUM = "VACUUM (FULL, ANALYZE) public.progressive_worker_reports;"
+TOAST_VACUUM = "VACUUM (FULL, PROCESS_MAIN false, PROCESS_TOAST true) public.progressive_worker_reports;"
 PROJECT = "hz-solver2"
 PG = PROJECT + "-postgres-1"
 ROLE_SQL = """SELECT jsonb_build_object('at',clock_timestamp(),'database',current_database(),
@@ -228,7 +229,24 @@ def report_identity(columns, alias="t"):
     return f"CASE WHEN {alias}.archive_bundle_id IS NOT NULL OR {alias}.result_payload_hash IS NOT NULL THEN pg_catalog.record_send(ROW({alias}.*)) ELSE pg_catalog.record_send(ROW({metadata})) END"
 
 
-def fingerprint_queries(staging_copies=False, *, columns, exhaustive=False):
+def toast_source(facts):
+    name = facts["toastName"]
+    if (
+        name != "pg_toast.pg_toast_" + str(load_audit().pg_oid(facts["oid"]))
+        or not facts["toastReadable"]
+    ):
+        raise ValueError("Cannot authenticate the named parent table's TOAST chunks")
+    return name
+
+
+def chunk_value_digest():
+    # Per-chunk hashes bound string_agg memory even for a large single datum.
+    return "sha256(string_agg(sha256(pg_catalog.record_send(ROW(c.chunk_id,c.chunk_seq,c.chunk_data))),''::bytea ORDER BY c.chunk_seq))"
+
+
+def fingerprint_queries(
+    staging_copies=False, *, columns, exhaustive=False, toast_facts=None
+):
     sources = dict(SOURCES)
     if staging_copies:
         sources["staging-copies"] = (
@@ -242,6 +260,13 @@ def fingerprint_queries(staging_copies=False, *, columns, exhaustive=False):
             if label == "reports" and not exhaustive
             else "pg_catalog.record_send(ROW(t.*))"
         )
+        if label == "reports" and toast_facts is not None:
+            # Values larger than an entire PostgreSQL page must be external.
+            # Read complete potentially inline bodies; pin the original slots
+            # and versions in the parent so no row can retarget a datum.
+            if not exhaustive:
+                data = f"CASE WHEN pg_column_size(t.report)<={int(toast_facts['blockBytes'])} THEN pg_catalog.record_send(ROW(t.*)) ELSE {data} END"
+            data = f"pg_catalog.record_send(ROW(t.xmin::text,t.ctid,{data}))"
         yield (
             label,
             (
@@ -271,12 +296,25 @@ def fingerprint_queries(staging_copies=False, *, columns, exhaustive=False):
         ),
     )
 
+    if toast_facts is not None:
+        name = toast_source(toast_facts)
+        yield (
+            "toast-values",
+            f"SELECT encode({chunk_value_digest()},'hex') FROM {name} c GROUP BY c.chunk_id ORDER BY c.chunk_id",
+        )
 
-def fingerprint_sql(staging_copies=False, *, columns, exhaustive=False):
+
+def fingerprint_sql(
+    staging_copies=False, *, columns, exhaustive=False, toast_facts=None
+):
     parts = ["BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY;"]
     for label, query in fingerprint_queries(
-        staging_copies, columns=columns, exhaustive=exhaustive
+        staging_copies, columns=columns, exhaustive=exhaustive, toast_facts=toast_facts
     ):
+        if label == "toast-values":
+            parts.append(
+                "SET LOCAL enable_seqscan=off; SET LOCAL enable_bitmapscan=off;"
+            )
         parts.extend([f"SELECT '@{label}';", f"COPY ({query}) TO STDOUT;"])
     return "\n".join([*parts, "COMMIT;"])
 
@@ -296,11 +334,12 @@ def verify_proof_schema(pg, physical):
 
 
 class Proof:
-    def __init__(self, staging_copies=False):
+    def __init__(self, staging_copies=False, toast=False):
         self.labels = [
             *SOURCES,
             *(["staging-copies"] if staging_copies else []),
             "report-body-witnesses",
+            *(["toast-values"] if toast else []),
         ]
         self.parts = {}
         self.current = None
@@ -407,7 +446,122 @@ def collector_count(services):
     return int(command(["docker", "exec", running[0]["id"], "node", "-e", script]))
 
 
-def measured(pg, *, census=False, sample=False):
+def auxiliary_files(pg, paths):
+    # Enumerate only numeric PostgreSQL segments and forks for the catalogued
+    # auxiliary heap and its indexes. st_blocks counts allocated filesystem bytes.
+    pattern = r"(?:base/[0-9]+|pg_tblspc/[0-9]+/PG_[0-9]+_[0-9]+/[0-9]+)/[0-9]+"
+    if not paths or not all(re.fullmatch(pattern, p) for p in paths):
+        raise ValueError("Unknown auxiliary file path")
+    script = """cd "$PGDATA"
+for p do
+ for f in "$p" "$p".[0-9]* "$p"_fsm* "$p"_vm* "$p"_init*; do
+  if [ -f "$f" ]; then stat -Lc '%n|%d|%i|%b|%s' "$f"; fi
+ done
+done"""
+    result = {}
+    raw = command(
+        ["docker", "exec", pg, "sh", "-ec", script, "hz_auxiliary_files", *paths],
+        seconds=20,
+    )
+    for line in raw.splitlines():
+        name, dev, inode, blocks, size = line.split("|")
+        root = (
+            re.split(r"(?:_[a-z]+|\.[0-9]+)$", name)[0]
+            .split("_fsm")[0]
+            .split("_vm")[0]
+            .split("_init")[0]
+        )
+        if root not in paths or name in result:
+            raise ValueError("Unexpected auxiliary fork or segment")
+        result[name] = {
+            "device": int(dev),
+            "inode": int(inode),
+            "allocated": int(blocks) * 512,
+            "size": int(size),
+        }
+    return result
+
+
+def toast_proof_plan(pg, f):
+    name = toast_source(f)
+    value = rows(
+        pg,
+        f"""BEGIN READ ONLY; SET LOCAL enable_seqscan=off; SET LOCAL enable_bitmapscan=off;
+       EXPLAIN (FORMAT JSON) SELECT encode({chunk_value_digest()},'hex') FROM {name} c GROUP BY c.chunk_id ORDER BY c.chunk_id;
+       COMMIT;""",
+    )[0]
+
+    def nodes(n):
+        yield n["Node Type"]
+        for child in n.get("Plans", []):
+            yield from nodes(child)
+
+    sequence = list(nodes(value[0]["Plan"]))
+    return {
+        "nodes": sequence,
+        "orderedByChunkIndex": "Index Scan" in sequence and "Sort" not in sequence,
+    }
+
+
+def sample_auxiliary_cost(pg, facts):
+    """Read complete external values from 96 bounded heap pages, in two disjoint cohorts."""
+    name = toast_source(facts)
+    pages = max(1, facts["toastHeapBytes"] // facts["blockBytes"])
+    windows = ",".join(
+        f"({p})" for p in sorted({i * (pages - 1) // 31 for i in range(32)})
+    )
+    keys = f"""WITH pages(k) AS(VALUES {windows}) SELECT DISTINCT t.chunk_id FROM pages CROSS JOIN LATERAL(
+      SELECT c.chunk_id::bigint FROM {name} c WHERE c.ctid>=('('||k||',0)')::tid AND c.ctid<('('||(k+3)||',0)')::tid LIMIT 12)t"""
+    plan = rows(pg, "EXPLAIN (FORMAT JSON) " + keys)[0]
+    if "Tid Range Scan" not in json.dumps(plan):
+        return {"state": "no bounded physical sampling plan"}
+    ids = rows(
+        pg, "SELECT to_jsonb(q.chunk_id) FROM (" + keys + ")q ORDER BY q.chunk_id"
+    )
+    if not ids:
+        return {"state": "no live sampled chunks"}
+    choices = ",".join(f"({int(i)}::oid)" for i in ids)
+    counts = rows(
+        pg,
+        f"""WITH keys(k) AS(VALUES {choices}) SELECT jsonb_build_object('id',k::bigint,'n',
+       (SELECT count(*) FROM(SELECT FROM {name} c WHERE c.chunk_id=k LIMIT 4097)b)) FROM keys ORDER BY k""",
+    )
+    chunk = int(
+        facts.get("packing", {}).get("toastChunkBytes", facts["blockBytes"] // 4)
+    )
+    cohorts = []
+    for group in (counts[::2], counts[1::2]):
+        picked = []
+        n = 0
+        for item in group:
+            if 0 < item["n"] <= 4096 and (n + item["n"]) * chunk <= 48 * 1024**2:
+                picked.append(int(item["id"]))
+                n += item["n"]
+        if not picked:
+            continue
+        values = ",".join(f"({i}::oid)" for i in picked)
+        sql = f"""WITH keys(k) AS(VALUES {values}), hashed AS MATERIALIZED(SELECT k,g.* FROM keys CROSS JOIN LATERAL
+        (SELECT count(*) AS n,sum(octet_length(c.chunk_data)) AS bytes,{chunk_value_digest()} AS digest FROM {name} c WHERE c.chunk_id=k)g),
+        work AS MATERIALIZED(SELECT count(*) AS datums,sum(n) AS chunks,sum(bytes) AS bytes,
+         encode(sha256(string_agg(digest,''::bytea ORDER BY k)),'hex') AS digest FROM hashed)
+        SELECT jsonb_build_object('values',datums,'chunks',chunks,'bytes',bytes,'digest',digest,
+          'seconds',extract(epoch FROM clock_timestamp()-statement_timestamp())) FROM work"""
+        trials = [rows(pg, sql, 15)[0] for _ in range(2)]
+        if (
+            trials[0]["digest"] != trials[1]["digest"]
+            or trials[0]["chunks"] != n
+            or trials[1]["chunks"] != n
+        ):
+            return {"state": "sample changed during the read"}
+        cohorts.append(trials)
+    return {
+        "state": "measured" if cohorts else "no bounded whole values",
+        "candidateValues": len(ids),
+        "trials": cohorts,
+    }
+
+
+def measured(pg, *, census=False, sample=False, toast=False):
     audit = load_audit()
     (physical,) = rows(pg, audit.RETURN_SNAPSHOT)
     (role,) = rows(pg, ROLE_SQL)
@@ -521,6 +675,20 @@ def measured(pg, *, census=False, sample=False):
     physical["wal"]["maxSizeBytes"] = rows(
         pg, "SELECT to_jsonb(pg_size_bytes(current_setting('max_wal_size')))"
     )[0]
+    if toast:
+        physical["toastProofPlan"] = (
+            toast_proof_plan(pg, physical)
+            if physical["toastReadable"]
+            else {"nodes": [], "orderedByChunkIndex": False}
+        )
+        paths = [
+            physical["paths"]["toast"],
+            *(physical["paths"]["index-" + key] for key in physical["toastIndexFiles"]),
+        ]
+        physical["auxiliaryPaths"] = paths
+        physical["auxiliaryFiles"] = auxiliary_files(pg, paths)
+        if any(path not in physical["auxiliaryFiles"] for path in paths):
+            raise RuntimeError("Incomplete auxiliary heap/index file inventory")
     if census:
         # Both operands come from this cluster. Charge each real datum its
         # own last partial page, including inline headers already in the heap.
@@ -544,11 +712,11 @@ def measured(pg, *, census=False, sample=False):
             rows(
                 pg,
                 f"""SELECT jsonb_object_agg(kind,jsonb_build_object(
-            'rows',n,'storedReportBytes',bytes,'referenceBytes',refs,'reportPageBytes',pages*{block}))
+            'rows',n,'storedReportBytes',bytes,'referenceBytes',refs,'reportPageBytes',pages*{block},'potentialChunks',chunks))
             FROM (SELECT CASE WHEN archived_at IS NOT NULL THEN 'archived'
             WHEN result_payload_hash IS NULL THEN 'inline' ELSE 'shared' END AS kind,
             count(*) AS n,sum(pg_column_size(report)) AS bytes,sum(coalesce(pg_column_size(result_payload_hash),0)) AS refs,
-            sum((pg_column_size(report)::bigint+{payload - 1})/{payload}) AS pages
+            sum((pg_column_size(report)::bigint+{payload - 1})/{payload}) AS pages, sum((pg_column_size(report)::bigint+{chunk - 1})/{chunk}) AS chunks
             FROM public.progressive_worker_reports GROUP BY 1) measured;""",
                 60,
             )[0]
@@ -563,8 +731,33 @@ def measured(pg, *, census=False, sample=False):
             + physical["totalBytes"]
             - physical["toastHeapBytes"],
         }
+        if toast:
+            chunks = sum(
+                group["potentialChunks"] for group in physical["live"].values()
+            )
+            # A sorted chunk btree with fixed (oid,int4) keys. Charge 256
+            # entries/leaf and at most 128 branch entries/page through the root.
+            pages = (chunks + 255) // 256
+            levels = 0
+            while pages > 1:
+                levels += pages
+                pages = (pages + 127) // 128
+            chunk_index = (levels + 65) * block
+            heap_bound = sum(
+                group["reportPageBytes"] for group in physical["live"].values()
+            )
+            physical["packing"].update(
+                potentialChunks=chunks,
+                chunkIndexEstimate=chunk_index,
+                toastReplacementBytes=heap_bound
+                + chunk_index
+                + (heap_bound + chunk_index + 1023) // 1024
+                + 16 * 1024**2,
+            )
     if sample:
         physical["identitySample"] = sample_identity_cost(pg, physical)
+        if toast and physical["toastReadable"]:
+            physical["toastProofSample"] = sample_auxiliary_cost(pg, physical)
     return physical
 
 
@@ -577,8 +770,16 @@ def wal_bytes(pg):
 
 
 def budget(facts, config):
-    old = int(facts["totalBytes"])
-    indexes = int(facts["indexBytes"]) + int(facts["toastIndexBytes"])
+    mode = config.get("mode", "whole")
+    if mode not in ("whole", "toast"):
+        raise ValueError("Unknown report rewrite mode")
+    toast = mode == "toast"
+    old = int(facts["toastTotalBytes"] if toast else facts["totalBytes"])
+    indexes = int(facts["toastIndexBytes"]) + (0 if toast else int(facts["indexBytes"]))
+    modeled = facts.get("packing", {}).get("modeledReplacementBytes")
+    if toast and modeled is not None:
+        modeled = facts["packing"].get("toastReplacementBytes")
+        indexes = max(indexes, facts["packing"].get("chunkIndexEstimate", 0))
     replacement = config["replacement"] if config["replacement"] is not None else old
     wal = facts["wal"]
     # max_wal_size is a checkpoint target, never a hard ceiling. Retainers can
@@ -602,18 +803,33 @@ def budget(facts, config):
         )
     if replacement < old:
         live = sum(x["storedReportBytes"] for x in facts.get("live", {}).values())
-        if not live or replacement < live + indexes + facts["heapBytes"]:
+        # The auxiliary-only projection charges every report (including
+        # inline values) an entire final page and retains its own index/FSM
+        # allowance. Parent heap and indexes stay in place.
+        minimum = modeled if toast else live + indexes + facts["heapBytes"]
+        if not live or minimum is None or replacement < minimum:
             reasons.append(
-                "Packed replacement budget is below live report bytes plus the existing heap/index allowances, or the census is unavailable"
+                "Packed TOAST budget is below the measured auxiliary heap, chunk index and fork model, or the census is unavailable"
+                if toast
+                else "Packed replacement budget is below live report bytes plus the existing heap/index allowances, or the census is unavailable"
             )
+    if toast:
+        try:
+            toast_source(facts)
+            if facts.get("toastProofPlan", {}).get("orderedByChunkIndex") is False:
+                reasons.append(
+                    "Chunk proof requires unbudgeted sorting of auxiliary data"
+                )
+        except ValueError as exc:
+            reasons.append(str(exc))
     if facts["disk"]["freeBytes"] < total:
         reasons.append("Insufficient available bytes on the PostgreSQL volume")
     return {
+        "mode": mode,
+        "parentTotalBytes": facts["totalBytes"],
         "allocatedBytes": old,
         "replacementBytes": replacement,
-        "modeledReplacementBytes": facts.get("packing", {}).get(
-            "modeledReplacementBytes"
-        ),
+        "modeledReplacementBytes": modeled,
         "indexScratchBytes": indexes,
         "additionalWalBytes": wal_budget,
         "externalGrowthBytes": config["growth"],
@@ -633,22 +849,36 @@ def budget(facts, config):
     }
 
 
-def identity(f):
+def normalized_identity(key):
+    columns, staging, heap, heap_file, toast, toast_file, indexes, *pins = key
+    audit = load_audit()
     return [
-        f["columns"],
-        f["stagingCopies"],
-        f["oid"],
-        f["relfilenode"],
-        f["toastOid"],
-        f["toastFilenode"],
-        f["indexFiles"],
-        f["serverStartedAt"],
-        f["device"],
-        f["disk"]["source"],
-        f["database"]["instance"],
-        f["database"]["registration"],
-        f["services"]["postgres"][0]["id"],
+        columns,
+        staging,
+        *(audit.pg_oid(i) for i in (heap, heap_file, toast, toast_file)),
+        audit.index_files(indexes),
+        *pins,
     ]
+
+
+def identity(f):
+    return normalized_identity(
+        [
+            f["columns"],
+            f["stagingCopies"],
+            f["oid"],
+            f["relfilenode"],
+            f["toastOid"],
+            f["toastFilenode"],
+            f["indexFiles"],
+            f["serverStartedAt"],
+            f["device"],
+            f["disk"]["source"],
+            f["database"]["instance"],
+            f["database"]["registration"],
+            f["services"]["postgres"][0]["id"],
+        ]
+    )
 
 
 def check_phase_space(f, config):
@@ -731,6 +961,7 @@ def host_phase(action, directory, pg):
     if action in ("preflight", "quiesced", "ready", "after", "resumed"):
         f = measured(
             pg,
+            toast=cfg.get("mode") == "toast",
             census=action in ("preflight", "quiesced", "ready")
             and cfg["replacement"] is not None,
         )
@@ -744,7 +975,7 @@ def host_phase(action, directory, pg):
                     "Container identity/state changed since operator preflight"
                 )
         if action in ("preflight", "quiesced", "ready"):
-            if identity(f) != opts["identity"]:
+            if identity(f) != normalized_identity(opts["identity"]):
                 raise RuntimeError(
                     "Database, volume, registration or table files changed since preflight"
                 )
@@ -813,22 +1044,49 @@ def host_phase(action, directory, pg):
         if action == "after":
             before = json.loads((directory / "quiesced.json").read_text())
             if (
-                f["oid"] != before["oid"]
-                or f["relfilenode"] == before["relfilenode"]
-                or f["serverStartedAt"] != before["serverStartedAt"]
+                load_audit().rewrite_outcome(before, f, cfg.get("mode", "whole"))
+                is not True
             ):
                 raise RuntimeError(
                     "Committed rewrite did not preserve table/server identity and replace the physical file"
                 )
+            if cfg.get("mode") == "toast" and any(
+                before[k] != f[k]
+                for k in ("heapBytes", "indexBytes", "parentIndexFileBytes")
+            ):
+                raise RuntimeError(
+                    "Parent heap or index allocation changed during the TOAST-only rewrite"
+                )
+            physical_result = {}
+            if cfg.get("mode") == "toast":
+                retired = auxiliary_files(pg, before["auxiliaryPaths"])
+                if any(v["allocated"] for v in retired.values()):
+                    raise RuntimeError(
+                        "Retired TOAST relation files still have allocated blocks"
+                    )
+                old_blocks = sum(
+                    v["allocated"] for v in before["auxiliaryFiles"].values()
+                )
+                new_blocks = sum(v["allocated"] for v in f["auxiliaryFiles"].values())
+                physical_result = dict(
+                    oldAuxiliaryAllocatedBytes=old_blocks,
+                    newAuxiliaryAllocatedBytes=new_blocks,
+                    releasedAllocatedBytes=old_blocks - new_blocks,
+                    oldFilePathsRemainingAllocatedBytes=0,
+                )
             dump(
                 directory / "space-result.json",
                 {
+                    **physical_result,
                     "relationBytesReturned": before["totalBytes"] - f["totalBytes"],
                     "filesystemAvailableDeltaBytes": f["disk"]["freeBytes"]
                     - before["disk"]["freeBytes"],
                     "beforeAllocation": before["totalBytes"],
                     "afterAllocation": f["totalBytes"],
                     "device": f["disk"]["source"],
+                    "mode": cfg.get("mode", "whole"),
+                    "toastBytesReturned": before["toastTotalBytes"]
+                    - f["toastTotalBytes"],
                 },
             )
         return
@@ -847,7 +1105,11 @@ def host_phase(action, directory, pg):
             and time.time() + opts["restoreReserve"] >= opts["leaseDeadline"]
         ):
             raise RuntimeError("Lease renewal/restoration margin reached")
-        progress = rows(pg, monitor_sql(tag, f["oid"]), 4)
+        progress = rows(
+            pg,
+            monitor_sql(tag, f["toastOid"] if cfg.get("mode") == "toast" else f["oid"]),
+            4,
+        )
         sample = {
             "at": time.time(),
             "phase": action,
@@ -866,10 +1128,13 @@ def host_phase(action, directory, pg):
 
     secs = opts["sqlSeconds"] if action == "rewrite" else opts["identitySeconds"]
     run_sql = (
-        VACUUM
+        (TOAST_VACUUM if cfg.get("mode") == "toast" else VACUUM)
         if action == "rewrite"
         else fingerprint_sql(
-            f["stagingCopies"], columns=f["columns"], exhaustive=opts["allReportBytes"]
+            f["stagingCopies"],
+            columns=f["columns"],
+            exhaustive=opts["allReportBytes"],
+            toast_facts=f if cfg.get("mode") == "toast" else None,
         )
     )
     result = run_phase(
@@ -878,12 +1143,18 @@ def host_phase(action, directory, pg):
         secs,
         poll,
         cancel,
-        None if action == "rewrite" else Proof(f["stagingCopies"]),
+        None
+        if action == "rewrite"
+        else Proof(f["stagingCopies"], cfg.get("mode") == "toast"),
     )
     if action == "rewrite":
         dump(
             directory / "rewrite-commit.json",
-            {"completedAt": time.time(), "table": TABLE},
+            {
+                "completedAt": time.time(),
+                "table": TABLE,
+                "mode": cfg.get("mode", "whole"),
+            },
         )
     else:
         dump(directory / (action + ".json"), result)

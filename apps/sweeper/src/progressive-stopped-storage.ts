@@ -14,11 +14,11 @@ const stoppedOwner = sql`
     AND promise.source_base_url=settings.upstream_base_url
     AND job.request_payload->>'upstreamBaseUrl'=settings.upstream_base_url
     AND NOT settings.remote_solver_transfer_paused AND settings.remote_solver_auth_token<>''
-    AND EXISTS (SELECT 1 FROM progressive_worker_reports report
+    AND EXISTS (SELECT 1 FROM progressive_worker_staging_candidates eligible
+      JOIN progressive_worker_reports report ON (report.sim_job_id,report.sequence)=(eligible.sim_job_id,eligible.sequence)
       JOIN progressive_worker_submission_intents intent ON intent.sim_job_id=report.sim_job_id
         AND intent.assignment_signature=report.assignment_signature
-      WHERE report.sim_job_id=job.id AND report.stopped_engine_job_id=job.id::text
-        AND report.acknowledged_at IS NOT NULL AND jsonb_typeof(report.report->'result')='object')
+      WHERE eligible.sim_job_id=job.id AND eligible.stopped_engine_job_id=job.id::text)
 `;
 
 export async function progressiveStoppedStorageEligible(

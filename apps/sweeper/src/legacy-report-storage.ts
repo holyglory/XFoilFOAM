@@ -1,17 +1,17 @@
+import { randomUUID } from "node:crypto";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
+import { mkdir, open, readFile, lstat, unlink } from "node:fs/promises";
+import { syncDirectory, durableWrite } from "./legacy-report-storage-files";
 import {
-  mkdir,
-  open,
-  readFile,
-  rename,
-  rmdir,
-  lstat,
-  link,
-  unlink,
-} from "node:fs/promises";
-import { randomUUID } from "node:crypto";
+  runLegacyExecutionSlots,
+  type LegacySlotOptions,
+} from "./legacy-report-execution-slots";
 import { join } from "node:path";
+import {
+  readNormalizedPrefix,
+  type NormalizedPrefix,
+} from "./legacy-report-normalized-batch";
 import { LegacyResultTransport } from "./legacy-report-result-transport";
 
 import {
@@ -19,6 +19,7 @@ import {
   legacyBound,
   legacyKeysSql,
   legacyMemberSql,
+  legacyReadOnlySql,
   type LegacyReportMember,
   type LegacyReportScope,
   type LegacyReportKind,
@@ -58,6 +59,11 @@ export type {
 export interface LegacySqlReader {
   acceptVerifiedTransportHistory?(): void;
   query(sql: string, maxBytes: number): Promise<Record<string, unknown>[]>;
+  readNormalizedPrefix?(
+    executionId: string,
+    sequences: number[],
+    maxBytes: number,
+  ): Promise<NormalizedPrefix | null>;
   readMember?(
     executionId: string,
     kind: LegacyReportKind,
@@ -285,6 +291,21 @@ export class LegacySshReader implements LegacySqlReader {
       child.stdin.write(sql + "\n\\echo " + marker + "\n");
     });
   }
+  async readNormalizedPrefix(
+    executionId: string,
+    keys: number[],
+    budget: number,
+  ) {
+    const prefix = await readNormalizedPrefix(this, executionId, keys, budget);
+    if (prefix) {
+      const stats = this.resultTransport.stats;
+      stats.definitions++;
+      stats.reuses += prefix.members.length - 1;
+      stats.resultBytesReceived += prefix.dictionaryBytes;
+      stats.decodedBytes += prefix.decodedBytes;
+    }
+    return prefix;
+  }
   readMember(
     executionId: string,
     kind: LegacyReportKind,
@@ -331,9 +352,17 @@ export async function readLegacyPage(
   start = initialCursor(scope),
   rows = 16,
   maxBytes = 64 * 1024 ** 2,
+  checkRead?: (cursor: LegacyCursor) => void,
+  endExecution = scope.executions.length,
 ): Promise<LegacyBackupPage> {
   assertLegacyScope(scope);
   checkCursor(scope, start);
+  legacyBound(
+    endExecution,
+    scope.executions.length,
+    "execution range end",
+    start.execution,
+  );
   legacyBound(rows, 128, "page rows");
   legacyBound(maxBytes, 256 * 1024 ** 2, "page bytes");
   const next = { ...start };
@@ -342,10 +371,11 @@ export async function readLegacyPage(
   // Bound metadata requests as well, including runs through zero-conflict executions.
   let queries = 0;
   while (
-    next.execution < scope.executions.length &&
+    next.execution < endExecution &&
     members.length < rows &&
     queries < 2 * rows + 4
   ) {
+    checkRead?.(next);
     const item = scope.executions[next.execution];
     const highWater =
       next.kind === "report" ? item.reportHighWater : item.conflictHighWater;
@@ -358,9 +388,11 @@ export async function readLegacyPage(
         next.after,
         highWater,
         rows - members.length,
+        Boolean(source.readNormalizedPrefix),
       ),
       65536,
     );
+    checkRead?.(next);
     if (keys.length === 0) {
       if (next.copied !== count || next.after !== highWater)
         throw new Error(
@@ -380,27 +412,53 @@ export async function readLegacyPage(
     }
     if (keys.length > rows - members.length)
       throw new Error("Unbounded source key result");
-    for (const key of keys) {
-      const sequence = Number(key.sequence);
-      legacyBound(sequence, highWater, "source sequence");
-      if (sequence <= next.after) throw new Error("Source keys out of order");
-      queries++;
-      const result = source.readMember
-        ? await source.readMember(
+    const sequences = keys.map((key) =>
+      legacyBound(Number(key.sequence), highWater, "source sequence"),
+    );
+    if (
+      sequences.some(
+        (sequence, index) =>
+          sequence <= (index ? sequences[index - 1]! : next.after),
+      )
+    )
+      throw new Error("Source keys out of order");
+    // This hint avoids an extra round trip for inline/unique results. The
+    // batch query independently rechecks its exact keys, hash and member bytes.
+    const hint = keys[0].normalizedHash;
+    const batch =
+      next.kind === "report" &&
+      source.readNormalizedPrefix &&
+      typeof hint === "string" &&
+      hint === keys[1]?.normalizedHash
+        ? await source.readNormalizedPrefix(
             item.executionId,
-            next.kind,
-            sequence,
+            sequences,
             maxBytes - bytes,
           )
-        : await source.query(
-            legacyMemberSql(
+        : null;
+    for (const [index, sequence] of sequences.entries()) {
+      if (batch?.nextCost != null && index === batch.members.length)
+        return page();
+      queries++;
+      const sealed = batch?.members[index];
+      const result = sealed
+        ? [sealed as unknown as Record<string, unknown>]
+        : source.readMember
+          ? await source.readMember(
               item.executionId,
               next.kind,
               sequence,
               maxBytes - bytes,
-            ),
-            (maxBytes - bytes) * 6 + 1024 * 1024,
-          );
+            )
+          : await source.query(
+              legacyMemberSql(
+                item.executionId,
+                next.kind,
+                sequence,
+                maxBytes - bytes,
+              ),
+              (maxBytes - bytes) * 6 + 1024 * 1024,
+            );
       if (result.length !== 1) throw new Error("Frozen source member missing");
       if (result[0].blocked) {
         if (
@@ -411,6 +469,7 @@ export async function readLegacyPage(
         throw new Error(`Legacy copy blocked: ${result[0].blocked}`);
       }
       const member = result[0] as unknown as LegacyReportMember;
+      checkRead?.(next);
       checkLegacyMember(member);
       if (
         member.executionId !== item.executionId ||
@@ -444,13 +503,51 @@ export async function readLegacyPage(
   }
 }
 
-async function syncDirectory(path: string): Promise<void> {
-  const directory = await open(path, "r");
-  try {
-    await directory.sync();
-  } finally {
-    await directory.close();
-  }
+// Keep only the encoded bytes and receipt fields while another page is read.
+// An opted-in writer later receives the authenticated object-store readback.
+function packedPage(page: LegacyBackupPage, packed = encodeLegacyPage(page)) {
+  const { members, ...header } = page;
+  return {
+    ...header,
+    ...packed,
+    memberCount: members.length,
+    reportRows: members.filter((member) => member.kind === "report").length,
+  };
+}
+
+// Acknowledgement or representation changes can alter the original row text
+// without changing its report signature. Compare the indexed heap versions
+// around a speculative read, including insertion/deletion among sparse keys.
+// Whole-row JSON and the resolver can also change on metadata-only DDL.
+async function reportWindowVersion(
+  source: LegacySqlReader,
+  scope: LegacyReportScope,
+  cursor: LegacyCursor,
+  rows: number,
+): Promise<string | undefined> {
+  const item = scope.executions[cursor.execution];
+  const [result] = await source.query(
+    legacyReadOnlySql(`SELECT jsonb_build_object(
+    'count', count(*), 'version', encode(sha256(convert_to(concat_ws('/',
+      (SELECT string_agg(concat_ws(':',attnum,xmin,ctid), ',' ORDER BY attnum)
+       FROM pg_attribute WHERE attrelid='public.progressive_worker_reports'::regclass AND attnum>0),
+      (SELECT string_agg(concat_ws(':',oid,xmin,ctid), ',' ORDER BY oid)
+       FROM pg_proc WHERE oid IN ('public.resolve_progressive_report(jsonb)'::regprocedure,
+         'public.resolve_progressive_report(jsonb,text)'::regprocedure,
+         'public.progressive_report_result_header(jsonb)'::regprocedure)),
+      string_agg(concat_ws(':',sequence,tableoid,xmin,ctid), ',' ORDER BY sequence)), 'UTF8')), 'hex'))::text
+    FROM (SELECT sequence,tableoid,xmin,ctid FROM public.progressive_worker_reports
+      WHERE sim_job_id='${item.executionId}'::uuid AND sequence>${cursor.after}
+        AND sequence<=${item.reportHighWater} ORDER BY sequence LIMIT ${rows}) AS bounded;`),
+    1024,
+  );
+  if (result?.count !== rows) return undefined;
+  if (
+    typeof result.version !== "string" ||
+    !/^[a-f0-9]{64}$/.test(result.version)
+  )
+    throw new Error("Invalid legacy report window version");
+  return result.version;
 }
 
 /** Kernel-owned lock: stdin closes on process death, releasing flock without a stale directory. */
@@ -511,36 +608,6 @@ async function acquireLegacyCopyLock(
   };
 }
 
-async function durableWrite(
-  path: string,
-  bytes: Buffer,
-  immutable: boolean,
-): Promise<void> {
-  const temporary = `${path}.tmp-${randomUUID()}`;
-  const file = await open(temporary, "wx", 0o600);
-  try {
-    await file.writeFile(bytes);
-    await file.sync();
-  } finally {
-    await file.close();
-  }
-  try {
-    if (immutable) {
-      try {
-        await link(temporary, path);
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-        if (!(await readFile(path)).equals(bytes))
-          throw new Error("Existing immutable backup artifact differs");
-      }
-    } else await rename(temporary, path);
-  } finally {
-    await unlink(temporary).catch((error: NodeJS.ErrnoException) => {
-      if (error.code !== "ENOENT") throw error;
-    });
-  }
-}
-
 /** State is backup progress, not application custody and never authorizes report removal. */
 export async function exportLegacyReports(input: {
   source: LegacySqlReader;
@@ -552,6 +619,9 @@ export async function exportLegacyReports(input: {
   rows?: number;
   maxBytes?: number;
   keepLocal?: boolean;
+  /** Overlap one read-only page with the independent store/apply callback. */
+  prepareNextPage?: boolean;
+  executionSupervisor?: LegacySlotOptions<LegacySqlReader>;
   shouldStop?: () => boolean;
   onVerifiedHistory?: () => void;
   applyVerifiedPage?: (
@@ -559,6 +629,7 @@ export async function exportLegacyReports(input: {
     receipt: LegacyBackupReceipt,
     receiptFile: string,
     verifiedPackedBytes: Buffer,
+    proofDirectory: string,
   ) => Promise<void | LegacyPageApplyStats>;
   adoptCopy?: {
     sourceBinding: string;
@@ -569,6 +640,7 @@ export async function exportLegacyReports(input: {
 }) {
   assertLegacyScope(input.scope);
   const pages = legacyBound(input.pages ?? 1, 32, "pages per invocation");
+  const rows = legacyBound(input.rows ?? 16, 128, "page rows");
   await mkdir(input.directory, { recursive: true, mode: 0o700 });
   if (!(await lstat(input.directory)).isDirectory())
     throw new Error("Backup directory must be a real directory");
@@ -620,6 +692,58 @@ export async function exportLegacyReports(input: {
     if (includeVerified) {
       add("reportRowsVerified", stats?.reportRowsVerified);
       add("archiveMembersVerified", stats?.archiveMembersVerified);
+    }
+  };
+  type Packed = ReturnType<typeof packedPage>;
+  let ahead:
+    | Promise<
+        { page: Packed; version: string } | { error: unknown } | undefined
+      >
+    | undefined;
+  let closing = false;
+  const prepare = async (
+    cursor: LegacyCursor,
+    check?: (cursor: LegacyCursor) => void,
+    source = input.source,
+    maxBytes = input.maxBytes,
+    endExecution = input.scope.executions.length,
+  ) => {
+    const page = await readLegacyPage(
+      source,
+      input.scope,
+      cursor,
+      rows,
+      maxBytes,
+      check,
+      endExecution,
+    );
+    check?.(page.next);
+    return packedPage(page);
+  };
+  const speculate = async (cursor: LegacyCursor) => {
+    const version = await reportWindowVersion(
+      input.source,
+      input.scope,
+      cursor,
+      rows,
+    );
+    if (!version) return;
+    // Conflict aliases can refer to a report in the page being committed.
+    // Speculation is confined to later reports in one execution.
+    const abandoned = new Error("Speculative legacy page abandoned");
+    const check = (at: LegacyCursor) => {
+      if (
+        closing ||
+        input.shouldStop?.() ||
+        at.execution !== cursor.execution ||
+        at.kind !== "report"
+      )
+        throw abandoned;
+    };
+    try {
+      return { page: await prepare(cursor, check), version };
+    } catch (error) {
+      if (error !== abandoned) throw error;
     }
   };
   try {
@@ -706,84 +830,198 @@ export async function exportLegacyReports(input: {
       }
     } else await saveState();
     const receipts: string[] = [];
-    for (let index = 0; index < pages; index++) {
-      if (input.shouldStop?.()) break;
-      let packed: { bytes: Buffer; rawByteSize: number },
-        page: LegacyBackupPage;
-      try {
-        const details = await lstat(pendingPath);
-        if (!details.isFile() || details.size > 512 * 1024 ** 2)
-          throw new Error(
-            "Invalid/oversized pending page; preserve for inspection",
-          );
-        const bytes = await readFile(pendingPath);
-        const inspected = inspectLegacyPage(bytes);
-        packed = { bytes, rawByteSize: inspected.rawByteSize };
-        page = inspected.page;
-        if (
-          page.scopeSha256 !== legacyScopeHash(input.scope) ||
-          page.sourceInstance !== input.scope.sourceInstance ||
-          page.solverId !== input.scope.solverId
-        )
-          throw new Error(
-            "Pending page belongs to another source/scope; preserved",
-          );
-        checkCursor(input.scope, page.start);
-        checkCursor(input.scope, page.next);
-        if (!sameCursor(page.start, next)) {
-          if (
-            !sameCursor(page.next, next) ||
-            !lastReceipt ||
-            !/^[a-f0-9]{64}\.[a-f0-9]{64}\.[0-9]+\.receipt\.json$/.test(
-              lastReceipt,
-            )
-          )
-            throw new Error("Pending page/checkpoint disagree; preserved");
-          const receiptBytes = await readFile(
-            join(input.directory, lastReceipt),
-          );
-          if (legacySha256(receiptBytes) !== lastReceipt.split(".")[0])
-            throw new Error("Saved receipt changed; pending bytes preserved");
-          const receipt = JSON.parse(
-            receiptBytes.toString("utf8"),
-          ) as LegacyBackupReceipt;
-          if (receipt.object.sha256 !== legacySha256(packed.bytes))
-            throw new Error("Pending page does not match committed receipt");
-          decodeLegacyPage(await input.store.read(receipt.object), receipt); // Fresh pinned recovery proof before delayed drop.
-          await unlink(pendingPath);
-          await syncDirectory(input.directory);
-          if (next.execution === input.scope.executions.length) break;
-          continue;
-        }
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-        if (next.execution === input.scope.executions.length) break;
-        page = await readLegacyPage(
-          input.source,
-          input.scope,
-          next,
-          input.rows,
-          input.maxBytes,
+    const savedPending = await lstat(pendingPath).catch(
+      (error: NodeJS.ErrnoException) => {
+        if (error.code !== "ENOENT") throw error;
+        return null;
+      },
+    );
+    const supervisor = input.executionSupervisor;
+    const maxBytes = input.maxBytes ?? 64 * 1024 ** 2;
+    let slotResult;
+    const useSlots =
+      !savedPending &&
+      supervisor?.slots === 2 &&
+      pages >= 2 &&
+      next.execution + 1 < input.scope.executions.length;
+    if (savedPending?.isDirectory() || useSlots) {
+      if (!supervisor || !input.applyVerifiedPage)
+        throw new Error(
+          "Resume the pending execution ranges with the migration supervisor",
         );
-        packed = encodeLegacyPage(page);
-        // Exactly one transfer file. A crash during this write leaves a bounded
-        // incomplete page for inspection, never another unbounded capture batch.
-        const file = await open(pendingPath, "wx", 0o600);
+      slotResult = await runLegacyExecutionSlots({
+        options: supervisor,
+        scope: input.scope,
+        binding,
+        directory: input.directory,
+        pendingPath,
+        pages,
+        maxBytes,
+        scopeHash: legacyScopeHash(input.scope),
+        exists: savedPending?.isDirectory() === true,
+        shouldStop: input.shouldStop,
+        cursor: () => ({ next, lastReceipt }),
+        prepare: (cursor, peer, cap) =>
+          prepare(
+            cursor,
+            undefined,
+            peer ? (supervisor.peerSource ?? input.source) : input.source,
+            cap,
+            cursor.execution + 1,
+          ),
+        inspect: (bytes) => {
+          const { page, rawByteSize } = inspectLegacyPage(bytes);
+          return packedPage(page, { bytes, rawByteSize });
+        },
+        apply: commitPacked,
+        publish: async (cursor, receipt) => {
+          next = cursor;
+          lastReceipt = receipt;
+          await saveState();
+          receipts.push(receipt);
+        },
+        store: input.store,
+      });
+    } else
+      for (
+        let index = 0;
+        index < (savedPending && supervisor?.slots === 2 ? 1 : pages);
+        index++
+      ) {
+        if (input.shouldStop?.()) break;
+        let page: Packed;
         try {
-          await file.writeFile(packed.bytes);
-          await file.sync();
-        } finally {
-          await file.close();
+          const details = await lstat(pendingPath);
+          if (!details.isFile() || details.size > 512 * 1024 ** 2)
+            throw new Error(
+              "Invalid/oversized pending page; preserve for inspection",
+            );
+          const bytes = await readFile(pendingPath);
+          const inspected = inspectLegacyPage(bytes);
+          page = packedPage(inspected.page, {
+            bytes,
+            rawByteSize: inspected.rawByteSize,
+          });
+          if (
+            page.scopeSha256 !== legacyScopeHash(input.scope) ||
+            page.sourceInstance !== input.scope.sourceInstance ||
+            page.solverId !== input.scope.solverId
+          )
+            throw new Error(
+              "Pending page belongs to another source/scope; preserved",
+            );
+          checkCursor(input.scope, page.start);
+          checkCursor(input.scope, page.next);
+          if (!sameCursor(page.start, next)) {
+            if (
+              !sameCursor(page.next, next) ||
+              !lastReceipt ||
+              !/^[a-f0-9]{64}\.[a-f0-9]{64}\.[0-9]+\.receipt\.json$/.test(
+                lastReceipt,
+              )
+            )
+              throw new Error("Pending page/checkpoint disagree; preserved");
+            const receiptBytes = await readFile(
+              join(input.directory, lastReceipt),
+            );
+            if (legacySha256(receiptBytes) !== lastReceipt.split(".")[0])
+              throw new Error("Saved receipt changed; pending bytes preserved");
+            const receipt = JSON.parse(
+              receiptBytes.toString("utf8"),
+            ) as LegacyBackupReceipt;
+            if (receipt.object.sha256 !== legacySha256(page.bytes))
+              throw new Error("Pending page does not match committed receipt");
+            decodeLegacyPage(await input.store.read(receipt.object), receipt); // Fresh pinned recovery proof before delayed drop.
+            await unlink(pendingPath);
+            await syncDirectory(input.directory);
+            if (next.execution === input.scope.executions.length) break;
+            continue;
+          }
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+          if (next.execution === input.scope.executions.length) break;
+          let reusable: Packed | undefined;
+          if (ahead) {
+            const prepared = await ahead;
+            ahead = undefined;
+            if (input.shouldStop?.()) break;
+            if (prepared && "error" in prepared) throw prepared.error;
+            if (prepared) {
+              if (!sameCursor(prepared.page.start, next))
+                throw new Error(
+                  "Speculative page differs from the durable cursor",
+                );
+              const current = await reportWindowVersion(
+                input.source,
+                input.scope,
+                next,
+                rows,
+              );
+              if (input.shouldStop?.()) break;
+              if (current === prepared.version) reusable = prepared.page;
+            }
+          }
+          page = reusable ?? (await prepare(next));
+          // Exactly one transfer file. A crash during this write leaves a bounded
+          // incomplete page for inspection, never another unbounded capture batch.
+          const file = await open(pendingPath, "wx", 0o600);
+          try {
+            await file.writeFile(page.bytes);
+            await file.sync();
+          } finally {
+            await file.close();
+          }
+          await syncDirectory(input.directory);
         }
+        const following = page.next;
+        const target = input.scope.executions[following.execution];
+        if (
+          input.prepareNextPage &&
+          index + 1 < pages &&
+          following.kind === "report" &&
+          target &&
+          target.reports - following.copied >= rows &&
+          !input.shouldStop?.()
+        ) {
+          // Only the committed cursor may publish these bytes. Attach the error
+          // handler now, and finish the current durable operation first.
+          ahead = speculate(following).catch((error: unknown) => ({ error }));
+        }
+        const receiptFile = await commitPacked(page, input.directory);
+        next = page.next;
+        lastReceipt = receiptFile;
+        await saveState();
+        await unlink(pendingPath);
         await syncDirectory(input.directory);
+        receipts.push(receiptFile);
       }
-      const hash = legacySha256(packed.bytes);
+    return {
+      complete: next.execution === input.scope.executions.length,
+      next,
+      receipts,
+      ...totals,
+      ...(slotResult && { executionSupervisor: slotResult }),
+      countsArePerInvocation: true,
+      localBodiesRemoved:
+        totals.archiveMembersReleased === null
+          ? null
+          : totals.archiveMembersReleased > 0,
+      transferBytesRetained: input.keepLocal === true,
+    };
+    async function commitPacked(
+      page: Packed,
+      directory: string,
+      pinned?: LegacyBackupReceipt,
+      check?: (verified: LegacyBackupPage) => void,
+    ) {
+      const hash = legacySha256(page.bytes);
       const objectKey = `legacy-worker-reports/v1/${input.scope.sourceInstance}/${input.scope.solverId}/${page.scopeSha256}/${hash}.jsonl.gz`;
-      const object = await input.store.put(objectKey, packed.bytes);
+      const object =
+        pinned?.object ?? (await input.store.put(objectKey, page.bytes));
       if (
         object.objectKey !== objectKey ||
         object.sha256 !== hash ||
-        object.byteSize !== packed.bytes.length
+        object.byteSize !== page.bytes.length
       )
         throw new Error("Backup store returned another object");
       const receipt: LegacyBackupReceipt = {
@@ -793,41 +1031,49 @@ export async function exportLegacyReports(input: {
         solverId: page.solverId,
         start: page.start,
         next: page.next,
-        object,
-        memberCount: page.members.length,
-        rawByteSize: packed.rawByteSize,
+        object: { ...object },
+        memberCount: page.memberCount,
+        rawByteSize: page.rawByteSize,
       };
+      if (pinned && JSON.stringify(receipt) !== JSON.stringify(pinned))
+        throw new Error("Pending receipt differs from the original transfer");
       const restored = await input.store.read(object);
-      decodeLegacyPage(restored, receipt);
-      if (!restored.equals(packed.bytes))
+      let verifiedPage: LegacyBackupPage | undefined = decodeLegacyPage(
+        restored,
+        receipt,
+      );
+      check?.(verifiedPage);
+      if (!input.applyVerifiedPage) verifiedPage = undefined;
+      if (!restored.equals(page.bytes))
         throw new Error("Backup bytes changed during readback");
-      add(
-        "reportRowsVerified",
-        page.members.filter((member) => member.kind === "report").length,
-      );
-      add("archiveMembersVerified", page.members.length);
+      add("reportRowsVerified", page.reportRows);
+      add("archiveMembersVerified", page.memberCount);
       const receiptBytes = Buffer.from(JSON.stringify(receipt) + "\n");
-      const receiptFile = `${legacySha256(receiptBytes)}.${hash}.${object.generation}.receipt.json`;
-      await durableWrite(
-        join(input.directory, receiptFile),
-        receiptBytes,
-        true,
-      );
+      const receiptFile = `${legacySha256(receiptBytes)}.${hash}.${receipt.object.generation}.receipt.json`;
+      await durableWrite(join(directory, receiptFile), receiptBytes, true);
       if (input.keepLocal)
         await durableWrite(
-          join(input.directory, `${hash}.jsonl.gz`),
-          packed.bytes,
+          join(directory, `${hash}.jsonl.gz`),
+          page.bytes,
           true,
         );
-      await syncDirectory(input.directory); // Receipt/optional retained copy BEFORE progress.
-      if (input.applyVerifiedPage)
+      await syncDirectory(directory); // Receipt/optional retained copy BEFORE progress.
+      if (input.applyVerifiedPage && verifiedPage)
         try {
+          // The store may still hold its Buffer across the receipt fsync.
+          // Match it to the durable identity before handing both to the writer.
+          if (
+            restored.length !== receipt.object.byteSize ||
+            legacySha256(restored) !== hash
+          )
+            throw new Error("Verified backup bytes changed before application");
           applied(
             await input.applyVerifiedPage(
-              decodeLegacyPage(restored, receipt),
+              verifiedPage,
               receipt,
               receiptFile,
               restored,
+              directory,
             ),
           );
         } catch (error) {
@@ -842,25 +1088,8 @@ export async function exportLegacyReports(input: {
             } catch {}
           throw error;
         }
-      next = page.next;
-      lastReceipt = receiptFile;
-      await saveState();
-      await unlink(pendingPath);
-      await syncDirectory(input.directory);
-      receipts.push(receiptFile);
+      return receiptFile;
     }
-    return {
-      complete: next.execution === input.scope.executions.length,
-      next,
-      receipts,
-      ...totals,
-      countsArePerInvocation: true,
-      localBodiesRemoved:
-        totals.archiveMembersReleased === null
-          ? null
-          : totals.archiveMembersReleased > 0,
-      transferBytesRetained: input.keepLocal === true,
-    };
     async function saveState() {
       await durableWrite(
         statePath,
@@ -872,6 +1101,8 @@ export async function exportLegacyReports(input: {
       await syncDirectory(input.directory);
     }
   } finally {
+    closing = true;
+    await ahead;
     await releaseLock();
   }
 }

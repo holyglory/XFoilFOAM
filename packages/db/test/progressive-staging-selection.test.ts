@@ -1,3 +1,5 @@
+import { unexpectedWorkerJobScans } from "../test-support/worker-ownership-plan";
+import { fixtureStagingCandidateView, useFixtureStagingKeys } from "../test-support/staging-candidate-view";
 import { afterAll, expect, it } from "vitest";
 import { sql } from "drizzle-orm";
 import { createClient, type DB } from "../src/client";
@@ -34,7 +36,9 @@ async function withWakeFixture(
       SELECT 1 id,false remote_solver_transfer_paused,'fixture-token'::text remote_solver_auth_token,
         'https://wake.invalid'::text upstream_base_url,md5('unselected')::uuid remote_solver_registered_id`);
     await transaction.execute(sql`CREATE TEMP TABLE sim_jobs (
-      id uuid PRIMARY KEY,request_payload jsonb,ingest_lease_token uuid,ingest_lease_expires_at timestamptz) ON COMMIT DROP`);
+      id uuid PRIMARY KEY,request_payload jsonb,ingest_lease_token uuid,ingest_lease_expires_at timestamptz,
+      status sim_job_status DEFAULT 'running') ON COMMIT DROP`);
+    await transaction.execute(sql`CREATE INDEX wake_fixture_ingest_lease_idx ON sim_jobs(status,ingest_lease_expires_at)`);
     await transaction.execute(sql`INSERT INTO sim_jobs
       SELECT id,jsonb_build_object('syncPromiseId',id::text,'remoteSolver',variant<>'not-remote',
         'upstreamBaseUrl',CASE WHEN variant='wrong-job-upstream' THEN 'https://foreign.invalid' ELSE 'https://wake.invalid' END),
@@ -51,8 +55,9 @@ async function withWakeFixture(
       sql`CREATE UNIQUE INDEX wake_promise_identity_idx ON sync_sweep_promises((id::text))`,
     );
     await transaction.execute(sql`CREATE TEMP TABLE progressive_worker_reports (
-      sim_job_id uuid,sequence bigint,acknowledged_at timestamptz,report jsonb,created_at timestamptz,
+      sim_job_id uuid,sequence bigint,acknowledged_at timestamptz,report jsonb,created_at timestamptz,stopped_engine_job_id text,
       PRIMARY KEY(sim_job_id,sequence)) ON COMMIT DROP`);
+    await transaction.execute(fixtureStagingCandidateView);
     await transaction.execute(sql`CREATE TEMP TABLE progressive_worker_report_conflicts (
       sim_job_id uuid,sequence bigint,PRIMARY KEY(sim_job_id,sequence)) ON COMMIT DROP`);
     await transaction.execute(sql`INSERT INTO progressive_worker_reports
@@ -106,10 +111,14 @@ async function withWakeFixture(
   });
 }
 
-it.each(["staging", "delivery"] as const)(
-  "wakes %s only for owned pending work after every claim and retry deadline",
-  async (scope) => {
+const wakeSources = (["staging", "delivery"] as const).flatMap(scope =>
+  (["source", "keys"] as const).map(reads => ({scope, reads})));
+
+it.each(wakeSources)(
+  "wakes $scope via $reads only for owned pending work after every claim and retry deadline",
+  async ({scope, reads}) => {
     await withWakeFixture(scope, async (connection) => {
+      if (reads === "keys") await useFixtureStagingKeys(connection);
       const selectVariant = async (variant: string) => {
         await connection.execute(sql`UPDATE sync_api_settings SET remote_solver_registered_id=
         (SELECT id FROM wake_cases WHERE variant=${variant})`);
@@ -200,9 +209,36 @@ it.each(["staging", "delivery"] as const)(
   },
 );
 
-it.each(["staging", "delivery"] as const)(
-  "keeps %s ownership probes bounded with forty thousand retained reports",
-  async (scope) => {
+it.each(["source", "keys"] as const)("keeps only eligible sequences and exact attempts when repeated bindings share a deadline (%s)", async (reads) => {
+  await withWakeFixture("delivery", async db => {
+    const [job] = await db.execute(sql`SELECT id FROM wake_cases WHERE variant='future-retry'`);
+    await db.execute(sql`UPDATE sync_api_settings SET remote_solver_registered_id=${job.id}::uuid`);
+    await db.execute(sql`INSERT INTO progressive_worker_reports(sim_job_id,sequence,acknowledged_at,report,created_at)
+      SELECT sim_job_id,n,acknowledged_at,report,created_at FROM progressive_worker_reports
+      CROSS JOIN generate_series(2,4)n WHERE sim_job_id=${job.id}::uuid AND sequence=1`);
+    await db.execute(sql`INSERT INTO progressive_worker_evidence_receipts SELECT ${job.id}::uuid,n FROM generate_series(2,4)n`);
+    await db.execute(sql`INSERT INTO result_attempts(id,sim_job_id,engine_job_id,result_id)
+      VALUES(md5('competing-attempt')::uuid,${job.id}::uuid,'wrong-engine',${job.id}::uuid)`);
+    await db.execute(sql`INSERT INTO progressive_worker_evidence_attempts
+      SELECT ${job.id}::uuid,n,CASE WHEN n=4 THEN md5('competing-attempt')::uuid ELSE ${job.id}::uuid END,${job.id}::text
+      FROM generate_series(2,4)n`);
+    if (reads === "keys") await useFixtureStagingKeys(db);
+    const wake = async () => (await db.execute(progressiveEvidenceWakeSql("delivery", false)))[0].wake_at;
+    const [expected] = await db.execute(sql`SELECT retry_after FROM progressive_worker_delivery_failures WHERE sim_job_id=${job.id}::uuid`);
+    await db.execute(sql`INSERT INTO progressive_worker_report_conflicts VALUES(${job.id}::uuid,1),(${job.id}::uuid,2)`);
+    expect(await wake()).toEqual(expected.retry_after);
+    await db.execute(sql`INSERT INTO progressive_worker_report_conflicts VALUES(${job.id}::uuid,3)`);
+    expect(await wake()).toBeNull();
+    await db.execute(sql`UPDATE result_attempts SET engine_job_id=${job.id}::text WHERE id=md5('competing-attempt')::uuid`);
+    expect(await wake()).toEqual(expected.retry_after);
+    await db.execute(sql`DELETE FROM progressive_worker_evidence_receipts WHERE sim_job_id=${job.id}::uuid AND sequence=4`);
+    expect(await wake()).toBeNull();
+  });
+});
+
+it.each(wakeSources)(
+  "keeps $scope via $reads ownership probes bounded with forty thousand retained reports",
+  async ({scope, reads}) => {
     await withWakeFixture(scope, async (connection) => {
       await connection.execute(sql`CREATE TEMP TABLE retained_wake_jobs ON COMMIT DROP AS
       SELECT md5('retained-wake-'||ordinal)::uuid id FROM generate_series(1,40000) ordinal`);
@@ -226,6 +262,7 @@ it.each(["staging", "delivery"] as const)(
       await connection.execute(
         sql`INSERT INTO progressive_worker_hub_receipts SELECT id,id::text FROM retained_wake_jobs`,
       );
+      if (reads === "keys") await useFixtureStagingKeys(connection);
       await connection.execute(sql`ANALYZE sim_jobs,sync_sweep_promises,progressive_worker_reports,progressive_worker_evidence_receipts,
       progressive_worker_evidence_attempts,progressive_worker_hub_receipts,progressive_worker_delivery_failures,
       progressive_worker_evidence_delivery_claims,progressive_worker_staging_failures,result_attempts,sync_api_settings`);
@@ -237,7 +274,7 @@ it.each(["staging", "delivery"] as const)(
       ).not.toBeNull();
       for (const ready of [true, false]) {
         const [measured] = await connection.execute(
-          sql`EXPLAIN (ANALYZE,BUFFERS,FORMAT JSON) ${progressiveEvidenceWakeSql(scope, ready)}`,
+          sql`EXPLAIN (ANALYZE,VERBOSE,BUFFERS,FORMAT JSON) ${progressiveEvidenceWakeSql(scope, ready)}`,
         );
         const result = (
           measured["QUERY PLAN"] as Array<Record<string, unknown>>
@@ -251,12 +288,16 @@ it.each(["staging", "delivery"] as const)(
             visit(child);
         };
         visit(result.Plan as Record<string, unknown>);
+        if (reads === "keys") {
+          // The independent 0217 closed-copy proof still joins its source PK.
+          // Neither staging lane may evaluate report JSON to discover candidates.
+          expect(nodes.some(n => n["Relation Name"] === "fixture_staging_keys")).toBe(true);
+          expect(JSON.stringify(nodes)).not.toContain("jsonb_typeof");
+        }
         const ownership = nodes.filter(
           (node) => node["Relation Name"] === "sim_jobs",
         );
-        expect(
-          ownership.every((node) => node["Node Type"] !== "Seq Scan"),
-        ).toBe(true);
+        expect(unexpectedWorkerJobScans(ownership, scope === "staging")).toEqual([]);
         const probes = ownership.reduce(
           (total, node) => total + Number(node["Actual Loops"]),
           0,
@@ -320,6 +361,7 @@ it("serves fresh active reports and FIFO backlog without changing eligibility", 
         CASE WHEN variant='eligible-expired' THEN id::text END AS stopped_engine_job_id,
         timestamptz '2026-01-01T00:00:00Z' + CASE WHEN variant='eligible-cancelled' THEN interval '0 seconds' ELSE interval '1 second' END AS created_at
       FROM fixture_jobs CROSS JOIN generate_series(1,2) sequence`);
+    await transaction.execute(fixtureStagingCandidateView);
     await transaction.execute(sql`CREATE TEMP TABLE progressive_worker_report_conflicts ON COMMIT DROP AS
       SELECT id AS sim_job_id,sequence FROM fixture_jobs CROSS JOIN generate_series(1,2) sequence WHERE false`);
     await transaction.execute(sql`CREATE UNIQUE INDEX fixture_report_conflicts_idx
@@ -345,7 +387,10 @@ it("serves fresh active reports and FIFO backlog without changing eligibility", 
     await transaction.execute(sql`CREATE INDEX fixture_report_job_order_idx ON progressive_worker_reports(sim_job_id,created_at,sequence)
       WHERE acknowledged_at IS NOT NULL AND jsonb_typeof(report->'result')='object'`);
     const [index] = await transaction.execute(
-      sql`SELECT indisvalid FROM pg_index WHERE indexrelid='public.progressive_worker_reports_staging_order_idx'::regclass`,
+      sql`SELECT indisvalid FROM pg_index WHERE indexrelid=CASE WHEN
+      (SELECT reads_enabled FROM public.progressive_worker_staging_key_backfill WHERE singleton)
+      THEN to_regclass('public.progressive_worker_staging_keys_order_idx')
+      ELSE to_regclass('public.progressive_worker_reports_staging_order_idx') END`,
     );
     expect(index.indisvalid).toBe(true);
     const select = (active: boolean) =>
@@ -402,7 +447,7 @@ it("serves fresh active reports and FIFO backlog without changing eligibility", 
     expect(backlogHead[0].sequence).toBe(1);
     for (const active of [true, false]) {
       const [measured] = await transaction.execute(
-        sql`EXPLAIN (ANALYZE,BUFFERS,FORMAT JSON) ${progressiveStagingSelectionSql(active)}`,
+        sql`EXPLAIN (ANALYZE,VERBOSE,BUFFERS,FORMAT JSON) ${progressiveStagingSelectionSql(active)}`,
       );
       const result = (
         measured["QUERY PLAN"] as Array<Record<string, unknown>>
@@ -424,12 +469,14 @@ it("serves fresh active reports and FIFO backlog without changing eligibility", 
         ),
       ).toBe(true);
       expect(
-        nodes.some(
-          (node) =>
-            node["Relation Name"] === "progressive_worker_reports" &&
-            node["Node Type"] === "Seq Scan",
-        ),
-      ).toBe(false);
+        nodes.filter((node) =>
+          node["Relation Name"] === "progressive_worker_reports" &&
+          node["Node Type"] === "Seq Scan" &&
+          // The independent 0217 covered-copy relation may inspect its own
+          // retained signature. This assertion owns the staging candidate scan.
+          !(node.Schema === "public" && /^target(?:_\d+)?$/.test(String(node.Alias)) && node["Actual Loops"] === 0 && node["Actual Rows"] === 0)
+        ).map(node => ({alias:node["Alias"],loops:node["Actual Loops"],rows:node["Actual Rows"],filter:node.Filter})),
+      ).toEqual([]);
       console.info(
         JSON.stringify({
           freshPriority: active,
@@ -438,6 +485,19 @@ it("serves fresh active reports and FIFO backlog without changing eligibility", 
         }),
       );
     }
+    await transaction.execute(sql`SAVEPOINT source_staging_layout`);
+    const beforeKeys = [await select(false),await select(true)];
+    await useFixtureStagingKeys(transaction);
+    for (const [i,active] of [false,true].entries()) {
+      expect(await select(active)).toEqual(beforeKeys[i]);
+      const [measured] = await transaction.execute(sql`EXPLAIN (ANALYZE,VERBOSE,BUFFERS,FORMAT JSON) ${progressiveStagingSelectionSql(active)}`);
+      const plan=JSON.stringify(measured["QUERY PLAN"]);
+      expect(plan).toMatch(/fixture_keys_(order|job|terminal)_idx/);
+      expect(plan).toContain('"Relation Name":"fixture_staging_keys"');
+      expect(plan).not.toContain("jsonb_typeof");
+    }
+    await transaction.execute(sql`ROLLBACK TO SAVEPOINT source_staging_layout`);
+    await transaction.execute(sql`RELEASE SAVEPOINT source_staging_layout`);
     await transaction.execute(sql`INSERT INTO progressive_worker_evidence_receipts(sim_job_id,sequence)
       VALUES(${fresh[0].sim_job_id},${fresh[0].sequence})`);
     expect(await select(true)).not.toEqual(fresh);
@@ -510,10 +570,11 @@ it("serves fresh active reports and FIFO backlog without changing eligibility", 
     );
     expect(await select(true)).toEqual([]);
     expect(await select(false)).toEqual([]);
+
   });
 }, 30_000);
 
-it("prioritizes active terminal reports and keeps invalid reports in the fallback queue", async () => {
+it.each(["source","keys"] as const)("prioritizes active terminal reports and keeps invalid reports in the fallback queue via %s", async (reads) => {
   await client.db.transaction(async (transaction) => {
     await transaction.execute(sql`CREATE TEMP TABLE fixture_jobs ON COMMIT DROP AS
       SELECT md5(variant)::uuid AS id,variant FROM unnest(ARRAY[
@@ -547,6 +608,7 @@ it("prioritizes active terminal reports and keeps invalid reports in the fallbac
           WHEN variant='active-terminal' THEN interval '3 seconds'
           ELSE interval '4 seconds' END AS created_at
       FROM fixture_jobs`);
+    await transaction.execute(fixtureStagingCandidateView);
     await transaction.execute(sql`CREATE TEMP TABLE progressive_worker_report_conflicts(
       sim_job_id uuid,sequence bigint,PRIMARY KEY(sim_job_id,sequence)) ON COMMIT DROP`);
     await transaction.execute(sql`CREATE TEMP TABLE progressive_worker_staging_failures(
@@ -569,6 +631,7 @@ it("prioritizes active terminal reports and keeps invalid reports in the fallbac
     await transaction.execute(sql`CREATE UNIQUE INDEX fixture_receipt_idx
       ON progressive_worker_evidence_receipts(sim_job_id,sequence)`);
 
+    if (reads === "keys") await useFixtureStagingKeys(transaction);
     const [activeTerminal] = await transaction.execute(
       sql`SELECT id FROM fixture_jobs WHERE variant='active-terminal'`,
     );
@@ -609,4 +672,20 @@ it("prioritizes active terminal reports and keeps invalid reports in the fallbac
       expect(selectedFallback.sim_job_id).not.toBe(invalidTerminal.id);
     }
   });
+});
+
+
+it("keeps the ownership scan guard for executed or foreign sequential scans", () => {
+  const viewNode = {
+    "Node Type": "Seq Scan", "Relation Name": "sim_jobs", Schema: "public", Alias: "j_2",
+    Filter: `((j_2."ingestedAt" IS NOT NULL) AND (j_2.status = ANY ('{done,failed,cancelled}'::sim_job_status[])) AND (j_2.engine_job_id = (j_2.id)::text))`,
+    Output: ["j_2.id"], "Actual Loops": 0, "Actual Rows": 0, "Rows Removed by Filter": 0,
+  };
+  expect(unexpectedWorkerJobScans([viewNode], true)).toEqual([]);
+  expect(unexpectedWorkerJobScans([viewNode], false)).toHaveLength(1);
+  for (const changed of [
+    { "Actual Loops": 1 }, { "Actual Rows": 1 }, { "Rows Removed by Filter": 1 },
+    { Schema: "pg_temp" }, { Alias: "job" }, { Output: ["j_2.request_payload"] },
+    { Filter: "j_2.id IS NOT NULL" }, { "Actual Loops": undefined },
+  ]) expect(unexpectedWorkerJobScans([{ ...viewNode, ...changed }], true)).toHaveLength(1);
 });

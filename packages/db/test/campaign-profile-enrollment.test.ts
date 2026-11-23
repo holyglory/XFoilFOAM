@@ -112,6 +112,7 @@ import {
 } from "../../../apps/sweeper/src/progressive-remote-progress";
 import { storeProgressiveRemoteReport } from "../src/progressive-remote-reports";
 import { settleProgressiveRemoteJob } from "../../../apps/sweeper/src/progressive-remote-settlement";
+import { verifyRepeatedProgress } from "./progressive-repeated-progress-fixture";
 import { verifyProgressiveWorkerReportDelivery } from "./progressive-worker-report-fixture";
 import { verifyProgressiveAcceptedArchiveReplay } from "./progressive-accepted-archive-fixture";
 import { verifyProgressiveRemoteReportInventory } from "./progressive-remote-inventory-fixture";
@@ -5740,6 +5741,10 @@ describe("progressive CPU admission", () => {
             VALUES (${promiseId}::uuid,${job.airfoilId}::uuid,${job.simulationPresetRevisionId}::uuid,${lease.alpha})`);
         const { envelope } = await bindProgressiveRemoteDispatch(db, { simJobId: job.id, solverId, promiseId });
         const { verifyStoppedFailedProgressiveDelivery, verifyPriorRawStoppedProgressiveSettlement } = await import("./progressive-stopped-failed-delivery-fixture");
+        if (!priorRaw) {
+          const { verifyHistoricalRawArchive } = await import("../../../apps/api/test/historical-raw-archive-fixture");
+          await verifyHistoricalRawArchive(db, envelope);
+        }
         await (priorRaw ? verifyPriorRawStoppedProgressiveSettlement : verifyStoppedFailedProgressiveDelivery)(db, envelope);
       } finally {
         await db.update(sweeperState).set({ enabled: admission.enabled }).where(eq(sweeperState.id, 1));
@@ -6025,6 +6030,7 @@ describe("progressive CPU admission", () => {
             },
           },
         };
+        await verifyRepeatedProgress(db, bound.envelope, running, client.sql);
         await verifyProgressiveAcceptedArchiveReplay(
           db,
           bound.envelope,
@@ -6458,9 +6464,19 @@ describe("progressive CPU admission", () => {
         const [targets] =
           await db.execute(sql`SELECT count(*)::integer AS count FROM progressive_work
           WHERE generation_id = ${generationId}::uuid AND stage = 2 AND state = 'pending'`);
-        expect(await prepareProgressiveRemoteFleet(db)).toMatchObject({
-          prepared: targets.count,
-          errors: [],
+        async function observeFleet() {
+          const execute = vi.spyOn(db, "execute");
+          try {
+            const receipt = await prepareProgressiveRemoteFleet(db);
+            const pressureReads = execute.mock.calls.filter(([statement]) =>
+              (typeof statement === "string" ? statement : new PgDialect().sqlToQuery(statement.getSQL()).sql)
+                .includes("AS throttled")).length;
+            return { receipt, pressureReads };
+          } finally { execute.mockRestore(); }
+        }
+        expect(await observeFleet()).toMatchObject({
+          pressureReads: 1,
+          receipt: { prepared: targets.count, errors: [] },
         });
         const dispatches = await db.execute(
           sql`SELECT envelope FROM progressive_remote_dispatches WHERE solver_id = ${solverId}::uuid`,
@@ -6504,6 +6520,32 @@ describe("progressive CPU admission", () => {
         expect(await progressiveRemoteActivePromiseCount(db, solverId)).toBe(
           Number(targets.count),
         );
+        // The ordinary dispatches above hold this worker's entire configured
+        // budget. A saturated fleet must not walk historical report receipts.
+        await db.execute(sql`UPDATE registered_remote_solvers SET cpu_budget=${Number(targets.count)}
+          WHERE id=${solverId}::uuid`);
+        expect(await observeFleet()).toMatchObject({
+          pressureReads: 0,
+          receipt: { prepared: 0, waitingReasons: [{ solverId, reason: "The worker has no unreserved CPU slots" }] },
+        });
+        const availableSolver = randomUUID();
+        await db.execute(sql`INSERT INTO registered_remote_solvers
+            (id,instance_id,instance_name,cpu_capacity,cpu_budget,max_active_polar_promises,
+             auth_token_hash,credential_version,last_heartbeat_at,metadata)
+          SELECT ${availableSolver}::uuid,${`${PREFIX}-${availableSolver}`},instance_name,1,1,1,
+            ${"b".repeat(64)},1,clock_timestamp(),metadata
+          FROM registered_remote_solvers WHERE id=${solverId}::uuid`);
+        try {
+          // The full worker cannot suppress the global gate for its free peer.
+          const mixed = await observeFleet();
+          expect(mixed.pressureReads).toBe(1);
+          expect(mixed.receipt).toMatchObject({ prepared: 0, errors: [] });
+          expect(mixed.receipt.waitingReasons.map((row) => row.solverId).sort())
+            .toEqual([solverId, availableSolver].sort());
+        } finally {
+          await db.execute(sql`DELETE FROM registered_remote_solvers WHERE id=${availableSolver}::uuid`);
+        }
+        await db.execute(sql`UPDATE registered_remote_solvers SET cpu_budget=96 WHERE id=${solverId}::uuid`);
         await verifyProgressiveRemoteStart(db, prepared.envelope);
         await db.execute(
           sql`UPDATE registered_remote_solvers SET last_heartbeat_at = clock_timestamp() - interval '3 minutes' WHERE id = ${solverId}::uuid`,

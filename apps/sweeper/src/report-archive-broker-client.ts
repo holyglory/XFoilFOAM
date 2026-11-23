@@ -85,7 +85,7 @@ function assertArchive(
     );
 }
 
-async function owner(db: DB, executionId: string) {
+export async function registeredWorkerArchiveOwner(db: DB, executionId: string) {
   const [owned] = await db.execute(sql`
     SELECT settings.remote_solver_registered_id AS solver_id,
       settings.remote_solver_auth_token AS auth_token, settings.upstream_base_url,
@@ -129,7 +129,7 @@ function archiveUrl(baseUrl: string, executionId: string, sha256: string) {
   return `${baseUrl}/progressive-executions/${executionId}/report-archives/${sha256}`;
 }
 
-async function receiptJson(response: Response): Promise<unknown> {
+export async function readArchiveBrokerResponse(response: Response): Promise<unknown> {
   if (!response.body)
     throw new Error("Worker report archive receipt is missing");
   const chunks: Buffer[] = [];
@@ -153,7 +153,7 @@ export async function putWorkerReportBundle(
   executionId: string,
 ): Promise<ProgressiveReportArchiveIdentity> {
   assertLocalIdentity(executionId, identity);
-  const owned = await owner(db, executionId);
+  const owned = await registeredWorkerArchiveOwner(db, executionId);
   const file = await open(path, "r");
   let body: Readable | undefined;
   try {
@@ -205,7 +205,7 @@ export async function putWorkerReportBundle(
         `Worker report archive upload failed (${response.status})`,
       );
     }
-    const value = (await receiptJson(response)) as Record<string, unknown>;
+    const value = (await readArchiveBrokerResponse(response)) as Record<string, unknown>;
     if (
       !value ||
       typeof value !== "object" ||
@@ -294,7 +294,7 @@ export async function readWorkerReportArchiveText(
   )
     throw new Error("Invalid exact worker report archive member");
   const archive = identity;
-  const owned = await owner(db, identity.executionId);
+  const owned = await registeredWorkerArchiveOwner(db, identity.executionId);
   let stream = options.upstreamOnly
     ? null
     : await readWorkerReportVolume(identity);
@@ -318,7 +318,7 @@ export async function readWorkerReportArchiveText(
       },
     );
     if (response.status === 403) {
-      const body = (await receiptJson(response)) as { error?: unknown };
+      const body = (await readArchiveBrokerResponse(response)) as { error?: unknown };
       if (body?.error === "fetch disabled for evidence_artifacts")
         throw new WorkerReportFetchDisabled();
       throw new Error("The registered worker has no access to this archive");

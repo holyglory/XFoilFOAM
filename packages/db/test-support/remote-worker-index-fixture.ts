@@ -1,3 +1,5 @@
+import { unexpectedWorkerJobScans } from "./worker-ownership-plan";
+import { fixtureStagingCandidateView } from "./staging-candidate-view";
 import { readFileSync } from "node:fs";
 import { sql, type SQL } from "drizzle-orm";
 import { expect } from "vitest";
@@ -52,6 +54,7 @@ export async function verifyRemoteWorkerIdentityIndex(
       sim_job_id uuid,sequence bigint,acknowledged_at timestamptz,report jsonb,stopped_engine_job_id text,
       created_at timestamptz,PRIMARY KEY(sim_job_id,sequence)
     ) ON COMMIT DROP`);
+    if (acknowledged) await transaction.execute(fixtureStagingCandidateView);
     await transaction.execute(sql`INSERT INTO progressive_worker_reports
       SELECT id,1,CASE WHEN ${acknowledged} THEN clock_timestamp() END,
         jsonb_build_object('solverId',md5('worker-index-solver')::uuid,'result','{}'::jsonb),id::text,
@@ -73,7 +76,7 @@ export async function verifyRemoteWorkerIdentityIndex(
     await transaction.execute(sql`SET LOCAL statement_timeout='20s'`);
     const explain = async (query: SQL) => {
       const [row] = await transaction.execute(
-        sql`EXPLAIN (ANALYZE,BUFFERS,FORMAT JSON) ${query}`,
+        sql`EXPLAIN (ANALYZE,VERBOSE,BUFFERS,FORMAT JSON) ${query}`,
       );
       const plan = (row["QUERY PLAN"] as Array<Record<string, unknown>>)[0];
       const nodes: Array<Record<string, unknown>> = [];
@@ -112,9 +115,7 @@ export async function verifyRemoteWorkerIdentityIndex(
     for (const [position, selector] of selectors.entries()) {
       expect(await transaction.execute(selector.query(0))).toEqual([]);
       const after = await explain(selector.query(0));
-      expect(after.jobs.some((node) => node["Node Type"] === "Seq Scan")).toBe(
-        false,
-      );
+      expect(unexpectedWorkerJobScans(after.jobs, acknowledged)).toEqual([]);
       expect(
         after.nodes.some(
           (node) =>

@@ -175,7 +175,8 @@ export async function readProgressiveReport(
     typeof stored.bucket !== "string" || !stored.bucket || typeof stored.object_key !== "string" || !stored.object_key ||
     !/^[1-9][0-9]{0,19}$/.test(String(stored.generation)) || stored.mime_type !== "application/gzip" ||
     stored.compression !== "gzip" ||
-    (stored.archive_format !== "jsonl" && !(stored.archive_format === "legacy-jsonl" && reference.sourceKind === "worker")) ||
+    (stored.archive_format !== "jsonl" && !(stored.archive_format === "legacy-jsonl" && reference.sourceKind === "worker")
+      && !(stored.archive_format === "shared-result-v1" && reference.sourceKind === "remote")) ||
     !SHA256.test(String(stored.stored_sha256)) || !Number.isSafeInteger(storedByteSize) || storedByteSize < 1 ||
     !/^[A-Za-z0-9+/]{6}==$/.test(String(stored.crc32c)) ||
     !Number.isSafeInteger(Number(stored.member_count)) || Number(stored.member_count) < 1 ||
@@ -248,7 +249,7 @@ export async function readProgressiveReport(
         report.assignmentSignature !== preparedOwner.assignmentSignature))
         throw new Error("Verified report belongs to another dispatch");
       if (identity.sourceKind === "remote")
-        archivedMembers.set(report, Object.freeze({ bundleId: String(stored.archive_bundle_id), identity }));
+        archivedMembers.set(report, Object.freeze({ bundleId: String(stored.archive_bundle_id), identity: Object.freeze(storedIdentity) }));
       if (scoped) freezeProgressiveReport(report);
       return report;
     } finally {

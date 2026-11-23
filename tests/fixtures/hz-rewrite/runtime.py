@@ -40,6 +40,47 @@ def install(host):
         ]
 
     def command(argv, **kwargs):
+        if argv[:2] == ["docker", "exec"] and "hz_auxiliary_files" in argv:
+            # Use the actual run-owned PG container for filesystem block
+            # accounting. Only Compose/service lifecycle is substituted.
+            run = os.environ["DEVCOORDINATOR_RUN_ID"]
+            candidates = subprocess.check_output(
+                [
+                    "/usr/bin/docker",
+                    "ps",
+                    "--filter",
+                    "label=devcoordinator2.run=" + run,
+                    "--format",
+                    "{{.ID}}",
+                ],
+                text=True,
+            ).split()
+            matches = []
+            for cid in candidates:
+                ports = json.loads(
+                    subprocess.check_output(
+                        [
+                            "/usr/bin/docker",
+                            "inspect",
+                            "--format",
+                            "{{json .NetworkSettings.Ports}}",
+                            cid,
+                        ],
+                        text=True,
+                    )
+                )
+                if any(
+                    v.get("HostPort") == os.environ["PGPORT"]
+                    for v in (ports.get("5432/tcp") or [])
+                ):
+                    matches.append(cid)
+            if len(matches) != 1:
+                raise ValueError(
+                    "Expected one disposable PG fixture with the published test port"
+                )
+            return actual_command(
+                ["/usr/bin/docker", "exec", matches[0], *argv[3:]], **kwargs
+            )
         if argv[:2] == ["docker", "exec"] and "pg_controldata" in argv[-1]:
             return "1996"
         if argv[:2] == ["docker", "ps"]:

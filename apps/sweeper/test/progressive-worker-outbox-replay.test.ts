@@ -32,6 +32,7 @@ import { afterAll, afterEach, beforeEach, expect, it, vi } from "vitest";
 import { progressiveDeliverySelectionSql } from "../src/progressive-delivery-selection";
 import { installProgressiveReportArchiveReader } from "@aerodb/db/progressive-report-reader";
 import { archiveReportFixture } from "../../../packages/db/test-support/progressive-report-archive-fixture";
+import { fixtureStagingCandidateView } from "../../../packages/db/test-support/staging-candidate-view";
 import { progressiveStoppedStorageEligible } from "../src/progressive-stopped-storage";
 import { reconcileProgressiveRemoteWorker } from "../src/progressive-remote-reconciliation";
 import { deliverNextProgressiveWorkerEvidence } from "../src/progressive-worker-evidence-delivery";
@@ -122,6 +123,7 @@ async function withFixture(
       assignment_signature text GENERATED ALWAYS AS (report->>'assignmentSignature') STORED,
       stopped_engine_job_id text GENERATED ALWAYS AS (report#>>'{stopProof,job_id}') STORED,
       PRIMARY KEY(sim_job_id,sequence)) ON COMMIT DROP`);
+    await connection.execute(fixtureStagingCandidateView);
     await connection.execute(sql`CREATE TEMP TABLE progressive_worker_report_conflicts (
       sim_job_id uuid, sequence bigint, PRIMARY KEY(sim_job_id,sequence)) ON COMMIT DROP`);
     await connection.execute(sql`CREATE TEMP TABLE progressive_worker_evidence_receipts (
@@ -1060,6 +1062,10 @@ it("does not fall back to a cancelled scope when an exact failed source does not
         ).toBe(false);
       }
       expect(await snapshot(connection)).toEqual(before);
+      await connection.execute(sql`UPDATE pg_temp.progressive_worker_reports SET acknowledged_at=NULL
+        WHERE sim_job_id=${input.executionId}::uuid`);
+      expect(await progressiveStoppedStorageEligible(connection, input.executionId)).toBe(false);
+      expect(await progressiveStoppedStorageEligible(connection, input.executionId, point)).toBe(false);
     },
     { failedPoints: true },
   );

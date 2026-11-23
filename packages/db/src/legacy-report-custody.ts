@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, type Hash } from "node:crypto";
 import { sql } from "drizzle-orm";
 import type { DB } from "./client";
 import { LEGACY_HASH, LEGACY_UUID, legacyBound, type LegacyReportMember } from "./legacy-report-storage";
@@ -145,7 +145,7 @@ interface ScientificResultGroup {
 
 interface VerifiedScientificResult {
   group: ScientificResultGroup;
-  canonical?: string;
+  signedPrefix?: { text: string; hash: Hash };
 }
 
 function postgresEnvelope(fields: Map<string, string>, result: string): string {
@@ -158,26 +158,39 @@ function appendScientificReport(group: ScientificResultGroup, member: LegacyRepo
     envelopeText: postgresEnvelope(fields, "null") });
 }
 
-/** A 0198 row already carries the small envelope and an index into the result
- * payload table. Treat the index only as a hint. Replacing its result must
- * reconstruct the complete, independently authenticated PG text byte for byte. */
-function reuseScientificResult(member: LegacyReportMember, storedReport: string, prior: VerifiedScientificResult): boolean {
-  const fields = new Map<string, string>();
-  const envelope = reportJsonObject(parseReportJson(storedReport, fields));
-  if (!fields.has("result") || postgresEnvelope(fields, prior.group.resultText) !== member.reportText)
-    return false;
-
-  // Use the production canonical serializer for every varying envelope. An
-  // additional nested "result":null slot takes the ordinary full verifier.
+/** Split only an unambiguous top-level canonical result slot. All varying
+ * envelope tokens still use the production lossless canonical serializer. */
+function resultSlot(envelope: ReturnType<typeof reportJsonObject>) {
   const canonical = canonicalReportJson({ ...envelope, result: null });
   const slot = '"result":null';
   const at = canonical.indexOf(slot);
-  if (at < 0 || at !== canonical.lastIndexOf(slot)) return false;
-  const valueAt = at + slot.length - "null".length;
-  prior.canonical ??= canonicalReportJson(parseReportJson(prior.group.resultText));
-  const signature = createHash("sha256").update(canonical.slice(0, valueAt))
-    .update(prior.canonical).update(canonical.slice(valueAt + "null".length)).digest("hex");
-  if (signature !== member.contentSignature)
+  if (at < 0 || at !== canonical.lastIndexOf(slot)) return undefined;
+  return { prefix: canonical.slice(0, at + slot.length - 4), suffix: canonical.slice(at + slot.length) };
+}
+
+function matchesOriginalReport(fields: ReadonlyMap<string, string>, result: string, text: string) {
+  if (!text.startsWith("{") || !fields.has("result")) return false;
+  let offset = 1;
+  for (const [key, value] of fields) {
+    const name = (offset === 1 ? "" : ", ") + JSON.stringify(key) + ": ";
+    const original = key === "result" ? result : value;
+    if (!text.startsWith(name, offset) || !text.startsWith(original, offset + name.length)) return false;
+    offset += name.length + original.length;
+  }
+  return offset === text.length - 1 && text[offset] === "}";
+}
+
+/** A 0198 hash is only a lookup hint. First match the entire original PG
+ * report using the verified result text. Then copy the SHA-256 state only
+ * if the bytes through the canonical result are identical to the prior row. */
+function reuseScientificResult(member: LegacyReportMember, storedReport: string, prior: VerifiedScientificResult): boolean {
+  if (!prior.signedPrefix) return false;
+  const fields = new Map<string, string>();
+  const envelope = reportJsonObject(parseReportJson(storedReport, fields));
+  if (!matchesOriginalReport(fields, prior.group.resultText, member.reportText)) return false;
+  const slot = resultSlot(envelope);
+  if (!slot || slot.prefix !== prior.signedPrefix.text) return false;
+  if (prior.signedPrefix.hash.copy().update(slot.suffix).digest("hex") !== member.contentSignature)
     throw new Error("Legacy report canonical signature differs from its stored identity");
   appendScientificReport(prior.group, member, fields);
   return true;
@@ -194,9 +207,19 @@ function collectScientificSource(member: LegacyReportMember, groups: Map<string,
 
   const fields = new Map<string, string>();
   const report = parseReportJson(member.reportText, fields);
-  if (createHash("sha256").update(canonicalReportJson(report)).digest("hex") !== member.contentSignature)
-    throw new Error("Legacy report canonical signature differs from its stored identity");
   const resultText = fields.get("result");
+  const slot = resultText?.startsWith("{") ? resultSlot(reportJsonObject(report)) : undefined;
+  let signedPrefix: VerifiedScientificResult["signedPrefix"];
+  let signature: string;
+  if (slot) {
+    const hash = createHash("sha256").update(slot.prefix).update(canonicalReportJson(reportJsonObject(report).result!));
+    signature = hash.copy().update(slot.suffix).digest("hex");
+    signedPrefix = { text: slot.prefix, hash };
+  } else {
+    signature = createHash("sha256").update(canonicalReportJson(report)).digest("hex");
+  }
+  if (signature !== member.contentSignature)
+    throw new Error("Legacy report canonical signature differs from its stored identity");
   if (!resultText?.startsWith("{")) return;
   const { sha256, byteSize } = reportTextIdentity(resultText);
   const key = `${member.executionId}:${sha256}:${byteSize}`;
@@ -215,7 +238,7 @@ function collectScientificSource(member: LegacyReportMember, groups: Map<string,
     throw new Error("Scientific result digest collision");
   }
   appendScientificReport(group, member, fields);
-  return previous?.group === group ? previous : {group};
+  return { group, signedPrefix };
 }
 
 interface BoundPage {

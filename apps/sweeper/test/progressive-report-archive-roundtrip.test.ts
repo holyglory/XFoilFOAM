@@ -19,6 +19,52 @@ import {
   writeProgressiveReportBundle,
 } from "../src/progressive-report-archive-store";
 
+it("restores exact PG results across shared pages including unknown, wide and null values", async () => {
+  const { memoryReportObjects } = await import("./shared-report-object-fixture");
+  const { readSharedReport, writeSharedReportPage, SHARED_REPORT_FORMAT } = await import("../src/shared-report-archive");
+  const { splitProgressiveReportText, reportJsonObject } = await import("@aerodb/db/progressive-report-archive");
+  const { retainedReportInventory } = await import("@aerodb/db/retained-solver-reports");
+  const { files, store } = memoryReportObjects();
+  const owner = { executionId:randomUUID(), promiseId:randomUUID(), solverId:randomUUID(), assignmentSignature:"4".repeat(64) };
+  const rawResult = '{"job_id":'+JSON.stringify(owner.executionId)+',"polars":[], "unknown":9007199254740993123456789, "decimal":1.2300, "nested":{"result":"終😀"}}';
+  const full = (seq:number, r:string) => '{"unknown":{"result":{"earlier":true}}, "sequence":'+seq+', "result":'+r+
+    ', "status":{"extra":"\\\"result\\\":null β"}, "stopProof":null, "promiseId":"'+owner.promiseId+'", "solverId":"'+owner.solverId+
+    '", "executionId":"'+owner.executionId+'", "assignmentSignature":"'+owner.assignmentSignature+'"}';
+  const source = (text:string,seq:number) => {
+    const cut=splitProgressiveReportText(text),sig=reportTextIdentity(canonicalReportJson(cut.report)).sha256;
+    const inv=retainedReportInventory(cut.report,sig),p=reportTextIdentity(text);
+    return {sequence:seq,signature:sig,reportSha256:p.sha256,reportByteSize:p.byteSize,prefix:cut.prefix,suffix:cut.suffix,
+      resultHash:cut.result?reportTextIdentity(cut.result).sha256:null,
+      resultSize:cut.result?Buffer.byteLength(cut.result):undefined,loadResult:async()=>cut.result!,
+      sourceCount:inv.sourceCount,inventorySignature:inv.signature,sourceListSha256:reportTextIdentity(canonicalReportJson(inv.sources)).sha256};
+  };
+  const raws=[full(1,rawResult),full(2,rawResult),full(3,rawResult.replace("1.2300","1.23")),full(4,"null")];
+  const members=raws.map((s,i)=>source(s,i+1));
+  const copies=[];
+  for(const m of members) copies.push(await writeSharedReportPage(store,owner,[m]));
+  expect([...files.keys()].filter(k=>k.includes("/results/"))).toHaveLength(2);
+  expect(copies[1].resultBytesSubmitted).toBe(0);
+  expect(copies[0].manifest.results).toEqual(copies[1].manifest.results);
+  for(const [i,copy] of copies.entries()){
+    const m=members[i],p=copy.pin;
+    const ref={bucket:store.bucket,objectKey:p.key,generation:p.generation,crc32c:p.crc32c,storedSha256:p.sha256,storedByteSize:p.size,
+      mimeType:"application/gzip",compression:"gzip",archiveFormat:SHARED_REPORT_FORMAT,sourceKind:"remote" as const,memberKind:"report" as const,
+      executionId:owner.executionId,sequence:m.sequence,signature:m.signature,reportSha256:m.reportSha256,reportByteSize:m.reportByteSize};
+    expect(await readSharedReport(store,ref)).toBe(raws[i]);
+    if(i===0)await expect(readSharedReport({...store,read:()=>new Promise<Buffer>(()=>{})},ref,AbortSignal.timeout(10))).rejects.toThrow();
+
+    await expect(readSharedReport(store,{...ref,executionId:randomUUID()})).rejects.toThrow();
+  }
+  const replay=await writeSharedReportPage(store,owner,[members[0]]);
+  expect(replay.pin).toEqual(copies[0].pin);
+  const hash=members[0].resultHash!;
+  const result=copies[0].manifest.results[hash].pin;
+  const bytes=files.get(result.key)!;
+  files.set(result.key,{...bytes,bytes:Buffer.from("corrupt shared result")});
+  await expect(writeSharedReportPage(store,owner,[members[1]])).rejects.toThrow();
+  expect(reportJsonObject(parseReportJson(raws[0])).unknown).toBeDefined();
+});
+
 const temporaryDirectories: string[] = [];
 afterEach(async () => {
   await Promise.all(

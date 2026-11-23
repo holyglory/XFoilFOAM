@@ -120,6 +120,95 @@ When HZ's evidence-download permission is disabled, record
 copy. Omitting `--worker-sweeper-container` selects 0198 sharing and leaves the
 full data accessible inside PostgreSQL.
 
+## Bounded migration of two separate executions
+
+The default migration uses one custody worker. To qualify two workers, use the
+existing bulk service, its frozen scope and its current progress directory.
+Change the normal invocation for a finite pass at a durable page boundary.
+The following invocation admits at most four page operations. Execute it
+through the sole service that owns the directory lock.
+
+```bash
+legacy_reports migrate "${legacy_targets[@]}" \
+  --scope="$LEGACY_REPORT_SCOPE" --directory="$LEGACY_REPORT_PROGRESS" \
+  --worker-sweeper-container="$HZ_SWEEPER_CONTAINER" --registered-get=denied \
+  --execution-slots=2 --rows=128 --pages=4 --max-bytes=268435456 \
+  --slot-min-available-mib=8192 --slot-max-rss-mib=4096 \
+  --until-complete --max-passes=1 --readers-ready --apply
+```
+
+One controller owns `copy.lock` and advances `checkpoint.json`. A pair
+uses the current execution and one later execution. It inspects at most 16
+frozen counts and chooses the nearest job that can cover as much of the
+remaining front workload as possible. Intervening jobs stay on the ordered
+front slot.
+Reports and conflicts from each execution stay in order. Each page still
+requires an immutable hub upload, exact generation readback, local volume
+verification and the same guarded custody transaction or 0198 fallback.
+A short peer can finish first. Its applied receipts wait for the preceding
+execution's contiguous prefix. The next execution is admitted after that
+pair joins. The per-pass page budget counts both slots and promotion of a
+previously completed peer page. Per-pass worker and receipt counts can differ.
+
+At most two pages of up to 128 MiB each may run together. Each fresh
+single-worker head can use the full configured 256 MiB budget. Recovery uses the budget recorded with each pending page,
+including after a switch between 128 and 256 MiB. The supervisor samples
+controller and worker host/cgroup headroom and RSS every half second during a
+paired wave. Defaults require 8,192 MiB available on each host and limit the
+controller process RSS and combined custody-worker RSS separately to 4,096 MiB.
+The initial sample includes all current custody workers in the selected cgroup.
+Their aggregate RSS plus the measured reservation for a new pair must fit the
+RSS limit. The initial pair reservation defaults to 3,072 MiB and can be set
+with `--slot-pair-reserve-mib`. Low initial headroom selects one worker.
+Unavailable capacity measurements are reported as `capacity_unavailable`.
+The ordinary head still verifies its exact source, cloud generation and
+working-volume receipt. Authentication and host-key failures retain their
+existing error categories. A measured breach during a paired wave allows the
+in-flight transactions to finish and writes `execution-peer-memory-hold.json`.
+Subsequent waves use one worker. After reviewing the host and receipt evidence,
+the operator can clear that hold at a service boundary. These are sampled
+admission limits. The operating system's cgroup limits govern allocations.
+
+For a production trial, compare windows of the same ordinary 256 MiB command
+with the candidate. The packaged `legacy_report_host_capacity.py` evaluator
+accepts host and cgroup-v2 counter samples from a read-only operator observer.
+It reports host free and available memory separately. For PostgreSQL it reports
+anonymous memory, file-backed memory, shared memory and the inactive file
+cache. It credits at most the lesser of inactive file pages and non-shared
+file pages when estimating the working set. Actual cgroup high/max margins,
+memory events, pressure, throttling, signed progress and solver CPU relative
+to the ordinary window still bound admission. A cache-heavy PostgreSQL can
+therefore coexist with a second worker while measured resource margins hold.
+
+
+During a pair, `pending.jsonl.gz` is a directory with a transfer file per
+active slot, exact archive receipts, and a short publication record. The
+supervisor removes transfer bytes after durable application evidence. It
+reopens uncertain generations and checks the application proof before linking
+the ordinary receipt files into the existing inventory. The checkpoint moves
+only after those links are durable. An interruption can leave an already
+committed generation awaiting an idempotent replay. Failed proof or a missing
+receipt holds the gap with its evidence on disk.
+
+To return to one worker, use this release with `--execution-slots=1` and the
+same targets, scope, and progress directory. It accepts a 256 MiB page budget,
+finishes any uncertain work and joins its recorded peer receipts. During this
+drain the public checkpoint can still be several pages behind an applied peer.
+Older executables see the reserved pending directory and stop safely. They
+can resume the ordinary version-1 checkpoint once the directory has been
+joined and removed. A scalar pending file from an older run is always recovered
+first using its original bytes.
+
+For canary acceptance, compare the public checkpoint and its last receipt
+before and after. Check the separate execution IDs, actual peak worker count,
+peer receipt and generation, every normal member read, remaining warm counts
+and the continuous signed publication and heartbeat frontiers. Compare the
+observed headroom, worker/PG/controller memory and page time with recent
+one-worker pages on the same sources. An early peer success should leave the
+public cursor on the earlier execution. Resume with one worker and confirm the
+old receipt chain covers the joined prefix and each original member exactly.
+Keep the one-worker operating setting until these live observations pass.
+
 ## Adopt existing copy-only progress
 
 Use `migrate --adopt-copy` with the same frozen scope, targets, and progress

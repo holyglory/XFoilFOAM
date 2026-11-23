@@ -13,6 +13,7 @@ from pathlib import Path
 import re
 import shlex
 import signal
+import stat
 import subprocess
 import time
 import uuid
@@ -78,7 +79,7 @@ def ctl(*args):
         ["systemctl", "--user", *args],
         text=True,
         capture_output=True,
-        timeout=20,
+        timeout=90 if args[0] == "stop" else 20,
         env=env,
     )
     if p.returncode:
@@ -169,6 +170,185 @@ def same_unit(prior, current, *, paused):
     )
 
 
+# These standard archival controllers run remote commands under the shared
+# deploy flock. Freezing their local SSH clients can strand that remote lock.
+SHARED_LOCK_SERVICES = (
+    "airfoils-historical-report-sharing-*.service",
+    "airfoils-hz-attempt-history-watch.service",
+    "airfoils-hz-attempt-original-backup.service",
+    "airfoils-hz-point-history-watch.service",
+    "airfoils-report-migration-*.service",
+    "airfoils-report-0209-*.service",
+)
+
+
+def checkpoint_specs(path):
+    if path is None:
+        return {}
+    values = json.loads(path.read_text())
+    if not isinstance(values, dict):
+        raise ValueError("Expected a JSON map of service names and checkpoint paths")
+    result = {}
+    for name, spec in values.items():
+        if not re.fullmatch(r"[a-zA-Z0-9_.@:-]+\.service", name):
+            raise ValueError("Invalid checkpoint service name")
+        if isinstance(spec, str):
+            spec = {"checkpoint": spec}
+        if (
+            not isinstance(spec, dict)
+            or set(spec) - {"checkpoint", "receipt"}
+            or "checkpoint" not in spec
+        ):
+            raise ValueError(f"Invalid checkpoint and receipt for {name}")
+        paths = [spec["checkpoint"], spec.get("receipt", spec["checkpoint"])]
+        if not all(isinstance(p, str) and Path(p).is_absolute() for p in paths):
+            raise ValueError(
+                f"Expected absolute checkpoint and receipt paths for {name}"
+            )
+        result[name] = {"checkpoint": paths[0], "receipt": paths[1]}
+    return result
+
+
+def file_witness(path):
+    path = Path(path)
+    for _ in range(2):
+        with path.open("rb") as stream:
+            before = os.fstat(stream.fileno())
+            if not stat.S_ISREG(before.st_mode):
+                raise ValueError(f"Checkpoint is not a regular file: {path}")
+            sha = hashlib.sha256()
+            while chunk := stream.read(1024 * 1024):
+                sha.update(chunk)
+        after = path.stat()
+        if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) == (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+        ):
+            return {
+                "sha256": sha.hexdigest(),
+                "size": after.st_size,
+                "mtimeNs": after.st_mtime_ns,
+                "device": after.st_dev,
+                "inode": after.st_ino,
+            }
+    raise ValueError(f"Checkpoint changed during its read: {path}")
+
+
+def durable_checkpoint(owner):
+    path = Path(owner["checkpoint"])
+    witness = {"main": file_witness(path)}
+    # A clean stop may checkpoint a SQLite WAL into its main file. Capture
+    # both surviving data files before resumption; the shm file is ephemeral.
+    wal = Path(str(path) + "-wal")
+    if wal.exists():
+        witness["wal"] = file_witness(wal)
+    return witness
+
+
+def definition_digest(name):
+    return hashlib.sha256(ctl("cat", name).encode()).hexdigest()
+
+
+def plan_checkpoints(specs, units):
+    owners, reasons = {}, []
+    for name, row in units.items():
+        if (
+            row.get("ActiveState") != "active"
+            or row.get("FreezerState") == "frozen"
+            or row.get("captureRefusal")
+        ):
+            continue
+        if name not in specs:
+            if any(
+                fnmatch.fnmatchcase(name, pattern) for pattern in SHARED_LOCK_SERVICES
+            ):
+                reasons.append(
+                    f"Specify the restart checkpoint for active SSH archive service {name} in --checkpointed-units"
+                )
+            continue
+        try:
+            if (
+                not Path(row["FragmentPath"]).is_file()
+                or row["UnitFileState"] == "transient"
+                or row["SubState"] != "running"
+            ):
+                raise ValueError("service has no restartable persistent definition")
+            owner = dict(specs[name], definitionSha256=definition_digest(name))
+            owner["initial"] = durable_checkpoint(owner)
+            owner["initialReceipt"] = file_witness(owner["receipt"])
+            owners[name] = owner
+        except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired) as exc:
+            reasons.append(f"Cannot capture checkpointed archive service {name}: {exc}")
+    return owners, reasons
+
+
+def checkpoint_unit_matches(prior, current, owner, paused):
+    if not owner or not owner.get("stopIntent"):
+        return same_unit(prior, current, paused=paused)
+    if (
+        not current
+        or current.get("captureRefusal")
+        or any(prior[k] != current.get(k) for k in ("FragmentPath", "UnitFileState"))
+    ):
+        return False
+    if paused:
+        group_events = (
+            Path("/sys/fs/cgroup") / prior["ControlGroup"].lstrip("/") / "cgroup.events"
+        )
+        return (
+            current["ActiveState"] == "inactive"
+            and current["SubState"] == "dead"
+            and current.get("MainPID", "0") == "0"
+            and (
+                not group_events.exists()
+                or "populated 0" in group_events.read_text().splitlines()
+            )
+        )
+    if same_unit(prior, current, paused=False):
+        return True  # The attempted stop failed before changing anything.
+    return bool(
+        (owner.get("restartIntent") or owner.get("restoredViaDependency"))
+        and current["ActiveState"] == "active"
+        and current["SubState"] == prior["SubState"]
+        and current.get("MainPID", "0") != "0"
+        and current.get("InvocationID")
+        and owner.get("restoredInvocation", current["InvocationID"])
+        == current["InvocationID"]
+        and current.get("FreezerState") == prior.get("FreezerState")
+    )
+
+
+def verify_restarted_checkpoints(state, save):
+    pending = {
+        n: o
+        for n, o in state.get("checkpointedOwners", {}).items()
+        if (o.get("restartIntent") or o.get("restoredViaDependency"))
+        and not o.get("advancedReceipt")
+    }
+    deadline = time.monotonic() + state.get("restoreReserve", 300)
+    while pending:
+        for name, owner in list(pending.items()):
+            path = Path(owner["receipt"])
+            if (
+                path.is_file()
+                and path.stat().st_mtime_ns != owner["stoppedReceipt"]["mtimeNs"]
+            ):
+                current = file_witness(path)
+                if current["sha256"] != owner["stoppedReceipt"]["sha256"]:
+                    owner["advancedReceipt"] = current
+                    save()
+                    del pending[name]
+        if pending:
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    "Services restored; awaiting fresh checkpoint receipts: "
+                    + ", ".join(pending)
+                )
+            time.sleep(2)
+
+
 def operator_cgroups():
     return [
         line.split(":", 2)[2]
@@ -197,13 +377,32 @@ def freeze_units(state, save, discover=inventory, control=ctl):
             )
     # Stop triggering timers first. Freeze services without unloading a transient
     # unit, losing its checkpoint, changing enablement or replacing its process.
-    for name in sorted(prior, key=lambda n: not n.endswith(".timer")):
+    checkpointed = state.get("checkpointedOwners", {})
+    for name in sorted(
+        prior, key=lambda n: (not n.endswith(".timer"), n not in checkpointed)
+    ):
         row = prior[name]
         if row["ActiveState"] != "active" or row["FreezerState"] == "frozen":
             continue
+        owner = checkpointed.get(name)
+        if owner:
+            if definition_digest(name) != owner["definitionSha256"]:
+                raise RuntimeError(
+                    f"Checkpointed service definition changed before stop: {name}"
+                )
+            owner["beforeStop"] = durable_checkpoint(owner)
+            owner["stopIntent"] = True
         state["touched"].append(name)
         save()
-        control("stop" if name.endswith(".timer") else "freeze", name)
+        control("stop" if owner or name.endswith(".timer") else "freeze", name)
+        if owner:
+            if not checkpoint_unit_matches(
+                row, discover([name]).get(name), owner, True
+            ):
+                raise RuntimeError(f"Checkpointed service did not stop cleanly: {name}")
+            owner["stopped"] = durable_checkpoint(owner)
+            owner["stoppedReceipt"] = file_witness(owner["receipt"])
+            save()
     check_units(state, True, discover)
 
 
@@ -213,7 +412,9 @@ def check_units(state, paused, discover=inventory):
         if refusal := row.get("captureRefusal"):
             raise RuntimeError(refusal)
     for name, row in state["units"].items():
-        if not same_unit(row, now.get(name), paused=paused):
+        if not checkpoint_unit_matches(
+            row, now.get(name), state.get("checkpointedOwners", {}).get(name), paused
+        ):
             raise RuntimeError("Unexpected operator unit state: " + name)
     if any(
         row["ActiveState"] == "active"
@@ -223,6 +424,164 @@ def check_units(state, paused, discover=inventory):
         raise RuntimeError("Another report maintenance unit became active")
 
 
+def activation(unit):
+    properties = "ActiveState,SubState,MainPID,ControlGroup,InvocationID,ExecMainStartTimestampMonotonic,Restart,NRestarts,Requires,Wants,BindsTo,Upholds,After"
+    return dict(
+        line.split("=", 1)
+        for line in ctl("show", unit, "--property=" + properties).splitlines()
+    )
+
+
+def dependency_activation(state, name, owner, current):
+    """Recognize a systemd job started by another exact captured service."""
+    prior = state["units"][name]
+    if (
+        not owner.get("stopped")
+        or owner.get("restartIntent")
+        or not current
+        or current.get("captureRefusal")
+        or current.get("ActiveState") != "active"
+        or current.get("SubState") != "running"
+        or current.get("MainPID", "0") == "0"
+        or not current.get("InvocationID")
+        or current.get("InvocationID") == prior["InvocationID"]
+        or current.get("ControlGroup") != prior["ControlGroup"]
+        or any(
+            prior[k] != current.get(k)
+            for k in ("FragmentPath", "UnitFileState", "FreezerState")
+        )
+        or definition_digest(name) != owner["definitionSha256"]
+    ):
+        return None
+    actual = activation(name)
+    if (
+        actual.get("InvocationID") != current["InvocationID"]
+        or actual.get("MainPID") != current["MainPID"]
+    ):
+        return None
+    child_start = int(actual.get("ExecMainStartTimestampMonotonic") or 0)
+    if not child_start:
+        return None
+    for peer, saved in state["checkpointedOwners"].items():
+        if (
+            peer == name
+            or not saved.get("restartIntent")
+            or not saved.get("restoredInvocation")
+        ):
+            continue
+        props = activation(peer)
+        if (
+            props.get("InvocationID") != saved["restoredInvocation"]
+            or props.get("ActiveState") != "active"
+            or definition_digest(peer) != saved["definitionSha256"]
+        ):
+            continue
+        edges = [
+            k
+            for k in ("Wants", "Requires", "BindsTo", "Upholds")
+            if name in props.get(k, "").split()
+        ]
+        if not edges:
+            continue
+        if "startRequestUs" in saved and "startConfirmedUs" in saved:
+            if not saved["startRequestUs"] <= child_start <= saved["startConfirmedUs"]:
+                continue
+        else:
+            # Old run receipts did not include a monotonic start bracket. Only
+            # adopt an ordered strong dependency which has already made fresh
+            # progress and started in the verified peer's start-command window.
+            peer_start = int(props.get("ExecMainStartTimestampMonotonic") or 0)
+            if not (
+                "BindsTo" in edges
+                and name in props.get("After", "").split()
+                and 0 <= peer_start - child_start <= 20_000_000
+            ):
+                continue
+            receipt = file_witness(owner["receipt"])
+            if (
+                receipt["sha256"] == owner["stoppedReceipt"]["sha256"]
+                or receipt["mtimeNs"] <= owner["stoppedReceipt"]["mtimeNs"]
+            ):
+                continue
+        return {
+            "activatedBy": peer,
+            "sourceInvocation": props["InvocationID"],
+            "edges": edges,
+            "invocation": actual["InvocationID"],
+            "startMonotonicUs": child_start,
+        }
+    return None
+
+
+def verify_restored_units(state, save, discover):
+    deadline = time.monotonic() + state.get("restoreReserve", 300)
+    while True:
+        current = discover(state["extraUnits"])
+        waiting = []
+        for name, owner in state.get("checkpointedOwners", {}).items():
+            if not owner.get("restoredInvocation"):
+                continue
+            actual = current.get(name)
+            if checkpoint_unit_matches(state["units"][name], actual, owner, False):
+                continue
+            props = activation(name)
+            if (
+                not actual
+                or definition_digest(name) != owner["definitionSha256"]
+                or props.get("Restart") in (None, "", "no")
+                or int(props.get("NRestarts") or 0) < 1
+            ):
+                raise RuntimeError("Unexpected restored invocation: " + name)
+            if (
+                props.get("ActiveState") == "activating"
+                and props.get("SubState") == "auto-restart"
+            ):
+                waiting.append(name)
+                continue
+            # A documented automatic retry must retain its definition, cgroup
+            # and configuration and produce a new durable receipt. A user start
+            # or an unrelated replacement cannot establish this transition.
+            same_shape = checkpoint_unit_matches(
+                state["units"][name],
+                actual,
+                dict(owner, restoredInvocation=actual.get("InvocationID")),
+                False,
+            )
+            if (
+                not same_shape
+                or props.get("InvocationID") != actual.get("InvocationID")
+                or actual.get("ControlGroup")
+                != state["units"][name].get("ControlGroup")
+            ):
+                raise RuntimeError("Unexpected restarted service state: " + name)
+            progress = file_witness(owner["receipt"])
+            if (
+                progress["sha256"] == owner["stoppedReceipt"]["sha256"]
+                or progress["mtimeNs"] <= owner["stoppedReceipt"]["mtimeNs"]
+            ):
+                waiting.append(name)
+                continue
+            owner.setdefault("automaticRestarts", []).append(
+                {
+                    "from": owner["restoredInvocation"],
+                    "to": actual["InvocationID"],
+                    "systemdCount": int(props["NRestarts"]),
+                    "receipt": progress,
+                }
+            )
+            owner["restoredInvocation"] = actual["InvocationID"]
+            save()
+        if not waiting:
+            check_units(state, False, lambda _: current)
+            return
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                "Restored systemd services still retry without a fresh receipt: "
+                + ", ".join(waiting)
+            )
+        time.sleep(2)
+
+
 def restore_units(state, save, discover=None, control=ctl):
     # Release each captured process independently even when a different writer
     # is restarting or systemd cannot enumerate the full inventory.
@@ -230,21 +589,50 @@ def restore_units(state, save, discover=None, control=ctl):
     failures = []
     for name in reversed(state["touched"][:]):
         prior = state["units"][name]
+        owner = state.get("checkpointedOwners", {}).get(name)
         try:
             now = lookup([name]).get(name)
-            if not same_unit(prior, now, paused=False):
-                if not same_unit(prior, now, paused=True):
+            if owner and not checkpoint_unit_matches(prior, now, owner, False):
+                activation_proof = dependency_activation(state, name, owner, now)
+                if activation_proof:
+                    owner["restoredViaDependency"] = activation_proof
+                    owner["restoredInvocation"] = activation_proof["invocation"]
+                    save()
+            if not checkpoint_unit_matches(prior, now, owner, False):
+                if not checkpoint_unit_matches(prior, now, owner, True):
                     raise RuntimeError("Unit identity or state changed")
-                control("start" if name.endswith(".timer") else "thaw", name)
-                if not same_unit(prior, lookup([name]).get(name), paused=False):
+                if owner:
+                    if definition_digest(name) != owner["definitionSha256"]:
+                        raise RuntimeError("Checkpointed service definition changed")
+                    current = durable_checkpoint(owner)
+                    if "stopped" in owner and owner["stopped"] != current:
+                        raise RuntimeError("Stopped checkpoint changed before restart")
+                    # A stop can succeed before its command reply is lost.
+                    owner["stopped"] = current
+                    owner.setdefault("stoppedReceipt", file_witness(owner["receipt"]))
+                    owner["restartIntent"] = True
+                    owner["startRequestUs"] = time.monotonic_ns() // 1000
+                    save()
+                control("start" if owner or name.endswith(".timer") else "thaw", name)
+                if owner:
+                    owner["startConfirmedUs"] = time.monotonic_ns() // 1000
+                if not checkpoint_unit_matches(
+                    prior, lookup([name]).get(name), owner, False
+                ):
                     raise RuntimeError("Prior state was not restored")
+            if owner and owner.get("restartIntent"):
+                if definition_digest(name) != owner["definitionSha256"]:
+                    raise RuntimeError(
+                        "Restored checkpointed service definition changed"
+                    )
+                owner["restoredInvocation"] = lookup([name])[name]["InvocationID"]
             state["touched"].remove(name)
             save()
         except Exception as exc:
             failures.append(f"{name}: {exc}")
     if failures:
         raise RuntimeError("Operator recovery incomplete: " + "; ".join(failures))
-    check_units(state, False, discover or inventory)
+    verify_restored_units(state, save, discover or inventory)
 
 
 PROBE = """
@@ -255,15 +643,16 @@ exec(compile(package["audit"],a.__file__,"exec"),a.__dict__)
 h=types.ModuleType("hz_rewrite_probe");h.__file__="<hz-worker-report-rewrite>"
 exec(compile(package["host"],h.__file__,"exec"),h.__dict__)
 h.load_audit=lambda:a
-print(json.dumps(h.measured(h.PG,census=package["census"],sample=package["sample"])))
+print(json.dumps(h.measured(h.PG,census=package["census"],sample=package["sample"],toast=package["toast"])))
 """
 
 
-def worker(census=False, sample=False):
+def worker(census=False, sample=False, toast=False):
     package = {
         "audit": (HERE / FILES[2]).read_text(),
         "host": (HERE / FILES[1]).read_text(),
         "census": census,
+        "toast": toast,
         "sample": sample,
     }
     return json.loads(
@@ -292,9 +681,12 @@ def authoritative(facts):
 
 def make_plan(args):
     measured_at = time.time()
-    f = worker(args.replacement_bytes is not None, args.sample_identity)
+    f = worker(
+        args.replacement_bytes is not None, args.sample_identity, args.toast_only
+    )
     hub = authoritative(f)
     cfg = dict(
+        mode="toast" if args.toast_only else "whole",
         replacement=args.replacement_bytes,
         wal=args.wal_bytes,
         growth=args.growth_bytes or 0,
@@ -302,14 +694,18 @@ def make_plan(args):
     )
     space = host.budget(f, cfg)
     reasons = space["refusals"][:]
+    specs = checkpoint_specs(args.checkpointed_units)
+    extra_units = list(dict.fromkeys([*args.unit, *specs]))
     try:
-        units = inventory(args.unit)
+        units = inventory(extra_units)
     except (RuntimeError, subprocess.TimeoutExpired) as exc:
         units = {}
         reasons.append(f"Operator unit inventory unavailable: {exc}")
     reasons.extend(
         row["captureRefusal"] for row in units.values() if "captureRefusal" in row
     )
+    checkpointed, problems = plan_checkpoints(specs, units)
+    reasons.extend(problems)
     if args.growth_bytes is None:
         reasons.append("Specify the reviewed external growth allowance for this pause")
     # Retain time for client shutdown, readiness, a normal heartbeat and the
@@ -328,7 +724,8 @@ def make_plan(args):
         "worker": f,
         "authority": hub,
         "units": units,
-        "extraUnits": args.unit,
+        "extraUnits": extra_units,
+        "checkpointedOwners": checkpointed,
         "touched": [],
         "budget": cfg,
         "workspace": space,
@@ -340,7 +737,11 @@ def make_plan(args):
         "remainingWorkSeconds": maintenance + reserve,
         "verificationMode": "every report byte"
         if args.all_report_bytes
-        else "all signed report identities and full scientific records",
+        else (
+            "all external TOAST bytes, inline candidates, pinned parent tuples and full scientific records"
+            if args.toast_only
+            else "all signed report identities and full scientific records"
+        ),
         "availableForReplacementBytes": space["maximumAffordableReplacementBytes"],
         "leaseDeadline": measured_at + min(ttl) if ttl else None,
     }
@@ -381,8 +782,8 @@ o["result"]=dict(x.split("=",1) for x in (p/"result").read_text().splitlines()) 
 o["recovered"]=dict(x.split("=",1) for x in (p/"recovery-result").read_text().splitlines()) if (p/"recovery-result").is_file() else None
 o["committed"]=True if (p/"rewrite-commit.json").is_file() else None
 if o["committed"] is None and (p/"resumed.json").is_file() and (p/"quiesced.json").is_file():
- b=json.loads((p/"quiesced.json").read_text());a=json.loads((p/"resumed.json").read_text())
- if a["oid"]==b["oid"] and a["serverStartedAt"]==b["serverStartedAt"]:o["committed"]=a["relfilenode"]!=b["relfilenode"]
+ keys=("serverStartedAt","oid","relfilenode","toastOid","toastFilenode","indexFiles","parentIndexFiles","toastIndexFiles")
+ o["physical"]=[{k:s[k] for k in keys if k in s} for s in (json.loads((p/n).read_text()) for n in ("quiesced.json","resumed.json"))]
 print(json.dumps(o))
 """
 
@@ -406,7 +807,15 @@ def read_host(args):
 
 def status(state):
     directory, unit = location(state)
-    return json.loads(read_host(["python3", "-B", "-c", STATUS, directory, unit]))
+    observation = json.loads(
+        read_host(["python3", "-B", "-c", STATUS, directory, unit])
+    )
+    physical = observation.pop("physical", None)
+    if physical is not None:
+        observation["committed"] = audit.rewrite_outcome(
+            *physical, state.get("budget", {}).get("mode", "whole")
+        )
+    return observation
 
 
 def launch(state, restore=False):
@@ -603,6 +1012,7 @@ def transaction(state, directory, *, recovery=False):
             if state.get("submissionIntent"):
                 recover_host(state)
             restore_units(state, save)
+            verify_restarted_checkpoints(state, save)
             marker.unlink(missing_ok=True)
             if state.get("submissionIntent"):
                 collect(state, directory)
@@ -642,6 +1052,7 @@ def transaction(state, directory, *, recovery=False):
                     recover_host(state)
                 try:
                     restore_units(state, save)
+                    verify_restarted_checkpoints(state, save)
                     marker.unlink(missing_ok=True)
                 finally:
                     if state.get("submissionIntent"):
@@ -665,6 +1076,12 @@ def main():
     )
     parser.add_argument(
         "--output", type=Path, help="local JSON for read-only feasibility"
+    )
+    parser.add_argument(
+        "--checkpointed-units",
+        type=Path,
+        metavar="FILE",
+        help="operator JSON mapping persistent SSH archive services to their checkpoint and optional progress receipt paths",
     )
     parser.add_argument(
         "--unit",
@@ -704,6 +1121,11 @@ def main():
         help="minimum operating/cancellation reserve",
     )
     parser.add_argument("--rewrite-seconds", type=int, default=5400)
+    parser.add_argument(
+        "--toast-only",
+        action="store_true",
+        help="rewrite only the report table's TOAST heap and chunk index through its fixed parent name",
+    )
     parser.add_argument(
         "--identity-seconds",
         type=int,
@@ -757,6 +1179,7 @@ def main():
                 "localLeases": state["worker"]["database"]["leases"],
                 "pauseSeconds": state["remainingWorkSeconds"],
                 "identitySample": state["worker"].get("identitySample"),
+                "toastProofSample": state["worker"].get("toastProofSample"),
                 "solverProcesses": state["worker"]["solverProcesses"],
                 "ingress": state["worker"]["ingress"],
                 "operatorUnits": len(state["units"]),

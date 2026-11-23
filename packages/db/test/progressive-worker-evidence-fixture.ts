@@ -238,14 +238,18 @@ export async function verifyProgressiveWorkerEvidence(
     sql`SELECT status FROM sim_jobs WHERE id = ${executionId}::uuid`,
   );
   try {
-    const [index] =
-      await db.execute(sql`SELECT indisvalid,pg_get_expr(indpred,indrelid) AS predicate FROM pg_index
-      WHERE indexrelid='progressive_worker_reports_staging_candidate_idx'::regclass`);
-    expect(index.indisvalid).toBe(true);
-    expect(index.predicate).toContain("acknowledged_at IS NOT NULL");
-    const candidates = () =>
-      db.execute(sql`SELECT sequence FROM progressive_worker_reports
-      WHERE sim_job_id=${executionId}::uuid AND acknowledged_at IS NOT NULL AND jsonb_typeof(report->'result')='object' ORDER BY sequence`);
+    const [coverage] = await db.execute(sql`SELECT coalesce((SELECT reads_enabled FROM
+      public.progressive_worker_staging_key_backfill WHERE singleton),false) AS keys`);
+    const [index] = await db.execute(sql`SELECT indisvalid,indisprimary,pg_get_expr(indpred,indrelid) AS predicate FROM pg_index WHERE indexrelid=to_regclass(
+      ${coverage.keys===true ? "public.progressive_worker_staging_keys_pkey" : "public.progressive_worker_reports_staging_candidate_idx"})`);
+    expect(index?.indisvalid).toBe(true);
+    if (coverage.keys === true) expect(index.indisprimary).toBe(true);
+    else {
+      expect(index.predicate).toContain("acknowledged_at IS NOT NULL");
+      expect(index.predicate).toContain("jsonb_typeof");
+    }
+    const candidates = () => db.execute(sql`SELECT sequence FROM progressive_worker_staging_candidates
+      WHERE sim_job_id=${executionId}::uuid ORDER BY sequence`);
     expect(await candidates()).toHaveLength(0);
     for (const preferActive of [true, false]) {
       const rows =

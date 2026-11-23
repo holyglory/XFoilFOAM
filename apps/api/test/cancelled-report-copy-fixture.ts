@@ -16,6 +16,10 @@ import { prepareProgressiveRemoteEvidence, resolveProgressiveRemoteEvidence } fr
 import { readProgressiveRemoteRetention } from "@aerodb/db/progressive-remote-retention";
 import { resolveProgressiveReportedPoint } from "@aerodb/db/progressive-remote-report";
 import {
+  backfillProgressiveReportPayloads,
+  setProgressiveReportNormalization,
+} from "@aerodb/db/progressive-report-payloads";
+import {
   readProgressiveReportArchiveText,
   verifyProgressiveReportArchive,
 } from "@aerodb/db/progressive-report-archive";
@@ -27,6 +31,9 @@ import {
 import { nextCancelledReportCopies } from "../../sweeper/src/cancelled-report-copies";
 import { applyProgressiveRemoteProgress } from "../../sweeper/src/progressive-remote-progress";
 import { archiveProgressiveReportBatch } from "../../sweeper/src/progressive-report-archive-service";
+import { copyStoppedReportBatch, stoppedReportCopyKeys } from "../../sweeper/src/shared-stopped-report-custody";
+import { readSharedReport, SHARED_REPORT_FORMAT } from "../../sweeper/src/shared-report-archive";
+import { memoryReportObjects } from "../../sweeper/test/shared-report-object-fixture";
 import type { importPolarPush } from "../src/sync-routes";
 
 // The caller has already delivered the original physical attempt and bound its
@@ -58,6 +65,9 @@ export async function verifyCancelledReportCopyReplay(
     ...anchor,
     sequence: anchorSequence + 1,
   };
+  // This fixture runs inside the caller's rolled-back transaction. Start with
+  // the historical inline representation even on a normalized-write backend.
+  await setProgressiveReportNormalization(db, { enabled: false, readersReady: true });
   const copyReceipt = await storeProgressiveRemoteReport(db, {
     ...sender,
     report: copy,
@@ -84,7 +94,11 @@ export async function verifyCancelledReportCopyReplay(
     ...sender,
     report: gap,
   });
-  const final = structuredClone(gap);
+  const repeat = { ...gap, sequence: gap.sequence + 1 };
+  const repeatReceipt = await storeProgressiveRemoteReport(db, { ...sender, report: repeat });
+  const nextRepeat = { ...repeat, sequence: repeat.sequence + 1 };
+  const nextReceipt = await storeProgressiveRemoteReport(db, { ...sender, report: nextRepeat });
+  const final = structuredClone(nextRepeat);
   final.sequence++;
   final.status.state = "failed";
   final.result!.state = "failed";
@@ -159,15 +173,34 @@ export async function verifyCancelledReportCopyReplay(
   const warmBody = warm.json();
   expect(warmBody.fulfilledAoas).toEqual([]);
   expect(warmBody.progressiveEvidenceReceipts[0].sequence).toBe(anchorSequence);
-  const page = await nextCancelledReportCopies(db, {
+  const cursor = {
     executionId: id,
     sequence: anchorSequence - 1,
-  });
+  };
+  const page = await nextCancelledReportCopies(db, cursor);
   expect(page.executionId).toBe(id);
   expect(page.sequences).toEqual([copy.sequence]);
   const [original] =
-    await db.execute(sql`SELECT public.resolve_progressive_report(report,result_payload_hash)::text AS text
+    await db.execute(sql`SELECT report::text AS text, result_payload_hash AS hash
     FROM progressive_remote_reports WHERE sim_job_id=${id}::uuid AND sequence=${copy.sequence}`);
+  expect(original.hash).toBeNull();
+  await setProgressiveReportNormalization(db, { enabled: true, readersReady: true });
+  const sharing = await backfillProgressiveReportPayloads(db, {
+    table: "progressive_remote_reports", after: { executionId: id, sequence: anchorSequence },
+    rows: 1, apply: true,
+  });
+  expect(sharing.proofs).toEqual([{
+    executionId: id, sequence: copy.sequence, contentSignature: copyReceipt.contentSignature,
+    digest: createHash("sha256").update(String(original.text)).digest("hex"),
+  }]);
+  expect(sharing.normalized).toBe(1);
+  expect(await nextCancelledReportCopies(db, cursor)).toEqual(page);
+  const shared = await post();
+  expect(shared.statusCode, shared.body).toBe(200);
+  expect(shared.json().progressiveEvidenceReceipts).toEqual(warmBody.progressiveEvidenceReceipts);
+  expect(shared.json().progressiveArchiveReceipts).toEqual(warmBody.progressiveArchiveReceipts);
+  expect(shared.json().fulfilledAoas).toEqual([]);
+  expect(await readProgressiveRemoteRetention(db, id)).toEqual(waiting);
   let bytes = Buffer.alloc(0);
   const put: Parameters<typeof archiveProgressiveReportBatch>[3] = async (
     path,
@@ -221,7 +254,7 @@ export async function verifyCancelledReportCopyReplay(
     WHERE sim_job_id=${id}::uuid AND archived_at IS NOT NULL ORDER BY sequence`);
   expect(cold).toEqual([{ seq: copy.sequence }]);
   expect(
-    await archiveProgressiveReportBatch(db, "remote", id, put, page.sequences),
+    await archiveProgressiveReportBatch(db, "remote", id, put, [copy.sequence]),
   ).toBe(0);
   let reads = 0;
   try {
@@ -313,6 +346,8 @@ export async function verifyCancelledReportCopyReplay(
       speed: polar.speed,
       chord: polar.chord,
     });
+    const lateSequence = repeat.sequence;
+    const lateSignature = repeatReceipt.contentSignature;
     const incoming = {
       ...latePoint,
       aoaDeg: point.aoa_deg,
@@ -322,8 +357,8 @@ export async function verifyCancelledReportCopyReplay(
       evidenceArtifacts: [],
       media: [],
       progressiveEvidence: {
-        sequence: gap.sequence,
-        reportContentSignature: gapReceipt.contentSignature,
+        sequence: lateSequence,
+        reportContentSignature: lateSignature,
         pointContentSignature: gapSource.contentSignature,
       },
     };
@@ -334,12 +369,90 @@ export async function verifyCancelledReportCopyReplay(
         headers: { "x-xfoilfoam-solver-token": token },
         payload: { ...payload, results: [incoming] },
       });
+    {
+      const [original] = await db.execute(sql`SELECT public.resolve_progressive_report(report,result_payload_hash)::text AS body
+        FROM progressive_remote_reports WHERE sim_job_id=${id}::uuid AND sequence=${repeat.sequence}`);
+      const normalized = await backfillProgressiveReportPayloads(db, {
+        table:"progressive_remote_reports", after:{executionId:id,sequence:gap.sequence}, rows:2, apply:true,
+      });
+      expect(normalized.normalized).toBe(2);
+      const [referenceHash] = await db.execute(sql`SELECT result_payload_hash AS hash FROM progressive_remote_reports
+        WHERE sim_job_id=${id}::uuid AND sequence=${repeat.sequence}`);
+      const protectedCount = async () => (await db.execute(sql`SELECT count(*)::int AS n FROM progressive_report_result_payloads
+        WHERE content_hash=${referenceHash.hash}`))[0].n;
+      const { files, store } = memoryReportObjects();
+      const verifyReader = (pin:Parameters<typeof readSharedReport>[1])=>readSharedReport(store,pin);
+      const adapters={readers:[verifyReader,verifyReader] as const};
+      const key = { sequence: repeat.sequence, signature: lateSignature };
+      const second = { sequence: nextRepeat.sequence, signature: nextReceipt.contentSignature };
+      const candidates = await stoppedReportCopyKeys(db, id, gap.sequence - 1);
+      expect(candidates.filter(k => k.mode === "release").map(k => k.sequence)).toEqual([repeat.sequence, nextRepeat.sequence]);
+      const keptKey={sequence:gap.sequence,signature:gapReceipt.contentSignature};
+      const held = await copyStoppedReportBatch(db,store,id,[keptKey],"preserve",adapters);
+      expect(held.released).toBe(0);
+      const firstPin=held.object;
+      expect(firstPin.generation.length).toBeGreaterThan(16);
+      await expect(copyStoppedReportBatch(db,store,id,[keptKey],"release",adapters)).rejects.toThrow();
+      await expect(copyStoppedReportBatch(db,store,id,[{...key,signature:"0".repeat(64)}],"release",adapters)).rejects.toThrow();
+      const changedJob={...store,create:async(k:string,b:Buffer)=>{
+        const pin=await store.create(k,b);
+        await db.execute(sql`UPDATE sim_jobs SET ingest_lease_token='copy-race',ingest_lease_expires_at=now()+interval '1 hour' WHERE id=${id}::uuid`);
+        return pin;
+      }};
+      await expect(copyStoppedReportBatch(db,changedJob,id,[key],"release",adapters)).rejects.toThrow("owner");
+      await db.execute(sql`UPDATE sim_jobs SET ingest_lease_token=NULL,ingest_lease_expires_at=NULL WHERE id=${id}::uuid`);
+      await expect(copyStoppedReportBatch(db,store,id,[key],"release",{readers:[verifyReader,async()=>{throw new Error("serving reader unavailable");}]}))
+        .rejects.toThrow("serving reader unavailable");
+      const [warmRepeat]=await db.execute(sql`SELECT archived_at, result_payload_hash FROM progressive_remote_reports
+        WHERE sim_job_id=${id}::uuid AND sequence=${key.sequence}`);
+      expect(warmRepeat.archived_at).toBeNull();
+      expect(warmRepeat.result_payload_hash).toBe(referenceHash.hash);
+      await expect(copyStoppedReportBatch(db,store,id,[key],"release",{...adapters,beforeCommit:async()=>{throw new Error("interrupted durable receipt");}}))
+        .rejects.toThrow("interrupted durable receipt");
+      const [afterAbort]=await db.execute(sql`SELECT archive_bundle_id,result_payload_hash FROM progressive_remote_reports
+        WHERE sim_job_id=${id}::uuid AND sequence=${key.sequence}`);
+      expect(afterAbort.archive_bundle_id).toBeNull();
+      expect(afterAbort.result_payload_hash).toBe(referenceHash.hash);
+      const first = await copyStoppedReportBatch(db,store,id,[key],"release",adapters);
+      expect(await protectedCount()).toBe(1);
+      const other = await copyStoppedReportBatch(db,store,id,[second],"release",adapters);
+      expect(await protectedCount()).toBe(0);
+      expect([first.released,other.released]).toEqual([1,1]);
+      const payloads=[...files.values()].filter(v=>v.pin.key.includes("/results/"));
+      expect(payloads).toHaveLength(1);
+      expect(first.object.key).not.toBe(other.object.key);
+      const restore=(pin:Parameters<typeof readSharedReport>[1])=>readSharedReport(store,pin);
+      installProgressiveReportArchiveReader({read:restore});
+      const reference = { sourceKind: "remote" as const, executionId: id, sequence: repeat.sequence, contentSignature: lateSignature };
+      const restored = await readProgressiveReport(db, reference);
+      expect(restored).toEqual(repeat);
+      const member = verifiedProgressiveReportMember(restored)!.identity;
+      expect(member.archiveFormat).toBe(SHARED_REPORT_FORMAT);
+      // A completed read's timeout signal cannot become part of the durable
+      // member identity used by a second, independently cancellable reader.
+      expect(member).not.toHaveProperty("signal");
+      expect(await restore(member)).toBe(original.body);
+      expect(await readProgressiveReport(db,{...reference,sequence:second.sequence,contentSignature:second.signature})).toEqual(nextRepeat);
+      expect(await readProgressiveRemoteRetention(db, id)).toEqual(waiting);
+      expect(await state()).toEqual(before);
+      const [payload]=payloads;files.delete(payload.pin.key);
+      expect((await deliver()).statusCode).toBeGreaterThanOrEqual(400);
+      files.set(payload.pin.key,{...payload,bytes:Buffer.from("bad scientific generation")});
+      expect((await deliver()).statusCode).toBeGreaterThanOrEqual(400);
+      files.set(payload.pin.key,{...payload,pin:{...payload.pin,generation:String(BigInt(payload.pin.generation)+9n)}});
+      expect((await deliver()).statusCode).toBeGreaterThanOrEqual(400);
+      files.set(payload.pin.key,payload);
+      await expect(restore({...member,sourceKind:"worker"})).rejects.toThrow();
+      await expect(restore({...member,reportSha256:"0".repeat(64)})).rejects.toThrow();
+      await expect(restore({...member,generation:String(BigInt(member.generation)+1n)})).rejects.toThrow();
+      expect(await state()).toEqual(before);
+    }
     const late = await deliver();
     expect(late.statusCode, late.body).toBe(200);
     const received = late.json();
     expect(received.progressiveEvidenceReceipts).toMatchObject([
       {
-        sequence: gap.sequence,
+        sequence: lateSequence,
         storageOnly: true,
         pointContentSignature: gapSource.contentSignature,
         remoteResultAttemptId: incoming.remoteResultAttemptId,

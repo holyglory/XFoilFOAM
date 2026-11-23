@@ -1,3 +1,4 @@
+import { progressiveAdmissionReportPressureSql } from "./progressive-progress-selection";
 import { randomUUID } from "node:crypto";
 import { sql } from "drizzle-orm";
 import {
@@ -6,6 +7,7 @@ import {
   claimProgressiveCfdBatch,
   clearHubWorkerPayloadFields,
   progressiveRemoteAdmissionReservedSlots,
+  progressiveRemoteAdmissionReservedSlotsSql,
   progressiveRemoteActivePromiseCount,
   PROGRESSIVE_REMOTE_START_LEASE_SECONDS,
   type DB,
@@ -22,6 +24,7 @@ import { REQUIRED_PRECALC_EVIDENCE_RECOVERY_VERSION } from "./build-request";
 import { retireSettledProgressivePromise } from "./progressive-remote-lease-retirement";
 
 const PROGRESSIVE_REPORT_BACKPRESSURE_LIMIT = 2_000;
+const NO_UNRESERVED_CPU_SLOTS = "The worker has no unreserved CPU slots";
 
 export interface ProgressiveRemoteCapabilities {
   localTimeStepVersion?: number | null;
@@ -241,7 +244,7 @@ export async function prepareProgressiveRemoteDispatch(
         (await progressiveRemoteAdmissionReservedSlots(connection, solverId));
       if (!Number.isSafeInteger(available) || available < 1)
         throw new RemoteProgressiveAdmissionWait(
-          "The worker has no unreserved CPU slots",
+          NO_UNRESERVED_CPU_SLOTS,
         );
       const [admissionGate] = await connection.execute(sql`
         SELECT pg_try_advisory_xact_lock(
@@ -393,7 +396,8 @@ async function prepareProgressiveRemoteFleetRun(db: DB) {
       }),
     );
   const solvers = await db.execute(sql`
-    SELECT solver.id, least(solver.cpu_capacity, CASE WHEN solver.cpu_budget > 0 THEN solver.cpu_budget ELSE solver.cpu_capacity END)::integer AS capacity
+    SELECT solver.id, least(solver.cpu_capacity, CASE WHEN solver.cpu_budget > 0 THEN solver.cpu_budget ELSE solver.cpu_capacity END)::integer AS capacity,
+      (${progressiveRemoteAdmissionReservedSlotsSql(sql`solver.id`)}) AS reserved
     FROM registered_remote_solvers solver JOIN sync_api_settings settings ON settings.id = 1
     JOIN sweeper_state state ON state.id = 1
     WHERE settings.enabled AND NOT settings.remote_solver_enabled AND state.enabled
@@ -416,18 +420,13 @@ async function prepareProgressiveRemoteFleetRun(db: DB) {
     waitingReasons: [] as Array<{ solverId: string; reason: string }>,
     errors: [] as Array<{ solverId: string; reason: string }>,
   };
-  const unappliedReports = await db.execute(sql`
-    SELECT report.sim_job_id, report.sequence
-    FROM progressive_remote_reports report
-    LEFT JOIN progressive_remote_progress_receipts receipt
-      ON receipt.sim_job_id = report.sim_job_id AND receipt.sequence = report.sequence
-    LEFT JOIN progressive_remote_report_inventories inventory
-      ON inventory.sim_job_id = report.sim_job_id AND inventory.sequence = report.sequence
-    WHERE receipt.sim_job_id IS NULL OR inventory.sim_job_id IS NULL
-    ORDER BY report.received_at, report.sim_job_id, report.sequence
-    LIMIT ${PROGRESSIVE_REPORT_BACKPRESSURE_LIMIT}
-  `);
-  if (unappliedReports.length >= PROGRESSIVE_REPORT_BACKPRESSURE_LIMIT) {
+  // A fleet with no free slots cannot admit work in this pass. Only scan
+  // report history when at least one registered worker could actually claim.
+  const hasCapacity = solvers.some((solver) => Number(solver.capacity) > Number(solver.reserved));
+  const [pressure] = hasCapacity
+    ? await db.execute(progressiveAdmissionReportPressureSql(PROGRESSIVE_REPORT_BACKPRESSURE_LIMIT))
+    : [];
+  if (pressure?.throttled === true) {
     for (const solver of solvers) {
       receipt.waiting += 1;
       receipt.waitingReasons.push({
@@ -443,6 +442,11 @@ async function prepareProgressiveRemoteFleetRun(db: DB) {
     const solverId = String(solver.id);
     const capacity = Number(solver.capacity);
     if (!Number.isSafeInteger(capacity) || capacity < 1) continue;
+    if (Number(solver.reserved) >= capacity) {
+      receipt.waiting += 1;
+      receipt.waitingReasons.push({ solverId, reason: NO_UNRESERVED_CPU_SLOTS });
+      continue;
+    }
     for (
       let admitted = 0;
       admitted < Math.min(capacity, maxAdmissionsPerTick);

@@ -141,3 +141,14 @@ bytes were already unavailable at capture. A new frozen selection can preserve a
 later revision under its own object key. The version pass leaves PostgreSQL
 payloads and application selections intact. Ordinary registration after settlement
 can adopt the same object through its existing source check.
+
+
+For an unscoped live inventory, add `--capture-live-versions` to the existing
+`backup` or `cycle` invocation. Each completed inventory row already pins its
+worker, attempt, producing job, result and original source digest and size.
+The single backup lane authenticates those pins, processes outstanding generations
+first, and prioritizes sources that had no archive at inventory. A deferred source
+can receive a version-only object through the same signed-owner and readback path.
+The ordinary registration and version receipt counters can overlap for a source
+that later settles. Existing scans with older exclusion tallies report those
+counts as unknown. A fresh inventory tallies each page exactly.

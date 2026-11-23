@@ -37,6 +37,9 @@ try {
   for (const helper of ["legacy-report-storage-gcs.ts", "legacy-report-storage-custody-worker.ts"]) {
     await copyFile(join(root, "apps/sweeper/src", helper), join(temp, helper));
   }
+  const sampler = "legacy-report-peer-memory-sampler.cjs";
+  await copyFile(join(root, "apps/sweeper/src", sampler), join(temp, sampler));
+  await copyFile(join(root, "scripts/deploy/legacy_report_host_capacity.py"), join(temp, "legacy_report_host_capacity.py"));
   const installed = join(temp, "node_modules/typescript");
   await mkdir(join(installed, "lib"), { recursive: true });
   for (const name of ["package.json", "lib/typescript.js", "LICENSE.txt", "ThirdPartyNoticeText.txt"]) {
@@ -46,6 +49,7 @@ try {
   const cli = join(temp, entry);
   const loader = createRequire(cli);
   assert.equal(loader.resolve("typescript"), join(installed, "lib/typescript.js"));
+  assert.equal(typeof loader("./" + sampler).watchCustodyMemory, "function");
   const ts = loader("typescript");
   for (const helper of ["legacy-report-storage-gcs.ts", "legacy-report-storage-custody-worker.ts"]) {
     const { outputText } = ts.transpileModule(await readFile(join(temp, helper), "utf8"), {
@@ -58,9 +62,11 @@ try {
   assert.match(inventory, /progressive_worker_reports/);
   assert.match(inventory, /LIMIT 2\b/);
   const help = execFileSync(cli, ["--help"], { cwd: temp, encoding: "utf8" });
-  for (const name of ["migrate-receipts", "--until-complete", "--worker-sweeper-container"]) assert(help.includes(name));
+  for (const name of ["migrate-receipts", "--until-complete", "--worker-sweeper-container", "--execution-slots"]) assert(help.includes(name));
 
   if (governed) {
+    execFileSync("python3", ["-B", join(root, "tests/test_legacy_report_host_capacity.py")], { cwd: root, stdio: "inherit" });
+    execFileSync(process.execPath, [join(root, "scripts/deploy/check-report-peer-cgroup.mjs")], { cwd: root, stdio: "inherit", timeout: 155000 });
     assert.match(run ?? "", /^t[0-9]{8}T[0-9]{6}Z-[a-f0-9]+$/);
     const executor = process.env.DEVCOORDINATOR_EXECUTOR ??
       join(dirname(await realpath("/usr/local/bin/devcoordinator2")), "devcoordinator2-executor");

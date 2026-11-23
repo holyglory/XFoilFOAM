@@ -486,6 +486,24 @@ it("replaces per-sequence terminal staging with one indexed proof page on the sa
     expect(JSON.stringify(plan)).toContain(
       "progressive_worker_staging_copies_pkey",
     );
+    // This is the full selector with real covered copies. A single-key plan
+    // above cannot catch an uncorrelated materialization in the outer query.
+    for (const preferActive of [false, true]) {
+      const [measured] = await f.db.execute(sql`EXPLAIN (ANALYZE,VERBOSE,BUFFERS,FORMAT JSON)
+        ${progressiveStagingSelectionSql(preferActive)}`);
+      const nodes = [(measured["QUERY PLAN"] as { Plan: Record<string, unknown> }[])[0].Plan];
+      const proofScans = [];
+      for (const node of nodes) {
+        nodes.push(...((node.Plans ?? []) as Record<string, unknown>[]));
+        if (node["Relation Name"] === "progressive_worker_staging_copies" && Number(node["Actual Loops"]) > 0)
+          proofScans.push(node);
+      }
+      expect(proofScans.length).toBeGreaterThan(0);
+      for (const scan of proofScans) {
+        expect(scan["Index Name"]).toBe("progressive_worker_staging_copies_pkey");
+        expect(String(scan["Index Cond"])).toMatch(/sim_job_id.*sequence/);
+      }
+    }
     expect(await protectedState(f)).toEqual(original);
     console.info(
       JSON.stringify({
@@ -695,6 +713,18 @@ it("checks each signed envelope and preserves a one-sample history change on rep
       `"content_signature": "${original.contentSignature}"`,
       `"content_signature": "${member.contentSignature}"`,
     );
+    member.rowSha256 = hash(member.rowText);
+    await expect(whole.verify()).rejects.toThrow("canonical signature");
+    Object.assign(member, original);
+    // A changed canonical prefix may not borrow the prior hash midstate,
+    // even when the result, suffix, and stored original-row hint all match.
+    const prefix = `"assignmentSignature": "${f.scientific.assignmentSignature}"`;
+    const foreignPrefix = `"assignmentSignature": "${"e".repeat(64)}"`;
+    member.rowText = member.rowText.replace(prefix, foreignPrefix);
+    member.reportText = member.reportText.replace(prefix, foreignPrefix);
+    expect(member.rowText).not.toBe(original.rowText);
+    expect(member.reportText).not.toBe(original.reportText);
+    member.reportSha256 = hash(member.reportText);
     member.rowSha256 = hash(member.rowText);
     await expect(whole.verify()).rejects.toThrow("canonical signature");
     Object.assign(member, original);

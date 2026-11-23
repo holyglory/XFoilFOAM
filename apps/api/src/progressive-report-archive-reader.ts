@@ -13,6 +13,8 @@ import {
   type ProgressiveReportArchiveReadIdentity,
 } from "@aerodb/db/progressive-report-archive";
 import { env } from "./env";
+import { readSharedReport, SHARED_REPORT_FORMAT } from "../../sweeper/src/shared-report-archive";
+import { HubReportObjects } from "../../sweeper/src/shared-report-objects";
 
 let storage: Storage | null = null;
 
@@ -78,6 +80,13 @@ async function pinnedReportFile(
 export async function readProgressiveReportArchive(
   identity: ProgressiveReportArchiveReadIdentity & { signal?: AbortSignal },
 ): Promise<string> {
+  if (identity.archiveFormat === SHARED_REPORT_FORMAT) {
+    if (process.env.AIRFOILFOAM_DEPLOYMENT_ROLE === "remote-solver" || !env.evidenceBucket)
+      throw new Error("Shared report generations require the configured hub");
+    storage ??= new Storage();
+    return readSharedReport(new HubReportObjects(env.evidenceBucket,
+      process.env.AIRFOILFOAM_REPORT_ARCHIVE_PREFIX ?? "progressive-reports/v1", storage), identity, identity.signal);
+  }
   const file = await pinnedReportFile(identity);
   return readProgressiveReportArchiveText(
     file.createReadStream({ validation: "crc32c", decompress: false }),
@@ -102,6 +111,10 @@ export async function verifyRetainedReportGeneration(
     signal: controller.signal,
   };
   const read = async () => {
+    if (scoped.archiveFormat === SHARED_REPORT_FORMAT) {
+      await readProgressiveReportArchive(scoped);
+      return;
+    }
     const file = await pinnedReportFile(scoped);
     const hash = createHash("sha256"),
       crc = new CRC32C();

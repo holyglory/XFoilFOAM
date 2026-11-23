@@ -8300,9 +8300,9 @@ export const progressiveReportArchiveBundles = pgTable(
       sql`${table.compression} = 'gzip'`,
     ),
     archiveFormatCheck: check("progressive_report_archive_bundles_archive_format_check",
-      sql`${table.archiveFormat} IN ('jsonl','legacy-jsonl')`),
+      sql`${table.archiveFormat} IN ('jsonl','legacy-jsonl','shared-result-v1')`),
     legacyCheck: check("progressive_report_archive_bundles_legacy_check", sql`
-      (${table.archiveFormat}='jsonl' AND ${table.legacyInstanceId} IS NULL AND ${table.legacySolverId} IS NULL
+      ((${table.archiveFormat}='jsonl' OR (${table.archiveFormat}='shared-result-v1' AND ${table.sourceKind}='remote' AND ${table.mimeType}='application/gzip')) AND ${table.legacyInstanceId} IS NULL AND ${table.legacySolverId} IS NULL
         AND ${table.legacyScopeSha256} IS NULL AND ${table.legacyPageMemberCount} IS NULL
         AND ${table.legacyReadMode} IS NULL AND ${table.legacyLocalStorageKey} IS NULL AND ${table.legacyLocalVerifiedAt} IS NULL)
       OR (${table.archiveFormat}='legacy-jsonl' AND ${table.sourceKind}='worker' AND ${table.mimeType}='application/gzip'
@@ -8842,6 +8842,52 @@ export const progressiveWorkerReportScienceProofs = pgTable(
     envelopeCheck: check("worker_science_proof_envelope_check", sql`jsonb_typeof(${table.envelope})='object' AND (${table.envelope}->>'executionId') IS NOT DISTINCT FROM ${table.simJobId}::text`),
     pointsCheck: check("worker_science_proof_points_check", sql`jsonb_typeof(${table.pointSignatures})='array' AND jsonb_array_length(${table.pointSignatures}) BETWEEN 1 AND 2048`),
     resultIdx: index("progressive_worker_report_science_proofs_result_idx").on(table.simJobId, table.resultSha256, table.resultByteSize, table.sequence),
+  }),
+);
+
+// Optional worker-only scheduling metadata. Source reports and their receipts
+// retain separate identities. The migration owns the swappable read view.
+export const progressiveWorkerStagingKeys = pgTable(
+  "progressive_worker_staging_keys",
+  {
+    simJobId: uuid("sim_job_id").notNull(),
+    sequence: bigint("sequence",{mode:"number"}).notNull(),
+    createdAt: timestamp("created_at",{withTimezone:true}).notNull(),
+    stoppedEngineJobId: text("stopped_engine_job_id"),
+  },
+  (t)=>({
+    primary:primaryKey({name:"progressive_worker_staging_keys_pkey",columns:[t.simJobId,t.sequence]}),
+    report:foreignKey({name:"worker_staging_keys_report_fk",columns:[t.simJobId,t.sequence],
+      foreignColumns:[progressiveWorkerReports.simJobId,progressiveWorkerReports.sequence]}).onDelete("cascade"),
+    order:index("progressive_worker_staging_keys_order_idx").on(t.createdAt,t.simJobId,t.sequence),
+    jobOrder:index("progressive_worker_staging_keys_job_order_idx").on(t.simJobId,t.createdAt,t.sequence),
+    terminalOrder:index("progressive_worker_staging_keys_terminal_order_idx").on(t.createdAt,t.simJobId,t.sequence)
+      .where(sql`${t.stoppedEngineJobId} IS NOT NULL`),
+  }),
+);
+
+export const progressiveWorkerStagingKeyBackfill = pgTable(
+  "progressive_worker_staging_key_backfill",
+  {
+    singleton:boolean("singleton").primaryKey(),
+    trackingInstanceId:uuid("tracking_instance_id").notNull(),
+    afterJob:uuid("after_job").notNull().default("00000000-0000-0000-0000-000000000000"),
+    afterSequence:bigint("after_sequence",{mode:"number"}).notNull().default(0),
+    complete:boolean("complete").notNull().default(false),
+    readsEnabled:boolean("reads_enabled").notNull().default(false),
+    indexPhase:text("index_phase").notNull().default("present"),
+    parityCheckedAt:timestamp("parity_checked_at",{withTimezone:true}),
+    parityCount:bigint("parity_count",{mode:"number"}),
+    trackingSignature:text("tracking_signature"),
+    retirementRevision:text("retirement_revision"),
+  },
+  (t)=>({
+    singletonCheck:check("worker_staging_key_singleton_check",sql`${t.singleton}`),
+    readsCheck:check("worker_staging_key_reads_check",sql`NOT ${t.readsEnabled} OR ${t.complete}`),
+    phaseCheck:check("worker_staging_key_phase_check",sql`${t.indexPhase} IN ('present','retiring','retired','restoring')`),
+    phaseActive:check("worker_staging_key_active_phase_check",sql`${t.indexPhase}='present' OR ${t.readsEnabled}`),
+    signatureCheck:check("worker_staging_key_trigger_hash_check",sql`${t.trackingSignature} IS NULL OR ${t.trackingSignature} ~ '^[0-9a-f]{64}$'`),
+    revisionCheck:check("worker_staging_key_revision_check",sql`${t.retirementRevision} IS NULL OR ${t.retirementRevision} ~ '^[0-9a-f]{40}$'`),
   }),
 );
 

@@ -1452,7 +1452,7 @@ command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vites
 name = "publication-services"
 tier = "development"
 requires = ["types"]
-command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/progressive-report-service.test.ts"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/progressive-report-service.test.ts", "test/progressive-remote-http.test.ts"]
 
 [[test.staging-selection.check]]
 name = "settlement-evidence"
@@ -5586,6 +5586,12 @@ diagnostic_sources = [{ format = "junit", path = "report.xml" }]
 # Host admission time counts against the complete graph's deadline.
 timeout_seconds = 7200
 
+[[test.progressive-report-archive.check]]
+name = "deployment-storage-cleanup"
+tier = "development"
+timeout_seconds = 60
+command = ["/bin/bash", "-c", "repo_git=$(git rev-parse --path-format=absolute --git-common-dir) && exec \"${repo_git%/*}/.venv/bin/python\" -m pytest tests/test_deployment_storage_prune.py -q"]
+
 [test.progressive-report-archive.postgres]
 image = "postgres:16-alpine"
 database = "aerodb"
@@ -5829,9 +5835,11 @@ diagnostic_sources = [{ format = "junit", path = "report.xml" }]
 name = "legacy-custody"
 tier = "development"
 timeout_seconds = 300
-requires = ["seed"]
+# This fixture changes both instance identity and report normalization for its transaction.
+requires = ["workspace"]
 env = { PROGRESSIVE_REPORT_ARCHIVE_DISPOSABLE_DB = "1" }
-command = ["/bin/bash", "-c", "exec /usr/bin/corepack pnpm --filter @aerodb/db exec vitest run test/legacy-report-custody.test.ts test/legacy-report-custody-page.test.ts --reporter=default --reporter=junit --outputFile.junit=\"$DEVCOORDINATOR_DIAGNOSTICS_DIR/report.xml\""]
+case_command = ["/bin/bash", "-c", "/usr/bin/corepack pnpm --filter @aerodb/db migrate && /usr/bin/corepack pnpm --filter @aerodb/db seed && exec /usr/bin/corepack pnpm --filter @aerodb/db exec vitest run test/legacy-report-custody.test.ts test/legacy-report-custody-page.test.ts --reporter=default --reporter=junit --outputFile.junit=\"$DEVCOORDINATOR_DIAGNOSTICS_DIR/report.xml\""]
+cases = [{ id = "isolated-custody", args = [], postgres = "default" }]
 diagnostic_sources = [{ format = "junit", path = "report.xml" }]
 
 [[test.progressive-report-archive.check]]
@@ -5873,7 +5881,7 @@ name = "terminal-recovery"
 tier = "development"
 timeout_seconds = 900
 requires = ["seed"]
-command = ["/bin/bash", "-c", "exec /usr/bin/corepack pnpm --filter @aerodb/db exec vitest run test/campaign-profile-enrollment.test.ts -t 'terminal evidence inventory preserves exact ownership|recovers an authenticated mixed RANS promotion from a fresh stage-2 execution|progressive remote dispatch pins one exact request' --reporter=default --reporter=junit --outputFile.junit=\"$DEVCOORDINATOR_DIAGNOSTICS_DIR/report.xml\""]
+command = ["/bin/bash", "-c", "exec /usr/bin/corepack pnpm --filter @aerodb/db exec vitest run test/campaign-profile-enrollment.test.ts -t 'terminal evidence inventory preserves exact ownership|recovers an authenticated mixed RANS promotion from a fresh stage-2 execution|progressive remote dispatch pins one exact request|progressive remote dispatch composes only after authenticated capabilities' --reporter=default --reporter=junit --outputFile.junit=\"$DEVCOORDINATOR_DIAGNOSTICS_DIR/report.xml\""]
 diagnostic_sources = [{ format = "junit", path = "report.xml" }]
 
 # Exact per-attempt shortening boundary: disposable schema, real 0207/0208,
@@ -6139,6 +6147,7 @@ depends_on = ["db"]
 health = { path = "/health", timeout_seconds = 240 }
 
 [deployment.catalog-paging.component.web]
+route = true
 type = "process"
 command = ["bash", "scripts/dev/progressive-preview.sh", "web"]
 port = true
@@ -6218,3 +6227,180 @@ timeout_seconds = 90
 name = "authenticated-stage-reads"
 tier = "development"
 command = ["node", "scripts/dev/verify-campaign-stage-fixture.mjs"]
+
+# Isolated measurement only. The capture step supplies the private binary PG corpus.
+[test.hz-worker-rewrite-cost]
+timeout_seconds = 3600
+
+[test.hz-worker-rewrite-cost.postgres]
+image = "postgres:16-alpine"
+database = "hz_rewrite_cost"
+user = "aerodb"
+
+[[test.hz-worker-rewrite-cost.check]]
+name = "workspace"
+tier = "development"
+timeout_seconds = 600
+command = ["/usr/bin/corepack", "pnpm", "install", "--frozen-lockfile", "--ignore-scripts", "--offline"]
+
+[[test.hz-worker-rewrite-cost.check]]
+name = "schema"
+tier = "development"
+requires = ["workspace"]
+timeout_seconds = 360
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "migrate"]
+
+[[test.hz-worker-rewrite-cost.check]]
+name = "full-rewrites"
+tier = "development"
+requires = ["schema"]
+timeout_seconds = 3000
+env = { HZ_REWRITE_COST_DISPOSABLE = "1", PYTHONDONTWRITEBYTECODE = "1" }
+command = ["python3", "-B", "tests/fixtures/hz-rewrite/rehearse_cost.py", "--corpus", ".codex-artifacts/hz-rewrite-cost-corpus", "--output", ".codex-artifacts/hz-rewrite-cost-result/summary.json"]
+retained_artifacts = [{ name = "full-rewrite-cost", path = ".codex-artifacts/hz-rewrite-cost-result", max_bytes = 4194304 }]
+
+[test.hz-worker-toast-cost]
+timeout_seconds = 3600
+
+[test.hz-worker-toast-cost.postgres]
+image = "postgres:16-alpine"
+database = "hz_rewrite_cost"
+user = "aerodb"
+
+[[test.hz-worker-toast-cost.check]]
+name = "workspace"
+tier = "development"
+timeout_seconds = 600
+command = ["/usr/bin/corepack", "pnpm", "install", "--frozen-lockfile", "--ignore-scripts", "--offline"]
+
+[[test.hz-worker-toast-cost.check]]
+name = "schema"
+tier = "development"
+requires = ["workspace"]
+timeout_seconds = 360
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "migrate"]
+
+[[test.hz-worker-toast-cost.check]]
+name = "toast-rewrites"
+tier = "development"
+requires = ["schema"]
+timeout_seconds = 3000
+env = { HZ_REWRITE_COST_DISPOSABLE = "1", PYTHONDONTWRITEBYTECODE = "1" }
+command = ["python3", "-B", "tests/fixtures/hz-rewrite/rehearse_cost.py", "--corpus", ".codex-artifacts/hz-rewrite-cost-corpus", "--output", ".codex-artifacts/hz-toast-rewrite-cost-result/summary.json", "--toast-only", "--copies", "32"]
+retained_artifacts = [{ name = "full-rewrite-cost", path = ".codex-artifacts/hz-toast-rewrite-cost-result", max_bytes = 4194304 }]
+
+# PostgreSQL and immutable object bytes are disposable for this workload.
+[test.worker-staging-key-rollout]
+timeout_seconds = 900
+[test.worker-staging-key-rollout.postgres]
+image = "postgres:16-alpine"
+database = "aerodb"
+user = "aerodb"
+
+[[test.worker-staging-key-rollout.check]]
+name = "workspace"
+tier = "development"
+timeout_seconds = 240
+command = ["/usr/bin/corepack", "pnpm", "install", "--frozen-lockfile", "--ignore-scripts", "--offline"]
+[[test.worker-staging-key-rollout.check]]
+name = "schema"
+tier = "development"
+requires = ["workspace"]
+timeout_seconds = 180
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "migrate"]
+[[test.worker-staging-key-rollout.check]]
+name = "concurrent-backfill"
+tier = "development"
+requires = ["schema"]
+timeout_seconds = 90
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/worker-staging-key-backfill.test.ts", "--reporter=default"]
+[[test.worker-staging-key-rollout.check]]
+name = "source-and-key-selectors"
+tier = "development"
+requires = ["schema"]
+timeout_seconds = 180
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/progressive-staging-selection.test.ts", "test/progressive-stopped-storage.test.ts", "--reporter=default"]
+[[test.worker-staging-key-rollout.check]]
+name = "workload-to-storage"
+tier = "development"
+requires = ["workspace"]
+timeout_seconds = 240
+env = { PROGRESSIVE_REPORT_ARCHIVE_DISPOSABLE_DB="1", WORKER_STAGING_KEYS_ACCEPTANCE="1", NODE_ENV="test" }
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/progressive-report-archive.test.ts", "-t", "one registered worker workload through tracking, storage and rollback", "--reporter=default"]
+retained_artifacts = [{ name = "staging-key-workload", path = ".codex-artifacts/worker-staging-key-workload", max_bytes = 524288 }]
+
+[[test.worker-staging-key-rollout.check]]
+name = "seed-regressions"
+tier = "development"
+requires = ["schema"]
+timeout_seconds = 180
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "seed"]
+[[test.worker-staging-key-rollout.check]]
+name = "retention-and-delivery"
+tier = "development"
+requires = ["seed-regressions"]
+timeout_seconds = 300
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/progressive-report-retention.test.ts", "test/progressive-delivery-selection.test.ts", "--reporter=default"]
+[[test.worker-staging-key-rollout.check]]
+name = "archive-readers"
+tier = "development"
+requires = ["seed-regressions"]
+timeout_seconds = 240
+env = { PROGRESSIVE_REPORT_ARCHIVE_DISPOSABLE_DB="1", NODE_ENV="test" }
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/progressive-report-archive.test.ts", "--reporter=default"]
+[[test.worker-staging-key-rollout.check]]
+name = "release-identity"
+tier = "development"
+timeout_seconds = 45
+command = ["/usr/bin/python3", "-B", "tests/test_worker_staging_key_release.py"]
+[[test.worker-staging-key-rollout.check]]
+name = "workspace-types"
+tier = "development"
+requires = ["workspace"]
+timeout_seconds = 300
+command = ["/usr/bin/corepack", "pnpm", "-r", "typecheck"]
+
+[test.shared-report-daemon]
+timeout_seconds = 1100
+
+[test.shared-report-daemon.postgres]
+image = "postgres:16-alpine"
+database = "shared_report_service"
+user = "aerodb"
+
+[[test.shared-report-daemon.check]]
+name = "workspace"
+tier = "development"
+command = ["/usr/bin/corepack","pnpm","install","--frozen-lockfile","--ignore-scripts","--offline"]
+
+[[test.shared-report-daemon.check]]
+name = "schema"
+tier = "development"
+requires = ["workspace"]
+command = ["/usr/bin/corepack","pnpm","--filter","@aerodb/db","migrate"]
+
+[[test.shared-report-daemon.check]]
+name = "seed"
+tier = "development"
+requires = ["schema"]
+command = ["/usr/bin/corepack","pnpm","--filter","@aerodb/db","seed"]
+
+[[test.shared-report-daemon.check]]
+name = "recurring-service"
+tier = "development"
+timeout_seconds = 360
+requires = ["seed"]
+env = { PROGRESSIVE_REPORT_ARCHIVE_DISPOSABLE_DB="1", NODE_ENV="test", AIRFOILFOAM_DEPLOYMENT_ROLE="hub", AIRFOILFOAM_EVIDENCE_BUCKET="shared-fixture", LOG_LEVEL="error" }
+command = ["/usr/bin/corepack","pnpm","--filter","@aerodb/sweeper","exec","vitest","run","test/shared-stopped-report-service.test.ts"]
+
+[[test.shared-report-daemon.check]]
+name = "types"
+tier = "development"
+requires = ["workspace"]
+command = ["/usr/bin/corepack","pnpm","-r","typecheck"]
+
+[[test.shared-report-daemon.check]]
+name = "transport"
+tier = "development"
+requires = ["workspace"]
+command = ["/usr/bin/corepack","pnpm","--filter","@aerodb/sweeper","exec","vitest","run","test/progressive-report-archive-roundtrip.test.ts"]

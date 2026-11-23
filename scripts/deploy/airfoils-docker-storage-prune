@@ -34,7 +34,7 @@ if [[ "$DEPLOY_ROOT" != /* || "$DEPLOY_ROOT" == "/" ]]; then
 fi
 
 exec 9>"$LOCK_FILE"
-if ! flock -n 9; then
+if ! flock -x -n 9; then
   echo "Deployment-host storage cleanup is already running; leaving this invocation idle."
   exit 0
 fi
@@ -46,7 +46,16 @@ fi
 # truncating write from a system service is denied by fs.protected_regular;
 # flock needs only the shared inode, so use a non-mutating descriptor.
 exec 8<"$DEPLOY_LOCK_FILE"
-if ! flock -n 8; then
+# Only contention is a successful skip. Surface lock or descriptor errors.
+try_deploy_lock() {
+  local rc
+  flock "$1" -n -E 75 8 && return 0
+  rc=$?
+  ((rc == 75)) || exit "$rc"
+  return 1
+}
+
+if ! try_deploy_lock -s; then
   echo "A deployment is running; leaving deployment-host storage cleanup idle."
   exit 0
 fi
@@ -85,6 +94,17 @@ removed_source_trees=0
 removed_source_bytes=0
 staging_age_minutes=$((STAGING_MAX_AGE_HOURS * 60))
 
+report_cleanup() {
+  printf '%s\n' "${image_summary##*$'\n'}"
+  printf '%s\n' "${cache_summary##*$'\n'}"
+  printf 'Deployment source cleanup: state=%s removed_trees=%s removed_bytes=%s release_keep=%s staging_max_age_hours=%s\n' \
+    "$1" "$removed_source_trees" "$removed_source_bytes" \
+    "$RELEASE_KEEP_COUNT" "$STAGING_MAX_AGE_HOURS"
+  printf 'Docker storage cleanup complete: docker_root=%s free_bytes=%s free_bytes_delta_during_run=%s retention_hours=%s build_cache_keep=%s\n' \
+    "$DOCKER_ROOT_DIR" "$after_bytes" "$free_bytes_delta" "$RETENTION_HOURS" \
+    "$BUILD_CACHE_KEEP_STORAGE"
+}
+
 remove_source_tree() {
   local target="$1" target_real bytes
   [[ -d "$target" && ! -L "$target" ]] || return 0
@@ -116,7 +136,14 @@ remove_old_children() {
   )
 }
 
-deployment_cleanup="complete"
+# Docker's two bounded prunes are complete. Yield shared access before
+# the exclusive acquisition on the same inode, before looking up any source trees.
+flock -u 8
+if ! try_deploy_lock -x; then
+  report_cleanup deferred
+  exit 0
+fi
+
 remove_old_children "$DEPLOY_ROOT/deploy-staging"
 remove_old_children "$DEPLOY_ROOT/staging"
 remove_old_children "$DEPLOY_ROOT/incoming"
@@ -173,11 +200,4 @@ if [[ -e "$RELEASES_DIR" ]]; then
   )
 fi
 
-printf '%s\n' "${image_summary##*$'\n'}"
-printf '%s\n' "${cache_summary##*$'\n'}"
-printf 'Deployment source cleanup: state=%s removed_trees=%s removed_bytes=%s release_keep=%s staging_max_age_hours=%s\n' \
-  "$deployment_cleanup" "$removed_source_trees" "$removed_source_bytes" \
-  "$RELEASE_KEEP_COUNT" "$STAGING_MAX_AGE_HOURS"
-printf 'Docker storage cleanup complete: docker_root=%s free_bytes=%s free_bytes_delta_during_run=%s retention_hours=%s build_cache_keep=%s\n' \
-  "$DOCKER_ROOT_DIR" "$after_bytes" "$free_bytes_delta" "$RETENTION_HOURS" \
-  "$BUILD_CACHE_KEEP_STORAGE"
+report_cleanup complete

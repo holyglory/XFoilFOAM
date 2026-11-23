@@ -32,6 +32,28 @@ const terminalReportJob = sql`(job.status NOT IN ('pending', 'submitted', 'runni
       AND stopped.engine_job_id = job.engine_job_id
       AND stopped.engine_job_id = job.id::text))`;
 
+/** Admission needs a threshold, not the identities of the oldest missing rows.
+ * Recent arrivals can prove pressure cheaply. A miss always checks the whole
+ * history, including old receipts whose point inventory is still absent. */
+export function progressiveAdmissionReportPressureSql(limit: number) {
+  if (!Number.isSafeInteger(limit) || limit < 1) throw new Error("Invalid admission report threshold");
+  return sql`WITH recent AS MATERIALIZED (
+    SELECT r.sim_job_id,r.sequence FROM progressive_remote_reports r
+    ORDER BY r.received_at DESC,r.sim_job_id DESC,r.sequence DESC LIMIT ${limit * 4}
+  ) SELECT CASE WHEN EXISTS (
+    SELECT 1 FROM recent r CROSS JOIN LATERAL (
+      SELECT EXISTS(SELECT FROM progressive_remote_progress_receipts p WHERE p.sim_job_id=r.sim_job_id AND p.sequence=r.sequence) AS applied,
+        EXISTS(SELECT FROM progressive_remote_report_inventories i WHERE i.sim_job_id=r.sim_job_id AND i.sequence=r.sequence) AS indexed
+      OFFSET 0
+    ) seen WHERE NOT seen.applied OR NOT seen.indexed OFFSET ${limit-1}
+  ) THEN true ELSE EXISTS (
+    SELECT 1 FROM progressive_remote_reports r
+    LEFT JOIN progressive_remote_progress_receipts p ON p.sim_job_id=r.sim_job_id AND p.sequence=r.sequence
+    LEFT JOIN progressive_remote_report_inventories i ON i.sim_job_id=r.sim_job_id AND i.sequence=r.sequence
+    WHERE p.sequence IS NULL OR i.sequence IS NULL OFFSET ${limit-1}
+  ) END AS throttled`;
+}
+
 export function progressiveReportPressureSql(jobIds?: string[]) {
   return sql`WITH pending AS MATERIALIZED (
     SELECT report.sim_job_id, count(*)::integer AS reports, min(report.received_at) AS oldest

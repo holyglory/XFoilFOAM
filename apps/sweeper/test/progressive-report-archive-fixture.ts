@@ -1,8 +1,10 @@
+import { ensureSimulationPresetRevision } from "@aerodb/db/simulation-setup";
 import {
   airfoils,
   analysisContentHash,
   createClient,
   registeredRemoteSolvers,
+  progressiveWorkerSubmissionIntents,
   resultAttempts,
   results,
   sealProgressiveRemoteExecution,
@@ -16,6 +18,8 @@ import {
   canonicalReportJson,
   parseReportJson,
 } from "@aerodb/db/progressive-report-archive";
+import { acknowledgeProgressiveWorkerReport } from "@aerodb/db/progressive-worker-reports";
+import { validateProgressiveRemoteReport } from "@aerodb/db/progressive-remote-report";
 import { progressiveRemoteReportInventory } from "@aerodb/db/progressive-remote-inventory";
 import { setProgressiveReportNormalization } from "@aerodb/db/progressive-report-payloads";
 import { sql } from "drizzle-orm";
@@ -38,7 +42,7 @@ export interface ArchiveFixture {
   source: ArchiveSource;
   executionId: string;
   promiseId: string;
-  attemptId: string;
+  attemptId?: string;
   reports: {
     sequence: number;
     contentSignature: string;
@@ -49,21 +53,46 @@ export interface ArchiveFixture {
 
 /** Reuse the exact setup fixture, with real migrated report tables/triggers.
  * Everything, including singleton normalization and immutable archives, rolls
- * back; deleting immutable rows is deliberately not part of fixture cleanup. */
+ * back in the ordinary suite. The named paired-database acceptance explicitly
+ * persists its fixture across transactions and drops its own databases afterwards. */
 export async function withArchiveFixture(
   client: ReturnType<typeof createClient>,
   source: ArchiveSource,
   run: (fixture: ArchiveFixture) => Promise<void>,
   options: {
     normalized?: boolean;
+    serviceAcceptance?: "pending" | "ordinary";
     stopped?: boolean;
     settled?: boolean;
     reportCount?: number;
     angles?: number[];
     historyRepeats?: number;
     legacyConflict?: "identical" | "distinct";
+    // The dedicated rollout graph needs durable transactions across its
+    // baseline, changing read view and independent archive reader.
+    stagingAcceptance?: {
+      t: number[];
+      cl: number[];
+      cd: number[];
+      cm: number[];
+    };
   } = {},
 ) {
+  if (options.serviceAcceptance) {
+    const [target]=await client.sql`SELECT current_database() AS name`;
+    if(source!=="remote" || target.name!=="shared_report_service" || process.env.PROGRESSIVE_REPORT_ARCHIVE_DISPOSABLE_DB!=="1")
+      throw new Error("Committed shared-report service fixtures require their isolated PG16 database");
+  }
+  if (options.stagingAcceptance) {
+    const [dbName] = await client.sql`SELECT current_database() AS name`;
+    if (
+      process.env.WORKER_STAGING_KEYS_ACCEPTANCE !== "1" ||
+      !/^staging_key_worker_[a-f0-9]{32}$/.test(String(dbName.name))
+    )
+      throw new Error(
+        "Persisted workload fixture requires its dedicated disposable database",
+      );
+  }
   const rollback = new Error(
     "Rollback disposable progressive report archive fixture",
   );
@@ -79,6 +108,23 @@ export async function withArchiveFixture(
         db,
         `report-archive-${executionId}`,
       );
+      let revisionId = solver.revisionId;
+      let reynolds = 1_234_567;
+      if (options.stagingAcceptance || options.serviceAcceptance) {
+        const [parent] = await db.execute(
+          sql`SELECT preset_id FROM simulation_preset_revisions WHERE id=${revisionId}::uuid`,
+        );
+        const resolved = await ensureSimulationPresetRevision(
+          db,
+          String(parent.preset_id),
+        );
+        if (!resolved)
+          throw new Error(
+            "The workload needs a complete immutable simulation setup",
+          );
+        revisionId = resolved.revision.id;
+        reynolds = resolved.snapshot.derived.reynolds;
+      }
       const [airfoil] = await db
         .select({ id: airfoils.id, slug: airfoils.slug })
         .from(airfoils)
@@ -136,12 +182,24 @@ export async function withArchiveFixture(
         id: promiseId,
         registeredSolverId: remote.id,
         airfoilId: airfoil.id,
-        simulationPresetRevisionId: solver.revisionId,
+        simulationPresetRevisionId: revisionId,
         aoaCount: units.length,
-        status: "expired",
+        status: options.stagingAcceptance ? "cancelled" : "expired",
         expiresAt: new Date("2026-01-01T00:00:00Z"),
         requestPayload: { ...envelope },
       });
+      if (options.stagingAcceptance) {
+        await db.execute(sql`UPDATE public.registered_remote_solvers SET instance_id=(SELECT instance_id::text FROM public.sync_api_settings WHERE id=1),
+          auth_token_hash=encode(sha256(convert_to('disposable-staging-key-token','UTF8')),'hex') WHERE id=${remote.id}::uuid`);
+        await db.execute(sql`INSERT INTO public.sync_sweep_promise_points(promise_id,airfoil_id,simulation_preset_revision_id,aoa_deg,status)
+          VALUES(${promiseId}::uuid,${airfoil.id}::uuid,${revisionId}::uuid,0,'cancelled')`);
+        await db.execute(sql`UPDATE public.sync_api_settings SET remote_solver_enabled=false,
+          remote_solver_registered_id=${remote.id}::uuid,upstream_base_url='https://staging-key.invalid/api/sync/v1',
+          remote_solver_auth_token='disposable-staging-key-token',remote_solver_transfer_paused=false WHERE id=1`);
+        await db.execute(
+          sql`UPDATE public.sync_sweep_promises SET source_base_url='https://staging-key.invalid/api/sync/v1' WHERE id=${promiseId}::uuid`,
+        );
+      }
       // Hub ownership comes only from its dispatch. Worker ownership comes only
       // from its local mirror payload; neither fixture has the other's identity.
       await db.insert(simJobs).values({
@@ -149,7 +207,7 @@ export async function withArchiveFixture(
         engineJobId: executionId,
         airfoilId: airfoil.id,
         bcIds: [solver.bcId],
-        simulationPresetRevisionId: solver.revisionId,
+        simulationPresetRevisionId: revisionId,
         referenceChordM: 0.987654,
         status: "failed",
         engineState: "failed",
@@ -163,6 +221,13 @@ export async function withArchiveFixture(
                 remoteSolver: true,
                 syncPromiseId: promiseId,
                 remoteProgressiveExecution: envelope,
+                ...(options.stagingAcceptance
+                  ? {
+                      upstreamBaseUrl:
+                        "https://staging-key.invalid/api/sync/v1",
+                      engineRequest: envelope.request,
+                    }
+                  : {}),
               },
       });
       if (source === "remote")
@@ -173,41 +238,95 @@ export async function withArchiveFixture(
 
       // Retain an actual rejected attempt and its result projection, so an
       // archive cannot appear correct merely because the result tables are empty.
-      const [result] = await db
-        .insert(results)
-        .values({
-          airfoilId: airfoil.id,
-          bcId: solver.bcId,
-          simulationPresetRevisionId: solver.revisionId,
-          aoaDeg: 0,
+      // The paired workload creates its attempt later through normal ingestion.
+      const force = options.stagingAcceptance ?? (options.serviceAcceptance ? {t:[0,1,2],cl:[0.2,0.3,0.4],cd:[0.015,0.014,0.012],cm:[-0.01,-0.02,-0.03]} : undefined);
+      const runtime = {
+        ...envelope.request.expected_engine!,
+        build_id: "disposable-worker-staging-acceptance",
+        application_source_sha256: analysisContentHash({
+          fixture: executionId,
+        }),
+      };
+      const provenance = force
+        ? {
+            engine: runtime,
+            execution_pool: envelope.request.expected_execution_pool,
+          }
+        : {};
+      const point = {
+        aoa_deg: 0,
+        case_slug: "archive-case",
+        cl: force?.cl.at(-1) ?? null,
+        cd: force?.cd.at(-1) ?? null,
+        cm: force?.cm.at(-1) ?? null,
+        converged: false,
+        unsteady: force !== undefined,
+        first_order_fallback: false,
+        images: {},
+        error: "repeated immutable history λ🌬️".repeat(
+          options.historyRepeats ?? 512,
+        ),
+        ...(force
+          ? {
+              ...provenance,
+              solver_active_seconds: 48,
+              fidelity: "urans_full",
+              failure_disposition: "hard_solver",
+              force_history: force,
+            }
+          : {}),
+      };
+      let seededAttemptId: string | undefined;
+      if (!force) {
+        const [result] = await db
+          .insert(results)
+          .values({
+            airfoilId: airfoil.id,
+            bcId: solver.bcId,
+            simulationPresetRevisionId: revisionId,
+            aoaDeg: 0,
+            simJobId: executionId,
+            engineJobId: executionId,
+            engineCaseSlug: "archive-case",
+            status: "failed",
+            source: "solved",
+            regime: "rans",
+            converged: false,
+          })
+          .returning();
+        const [attempt] = await db
+          .insert(resultAttempts)
+          .values({
+            resultId: result.id,
+            airfoilId: airfoil.id,
+            bcId: solver.bcId,
+            simulationPresetRevisionId: revisionId,
+            aoaDeg: 0,
+            simJobId: executionId,
+            engineJobId: executionId,
+            engineCaseSlug: "archive-case",
+            status: "failed",
+            source: "solved",
+            regime: "rans",
+            validForPolar: false,
+            converged: false,
+            error: "retained archive regression diagnostic",
+          })
+          .returning();
+        seededAttemptId = attempt.id;
+      }
+      if (options.stagingAcceptance) {
+        await db.insert(progressiveWorkerSubmissionIntents).values({
           simJobId: executionId,
-          engineJobId: executionId,
-          engineCaseSlug: "archive-case",
-          status: "failed",
-          source: "solved",
-          regime: "rans",
-          converged: false,
-        })
-        .returning();
-      const [attempt] = await db
-        .insert(resultAttempts)
-        .values({
-          resultId: result.id,
-          airfoilId: airfoil.id,
-          bcId: solver.bcId,
-          simulationPresetRevisionId: solver.revisionId,
-          aoaDeg: 0,
-          simJobId: executionId,
-          engineJobId: executionId,
-          engineCaseSlug: "archive-case",
-          status: "failed",
-          source: "solved",
-          regime: "rans",
-          validForPolar: false,
-          converged: false,
-          error: "retained archive regression diagnostic",
-        })
-        .returning();
+          token: randomUUID(),
+          assignmentSignature: envelope.contentSignature,
+          authorization: {
+            kind: "authorized",
+            executionId,
+            contentSignature: envelope.contentSignature,
+          },
+        });
+      }
       const proof = {
         version: 1,
         job_id: executionId,
@@ -231,7 +350,7 @@ export async function withArchiveFixture(
         source,
         executionId,
         promiseId,
-        attemptId: attempt.id,
+        ...(seededAttemptId ? { attemptId: seededAttemptId } : {}),
         reports: [],
       };
       const count = options.reportCount ?? 3;
@@ -244,12 +363,13 @@ export async function withArchiveFixture(
           assignmentSignature: envelope.contentSignature,
           sequence,
           status: {
+            ...provenance,
             job_id: executionId,
             state: sequence === count ? "failed" : "running",
             total_cases: units.length,
             completed_cases: sequence === 1 ? 0 : 1,
             // Unknown diagnostic values must survive archival without JS rounding.
-            diagnosticLargeInteger: "__LARGE_INTEGER__",
+            diagnosticLargeInteger: force ? 2147483647 : "__LARGE_INTEGER__",
             diagnosticNull: null,
             message: [
               "archive diagnostic: λ 🌬️",
@@ -261,40 +381,30 @@ export async function withArchiveFixture(
             sequence === 1
               ? null
               : {
+                  ...provenance,
                   job_id: executionId,
                   state: sequence === count ? "failed" : "running",
                   polars: [
                     {
                       chord: 0.987654,
                       speed: 19.876543,
-                      reynolds: 1_234_567,
+                      reynolds,
                       points: [],
-                      attempts: [
-                        {
-                          aoa_deg: 0,
-                          case_slug: "archive-case",
-                          cl: null,
-                          cd: null,
-                          cm: null,
-                          converged: false,
-                          unsteady: false,
-                          first_order_fallback: false,
-                          images: {},
-                          error: "repeated immutable history λ🌬️".repeat(
-                            options.historyRepeats ?? 512,
-                          ),
-                        },
-                      ],
+                      attempts: [point],
                     },
                   ],
                 },
           stopProof:
             sequence === count && options.stopped !== false ? proof : null,
         };
-        const inputText = JSON.stringify(report).replace(
-          '"__LARGE_INTEGER__"',
-          LARGE_REPORT_INTEGER,
-        );
+        const inputText = force
+          ? JSON.stringify(
+              validateProgressiveRemoteReport(report, envelope).report,
+            )
+          : JSON.stringify(report).replace(
+              '"__LARGE_INTEGER__"',
+              LARGE_REPORT_INTEGER,
+            );
         const contentSignature = archiveSha256(
           canonicalReportJson(parseReportJson(inputText)),
         );
@@ -330,17 +440,30 @@ export async function withArchiveFixture(
             await db.execute(sql`INSERT INTO progressive_remote_report_sources
               (sim_job_id,sequence,point_content_signature,aoa_deg,case_slug)
               VALUES (${executionId}::uuid,${sequence},${point.point_content_signature},${point.aoa_deg},${point.case_slug})`);
-            await db.execute(sql`INSERT INTO progressive_remote_diagnostic_receipts
+            if (options.serviceAcceptance !== "pending") await db.execute(sql`INSERT INTO progressive_remote_diagnostic_receipts
               (sim_job_id,sequence,point_content_signature,receipt)
               VALUES (${executionId}::uuid,${sequence},${point.point_content_signature},'{"kind":"retained-progressive-diagnostic"}'::jsonb)
               ON CONFLICT DO NOTHING`);
           }
           await db.execute(sql`INSERT INTO progressive_remote_progress_receipts (sim_job_id,sequence,content_signature)
             VALUES (${executionId}::uuid,${sequence},${contentSignature})`);
-        } else if (source === "worker" && options.settled !== false) {
-          await db.execute(sql`UPDATE progressive_worker_reports SET acknowledged_at=clock_timestamp()
+        } else if (
+          source === "worker" &&
+          options.settled !== false &&
+          !(force && sequence === count)
+        ) {
+          if (force)
+            await acknowledgeProgressiveWorkerReport(db, {
+              executionId,
+              solverId: remote.id,
+              sequence,
+              contentSignature,
+            });
+          else
+            await db.execute(sql`UPDATE progressive_worker_reports SET acknowledged_at=clock_timestamp()
             WHERE sim_job_id=${executionId}::uuid AND sequence=${sequence}`);
-          await db.execute(sql`INSERT INTO progressive_worker_evidence_receipts (sim_job_id,sequence,content_signature)
+          if (!force)
+            await db.execute(sql`INSERT INTO progressive_worker_evidence_receipts (sim_job_id,sequence,content_signature)
             VALUES (${executionId}::uuid,${sequence},${contentSignature})`);
         }
         const [stored] =
@@ -357,7 +480,7 @@ export async function withArchiveFixture(
         });
       }
       await run(fixture);
-      throw rollback;
+      if (!options.stagingAcceptance && !options.serviceAcceptance) throw rollback;
     });
   } catch (error) {
     if (error !== rollback) throw error;

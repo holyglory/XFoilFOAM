@@ -156,13 +156,14 @@ async function inspectBundle(
   );
 }
 
-async function stage(
+export async function stageBrokerArchive(
   source: Readable,
   identity: LocalIdentity,
   expectedCrc?: string,
+  maxBytes = MAX_STORED_BYTES,
 ) {
   const directory = await mkdtemp(join(tmpdir(), "worker-report-broker-"));
-  const path = join(directory, "bundle.jsonl.gz");
+  const path = join(directory, "archive");
   const remove = () => rm(directory, { recursive: true, force: true });
   const hash = createHash("sha256");
   const crc = new CRC32C();
@@ -173,7 +174,7 @@ async function stage(
       new Transform({
         transform(raw: Buffer, _encoding, callback) {
           size += raw.byteLength;
-          if (size > identity.byteSize || size > MAX_STORED_BYTES)
+          if (size > identity.byteSize || size > maxBytes)
             return callback(
               new ReportArchiveBrokerError(
                 413,
@@ -203,7 +204,7 @@ async function stage(
 }
 
 let storage: Storage | undefined;
-function storageClient() {
+export function brokerArchiveStorage() {
   // Only the hub resolves server-side credentials. Workers receive an archive
   // identity, never a credential, bearer capability, or caller-chosen object.
   return (storage ??= new Storage());
@@ -228,7 +229,7 @@ async function exactFile(
   crc32c?: string,
 ): Promise<{ file: File; identity: WorkerReportArchiveIdentity }> {
   const scope = objectScope(executionId, identity.sha256);
-  const bucket = storageClient().bucket(scope.bucket);
+  const bucket = brokerArchiveStorage().bucket(scope.bucket);
   const initialFile = generation
     ? generationPinnedFile(bucket, scope.objectKey, generation)
     : bucket.file(scope.objectKey);
@@ -285,7 +286,7 @@ export async function putBrokeredWorkerReportBundle(
   assertLocalIdentity(executionId, identity);
   const dispatch = await ownedDispatch(db, solver, executionId);
   const scope = objectScope(executionId, identity.sha256);
-  const local = await stage(body, identity);
+  const local = await stageBrokerArchive(body, identity);
   try {
     await inspectBundle(
       local.path,
@@ -305,7 +306,7 @@ export async function putBrokeredWorkerReportBundle(
       dispatch,
     );
     try {
-      await storageClient()
+      await brokerArchiveStorage()
         .bucket(scope.bucket)
         .upload(local.path, {
           destination: scope.objectKey,
@@ -336,7 +337,7 @@ export async function putBrokeredWorkerReportBundle(
       undefined,
       local.crc32c,
     );
-    const proof = await stage(
+    const proof = await stageBrokerArchive(
       remote.file.createReadStream({ validation: "crc32c", decompress: false }),
       identity,
       remote.identity.crc32c,
@@ -372,7 +373,7 @@ export async function restoreBrokeredWorkerReportBundle(
     generation,
     crc32c,
   );
-  const restored = await stage(
+  const restored = await stageBrokerArchive(
     remote.file.createReadStream({ validation: "crc32c", decompress: false }),
     identity,
     crc32c,

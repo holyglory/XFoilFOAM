@@ -67,23 +67,25 @@ export function progressiveStagingSelectionSql(preferActive: boolean) {
     FROM sync_api_settings WHERE id = 1`;
   const report = (active: boolean, terminalOnly: boolean) => {
     const direction = active ? sql`DESC` : sql`ASC`;
+    // Probe the ordinary receipt first, then validate a closed copy at this
+    // exact key. Comparing every historical copy to every candidate is costly.
     return sql`SELECT report.sim_job_id, report.sequence, report.created_at
-      FROM progressive_worker_reports report
+      FROM progressive_worker_staging_candidates report
       CROSS JOIN settings
       LEFT JOIN progressive_worker_staging_failures failure
         ON failure.sim_job_id = report.sim_job_id AND failure.sequence = report.sequence
       WHERE NOT settings.remote_solver_transfer_paused
         AND settings.remote_solver_auth_token <> ''
         AND settings.upstream_base_url IS NOT NULL
-        AND report.acknowledged_at IS NOT NULL
-        AND jsonb_typeof(report.report->'result') = 'object'
-        AND NOT EXISTS (SELECT 1 FROM public.progressive_worker_closed_staging_copies covered
+        AND NOT EXISTS (
+          SELECT 1 FROM progressive_worker_evidence_receipts receipt
+            WHERE receipt.sim_job_id=report.sim_job_id AND receipt.sequence=report.sequence
+          UNION ALL
+          SELECT 1 FROM public.progressive_worker_closed_staging_copies covered
           WHERE covered.sim_job_id=report.sim_job_id AND covered.sequence=report.sequence)
         AND NOT EXISTS (SELECT 1 FROM progressive_worker_report_conflicts conflict
           WHERE conflict.sim_job_id = report.sim_job_id AND conflict.sequence = report.sequence)
         AND (failure.sim_job_id IS NULL OR failure.retry_after <= clock_timestamp())
-        AND NOT EXISTS (SELECT 1 FROM progressive_worker_evidence_receipts receipt
-          WHERE receipt.sim_job_id = report.sim_job_id AND receipt.sequence = report.sequence)
         ${terminalOnly ? sql`AND report.stopped_engine_job_id = report.sim_job_id::text` : sql``}
         AND EXISTS (
           SELECT 1

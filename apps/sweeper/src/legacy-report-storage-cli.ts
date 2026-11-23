@@ -2,6 +2,10 @@ import {
   LegacyStorageOperationError,
   legacyLocalStorageError,
 } from "./legacy-report-storage-gcs";
+import {
+  LegacyPeerOccupied,
+  openLegacyPeerBudget,
+} from "./legacy-report-peer-memory";
 import { runLegacyUntilComplete } from "./legacy-report-storage-loop";
 import { LegacyWorkingVolumeNormalizer } from "./legacy-report-storage-custody";
 import { LegacyOperatorPaused } from "./legacy-report-storage-operator";
@@ -22,6 +26,7 @@ import { LegacyHubSshStore } from "./legacy-report-storage-hub";
 import {
   LegacySshNormalizer,
   applyVerifiedLegacyPage,
+  legacyAppliedReceiptFile,
   migrateLegacyReceipts,
   legacyNormalizationTelemetry,
 } from "./legacy-report-storage-migration";
@@ -34,7 +39,7 @@ import {
 } from "./legacy-report-storage";
 
 const usage = `legacy-report-storage-cli COMMAND [--name=value] [--apply] [--readers-ready]
-  migrate (copy options) [--until-complete --max-passes=N --max-seconds=N --yield-ms=N] --readers-ready [--adopt-copy] [--worker-sweeper-container=HZ_SWEEPER] [--registered-get=denied|unproven]
+  migrate (copy options) [--execution-slots=1|2 --slot-min-available-mib=N --slot-max-rss-mib=N --slot-pair-reserve-mib=N] [--until-complete --max-passes=N --max-seconds=N --yield-ms=N] --readers-ready [--adopt-copy] [--worker-sweeper-container=HZ_SWEEPER] [--registered-get=denied|unproven]
   migrate-receipts --scope=scope.json --directory=RECEIPTS --ssh-host=HZ --container=POSTGRES
                    (hub options) [--pages=32] [--apply --readers-ready]
   inventory-sql --side=worker|hub [--after=UUID] [--rows=256]
@@ -143,6 +148,10 @@ export async function legacyReportStorageCli(args: string[]): Promise<void> {
     ...allowed.copy,
     "readers-ready",
     "adopt-copy",
+    "execution-slots",
+    "slot-min-available-mib",
+    "slot-max-rss-mib",
+    "slot-pair-reserve-mib",
     "registered-get",
     "worker-sweeper-container",
     "until-complete",
@@ -328,7 +337,15 @@ export async function legacyReportStorageCli(args: string[]): Promise<void> {
   if (command === "plan" || command === "copy" || command === "migrate") {
     const rows = number("rows", 16, 128);
     const maxBytes = number("max-bytes", 64 * 1024 ** 2, 256 * 1024 ** 2);
-    const pages = number("pages", 1, 32);
+    const slots = number("execution-slots", 1, 2) as 1 | 2;
+    const minAvailable = number("slot-min-available-mib", 8192, 1048576);
+    const maxRss = number("slot-max-rss-mib", 4096, 1048576);
+    const pairReserve = number("slot-pair-reserve-mib", 3072, 1048576);
+    if (slots === 2 && !options.has("worker-sweeper-container"))
+      throw Error(
+        "Two execution slots require the exact working-volume custody worker",
+      );
+    const pages = number("pages", slots, 32);
     const directory = required("directory");
     if (!directory.startsWith("/"))
       throw new Error("Backup directory must be absolute");
@@ -368,6 +385,14 @@ export async function legacyReportStorageCli(args: string[]): Promise<void> {
             rows,
             maxBytes,
             pages,
+            executionSlots: slots,
+            ...(slots === 2 && {
+              pairedPageMaxBytes: 128 * 1024 ** 2,
+              combinedPageMaxBytes: 256 * 1024 ** 2,
+              minAvailableMiB: minAvailable,
+              maxRssMiB: maxRss,
+              pairReserveMiB: pairReserve,
+            }),
             continuation: options.has("until-complete")
               ? {
                   maxPasses: options.has("max-passes")
@@ -440,6 +465,15 @@ export async function legacyReportStorageCli(args: string[]): Promise<void> {
             required("worker-sweeper-container"),
           )
         : fallback;
+    const peer =
+      slots === 2
+        ? new LegacySshReader(
+            source.host,
+            required("container"),
+            options.get("pg-user"),
+            options.get("pg-database"),
+          )
+        : undefined;
     const stopping = new AbortController();
     let stopSignal: string | null = null;
     const onTerm = () => {
@@ -460,8 +494,32 @@ export async function legacyReportStorageCli(args: string[]): Promise<void> {
         maxBytes,
         pages,
         keepLocal: options.has("keep-local"),
+        prepareNextPage: slots === 1,
+        executionSupervisor: normalizer
+          ? {
+              slots,
+              peerSource: peer,
+              applicationMarker: (receipt) =>
+                legacyAppliedReceiptFile(receipt, normalizer),
+              targetBinding:
+                normalizer instanceof LegacyWorkingVolumeNormalizer
+                  ? normalizer.phaseBinding
+                  : normalizer.binding,
+              openBudget: () =>
+                openLegacyPeerBudget(
+                  source.host,
+                  required("worker-sweeper-container"),
+                  minAvailable,
+                  maxRss,
+                  pairReserve,
+                ),
+            }
+          : undefined,
         shouldStop: () => stopping.signal.aborted,
-        onVerifiedHistory: () => normalizer?.acceptVerifiedTransportHistory?.(),
+        onVerifiedHistory: () => {
+          normalizer?.acceptVerifiedTransportHistory?.();
+          peer?.acceptVerifiedTransportHistory();
+        },
         sourceBinding: normalizer
           ? JSON.stringify({
               operation: "migrate",
@@ -470,13 +528,13 @@ export async function legacyReportStorageCli(args: string[]): Promise<void> {
             })
           : copyBinding,
         applyVerifiedPage: normalizer
-          ? async (page, receipt, receiptFile) => {
+          ? async (page, receipt, receiptFile, _packed, proofDirectory) => {
               normalizer.acceptVerifiedTransportHistory?.();
               const proof = await applyVerifiedLegacyPage({
                 page,
                 receipt,
                 receiptFile,
-                directory,
+                directory: proofDirectory,
                 normalizer,
               });
               return legacyNormalizationTelemetry(proof, page.members.length);
@@ -507,15 +565,18 @@ export async function legacyReportStorageCli(args: string[]): Promise<void> {
       });
       return {
         ...result,
-        sourceSshConnections: source.connectionCount,
-        sourceQueries: source.queryCount,
+        sourceSshConnections:
+          source.connectionCount + (peer?.connectionCount ?? 0),
+        sourceQueries: source.queryCount + (peer?.queryCount ?? 0),
         operation: command,
       };
     };
     try {
-      if (options.has("until-complete")) {
+      if (options.has("until-complete") || slots === 2 || normalizer) {
         process.on("SIGTERM", onTerm);
         process.on("SIGINT", onInt);
+      }
+      if (options.has("until-complete")) {
         const result = await runLegacyUntilComplete(pass, {
           maxPasses: options.has("max-passes")
             ? number("max-passes", 1, Number.MAX_SAFE_INTEGER)
@@ -530,11 +591,15 @@ export async function legacyReportStorageCli(args: string[]): Promise<void> {
         console.log(JSON.stringify(result));
         if (result.stopReason === "signal")
           process.exitCode = stopSignal === "SIGINT" ? 130 : 143;
-      } else console.log(JSON.stringify(await pass()));
+      } else {
+        console.log(JSON.stringify(await pass()));
+        if (stopping.signal.aborted)
+          process.exitCode = stopSignal === "SIGINT" ? 130 : 143;
+      }
     } finally {
       process.off("SIGTERM", onTerm);
       process.off("SIGINT", onInt);
-      await source.close();
+      await Promise.all([source.close(), peer?.close()]);
     }
     return;
   }
@@ -648,7 +713,10 @@ export async function legacyReportStorageCli(args: string[]): Promise<void> {
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href)
   legacyReportStorageCli(process.argv.slice(2)).catch((error: Error) => {
-    if (error instanceof LegacyOperatorPaused) {
+    if (
+      error instanceof LegacyOperatorPaused ||
+      error instanceof LegacyPeerOccupied
+    ) {
       console.log(
         JSON.stringify({
           paused: true,
