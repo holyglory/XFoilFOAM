@@ -579,7 +579,7 @@ it("reschedules only one deferred point after an exact registered read, preservi
       await db.execute(sql.raw("CREATE TEMP TABLE " + definition + " ON COMMIT DROP"));
     await db.execute(sql`ALTER TABLE sync_api_settings ADD remote_solver_transfer_paused boolean DEFAULT false`);
     await db.execute(sql`ALTER TABLE progressive_worker_archive_reclaims ADD claim_token uuid,ADD claim_expires_at timestamptz,
-      ADD attempt_count int, ADD retry_after timestamptz,ADD last_error text`);
+      ADD attempt_count int, ADD retry_after timestamptz,ADD last_error text,ADD reclaimed_bytes bigint`);
     await db.execute(sql`INSERT INTO sync_api_settings VALUES(1,${solver},${token},${root})`);
     await db.execute(sql`INSERT INTO sync_sweep_promises VALUES(${promiseId},${root},${solver})`);
     const job = randomUUID(), [point] = await fixture(db,job,1);
