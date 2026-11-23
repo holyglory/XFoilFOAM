@@ -32,6 +32,8 @@ import { registeredReportRequest } from "../src/registered-worker-report-rpc";
 import {
   archiveSha256,
   archiveSnapshot,
+  archiveFixtureAttemptIdentity,
+  insertHubArchiveFixtureAttempt,
   type ArchiveFixture,
   LARGE_REPORT_INTEGER,
 } from "./progressive-report-archive-fixture";
@@ -107,6 +109,8 @@ export async function registeredWorkerRoundtrip(f: ArchiveFixture) {
     vi.stubEnv("AIRFOILFOAM_EVIDENCE_BUCKET", bucket);
     let link!: HubReportLink, restored!: Buffer;
     const more: HubReportLink[] = [];
+    const nativeIdentity = await archiveFixtureAttemptIdentity(db,nativeAttempt,hubAttempt);
+    expect(nativeIdentity).toMatchObject([{material_domain:false,hub_attempt_present:false}]);
     const rollback = new Error("finish independent hub snapshot");
     await expect(
       db.transaction(async (t) => {
@@ -115,9 +119,7 @@ export async function registeredWorkerRoundtrip(f: ArchiveFixture) {
         await hub.execute(
           sql`UPDATE sync_api_settings SET instance_id=${hubInstance}::uuid WHERE id=1`,
         );
-        await hub.execute(
-          sql`UPDATE result_attempts SET id=${hubAttempt}::uuid WHERE id=${nativeAttempt}::uuid`,
-        );
+        await insertHubArchiveFixtureAttempt(hub,id,nativeAttempt,hubAttempt);
         await hub.execute(sql`INSERT INTO progressive_remote_dispatches(sim_job_id,promise_id,solver_id,cpu_slots,content_signature,envelope)
         SELECT id,${f.promiseId}::uuid,${owner.solverId}::uuid,1,${owner.assignmentSignature},request_payload->'remoteProgressiveExecution' FROM sim_jobs WHERE id=${id}::uuid`);
         await hub.execute(sql`INSERT INTO progressive_remote_reports(sim_job_id,sequence,content_signature,report) SELECT sim_job_id,sequence,content_signature,report
@@ -232,6 +234,7 @@ export async function registeredWorkerRoundtrip(f: ArchiveFixture) {
         throw rollback;
       }),
     ).rejects.toBe(rollback);
+    expect(await archiveFixtureAttemptIdentity(db,nativeAttempt,hubAttempt)).toEqual(nativeIdentity);
     vi.stubEnv("AIRFOILFOAM_DEPLOYMENT_ROLE", "remote-solver");
     expect(
       await db.execute(

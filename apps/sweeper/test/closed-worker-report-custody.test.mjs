@@ -16,6 +16,8 @@ import { runClosedReportPeer } from "../src/closed-worker-report-peer.mjs";
 import { ProgressiveReportArchiveStore } from "../src/progressive-report-archive-store.ts";
 import {
   withArchiveFixture,
+  archiveFixtureAttemptIdentity,
+  insertHubArchiveFixtureAttempt,
   LARGE_REPORT_INTEGER,
 } from "./progressive-report-archive-fixture.ts";
 
@@ -124,6 +126,8 @@ it.each([
           expect(source.anchors[0].sequence).toBe(origin.sequence);
           expect(target.text).toContain(LARGE_REPORT_INTEGER);
           // Two independent database roles on one disposable PG. Roll the hub snapshot back before HZ writes.
+          const nativeIdentity = await archiveFixtureAttemptIdentity(db,workerAttempt,hubAttempt);
+          expect(nativeIdentity).toMatchObject([{material_domain:false,hub_attempt_present:false}]);
           const asHub = async (work) => {
             const rollback = new Error("finish hub role"),
               state = {};
@@ -140,9 +144,7 @@ it.each([
                 await tx.execute(
                   sql`DELETE FROM progressive_worker_evidence_attempts WHERE sim_job_id=${id}::uuid`,
                 );
-                await tx.execute(
-                  sql`UPDATE result_attempts SET id=${hubAttempt}::uuid WHERE id=${workerAttempt}::uuid`,
-                );
+                await insertHubArchiveFixtureAttempt(tx,id,workerAttempt,hubAttempt);
                 await tx.execute(sql`INSERT INTO progressive_remote_dispatches(sim_job_id,promise_id,solver_id,cpu_slots,content_signature,envelope)
             SELECT id,${f.promiseId}::uuid,${owner.solverId}::uuid,1,${owner.assignmentSignature},request_payload->'remoteProgressiveExecution' FROM sim_jobs WHERE id=${id}::uuid`);
                 const insertRemote = async (row) => {
@@ -174,6 +176,7 @@ it.each([
                 throw rollback;
               }),
             ).rejects.toBe(rollback);
+            expect(await archiveFixtureAttemptIdentity(db,workerAttempt,hubAttempt)).toEqual(nativeIdentity);
             vi.stubEnv("AIRFOILFOAM_DEPLOYMENT_ROLE", "remote-solver");
             return state.value;
           };
