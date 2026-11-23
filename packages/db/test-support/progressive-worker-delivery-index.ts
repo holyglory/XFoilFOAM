@@ -23,6 +23,9 @@ export async function installDeliveryIndexFixture(
     await connection.execute(sql`INSERT INTO delivery_fixture_job_keys
       SELECT DISTINCT j.id FROM sim_jobs j JOIN progressive_worker_evidence_attempts s ON s.sim_job_id=j.id`);
   }
+  const settings = () => connection.execute(sql`SELECT current_setting('work_mem') AS memory,
+    current_setting('max_parallel_workers_per_gather') AS parallel`);
+  const before = await settings();
   for (const statement of deliveryIndexMigration.split(
     "--> statement-breakpoint",
   )) {
@@ -44,4 +47,7 @@ export async function installDeliveryIndexFixture(
       local = local.replace(/\);\s*$/, ") ON COMMIT DROP;");
     await connection.execute(sql.raw(local));
   }
+  const [after] = await settings();
+  if (before[0].memory !== after.memory || before[0].parallel !== after.parallel)
+    throw Error("Delivery-index bootstrap changed its caller's memory or parallel settings");
 }

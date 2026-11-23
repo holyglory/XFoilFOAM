@@ -56,16 +56,27 @@ ON public.result_attempts FOR EACH ROW
 WHEN (NEW.sim_job_id IS NOT NULL AND NEW.engine_job_id=NEW.sim_job_id::text)
 EXECUTE FUNCTION public.track_worker_delivery_disposition();
 --> statement-breakpoint
--- Seed all known bindings once; keep only keys of unreceived aliases in the order index.
-INSERT INTO public.progressive_worker_delivery_points(sim_job_id,point_content_signature,attempt_ids,received)
-SELECT b.sim_job_id,b.point_content_signature,b.attempt_ids,h.sim_job_id IS NOT NULL
-FROM (SELECT s.sim_job_id,s.point_content_signature,array_agg(DISTINCT s.result_attempt_id ORDER BY s.result_attempt_id) AS attempt_ids
-      FROM public.progressive_worker_evidence_attempts s GROUP BY 1,2) b
-LEFT JOIN public.progressive_worker_hub_receipts h USING (sim_job_id,point_content_signature);
---> statement-breakpoint
-INSERT INTO public.progressive_worker_delivery_points(sim_job_id,point_content_signature,attempt_ids,received)
-SELECT sim_job_id,point_content_signature,'{}'::uuid[],true FROM public.progressive_worker_hub_receipts
-ON CONFLICT DO NOTHING;
+-- Deduplicate narrow keys before sorting attempt IDs. Bound memory to one process
+-- for this bootstrap, then restore the migration session settings.
+DO $bootstrap$
+DECLARE
+  prior_memory text := current_setting('work_mem');
+  prior_parallel text := current_setting('max_parallel_workers_per_gather');
+BEGIN
+  PERFORM set_config('work_mem','32MB',true),set_config('max_parallel_workers_per_gather','0',true);
+  WITH distinct_bindings AS MATERIALIZED (
+    SELECT DISTINCT sim_job_id,point_content_signature,result_attempt_id
+    FROM public.progressive_worker_evidence_attempts
+  ), bindings AS (
+    SELECT sim_job_id,point_content_signature,array_agg(result_attempt_id ORDER BY result_attempt_id) AS attempt_ids
+    FROM distinct_bindings GROUP BY 1,2
+  )
+  INSERT INTO public.progressive_worker_delivery_points(sim_job_id,point_content_signature,attempt_ids,received)
+  SELECT coalesce(b.sim_job_id,h.sim_job_id),coalesce(b.point_content_signature,h.point_content_signature),
+         coalesce(b.attempt_ids,'{}'::uuid[]),h.sim_job_id IS NOT NULL
+  FROM bindings b FULL JOIN public.progressive_worker_hub_receipts h USING(sim_job_id,point_content_signature);
+  PERFORM set_config('work_mem',prior_memory,true),set_config('max_parallel_workers_per_gather',prior_parallel,true);
+END $bootstrap$;
 --> statement-breakpoint
 INSERT INTO public.progressive_worker_delivery_diagnostics(result_attempt_id,material_domain)
 SELECT a.id,(a.evidence_payload->>'failure_disposition'='material_domain') IS TRUE
