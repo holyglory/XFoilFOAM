@@ -14,6 +14,7 @@ DECLARE
  result_text text;
  result_value jsonb;
  checked_payload boolean;
+ seen_source boolean;
  result_header jsonb;
 BEGIN
  IF jsonb_typeof(p_page->'scientificResults') IS DISTINCT FROM 'array' THEN RETURN; END IF;
@@ -40,7 +41,7 @@ BEGIN
      OR jsonb_array_length(science->'reports') NOT BETWEEN 1 AND 128
    THEN RAISE EXCEPTION 'Invalid exact scientific result source'; END IF;
    checked_payload:=false;
-   result_header:=public.progressive_report_result_header(result_value);
+   seen_source:=false;
    FOR source IN
      SELECT r.sequence AS source_sequence,r.content_signature AS signature,r.report AS current_report,
        r.result_payload_hash,r.archived_at,r.archive_bundle_id,proof."envelopeText" AS envelope_text,
@@ -62,7 +63,8 @@ BEGIN
      ORDER BY r.sequence LIMIT 128
    LOOP
      source_object:=source.envelope_text::jsonb;
-     IF jsonb_typeof(source_object)='object' AND source_object ? 'result' THEN
+     -- A lone staged source takes the ordinary full reconstruction path.
+     IF seen_source AND jsonb_typeof(source_object)='object' AND source_object ? 'result' THEN
        -- Each group already carries the exact canonical PostgreSQL result text.
        -- jsonb_each emits the envelope keys in JSONB order. PostgreSQL still
        -- quotes each key and formats every other value, including numeric scale.
@@ -90,12 +92,13 @@ BEGIN
        IF source.archive_bundle_id IS NULL OR source.archived_sha IS DISTINCT FROM source.expected_sha
          OR source.archived_bytes IS DISTINCT FROM source.expected_bytes
        THEN RAISE EXCEPTION 'Cold scientific source lacks exact archived original'; END IF;
-     ELSIF source.result_payload_hash=science->>'resultSha256'
+     ELSIF seen_source AND source.result_payload_hash=science->>'resultSha256'
          AND jsonb_typeof(source_object)='object' AND source_object ? 'result' THEN
        -- 0198 makes this payload immutable. Compare its actual PostgreSQL text
        -- to the authenticated group once. Check every row's result header and
        -- every other field byte-for-byte before returning its scientific proof.
        IF NOT checked_payload THEN
+         result_header:=public.progressive_report_result_header(result_value);
          SELECT payload.byte_size=octet_length(result_text)
              AND payload.result::text COLLATE "C"=result_text COLLATE "C"
            INTO checked_payload FROM public.progressive_report_result_payloads payload
@@ -116,6 +119,7 @@ BEGIN
      result_sha256:=science->>'resultSha256'; result_byte_size:=(science->>'resultByteSize')::bigint;
      envelope:=source_object-ARRAY['sequence','status','result','stopProof','archivedReport'];
      point_signatures:=science->'pointSignatures';
+     seen_source:=true;
      RETURN NEXT;
    END LOOP;
  END LOOP;
