@@ -4,7 +4,8 @@ import {
   withActiveHzTransfer,
   type HzWorkerOwner,
 } from "./hz-attempt-transfer-fence";
-import { ProgressiveWorkerTransferPaused } from "./progressive-worker-outbox-replay";
+import { ProgressiveWorkerReplayNeedsFinalReport, ProgressiveWorkerTransferPaused } from "./progressive-worker-outbox-replay";
+import { readSettledWorkerPoint, settledWorkerScope, type HzSettledReceiptScope } from "./hz-settled-attempt-receipt";
 import { replayProgressiveWorkerOutbox } from "./progressive-worker-outbox-replay";
 import {
   loadAttemptSourcePins,
@@ -100,6 +101,7 @@ export async function attemptPage(
   high: string,
   limit: number,
   retained = false,
+  settled = false,
 ) {
   if (!Number.isInteger(limit) || limit < 1 || limit > 64)
     throw Error("Invalid page size");
@@ -108,12 +110,16 @@ export async function attemptPage(
    AND ${retained ? sql`a.status IN ('done','failed') AND h.receipt->>'kind'='retained-progressive-attempt'` : sql`a.status='done' AND a.regime='rans'`} AND h.receipt->'storageOnly' IN ('true'::jsonb,${retained ? sql`'false'::jsonb` : sql`'true'::jsonb`})
   ORDER BY a.id LIMIT ${limit})
  SELECT k.id::text AS id,a.evidence_archive_id::text AS archive, e.app_readback_at IS NULL AND a.evidence_archive_id IS NOT NULL AS pending,
- CASE WHEN a.evidence_archive_id IS NULL THEN ${retained ? sql`attempt_evidence_hz_retained_limiter(k.id)` : sql`attempt_evidence_hz_limiter(k.id)`} END AS limiter,
- pg_column_size(a.evidence_payload) AS stored,CASE WHEN a.evidence_archive_id IS NULL AND pg_column_size(a.evidence_payload)<=262144 THEN octet_length(a.evidence_payload::text)-octet_length(attempt_evidence_compact(a.evidence_payload)::text) END AS logical
+ CASE WHEN a.evidence_archive_id IS NULL THEN ${workerAttemptLimiter(sql`k.id`, retained, settled)} END AS limiter,
+ pg_column_size(a.evidence_payload) AS stored,CASE WHEN a.evidence_archive_id IS NULL AND pg_column_size(a.evidence_payload)<=${settled ? 8388608 : 262144} THEN octet_length(a.evidence_payload::text)-octet_length(attempt_evidence_compact(a.evidence_payload)::text) END AS logical
  FROM keys k JOIN result_attempts a ON a.id=k.id LEFT JOIN attempt_evidence_storage_events e ON e.id=a.evidence_storage_event_id ORDER BY k.id`);
 }
+export function workerAttemptLimiter(id: ReturnType<typeof sql>, retained: boolean, settled: boolean) {
+  if (settled) return sql`attempt_evidence_hz_supported_limiter(${id})`;
+  return retained ? sql`attempt_evidence_hz_retained_limiter(${id})` : sql`attempt_evidence_hz_limiter(${id})`;
+}
 /** The only worker mode enabled by this operator is the separately gated 0212 cohort. */
-export async function enableHzCustody(db: DB, retained = false) {
+export async function enableHzCustody(db: DB, retained = false, settled = false) {
   const changed =
     await db.execute(sql`UPDATE attempt_evidence_storage_policy p SET hz_worker_only=true,shortening_enabled=true,consumer_contract_version=1
    WHERE id=1 AND NOT shortening_enabled AND NOT stopped_progressive_enabled AND progressive_source_scope='legacy'
@@ -138,8 +144,16 @@ export async function enableHzCustody(db: DB, retained = false) {
         throw Error("Worker retained-source policy unavailable");
     }
   }
+  if (settled) {
+    const [policy] = await db.execute(sql`UPDATE attempt_evidence_storage_policy SET hz_settled_receipts_enabled=true
+      WHERE id=1 AND hz_retained_enabled AND NOT hz_settled_receipts_enabled RETURNING id`);
+    if (!policy) {
+      const [enabled] = await db.execute(sql`SELECT hz_settled_receipts_enabled AS ready FROM attempt_evidence_storage_policy WHERE id=1`);
+      if (enabled?.ready !== true) throw Error("Worker settled-receipt policy unavailable");
+    }
+  }
 }
-export async function prepareHzEnvelope(db: DB, id: string, retained = false) {
+export async function prepareHzEnvelope(db: DB, id: string, retained = false, settled = false) {
   const [pointer] = await db.execute(
     sql`SELECT evidence_archive_id AS archive,evidence_storage_event_id AS event FROM result_attempts WHERE id=${id}::uuid`,
   );
@@ -151,10 +165,17 @@ export async function prepareHzEnvelope(db: DB, id: string, retained = false) {
       eventId: String(pointer.event),
     };
   const [condition] = await db.execute(
-    sql`SELECT ${retained ? sql`attempt_evidence_hz_retained_limiter(${id}::uuid)` : sql`attempt_evidence_hz_limiter(${id}::uuid)`} AS reason`,
+    sql`SELECT ${workerAttemptLimiter(sql`${id}::uuid`, retained, settled)} AS reason`,
   );
   if (condition?.reason !== null)
     return { limited: String(condition?.reason ?? "missing") };
+  if (settled) {
+    const scope = await settledWorkerScope(db, id);
+    if (scope) {
+      const { archive } = await readSettledWorkerPoint(db, scope, AbortSignal.timeout(30_000));
+      return { archive, cold: false };
+    }
+  }
   const source = await loadSettledAttemptEvidenceCopy(db, id);
   const { payloadText, witness } = await readHzAttemptFromWorkerReport(
     db,
@@ -196,7 +217,7 @@ export async function stageHzEnvelope(
   identity: AttemptEvidenceArchiveIdentity,
   bytes: Buffer,
   expected?: HzWorkerOwner,
-  enable?: { retained: boolean },
+  enable?: { retained: boolean; settled?: boolean },
 ) {
   const original = await retainHzAttemptVolume(db, identity, bytes);
   const stored = await getAttemptEvidenceStorage(db, identity.attemptId);
@@ -211,7 +232,7 @@ export async function stageHzEnvelope(
   return withActiveHzTransfer(db, expected, async (tx) => {
     const result = await registerAttemptEvidenceArchive(tx, identity, plan);
     sameArchive(result.archive, identity);
-    if (enable) await enableHzCustody(tx, enable.retained);
+    if (enable) await enableHzCustody(tx, enable.retained, enable.settled);
     return result.archive;
   });
 }
@@ -222,18 +243,17 @@ export async function hzScience(db: DB, id: string, archiveId: string) {
     db,
     sweeperAttemptArchiveReader(),
     async (attempt, original) => {
-      const replay = await readHzAttemptFromWorkerReport(
-        db,
-        attempt,
-        AbortSignal.timeout(30000),
-      );
-      if (replay.payloadText !== original)
-        throw Error("Signed worker report differs from original");
       const [bound] = await db.execute(
         sql`SELECT attempt_evidence_hz_scope(${attempt}::uuid) AS scope`,
       );
       if (!bound?.scope) throw Error("Worker custody scope changed");
-      return bound.scope as Record<string, unknown>;
+      const scope = bound.scope as Record<string, unknown>;
+      const replay = scope.contract === "settled-receipt-v3"
+        ? await readSettledWorkerPoint(db, bound.scope as HzSettledReceiptScope, AbortSignal.timeout(30_000))
+        : await readHzAttemptFromWorkerReport(db, attempt, AbortSignal.timeout(30_000));
+      if (replay.payloadText !== original)
+        throw Error("Signed worker report differs from original");
+      return scope;
     },
   );
   return verify({
@@ -258,6 +278,8 @@ export async function verifyHzOutboxReplay(db: DB, id: string) {
     FROM result_attempts a LEFT JOIN attempt_evidence_storage_events e ON e.id=a.evidence_storage_event_id AND e.archive_id=a.evidence_archive_id
     WHERE a.id=${id}::uuid`);
   const scope = owner?.scope as {
+    contract?: string;
+    stopSequence?: number;
     job: string;
     point: string;
     sequence: number;
@@ -280,6 +302,9 @@ export async function verifyHzOutboxReplay(db: DB, id: string) {
     },
     { apply: false },
   ).catch((error) => {
+    if (error instanceof ProgressiveWorkerReplayNeedsFinalReport && scope.contract === "settled-receipt-v3"
+        && Number(scope.stopSequence) > scope.sequence)
+      return null;
     if (error instanceof ProgressiveWorkerTransferPaused)
       throw new HistoryOperationError(
         "worker_transfer_paused",
@@ -288,6 +313,10 @@ export async function verifyHzOutboxReplay(db: DB, id: string) {
       );
     throw error;
   });
+  // A previously delivered running snapshot is still ineligible for the
+  // final-only requeue command. Its actual point and terminal signatures are
+  // independently checked in the scientific source read.
+  if (preview === null) return { replayDisposition: "nonfinal-already-received" };
   if (
     preview.points.length !== 1 ||
     preview.points[0]?.outcome !== "already_delivered"
@@ -351,10 +380,17 @@ export async function confirmHzAttempt(
     | {
         verifier?: string;
         jobDecisionsSha256?: string;
-        workerScope?: { selectionSha256?: string };
+        workerScope?: HzSettledReceiptScope | { selectionSha256?: string };
       }
     | undefined;
-  if (deps?.verifier === "server-consumers/hz-retained-original-v2") {
+  if (deps?.verifier === "server-consumers/hz-retained-original-v2" || deps?.verifier === "server-consumers/hz-settled-receipt-v3") {
+    if (deps.verifier === "server-consumers/hz-settled-receipt-v3") {
+      const source = deps.workerScope;
+      if (!source || !("contract" in source) || source.contract !== "settled-receipt-v3")
+        throw Error("Missing sealed worker receipt");
+      const signed = await readSettledWorkerPoint(db, source, AbortSignal.timeout(30_000));
+      if (signed.payloadText !== text) throw Error("Stored attempt differs from the acknowledged signed point");
+    }
     await db.transaction(async (rawTx) => {
       const tx = rawTx as unknown as DB;
       await tx.execute(sql`SET TRANSACTION ISOLATION LEVEL REPEATABLE READ`);
@@ -362,12 +398,17 @@ export async function confirmHzAttempt(
       await tx.execute(sql`SET LOCAL lock_timeout='1s'`);
       await checkHzTransferFence(tx, expected, true);
       await tx.execute(sql`SELECT attempt_evidence_lock_source(${id}::uuid)`);
+      if (deps.verifier === "server-consumers/hz-settled-receipt-v3") {
+        const [unchanged] = await tx.execute(sql`SELECT attempt_evidence_hz_settled_scope(${id}::uuid,${app.archiveId}::uuid)
+          = ${JSON.stringify(deps.workerScope)}::jsonb AS verified`);
+        if (unchanged?.verified !== true) throw Error("Worker receipt, assignment or selected evidence changed");
+      }
       const [selection] = await tx.execute(
         sql`SELECT attempt_evidence_hz_selection_sha256(${id}::uuid) AS sha`,
       );
       if (
         selection?.sha !== deps.workerScope?.selectionSha256 ||
-        (await storedJobDecisionSha256(tx, id)) !== deps.jobDecisionsSha256
+        (await storedJobDecisionSha256(tx, id, deps.verifier === "server-consumers/hz-settled-receipt-v3")) !== deps.jobDecisionsSha256
       )
         throw Error(
           "Stored worker classification, selection, interpretation or fit changed",

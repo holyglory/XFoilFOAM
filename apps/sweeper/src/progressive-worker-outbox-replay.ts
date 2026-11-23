@@ -22,6 +22,7 @@ const SCOPE_CLOSED =
   /^(?:Progressive evidence|Stopped progressive storage) delivery failed \(409\): progressive_scope_closed(?: |$)/;
 
 export class ProgressiveWorkerOutboxReplayRefused extends Error {}
+export class ProgressiveWorkerReplayNeedsFinalReport extends ProgressiveWorkerOutboxReplayRefused {}
 export class ProgressiveWorkerTransferPaused extends ProgressiveWorkerOutboxReplayRefused {}
 
 export interface ProgressiveWorkerOutboxReplayPoint {
@@ -283,10 +284,13 @@ export async function replayProgressiveWorkerOutbox(
         report.sequence !== point.sequence ||
         validated.contentSignature !== source.content_signature ||
         validated.contentSignature !== source.staged_signature ||
-        !isFinalProgressiveRemoteReport(report) ||
         report.result === null
       )
         throw new ProgressiveWorkerOutboxReplayRefused(
+          "Replay requires its unchanged acknowledged final report and staging receipt",
+        );
+      if (!isFinalProgressiveRemoteReport(report))
+        throw new ProgressiveWorkerReplayNeedsFinalReport(
           "Replay requires its unchanged acknowledged final report and staging receipt",
         );
       const attempt = source.attempt as Record<string, unknown>;

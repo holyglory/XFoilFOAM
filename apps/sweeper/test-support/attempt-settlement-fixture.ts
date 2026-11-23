@@ -195,6 +195,7 @@ export async function createSettlementFixture(workerCustody = false) {
             "0214_verified_attempt_history_policy.sql",
             "0215_verified_attempt_active_role.sql",
             "0216_hz_retained_original_attempts.sql",
+            "0224_hz_settled_attempt_receipts.sql",
           ]
         : []),
     ]) {

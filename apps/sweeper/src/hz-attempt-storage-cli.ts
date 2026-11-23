@@ -26,7 +26,7 @@ export async function hzAttemptStorage(
   const report = io.report ?? ((value) => console.log(JSON.stringify(value)));
   if (args.length === 1 && args[0] === "--help") {
     console.log(
-      "hz-attempt-storage-cli.ts plan [--id UUID | --until-complete] | status | migrate --apply (--id UUID | --directory DIR [--until-complete]) | watch --apply --directory DIR [--poll-seconds N] | restore --apply --id UUID. Writes require --bucket BUCKET --hub-account-file FILE. Worker extension: --include-retained. Add --originals-directory DIR [--originals-scope FILE] to the same watch for archive-only discovery and copies.",
+      "hz-attempt-storage-cli.ts plan [--id UUID | --until-complete] | status | migrate --apply (--id UUID | --directory DIR [--until-complete]) | watch --apply --directory DIR [--poll-seconds N] | restore --apply --id UUID. Writes require --bucket BUCKET --hub-account-file FILE. Worker scopes: --include-retained or --include-settled-receipts. Add --originals-directory DIR [--originals-scope FILE] to the same watch for archive-only discovery and copies.",
     );
     return;
   }
@@ -36,6 +36,7 @@ export async function hzAttemptStorage(
     options: {
       apply: { type: "boolean" },
       "include-retained": { type: "boolean" },
+      "include-settled-receipts": { type: "boolean" },
       "originals-directory": { type: "string" },
       "originals-scope": { type: "string" },
       id: { type: "string" },
@@ -54,6 +55,8 @@ export async function hzAttemptStorage(
     },
   });
   const [mode] = positionals;
+  const settled = v["include-settled-receipts"] === true;
+  const retained = settled || v["include-retained"] === true;
   const watching = mode === "watch",
     write = ["migrate", "watch", "restore"].includes(mode!),
     continuous = watching || v["until-complete"];
@@ -167,7 +170,8 @@ export async function hzAttemptStorage(
         const result = await transport.worker(
           {
             ...r,
-            ...(v["include-retained"] ? { retained: true } : {}),
+            ...(retained ? { retained: true } : {}),
+            ...(settled ? { settled: true } : {}),
             ...(requireTransfers ? { requireTransfers: true, owner } : {}),
           },
           lock,
@@ -212,6 +216,8 @@ export async function hzAttemptStorage(
     owner = { instance, solver: exactId(bound.solver) };
     if (v["include-retained"] && bound.retained_contract !== true)
       throw new HistoryOperationError("retained_worker_contract", "input");
+    if (settled && bound.settled_receipt_contract !== true)
+      throw new HistoryOperationError("settled_worker_contract", "input");
     if (mode === "status") {
       report(await relay.worker({ operation: "status" }));
       return;
@@ -250,7 +256,7 @@ export async function hzAttemptStorage(
         dir,
         "attempt-" +
           mode +
-          (v["include-retained"] ? "-retained" : "") +
+          (settled ? "-settled-receipts" : retained ? "-retained" : "") +
           ".json",
       );
     let state = {

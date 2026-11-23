@@ -48,6 +48,8 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href)
       },
     });
     try {
+      const { installApiReportArchiveReader } = await import("./progressive-report-archive-reader");
+      await installApiReportArchiveReader();
       return await hzAttemptApiProbe(
         c.db,
         exactId(r.attemptId),
