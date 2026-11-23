@@ -20,7 +20,7 @@ import { analysisContentHash } from "../src/analysis-target";
 import { createClient, type DB } from "../src/client";
 import { sealProgressiveRemoteExecution } from "../src/progressive-remote-execution";
 import type { ProgressiveRemoteReport } from "../src/progressive-remote-report";
-import { storeProgressiveRemoteReport } from "../src/progressive-remote-reports";
+import { prepareRunningReportOrder, readLatestReportForOrder, storeProgressiveRemoteReport } from "../src/progressive-remote-reports";
 import { readProgressiveRemoteRetention } from "../src/progressive-remote-retention";
 import {
   PROGRESSIVE_REPORT_RETENTION_DISABLED,
@@ -314,6 +314,137 @@ async function rejectsStatement(
     }),
   ).rejects.toThrow(message);
 }
+
+it("admits the next execution report from exact running order metadata and preserves stop and replay conflicts", async () => {
+  await rolledBack(async (db) => {
+    const input = await normalizedFixture(db, {
+      repeats: 1,
+      payloadBytes: 2 * 1024 * 1024,
+    });
+    const report = input.reports[1];
+    // The normal store issues the next 0198 receipt on this isolated dispatch.
+    await db.execute(
+      sql`DELETE FROM progressive_remote_reports WHERE sequence>1`,
+    );
+    await setProgressiveReportNormalization(db, {
+      enabled: true,
+      readersReady: true,
+    });
+    const store = (value: ProgressiveRemoteReport) =>
+      storeProgressiveRemoteReport(db, { ...input.sender, report: value });
+    await store(report);
+    const prepared = await prepareRunningReportOrder(
+      db,
+      input.envelope,
+      report.sequence,
+    );
+    expect(prepared).toMatchObject({
+      sequence: 2,
+      completedCases: 1,
+      signature: analysisContentHash(report),
+    });
+    const compact = await readLatestReportForOrder(
+      db,
+      input.executionId,
+      prepared,
+    );
+    expect(compact).toMatchObject({
+      running: true,
+      content_signature: null,
+    });
+    const [old] = await db.execute(
+      sql`SELECT octet_length(resolve_progressive_report(to_jsonb(r.*))::text) AS full_bytes FROM progressive_remote_reports r WHERE sequence=2`,
+    );
+    expect(Number(old.full_bytes)).toBeGreaterThan(2 * 1024 * 1024);
+    expect(compact).not.toHaveProperty("report");
+    expect(Buffer.byteLength(JSON.stringify(compact))).toBeLessThan(120);
+    await expect(store({ ...report, sequence: 4 })).rejects.toThrow(
+      "durable publication order",
+    );
+    await expect(
+      store({
+        ...report,
+        sequence: 3,
+        result: null,
+        status: { ...report.status, completed_cases: 0 },
+      }),
+    ).rejects.toThrow("forget previously completed cases");
+    await expect(
+      store({
+        ...report,
+        status: { ...report.status, message: "changed report" },
+      }),
+    ).rejects.toThrow("replay changed immutable content");
+    expect((await store(report)).replayed).toBe(true);
+    // The same prepared predecessor must cease to qualify after another report wins.
+    const final = { ...input.terminal, sequence: 3 };
+    expect((await store(final)).replayed).toBe(false);
+    expect(await prepareRunningReportOrder(db, input.envelope, 3)).toBeNull();
+    expect(
+      await readLatestReportForOrder(db, input.executionId, prepared),
+    ).toMatchObject({ running: false, content_signature: analysisContentHash(final) });
+    await expect(store({ ...report, sequence: 4 })).rejects.toThrow(
+      "stopped remote execution cannot resume",
+    );
+    const changed = structuredClone(final);
+    changed.sequence = 4;
+    changed.result!.polars = structuredClone(report.result!.polars);
+    await expect(store(changed)).rejects.toThrow(
+      "Final remote execution evidence cannot change",
+    );
+    expect((await store({ ...final, sequence: 4 })).replayed).toBe(false);
+
+    // An unconstrained predecessor is a negative control for corrupt or old storage.
+    await db.execute(
+      sql`ALTER TABLE progressive_remote_reports RENAME TO intact_reports`,
+    );
+    await db.execute(
+      sql`CREATE TEMP TABLE progressive_remote_reports AS SELECT * FROM intact_reports WHERE sequence=2`,
+    );
+    const [original] = await db.execute(
+      sql`SELECT report FROM progressive_remote_reports`,
+    );
+    for (const damaged of [
+      sql`report - 'stopProof'`,
+      sql`report||'{"stopProof":{}}'::jsonb`,
+      sql`report||'{"archivedReport":true}'::jsonb`,
+      sql`jsonb_set(report,'{status,completed_cases}','"1"')`,
+      sql`jsonb_set(report,'{status,completed_cases}','0.5')`,
+      sql`jsonb_set(report,'{status,completed_cases}','-1')`,
+      sql`jsonb_set(report,'{status,total_cases}','2')`,
+      sql`jsonb_set(report,'{status,state}','"completed"')`,
+    ]) {
+      await db.execute(
+        sql`UPDATE progressive_remote_reports SET report=${damaged}`,
+      );
+      expect(await prepareRunningReportOrder(db, input.envelope, 2)).toBeNull();
+      expect(
+        (await readLatestReportForOrder(db, input.executionId, prepared))
+          ?.running,
+      ).toBe(false);
+      await db.execute(
+        sql`UPDATE progressive_remote_reports SET report=${JSON.stringify(original.report)}::jsonb`,
+      );
+    }
+    await db.execute(
+      sql`UPDATE progressive_remote_reports SET report=jsonb_set(report,'{result,state}','"failed"')`,
+    );
+    expect(await prepareRunningReportOrder(db, input.envelope, 2)).toBeNull();
+    await expect(db.transaction(tx => storeProgressiveRemoteReport(tx as unknown as DB, {
+      ...input.sender, report: { ...report, sequence:3 },
+    }))).rejects.toThrow("Missing or inconsistent progressive report result payload");
+    await db.execute(
+      sql`UPDATE progressive_remote_reports SET report=${JSON.stringify(original.report)}::jsonb`,
+    );
+    await db.execute(
+      sql`UPDATE progressive_remote_reports SET result_payload_hash=${"0".repeat(64)}`,
+    );
+    expect(await prepareRunningReportOrder(db, input.envelope, 2)).toBeNull();
+    await expect(db.transaction(tx => storeProgressiveRemoteReport(tx as unknown as DB, {
+      ...input.sender, report: { ...report, sequence:3 },
+    }))).rejects.toThrow("Missing or inconsistent progressive report result payload");
+  });
+});
 
 it("shares repeated large results losslessly across report history while preserving replay, inventories, evidence and downloads", async () => {
   await rolledBack(async (db) => {

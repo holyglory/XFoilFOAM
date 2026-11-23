@@ -144,7 +144,7 @@ export function isMeasuredCancelledProgressiveRemoteReport(
   );
 }
 
-/** These are the complete order checks when the previous stop proof is JSON null. */
+/** Shared by full-order validation and an authenticated running, unstopped predecessor. */
 export function validateProgressiveReportProgress(
   report: ProgressiveRemoteReport,
   previousSequence: number,
