@@ -60,15 +60,26 @@ def run_engine(scope, packet, source, settings):
             "media keep-set differs from the explicitly named operation")
     require(isinstance(manifests, list) and 1 <= len(manifests) <= 256 and
             isinstance(readbacks, list) and len(readbacks) <= 256, "invalid custody inventory")
+    historical=scope.get("historicalRaw") is True
+    require((req.get("historicalRaw") is True)==historical and any("historicalRaw" in m for m in manifests)==historical,
+            "historical proof belongs to another scope")
     for m in manifests:
-        require(isinstance(m["directory"], str) and isinstance(m["brokeredUploadId"], str) and
-                all(re.fullmatch("[0-9a-f]{64}", m[k]) for k in ("catalogSha256", "manifestSha256", "receiptHmac")) and
-                re.fullmatch("[1-9][0-9]{0,19}", m["generation"]) and type(m["manifestByteSize"]) is int and
-                m["manifestByteSize"] > 0, "invalid manifest identity")
+        require(isinstance(m["directory"],str) and all(re.fullmatch("[0-9a-f]{64}",m[k]) for k in ("catalogSha256","manifestSha256"))
+                and re.fullmatch("[1-9][0-9]{0,19}",m["generation"]) and type(m["manifestByteSize"]) is int and m["manifestByteSize"]>0,
+                "invalid manifest identity")
+        if "historicalRaw" in m:
+            c=m["historicalRaw"]
+            require(historical and "brokeredUploadId" not in m and "receiptHmac" not in m and c["sim_job_id"]==scope["id"] and
+                    c["manifest_sha256"]==m["manifestSha256"] and c["manifest_bytes"]==m["manifestByteSize"] and c["generation"]==m["generation"]
+                    and re.fullmatch("[0-9a-f]{64}",c["point_content_signature"]), "historical original scope differs")
+        else:
+            require(isinstance(m["brokeredUploadId"],str) and re.fullmatch("[0-9a-f]{64}",m["receiptHmac"]), "ordinary manifest ownership differs")
     for r in readbacks:
-        require(isinstance(r["brokeredUploadId"], str) and isinstance(r["verifiedAt"], str) and
-                re.fullmatch("[1-9][0-9]{0,19}", r["generation"]) and re.fullmatch("[0-9a-f]{64}", r["storedSha256"]) and
-                type(r["storedByteSize"]) is int and r["storedByteSize"] > 0, "invalid object readback")
+        require(("brokeredUploadId" in r) != ("historicalPointSignature" in r) and
+                (isinstance(r.get("brokeredUploadId"),str) or historical and re.fullmatch("[0-9a-f]{64}",r["historicalPointSignature"]))
+                and isinstance(r["verifiedAt"],str) and re.fullmatch("[1-9][0-9]{0,19}",r["generation"])
+                and re.fullmatch("[0-9a-f]{64}",r["storedSha256"]) and type(r["storedByteSize"]) is int and r["storedByteSize"]>0,
+                "invalid complete byte readback")
     root = settings.job_dir(scope["id"])
     require(root.parent == settings.data_dir / "jobs" and root.resolve() == root and root.is_dir() and
             root.name == scope["id"] and inode(root.parent) == scope["jobsInode"] and inode(root) == scope["jobInode"],

@@ -143,6 +143,22 @@ export async function verifyHistoricalRawArchive(
           }[] = [];
           return {
             interceptors,
+            createReadStream: (options: unknown) => {
+              expect(options).toEqual({
+                validation: "crc32c",
+                decompress: false,
+              });
+              if (
+                !cloud ||
+                k !== key ||
+                interceptors[0]?.request({
+                  uri: "https://fixture.invalid",
+                  qs: {},
+                }).qs.generation !== generation
+              )
+                throw missing();
+              return Readable.from([cloud.bytes]);
+            },
             getMetadata: async () => {
               if (
                 k !== key ||
@@ -524,6 +540,17 @@ export async function verifyHistoricalRawArchive(
               )
             )[0].n,
           ).toBe(0);
+          const download = (
+            ownerToken: string,
+            pin = generation,
+            target = url,
+          ) =>
+            app.inject({
+              method: "GET",
+              url: target + "/generations/" + pin,
+              headers: { "x-xfoilfoam-solver-token": ownerToken },
+            });
+          expect((await download("owner")).statusCode).toBe(409);
           const saved = await verify();
           expect(saved.statusCode, saved.body).toBe(200);
           expect(saved.json()).toMatchObject({
@@ -533,6 +560,33 @@ export async function verifyHistoricalRawArchive(
             manifest_sha256: sha(manifest),
             solver_id: owner.id,
           });
+          const { verifyHistoricalWorkerRestore } =
+            await import("./historical-raw-worker-restore-fixture");
+          await verifyHistoricalWorkerRestore(
+            app,
+            cx,
+            job,
+            point.case_slug!,
+            point.aoa_deg,
+            manifest,
+            bytes,
+            saved.json(),
+          );
+          const listed = await app.inject({
+            method: "GET",
+            url: `/api/sync/v1/progressive-executions/${job}/historical-raw-archives/receipts`,
+            headers: { "x-xfoilfoam-solver-token": "owner" },
+          });
+          expect(listed.statusCode, listed.body).toBe(200);
+          expect(listed.json().receipts).toHaveLength(1);
+          const reopened = await download("owner");
+          expect(reopened.statusCode, reopened.body).toBe(200);
+          expect(sha(reopened.rawPayload)).toBe(sha(bytes));
+          expect(reopened.headers["x-gcs-generation"]).toBe(generation);
+          expect(reopened.headers["x-content-sha256"]).toBe(sha(bytes));
+          expect((await download("foreign")).statusCode).toBe(409);
+          expect((await download("owner", "7")).statusCode).toBe(409);
+          expect((await download("invalid")).statusCode).toBe(401);
           expect((await verify()).json()).toEqual(saved.json());
           expect(reads).toBe(2);
           const reused = await worker(true);
@@ -571,6 +625,9 @@ export async function verifyHistoricalRawArchive(
             sql`SELECT count(*)::int n FROM progressive_historical_raw_archives WHERE sim_job_id=${job}::uuid`,
           );
           expect(receiptCount.n).toBe(1);
+          expect(
+            (await download("owner", generation, missingUrl)).statusCode,
+          ).toBe(409);
           const storedObject = cloud!;
           cloud = undefined;
           expect((await plan()).statusCode).toBe(409);
@@ -580,6 +637,9 @@ export async function verifyHistoricalRawArchive(
           const wrong = Buffer.from(cloud.bytes);
           wrong[0] ^= 1;
           cloud.bytes = wrong;
+          const corruptRead = await download("owner");
+          expect(corruptRead.statusCode).toBe(409);
+          expect(corruptRead.headers["x-gcs-generation"]).toBeUndefined();
           expect((await verify()).statusCode).toBe(409);
           cloud.bytes = bytes;
           expect((await verify()).json()).toEqual(saved.json());

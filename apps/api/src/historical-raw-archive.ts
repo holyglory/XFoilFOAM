@@ -9,6 +9,8 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { createHash } from "node:crypto";
 import { Readable } from "node:stream";
 import { z } from "zod";
+import { registerHistoricalWorkerRestore } from "./historical-worker-restore";
+import { registerHistoricalRawDownloads } from "./historical-raw-download";
 import { makeEngineClient } from "./engine-client";
 import { env } from "./env";
 import {
@@ -173,6 +175,8 @@ export async function registerHistoricalRawArchiveRoutes(
   },
 ) {
   await app.register(async (routes) => {
+    await registerHistoricalRawDownloads(routes, access.db, access.authenticate);
+    registerHistoricalWorkerRestore(routes, access.db);
     routes.addContentTypeParser("application/zstd", (_req, stream, done) =>
       done(null, stream),
     );

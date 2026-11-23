@@ -344,6 +344,145 @@ def _inventory(root, proofs, readbacks, kept=None):
     return candidates
 
 
+def _historical_inventory(root, proofs, readbacks, kept, resuming, samples):
+    """Only exact packaged raw files may retire. All working, media, manifest and core paths stay local."""
+    from .evidence_store import verify_local_archive_manifest_members
+    declared = {} if kept is not None else None
+    reported = _result_manifests(root, declared)
+    all_proofs = {p["directory"]: p for p in proofs}
+    _require(len(proofs) == len(all_proofs) and set(reported) == set(all_proofs), "uncovered or competing terminal point")
+    protected = _kept_images(root, proofs, declared) if kept is not None else {}
+    if kept is not None:
+        kept.update(protected)
+    found = set()
+    files = {}
+    raw_members = {}
+    raw_dirs = {"VTK", "openfoam", "time_directories"}
+    protected_dirs = {p.as_posix() for name in protected for p in PurePosixPath(name).parents}
+    cases,solvers,owned_cases,owned_solvers=set(),set(),set(),set()
+    seen=0
+    def walk_error(error):
+        raise error
+    for folder, dirs, names in os.walk(root, followlinks=False, onerror=walk_error):
+        folder = Path(folder)
+        rel = relative = folder.relative_to(root)
+        seen+=len(names)+len(dirs)
+        _require(seen<=100_000,"job exceeds bounded filesystem inventory")
+        if len(rel.parts)==2 and rel.parts[0]=="cases": cases.add(rel)
+        if (folder.name=="transient" or folder.name.startswith("transient_a")) and not any(
+                rel.is_relative_to(_relative(key)) for key in all_proofs):
+            # A manifest-owned copy of system/log fields within evidence is not an execution namespace.
+            solvers.add(rel)
+        for name in dirs:
+            path = folder / name
+            if path.is_symlink():
+                actual = path.resolve(strict=True) if protected else path.resolve()
+                _require(name == "polyMesh" and actual.is_relative_to(root / "meshes"), "unaccounted directory symlink")
+                if protected:
+                    lexical = Path(os.path.abspath(path.parent / os.readlink(path)))
+                    _require(relative.parts[:1] == ("cases",) and relative.name == "constant" and
+                             actual.parts[-2:] == ("constant", "polyMesh") and lexical == actual and actual.is_dir(),
+                             "unverified shared-mesh link")
+        if any(part in {"images", "frames", "scaled_media", "custom_renders"} for part in relative.parts):
+            _require(all((relative / name).as_posix() in protected for name in names), "unaccounted local media remains")
+            if protected:
+                _require(relative.as_posix() in protected_dirs and
+                         all((relative / name).as_posix() in protected_dirs for name in dirs), "unknown media directory")
+        for n in names:
+            p = folder / n
+            _require(not p.is_symlink() and stat.S_ISREG(p.lstat().st_mode), "unaccounted nonregular file")
+            _require("quarantine" not in n and n not in {"engine_evidence.tar.gz","openfoam_evidence.tar.gz"},
+                     "unaccounted forensic or legacy package")
+            if n == "engine_evidence.tar.zst":
+                _require(all_proofs.get(rel.as_posix(), {}).get("historicalRaw"), "unowned local archive")
+            if n.lower().endswith((".png",".jpg",".jpeg",".gif",".bmp",".webp",".svg",".mp4",".webm",".mov",".avi",".tif",".tiff")):
+                _require(p.relative_to(root).as_posix() in protected, "local media is outside the protected keep-set")
+        if folder.name == "evidence" or "evidence_manifest.json" in names:
+            key = rel.as_posix()
+            _require(key in all_proofs and "evidence_manifest.json" in names, "unowned or incomplete evidence directory")
+            found.add(key)
+            proof = all_proofs[key]
+            if "historicalRaw" not in proof:
+                _require(set(names) == {"brokered_hub_binding.database.json","brokered_local_reclaim.intent.json","brokered_local_reclaim.json","evidence_manifest.json"} and set(dirs) <= {"scaled_media"},
+                         "ordinary sibling still has an unaccounted package or source")
+                case, post, _ = _local_manifest(root, folder, proof, reported[key], readbacks, declared)
+                owned_cases.add(case);owned_solvers.add(post)
+                continue
+            c = proof["historicalRaw"]
+            expected_marker = {"version": 1, "directory":key, "receipt":c}
+            marker = folder / "historical_raw_custody.database.json"
+            if marker.exists():
+                _require(_json(marker,8192)==expected_marker,"historical marker names a different source")
+            _require(set(names) <= {"evidence_manifest.json","engine_evidence.tar.zst",marker.name}
+                     and set(dirs) <= raw_dirs | {"scaled_media","frames"}, "historical folder contains unaccounted evidence")
+            mf = folder / "evidence_manifest.json"
+            _require(mf.stat().st_size == proof["manifestByteSize"] == c["manifest_bytes"] <= MAX_EVIDENCE_MANIFEST_BYTES, "original manifest size changed")
+            data = mf.read_bytes()
+            _require(hashlib.sha256(data).hexdigest()==proof["manifestSha256"]==c["manifest_sha256"] and c["sim_job_id"]==root.name
+                     and proof["generation"]==c["generation"], "historical manifest or generation changed")
+            items = reported[key]
+            catalog = sorted(f"{'mesh' if kind == 'mesh_evidence' else kind}\tjobs/{root.name}/{key}/{name}\t{size}\t{sha}"
+                             for kind,name,size,sha in items)
+            _require(hashlib.sha256("\n".join(catalog).encode()).hexdigest()==proof["catalogSha256"], "full signed artifact inventory differs")
+            manifest = json.loads(data)
+            case = PurePosixPath(*rel.parts[:2])
+            _require(_case_path(root.name,manifest["casePath"],case)==case and _case_path(root.name,manifest["postPath"],case).is_relative_to(case), "historical manifest has another job or case")
+            owned_cases.add(case);owned_solvers.add(_case_path(root.name,manifest["postPath"],case))
+            members = {_relative(m["path"]).as_posix():(m["byteSize"],m["sha256"]) for m in manifest["files"]}
+            _require(len(members)==len(manifest["files"]), "ambiguous historical manifest members")
+            for kind,name,n,sha in items:
+                if kind=="engine_bundle":
+                    _require((name,n,sha)==("engine_evidence.tar.zst",c["stored_bytes"],c["stored_sha256"]), "signed archive differs")
+                elif kind=="manifest":
+                    _require((name,n,sha)==("evidence_manifest.json",len(data),c["manifest_sha256"]), "signed manifest differs")
+                else:
+                    _require(members.get(name)==(n,sha), "signed artifact absent from historical manifest")
+            excluded = {str(_relative(name)) for name in manifest.get("bundleExcludes",[])}
+            _require(not raw_dirs.intersection(excluded), "candidate raw subtree is excluded from archive")
+            forces = {name for kind, name, _, _ in items if kind == "force_coefficients"}
+            candidates = [(name not in forces, size, name, sha) for name, (size, sha) in members.items()
+                          if _relative(name).parts[0] in raw_dirs]
+            samples[c["point_content_signature"]] = None
+            if candidates:
+                _,size,name,checksum=min(candidates)
+                samples[c["point_content_signature"]]={"path":name,"byteSize":size,"sha256":checksum}
+            raw_members[key]=members
+            archive=folder/"engine_evidence.tar.zst"
+            if archive.exists():
+                st=archive.lstat()
+                _require(st.st_nlink==1 and st.st_size==c["stored_bytes"],"historical archive is shared or changed")
+                rec,count=verify_local_archive_manifest_members(archive,expected_manifest=data,level=c["zstd_level"])
+                _require((rec.stored_sha256,rec.tar_sha256,rec.tar_size,count)==(c["stored_sha256"],c["tar_sha256"],c["tar_bytes"],c["bundled_file_count"]),
+                         "local full archive differs from immutable custody")
+                files[archive]=(rec.stored_sha256,st)
+            else:
+                _require(resuming and marker.exists(), "original archive disappeared before a verified intent")
+            if readbacks is not None:
+                rb=readbacks["historical:"+c["point_content_signature"]]
+                age=(datetime.now(timezone.utc)-datetime.fromisoformat(rb["verifiedAt"].replace("Z","+00:00"))).total_seconds()
+                _require(-5<=age<=1200 and (rb["generation"],rb["storedSha256"],rb["storedByteSize"])==
+                         (c["generation"],c["stored_sha256"],c["stored_bytes"]), "historical readback differs")
+                _require("verifiedMember" in rb and rb["verifiedMember"] == samples[c["point_content_signature"]],
+                         "registered member readback differs from original manifest")
+        else:
+            for key,members in raw_members.items():
+                directory=root/key
+                if not folder.is_relative_to(directory): continue
+                parts=folder.relative_to(directory).parts
+                if not parts or parts[0] not in raw_dirs: continue
+                for n in names:
+                    p=folder/n
+                    _require(n!="core" and not re.fullmatch(r"core\.\d+",n), "forensic file under raw path")
+                    st=p.lstat();entry=members.get(p.relative_to(directory).as_posix())
+                    _require(entry and st.st_nlink==1 and entry[0]==st.st_size and _size_and_sha256(p)==entry,
+                             "unlisted, shared or different original raw file")
+                    files[p]=(entry[1],st)
+                break
+    _require(found==set(all_proofs), "expected evidence directory is missing")
+    _require(cases<=owned_cases and solvers<=owned_solvers,"unarchived case state")
+    return files
+
+
 def _same_file(path, original):
     current = path.lstat()
     return (path.resolve() == path and os.path.samestat(current, original) and current.st_nlink == 1 and
@@ -351,19 +490,20 @@ def _same_file(path, original):
             current.st_ctime_ns == original.st_ctime_ns)
 
 
-def _allocation(root, rows, files, stored):
+def _allocation(root, rows, files, stored, receipt_files=None):
     parents = {root, *((root / _relative(name)).parent for name, _, _ in rows)}
     directory_bytes = sum(p.stat().st_blocks * 512 for p in parents)
     volume = os.statvfs(root)
     free = volume.f_frsize * volume.f_bfree
+    receipts = receipt_files or [root / f"closed_progressive_duplicate_files.{kind}.json" for kind in ("intent", "complete")]
+    receipt_bytes = sum(p.lstat().st_blocks * 512 for p in receipts if p.exists())
     if stored is None:
-        return {"fileAllocatedBytes": sum(st.st_blocks * 512 for _, st in files.values()),
+        return {**({"originalReceiptAllocatedBytes":receipt_bytes} if receipt_bytes else {}), "fileAllocatedBytes": sum(st.st_blocks * 512 for _, st in files.values()),
                 "directoryBytesBefore": directory_bytes, "filesystemFreeBefore": free}
     baseline = stored.get("allocationBaseline")
     if not baseline:
         return None
-    receipts = [root / f"closed_progressive_duplicate_files.{kind}.json" for kind in ("intent", "complete")]
-    receipt_bytes = sum(p.lstat().st_blocks * 512 for p in receipts if p.exists())
+    receipt_bytes -= baseline.get("originalReceiptAllocatedBytes", 0)
     directory_delta = directory_bytes - baseline["directoryBytesBefore"]
     return {**baseline, "receiptAllocatedBytes": receipt_bytes, "directoryAllocatedDelta": directory_delta,
             "netAttributedAllocatedBytes": baseline["fileAllocatedBytes"] - receipt_bytes - directory_delta,
@@ -383,20 +523,29 @@ def reclaim_closed_progressive_files(job_root: Path, proofs: list[dict], expecte
                 _require(stat.S_ISREG(held.st_mode) and [held.st_dev, held.st_ino] == lock_identity,
                          "execution lock differs from the worker namespace")
 
+            historic = [p for p in proofs if p.get("historicalRaw")]
+            prefix = "closed_progressive_historical_raw_files" if historic else "closed_progressive_duplicate_files"
+            intent_file = job_root / (prefix+".intent.json")
+            done_file = job_root / (prefix+".complete.json")
+            stored = _json(intent_file, 32 * 1024**2) if intent_file.exists() else None
+            markers = {job_root/_relative(p["directory"])/"historical_raw_custody.database.json":
+                       {"version":1,"directory":p["directory"],"receipt":p["historicalRaw"]} for p in historic}
+            receipt_files=[intent_file,done_file,*markers]
             authenticated = None
             if expected_plan is not None:
-                authenticated = {r["brokeredUploadId"]: r for r in readbacks or []}
-                _require(len(authenticated) == len(proofs) == len(readbacks or []) and
-                         set(authenticated) == {p["brokeredUploadId"] for p in proofs}, "missing exhaustive fresh readback")
+                authenticated = {(r["brokeredUploadId"] if "brokeredUploadId" in r else "historical:"+r["historicalPointSignature"]):r for r in readbacks or []}
+                expected_keys={p["brokeredUploadId"] if "brokeredUploadId" in p else "historical:"+p["historicalRaw"]["point_content_signature"] for p in proofs}
+                _require(len(authenticated)==len(proofs)==len(readbacks or []) and set(authenticated)==expected_keys, "missing exhaustive fresh readback")
             keep_requested = any("keepMedia" in p for p in proofs)
             _require(not keep_requested or all("keepMedia" in p for p in proofs), "incomplete media keep-set")
             kept = {} if keep_requested else None
-            files = _inventory(job_root, proofs, authenticated, kept)
+            samples={}
+            def inventory(keep):
+                return (_historical_inventory(job_root, proofs, authenticated, keep, intent_file.exists(), samples)
+                        if historic else _inventory(job_root, proofs, authenticated, keep))
+            files = inventory(kept)
             kept_rows = [entry for entry, _ in (kept or {}).values()]
             current = {path.relative_to(job_root).as_posix(): [sha, st.st_size] for path, (sha, st) in files.items()}
-            intent_file = job_root / "closed_progressive_duplicate_files.intent.json"
-            done_file = job_root / "closed_progressive_duplicate_files.complete.json"
-            stored = _json(intent_file, 32 * 1024**2) if intent_file.exists() else None
             rows = stored["files"] if stored is not None else [[name, *current[name]] for name in sorted(current)]
             fingerprint = [proofs, rows, kept_rows] if keep_requested else [proofs, rows]
             digest = hashlib.sha256(json.dumps(fingerprint, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
@@ -405,6 +554,12 @@ def reclaim_closed_progressive_files(job_root: Path, proofs: list[dict], expecte
             extra = {"mediaFiles": kept_rows, "workingPaths": [name for name, _, _ in rows],
                      "plannedAllocatedBytes": sum(info.st_blocks * 512 for _, info in files.values())
                      if stored is None else stored["allocationBaseline"]["fileAllocatedBytes"]} if keep_requested else {}
+            if historic:
+                extra.pop("workingPaths",None)
+                extra["historicalSamples"]=samples.copy()
+                extra["historicalPathsSha256"]=hashlib.sha256(json.dumps(rows,separators=(",",":")).encode()).hexdigest()
+                extra["plannedAllocatedBytes"]=(sum(st.st_blocks*512 for _,st in files.values()) if stored is None else
+                                                stored["allocationBaseline"]["fileAllocatedBytes"])
             if stored is not None:
                 _require(stored.get("job_id") == job_root.name and stored.get("plan") == digest, "reclaim intent changed")
                 intended = {name: [sha, size] for name, sha, size in rows}
@@ -416,7 +571,7 @@ def reclaim_closed_progressive_files(job_root: Path, proofs: list[dict], expecte
                 _require(stored is not None and not files and _json(done_file, 65536) == receipt, "completed receipt or files changed")
                 _require(expected_plan is None or expected_plan == digest, "completed plan mismatch")
                 return {**receipt, **extra, "state": "planned" if expected_plan is None else "reclaimed", "replayed": True,
-                        "allocation": _allocation(job_root, rows, files, stored)}
+                        "allocation": _allocation(job_root, rows, files, stored, receipt_files)}
             if expected_plan is None:
                 return {**receipt, **extra, "state": "planned", "replayed": False}
             _require(digest == expected_plan, "job changed after preflight")
@@ -424,10 +579,20 @@ def reclaim_closed_progressive_files(job_root: Path, proofs: list[dict], expecte
                 _require(_same_file(path, info), "source changed before unlink")
             for name, (_, st) in (kept or {}).items():
                 _require(_same_file(job_root / name, st), "retained image changed before reclaim")
+            if historic:
+                now = datetime.now(timezone.utc)
+                for readback in authenticated.values():
+                    verified_at = datetime.fromisoformat(readback["verifiedAt"].replace("Z", "+00:00"))
+                    _require(-5 <= (now - verified_at).total_seconds() <= 1200,
+                             "registered restore proof expired during filesystem preflight")
             if stored is None:
                 stored = {"job_id": job_root.name, "plan": digest, "files": rows,
-                          "allocationBaseline": _allocation(job_root, rows, files, None)}
+                          "allocationBaseline": _allocation(job_root, rows, files, None, receipt_files)}
             _atomic_create_json(intent_file, stored)
+            # All folders, files and remote readbacks have passed under this job lock.
+            for marker,payload in markers.items():
+                _atomic_create_json(marker,payload)
+            _require(all(_json(m,8192)==v for m,v in markers.items()),"historical restore markers are not durable")
             for path, (_, info) in files.items():
                 _require(_same_file(path, info), "source changed while reclaiming")
                 path.unlink()
@@ -440,12 +605,14 @@ def reclaim_closed_progressive_files(job_root: Path, proofs: list[dict], expecte
                     os.close(fd)
             if kept is not None:
                 after = {}
-                _require(not _inventory(job_root, proofs, authenticated, after) and
+                _require(not inventory(after) and
                          [entry for entry, _ in after.values()] == kept_rows and
                          all(_same_file(job_root / name, st) for name, (_, st) in kept.items()),
                          "retained media or working-file set changed during reclaim")
+            if historic and kept is None:
+                _require(not inventory(None), "historical raw files remain after reclaim")
             _atomic_create_json(done_file, receipt)
             return {**receipt, **extra, "state": "reclaimed", "replayed": False,
-                    "allocation": _allocation(job_root, rows, files, stored)}
+                    "allocation": _allocation(job_root, rows, files, stored, receipt_files)}
     except (OSError, KeyError, ValueError, TypeError, EvidenceCleanupError) as exc:
         raise JobRetentionRefused(f"closed progressive inventory could not be proven: {exc}") from exc

@@ -26,6 +26,7 @@ export * from "./progressive-cfd-numerical-recovery";
 export * from "./progressive-cfd-stages";
 export * from "./progressive-cfd-recovery";
 export * from "./progressive-remote-execution";
+export * from "./registered-worker-archive-owner";
 export * from "./progressive-remote-dispatch";
 export * from "./progressive-solver-lock";
 export * from "./progressive-prediction-repair";

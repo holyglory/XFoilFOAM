@@ -213,8 +213,8 @@ async function run(next) {
       // A lost operator response after commit is an observation of the recorded outcome.
       // It neither authorizes a second unlink nor fabricates a new cloud readback.
       const [prior] = await client.sql.unsafe(
-        "SELECT strip_report->'closedProgressiveFiles' AS receipt FROM sim_jobs WHERE id=$1::uuid",
-        [scope.id],
+        "SELECT strip_report->$2::text AS receipt FROM sim_jobs WHERE id=$1::uuid",
+        [scope.id,scope.historicalRaw?"historicalRawFiles":"closedProgressiveFiles"],
       );
       if (prior?.receipt?.complete === true) {
         if (
@@ -226,6 +226,7 @@ async function run(next) {
           throw Error("A different plan is already complete");
         return {
           status: "already-settled",
+          ...(scope.historicalRaw ? {historicalRaw:true}:{}),
           record: prior.receipt,
           dependenciesSha256,
           nodePackagesSha256,
@@ -256,6 +257,7 @@ async function run(next) {
           helper: scope.helper,
           ...(scope.keepMedia ? { keepMedia: true } : {}),
           mode: scope.mode,
+          ...(scope.historicalRaw ? {historicalRaw:true} : {}),
           manifests,
           expectedPlan,
           readbacks,
@@ -298,6 +300,7 @@ async function run(next) {
           verifyCompleted: scope.mode === "verify",
           expectedScientificSha256: scope.expectedScience ?? undefined,
           keepMedia: scope.keepMedia === true,
+          historicalRaw: scope.historicalRaw === true,
           expectedMediaSha256: scope.expectedMedia ?? undefined,
           signal: AbortSignal.timeout(20 * 60_000),
         }),
@@ -315,6 +318,7 @@ async function run(next) {
       nodePackagesSha256,
       admissionRetries,
       ...result,
+      ...(scope.historicalRaw?{historicalRaw:true}:{}),
     };
   } finally {
     await client.sql.end({ timeout: 2 });
