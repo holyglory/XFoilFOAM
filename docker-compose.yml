@@ -55,6 +55,9 @@ services:
       args:
         AIRFOILFOAM_BUILD_ID: ${AIRFOILFOAM_BUILD_ID:-dev-20260704-batch-cache}
     ulimits:
+      core:
+        soft: ${AIRFOILFOAM_SOLVER_CORE_SOFT_BYTES:-0}
+        hard: ${AIRFOILFOAM_SOLVER_CORE_HARD_BYTES:--1}
       nofile:
         soft: 65536
         hard: 524288
@@ -63,6 +66,7 @@ services:
       AIRFOILFOAM_DATA_DIR: /data/airfoilfoam
       AIRFOILFOAM_BUILD_ID: ${AIRFOILFOAM_BUILD_ID:-dev-20260704-batch-cache}
       AIRFOILFOAM_OPENFOAM_RUNNER: local
+      AIRFOILFOAM_SOLVER_CORE_SOFT_BYTES: ${AIRFOILFOAM_SOLVER_CORE_SOFT_BYTES:-0}
       AIRFOILFOAM_ENGINE_FAMILY: openfoam
       AIRFOILFOAM_ENGINE_DISTRIBUTION: opencfd
       AIRFOILFOAM_ENGINE_VERSION: "2606"
@@ -117,6 +121,9 @@ services:
       args:
         AIRFOILFOAM_BUILD_ID: ${AIRFOILFOAM_BUILD_ID:-dev-20260704-batch-cache}
     ulimits:
+      core:
+        soft: ${AIRFOILFOAM_SOLVER_CORE_SOFT_BYTES:-0}
+        hard: ${AIRFOILFOAM_SOLVER_CORE_HARD_BYTES:--1}
       nofile:
         soft: 65536
         hard: 524288
@@ -125,6 +132,7 @@ services:
       AIRFOILFOAM_DATA_DIR: /data/airfoilfoam
       AIRFOILFOAM_BUILD_ID: ${AIRFOILFOAM_BUILD_ID:-dev-20260704-batch-cache}
       AIRFOILFOAM_OPENFOAM_RUNNER: local
+      AIRFOILFOAM_SOLVER_CORE_SOFT_BYTES: ${AIRFOILFOAM_SOLVER_CORE_SOFT_BYTES:-0}
       AIRFOILFOAM_ENGINE_FAMILY: openfoam
       AIRFOILFOAM_ENGINE_DISTRIBUTION: foundation
       AIRFOILFOAM_ENGINE_VERSION: "14"

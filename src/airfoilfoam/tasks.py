@@ -1210,6 +1210,19 @@ def run_polar(self, job_id: str, request_json: str) -> dict:
             cancelled_status.message = "cancelled before execution"
             store.write_status(cancelled_status)
             return {"job_id": job_id, "state": "cancelled"}
+        if os.environ.get("AIRFOILFOAM_SOLVER_CORE_SOFT_BYTES", "0") != "0":
+            # A deliberately enabled diagnostic run keeps its crash files even
+            # after a later deployment restores the ordinary zero soft limit.
+            hold = store.job_dir(job_id) / ".retain-solver-core-dumps"
+            try:
+                fd = os.open(hold, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
+            except FileExistsError:
+                pass
+            else:
+                with os.fdopen(fd, "w") as marker:
+                    marker.write(job_id + "\n")
+                    marker.flush()
+                    os.fsync(marker.fileno())
         record_execution_owner(store, job_id)
         status = store.read_status(job_id)
         if status:
