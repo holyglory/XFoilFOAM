@@ -99,34 +99,47 @@ def inventory(extra=()):
         name = line.split()[0]
         if any(fnmatch.fnmatchcase(name, p) for p in PATTERNS):
             units.add(name)
+    return read_units(units)
+
+
+def read_units(names):
     result = {}
-    for name in sorted(units):
+    for name in sorted(names):
         if not re.fullmatch(r"[a-zA-Z0-9_.@:-]+\.(service|timer)", name):
             raise ValueError("Invalid report maintenance unit name")
         props = "LoadState,ActiveState,SubState,FreezerState,FragmentPath,UnitFileState,InvocationID,MainPID,ControlGroup"
-        row = dict(
-            x.split("=", 1)
-            for x in ctl("show", name, "--property=" + props).splitlines()
-        )
+        try:
+            row = dict(
+                x.split("=", 1)
+                for x in ctl("show", name, "--property=" + props).splitlines()
+            )
+        except (RuntimeError, subprocess.TimeoutExpired) as exc:
+            result[name] = {
+                "captureRefusal": f"Could not inspect operator unit {name}: {exc}"
+            }
+            continue
         if row.get("LoadState") != "loaded" or row.get("ActiveState") not in (
             "active",
             "inactive",
             "failed",
         ):
-            raise ValueError(f"Cannot capture stable operator unit {name}")
-        if row["ActiveState"] == "active" and name.endswith(".service"):
+            row["captureRefusal"] = (
+                f"Cannot pause operator unit {name} in "
+                f"{row.get('LoadState', 'unknown')} {row.get('ActiveState', 'unknown')}/{row.get('SubState', 'unknown')}"
+            )
+        elif row["ActiveState"] == "active" and name.endswith(".service"):
             if (
                 row.get("FreezerState") not in ("running", "frozen")
                 or not row.get("ControlGroup")
                 or not row.get("InvocationID")
             ):
-                raise ValueError(f"Cannot reversibly freeze {name}")
-        if row["ActiveState"] == "active" and name.endswith(".timer"):
+                row["captureRefusal"] = f"Cannot reversibly freeze {name}"
+        elif row["ActiveState"] == "active" and name.endswith(".timer"):
             if (
                 not Path(row.get("FragmentPath", "")).is_file()
                 or row.get("UnitFileState") == "transient"
             ):
-                raise ValueError(
+                row["captureRefusal"] = (
                     f"Cannot restore the prior timer definition for {name}"
                 )
         result[name] = row
@@ -134,7 +147,7 @@ def inventory(extra=()):
 
 
 def same_unit(prior, current, *, paused):
-    if current is None:
+    if current is None or current.get("captureRefusal") or prior.get("captureRefusal"):
         return False
     if (
         prior["FragmentPath"] != current["FragmentPath"]
@@ -199,6 +212,9 @@ def freeze_units(state, save, discover=inventory, control=ctl):
 
 def check_units(state, paused, discover=inventory):
     now = discover(state["extraUnits"])
+    for row in now.values():
+        if refusal := row.get("captureRefusal"):
+            raise RuntimeError(refusal)
     for name, row in state["units"].items():
         if not same_unit(row, now.get(name), paused=paused):
             raise RuntimeError("Unexpected operator unit state: " + name)
@@ -210,17 +226,20 @@ def check_units(state, paused, discover=inventory):
         raise RuntimeError("Another report maintenance unit became active")
 
 
-def restore_units(state, save, discover=inventory, control=ctl):
+def restore_units(state, save, discover=None, control=ctl):
+    # Release each captured process independently even when a different writer
+    # is restarting or systemd cannot enumerate the full inventory.
+    lookup = read_units if discover is None else discover
     failures = []
     for name in reversed(state["touched"][:]):
         prior = state["units"][name]
         try:
-            now = discover([name]).get(name)
+            now = lookup([name]).get(name)
             if not same_unit(prior, now, paused=False):
                 if not same_unit(prior, now, paused=True):
                     raise RuntimeError("Unit identity or state changed")
                 control("start" if name.endswith(".timer") else "thaw", name)
-                if not same_unit(prior, discover([name]).get(name), paused=False):
+                if not same_unit(prior, lookup([name]).get(name), paused=False):
                     raise RuntimeError("Prior state was not restored")
             state["touched"].remove(name)
             save()
@@ -228,7 +247,7 @@ def restore_units(state, save, discover=inventory, control=ctl):
             failures.append(f"{name}: {exc}")
     if failures:
         raise RuntimeError("Operator recovery incomplete: " + "; ".join(failures))
-    check_units(state, False, discover)
+    check_units(state, False, discover or inventory)
 
 
 PROBE = """
@@ -278,7 +297,6 @@ def make_plan(args):
     measured_at = time.time()
     f = worker(args.replacement_bytes is not None, args.sample_identity)
     hub = authoritative(f)
-    units = inventory(args.unit)
     cfg = dict(
         replacement=args.replacement_bytes,
         wal=args.wal_bytes,
@@ -287,6 +305,14 @@ def make_plan(args):
     )
     space = host.budget(f, cfg)
     reasons = space["refusals"][:]
+    try:
+        units = inventory(args.unit)
+    except (RuntimeError, subprocess.TimeoutExpired) as exc:
+        units = {}
+        reasons.append(f"Operator unit inventory unavailable: {exc}")
+    reasons.extend(
+        row["captureRefusal"] for row in units.values() if "captureRefusal" in row
+    )
     if args.growth_bytes is None:
         reasons.append("Specify the reviewed external growth allowance for this pause")
     # Retain time for client shutdown, readiness, a normal heartbeat and the

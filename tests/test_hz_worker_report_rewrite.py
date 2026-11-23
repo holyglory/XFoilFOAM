@@ -48,12 +48,12 @@ def sql(q):
 
 @pytest.fixture(scope="module")
 def database():
-    if (
-        os.environ.get("HZ_REPORT_REWRITE_DISPOSABLE") != "1"
-        or not os.environ.get("PGHOST")
-        or not os.environ.get("PGPORT")
-    ):
+    if os.environ.get("HZ_REPORT_REWRITE_DISPOSABLE") != "1":
         pytest.skip("requires the hz-worker-report-rewrite disposable PostgreSQL graph")
+    if not all(os.environ.get(name) for name in ("PGHOST", "PGPORT", "DATABASE_URL")):
+        pytest.fail(
+            "The disposable rewrite graph must supply PGHOST, PGPORT and DATABASE_URL"
+        )
     if (
         sql(
             "SELECT count(*) FROM pg_class WHERE relnamespace='public'::regnamespace AND relkind='r'"
@@ -554,6 +554,93 @@ def test_operator_refuses_to_freeze_itself_before_stopping_any_timer(monkeypatch
             lambda *_: pytest.fail("paused a unit"),
         )
     assert state["touched"] == []
+
+
+def test_restarting_operator_writer_reports_budget_and_does_not_strand_prior_units(
+    runtime, tmp_path, monkeypatch
+):
+    env, directory, host, prior = runtime
+    writer = "airfoils-report-migration-fixture.service"
+    recheck = "airfoils-report-0209-recheck-fixture.service"
+    examples = units_fixture()
+    units = {
+        writer: examples["airfoils-hz-bulk.service"],
+        recheck: examples["airfoils-hz-idle.service"],
+    }
+    calls = []
+
+    def ctl(action, *args):
+        if action == "list-units":
+            return "\n".join(units)
+        name = args[0]
+        if action == "show":
+            return "\n".join(f"{k}={v}" for k, v in units[name].items())
+        assert name == writer and action in ("freeze", "thaw")
+        calls.append((action, name))
+        units[name]["FreezerState"] = "frozen" if action == "freeze" else "running"
+
+    monkeypatch.setattr(ops, "ctl", ctl)
+    initial = ops.inventory()
+    monkeypatch.setattr(ops, "worker", lambda *_: host.measured(host.PG))
+    monkeypatch.setattr(
+        ops.audit,
+        "query",
+        lambda role, q: [
+            json.loads(x)
+            for x in sql("BEGIN READ ONLY;\n" + q + "\nCOMMIT;").splitlines()
+        ],
+    )
+    monkeypatch.setattr(
+        ops,
+        "ssh",
+        lambda *_a, **_kw: pytest.fail("staged or submitted a refused rewrite"),
+    )
+
+    # Real long-lived operator service shape between its restart attempts.
+    def restarting():
+        units[recheck].update(
+            ActiveState="activating",
+            SubState="auto-restart",
+            MainPID="0",
+            ControlGroup="",
+        )
+
+    restarting()
+    output = tmp_path / "plan.json"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["rewrite", "--dry-run", "--growth-bytes", "0", "--output", str(output)],
+    )
+    ops.main()
+    plan = json.loads(output.read_text())
+    assert plan["workspace"]["availableBytes"] > 0 and plan["authority"]["active"] == 1
+    assert (
+        plan["units"][recheck]["MainPID"] == "0"
+        and "activating/auto-restart" in plan["refusals"][0]
+    )
+    run_dir = tmp_path / "refused"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["rewrite", "--execute", "--growth-bytes", "0", "--run-dir", str(run_dir)],
+    )
+    with pytest.raises(SystemExit, match="before the pause"):
+        ops.main()
+    assert not run_dir.exists() and not calls
+    # A transition after a different service was frozen must first release
+    # that exact process, then report the independent inventory discrepancy.
+    units[recheck] = dict(initial[recheck])
+    state = {"units": initial, "extraUnits": [], "touched": []}
+    ops.freeze_units(state, lambda: None, control=ctl)
+    restarting()
+    with pytest.raises(RuntimeError, match="activating/auto-restart"):
+        ops.check_units(state, True)
+    with pytest.raises(RuntimeError, match="activating/auto-restart"):
+        ops.restore_units(state, lambda: None, control=ctl)
+    assert calls == [("freeze", writer), ("thaw", writer)]
+    assert state["touched"] == [] and units[writer] == initial[writer]
+    restored(env, prior)
 
 
 def test_short_lease_refuses_before_pausing_any_service(runtime):

@@ -74,12 +74,20 @@ All return checks are read-only. Keep ordinary HZ ingress and the engine service
 
 ### HZ physical rewrite
 
+The named `hz-worker-report-rewrite` graph provisions an empty disposable PostgreSQL 16 database, runs the worker rewrite and recovery tests, checks the existing hub lifecycle, and tears down its database. To reproduce it, supply the absolute path to the checkout in this command.
+
+```sh
+devcoordinator2 call test.start --params '{"path":"/absolute/path/to/XFoilFOAM","test":"hz-worker-report-rewrite"}'
+```
+
 Run the worker command from the operator machine that owns the report maintenance user units, with the usual host-key-checked HZ and upstream SSH access. Start with the live, read-only plan. `--growth-bytes` is the reviewed allowance for other filesystem writes over the whole window. Supply the value in bytes. Save the JSON in a new private file.
 
 ```sh
 python3 scripts/deploy/rewrite-hz-worker-reports.py --dry-run \
   --growth-bytes "$growth_bytes" --sample-identity --output "$plan_file"
 ```
+
+A restarting operator service appears in the dry run with its systemd state and a pause refusal. Disk and lease measurements remain available. Recovery checks each captured writer directly, so an unrelated service transition can be reported after the original writer is released.
 
 The plan binds the HZ registration on both instances, the configured remote-solver role, the PostgreSQL 16 primary, and the exact heap, TOAST and index files of `public.progressive_worker_reports`. It resolves their actual Docker mount and device, WAL and sort workspace, usable filesystem bytes, archive mode and replication slots. It reports local collection and outstanding delivery, physical solver processes, operator units and both hosts’ earliest active promise expiry. A running physical solver can keep computing throughout the rewrite.
 
