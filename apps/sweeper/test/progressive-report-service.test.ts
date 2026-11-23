@@ -53,16 +53,13 @@ function publicationFixture(
   const dialect = new PgDialect();
   const lane = options.lane ?? 0;
   const laneCount = options.laneCount ?? 1;
-  const selectionQueries = new Map(
-    (["active", "backlog"] as const).map((pass) => [
-      JSON.stringify(
-        dialect.sqlToQuery(
-          progressivePublicationSelectionSql(lane, laneCount, pass),
-        ),
-      ),
-      pass,
-    ]),
-  );
+  const selectionQueries = new Map<string, ProgressivePublicationPass>();
+  for (const pass of ["active", "backlog"] as const) {
+    for (const after of [undefined, activeId, terminalId]) {
+      const selection = progressivePublicationSelectionSql(lane, laneCount, pass, after);
+      selectionQueries.set(JSON.stringify(dialect.sqlToQuery(selection)), pass);
+    }
+  }
   const db = {
     execute: vi.fn(async (statement: SQL) => {
       const query = dialect.sqlToQuery(statement);
