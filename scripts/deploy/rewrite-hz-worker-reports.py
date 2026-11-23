@@ -185,15 +185,12 @@ def freeze_units(state, save, discover=inventory, control=ctl):
         raise RuntimeError("An operator unit changed before the pause")
     own_groups = operator_cgroups()
     for name, row in prior.items():
+        if not name.endswith(".service") or row["ActiveState"] != "active":
+            continue
         parent = row["ControlGroup"]
-        if (
-            name.endswith(".service")
-            and row["ActiveState"] == "active"
-            and parent
-            and any(
-                group == parent or group.startswith(parent.rstrip("/") + "/")
-                for group in own_groups
-            )
+        if parent and any(
+            group == parent or group.startswith(parent.rstrip("/") + "/")
+            for group in own_groups
         ):
             raise RuntimeError(
                 f"Run the operator outside {name} so it can restore that service"
