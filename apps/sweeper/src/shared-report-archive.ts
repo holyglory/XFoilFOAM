@@ -1,6 +1,7 @@
 import { DEFAULT_PROGRESSIVE_REPORT_READ_TIMEOUT_MS } from "@aerodb/db/progressive-report-reader";
+import { Readable, addAbortSignal } from "node:stream";
 import { AsyncLocalStorage } from "node:async_hooks";
-import { gzipSync, gunzipSync } from "node:zlib";
+import { gzipSync, gunzipSync, createGunzip } from "node:zlib";
 import { createHash } from "node:crypto";
 import {
   canonicalReportJson,
@@ -302,7 +303,7 @@ export async function readSharedReport(
   }
 }
 
-async function readPinnedSharedReport(
+async function selectSharedMember(
   store: ReportObjects,
   id: ProgressiveReportArchiveReadIdentity,
   signal: AbortSignal,
@@ -365,6 +366,15 @@ async function readPinnedSharedReport(
     m.reportByteSize !== id.reportByteSize
   )
     throw new Error("Shared report does not match the registered member");
+  return { m, manifest, cache };
+}
+
+async function readPinnedSharedReport(
+  store: ReportObjects,
+  id: ProgressiveReportArchiveReadIdentity,
+  signal: AbortSignal,
+) {
+  const { m, manifest, cache } = await selectSharedMember(store, id, signal);
   const hash = m.resultHash;
   const value = hash
     ? cache?.result?.hash === hash
@@ -373,6 +383,48 @@ async function readPinnedSharedReport(
     : undefined;
   if (cache && hash && value) cache.result = { hash, value };
   return restore(manifest, m, value);
+}
+
+/** A previously issued polar/raw receipt already proves the exact point.
+ * Authenticate both registered generations and reconstruct the original byte
+ * digest without parsing or retaining unrelated points from a cumulative result. */
+export async function verifySharedReportGeneration(
+  store: ReportObjects,
+  id: ProgressiveReportArchiveReadIdentity,
+  signal: AbortSignal,
+) {
+  const { m, manifest } = await selectSharedMember(store, id, signal);
+  let bytes = Buffer.byteLength(m.prefix);
+  const whole = createHash("sha256").update(m.prefix);
+  if (m.resultHash) {
+    const result = manifest.results[m.resultHash],
+      packed = await store.read(result.pin, limit + 65536, signal);
+    if (
+      packed.length !== result.pin.size ||
+      sha256(packed) !== result.pin.sha256
+    )
+      throw new Error("Shared receipt compressed generation changed");
+    const h = createHash("sha256");
+    let n = 0;
+    const stream = addAbortSignal(
+      signal,
+      Readable.from([packed]).pipe(createGunzip()),
+    );
+    for await (const chunk of stream) {
+      n += chunk.length;
+      if (n > result.rawSize)
+        throw new Error("Shared receipt result exceeded its stored length");
+      h.update(chunk);
+      whole.update(chunk);
+    }
+    if (n !== result.rawSize || h.digest("hex") !== m.resultHash)
+      throw new Error("Shared receipt scientific generation changed");
+    bytes += n;
+  }
+  bytes += Buffer.byteLength(m.suffix);
+  whole.update(m.suffix);
+  if (bytes !== m.reportByteSize || whole.digest("hex") !== m.reportSha256)
+    throw new Error("Shared receipt original PG bytes changed");
 }
 
 /** Copy before publication. Every immutable result is stored once across pages;
