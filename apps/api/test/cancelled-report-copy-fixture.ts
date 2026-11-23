@@ -32,7 +32,7 @@ import {
 import { CancelledReportCopyPriority, nextCancelledReportCopies, selectCancelledReportCopyPage } from "../../sweeper/src/cancelled-report-copies";
 import { applyProgressiveRemoteProgress } from "../../sweeper/src/progressive-remote-progress";
 import { archiveProgressiveReportBatch } from "../../sweeper/src/progressive-report-archive-service";
-import { copyStoppedReportBatch, stoppedReportCopyKeys } from "../../sweeper/src/shared-stopped-report-custody";
+import { copyStoppedReportBatch, offerNextStoppedCopyPage, stoppedReportCopyKeys } from "../../sweeper/src/shared-stopped-report-custody";
 import { readSharedReport, SHARED_REPORT_FORMAT } from "../../sweeper/src/shared-report-archive";
 import { memoryReportObjects } from "../../sweeper/test/shared-report-object-fixture";
 import type { importPolarPush } from "../src/sync-routes";
@@ -296,6 +296,11 @@ export async function verifyCancelledReportCopyReplay(
     await db.execute(sql`SELECT sequence::int AS seq FROM progressive_remote_reports
     WHERE sim_job_id=${id}::uuid AND archived_at IS NOT NULL ORDER BY sequence`);
   expect(cold).toEqual([{ seq: copy.sequence }]);
+  const continuation = new CancelledReportCopyPriority();
+  await offerNextStoppedCopyPage(db,id,copy.sequence,continuation);
+  const next = await selectCancelledReportCopyPage(db,cursor,continuation);
+  expect(next.after).toEqual(cursor);
+  expect(next.preferred?.keys.map(k=>[k.sequence,k.signature])).toEqual([[dependent.sequence,exact.get(dependent.sequence)]]);
   expect(
     await archiveProgressiveReportBatch(db, "remote", id, put, [copy.sequence]),
   ).toBe(0);

@@ -5,6 +5,7 @@ import {
   canonicalAnalysisJson,
   registeredWorkerArchiveOwner,
   verifyProgressiveEvidenceCustodyReceipt,
+  verifyProgressiveRemoteExecution,
   type DB,
   type ProgressiveEvidenceCustodyReceipt,
 } from "@aerodb/db";
@@ -412,6 +413,63 @@ async function checkPreservedSolver(id: string, directory: string, plan: ClosedP
   await readStoredFile(new URL(`/api/media/jobs/${id}/${path}`, "http://node-api:4000"), sample, signal, "");
 }
 
+type RegisteredStop = {
+  baseUrl: string; solverId: string; promiseId: string; executionId: string;
+  assignmentSignature: string; localEnvelopeSha256: string; stoppedReportSignature: string; receivedSequence: number;
+  promiseState: "cancelled" | "expired"; jobState: string; engineState: string;
+};
+
+/** A stopped worker need not receive another assignment poll after its hub cancels the promise. */
+async function registeredTerminalPromise(db: DB, id: string, signal?: AbortSignal): Promise<RegisteredStop | undefined> {
+  const [mirror] = await db.execute(sql`SELECT p.status FROM sim_jobs j
+    JOIN sync_sweep_promises p ON p.id::text=j.request_payload->>'syncPromiseId'
+    WHERE j.id=${id}::uuid AND j.engine_job_id=${id} AND j.status='cancelled'`);
+  if (mirror?.status !== "active") return undefined;
+  if (process.env.AIRFOILFOAM_DEPLOYMENT_ROLE !== "remote-solver") throw Error("Job has active ownership");
+  const { baseUrl, authToken, envelope } = await registeredWorkerArchiveOwner(db, id);
+  const [stop] = await db.execute(sql`SELECT r.sequence,r.content_signature,r.assignment_signature,r.acknowledged_at,r.stopped_engine_job_id,
+    encode(sha256(convert_to((j.request_payload->'remoteProgressiveExecution')::text,'UTF8')),'hex') AS local_envelope_sha
+    FROM progressive_worker_reports r JOIN sim_jobs j ON j.id=r.sim_job_id AND j.request_payload->'remoteProgressiveExecution'=${JSON.stringify(envelope)}::jsonb
+    WHERE r.sim_job_id=${id}::uuid ORDER BY r.sequence DESC LIMIT 1`);
+  const sequence = Number(stop?.sequence);
+  if (stop?.stopped_engine_job_id !== id || !stop.acknowledged_at || stop.assignment_signature !== envelope.contentSignature ||
+      typeof stop.local_envelope_sha !== "string" || !/^[a-f0-9]{64}$/.test(stop.local_envelope_sha) ||
+      typeof stop.content_signature !== "string" || !/^[a-f0-9]{64}$/.test(stop.content_signature) ||
+      !Number.isSafeInteger(sequence) || sequence < 1)
+    throw Error("Job has active ownership or lacks an exact acknowledged stop");
+  const { readRegisteredArchive } = await import("@aerodb/core/registered-archive-read");
+  const r = await readRegisteredArchive(`${baseUrl}/progressive-executions/${id}`, authToken,
+    signal ?? AbortSignal.timeout(30_000), "application/json");
+  if (r.status !== 200 || !r.body || r.headers.get("content-type")?.split(";")[0] !== "application/json") {
+    await r.body?.cancel();
+    throw Error(`Registered assignment read refused (HTTP ${r.status})`);
+  }
+  let length = 0;
+  const bytes: Buffer[] = [];
+  for await (const chunk of r.body as unknown as AsyncIterable<Uint8Array>) {
+    length += chunk.length;
+    if (length > 1024 ** 2) throw Error("Registered assignment exceeds the owner proof bound");
+    bytes.push(Buffer.from(chunk));
+  }
+  const observed = JSON.parse(Buffer.concat(bytes).toString("utf8")) as {
+    assignment?: { envelope?: unknown; executionStopped?: boolean; receivedSequence?: number;
+      promise?: { id?: string; status?: string }; job?: { status?: string; engineState?: string } };
+    continuation?: { kind?: string };
+  };
+  const a = observed?.assignment;
+  verifyProgressiveRemoteExecution(a?.envelope, {
+    solverId: envelope.solverId, promiseId: envelope.promiseId, executionId: id, contentSignature: envelope.contentSignature,
+  });
+  if (!a || a.promise?.id !== envelope.promiseId || a.executionStopped !== true || a.receivedSequence !== sequence ||
+      observed.continuation?.kind !== "stop" || (a.promise.status !== "cancelled" && a.promise.status !== "expired") ||
+      !a.job?.status || !["cancelled", "done", "failed"].includes(a.job.status) ||
+      !a.job.engineState || !["cancelled", "completed", "failed"].includes(a.job.engineState))
+    throw Error("Registered hub has active ownership or lacks the matching terminal job, promise and report");
+  return { baseUrl, solverId: envelope.solverId, promiseId: envelope.promiseId, executionId: id,
+    assignmentSignature: envelope.contentSignature, localEnvelopeSha256: stop.local_envelope_sha, stoppedReportSignature: stop.content_signature, receivedSequence: sequence,
+    promiseState: a.promise.status, jobState: a.job.status, engineState: a.job.engineState };
+}
+
 const LIVE = sql`('pending','submitted','running','ingesting')`;
 function eligible(
   now: Date,
@@ -420,6 +478,7 @@ function eligible(
   media: KeptImage[] = [],
   historical = false,
   preserveSolver?: string,
+  hubStop?: RegisteredStop,
 ) {
   const receiptKey = preserveSolver ? "closedProgressiveSiblingFiles" : historical
     ? "historicalRawFiles"
@@ -430,7 +489,15 @@ function eligible(
     ${preserveSolver ? sql`AND j.status='cancelled' AND (j.strip_report->'closedProgressiveFiles'->>'complete') IS DISTINCT FROM 'true'
       AND EXISTS(SELECT FROM sync_sweep_promises p JOIN sync_api_settings s ON s.id=1
         WHERE p.id::text=j.request_payload->>'syncPromiseId' AND p.registered_solver_id=s.remote_solver_registered_id
-          AND p.source_base_url=s.upstream_base_url AND p.status IN ('cancelled','expired') AND NOT s.remote_solver_transfer_paused)` : sql``}
+          AND p.source_base_url=s.upstream_base_url AND NOT s.remote_solver_transfer_paused
+          AND (p.status IN ('cancelled','expired') ${hubStop ? sql`OR (p.status='active' AND j.id=${hubStop.executionId}::uuid
+            AND p.id=${hubStop.promiseId}::uuid AND p.registered_solver_id=${hubStop.solverId}::uuid AND p.source_base_url=${hubStop.baseUrl}
+            AND j.request_payload#>>'{remoteProgressiveExecution,contentSignature}'=${hubStop.assignmentSignature}
+            AND encode(sha256(convert_to((j.request_payload->'remoteProgressiveExecution')::text,'UTF8')),'hex')=${hubStop.localEnvelopeSha256}
+            AND EXISTS(SELECT FROM progressive_worker_reports r WHERE r.sim_job_id=j.id AND r.sequence=${hubStop.receivedSequence}
+              AND r.content_signature=${hubStop.stoppedReportSignature} AND r.assignment_signature=${hubStop.assignmentSignature}
+              AND r.stopped_engine_job_id=j.engine_job_id AND r.acknowledged_at IS NOT NULL
+              AND NOT EXISTS(SELECT FROM progressive_worker_reports later WHERE later.sim_job_id=j.id AND later.sequence>r.sequence)))` : sql``}))` : sql``}
     AND ${
       historical
         ? sql`j.status='cancelled' AND j."ingestedAt" IS NOT NULL
@@ -927,12 +994,14 @@ async function record(
   mediaSha256?: string,
   historical = false,
   preserved?: PreservedSolver,
+  hubStop?: RegisteredStop,
 ) {
   const field = preserved ? "closedProgressiveSiblingFiles" : historical ? "historicalRawFiles" : "closedProgressiveFiles";
   await db.execute(sql`UPDATE sim_jobs SET strip_report=jsonb_set(coalesce(strip_report,'{}'::jsonb),ARRAY[${field}::text],
     jsonb_build_object('checkedAt',clock_timestamp(),'complete',${complete}::boolean,'retryAfter',CASE WHEN ${complete}::boolean THEN NULL ELSE clock_timestamp()+interval '5 minutes' END,'outcome',${outcome}::text,'bytes',${bytes}::bigint,'files',${files}::int,'planSha256',${planSha256}::text,'verifiedArchives',${verifiedArchives}::int,'scientificSha256',${scientificSha256}::text,'allocation',${JSON.stringify(allocation ?? null)}::jsonb)
     || ${mediaSha256 ? sql`jsonb_build_object('mediaSha256',${mediaSha256}::text)` : sql`'{}'::jsonb`}
-    || ${preserved ? sql`jsonb_build_object('preservedSolver',${JSON.stringify(preserved)}::jsonb)` : sql`'{}'::jsonb`})
+    || ${preserved ? sql`jsonb_build_object('preservedSolver',${JSON.stringify(preserved)}::jsonb)` : sql`'{}'::jsonb`}
+    || ${hubStop ? sql`jsonb_build_object('registeredTerminalPromise',${JSON.stringify(hubStop)}::jsonb)` : sql`'{}'::jsonb`})
     WHERE id=${id}::uuid AND (${historical} OR stripped_at IS NULL) AND (strip_report->${field}::text)->>'complete' IS DISTINCT FROM 'true'`);
 }
 
@@ -968,6 +1037,7 @@ export async function closedProgressiveJob(
   const historical = options.historicalRaw
     ? await historicalCustody(db, id, options.signal)
     : undefined;
+  const hubStop = options.preserveSolver ? await registeredTerminalPromise(db, id, options.signal) : undefined;
   const source = await db.transaction(async (raw) => {
     const tx = raw as unknown as DB;
     await tx.execute(
@@ -977,7 +1047,7 @@ export async function closedProgressiveJob(
       ? await registeredImages(tx, id, false, !historical)
       : [];
     const [ready] = await tx.execute(
-      sql`SELECT j.id FROM sim_jobs j WHERE j.id=${id}::uuid AND ${eligible(now, ageMs, options.verifyCompleted ? options.expectedPlan : undefined, media, options.historicalRaw, options.preserveSolver)}`,
+      sql`SELECT j.id FROM sim_jobs j WHERE j.id=${id}::uuid AND ${eligible(now, ageMs, options.verifyCompleted ? options.expectedPlan : undefined, media, options.historicalRaw, options.preserveSolver, hubStop)}`,
     );
     if (!ready)
       throw new Error(
@@ -1173,10 +1243,15 @@ export async function closedProgressiveJob(
       points,
       scientificSha256,
       ...(mediaSha256 ? { mediaSha256, keptMediaRows: source.media } : {}),
+      ...(hubStop ? { registeredTerminalPromise: hubStop } : {}),
       settled: false,
     };
   let allocation: ClosedProgressiveReclaimResponse["allocation"] = null;
   options.signal?.throwIfAborted();
+  // All authenticated network reads finish before the write transaction starts.
+  const confirmedStop = options.preserveSolver ? await registeredTerminalPromise(db, id, options.signal) : undefined;
+  if (hubStop && confirmedStop && canonicalAnalysisJson(hubStop) !== canonicalAnalysisJson(confirmedStop))
+    throw Error("Registered terminal ownership changed during preflight");
   const settled = await db.transaction(async (raw) => {
     const tx = raw as unknown as DB;
     await tx.execute(
@@ -1188,7 +1263,7 @@ export async function closedProgressiveJob(
     if (!locked) return false;
     const media = options.keepMedia ? await registeredImages(tx, id, true, !historical) : [];
     const [ready] = await tx.execute(
-      sql`SELECT j.id FROM sim_jobs j WHERE j.id=${id}::uuid AND ${eligible(now, ageMs, undefined, media, options.historicalRaw, options.preserveSolver)}`,
+      sql`SELECT j.id FROM sim_jobs j WHERE j.id=${id}::uuid AND ${eligible(now, ageMs, undefined, media, options.historicalRaw, options.preserveSolver, confirmedStop)}`,
     );
     if (!ready) return false;
     const fresh = await proofs(tx, id, media, historical, options.keepMedia);
@@ -1252,6 +1327,7 @@ export async function closedProgressiveJob(
       mediaSha256,
       options.historicalRaw,
       plan.preservedSolver,
+      confirmedStop ?? hubStop,
     );
     return true;
   });
@@ -1261,6 +1337,7 @@ export async function closedProgressiveJob(
     points,
     scientificSha256,
     ...(mediaSha256 ? { mediaSha256, keptMediaRows: source.media } : {}),
+    ...((confirmedStop ?? hubStop) ? { registeredTerminalPromise: confirmedStop ?? hubStop } : {}),
     allocation,
     settled,
   };

@@ -4,6 +4,7 @@ import {
 } from "@aerodb/db/progressive-report-prefix";
 import type { DB } from "@aerodb/db";
 import { cancelledReportSourceVerifier } from "./report-archive-source-proof";
+import { offerNextStoppedCopyPage } from "./shared-stopped-report-custody";
 import { sql } from "drizzle-orm";
 import { createHash } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
@@ -533,9 +534,8 @@ export async function runProgressiveReportArchiveService(
               preferred ? new Map(preferred.keys.map(k => [k.sequence,k.signature])) : undefined,
             );
             if (members) {
-              if (members < page.sequences.length) {
-                if (preferred) priority?.offer(preferred.executionId,preferred.keys);
-                else copyCursor = {
+              if (!preferred && members < page.sequences.length) {
+                copyCursor = {
                   executionId: page.executionId,
                   sequence: page.sequences[members - 1]!,
                 };
@@ -548,6 +548,16 @@ export async function runProgressiveReportArchiveService(
                   members,
                 }),
               );
+              if (preferred && priority && !signal.aborted) {
+                try {
+                  await offerNextStoppedCopyPage(db, preferred.executionId, preferred.keys[0]!.sequence, priority);
+                } catch (error) {
+                  // Publication already committed. Ordinary discovery still
+                  // covers this owner if the separate follow-up read fails.
+                  console.warn("[sweeper] stopped report follow-up", preferred.executionId,
+                    error instanceof Error ? error.message : String(error));
+                }
+              }
             }
           }
         } catch (error) {
