@@ -4323,7 +4323,7 @@ describe("cell preliminary outcomes stay separate from ordinary RANS failures", 
         method: "GET", url: `/api/admin/point-history/${fastResult.id}/sim?resultAttemptId=${attempt.id}`,
       });
       expect(response.statusCode).toBe(200);
-      expect(response.json()).toMatchObject({ fidelity, cl });
+      expect(response.json()).toMatchObject({ resultId: fastResult.id, resultAttemptId: attempt.id, fidelity, cl });
     }
 
     // MUST-CATCH: an exact accepted final generation stays authoritative even

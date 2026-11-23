@@ -882,5 +882,6 @@ export async function assembleAdminSim(
   const projected = await selectedResultProjection(selected.result, selected.attempt);
   const effectiveRe = projected.reynolds ?? selected.revisionReynolds;
   if (!finiteStored(effectiveRe) || effectiveRe <= 0) return null;
-  return solvedDetail(selected.airfoilName, effectiveRe, projected);
+  const detail = await solvedDetail(selected.airfoilName, effectiveRe, projected);
+  return detail ? { ...detail, resultAttemptId: selected.attempt.id } : null;
 }
