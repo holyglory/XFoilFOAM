@@ -4,6 +4,7 @@ import { prepareReportPayloadReferenceIndexes } from "../src/report-payload-refe
 import { drizzle } from "drizzle-orm/postgres-js";
 import { sql as drizzleSql } from "drizzle-orm";
 import { migrate } from "drizzle-orm/postgres-js/migrator";
+import { readMigrationFiles } from "drizzle-orm/migrator";
 import {
   cpSync,
   mkdirSync,
@@ -820,6 +821,11 @@ it("normal migrate prepares 0223 online, recovers an interrupted build and prese
     Number(
       (await db`SELECT count(*) AS n FROM drizzle.__drizzle_migrations`)[0].n,
     );
+  const readJournal = () => db`SELECT id, hash, created_at::text AS created_at
+    FROM drizzle.__drizzle_migrations ORDER BY id`;
+  const expectedJournal = readMigrationFiles({ migrationsFolder: migrations }).map(m => ({
+    hash: m.hash, created_at: String(m.folderMillis),
+  }));
   try {
     await migrate(drizzle(db), { migrationsFolder: prior });
     const n = await countJournal();
@@ -900,7 +906,12 @@ it("normal migrate prepares 0223 online, recovers an interrupted build and prese
     ).toBe(false);
     expect(await countJournal()).toBe(n);
     await normal();
-    expect(await countJournal()).toBe(n + 1);
+    const installedJournal = await readJournal();
+    expect(installedJournal.map(({ hash, created_at }) => ({ hash, created_at }))).toEqual(expectedJournal);
+    const [workerPolicy] = await db`SELECT hz_settled_receipts_enabled AS enabled,
+      to_regprocedure('public.attempt_evidence_hz_settled_scope(uuid,uuid)') IS NOT NULL AS ready
+      FROM attempt_evidence_storage_policy WHERE id=1`;
+    expect(workerPolicy).toEqual({ enabled: false, ready: true });
     expect((await prepareReportPayloadReferenceIndexes(db)).indexes).toEqual([
       { name: worker, action: "existing" },
       { name: remote, action: "existing" },
@@ -916,7 +927,7 @@ it("normal migrate prepares 0223 online, recovers an interrupted build and prese
     ).rejects.toThrow(/referenced|foreign key/i);
     expect(await identity()).toEqual(before);
     await normal();
-    expect(await countJournal()).toBe(n + 1);
+    expect(await readJournal()).toEqual(installedJournal);
   } finally {
     await db.end();
     await admin!.unsafe(`DROP DATABASE "${name}"`);
