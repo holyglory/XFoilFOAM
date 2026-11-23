@@ -140,7 +140,7 @@ historical_gateway_operation() {
     # Unrelated Node releases may continue during this long drain. Rebinding
     # only the draining phase also requires identical qualified gateway modules.
     if [[ "$(read_env_var REMOTE_SOLVER2606_DRAIN_PHASE)" == draining ]]; then
-      gateway_image bind-original
+      gateway_image bind-original || return 14
       DRAIN_REBIND=true
     fi
     load_drain_state
