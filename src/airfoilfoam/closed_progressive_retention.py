@@ -42,9 +42,9 @@ def _case_path(job_id, value, case):
     return path
 
 
-def _images(job, directory, images):
+def _images(job, directory, images, allow_empty=False):
     """Normalize the two actual spellings used by engine results and manifests."""
-    _require(isinstance(images, dict) and images, "point has no instantaneous image inventory")
+    _require(isinstance(images, dict) and (images or allow_empty), "point has no instantaneous image inventory")
     case = PurePosixPath(*directory.parts[:2])
     prefix = f"/jobs/{job}/files/"
     paths = {}
@@ -71,9 +71,23 @@ def _kept_images(root, proofs, declared):
             expected[name] = None
         for row in rows:
             path = _relative(row["path"])
-            _require(path.is_relative_to(directory / "scaled_media") and path.name == row["field"] + ".png" and
-                     path.as_posix() not in expected, "scaled image has a different or duplicate owner")
+            native = proof.get("regime") == "urans" and path.as_posix() == images[row["field"]]
+            _require(native or (path.is_relative_to(directory / "scaled_media") and path.name == row["field"] + ".png" and
+                                path.as_posix() not in expected), "scaled image has a different or duplicate owner")
             expected[path.as_posix()] = (row["byteSize"], row["sha256"])
+        if proof.get("regime") == "urans":
+            # Prior scale versions can remain visible by their original path.
+            # Retain them only under this signed point and declared image field.
+            cache = root / directory / "scaled_media" / "default_v1_zoom2"
+            if cache.exists():
+                _require(cache.resolve(strict=True) == cache and cache.is_dir(), "unsafe scaled-media root")
+                for version in cache.iterdir():
+                    _require(re.fullmatch(r"v[0-9]+", version.name) and not version.is_symlink() and version.is_dir(),
+                             "unknown scaled-media version")
+                    for image in version.iterdir():
+                        _require(image.name == image.stem + ".png" and image.stem in images, "unknown scaled-media field")
+                        expected.setdefault(image.relative_to(root).as_posix(), None)
+                        _require(len(expected) <= 512, "media inventory exceeds the bounded job proof")
     _require(0 < len(expected) <= 512, "media inventory exceeds the bounded job proof")
     kept = {}
     total_bytes = 0
@@ -91,7 +105,7 @@ def _kept_images(root, proofs, declared):
     return kept
 
 
-def _result_manifests(root, declared=None):
+def _result_manifests(root, declared=None, urans_directories=()):
     result = _json(root / "result.json", 128 * 1024**2)
     for record in (result, _json(root / "status.json", 1024**2)):
         _require(record.get("job_id") == root.name and record.get("state") in {"completed", "failed", "cancelled"},
@@ -109,7 +123,7 @@ def _result_manifests(root, declared=None):
             _require(path.name == "evidence_manifest.json", "invalid result manifest path")
             directory = path.parent
             if declared is not None:
-                images = _images(root.name, directory, point.get("images"))
+                images = _images(root.name, directory, point.get("images"), directory.as_posix() in urans_directories)
                 _require(declared.setdefault(directory.as_posix(), images) == images, "point image declarations differ")
             members = set()
             for item in artifacts:
@@ -131,10 +145,18 @@ def _time(name):
         return -1
 
 
-def _live_member(member, latest):
+def _live_member(member, latest, urans_solver=None):
     """Continuation uses the mesh, dictionaries and the latest saved U/p fields."""
     path = _relative(member["path"])
     parts = path.parts
+    if any(re.fullmatch(r"core\.[0-9]+", part) for part in parts):
+        return None
+    if urans_solver:
+        if parts == ("openfoam", "logs", urans_solver, "log.pimpleFoam"):
+            return PurePosixPath("log.pimpleFoam")
+        # Processor time directories can link back to reconstructed uniform state.
+        if len(parts) >= 3 and parts[0] == "time_directories" and parts[2] == "uniform":
+            return None
     if len(parts) >= 3 and parts[0] == "time_directories" and 0 < _time(parts[1]) < latest:
         return PurePosixPath(*parts[1:])
     if len(parts) >= 3 and parts[:2] == ("openfoam", "postProcessing"):
@@ -144,6 +166,7 @@ def _live_member(member, latest):
 
 def _local_manifest(root, folder, proof, reported, readbacks, declared=None):
     mf = folder / "evidence_manifest.json"
+    _require(mf.resolve(strict=True) == mf and stat.S_ISREG(mf.lstat().st_mode), "unsafe evidence manifest path")
     _require(mf.stat().st_size == proof["manifestByteSize"] <= MAX_EVIDENCE_MANIFEST_BYTES, "manifest size differs")
     data = mf.read_bytes()
     _require(hashlib.sha256(data).hexdigest() == proof["manifestSha256"], "local manifest differs")
@@ -183,7 +206,8 @@ def _local_manifest(root, folder, proof, reported, readbacks, declared=None):
     if declared is None:
         _require(not media.get("instantaneous"), "manifest declares separate media")
     else:
-        _require(_images(root.name, rel, media.get("instantaneous")) == declared, "manifest and result image paths differ")
+        _require(_images(root.name, rel, media.get("instantaneous"), proof.get("regime") == "urans") == declared,
+                 "manifest and result image paths differ")
     # Sweeper ingestion registers mesh_evidence as mesh and retains its original engine kind in metadata.
     catalog = sorted(f"{'mesh' if kind == 'mesh_evidence' else kind}\tjobs/{root.name}/{rel.as_posix()}/{name}\t{size}\t{sha}"
                      for kind, name, size, sha in reported)
@@ -201,19 +225,29 @@ def _local_manifest(root, folder, proof, reported, readbacks, declared=None):
             _require((name, size, sha) in members and not any(_relative(name).is_relative_to(d) for d in excluded),
                      "registered artifact is outside authenticated bundle members")
     _require(_case_path(root.name, manifest["casePath"], case) == case, "unowned manifest case")
-    return case, _case_path(root.name, manifest["postPath"], case), manifest["files"]
+    post = _case_path(root.name, manifest["postPath"], case)
+    if proof.get("regime") == "urans":
+        _require(manifest.get("unsteady") is True and post.parent == case and
+                 re.fullmatch(r"transient(?:_a[0-9]+)?", post.name), "URANS manifest does not own this transient solver")
+    return case, post, [m for m in manifest["files"] if not any(_relative(m["path"]).is_relative_to(d) for d in excluded)]
 
 
 def _inventory(root, proofs, readbacks, kept=None):
     expected = {str(_relative(p["directory"])): p for p in proofs}
     _require(expected and len(expected) == len(proofs), "empty or duplicate evidence identity")
     declared = {} if kept is not None else None
-    reported = _result_manifests(root, declared)
+    urans = {key for key, proof in expected.items() if kept is not None and proof.get("regime") == "urans"}
+    reported = _result_manifests(root, declared, urans)
     _require(set(reported) == set(expected),
              "engine result and proven point inventory differ")
     cases, solvers, declared_cases, declared_solvers, found = set(), set(), set(), set(), set()
     if kept is not None:
         kept.update(_kept_images(root, proofs, declared))
+    # Authenticate the point/solver mapping before admitting its dense
+    # processor and time directories. All filesystem entries are still checked.
+    authenticated = {key: _local_manifest(root, root / key, expected[key], reported[key], readbacks,
+                                          declared[key] if declared is not None else None) for key in expected}
+    urans_solvers = {authenticated[key][1] for key in urans}
     protected = kept or {}
     protected_dirs = {p.as_posix() for name in protected for p in PurePosixPath(name).parents}
     protected_identities = {(entry["byteSize"], entry["sha256"]) for entry, _ in protected.values()}
@@ -226,7 +260,13 @@ def _inventory(root, proofs, readbacks, kept=None):
     for parent, dirs, names in os.walk(root, followlinks=False, onerror=walk_error):
         folder = Path(parent)
         relative = folder.relative_to(root)
-        seen += len(names) + len(dirs)
+        solver = PurePosixPath(*relative.parts[:3])
+        if solver in urans_solvers:
+            # os.walk consumes one directory at a time, with bounded per-point
+            # manifest candidates. Keep the original bound on unrelated trees.
+            _require(len(names) + len(dirs) <= 100_000, "solver directory exceeds bounded filesystem inventory")
+        else:
+            seen += len(names) + len(dirs)
         _require(seen <= 100_000, "job exceeds bounded filesystem inventory")
         if len(relative.parts) == 2 and relative.parts[0] == "cases":
             cases.add(relative)
@@ -236,6 +276,11 @@ def _inventory(root, proofs, readbacks, kept=None):
             path = folder / name
             if path.is_symlink():
                 actual = path.resolve(strict=True) if protected else path.resolve()
+                if (solver in urans_solvers and name == "uniform" and len(relative.parts) == 5 and
+                        re.fullmatch(r"processor[0-9]+", relative.parts[3]) and _time(relative.name) >= 0 and
+                        os.readlink(path) == f"../../{relative.name}/uniform" and
+                        actual == root / solver / relative.name / "uniform" and actual.is_dir()):
+                    continue
                 _require(name == "polyMesh" and actual.is_relative_to(root / "meshes"), "unaccounted directory symlink")
                 if protected:
                     lexical = Path(os.path.abspath(path.parent / os.readlink(path)))
@@ -264,15 +309,14 @@ def _inventory(root, proofs, readbacks, kept=None):
                  and set(names) == {"evidence_manifest.json", "brokered_hub_binding.database.json",
                  "brokered_local_reclaim.intent.json", "brokered_local_reclaim.json"}, "extra local evidence remains")
         found.add(key)
-        case, post, members = _local_manifest(root, folder, expected[key], reported[key], readbacks,
-                                              declared[key] if declared is not None else None)
+        case, post, members = authenticated[key]
         declared_cases.add(case)
         declared_solvers.add(post)
         post_dir = root / post
         latest = max((_time(t.name) for t in post_dir.iterdir() if t.is_dir() and not t.is_symlink()
                       and (t / "U").is_file() and (t / "p").is_file()), default=-1) if post_dir.is_dir() else -1
         for member in members:
-            live = _live_member(member, latest)
+            live = _live_member(member, latest, post.name if key in urans else None)
             if live is None:
                 continue
             path = root / post / live
