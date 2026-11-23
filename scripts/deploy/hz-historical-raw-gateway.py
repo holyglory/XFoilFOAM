@@ -110,12 +110,23 @@ def run(*args, data=None, timeout=60):
     return command.stdout.strip()
 
 
-def write(path, value):
-    with tempfile.NamedTemporaryFile(dir=path.parent, mode="w", delete=False) as f:
+def json_bytes(value):
+    return (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
+
+
+def sync_directory(path):
+    fd = os.open(path, os.O_DIRECTORY | os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def replace_bytes(path, data):
+    with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as f:
         tmp = Path(f.name)
         try:
-            json.dump(value, f, sort_keys=True, separators=(",", ":"))
-            f.write("\n")
+            f.write(data)
             f.flush()
             os.fsync(f.fileno())
         except BaseException:
@@ -123,26 +134,312 @@ def write(path, value):
             raise
     try:
         os.replace(tmp, path)
-        fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
-        try:
-            os.fsync(fd)
-        finally:
-            os.close(fd)
+        sync_directory(path.parent)
     finally:
         tmp.unlink(missing_ok=True)
 
 
+def write(path, value):
+    replace_bytes(path, json_bytes(value))
+
+
+def private_bytes(path, maximum=32768):
+    with os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK), "rb") as f:
+        info = os.fstat(f.fileno())
+        require(
+            stat.S_ISREG(info.st_mode)
+            and info.st_nlink == 1
+            and info.st_uid == os.geteuid()
+            and not info.st_mode & 0o022
+            and 0 < info.st_size <= maximum,
+            "unsafe local gateway receipt",
+        )
+        data = f.read(maximum + 1)
+        require(len(data) == info.st_size, "gateway receipt changed during read")
+        return data
+
+
 def private_json(path, maximum=32768):
-    info = path.lstat()
+    return json.loads(private_bytes(path, maximum))
+
+
+# The reviewed W23 writer emitted these exact fields and this operator-source manifest.
+LEGACY_SERVICE_FIELDS = {"id", "image", "imageRef", "project", "running", "service", "startedAt"}
+LEGACY_CAPTURE_FIELDS = {
+    "version",
+    "phase",
+    "project",
+    "build",
+    "base",
+    "worker",
+    "baseRef",
+    "before",
+    "candidateRef",
+    "workerNumerical",
+    "wanted",
+    "control",
+}
+LEGACY_CONTROL_SHA256 = "4a9a574815c6ab1f6628c2938c5645212e100e50bfa2d10e12e534254975516b"
+
+
+def capture_directory(journal, original_sha):
     require(
-        stat.S_ISREG(info.st_mode)
-        and info.st_nlink == 1
-        and info.st_uid == os.geteuid()
-        and not info.st_mode & 0o022
-        and 0 < info.st_size <= maximum,
-        "unsafe local gateway receipt",
+        isinstance(original_sha, str) and HEX.fullmatch(original_sha), "invalid original capture digest"
     )
-    return json.loads(path.read_bytes())
+    return journal.with_name(journal.stem + "-capture-" + original_sha)
+
+
+def check_transition(journal, current):
+    original_sha = current["originalCaptureSha256"]
+    archive = capture_directory(journal, original_sha)
+    info = archive.lstat()
+    require(
+        stat.S_ISDIR(info.st_mode) and info.st_uid == os.geteuid() and not info.st_mode & 0o077,
+        "unsafe capture transition directory",
+    )
+    require(
+        {p.name for p in archive.iterdir()} == {"original.json", "sealed.json", "transition.json"},
+        "incomplete capture transition",
+    )
+    original = private_bytes(archive / "original.json")
+    sealed = private_bytes(archive / "sealed.json")
+    proof = private_json(archive / "transition.json")
+    require(
+        hashlib.sha256(original).hexdigest() == original_sha == proof["originalSha256"]
+        and hashlib.sha256(sealed).hexdigest() == proof["sealedSha256"],
+        "capture transition bytes differ",
+    )
+    before = json.loads(original)
+    after = json.loads(sealed)
+    require(
+        set(before) == LEGACY_CAPTURE_FIELDS
+        and before["phase"] == after["phase"] == "captured"
+        and hashlib.sha256(json_bytes(before["control"]).rstrip(b"\n")).hexdigest() == LEGACY_CONTROL_SHA256
+        and set(after) == LEGACY_CAPTURE_FIELDS | {"originalCaptureSha256", "captureBindingSha256"}
+        and after["originalCaptureSha256"] == original_sha
+        and set(proof)
+        == {"originalSha256", "sealedSha256", "composeConfigHash", "originalOperatorSha256", "drain"}
+        and proof["composeConfigHash"] == after["base"]["configHash"]
+        and proof["originalOperatorSha256"] == LEGACY_CONTROL_SHA256
+        and hashlib.sha256(json_bytes({k: v for k, v in proof.items() if k != "sealedSha256"})).hexdigest()
+        == after["captureBindingSha256"],
+        "unrecognized capture predecessor",
+    )
+    for key in before.keys() - {"control", "base", "worker"}:
+        require(before[key] == after[key], "capture transition changed an original field")
+    for key in ("base", "worker"):
+        require(
+            set(before[key]) == LEGACY_SERVICE_FIELDS
+            and set(after[key]) == LEGACY_SERVICE_FIELDS | {"configHash", "runtimeContract"}
+            and all(after[key][f] == before[key][f] for f in LEGACY_SERVICE_FIELDS),
+            "capture transition changed an original service",
+        )
+    require(
+        all(current.get(k) == after[k] for k in after.keys() - {"phase"}),
+        "current journal differs from sealed capture",
+    )
+    return sealed
+
+
+def publish_transition(archive, original, sealed, proof):
+    if archive.exists() or archive.is_symlink():
+        return
+    # Rename a fully fsynced directory. A crash cannot publish a partial predecessor or transition.
+    with tempfile.TemporaryDirectory(dir=archive.parent, prefix=".gateway-transition-") as tmp:
+        stage = Path(tmp) / "record"
+        stage.mkdir(mode=0o700)
+        replace_bytes(stage / "original.json", original)
+        replace_bytes(stage / "sealed.json", sealed)
+        write(stage / "transition.json", proof)
+        sync_directory(stage)
+        os.rename(stage, archive)
+        sync_directory(archive.parent)
+
+
+def legacy_drain_flags(a):
+    keys = {
+        "PENDING",
+        "KIND",
+        "PHASE",
+        "TARGET_BUILD_ID",
+        "SOURCE_REVISION",
+        "SOURCE_TREE_SHA256",
+        "POOL_2406_WAS_ENABLED",
+        "POOL_2606_WAS_ENABLED",
+        "POOL_NUMERICS2_WAS_ENABLED",
+        "SWEEPER_WAS_RUNNING",
+        "MEDIA_REPAIR_WAS_RUNNING",
+        "TRANSFER_PAUSED",
+    }
+    flags = {}
+    prefix = "REMOTE_SOLVER2606_DRAIN_"
+    require(a.drain_env is not None, "missing captured drain environment")
+    with a.drain_env.open(encoding="utf8") as f:
+        for line in f:
+            name, sep, value = line.rstrip("\n").partition("=")
+            if sep and name.startswith(prefix) and name[len(prefix) :] in keys:
+                key = name[len(prefix) :]
+                require(key not in flags, "ambiguous captured drain controls")
+                flags[key] = value
+    require(
+        set(flags) == keys
+        and (flags["PENDING"], flags["KIND"], flags["PHASE"], flags["TARGET_BUILD_ID"])
+        == ("1", "historical-raw-gateway", "draining", a.build)
+        and re.fullmatch("[0-9a-f]{40}", flags["SOURCE_REVISION"])
+        and HEX.fullmatch(flags["SOURCE_TREE_SHA256"]),
+        "original capture requires its exact pending drain",
+    )
+    require(
+        a.pool_state == "false|false|false"
+        and flags["TRANSFER_PAUSED"] == a.transfer_state in ("true", "false")
+        and flags["SWEEPER_WAS_RUNNING"] == a.sweeper_state in ("0", "1")
+        and flags["MEDIA_REPAIR_WAS_RUNNING"] == a.media_state in ("0", "1")
+        and all(flags[k] in ("true", "false") for k in keys if k.startswith("POOL_")),
+        "live pool, transfer or writer state differs from the captured drain",
+    )
+    return flags
+
+
+def bind_legacy_capture(a, original, existing, wanted, control, worker):
+    require(
+        a.action == "bind-original"
+        and set(existing) == LEGACY_CAPTURE_FIELDS
+        and existing["version"] == 1
+        and existing["phase"] == "captured"
+        and existing["project"] == a.project
+        and existing["build"] == a.build
+        and existing["wanted"] == wanted
+        and hashlib.sha256(json_bytes(existing["control"]).rstrip(b"\n")).hexdigest()
+        == LEGACY_CONTROL_SHA256,
+        "unsupported legacy capture or operator source",
+    )
+    flags = legacy_drain_flags(a)
+    gateway = service(a.project + "-api-1", a.project)
+    for key, live, role in (("base", gateway, "api"), ("worker", worker, "worker")):
+        require(
+            set(existing[key]) == LEGACY_SERVICE_FIELDS
+            and live["service"] == role
+            and {k: live[k] for k in LEGACY_SERVICE_FIELDS} == existing[key]
+            and HEX.fullmatch(live["configHash"])
+            and HEX.fullmatch(live["runtimeContract"]),
+            "original captured gateway or worker was replaced",
+        )
+    require(
+        gateway["configHash"] == a.config_hash
+        and gateway["imageRef"] in {a.project + "-api", a.project + "-api:latest"}
+        and existing["baseRef"] == a.project + "-raw-reader-base:" + gateway["image"].split(":")[1]
+        and existing["candidateRef"]
+        == a.project
+        + "-raw-reader:"
+        + hashlib.sha256(json.dumps([gateway["image"], wanted], sort_keys=True).encode()).hexdigest(),
+        "legacy Compose or image binding differs",
+    )
+    checked_tag(gateway["imageRef"], gateway["image"])
+    require(
+        exec_python(gateway["id"], PROBE) == existing["before"]
+        and existing["before"]["modules"] == {FILES[0]: BASE_MAIN, FILES[1]: None},
+        "original gateway application or installed module proof changed",
+    )
+    require(
+        require_worker(gateway, worker, existing["workerNumerical"]["application_source_sha256"], a.build)
+        == existing["workerNumerical"],
+        "original registered numerical worker proof changed",
+    )
+    old_sha = hashlib.sha256(original).hexdigest()
+    binding = {
+        "originalSha256": old_sha,
+        "composeConfigHash": a.config_hash,
+        "originalOperatorSha256": LEGACY_CONTROL_SHA256,
+        "drain": flags,
+    }
+    updated = {
+        **existing,
+        "base": gateway,
+        "worker": worker,
+        "control": control,
+        "originalCaptureSha256": old_sha,
+        "captureBindingSha256": hashlib.sha256(json_bytes(binding)).hexdigest(),
+    }
+    sealed = json_bytes(updated)
+    archive = capture_directory(a.state, old_sha)
+    proof = {**binding, "sealedSha256": hashlib.sha256(sealed).hexdigest()}
+    publish_transition(archive, original, sealed, proof)
+    require(
+        check_transition(a.state, updated) == sealed
+        and private_json(archive / "transition.json") == proof
+        and service(a.project + "-api-1", a.project) == gateway
+        and service(a.project + "-worker-1", a.project) == worker
+        and private_bytes(a.state) == original,
+        "original capture changed before atomic seal",
+    )
+    replace_bytes(a.state, sealed)
+    return updated
+
+
+def runtime_contract(container):
+    # Hash effective settings on the deployment host. Values, including server
+    # credentials, are never written to a receipt or diagnostic.
+    cfg, host, mounts = (
+        json.loads(line)
+        for line in run(
+            "docker",
+            "inspect",
+            "--format",
+            "{{json .Config}}\n{{json .HostConfig}}\n{{json .Mounts}}",
+            container,
+        ).splitlines()
+    )
+    config = {
+        k: cfg.get(k)
+        for k in (
+            "Entrypoint",
+            "Cmd",
+            "User",
+            "WorkingDir",
+            "Healthcheck",
+            "ExposedPorts",
+            "Volumes",
+            "StopSignal",
+            "StopTimeout",
+            "Tty",
+            "OpenStdin",
+        )
+    }
+    config["Env"] = sorted(cfg.get("Env") or [])
+    resources = {
+        k: host.get(k)
+        for k in (
+            "NetworkMode",
+            "PortBindings",
+            "RestartPolicy",
+            "ReadonlyRootfs",
+            "Ulimits",
+            "CapAdd",
+            "CapDrop",
+            "SecurityOpt",
+            "Privileged",
+            "PidsLimit",
+            "NanoCpus",
+            "CpuQuota",
+            "CpuPeriod",
+            "CpusetCpus",
+            "Memory",
+            "MemorySwap",
+            "Binds",
+            "Devices",
+            "Tmpfs",
+        )
+    }
+    volumes = sorted(
+        (
+            {k: m.get(k) for k in ("Type", "Source", "Destination", "Name", "RW", "Propagation")}
+            for m in mounts
+        ),
+        key=lambda m: m["Destination"],
+    )
+    return hashlib.sha256(
+        json.dumps([config, resources, volumes], sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
 
 
 def service(name, project):
@@ -156,7 +453,17 @@ def service(name, project):
         and value[6] in ("api", "worker"),
         "gateway or worker is outside the running Compose project",
     )
-    return dict(zip(("id", "image", "imageRef", "running", "startedAt", "project", "service"), value))
+    result = dict(zip(("id", "image", "imageRef", "running", "startedAt", "project", "service"), value))
+    result["configHash"] = run(
+        "docker",
+        "inspect",
+        "--format",
+        '{{index .Config.Labels "com.docker.compose.config-hash"}}',
+        result["id"],
+    )
+    require(HEX.fullmatch(result["configHash"]), "missing Compose service identity")
+    result["runtimeContract"] = runtime_contract(result["id"])
+    return result
 
 
 def exec_python(container, code, data=None, timeout=70):
@@ -261,7 +568,20 @@ def operate(a):
     }
     worker = service(a.project + "-worker-1", a.project)
     require(worker["service"] == "worker", "missing original solver worker")
-    existing = private_json(state_file) if state_file.exists() else None
+    original = private_bytes(state_file) if state_file.exists() or state_file.is_symlink() else None
+    existing = json.loads(original) if original is not None else None
+    if a.action == "bind-original":
+        require(
+            existing and existing.get("phase") == "captured",
+            "original identity binding requires a captured gateway",
+        )
+        legacy_drain_flags(a)
+    if existing and (
+        set(existing["base"]) == LEGACY_SERVICE_FIELDS or set(existing["worker"]) == LEGACY_SERVICE_FIELDS
+    ):
+        existing = bind_legacy_capture(a, original, existing, wanted, control, worker)
+    if existing and "originalCaptureSha256" in existing:
+        check_transition(state_file, existing)
     if a.action == "capture" and existing and existing["phase"] == "restored":
         # Preserve the first attempt and its exact recovery before taking a new baseline.
         recovered = existing["restoredGateway"]
@@ -280,6 +600,9 @@ def operate(a):
             gateway["service"] == "api"
             and gateway["imageRef"] in {a.project + "-api", a.project + "-api:latest"},
             "serving gateway is outside its canonical Compose image reference",
+        )
+        require(
+            gateway["configHash"] == a.config_hash, "running gateway has a different Compose specification"
         )
         checked_tag(gateway["imageRef"], gateway["image"])
         before = exec_python(gateway["id"], PROBE)
@@ -321,6 +644,10 @@ def operate(a):
         "maintenance state, reviewed reader or original worker changed",
     )
     old = existing["base"]
+    require(
+        old["configHash"] == a.config_hash,
+        "canonical Compose gateway configuration differs from the original",
+    )
     if a.action == "build" and not existing.get("candidate"):
         gateway = service(a.project + "-api-1", a.project)
         require(gateway == old, "original gateway changed before image preparation")
@@ -371,14 +698,7 @@ def operate(a):
         compare_candidate(before, qualified, wanted)
         existing.update(phase="built", reader=qualified, candidate=candidate)
         write(state_file, existing)
-    if existing.get("candidate") and a.action not in (
-        "capture",
-        "original",
-        "phase",
-        "restore-tag",
-        "verify-original",
-        "release-holder",
-    ):
+    if a.action in ("select", "build") and existing.get("candidate"):
         checked_tag(existing["baseRef"], old["image"])
         checked_tag(existing["candidateRef"], existing["candidate"])
     if a.action in ("bind-canary", "verify"):
@@ -415,11 +735,22 @@ def operate(a):
             existing.get("canarySha256") == canary_digest,
             "registered canary differs from the pre-switch source",
         )
-    if a.action in ("capture", "original"):
+    if a.action in ("capture", "original", "bind-original"):
         current = service(a.project + "-api-1", a.project)
         require(current == old, "original file gateway changed before switch")
         checked_tag(old["imageRef"], old["image"])
-        require_worker(current, worker, existing["workerNumerical"]["application_source_sha256"], a.build)
+        require(
+            require_worker(
+                current, worker, existing["workerNumerical"]["application_source_sha256"], a.build
+            )
+            == existing["workerNumerical"],
+            "original numerical worker proof differs",
+        )
+        if a.action == "bind-original":
+            require(
+                exec_python(current["id"], PROBE) == existing["before"],
+                "sealed original gateway proof differs",
+            )
     elif a.action in ("select", "restore-tag"):
         tag = run("docker", "image", "inspect", "--format", "{{.Id}}", old["imageRef"])
         require(tag in (old["image"], existing["candidate"]), "serving tag belongs to a different release")
@@ -436,7 +767,9 @@ def operate(a):
         require(
             current["service"] == "api"
             and current["image"] == target
-            and current["imageRef"] == old["imageRef"],
+            and current["imageRef"] == old["imageRef"]
+            and current["runtimeContract"] == old["runtimeContract"]
+            and current["configHash"] == old["configHash"],
             "serving gateway image differs",
         )
         checked_tag(old["imageRef"], target)
@@ -495,6 +828,7 @@ if __name__ == "__main__":
         "action",
         choices=(
             "capture",
+            "bind-original",
             "bind-canary",
             "build",
             "original",
@@ -510,8 +844,14 @@ if __name__ == "__main__":
     parser.add_argument("--state", type=Path, required=True)
     parser.add_argument("--app", type=Path, required=True)
     parser.add_argument("--project", required=True)
+    parser.add_argument("--config-hash", required=True)
     parser.add_argument("--build", required=True)
     parser.add_argument("--canary", type=Path)
+    parser.add_argument("--drain-env", type=Path)
+    parser.add_argument("--pool-state")
+    parser.add_argument("--transfer-state")
+    parser.add_argument("--sweeper-state")
+    parser.add_argument("--media-state")
     args = parser.parse_args()
     try:
         operate(args)

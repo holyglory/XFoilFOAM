@@ -1249,6 +1249,9 @@ if payload.get("evidence_storage") != expected_storage:
 fail_safe() {
   local rc=$? kind
   if [[ "${OPERATOR_LOCK_HELD:-true}" != true ]]; then return "$rc"; fi
+  # Until this caller has authenticated the gateway drain it cannot change
+  # an older owner's admission or transfer state from the EXIT trap.
+  if [[ -n "${GATEWAY_ACTION:-}" && "${DRAIN_STATE_ACTIVE:-false}" != true ]]; then return "$rc"; fi
   if [[ "$DRAIN_MODE" == true && $rc -ne 0 && "$(read_env_var REMOTE_SOLVER2606_DRAIN_PENDING)" == 1 ]]; then
     kind="$(read_env_var REMOTE_SOLVER2606_DRAIN_KIND)"
     if [[ "${kind:-engine}" != "${DRAIN_KIND:-engine}" ]]; then return "$rc"; fi
