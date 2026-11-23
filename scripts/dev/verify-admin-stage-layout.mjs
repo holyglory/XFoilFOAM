@@ -12,7 +12,9 @@ import {
 } from "./progressive-preview-origin.mjs";
 
 const root = fileURLToPath(new URL("../../", import.meta.url));
-const deployment = progressivePreviewDeployment({ name: "catalog-paging" });
+const deployment = progressivePreviewDeployment({
+  name: "campaign-stage-preview",
+});
 const origin = originFromDeployment(deployment);
 assert.equal(new URL(origin).hostname, "127.0.0.1");
 const generation = String(deployment.data.current_generation);
@@ -23,7 +25,16 @@ const privateDir = join(
   generation,
 );
 const fixture = JSON.parse(
-  await readFile(join(privateDir, "stage-target.json"), "utf8"),
+  await readFile(
+    join(
+      root,
+      ".codex-artifacts",
+      "campaign-stage-preview",
+      generation,
+      "fixture.json",
+    ),
+    "utf8",
+  ),
 );
 const uuid = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i;
 for (const key of ["campaignId", "resultId", "fastAttemptId", "finalAttemptId"])
