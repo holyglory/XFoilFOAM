@@ -412,7 +412,7 @@ def test_core_guards_retain_exact_or_replaced_bytes(core_case,hold):
         elif hold=="execution-lock":
             lock=(root/".execute.lock").open("r");fcntl.flock(lock,fcntl.LOCK_EX)
         elif hold=="manifest":
-            dest=case/"evidence"/"a2";dest.mkdir(parents=True)
+            dest=case/"a2"/"evidence";dest.mkdir(parents=True)
             (dest/"evidence_manifest.json").write_text('{"files":[{"sourcePath":"cases/c1_u30/core.321"}]}')
         elif hold=="db-source":db.refs=[("c1_u30",{"file":"/jobs/"+j+"/files/cases/c1_u30/core.321"})]
         elif hold=="diagnostic":(root/".retain-solver-core-dumps").touch()
