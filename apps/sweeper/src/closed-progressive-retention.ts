@@ -92,6 +92,7 @@ export interface ClosedProgressiveBackend {
 }
 
 type KeptImage = {
+  currentImage?: MediaFile & { id: string; attemptId: string; legend: Record<string, unknown> | null };
   regime?: "urans";
   id: string;
   resultId: string;
@@ -123,6 +124,7 @@ async function registeredImages(
   db: DB,
   jobId: string,
   lock: boolean,
+  checkPriorOwner: boolean,
 ): Promise<KeptImage[]> {
   const prefix = `jobs/${jobId}/`;
   const owned = sql`(SELECT id FROM result_attempts WHERE sim_job_id=${jobId}::uuid OR engine_job_id=${jobId})`;
@@ -147,21 +149,33 @@ async function registeredImages(
     encode(sha256(convert_to(to_jsonb(m)::text,'UTF8')),'hex') AS "rowSha256",
     CASE WHEN s.id IS NOT NULL THEN jsonb_build_object('mode','track','vmin',coalesce(m.scale_vmin,s.vmin),'vmax',coalesce(m.scale_vmax,s.vmax),
       'policy',coalesce(m.scale_policy,s.scale_policy),'version',coalesce(m.color_scale_version,s.version),'status',s.status) END AS legend,
+    CASE WHEN shown.id IS NOT NULL THEN jsonb_build_object('id',shown.id,'attemptId',picked.id,
+      'path',shown.storage_key,'sha256',shown.sha256,'byteSize',shown.byte_size,
+      'legend',CASE WHEN ss.id IS NOT NULL THEN jsonb_build_object('mode','track','vmin',coalesce(shown.scale_vmin,ss.vmin),
+        'vmax',coalesce(shown.scale_vmax,ss.vmax),'policy',coalesce(shown.scale_policy,ss.scale_policy),
+        'version',coalesce(shown.color_scale_version,ss.version),'status',ss.status) END) END AS current_image,
     a.regime AS source_regime,
-    (a.sim_job_id=${jobId}::uuid AND a.engine_job_id=${jobId} AND a.result_id=m.result_id AND a.regime IN ('rans','urans') AND r.current_result_attempt_id=a.id
+    (a.sim_job_id=${jobId}::uuid AND a.engine_job_id=${jobId} AND a.result_id=m.result_id AND a.regime IN ('rans','urans') AND (r.current_result_attempt_id=a.id OR shown.id IS NOT NULL)
      AND m.storage_key LIKE ${prefix + "%"} AND m.kind='image' AND m.role='instantaneous' AND m.mime_type='image/png'
      AND m.sha256~'^[a-f0-9]{64}$' AND m.byte_size>0 AND m.evidence_sha256~'^[a-f0-9]{64}$' AND m.field IS NOT NULL AND f.slug IS NOT NULL
      AND NOT EXISTS(SELECT 1 FROM result_media_storage_bindings b WHERE b.result_media_id=m.id)
      AND NOT EXISTS(SELECT 1 FROM result_media_storage_uploads u WHERE u.result_media_id=m.id)) AS ok
     FROM result_media m LEFT JOIN result_attempts a ON a.id=m.result_attempt_id LEFT JOIN results r ON r.id=m.result_id
+    LEFT JOIN result_attempts picked ON ${checkPriorOwner}::boolean AND a.regime='urans' AND picked.id=r.current_result_attempt_id
+      AND picked.result_id=m.result_id AND picked.airfoil_id=a.airfoil_id AND picked.sim_job_id<>a.sim_job_id
+      AND picked.engine_job_id=picked.sim_job_id::text
+    LEFT JOIN result_media shown ON shown.result_attempt_id=picked.id AND shown.result_id=picked.result_id AND shown.field=m.field
+      AND shown.kind='image' AND shown.role='instantaneous' AND shown.mime_type='image/png' AND shown.byte_size BETWEEN 1 AND 134217728
+      AND shown.sha256~'^[a-f0-9]{64}$' AND shown.storage_key LIKE 'jobs/'||picked.engine_job_id||'/%'
+    LEFT JOIN field_color_scales ss ON ss.id=shown.color_scale_id
     LEFT JOIN airfoils f ON f.id=a.airfoil_id LEFT JOIN field_color_scales s ON s.id=m.color_scale_id WHERE ${selected} ORDER BY m.id LIMIT 257`);
   if (rows.length > 256) throw Error("The named job exceeds 256 registered instantaneous PNGs");
-  if (rows.some((r) => r.ok !== true))
+  if (rows.some((r) => r.ok !== true) || new Set(rows.map((r) => r.id)).size !== rows.length)
     throw Error(
       "Keep-set requires a bounded inventory of exact current-job instantaneous PNG rows",
     );
-  return rows.map(({ ok, source_regime, ...r }) => ({
-    ...r, ...(source_regime === "urans" ? { regime: "urans" } : {}),
+  return rows.map(({ ok, source_regime, current_image, ...r }) => ({
+    ...r, ...(current_image ? { currentImage: current_image } : {}), ...(source_regime === "urans" ? { regime: "urans" } : {}),
   } as unknown as KeptImage));
 }
 
@@ -225,6 +239,42 @@ async function readStoredFile(
   }
   if (length !== file.byteSize || hash.digest("hex") !== file.sha256)
     throw Error("File route returned different bytes");
+}
+
+type DisplayedImages = Record<string, { kind?: string; url?: string; imageUrl?: string; scale?: unknown }>;
+
+async function readImageDetail(api: string, m: KeptImage, signal: AbortSignal, priorAttempt = false) {
+  const url = new URL(`/api/airfoils/${encodeURIComponent(m.slug)}/sim`, api);
+  url.searchParams.set("resultId", m.resultId);
+  if (priorAttempt) url.searchParams.set("resultAttemptId", m.attemptId);
+  const r = await fetch(url, { signal, redirect: "error" });
+  if (!r.ok && !(priorAttempt && r.status === 404)) {
+    await r.body?.cancel();
+    throw Error("Stored point detail is unavailable");
+  }
+  if (!r.body) throw Error("Stored point detail has no body");
+  const parts: Uint8Array[] = [];
+  let size = 0;
+  for await (const part of r.body as unknown as AsyncIterable<Uint8Array>) {
+    size += part.length;
+    if (size > 2 * 1024 ** 2) throw Error("Stored point detail exceeded the media-proof byte bound");
+    parts.push(part);
+  }
+  const detail = JSON.parse(Buffer.concat(parts).toString("utf8")) as {
+    resultId?: string; media?: DisplayedImages; error?: string;
+  };
+  if (priorAttempt && r.status === 404 && detail.error === "no solved OpenFOAM result for this point")
+    return null;
+  if (!r.ok || detail.resultId !== m.resultId || !detail.media) throw Error("Stored point detail changed owner or lost media");
+  return detail.media;
+}
+
+function checkDisplayedImage(shown: DisplayedImages, field: string, id: string, legend: KeptImage["legend"]) {
+  const entry = shown[field];
+  const stable = `/api/result-media/${id}`;
+  if (!entry || entry.kind !== "image" || (entry.url !== stable && entry.imageUrl !== stable) ||
+      canonicalAnalysisJson(entry.scale ?? null) !== canonicalAnalysisJson(legend))
+    throw Error("Displayed media link or color legend changed");
 }
 
 async function readKeptMedia(
@@ -293,13 +343,11 @@ async function readKeptMedia(
     await readStoredFile(new URL(`/jobs/${id}/files/${path}`, engine), f, signal);
     await readStoredFile(new URL(`/api/media/jobs/${id}/${path}`, api), f, signal);
   }
-  const results = new Map<
-    string,
-    Record<
-      string,
-      { kind?: string; url?: string; imageUrl?: string; scale?: unknown }
-    >
-  >();
+  const results = new Map<string, DisplayedImages>();
+  const priorDetails = new Map<string, DisplayedImages | null>();
+  const priorVisibility: Record<string, boolean> = {};
+  if (media.reduce((bytes, row) => bytes + (row.currentImage?.byteSize ?? 0), 0) > 128 * 1024 ** 2)
+    throw Error("Current image inventory exceeds the bounded byte budget");
   for (const m of media) {
     const file = files.get(m.path);
     if (!file || m.sha256 !== file.sha256 || m.byteSize !== file.byteSize)
@@ -318,49 +366,28 @@ async function readKeptMedia(
     await readStoredFile(new URL(stable, api), file, signal);
     let displayed = results.get(m.resultId);
     if (!displayed) {
-      const r = await fetch(
-        new URL(
-          `/api/airfoils/${encodeURIComponent(m.slug)}/sim?resultId=${m.resultId}`,
-          api,
-        ),
-        { signal, redirect: "error" },
-      );
-      if (!r.ok) {
-        await r.body?.cancel();
-        throw Error("Stored point detail is unavailable");
-      }
-      if (!r.body) throw Error("Stored point detail has no body");
-      const parts: Uint8Array[] = [];
-      let size = 0;
-      for await (const part of r.body as unknown as AsyncIterable<Uint8Array>) {
-        size += part.length;
-        if (size > 2 * 1024 ** 2)
-          throw Error(
-            "Stored point detail exceeded the media-proof byte bound",
-          );
-        parts.push(part);
-      }
-      const sim = JSON.parse(Buffer.concat(parts).toString("utf8")) as {
-        resultId: string;
-        media: NonNullable<typeof displayed>;
-      };
-      if (sim.resultId !== m.resultId || !sim.media)
-        throw Error("Stored point detail changed owner or lost media");
-      displayed = sim.media;
-      results.set(m.resultId, displayed);
+      const current = await readImageDetail(api, m, signal);
+      if (!current) throw Error("Stored point detail is unavailable");
+      displayed = current;
+      results.set(m.resultId, current);
     }
-    const entry = displayed[m.field];
-    if (
-      !entry ||
-      entry.kind !== "image" ||
-      (entry.url !== stable && entry.imageUrl !== stable) ||
-      canonicalAnalysisJson(entry.scale ?? null) !==
-        canonicalAnalysisJson(m.legend)
-    )
-      throw Error("Displayed media link or color legend changed");
+    const selected = m.currentImage ?? m;
+    checkDisplayedImage(displayed, m.field, selected.id, selected.legend);
+    if (m.currentImage) {
+      await readStoredFile(new URL(`/api/result-media/${m.currentImage.id}`, api), m.currentImage, signal);
+      // Pin the old attempt's actual visibility even when the public campaign
+      // no longer selects it. Its own stable image must always return exact bytes.
+      if (!priorDetails.has(m.attemptId)) {
+        const prior = await readImageDetail(api, m, signal, true);
+        priorDetails.set(m.attemptId, prior);
+        priorVisibility[m.attemptId] = prior !== null;
+      }
+      const prior = priorDetails.get(m.attemptId);
+      if (prior) checkDisplayedImage(prior, m.field, m.id, m.legend);
+    }
   }
   return createHash("sha256")
-    .update(canonicalAnalysisJson({ media, files: plan.mediaFiles }))
+    .update(canonicalAnalysisJson({ media, files: plan.mediaFiles, ...(priorDetails.size ? { priorVisibility } : {}) }))
     .digest("hex");
 }
 
@@ -910,7 +937,7 @@ export async function closedProgressiveJob(
       sql`SELECT set_config('statement_timeout',${String(timeoutMs)},true),set_config('lock_timeout','500ms',true)`,
     );
     const media = options.keepMedia
-      ? await registeredImages(tx, id, false)
+      ? await registeredImages(tx, id, false, !historical)
       : [];
     const [ready] = await tx.execute(
       sql`SELECT j.id FROM sim_jobs j WHERE j.id=${id}::uuid AND ${eligible(now, ageMs, options.verifyCompleted ? options.expectedPlan : undefined, media, options.historicalRaw)}`,
@@ -1110,7 +1137,7 @@ export async function closedProgressiveJob(
       sql`SELECT id FROM sim_jobs WHERE id=${id}::uuid FOR UPDATE SKIP LOCKED`,
     );
     if (!locked) return false;
-    const media = options.keepMedia ? await registeredImages(tx, id, true) : [];
+    const media = options.keepMedia ? await registeredImages(tx, id, true, !historical) : [];
     const [ready] = await tx.execute(
       sql`SELECT j.id FROM sim_jobs j WHERE j.id=${id}::uuid AND ${eligible(now, ageMs, undefined, media, options.historicalRaw)}`,
     );
