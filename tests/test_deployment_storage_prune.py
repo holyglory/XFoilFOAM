@@ -489,6 +489,12 @@ def test_real_top_level_installer_installs_and_validates_the_solver_core_dropin(
     (units/"docker.service").write_text("[Service]\nExecStart=/bin/true\n")
     env=os.environ|{"PATH":str(localbin)+os.pathsep+os.environ["PATH"],"SBIN_DIR":str(sbin),"SYSTEMD_DIR":str(units),
                     "SYSTEMD_UNIT_PATH":str(units)+":","RUN_INITIAL_CLEANUP":"0","FIXTURE_CTL_LOG":str(tmp_path/"ctl.log")}
+    env.pop("SOLVER_CORE_COMPOSE_PROJECT",None)
+    project="hz-solver2" if explicit_lib else "app"
+    deployment_env=tmp_path/".env.deploy"
+    deployment_env.write_text("AIRFOILFOAM_DEPLOYMENT_ROLE=remote-solver\nCOMPOSE_PROJECT_NAME=hz-solver2\n"
+                              if explicit_lib else "AIRFOILFOAM_DEPLOYMENT_ROLE=hub\n")
+    env["SOLVER_CORE_DEPLOY_ENV"]=str(deployment_env)
     env.pop("SOLVER_CORE_LIB_DIR",None)
     if explicit_lib:env["SOLVER_CORE_LIB_DIR"]=str(lib)
     # The parent service has a production absolute ExecStart. Override only
@@ -498,7 +504,7 @@ def test_real_top_level_installer_installs_and_validates_the_solver_core_dropin(
     run=subprocess.run(["bash",str(ROOT/"scripts/deploy/install-docker-storage-prune-timer.sh")],
                        cwd=ROOT,env=env,text=True,capture_output=True)
     assert run.returncode==0,run.stderr
-    assert (drop/"solver-core-maintenance.conf").read_text()==f'[Service]\nExecStartPost="{lib}/solver_core_maintenance.py" auto\n'
+    assert (drop/"solver-core-maintenance.conf").read_text()==f'[Service]\nExecStartPost="{lib}/solver_core_maintenance.py" auto --project "{project}"\n'
     helper=lib/"solver_core_maintenance.py"
     assert os.access(helper,os.X_OK)
     verify=subprocess.run([which("systemd-analyze"),"verify",str(units/"airfoils-docker-storage-prune.service"),
