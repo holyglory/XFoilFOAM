@@ -612,6 +612,22 @@ def _campaign_performance_regression() -> int:
                 "test/campaign-polling.test.ts",
             ],
         ),
+        (
+            "api-campaign-bootstrap",
+            "authenticated campaign list under slow engine monitoring",
+            [
+                "/usr/bin/corepack",
+                "pnpm",
+                "--filter",
+                "@aerodb/api",
+                "exec",
+                "vitest",
+                "run",
+                "test/admin-queue.test.ts",
+                "-t",
+                "authenticated campaign bootstrap with a saturated engine",
+            ],
+        ),
     ]
     result = 0
     for case_id, name, argv in commands:

@@ -198,6 +198,7 @@
         ".devcoordinator.toml",
         "apps/api/src/campaign-routes.ts",
         "apps/api/src/server.ts",
+        "apps/api/test/admin-queue.test.ts",
         "apps/api/test/campaigns.test.ts",
         "apps/api/test/review-buckets.test.ts",
         "apps/web/components/admin/campaigns/usePoll.ts",
