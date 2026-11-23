@@ -206,6 +206,7 @@ export function SimModal(props: {
   const [widthPx, setWidthPx] = useState(990);
   const [heightPx, setHeightPx] = useState(660);
   const [renderToolsOpen, setRenderToolsOpen] = useState(false);
+  const renderRequest = useRef<AbortController | null>(null);
   const [expandedRenderControl, setExpandedRenderControl] = useState<
     "role" | "zoom" | "map" | "levels" | "scale" | "resolution" | null
   >(null);
@@ -328,6 +329,17 @@ export function SimModal(props: {
       ? sim.media?.[f]
       : undefined;
   const activeStoredMedia = realField(activeFieldId);
+  const renderTarget =
+    sim?.status === "solved" &&
+    sim.resultId === ctx?.resultId &&
+    activeFieldId &&
+    (sim.availableFields.includes(activeFieldId) ||
+      playerModel?.fields.includes(activeFieldId) ||
+      sim.evidenceArtifacts?.some(
+        (artifact) => artifact.field === activeFieldId,
+      ))
+      ? sim.renderTarget
+      : null;
   const fieldChoices = useMemo(() => {
     const out: string[] = [];
     const add = (value: string | null | undefined) => {
@@ -437,7 +449,16 @@ export function SimModal(props: {
     setReviewError(null);
     setReviewHistory([]);
     setReviewDismissed(false);
-  }, [ctx?.re, ctx?.aoa, ctx?.resultId]);
+    setRenderBusy(false);
+    return () => renderRequest.current?.abort();
+  }, [
+    open,
+    ctx?.re,
+    ctx?.aoa,
+    ctx?.resultId,
+    sim?.resultAttemptId,
+    sim?.renderTarget?.manifestSha256,
+  ]);
 
   useEffect(() => {
     if (!open || !reviewLayerEligible || !ctx?.resultId) return;
@@ -684,24 +705,33 @@ export function SimModal(props: {
       : null;
 
   const requestCustomRender = async () => {
-    if (!ctx?.resultId || !activeFieldId) return;
+    if (!ctx?.resultId || !activeFieldId || !renderTarget) return;
+    renderRequest.current?.abort();
+    const controller = new AbortController();
+    renderRequest.current = controller;
     setRenderBusy(true);
     setRenderError(null);
     try {
-      const rendered = await renderResultField(ctx.resultId, {
-        field: activeFieldId,
-        role: customRole,
-        scaleMode,
-        zoomChords,
-        colormap,
-        levels,
-        vmin: scaleMode === "manual" && vmin.trim() ? Number(vmin) : null,
-        vmax: scaleMode === "manual" && vmax.trim() ? Number(vmax) : null,
-        frameIndex:
-          customRole === "instantaneous" && playerModel ? frameIdx : null,
-        widthPx,
-        heightPx,
-      });
+      const rendered = await renderResultField(
+        ctx.resultId,
+        {
+          field: activeFieldId,
+          role: customRole,
+          scaleMode,
+          zoomChords,
+          colormap,
+          levels,
+          vmin: scaleMode === "manual" && vmin.trim() ? Number(vmin) : null,
+          vmax: scaleMode === "manual" && vmax.trim() ? Number(vmax) : null,
+          frameIndex:
+            customRole === "instantaneous" && playerModel ? frameIdx : null,
+          widthPx,
+          heightPx,
+        },
+        renderTarget,
+        controller.signal,
+      );
+      if (controller.signal.aborted) return;
       setCustomRender({
         field: rendered.field,
         role: rendered.role as "instantaneous" | "mean",
@@ -709,9 +739,12 @@ export function SimModal(props: {
         cached: rendered.cached,
       });
     } catch (e) {
-      setRenderError((e as Error).message);
+      if (!controller.signal.aborted) setRenderError((e as Error).message);
     } finally {
-      setRenderBusy(false);
+      if (renderRequest.current === controller) {
+        renderRequest.current = null;
+        setRenderBusy(false);
+      }
     }
   };
 
@@ -993,7 +1026,7 @@ export function SimModal(props: {
     );
   };
   const renderTools = () => {
-    if (sim?.status !== "solved") return null;
+    if (!renderTarget) return null;
     return (
       <div style={{ display: "grid", gap: 8 }}>
         {!renderToolsOpen ? (

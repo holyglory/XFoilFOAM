@@ -633,6 +633,7 @@ test.describe
     const managementResultId = `${state.stamp}-failed-point-result`;
     const managementAttemptId = `${state.stamp}-failed-point-attempt`;
     const acceptedResultId = `${state.stamp}-accepted-result`;
+    const manifestSha256 = "ab".repeat(32);
     const attempts = new Map([
       [managementAttemptId, { resultId: managementResultId, fidelity: "urans_precalc" }],
       [`${state.stamp}-fast-attempt`, { resultId: acceptedResultId, fidelity: "urans_precalc" }],
@@ -761,7 +762,10 @@ test.describe
               cm: -0.01,
               ld: 12,
               media: null,
-              availableFields: [],
+              availableFields: target!.fidelity === "urans_full" ? ["vorticity"] : [],
+              renderTarget: target!.fidelity === "urans_full"
+                ? { resultAttemptId: attemptId, manifestSha256 }
+                : null,
               history: null,
               fidelity: target!.fidelity,
               steadyHistory: null,
@@ -799,6 +803,13 @@ test.describe
         await route.continue();
       },
     );
+    await page.route(`**/api/results/${acceptedResultId}/render`, async (route) => {
+      const headers = route.request().headers();
+      expect(headers["x-xfoilfoam-expected-result-attempt-id"]).toBe(`${state.stamp}-final-attempt`);
+      expect(headers["x-xfoilfoam-expected-evidence-sha256"]).toBe(manifestSha256);
+      // Simulate a newer canonical attempt winning after the dialog was opened.
+      await route.fulfill({ status: 409, json: { error: "selected evidence generation changed before render" } });
+    });
     await page.route(
       `**/api/admin/campaigns/${launched.campaign.id}/preliminary-outcomes?*`,
       async (route) => {
@@ -1343,6 +1354,14 @@ test.describe
         stage === "fast" ? "URANS fast" : "URANS final",
       );
       await expect(selectedDialog.getByTestId("sim-method-chip")).toHaveText("URANS");
+      const render = selectedDialog.getByRole("button", { name: "custom render" });
+      if (stage === "fast") {
+        await expect(render).toHaveCount(0);
+      } else {
+        await render.click();
+        await selectedDialog.getByRole("button", { name: "re-render", exact: true }).click();
+        await expect(selectedDialog).toContainText("selected evidence generation changed before render");
+      }
       await expect(selectedDialog).not.toContainText("✓ steady");
       await page.keyboard.press("Escape");
       await expect(page.getByTestId("sim-modal-dialog")).toHaveCount(0);
