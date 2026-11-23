@@ -554,3 +554,54 @@ def test_core_catalog_owner_arms_match_exactly_with_and_without_postgres_indexes
         db.query("CREATE INDEX core_fixture_engine ON solver_evidence_artifacts(engine_job_id) WHERE engine_job_id IS NOT NULL")
         assert paths()==expected
     finally:db.query("ROLLBACK");db.close()
+
+
+def _partial_core_fixture(path):
+    """Cut only the last populated PT_LOAD from the real, disposable Linux dump."""
+    import struct
+
+    with path.open("r+b") as f:
+        ident=f.read(16)
+        if ident[4:6]!=b"\x02\x01":pytest.skip("partial canary contract is Linux x86-64 ELF")
+        h=struct.unpack("<HHIQQQIHHHHHH",f.read(48))
+        if h[1]!=62 or h[5]:pytest.skip("requires a kernel-written x86-64 core, not a debugger section table")
+        f.seek(h[4]);headers=list(struct.iter_unpack("<IIQQQQQQ",f.read(h[9]*56)))
+        nonempty=[(i,ph) for i,ph in enumerate(headers)if ph[0]==1 and ph[5]]
+        index,tail=nonempty[-1];note=next(ph for ph in headers if ph[0]==4)
+        assert len(nonempty)>1 and tail[2]>note[2]+note[5]
+        off=note[2];pid=None
+        while off+12<=note[2]+note[5]:
+            f.seek(off);ns,ds,nt=struct.unpack("<III",f.read(12));desc=off+12+(ns+3)//4*4
+            if nt==3 and ds>=136:
+                f.seek(desc+24);pid=struct.unpack("<i",f.read(4))[0]
+            off=desc+(ds+3)//4*4
+        assert pid and pid>0
+        f.truncate(tail[2])
+    return pid,h[4]+index*56,note[2],note[5]
+
+
+def test_proven_partial_kernel_dump_is_reversible_and_released_only_under_the_same_guards(core_case):
+    files,_,_,_,case,dump,row,_,_,process=core_case
+    pid,_,_,_=_partial_core_fixture(dump);new=case/f"core.{pid}";dump.rename(new)
+    row.update(r="cases/c1_u30/"+new.name,**files.file_id(new.stat()))
+    canary=process("canary")[0];assert canary["state"]=="restored" and new.stat().st_ino==row["ino"]
+    proof=canary["elf"];assert proof["processId"]==pid and proof["signal"]==6 and proof["trailingPartialLoadSegments"]>0
+    actual=process("release")[0];assert actual["allocated"]==row["allocated"] and not new.exists()
+
+
+@pytest.mark.parametrize("error",["header","program-table","note","ambiguous-machine","wrong-filename","non-load-tail"])
+def test_partial_core_with_missing_structural_evidence_is_retained(core_case,error):
+    import struct
+
+    files,_,_,_,case,dump,row,_,_,process=core_case
+    pid,load_entry,note,size=_partial_core_fixture(dump)
+    with dump.open("r+b")as f:
+        if error=="header":f.truncate(9)
+        elif error=="program-table":f.truncate(65)
+        elif error=="note":f.truncate(note+size-1)
+        elif error=="ambiguous-machine":f.seek(18);f.write(struct.pack("<H",243))
+        elif error=="non-load-tail":f.seek(load_entry);f.write(struct.pack("<I",2))
+    new=case/f"core.{pid+(error=='wrong-filename')}";dump.rename(new)
+    row.update(r="cases/c1_u30/"+new.name,**files.file_id(new.stat()))
+    item=process("release")[0]
+    assert item["state"]=="held" and not item.get("allocated") and new.exists()

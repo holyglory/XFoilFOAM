@@ -65,46 +65,95 @@ def subject(row):
     return job, parts[1], parts[2]
 
 
-def elf_core(fd):
-    """Read ELF and note headers only. Never inspect or export dumped memory."""
+def elf_core(fd, source_name="core"):
+    """Verify the ELF tables and complete Linux notes without reading process memory."""
     info = os.fstat(fd)
     require(stat.S_ISREG(info.st_mode) and info.st_nlink == 1, "not a single-link regular file")
     ident = os.pread(fd, 16, 0)
-    require(len(ident) == 16 and ident[:4] == b"\x7fELF" and ident[4] in (1,2)
-            and ident[5] in (1,2) and ident[6] == 1, "not ELF")
+    require(len(ident) == 16 and ident[:4] == b"\x7fELF" and ident[4] in (1, 2)
+            and ident[5] in (1, 2) and ident[6] == 1, "not ELF")
     order = "<" if ident[5] == 1 else ">"
     wide = ident[4] == 2
     header = struct.Struct(order + ("HHIQQQIHHHHHH" if wide else "HHIIIIIHHHHHH"))
     data = os.pread(fd, header.size, 16)
     require(len(data) == header.size, "short ELF header")
-    kind,machine,version,_,phoff,_,_,ehsize,phsize,phnum,*_ = header.unpack(data)
+    kind, machine, version, _, phoff, shoff, _, ehsize, phsize, phnum, shsize, shnum, shnames = header.unpack(data)
     ph = struct.Struct(order + ("IIQQQQQQ" if wide else "IIIIIIII"))
-    require(kind == 4 and version == 1 and machine != 0 and ehsize == 16+header.size
+    require(kind == 4 and version == 1 and machine != 0 and ehsize == 16 + header.size
             and phsize == ph.size and 0 < phnum < 65535 and phoff >= ehsize
-            and phoff+phnum*phsize <= info.st_size, "not a complete ELF ET_CORE header")
-    heads = os.pread(fd, phnum*phsize, phoff)
-    require(len(heads) == phnum*phsize, "short ELF program table")
-    load = note = False
+            and phoff + phnum * phsize <= info.st_size, "not a complete ELF ET_CORE header")
+    if shoff or shnum or shnames:
+        section = struct.Struct(order + ("IIQQQQIIQQ" if wide else "IIIIIIIIII"))
+        require(shoff >= ehsize and 0 < shnum < 65535 and shsize == section.size and shnames < shnum
+                and shoff + shnum * shsize <= info.st_size, "truncated or unsupported ELF section table")
+        sections = os.pread(fd, shnum * shsize, shoff)
+        require(len(sections) == shnum * shsize, "short ELF section table")
+        for sh in section.iter_unpack(sections):
+            require(sh[1] == 8 or not sh[5] or sh[4] + sh[5] <= info.st_size, "truncated ELF section")
+    heads = os.pread(fd, phnum * phsize, phoff)
+    require(len(heads) == phnum * phsize, "short ELF program table")
+    count_load = count_status = partial = 0
+    extents = []
+    identities, statuses, signals = set(), set(), set()
+    native = wide and order == "<" and machine == 62 and ident[7] in (0, 3)
     for seg in ph.iter_unpack(heads):
-        offset, length = (seg[2],seg[5]) if wide else (seg[1],seg[4])
-        require(not length or offset+length <= info.st_size, "truncated ELF segment")
+        offset, length, mem = (seg[2], seg[5], seg[6]) if wide else (seg[1], seg[4], seg[5])
+        end = offset + length
         if seg[0] == 1:
-            load = True
-        if seg[0] != 4 or note:
+            require(length <= mem, "invalid ELF load sizes")
+            count_load += 1
+            if length:
+                extents.append((offset, end))
+                partial += int(end > info.st_size)
             continue
-        end = offset+length
-        while offset+12 <= end:
+        require(not length or end <= info.st_size, "truncated non-memory ELF segment")
+        if seg[0] != 4:
+            continue
+        while offset < end:
+            require(offset + 12 <= end, "truncated ELF note header")
             raw = os.pread(fd, 12, offset)
-            require(len(raw) == 12, "short ELF note")
-            namesz, descsz, nt = struct.unpack(order+"III", raw)
-            name = offset+12
-            offset = name+((namesz+3)//4)*4+((descsz+3)//4)*4
-            require(offset <= end, "truncated ELF note")
-            if nt == 1 and descsz and namesz in (4,5,6) and os.pread(fd,namesz,name).rstrip(b"\0") in (b"CORE", b"LINUX"):
-                note = True
-                break
-    require(load and note, "missing native core process note or load segment")
-    return machine
+            require(len(raw) == 12, "short ELF note header")
+            namesz, descsz, nt = struct.unpack(order + "III", raw)
+            name_at = offset + 12
+            desc_at = name_at + (namesz + 3) // 4 * 4
+            offset = desc_at + (descsz + 3) // 4 * 4
+            require(offset <= end, "truncated ELF note descriptor")
+            if namesz not in (4, 5, 6) or os.pread(fd, namesz, name_at).rstrip(b"\0") not in (b"CORE", b"LINUX"):
+                continue
+            if nt == 1 and descsz:
+                count_status += 1
+            if not native:
+                continue
+            if nt == 1 and descsz >= 336:
+                pid = struct.unpack("<i", os.pread(fd, 4, desc_at + 32))[0]
+                sig = struct.unpack("<h", os.pread(fd, 2, desc_at + 12))[0]
+                statuses.add((pid, sig))
+            elif nt == 3 and descsz >= 136:
+                pid = struct.unpack("<i", os.pread(fd, 4, desc_at + 24))[0]
+                name = os.pread(fd, 16, desc_at + 40).split(b"\0")[0]
+                if pid > 0 and name and all(32 <= b < 127 for b in name):
+                    identities.add((pid, name.decode("ascii")))
+            elif nt == 0x53494749 and descsz >= 128:
+                signals.add(struct.unpack("<i", os.pread(fd, 4, desc_at))[0])
+    require(count_load and count_status, "missing native core process note or load segment")
+    proof = {"machine": machine, "loadSegments": count_load, "processStatusNotes": count_status,
+             "trailingPartialLoadSegments": partial}
+    if partial:
+        require(native and len(identities) == len(signals) == 1, "ambiguous partial-core identity or signal")
+        pid, name = next(iter(identities))
+        sig = next(iter(signals))
+        fatal = {signal.SIGQUIT, signal.SIGILL, signal.SIGTRAP, signal.SIGABRT, signal.SIGBUS,
+                 signal.SIGFPE, signal.SIGSEGV, signal.SIGSYS, signal.SIGXCPU, signal.SIGXFSZ}
+        require(sig in fatal and (pid, sig) in statuses and
+                (source_name == "core" or source_name == f"core.{pid}"), "partial core lacks matching crash and process identity")
+        # A partially written memory tail is recognizable process debris. No
+        # missing header, note, section or non-LOAD data is accepted.
+        extents.sort()
+        require(any(end <= info.st_size for _, end in extents) and
+                all(left[1] <= right[0] for left, right in zip(extents, extents[1:])),
+                "ambiguous partial ELF memory extents")
+        proof.update(processId=pid, processName=name, signal=sig)
+    return proof
 
 
 def full_hash(fd):
@@ -288,7 +337,7 @@ def core_action(volume, state, subject_row, job_fds, documents, db_paths, action
                 f=_enter(stack,name,FILE,cf)
                 expect=dict(subject_row,ctimeNs=record.get("restoredCtimeNs",subject_row["ctimeNs"]))
                 require(identity_matches(os.fstat(f),expect),"inventoried source changed")
-                elf_core(f)
+                record["elf"]=elf_core(f,name)
                 return {"state":"eligible","key":key,"allocated":0}
             return {"state":"already-released" if record["state"]=="released" else "pending-"+record["state"],
                     "key":key,"allocated":0}
@@ -311,7 +360,7 @@ def core_action(volume, state, subject_row, job_fds, documents, db_paths, action
             f=_enter(stack,name,FILE,cf);st=os.fstat(f)
             expect=dict(subject_row,ctimeNs=record.get("restoredCtimeNs",subject_row["ctimeNs"]))
             require(identity_matches(st,expect,renamed=record["state"]=="restore-intent") and same_inode(st,_exists(cf,name)), "inventoried source changed")
-            elf_core(f)
+            record["elf"]=elf_core(f,name)
             if record["state"]=="restore-intent":
                 record.update(state="restored",restoredCtimeNs=st.st_ctime_ns);atomic_json(receipt,record)
                 return {"state":"restored","key":key,"allocated":0}
@@ -337,7 +386,7 @@ def core_action(volume, state, subject_row, job_fds, documents, db_paths, action
                     "unexpected quarantine identity")
             if "quarantinedCtimeNs" in record:
                 require(st.st_ctime_ns==record["quarantinedCtimeNs"], "quarantined inode changed since its recorded move")
-            elf_core(f)
+            record["elf"]=elf_core(f,name)
         def restore():
             require(bound() and _exists(cf,name) is None,"original path occupied or renamed; quarantine retained")
             require(same_inode(os.fstat(f),_exists(q,token)), "quarantine identity changed before restore")
@@ -364,7 +413,7 @@ def core_action(volume, state, subject_row, job_fds, documents, db_paths, action
                 restore()
                 if "sha256" in record:require(full_hash(f)==record["sha256"],"restored core hash differs")
                 science_check()
-                return {"state":"restored","key":key,"allocated":0,"sha256":record.get("sha256")}
+                return {"state":"restored","key":key,"allocated":0,"sha256":record.get("sha256"),"elf":record["elf"]}
             require(action=="release","unexpected core action")
             # The private directory is serialized by the host controller. This
             # name is never unlinked from a solver-writable directory.
@@ -388,7 +437,7 @@ def core_action(volume, state, subject_row, job_fds, documents, db_paths, action
             os.unlink(token,dir_fd=q);os.fsync(q)
             require(os.fstat(f).st_nlink==0,"unlinked inode retains another link")
             record["state"]="released";atomic_json(receipt,record)
-            return {"state":"released","key":key,"allocated":st.st_blocks*512,"apparent":st.st_size}
+            return {"state":"released","key":key,"allocated":st.st_blocks*512,"apparent":st.st_size,"elf":record["elf"]}
         except Exception:
             if _exists(q,token) is not None and _exists(cf,name) is None and bound():restore()
             raise
