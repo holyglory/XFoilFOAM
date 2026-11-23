@@ -85,6 +85,7 @@ export function progressivePublicationSelectionSql(
   lane = 0,
   laneCount = 1,
   pass: ProgressivePublicationPass = "active",
+  afterJob?: string,
 ) {
   if (
     !Number.isSafeInteger(lane) ||
@@ -104,6 +105,7 @@ export function progressivePublicationSelectionSql(
     )
     SELECT sim_job_id FROM eligible
     ORDER BY ${pass === "active" ? sql`active_lease DESC,` : sql``}
+      ${afterJob ? sql`(sim_job_id > ${afterJob}::uuid) DESC, sim_job_id,` : sql``}
       created_at, sim_job_id, sequence
     LIMIT 1
   `;
