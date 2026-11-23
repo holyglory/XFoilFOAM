@@ -114,8 +114,9 @@ Cloud credentials stay server-side in the existing authenticated GCS client.
 
 Each pass scans 32 IDs and attempts at most eight copies with an 8 MiB soft source
 budget. A first larger source can use one pass up to the hard 32 MiB source limit.
-Automatic copies require at least 4 KiB of recognized history arrays. Small,
-active, oversized and already-catalogued sources stay online. The keyset cursor
+The hub copies a settled source when a recognized history array has at least one
+sample. Empty arrays and metadata alone do not enter the copy queue. SQL
+shortening has its own minimum savings and scientific readback checks. The keyset cursor
 advances past failed copies and wraps so failures can be retried without starving
 later sources. Passes yield between pages and wait 30 seconds after wrapping.
 Shutdown stops between items and aborts active read streams.

@@ -139,6 +139,19 @@ const SERIES: Readonly<Record<string, readonly string[]>> = {
   frameTrack: ["frames"],
 };
 
+/** Counting the samples needs neither the full-tree hash nor a hash per channel.
+ * This also works when the audit runs before installation of the 0207 catalog. */
+export function attemptHistorySizesSql(payload: SQL): SQL {
+  const paths = Object.entries(SERIES).flatMap(([parent, children]) =>
+    children.map(child => sql`(ARRAY[${parent}, ${child}]::text[])`),
+  );
+  return sql`SELECT coalesce(sum(octet_length(channel.value::text)),0)::bigint AS history_bytes,
+    coalesce(bool_or(jsonb_array_length(channel.value)>0),false) AS has_samples
+    FROM (VALUES ${sql.join(paths, sql`,`)}) paths(path)
+    CROSS JOIN LATERAL (SELECT ${payload} #> path AS value) channel
+    WHERE jsonb_typeof(channel.value)='array'`;
+}
+
 export interface AttemptEvidenceCopySource {
   attemptId: string;
   resultId: string | null;
