@@ -6053,6 +6053,15 @@ cases = [{ id = "disposable-index-and-rewrite", args = [], postgres = "default" 
 [test.catalog-web-delivery]
 timeout_seconds = 300
 
+[test.campaign-attempt-design-audit]
+timeout_seconds = 100
+
+[[test.campaign-attempt-design-audit.check]]
+name = "capture"
+tier = "release"
+command = ["node", "scripts/dev/capture-admin-evidence-audit.mjs"]
+retained_artifacts = [{name="campaign-attempt-audit",path=".codex-artifacts/campaign-attempt-audit",max_bytes=16777216}]
+
 [test.campaign-stage-layout]
 timeout_seconds = 3600
 
