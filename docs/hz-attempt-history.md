@@ -109,3 +109,35 @@ attempt_history watch --apply --include-retained --directory "$HZ_ATTEMPT_STATE"
 ```
 
 When transferring an already running standalone original-copy job into the combined watcher, quiesce that job at a bounded page during the coordinated operator handoff and reuse its directory and scope. PostgreSQL shortening measurements and original-copy progress have separate counters. The original-copy controller's `status` command can inspect its SQLite receipts while the combined watcher runs.
+
+
+### Frozen original versions with an unsettled producing job
+
+The archive-only supervisor can run a finite `versions` pass after its registered
+backup drains. Use the frozen scope, checkpoint directory, canonical hub account
+pin and SSH aliases from that backup. Run it in the same captured operator
+service during an open transfer window.
+
+```sh
+python3 scripts/deploy/hz-attempt-originals.py versions --apply --until-complete \
+  --directory "$HZ_ORIGINALS_STATE" --scope "$FROZEN_SCOPE" \
+  --bucket "$HUB_BUCKET" --hub-account-file "$HUB_ACCOUNT_FILE"
+```
+
+For each deferred attempt, the HZ reader validates the native worker, signed
+request, producing job and exact result and attempt IDs in a read-only snapshot.
+The immutable object key binds its HZ source instance, local attempt, original
+UTF-8 hash and compressed hash. The hub uses its existing identity for conditional
+creation and fresh generation reads. The controller records the generation
+before confirming the restored envelope, history inventory and current source.
+The HZ transfer fence, deployment lock, frozen scope and per-source byte limits
+apply on replay.
+
+The `versionOnly` status counts come from `original_versions` in the existing
+private SQLite checkpoint. `verified-current` means the frozen source still
+matched at the final HZ observation. `verified-superseded` preserves the frozen
+object and records the changed live source. `source-changed` means the frozen
+bytes were already unavailable at capture. A new frozen selection can preserve a
+later revision under its own object key. The version pass leaves PostgreSQL
+payloads and application selections intact. Ordinary registration after settlement
+can adopt the same object through its existing source check.

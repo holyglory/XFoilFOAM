@@ -22,6 +22,7 @@ with TemporaryDirectory() as tmp:
     src.write_text("".join(json.dumps(dict(attemptId=r["id"],sourceSha256=r["sha"],sourceByteSize=r["bytes"]))+"\n" for r in entries))
     acct=root/"account";acct.write_text("expected-account")
     objects={};sql={};sent=[];failed=set()
+    version_ops=[]
     fences=[]
     class Endpoints:
         def __init__(self,_):pass
@@ -30,6 +31,15 @@ with TemporaryDirectory() as tmp:
             if fences and operation==fences[0]:
                 fences.pop(0);raise operator.RelayError("transfer_paused",True)
             if operation=="bound":return dict(high=max(ids),instance=instance,solver=solver)
+            if operation in ("version_put","version_read"):
+                version_ops.append(operation)
+                pin=params["pin"]
+                identity=dict(sourceInstance=instance,attemptId=pin["id"],resultId=pin["result"],simJobId=pin["job"],
+                              sourceSha256=pin["sha"],sourceByteSize=pin["bytes"],storedByteSize=750,generation="9007199254749999")
+                if operation=="version_read":
+                    assert params["identity"]==identity
+                    return dict(identity=identity,current=True)
+                return dict(identity=identity)
             if operation=="inventory":
                 return [x for x in entries if x["id"] in params["selection"]["ids"]]
             if operation=="upload":
@@ -67,6 +77,16 @@ with TemporaryDirectory() as tmp:
     run("backup",*scope,*apply,"--until-complete")
     assert not fences
     assert sent==[ids[1],ids[2],ids[0]] and len(sql)==3
+    # A version-only receipt cannot move the deferred source into registered custody.
+    run("versions",*scope,*apply,"--pages","1")
+    assert run("status")["versionOnly"][0]["state"]=="uploaded" and ids[3] not in sql
+    fences.append("version_read")
+    result=run("versions",*scope,*apply,"--until-complete")
+    assert result["versionOnly"]==[dict(state="verified-current",attempts=1,sourceBytes=10000,compressedBytes=750)]
+    assert version_ops==["version_put","version_read"] and ids[3] not in sql
+    assert sum(x["attempts"] for x in result["rows"] if x["state"]=="deferred")==1
+    run("versions",*scope,*apply,"--until-complete")
+    assert version_ops==["version_put","version_read"]
     entries[3]["settled"]=True
     r=run("backup",*scope,*apply,"--retry-deferred","--until-complete")
     assert sum(x["attempts"] for x in r["rows"] if x["state"]=="verified")==4 and len(sql)==4

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Bounded controller for original HZ 0207 copies. Only metadata goes into SQLite."""
+import re
 import argparse
 from collections import Counter
 from contextlib import closing, contextmanager
@@ -121,7 +122,13 @@ def summary(db):
     counts=[dict(r) for r in db.execute("""SELECT state,matched,settled,count(*) AS attempts,coalesce(sum(history),0) AS historyBytes,
         coalesce(sum(source_bytes),0) AS sourceBytes,coalesce(sum(packed),0) AS measuredPackedBytes,
         coalesce(sum(created),0) AS observedNewCatalogRows,coalesce(sum(prior),0) AS cataloguedAtInventory FROM originals GROUP BY state,matched,settled ORDER BY state,matched DESC,settled DESC""")]
-    return dict(inventory=get(db,"scan"),rows=counts,excluded={r[0]:r[1] for r in db.execute("SELECT * FROM excluded")},
+    versions = []
+    if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='original_versions'").fetchone():
+        versions=[dict(r) for r in db.execute("""SELECT state,count(*) AS attempts,
+            coalesce(sum(json_extract(identity,'$.sourceByteSize')),0) AS sourceBytes,
+            coalesce(sum(json_extract(identity,'$.storedByteSize')),0) AS compressedBytes
+            FROM original_versions GROUP BY state ORDER BY state""")]
+    return dict(versionOnly=versions,inventory=get(db,"scan"),rows=counts,excluded={r[0]:r[1] for r in db.execute("SELECT * FROM excluded")},
                 sourceAttemptPayloadWrites=False)
 
 def scope_page(path, offset, count, stamp):
@@ -241,9 +248,53 @@ def backup_page(db,args,relay,b):
                 if result.rowcount!=1:raise ValueError("Catalogue acknowledged a different generation")
     return True
 
+def version_page(db, args, relay, binding):
+    # Keep object versions separate from the SQL registration state. Losing a
+    # reply only repeats an immutable put or a pinned GET of the same version.
+    row = db.execute("""SELECT o.id,o.pin,o.source_bytes,v.state AS version_state,v.identity
+        FROM originals o LEFT JOIN original_versions v ON v.id=o.id AND v.sha=json_extract(o.pin,'$.sha')
+        WHERE v.state='uploaded' OR (o.state='deferred' AND v.id IS NULL)
+        ORDER BY (v.state='uploaded') IS TRUE DESC,o.id LIMIT 1""").fetchone()
+    if not row:
+        return False
+    pin = json.loads(row["pin"])
+    if pin["bytes"] > args.page_bytes:
+        raise ValueError("Version exceeds operator page byte budget")
+    if row["version_state"] == "uploaded":
+        original = json.loads(row["identity"])
+        result = relay.send("version_read", binding=binding, pin=pin, identity=original)
+        identity = result["identity"]
+        if any(identity[k] != v for k,v in original.items() if k != "verifiedAt"):
+            raise ValueError("Version generation changed")
+        state = "verified-current" if result.get("current") is True else "verified-superseded"
+        changed = result.get("changed")
+        if (state == "verified-superseded") != bool(changed):
+            raise ValueError("Missing exact current revision observation")
+    else:
+        result = relay.send("version_put", binding=binding, pin=pin)
+        identity, changed = result.get("identity"), result.get("changed")
+        state = "uploaded" if identity and not changed else "source-changed"
+        if (state == "source-changed") != bool(changed and not identity):
+            raise ValueError("Missing frozen version or changed-source observation")
+    if identity and (identity["sourceInstance"] != binding["instance"] or identity["attemptId"] != pin["id"] or
+        identity["simJobId"] != pin["job"] or identity["resultId"] != pin["result"] or
+        identity["sourceByteSize"] != pin["bytes"] or identity["sourceSha256"] != pin["sha"]):
+        raise ValueError("Version differs from frozen owner")
+    if changed and (not isinstance(changed.get("sha"),str) or not re.fullmatch("[a-f0-9]{64}",changed["sha"])
+                    or not isinstance(changed.get("bytes"),int) or changed["bytes"]<1):
+        raise ValueError("Invalid changed-source observation")
+    with db:
+        db.execute("""INSERT INTO original_versions(id,sha,state,identity,observed,checked_at) VALUES(?,?,?,?,?,?)
+            ON CONFLICT(id,sha) DO UPDATE SET state=excluded.state,identity=excluded.identity,
+              observed=excluded.observed,checked_at=excluded.checked_at
+            WHERE original_versions.state='uploaded'""",
+            (pin["id"],pin["sha"],state,json_text(identity) if identity else None,
+             json_text(changed) if changed else None,time.time()))
+    return True
+
 def parse(argv):
     ap=argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("mode",choices=["inventory","backup","status","cycle"])
+    ap.add_argument("mode",choices=["inventory","backup","status","cycle","versions"])
     ap.add_argument("--directory",required=True,type=Path)
     ap.add_argument("--scope",type=Path,help="Frozen JSONL with attemptId, sourceSha256 and sourceByteSize")
     ap.add_argument("--hz-host",default="hz-solver2");ap.add_argument("--hz-container",default="hz-solver2-sweeper-1")
@@ -256,8 +307,10 @@ def parse(argv):
     ap.add_argument("--apply",action="store_true")
     ap.add_argument("--retry-deferred",action="store_true");ap.add_argument("--refresh",action="store_true")
     a=ap.parse_args(argv)
-    if not 1<=a.limit<=64 or not 1<=a.page_bytes<=NATIVE_LIMIT or a.pages<1 or a.apply!=(a.mode in ('backup','cycle')) or (a.apply and (not a.bucket or not a.hub_account_file)):
+    if not 1<=a.limit<=64 or not 1<=a.page_bytes<=NATIVE_LIMIT or a.pages<1 or a.apply!=(a.mode in ('backup','cycle','versions')) or (a.apply and (not a.bucket or not a.hub_account_file)):
         ap.error("Check copy bounds and write options")
+    if a.mode=="versions" and (not a.scope or a.retry_deferred):
+        ap.error("Version-only backup requires a frozen scope")
     if a.refresh and (a.scope or a.mode!='inventory') or a.retry_deferred and not a.apply:ap.error("Invalid refresh or retry scope")
     if ((a.slice_seconds is not None or a.refresh_seconds is not None) and a.mode!="cycle") or any(v is not None and v<1 for v in (a.slice_seconds,a.refresh_seconds)):
         ap.error("Invalid cycle timing")
@@ -289,7 +342,17 @@ def main(argv=None,relay_factory=Relay):
                     backoff=min(30,backoff*2)
             else:return
             sig=digest_file(db,args.scope) if args.scope else None
+            if args.mode=="versions" and (not get(db,"binding") or not get(db,"scan",{}).get("complete")):
+                raise ValueError("Version-only backup requires a completed frozen inventory")
             bind(db,args,b,sig)
+            if args.mode=="versions":
+                if db.execute("SELECT 1 FROM originals WHERE state IN ('pending','uploaded') LIMIT 1").fetchone():
+                    raise ValueError("Finish the registered frozen pass first")
+                with db:
+                    db.execute("""CREATE TABLE IF NOT EXISTS original_versions(
+                        id TEXT NOT NULL,sha TEXT NOT NULL,state TEXT NOT NULL,identity TEXT,
+                        observed TEXT,checked_at REAL NOT NULL,PRIMARY KEY(id,sha))""")
+
             # A fixed file never admits a new identity. An unscoped watch
             # revisits random UUIDs behind its high-water mark after its drain.
             due=(args.mode=="cycle" and args.refresh_seconds and get(db,"scan")["complete"] and
@@ -312,7 +375,10 @@ def main(argv=None,relay_factory=Relay):
                     scan=not get(db,"scan")["complete"]
                     if args.mode=="inventory" and not scan:break
                     if args.mode=="backup" and scan:raise ValueError("Source inventory incomplete")
-                    more=inventory_page(db,args,relay,b) if scan else backup_page(db,args,relay,b)
+                    if args.mode=="versions":
+                        more=version_page(db,args,relay,b)
+                    else:
+                        more=inventory_page(db,args,relay,b) if scan else backup_page(db,args,relay,b)
                     batch+=1;backoff=1
                     if not more and (args.mode!="cycle" or not scan):break
                 except RelayError as e:
