@@ -24,6 +24,7 @@ const digest = (bytes) => createHash("sha256").update(bytes).digest("hex");
 await mkdir(dirname(out), { recursive: true });
 const temp = await mkdtemp(join(dirname(out), ".report-migrator-"));
 try {
+  execFileSync("python3", ["-B", join(root, "tests/test_legacy_bulk_qualification.py")], { cwd: root, stdio: "inherit" });
   const compile = await build({
     absWorkingDir: root, entryPoints: ["apps/sweeper/src/legacy-report-storage-cli.ts"],
     bundle: true, format: "esm", platform: "node", target: "node22",
