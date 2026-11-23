@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Compact exactly one hub table. Never deploy/recreate containers or touch the
+# Shared server-side maintenance lifecycle. Never deploy/recreate containers or touch the
 # OpenFOAM engines. Run on the server, from a stable release directory.
 set -Eeuo pipefail
 
@@ -7,6 +7,7 @@ usage() {
   cat <<'HELP'
 Usage: compact-progressive-remote-reports.sh [--dry-run | --execute] [--server-run]
 
+For the HZ worker use rewrite-hz-worker-reports.py on the operator host.
 Default: print the plan without probing or changing Docker, SQL, or lock files.
 --execute: hold the shared deploy lock, capture existing containers, stop only
   running node-api/web/sweeper/media-repair, VACUUM FULL the fixed report table,
@@ -41,16 +42,24 @@ HELP
 
 execute=false
 server_run=false
+hz=false
+restore_only=false
 for arg in "$@"; do
   case "$arg" in
     --execute) execute=true ;;
     --dry-run) execute=false ;;
     --server-run) server_run=true ;;
+    --hz-worker-session) hz=true ;;
+    --restore-worker-state) hz=true; restore_only=true ;;
     --help|-h) usage; exit 0 ;;
     *) printf 'Unknown argument: %s\n' "$arg" >&2; exit 2 ;;
   esac
 done
 if [[ "$execute" == false ]]; then
+  if [[ "$hz" == true ]]; then
+    printf '%s\n' 'Use rewrite-hz-worker-reports.py --dry-run for the live worker capacity and lease check.'
+    exit 0
+  fi
   printf '%s\n' 'DRY RUN: lock deployment; snapshot prior containers; stop running node-api web sweeper media-repair; VACUUM (FULL, ANALYZE) public.progressive_remote_reports; restore exact prior state. Engines api/worker remain untouched.'
   exit 0
 fi
@@ -71,14 +80,33 @@ READINESS_TIMEOUT_SECONDS="${READINESS_TIMEOUT_SECONDS:-120}"
 PUBLIC_ORIGIN="${PUBLIC_ORIGIN:-https://airfoils.pro}"
 API_ORIGIN="${API_ORIGIN:-http://127.0.0.1:4000}"
 
+UNIT=airfoils-progressive-report-compaction
+SQL_TAG=xfoilfoam_progressive_report_compaction
+if [[ "$hz" == true ]]; then
+  # The operator creates this unique, private package/receipt directory after
+  # preflight. HZ never runs the hub SQL or checks a public hub URL.
+  RUN_KEY="${SCRIPT_DIR##*/}"
+  [[ "$RUN_KEY" =~ ^[0-9a-f]{32}$ && "$SCRIPT_DIR" == "$AIRFOILS_PRO_STATE_DIR/worker-report-rewrite/$RUN_KEY" &&
+     -f "$SCRIPT_DIR/plan.json" ]] || { echo 'Use the HZ operator rewrite command.' >&2; exit 2; }
+  UNIT="airfoils-hz-report-rewrite-$RUN_KEY"
+  SQL_TAG="hz_rewrite_$RUN_KEY"
+  PUBLIC_ORIGIN=http://127.0.0.1:3100
+  API_ORIGIN=http://127.0.0.1:4000
+fi
+
 die() { printf '%s\n' "$2" >&2; exit "$1"; }
 bound() {
-  [[ "$2" =~ ^[1-9][0-9]{0,3}$ ]] && (( $2 <= $3 )) ||
+  [[ "$2" =~ ^[1-9][0-9]{0,5}$ ]] && (( $2 <= $3 )) ||
     die 2 "$1 must be a positive integer no greater than $3."
 }
 bound COMMAND_TIMEOUT_SECONDS "$COMMAND_TIMEOUT_SECONDS" 60
-bound COMPACTION_TIMEOUT_SECONDS "$COMPACTION_TIMEOUT_SECONDS" 1800
-bound MAINTENANCE_TIMEOUT_SECONDS "$MAINTENANCE_TIMEOUT_SECONDS" 2400
+if [[ "$hz" == true ]]; then
+  bound COMPACTION_TIMEOUT_SECONDS "$COMPACTION_TIMEOUT_SECONDS" 86400
+  bound MAINTENANCE_TIMEOUT_SECONDS "$MAINTENANCE_TIMEOUT_SECONDS" 259800
+else
+  bound COMPACTION_TIMEOUT_SECONDS "$COMPACTION_TIMEOUT_SECONDS" 1800
+  bound MAINTENANCE_TIMEOUT_SECONDS "$MAINTENANCE_TIMEOUT_SECONDS" 2400
+fi
 bound RESTORE_TIMEOUT_SECONDS "$RESTORE_TIMEOUT_SECONDS" 300
 bound READINESS_TIMEOUT_SECONDS "$READINESS_TIMEOUT_SECONDS" 240
 for key in PUBLIC_ORIGIN API_ORIGIN; do
@@ -99,11 +127,14 @@ if [[ "$server_run" == true ]]; then
     PUBLIC_ORIGIN API_ORIGIN; do
     env_args+=("--setenv=$key=${!key}")
   done
-  timeout --kill-after=2 15 systemd-run --unit=airfoils-progressive-report-compaction \
+  target_args=()
+  if [[ "$hz" == true ]]; then target_args+=(--hz-worker-session); fi
+  if [[ "$restore_only" == true ]]; then target_args+=(--restore-worker-state); fi
+  timeout --kill-after=2 15 systemd-run --unit="$UNIT" \
     --collect --property=Type=exec --property=KillMode=mixed \
     "--property=TimeoutStopSec=$((RESTORE_TIMEOUT_SECONDS + 15))s" \
     "--property=RuntimeMaxSec=$((MAINTENANCE_TIMEOUT_SECONDS + RESTORE_TIMEOUT_SECONDS + 30))s" \
-    "${env_args[@]}" /bin/bash "$SCRIPT_DIR/compact-progressive-remote-reports.sh" --execute
+    "${env_args[@]}" /bin/bash "$SCRIPT_DIR/compact-progressive-remote-reports.sh" --execute "${target_args[@]}"
   exit $?
 fi
 
@@ -132,7 +163,9 @@ RESTORE_ARMED=false
 SQL_ACTIVE=false
 RUN_DIR=""
 WRITERS=(node-api web sweeper media-repair)
-SERVICES=(api worker postgres "${WRITERS[@]}")
+PROTECTED=(api worker postgres)
+if [[ "$hz" == true ]]; then PROTECTED+=(redis); fi
+SERVICES=("${PROTECTED[@]}" "${WRITERS[@]}")
 declare -A IDS STATES STARTED
 
 # All clients lose fd 9: neither an orphaned client nor its child can retain
@@ -178,7 +211,7 @@ assert_prior() {
   capture "$service" && [[ "$CAPTURED_ID" == "${IDS[$service]}" &&
     "$CAPTURED_STATE" == "${STATES[$service]}" ]] || return 1
   # Engine processes must not have been restarted in the same container either.
-  if [[ "$service" == api || "$service" == worker || "$service" == postgres ]]; then
+  if [[ " ${PROTECTED[*]} " == *" $service "* ]]; then
     [[ "$CAPTURED_STARTED" == "${STARTED[$service]}" ]] || return 1
   fi
 }
@@ -217,7 +250,9 @@ verify_readiness() {
   fi
   if [[ "${STATES[web]}" == running && "${STATES[node-api]}" == running ]]; then
     route_ready admin "$PUBLIC_ORIGIN/admin" text/html || failed=true
-    route_ready airfoil-detail "$PUBLIC_ORIGIN/airfoils/ag24" text/html || failed=true
+    if [[ "$hz" == false ]]; then
+      route_ready airfoil-detail "$PUBLIC_ORIGIN/airfoils/ag24" text/html || failed=true
+    fi
   else
     printf 'web-routes\tskipped\tweb/node-api were not both running\n' >>"$RUN_DIR/readiness.tsv"
   fi
@@ -237,13 +272,20 @@ cleanup() {
   if [[ "$SQL_ACTIVE" == true ]]; then
     # Killing docker exec does not prove server-side SQL stopped. Cancel only
     # this operation's tagged session, then verify it is no longer active.
-    psql_cleanup -Atc "SELECT pg_cancel_backend(pid) FROM pg_stat_activity WHERE application_name = 'xfoilfoam_progressive_report_compaction' AND pid <> pg_backend_pid();" || failed=true
+    psql_cleanup -Atc "SELECT pg_cancel_backend(pid) FROM pg_stat_activity WHERE application_name = '${SQL_TAG}' AND datname=current_database() AND pid <> pg_backend_pid();" || failed=true
     pending=unknown
     for attempt in 1 2 3 4 5; do
-      pending="$(psql_cleanup -Atc "SELECT count(*) FROM pg_stat_activity WHERE application_name = 'xfoilfoam_progressive_report_compaction' AND state = 'active';")" || pending=unknown
+      pending="$(psql_cleanup -Atc "SELECT count(*) FROM pg_stat_activity WHERE application_name = '${SQL_TAG}' AND datname=current_database() AND state = 'active';")" || pending=unknown
       [[ "$pending" == 0 ]] && break
       run_bounded 1 sleep 0.2
     done
+    if [[ "$hz" == true && "$pending" != 0 ]]; then
+      # The HZ session tag is unique to the retained run. A lost docker-exec
+      # reply can leave that backend alive after its client is gone.
+      psql_cleanup -Atc "SELECT pg_terminate_backend(pid, 3000) FROM pg_stat_activity WHERE application_name='${SQL_TAG}' AND datname=current_database() AND pid<>pg_backend_pid();" || failed=true
+      pending="$(psql_cleanup -Atc "SELECT count(*) FROM pg_stat_activity WHERE application_name='${SQL_TAG}' AND datname=current_database() AND xact_start IS NOT NULL;")" || pending=unknown
+      if [[ "$pending" != 0 ]]; then RESTORE_ARMED=false; fi
+    fi
     [[ "$pending" == 0 ]] || { printf 'CRITICAL: SQL cancellation could not be confirmed.\n' >&2; failed=true; }
   fi
   if [[ "$RESTORE_ARMED" == true ]]; then
@@ -253,17 +295,20 @@ cleanup() {
         failed=true
         continue
       fi
-      if [[ "${STATES[$service]}" == running ]]; then
+      if [[ "${STATES[$service]}" == running && ( "$hz" == false || "$CAPTURED_STATE" != running ) ]]; then
         run_bounded "$COMMAND_TIMEOUT_SECONDS" docker start "${IDS[$service]}" || {
           printf 'CRITICAL: start command failed for %s.\n' "$service" >&2; failed=true;
         }
       fi
       assert_prior "$service" || { printf 'CRITICAL: prior state not restored for %s.\n' "$service" >&2; failed=true; }
     done
-    for service in api worker postgres; do
+    for service in "${PROTECTED[@]}"; do
       assert_prior "$service" || { printf 'CRITICAL: %s identity/state/start time changed.\n' "$service" >&2; failed=true; }
     done
     verify_readiness || readiness_failed=true
+    if [[ "$hz" == true ]]; then
+      run_bounded 45 python3 "$SCRIPT_DIR/hz-worker-report-rewrite-host.py" resumed "$RUN_DIR" "${IDS[postgres]}" || readiness_failed=true
+    fi
   fi
   local final_rc="$original_rc"
   if [[ "$readiness_failed" == true ]]; then
@@ -275,8 +320,10 @@ cleanup() {
     printf 'CRITICAL: recovery incomplete (operation exit %s). Inspect the retained prior-state snapshot.\n' "$original_rc" >&2
   fi
   if [[ -n "$RUN_DIR" ]]; then
+    local receipt=result
+    if [[ "$restore_only" == true ]]; then receipt=recovery-result; fi
     printf 'operation_exit=%s\nrecovery_failed=%s\nreadiness_failed=%s\nexit=%s\n' \
-      "$original_rc" "$failed" "$readiness_failed" "$final_rc" >"$RUN_DIR/result" || final_rc=18
+      "$original_rc" "$failed" "$readiness_failed" "$final_rc" >"$RUN_DIR/$receipt.tmp" && mv "$RUN_DIR/$receipt.tmp" "$RUN_DIR/$receipt" || final_rc=18
   fi
   exit "$final_rc"
 }
@@ -291,7 +338,11 @@ run_bounded "$COMMAND_TIMEOUT_SECONDS" python3 "$SCRIPT_DIR/deployment-env-prefl
   --app-dir "$APP_DIR" --state-dir "$AIRFOILS_PRO_STATE_DIR" --env-file "$ENV_FILE" >/dev/null
 source "$SCRIPT_DIR/deployment-compose-profile.sh"
 configure_deployment_compose_profile
-[[ "$DEPLOYMENT_ROLE" == hub ]] || die 2 'This compaction is restricted to the hub deployment.'
+if [[ "$hz" == true ]]; then
+  [[ "$DEPLOYMENT_ROLE" == remote-solver && "$COMPOSE_PROJECT_NAME" == hz-solver2 ]] || die 2 'Expected the HZ remote-solver deployment.'
+else
+  [[ "$DEPLOYMENT_ROLE" == hub ]] || die 2 'This compaction is restricted to the hub deployment.'
+fi
 if run_bounded "$COMMAND_TIMEOUT_SECONDS" docker compose version >/dev/null 2>&1; then
   COMPOSE=(docker compose)
 else
@@ -299,19 +350,46 @@ else
 fi
 compose config --quiet >/dev/null
 configured="$(compose config --services)"
+if [[ "$hz" == true && $'\n'"$configured"$'\n' == *$'\nworker-foundation14\n'* ]]; then
+  PROTECTED+=(worker-foundation14)
+  SERVICES+=(worker-foundation14)
+fi
 for service in "${SERVICES[@]}"; do
   [[ $'\n'"$configured"$'\n' == *$'\n'"$service"$'\n'* ]] || die 2 "Missing service: $service"
   capture "$service" || die 14 "Could not capture unambiguous state for $service."
   IDS[$service]="$CAPTURED_ID"; STATES[$service]="$CAPTURED_STATE"; STARTED[$service]="$CAPTURED_STARTED"
 done
 [[ "${STATES[postgres]}" == running ]] || die 14 'PostgreSQL must already be running.'
-RUN_DIR="$(mktemp -d "$AIRFOILS_PRO_STATE_DIR/progressive-report-compaction.XXXXXXXX")"
+if [[ "$hz" == true ]]; then
+  RUN_DIR="$SCRIPT_DIR"
+  if [[ "$restore_only" == true ]]; then
+    [[ -s "$RUN_DIR/prior-state.tsv" ]] || die 14 'Missing original HZ container snapshot.'
+    count=0
+    while IFS=$'\t' read -r service id state started; do
+      [[ " ${SERVICES[*]} " == *" $service "* && "${IDS[$service]:--}" == "$id" ]] || die 14 'Original container identity changed.'
+      STATES[$service]="$state"; STARTED[$service]="$started"; ((count+=1))
+    done < "$RUN_DIR/prior-state.tsv"
+    [[ "$count" == "${#SERVICES[@]}" ]] || die 14 'Incomplete container snapshot.'
+    RESTORE_ARMED=true
+    SQL_ACTIVE=true
+    exit 0
+  fi
+  [[ ! -e "$RUN_DIR/prior-state.tsv" ]] || die 14 'This rewrite already has captured state. Use recovery.'
+  run_bounded 120 python3 "$SCRIPT_DIR/hz-worker-report-rewrite-host.py" preflight "$RUN_DIR" "${IDS[postgres]}"
+else
+  RUN_DIR="$(mktemp -d "$AIRFOILS_PRO_STATE_DIR/progressive-report-compaction.XXXXXXXX")"
+fi
 for service in "${SERVICES[@]}"; do
-  printf '%s\t%s\t%s\t%s\n' "$service" "${IDS[$service]}" "${STATES[$service]}" "${STARTED[$service]}"
-done >"$RUN_DIR/prior-state.tsv"
+  # A dash denotes an absent ID so Bash IFS does not collapse an empty TSV field.
+  id="${IDS[$service]}"
+  if [[ "$hz" == true && -z "$id" ]]; then id=-; fi
+  printf '%s\t%s\t%s\t%s\n' "$service" "$id" "${STATES[$service]}" "${STARTED[$service]}"
+done >"$RUN_DIR/prior-state.tmp"
+mv "$RUN_DIR/prior-state.tmp" "$RUN_DIR/prior-state.tsv"
 printf 'Maintenance snapshot: %s\n' "$RUN_DIR"
 
 # Arm before the first stop, including partial/failed stop commands.
+if [[ "$hz" == true && -e "$RUN_DIR/cancel" ]]; then die 130 'HZ rewrite cancelled before the pause.'; fi
 RESTORE_ARMED=true
 for service in "${WRITERS[@]}"; do
   if [[ "${STATES[$service]}" == running ]]; then
@@ -321,13 +399,21 @@ for service in "${WRITERS[@]}"; do
   [[ "$CAPTURED_ID" == "${IDS[$service]}" && "$CAPTURED_STATE" != running ]] ||
     die 14 "$service did not stop with its captured identity."
 done
+if [[ "$hz" == true ]]; then
+  SQL_ACTIVE=true
+  for phase in quiesced identity-before ready rewrite identity-after after; do
+    run_bounded "$MAINTENANCE_TIMEOUT_SECONDS" python3 "$SCRIPT_DIR/hz-worker-report-rewrite-host.py" "$phase" "$RUN_DIR" "${IDS[postgres]}"
+  done
+  SQL_ACTIVE=false
+  exit 0
+fi
 sql_seconds=$((DEADLINE - SECONDS - 5))
 (( sql_seconds > 0 )) || die 124 'Maintenance deadline reached before compaction.'
 (( sql_seconds <= COMPACTION_TIMEOUT_SECONDS )) || sql_seconds="$COMPACTION_TIMEOUT_SECONDS"
 SQL_ACTIVE=true
 run_bounded "$((sql_seconds + 5))" docker exec \
   -e "PGOPTIONS=-c lock_timeout=5000 -c statement_timeout=$((sql_seconds * 1000)) -c application_name=xfoilfoam_progressive_report_compaction" \
-  "${IDS[postgres]}" psql -X -w -v ON_ERROR_STOP=1 -U aerodb -d aerodb \
+  "${IDS[postgres]}" psql -X -w -v ON_ERROR_STOP=1 -U aerodb -d "dbname=aerodb application_name=${SQL_TAG}" \
   -c 'VACUUM (FULL, ANALYZE) public.progressive_remote_reports;'
 SQL_ACTIVE=false
 # EXIT always restores and verifies; successful SQL alone is not completion.
