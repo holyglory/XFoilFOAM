@@ -15,12 +15,22 @@ const config: NextConfig = {
       process.env.API_URL ||
       process.env.NEXT_PUBLIC_API_URL ||
       "http://localhost:4000";
-    return [
-      {
-        source: "/api/:path*",
-        destination: `${apiUrl.replace(/\/$/, "")}/api/:path*`,
-      },
-    ];
+    return {
+      beforeFiles: [
+        {
+          source: "/",
+          missing: [{ type: "query", key: "condition" }],
+          destination: "/catalog-page/default",
+        },
+      ],
+      afterFiles: [
+        {
+          source: "/api/:path*",
+          destination: `${apiUrl.replace(/\/$/, "")}/api/:path*`,
+        },
+      ],
+      fallback: [],
+    };
   },
 };
 

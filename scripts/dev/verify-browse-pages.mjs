@@ -158,11 +158,24 @@ try {
     await response;
     await waitRows(page, match.items);
     await expect(page).toHaveURL(new RegExp("condition=" + condition));
+    const direct = await query(page, {
+      metricConditionKey: condition,
+      limit: "150",
+    });
+    const selectedDocument = await page.reload({
+      waitUntil: "domcontentloaded",
+    });
+    assert.equal(selectedDocument.status(), 200);
+    await expect(page.getByLabel("Metrics for", { exact: true })).toHaveValue(
+      condition,
+    );
+    await waitRows(page, direct.items);
     proof.filtered = {
       rows: match.items.length,
       condition: true,
       staleAppendIgnored: true,
       retainedPreview: true,
+      selectedConditionReload: true,
     };
   } finally {
     unblock();

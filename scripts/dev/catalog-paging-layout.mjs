@@ -153,6 +153,16 @@ export function catalogPagingLayout(origin, repoRoot, reviewInputs) {
         reviewInputs: [
           ...reviewInputs,
           { path: "apps/web/lib/api.ts", kind: "ui-code" },
+          {
+            path: "apps/web/components/browse/CatalogContent.tsx",
+            kind: "ui-code",
+          },
+          { path: "apps/web/components/shell/AppShell.tsx", kind: "ui-code" },
+          {
+            path: "apps/web/app/catalog-page/[view]/page.tsx",
+            kind: "ui-code",
+          },
+          { path: "apps/web/next.config.ts", kind: "ui-code" },
         ],
         states: actions,
       },
