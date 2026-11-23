@@ -55,10 +55,11 @@ it("runs the stock recurring hub storage worker and serves both archive formats 
     } while (Date.now() < end);
     throw Error("Stock service did not reach expectation " + lastLogs());
   }
-  const start = () => {
+  const start = (anchors = true) => {
     const env: NodeJS.ProcessEnv = {
       ...process.env,
       AIRFOILFOAM_HUB_REPORT_API_URL: host,
+      AIRFOILFOAM_STOPPED_REPORT_ANCHOR_SCOPE: anchors ? "all" : "off",
       AIRFOILFOAM_STOPPED_SHARED_REPORT_RECEIPTS: dir,
       STORAGE_EMULATOR_HOST: emulator.url,
       LOG_LEVEL: "error",
@@ -146,7 +147,7 @@ it("runs the stock recurring hub storage worker and serves both archive formats 
         download(f.executionId, 3, f.reports[2].contentSignature),
       ),
     );
-    start();
+    start(false);
     await until(async () => {
       const rows =
         await db.sql`SELECT count(*)::int n FROM progressive_report_archive_members m
@@ -204,6 +205,61 @@ it("runs the stock recurring hub storage worker and serves both archive formats 
       expect(
         await download(f.executionId, 3, f.reports[2].contentSignature),
       ).toBe(apiSamples[i]);
+    // Upgrade an existing 0219 checkpoint. The two original anchors already
+    // reside in pinned manifests and remain fully warm until both readers pass.
+    await stop();
+    const beforeAnchorObjects = emulator.objects.size;
+    const priorScienceKeys = [...emulator.objects.keys()]
+      .filter((k) => k.includes("/results/"))
+      .sort();
+    const ownerReads = await Promise.all(
+      originals
+        .slice(0, 2)
+        .map(async (f) => [
+          await download(f.executionId, 2, f.reports[1].contentSignature),
+          await download(f.executionId, 36, f.reports[35].contentSignature),
+        ]),
+    );
+    start();
+    await until(async () => {
+      const [r] = await db.sql.unsafe(
+        "SELECT count(*)::int n FROM progressive_remote_reports WHERE sim_job_id=ANY($1::uuid[]) AND archived_at IS NULL",
+        [ids.slice(0, 2)],
+      );
+      return Number(r.n) === 0;
+    });
+    const anchorTotals = [];
+    for (const [i, f] of originals.slice(0, 2).entries()) {
+      expect(
+        await download(f.executionId, 2, f.reports[1].contentSignature),
+      ).toBe(ownerReads[i][0]);
+      expect(
+        await download(f.executionId, 36, f.reports[35].contentSignature),
+      ).toBe(ownerReads[i][1]);
+      const total = await sharedReportTotals(
+        db.db,
+        join(dir, f.executionId),
+        f.executionId,
+      );
+      expect(total.registeredSqlMembers).toBe(36);
+      expect(total.protectedResultBytesReleased).toBeGreaterThan(0);
+      anchorTotals.push(total);
+    }
+    expect(
+      [...emulator.objects.keys()]
+        .filter((k) => k.includes("/results/"))
+        .sort(),
+    ).toEqual(priorScienceKeys);
+    expect(emulator.objects.size).toBe(beforeAnchorObjects);
+    const [protectedRows] = await db.sql.unsafe(
+      "SELECT count(*)::int n FROM progressive_report_result_payloads WHERE content_hash=ANY($1::text[])",
+      [
+        originals
+          .slice(0, 2)
+          .flatMap((f) => f.reports.map((m) => m.payloadHash).filter(Boolean)),
+      ],
+    );
+    expect(protectedRows.n).toBe(0);
     await stop();
     const objects = emulator.objects.size,
       media = emulator.media.length;
@@ -218,6 +274,7 @@ it("runs the stock recurring hub storage worker and serves both archive formats 
     expect(emulator.media.length).toBe(media);
     const result = {
       counts,
+      anchorTotals,
       objects,
       peakRssBytes: Math.max(...order.map((r) => r.peakRssBytes)),
       realService: true,

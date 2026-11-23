@@ -111,7 +111,7 @@ async function snapshot(
     await db.execute(sql`SELECT e.result_attempt_id,e.remote_result_id,e.remote_result_attempt_id,e.received_at,e.sequence,e.storage_only,
       a.result_id,d.envelope,d.content_signature AS assignment, cf.attempt_token,cf.evidence_signature,
       attempt_evidence_receipt_scope_for(a.id,a.regime='urans') AS scope, r.archive_bundle_id, b.bucket,b.object_key,b.generation,b.crc32c,
-      b.stored_sha256,b.stored_byte_size,b.member_count,b.first_sequence,b.last_sequence,m.report_sha256,m.report_byte_size,
+      b.archive_format,b.stored_sha256,b.stored_byte_size,b.member_count,b.first_sequence,b.last_sequence,m.report_sha256,m.report_byte_size,
       i.inventory_signature,i.source_count,u.id AS upload_id
     FROM progressive_remote_evidence_receipts e JOIN result_attempts a ON a.id=e.result_attempt_id AND a.sim_job_id=e.sim_job_id
     JOIN results cell ON cell.id=a.result_id AND cell.airfoil_id=a.airfoil_id AND cell.simulation_preset_revision_id=a.simulation_preset_revision_id
@@ -129,7 +129,7 @@ async function snapshot(
     JOIN public.progressive_report_archive_members m ON m.bundle_id=r.archive_bundle_id AND m.source_kind='remote' AND m.member_kind='report'
       AND m.sim_job_id=e.sim_job_id AND m.sequence=e.sequence AND m.content_signature=r.content_signature
     JOIN public.progressive_report_archive_bundles b ON b.id=m.bundle_id AND b.sim_job_id=e.sim_job_id AND b.source_kind='remote'
-      AND b.verified_at IS NOT NULL AND b.mime_type='application/gzip' AND b.archive_format='jsonl' AND b.compression='gzip'
+      AND b.verified_at IS NOT NULL AND b.mime_type='application/gzip' AND b.archive_format IN ('jsonl','shared-result-v1') AND b.compression='gzip'
       AND r.sequence BETWEEN b.first_sequence AND b.last_sequence
     JOIN sync_brokered_evidence_uploads u ON u.canonical_result_id=a.result_id AND u.canonical_result_attempt_id=a.id AND u.state='bound'
       AND u.promise_id=d.promise_id AND u.solver_id=d.solver_id AND u.remote_result_id=e.remote_result_id AND u.remote_result_attempt_id=e.remote_result_attempt_id
@@ -294,12 +294,12 @@ async function snapshot(
     crc32c: String(row.crc32c),
     mimeType: "application/gzip",
     compression: "gzip",
-    archiveFormat: "jsonl",
+    archiveFormat: String(row.archive_format),
     memberCount: Number(row.member_count),
     firstSequence: Number(row.first_sequence),
     lastSequence: Number(row.last_sequence),
   };
-  assertProgressiveReportArchiveIdentity(identity);
+  assertProgressiveReportArchiveIdentity(identity, row.archive_format === "shared-result-v1" ? "shared-result-v1" : "jsonl");
   if (
     !sha.test(identity.reportSha256) ||
     !Number.isSafeInteger(identity.reportByteSize) ||

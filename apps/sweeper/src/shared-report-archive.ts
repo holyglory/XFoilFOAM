@@ -381,6 +381,10 @@ export async function writeSharedReportPage(
   store: ReportObjects,
   owner: SharedReportOwner,
   inputs: SharedReportInput[],
+  previous?: {
+    results: SharedReportManifest["results"];
+    manifest: ReportObjectPin;
+  },
 ) {
   const results: SharedReportManifest["results"] = Object.create(null);
   const members: SharedReportMember[] = [];
@@ -400,7 +404,10 @@ export async function writeSharedReportPage(
       )
         throw new Error("Invalid SQL scientific payload pin");
       const key = resultKey(store, m.resultHash);
-      let pin = await store.find(key);
+      const existing = previous?.results[m.resultHash];
+      if (previous && (!existing || existing.rawSize !== resultSize))
+        throw new Error("Preserved scientific generation changed");
+      let pin = existing?.pin ?? (await store.find(key));
       if (!pin) {
         const value = await loadResult?.();
         if (
@@ -433,7 +440,10 @@ export async function writeSharedReportPage(
   const bytes = gzipSync(plain, { level: 9 }),
     sum = sha256(bytes),
     key = manifestKey(store, owner.executionId, sum);
-  const pin = (await store.find(key)) ?? (await store.create(key, bytes));
+  const pin =
+    previous?.manifest.key === key && previous.manifest.sha256 === sum
+      ? previous.manifest
+      : ((await store.find(key)) ?? (await store.create(key, bytes)));
   if (pin.sha256 !== sum || pin.size !== bytes.length)
     throw new Error("Stored manifest differs from the submitted page");
   const verified = await readManifest(store, pin, owner.executionId);

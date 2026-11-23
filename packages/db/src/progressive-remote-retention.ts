@@ -46,19 +46,24 @@ export async function withPreparedProgressiveRemoteRetention<T>(
   reader: AttemptEvidenceArchiveReader,
   action: () => Promise<T>,
 ): Promise<T> {
-  if (
-    retentionContext.getStore()?.executionId === executionId ||
-    !(await hasAttemptEvidenceStoragePointer(db))
-  )
-    return action();
-  const rows =
-    await db.execute(sql`SELECT e.result_attempt_id,e.remote_result_id,e.remote_result_attempt_id,e.point_content_signature,
-    e.sequence,r.content_signature,a.aoa_deg,a.engine_case_slug,d.solver_id,d.promise_id
+  if(retentionContext.getStore()?.executionId===executionId)return action();
+  const attemptPointer=await hasAttemptEvidenceStoragePointer(db);
+  const [schema]=await db.execute(sql`SELECT EXISTS(SELECT FROM pg_attribute WHERE attrelid=to_regclass('progressive_remote_reports')
+    AND attname='archived_at' AND NOT attisdropped) AS reports`);
+  if(!attemptPointer&&!schema?.reports)return action();
+  const archivedAttempt=attemptPointer?sql`a.evidence_archive_id`:sql`NULL::uuid`;
+  const archivedReport=schema?.reports?sql`r.archived_at IS NOT NULL`:sql`false`;
+  const rows=await db.execute(sql`SELECT e.result_attempt_id,e.remote_result_id,e.remote_result_attempt_id,e.point_content_signature,
+    e.sequence,r.content_signature,a.aoa_deg,a.engine_case_slug,d.solver_id,d.promise_id,${archivedAttempt} AS archived_attempt
     FROM progressive_remote_evidence_receipts e JOIN result_attempts a ON a.id=e.result_attempt_id
     JOIN progressive_remote_reports r ON r.sim_job_id=e.sim_job_id AND r.sequence=e.sequence
     JOIN progressive_remote_dispatches d ON d.sim_job_id=e.sim_job_id
-    WHERE e.sim_job_id=${executionId}::uuid AND a.evidence_archive_id IS NOT NULL ORDER BY e.result_attempt_id LIMIT 2049`);
-  if (!rows.length) return action();
+    WHERE e.sim_job_id=${executionId}::uuid AND (${archivedAttempt} IS NOT NULL OR ${archivedReport}) ORDER BY e.result_attempt_id LIMIT 2049`);
+  if(!rows.length){
+    if(!schema?.reports)return action();
+    const [cold]=await db.execute(sql`SELECT 1 FROM progressive_remote_reports WHERE sim_job_id=${executionId}::uuid AND archive_bundle_id IS NOT NULL LIMIT 1`);
+    if(!cold)return action();
+  }
   if (rows.length > 2048)
     throw new Error(
       "Remote retention exceeds the bounded source-attempt inventory",
@@ -85,13 +90,11 @@ export async function withPreparedProgressiveRemoteRetention<T>(
       },
     };
     const source = await prepareProgressiveRemoteEvidence(db, delivery);
-    const receipt = await prepareProgressiveRemoteReceiptReplay(
-      db,
-      delivery,
-      reader,
-    );
-    if (!source || receipt?.resultAttemptId !== row.result_attempt_id)
-      throw new Error("Remote retention source changed during preparation");
+    if (!source) throw new Error("Remote retention source changed during preparation");
+    if(row.archived_attempt){
+      const receipt=await prepareProgressiveRemoteReceiptReplay(db,delivery,reader);
+      if(receipt?.resultAttemptId!==row.result_attempt_id)throw new Error("Remote retention attempt changed during preparation");
+    }
     prepared.deliveries.set(String(row.result_attempt_id), delivery);
     prepared.reports.set(String(row.content_signature), source.report);
   }
@@ -431,8 +434,8 @@ async function readRemoteRetention(
         pointContentSignature: String(source.point_content_signature),
       },
     };
-    if (source.archive_id) {
-      const prepared = retentionContext.getStore()?.deliveries.get(String(source.result_attempt_id));
+    const prepared = retentionContext.getStore()?.deliveries.get(String(source.result_attempt_id));
+    if (source.archive_id || prepared) {
       if (!prepared || canonicalAnalysisJson(prepared) !== canonicalAnalysisJson(delivery))
         throw new Error("Cold remote retention requires its current original delivery to be prepared before locking");
       delivery.progressiveEvidence = prepared.progressiveEvidence;
