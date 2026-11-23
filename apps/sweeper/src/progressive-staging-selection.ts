@@ -68,15 +68,13 @@ export function progressiveStagingSelectionSql(preferActive: boolean) {
   const report = (active: boolean, terminalOnly: boolean) => {
     const direction = active ? sql`DESC` : sql`ASC`;
     return sql`SELECT report.sim_job_id, report.sequence, report.created_at
-      FROM progressive_worker_reports report
+      FROM progressive_worker_staging_candidates report
       CROSS JOIN settings
       LEFT JOIN progressive_worker_staging_failures failure
         ON failure.sim_job_id = report.sim_job_id AND failure.sequence = report.sequence
       WHERE NOT settings.remote_solver_transfer_paused
         AND settings.remote_solver_auth_token <> ''
         AND settings.upstream_base_url IS NOT NULL
-        AND report.acknowledged_at IS NOT NULL
-        AND jsonb_typeof(report.report->'result') = 'object'
         AND NOT EXISTS (SELECT 1 FROM public.progressive_worker_closed_staging_copies covered
           WHERE covered.sim_job_id=report.sim_job_id AND covered.sequence=report.sequence)
         AND NOT EXISTS (SELECT 1 FROM progressive_worker_report_conflicts conflict

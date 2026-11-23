@@ -1,3 +1,5 @@
+import { cloneStagingFixtureHub, createStagingFixtureWorker } from "./worker-staging-key-hub";
+import { deliverNextProgressiveWorkerEvidence } from "../src/progressive-worker-evidence-delivery";
 import { createClient, type DB } from "@aerodb/db";
 import {
   readProgressiveReportArchiveText,
@@ -13,12 +15,20 @@ import {
   proveProgressiveReportsInline,
   setProgressiveReportNormalization,
 } from "@aerodb/db/progressive-report-payloads";
+import { acknowledgeProgressiveWorkerReport } from "@aerodb/db/progressive-worker-reports";
+import { backfillWorkerStagingKeyPage, maintainWorkerStagingKeys } from "@aerodb/db/worker-staging-key-maintenance";
+import { measureExistingWorkerReport, measureWorkerStagingWrites } from "./worker-staging-key-workload-cost";
+import { stageProgressiveWorkerEvidence } from "../src/progressive-worker-evidence";
+import { progressiveStagingSelectionSql } from "../src/progressive-staging-selection";
+import type { EngineClient } from "@aerodb/engine-client";
 import { sql } from "drizzle-orm";
 import type { SQL } from "drizzle-orm";
 import { PgDialect } from "drizzle-orm/pg-core";
 import { Storage } from "@google-cloud/storage";
 import { randomUUID } from "node:crypto";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { execFileSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import { mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Readable } from "node:stream";
@@ -411,6 +421,18 @@ describe.each<ArchiveSource>(["remote", "worker"])(
           client,
           source,
           async (fixture) => {
+            const stagingKeys = sql`SELECT sim_job_id,sequence,created_at,stopped_engine_job_id
+              FROM public.progressive_worker_staging_keys WHERE sim_job_id=${fixture.executionId}::uuid ORDER BY sequence`;
+            const sourceKeys = sql`SELECT sim_job_id,sequence,created_at,stopped_engine_job_id
+              FROM public.progressive_worker_reports WHERE sim_job_id=${fixture.executionId}::uuid
+                AND acknowledged_at IS NOT NULL AND jsonb_typeof(report->'result')='object' ORDER BY sequence`;
+            const membership = source === "worker" ? await fixture.db.execute(sourceKeys) : [];
+            const [tracking] = await fixture.db.execute(sql`SELECT EXISTS(SELECT FROM
+              public.progressive_worker_staging_key_backfill WHERE singleton) AS active`);
+            if (source === "worker") {
+              expect(membership.length).toBeGreaterThan(0);
+              expect(await fixture.db.execute(stagingKeys)).toEqual(tracking.active ? membership : []);
+            }
             const before = await archiveSnapshot(fixture);
             expect((before.results as unknown[]).length).toBe(1);
             expect((before.result_attempts as unknown[]).length).toBe(1);
@@ -447,6 +469,10 @@ describe.each<ArchiveSource>(["remote", "worker"])(
                 cloud.putFile,
               ),
             ).toBe(fixture.reports.length);
+            if (source === "worker") {
+              expect(await fixture.db.execute(sourceKeys)).toEqual(membership);
+              expect(await fixture.db.execute(stagingKeys)).toEqual(tracking.active ? membership : []);
+            }
             const after = await archiveSnapshot(fixture);
             for (const table of [
               "results",
@@ -1196,3 +1222,511 @@ it("finds a warm hub execution beyond cold jobs and restores all members across 
     { reportCount: 129, historyRepeats: 4 },
   );
 }, 120_000);
+
+it.runIf(process.env.WORKER_STAGING_KEYS_ACCEPTANCE === "1")(
+  "one registered worker workload through tracking, storage and rollback",
+  async () => {
+    vi.stubEnv("AIRFOILFOAM_DEPLOYMENT_ROLE", "remote-solver");
+    const sourceRoot = fileURLToPath(new URL("../../../", import.meta.url));
+    const evidenceDir = join(
+      sourceRoot,
+      ".codex-artifacts",
+      "worker-staging-key-workload",
+    );
+    const runId = process.env.DEVCOORDINATOR_RUN_ID;
+    if (!runId)
+      throw new Error(
+        "Run the staging-key workload through its governed graph",
+      );
+    const sourceCommit = execFileSync("git", ["rev-parse", "HEAD"], {
+      cwd: sourceRoot,
+      encoding: "utf8",
+    }).trim();
+    const sourceTree = execFileSync("git", ["rev-parse", "HEAD^{tree}"], {
+      cwd: sourceRoot,
+      encoding: "utf8",
+    }).trim();
+    const publish = async (content: Record<string, unknown>) => {
+      await mkdir(evidenceDir, { recursive: true, mode: 0o700 });
+      const temporary = join(evidenceDir, runId + ".tmp");
+      await writeFile(
+        temporary,
+        JSON.stringify(
+          { runId, sourceCommit, sourceTree, ...content },
+          null,
+          2,
+        ),
+        { mode: 0o600 },
+      );
+      await rename(temporary, join(evidenceDir, "workload-to-storage.json"));
+    };
+    await publish({ outcome: "running" });
+    const workerDatabase = await createStagingFixtureWorker();
+    const workerUrl = workerDatabase.url.toString();
+    let worker = createClient({ url: workerUrl, max: 1 });
+    let { db, sql: pg } = worker;
+    let paired: Awaited<ReturnType<typeof cloneStagingFixtureHub>> | undefined;
+    let verified: Record<string, unknown> | undefined;
+    try {
+      const [[settings], [migration]] = await Promise.all([
+        pg`SELECT instance_id::text AS instance FROM public.sync_api_settings WHERE id=1`,
+        pg`SELECT hash FROM drizzle.__drizzle_migrations WHERE created_at=1795363913049`,
+      ]);
+      const migrationBytes = await readFile(
+        new URL(
+          "../../../packages/db/migrations/0218_worker_report_staging_keys.sql",
+          import.meta.url,
+        ),
+      );
+      expect(migration?.hash).toBe(archiveSha256(migrationBytes));
+      const instance = String(settings.instance);
+      const operation = (
+        action: Parameters<typeof maintainWorkerStagingKeys>[1],
+      ) =>
+        maintainWorkerStagingKeys(pg, action, {
+          instance,
+          readersRevision: "ab".repeat(20),
+        });
+      const force = {
+        t: Array.from({ length: 400 }, (_, i) => i / 100),
+        cl: Array.from({ length: 400 }, (_, i) => 0.19 + i / 40000),
+        cd: Array.from({ length: 400 }, (_, i) => 0.012 + i / 400000),
+        cm: Array.from({ length: 400 }, (_, i) => -0.073 - i / 400000),
+      };
+      expect(await operation("status")).toMatchObject({
+        tracking_instance_id: null,
+        reads_enabled: false,
+      });
+      let workload!: ArchiveFixture;
+      await withArchiveFixture(
+        worker,
+        "worker",
+        async (fixture) => {
+          workload = { ...fixture, db };
+        },
+        {
+          normalized: false,
+          reportCount: 3,
+          historyRepeats: 9000,
+          stagingAcceptance: force,
+        },
+      );
+      await worker.sql.end();
+      paired = await cloneStagingFixtureHub(workload, workerDatabase.url);
+      worker = createClient({ url: workerUrl, max: 1 });
+      db = worker.db;
+      pg = worker.sql;
+      workload.db = db;
+      const engine = {
+        baseUrl: "http://staging-key-fixture.invalid",
+      } as EngineClient;
+      const job = workload.executionId;
+      const historical = await stageProgressiveWorkerEvidence(db, engine, job, {
+        reportSequence: 2,
+      });
+      expect(historical.kind).toBe("staged");
+      const [identity] =
+        await pg`SELECT promise.registered_solver_id::text AS solver FROM sync_sweep_promises promise
+      WHERE promise.id=${workload.promiseId}::uuid`;
+      const sourceRows =
+        () => pg`SELECT sequence::int,created_at::text,stopped_engine_job_id FROM public.progressive_worker_reports
+      WHERE sim_job_id=${job} AND acknowledged_at IS NOT NULL AND jsonb_typeof(report->'result')='object' ORDER BY sequence`;
+      const reads =
+        () => pg`SELECT sequence::int,created_at::text,stopped_engine_job_id FROM public.progressive_worker_staging_candidates
+      WHERE sim_job_id=${job} ORDER BY sequence`;
+      const keys =
+        () => pg`SELECT sequence::int,created_at::text,stopped_engine_job_id FROM public.progressive_worker_staging_keys
+      WHERE sim_job_id=${job} ORDER BY sequence`;
+      const ack = (sequence: number, solverId = identity.solver) =>
+        acknowledgeProgressiveWorkerReport(db, {
+          executionId: job,
+          solverId,
+          sequence,
+          contentSignature: workload.reports[sequence - 1]!.contentSignature,
+        });
+      expect(await keys()).toHaveLength(0);
+      expect((await reads()).map((row) => row.sequence)).toEqual([2]);
+      expect(await reads()).toEqual(await sourceRows());
+      await expect(operation("start")).rejects.toThrow(
+        /exact registered worker instance/,
+      );
+      expect(
+        (
+          await pg`SELECT count(*)::int n FROM public.progressive_worker_staging_key_backfill`
+        )[0].n,
+      ).toBe(0);
+      await pg`UPDATE sync_api_settings SET remote_solver_enabled=true WHERE id=1`;
+
+      const fixedRowCrossover = await measureExistingWorkerReport(
+        pg,
+        job,
+        2,
+        async (enabled) => {
+          if (!enabled) {
+            await operation("stop");
+            return;
+          }
+          await operation("start");
+          while (
+            !(await backfillWorkerStagingKeyPage(pg, 1, instance)).complete
+          ) {
+            /* one page */
+          }
+        },
+        () => ack(2),
+      );
+      const measurements = [
+        await measureWorkerStagingWrites(
+          pg,
+          job,
+          3,
+          workload.reports[2]!.text,
+          workload.reports[0]!.text,
+          "inactive",
+          "inline",
+        ),
+      ];
+      expect(await backfillWorkerStagingKeyPage(pg, 1, instance)).toMatchObject(
+        { visited: 1, changed: 1, complete: false },
+      );
+      await expect(operation("enable")).rejects.toThrow(
+        /bootstrap is incomplete/,
+      );
+      expect(await backfillWorkerStagingKeyPage(pg, 1, instance)).toMatchObject(
+        { visited: 0, complete: true },
+      );
+      expect(await operation("verify")).toEqual({ matched: 1 });
+      const before = await reads();
+      await operation("enable");
+      expect(await reads()).toEqual(before);
+      measurements.push(
+        await measureWorkerStagingWrites(
+          pg,
+          job,
+          3,
+          workload.reports[2]!.text,
+          workload.reports[0]!.text,
+          "tracking",
+          "inline",
+        ),
+      );
+      await setProgressiveReportNormalization(db, {
+        enabled: true,
+        readersReady: true,
+      });
+      await backfillProgressiveReportPayloads(db, {
+        table: "progressive_worker_reports",
+        apply: true,
+      });
+      const [originalAfterNormalization] =
+        await pg`SELECT result_payload_hash,public.resolve_progressive_report(to_jsonb(r.*))::text original
+      FROM public.progressive_worker_reports r WHERE sim_job_id=${job} AND sequence=3`;
+      expect(originalAfterNormalization.result_payload_hash).toMatch(
+        /^[a-f0-9]{64}$/,
+      );
+      expect(originalAfterNormalization.original).toBe(
+        workload.reports[2]!.text,
+      );
+      measurements.push(
+        await measureWorkerStagingWrites(
+          pg,
+          job,
+          3,
+          workload.reports[2]!.text,
+          workload.reports[0]!.text,
+          "tracking",
+          "normalized",
+        ),
+      );
+      await operation("disable");
+      await operation("stop");
+      measurements.push(
+        await measureWorkerStagingWrites(
+          pg,
+          job,
+          3,
+          workload.reports[2]!.text,
+          workload.reports[0]!.text,
+          "inactive",
+          "normalized",
+        ),
+      );
+      await operation("start");
+      while (!(await backfillWorkerStagingKeyPage(pg, 1, instance)).complete) {
+        /* commit one page */
+      }
+      await operation("enable");
+      if (process.env.DEVCOORDINATOR_DIAGNOSTICS_DIR)
+        await writeFile(
+          join(
+            process.env.DEVCOORDINATOR_DIAGNOSTICS_DIR,
+            "matched-reads-writes.json",
+          ),
+          JSON.stringify(measurements),
+        );
+      await expect(ack(3, randomUUID())).rejects.toThrow(/does not match/);
+      expect(await reads()).toEqual(before);
+      await ack(3);
+      const native = await sourceRows();
+      expect(native.map((k) => [k.sequence, k.stopped_engine_job_id])).toEqual([
+        [2, null],
+        [3, job],
+      ]);
+      expect(await reads()).toEqual(native);
+      const [selected] = await db.execute(
+        progressiveStagingSelectionSql(false),
+      );
+      expect(String(selected?.sim_job_id)).toBe(job);
+      expect(Number(selected.sequence)).toBe(3);
+
+      const [replayPlan] =
+        await pg`EXPLAIN (ANALYZE,BUFFERS,FORMAT JSON) UPDATE public.progressive_worker_reports
+      SET acknowledged_at=coalesce(acknowledged_at,clock_timestamp()) WHERE sim_job_id=${job} AND sequence=3`;
+      expect(
+        replayPlan["QUERY PLAN"][0].Triggers.filter(
+          (t: { "Trigger Name": string; Calls: number }) =>
+            t["Trigger Name"].startsWith("progressive_worker_staging_key") &&
+            t.Calls > 0,
+        ),
+      ).toEqual([]);
+      await ack(3);
+      await expect(pg`UPDATE public.progressive_worker_reports SET report=jsonb_set(report,'{result}','null'::jsonb)
+      WHERE sim_job_id=${job} AND sequence=3`).rejects.toThrow(/immutable/);
+      expect(await reads()).toEqual(native);
+
+      // No engine rerun. Stage the actual signed last report of this workload.
+      const staged = await stageProgressiveWorkerEvidence(db, engine, job, {
+        reportSequence: 3,
+      });
+      expect(staged.kind).toBe("staged");
+      const [bound] =
+        await pg`SELECT s.result_attempt_id::text attempt,s.point_content_signature AS point,a.aoa_deg,
+      a.regime,a.status,a.converged,a.valid_for_polar,a.cl,a.cd,a.cm,encode(sha256(convert_to(a.evidence_payload::text,'UTF8')),'hex') AS evidence_hash,a.evidence_payload->'force_history' AS history
+      FROM progressive_worker_evidence_attempts s JOIN result_attempts a ON s.result_attempt_id=a.id
+      WHERE s.sim_job_id=${job} AND s.sequence=3`;
+      expect(bound).toMatchObject({
+        status: "failed",
+        converged: false,
+        valid_for_polar: false,
+        cl: force.cl.at(-1),
+        cd: force.cd.at(-1),
+        cm: force.cm.at(-1),
+        history: force,
+      });
+      expect(
+        (
+          await pg`SELECT count(*)::int n FROM progressive_worker_hub_receipts WHERE sim_job_id=${job}`
+        )[0].n,
+      ).toBe(0);
+
+      // Status-only bytes may leave first. Both reports containing the
+      // scientific point stay inline until an independent hub actually retains it.
+      const objects = cloudFixture();
+      const temp = await mkdtemp(join(tmpdir(), "staging-key-verified-"));
+      try {
+        expect(
+          await archiveProgressiveReportBatch(
+            db,
+            "worker",
+            job,
+            objects.putFile,
+          ),
+        ).toBe(1);
+        const held =
+          await pg`SELECT sequence::int FROM public.progressive_worker_reports WHERE sim_job_id=${job}
+        AND archived_at IS NULL ORDER BY sequence`;
+        expect(held.map((r) => r.sequence)).toEqual([2, 3]);
+        const delivered = await deliverNextProgressiveWorkerEvidence(
+          db,
+          paired.send,
+        );
+        if (!delivered) {
+          const [failure] =
+            await pg`SELECT state,last_http_status,last_error FROM public.progressive_worker_delivery_failures
+          WHERE sim_job_id=${job} AND point_content_signature=${bound.point}`;
+          throw new Error(
+            "Fixture delivery has no hub receipt: " +
+              JSON.stringify({ requests: paired.requests, failure }),
+          );
+        }
+        const [receipt] =
+          await pg`SELECT sequence::int,receipt FROM progressive_worker_hub_receipts
+        WHERE sim_job_id=${job} AND point_content_signature=${bound.point}`;
+        const [hubReceipt] = await paired.hub
+          .sql`SELECT s.sequence::int,s.remote_result_attempt_id::text AS worker,
+        s.storage_only,a.id::text attempt,a.status,a.valid_for_polar,a.cl,a.cd,a.cm,encode(sha256(convert_to(a.evidence_payload::text,'UTF8')),'hex') AS evidence_hash,a.evidence_payload->'force_history' history
+        FROM progressive_remote_evidence_receipts s JOIN result_attempts a ON a.id=s.result_attempt_id
+        WHERE s.sim_job_id=${job} AND s.point_content_signature=${bound.point}`;
+        expect(hubReceipt).toMatchObject({
+          worker: bound.attempt,
+          status: "failed",
+          valid_for_polar: false,
+          cl: bound.cl,
+          cd: bound.cd,
+          cm: bound.cm,
+          history: bound.history,
+          evidence_hash: bound.evidence_hash,
+          storage_only: true,
+        });
+        expect(hubReceipt.attempt).not.toBe(bound.attempt);
+        const [published] = await paired.hub
+          .sql`SELECT status,result_attempt_id FROM public.sync_sweep_promise_points WHERE promise_id=${workload.promiseId} AND aoa_deg=0`;
+        expect(published).toEqual({
+          status: "cancelled",
+          result_attempt_id: null,
+        });
+
+        const [hubTracking] = await paired.hub
+          .sql`SELECT public.progressive_worker_staging_key_tracking_enabled() AS enabled,
+        (SELECT count(*)::int FROM public.progressive_worker_staging_key_backfill) state_rows,
+        (SELECT count(*)::int FROM public.progressive_worker_staging_keys) keys`;
+        expect(hubTracking).toEqual({ enabled: false, state_rows: 0, keys: 0 });
+        expect(receipt.receipt).toMatchObject({
+          pointContentSignature: bound.point,
+          resultAttemptId: hubReceipt.attempt,
+          remoteResultAttemptId: bound.attempt,
+          storageOnly: true,
+          sequence: hubReceipt.sequence,
+        });
+        expect(
+          paired.requests.some((r) => r.status === 200 && r.conflicts === 0),
+        ).toBe(true);
+        expect(
+          await archiveProgressiveReportBatch(
+            db,
+            "worker",
+            job,
+            objects.putFile,
+          ),
+        ).toBe(2);
+        const members = await storedMembers(workload);
+        expect(members.map((m) => m.sequence)).toEqual([1, 2, 3]);
+        for (const [key, bytes] of objects.objects)
+          await writeFile(join(temp, archiveSha256(key)), bytes);
+        objects.objects.clear();
+        installProgressiveReportArchiveReader({
+          async read(m) {
+            const bytes = await readFile(
+              join(temp, archiveSha256(m.objectKey)),
+            );
+            return readProgressiveReportArchiveText(Readable.from([bytes]), m);
+          },
+        });
+        const member = members.find((m) => m.sequence === 2)!;
+        const bytes = await readFile(
+          join(temp, archiveSha256(member.objectKey)),
+        );
+        const original = workload.reports.find((r) => r.sequence === 2)!;
+        expect(member.signature).toBe(original.contentSignature);
+        expect(member.reportSha256).toBe(archiveSha256(original.text));
+        expect(
+          await readProgressiveReportArchiveText(
+            Readable.from([bytes]),
+            member,
+          ),
+        ).toBe(original.text);
+        const restored = await readProgressiveReport(db, {
+          sourceKind: "worker",
+          executionId: job,
+          sequence: 2,
+          contentSignature: original.contentSignature,
+        });
+        expect(
+          restored.result?.polars[0]?.attempts?.[0]?.force_history,
+        ).toEqual(force);
+        const corrupt = Buffer.from(bytes);
+        corrupt[corrupt.length - 1]! ^= 1;
+        await expect(
+          readProgressiveReportArchiveText(Readable.from([corrupt]), member),
+        ).rejects.toThrow();
+        for (const m of members) {
+          const source = workload.reports.find(
+            (r) => r.sequence === m.sequence,
+          )!;
+          const raw = await readFile(join(temp, archiveSha256(m.objectKey)));
+          expect(
+            await readProgressiveReportArchiveText(Readable.from([raw]), m),
+          ).toBe(source.text);
+          expect(m.signature).toBe(source.contentSignature);
+        }
+        expect(await keys()).toEqual(native);
+        expect(await operation("verify")).toEqual({ matched: 2 });
+        await operation("retire");
+        await operation("restore");
+        await operation("disable");
+        await operation("stop");
+        expect(await reads()).toEqual(native);
+        expect(await keys()).toEqual([]);
+        expect(
+          (
+            await pg`SELECT count(*)::int n FROM public.progressive_worker_staging_key_backfill`
+          )[0].n,
+        ).toBe(0);
+        const [after] =
+          await pg`SELECT id::text,valid_for_polar,status,evidence_payload->'force_history' history
+        FROM result_attempts WHERE id=${bound.attempt}::uuid`;
+        expect(after).toEqual({
+          id: bound.attempt,
+          status: "failed",
+          valid_for_polar: false,
+          history: bound.history,
+        });
+        const afterRollback = await readProgressiveReport(db, {
+          sourceKind: "worker",
+          executionId: job,
+          sequence: 2,
+          contentSignature: original.contentSignature,
+        });
+        expect(
+          afterRollback.result?.polars[0]?.attempts?.[0]?.force_history,
+        ).toEqual(force);
+        const proof = {
+          hubTracking,
+          job,
+          sourceReport: original.contentSignature,
+          originalPGSHA256: member.reportSha256,
+          bytes: member.reportByteSize,
+          pinnedGeneration: member.generation,
+          archivedSequences: [1, 2, 3],
+          heldBeforeDelivery: [2, 3],
+          hubAttempt: hubReceipt.attempt,
+          receiptSequence: hubReceipt.sequence,
+          requests: paired.requests,
+          attempt: bound.attempt,
+          point: bound.point,
+          workerEvidenceHash: bound.evidence_hash,
+          hubEvidenceHash: hubReceipt.evidence_hash,
+          historySamples: force.t.length,
+          validForPolar: after.valid_for_polar,
+          restored: true,
+          fixedRowCrossover,
+          measurements,
+        };
+        verified = proof;
+        if (process.env.DEVCOORDINATOR_DIAGNOSTICS_DIR)
+          await writeFile(
+            join(
+              process.env.DEVCOORDINATOR_DIAGNOSTICS_DIR,
+              "workload-to-storage.json",
+            ),
+            JSON.stringify(proof, null, 2),
+          );
+      } finally {
+        await rm(temp, { recursive: true, force: true });
+      }
+    } finally {
+      try {
+        await paired?.close();
+      } finally {
+        try {
+          await worker.sql.end();
+        } finally {
+          await workerDatabase.close();
+        }
+      }
+    }
+    if (!verified) throw new Error("Missing verified workload receipt");
+    await publish({ outcome: "passed", ...verified });
+  },
+  180000,
+);

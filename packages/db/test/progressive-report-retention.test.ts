@@ -1,3 +1,4 @@
+import { fixtureStagingCandidateView } from "../test-support/staging-candidate-view";
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
@@ -680,8 +681,14 @@ it("preserves JSONB integers, null versus absent, headers and immutable guards, 
       sql`UPDATE progressive_worker_reports SET acknowledged_at=clock_timestamp() WHERE sequence=${legacy}`,
     );
     await db.execute(sql`SET LOCAL enable_seqscan=off`);
-    const metadataQuery = sql`SELECT sim_job_id,sequence FROM progressive_worker_reports
-      WHERE acknowledged_at IS NOT NULL AND jsonb_typeof(report->'result')='object'
+    // This isolated normalizer fixture models pre-cutover source reads even
+    // after a worker has retired its historic indexes. LIKE INCLUDING ALL
+    // copies only the indexes that still exist in the source database.
+    await db.execute(sql`CREATE INDEX IF NOT EXISTS retention_fixture_staging_order_idx
+      ON pg_temp.progressive_worker_reports(created_at,sim_job_id,sequence)
+      WHERE acknowledged_at IS NOT NULL AND jsonb_typeof(report->'result')='object'`);
+    await db.execute(fixtureStagingCandidateView);
+    const metadataQuery = sql`SELECT sim_job_id,sequence FROM progressive_worker_staging_candidates
       ORDER BY created_at,sim_job_id,sequence LIMIT 1`;
     const metadataBefore = await db.execute(metadataQuery);
     const planBefore = await db.execute(
