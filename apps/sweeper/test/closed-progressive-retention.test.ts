@@ -425,6 +425,16 @@ it("runs the default sweeper past eight held jobs, restores every member, and re
     for(const id of [scratch,historical,referenced])await utimes(join(jobs,id),new Date(0),new Date(0));
     const science=async()=>connection.db.execute(sql`SELECT id,result_id,status,valid_for_polar,cl,cd,cm,evidence_payload::text AS original FROM result_attempts WHERE sim_job_id=${good}::uuid`);
     const initial=await science();
+    const savedPython=process.env.AIRFOILFOAM_RETENTION_PYTHON;
+    process.env.AIRFOILFOAM_RETENTION_PYTHON=join(volume,"uninstalled-verifier");
+    try {
+      resetRetentionMemory();await tick(0,8);
+      expect(existsSync(join(jobs,scratch,"status.json"))).toBe(true);
+      expect((await connection.db.execute(sql`SELECT closed_progressive_retention_after_id AS cursor FROM sweeper_state WHERE id=1`))[0]!.cursor).toBeNull();
+      expect(engine.deleteJob).not.toHaveBeenCalled();expect(engine.stripJob).not.toHaveBeenCalled();
+    } finally {
+      if(savedPython===undefined)delete process.env.AIRFOILFOAM_RETENTION_PYTHON;else process.env.AIRFOILFOAM_RETENTION_PYTHON=savedPython;
+    }
     resetRetentionMemory();await tick(0,8);
     expect((await connection.db.execute(sql`SELECT closed_progressive_retention_after_id AS cursor FROM sweeper_state WHERE id=1`))[0]!.cursor).toBe(owned(8));
     expect([...original.values()].every(x=>x.hits===0)).toBe(true);
@@ -457,6 +467,17 @@ it("runs the default sweeper past eight held jobs, restores every member, and re
     expect(await readFile(join(jobs,good,"cases/foil/transient_a0/0.5/U"),"utf8")).toBe("unarchived original field");
     expect(await readFile(join(jobs,good,"cases/foil/transient_a0/1/p"),"utf8")).toBe("latest pressure");
     expect([...original.values()].map(x=>x.hits)).toEqual([0,1,3,1,0]);
+    // A future closed execution can sort before the current durable cursor.
+    const future=owned(0), remote=generate(future,"good") as ProgressiveEvidenceCustodyReceipt["remote"];
+    const [late]=await fixture(connection.db,future,1,{remote,base:upstream});
+    assignments.set(future,late!.assignment!.contentSignature);generate(future,"bind",late!.signed);
+    await connection.db.execute(sql`UPDATE result_attempts SET regime='urans',status='failed',valid_for_polar=false WHERE id=${late!.attempt}`);
+    original.set(late!.upload,{path:join(volume,future+".tar.zst"),remote,hits:0,failPost:false});
+    await tick(6,1);await tick(7,1);await tick(8,1);
+    expect(original.get(late!.upload)?.hits).toBe(2);
+    expect(existsSync(sourceFile(future))).toBe(false);
+    expect((await connection.db.execute(sql`SELECT stripped_at,strip_report->'closedProgressiveFiles' AS receipt FROM sim_jobs WHERE id=${future}`))[0])
+      .toMatchObject({stripped_at:null,receipt:{complete:true,automaticVerification:{state:"verified"}}});
     expect(engine.deleteJob).not.toHaveBeenCalled();expect(engine.stripJob).not.toHaveBeenCalled();
     expect(captureErrors.mock.calls.flat().map(String).filter(v=>v.includes("Failed query")||v.includes("strip reaper failed"))).toEqual([]);
   } finally {

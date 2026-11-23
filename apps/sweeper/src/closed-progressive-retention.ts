@@ -107,6 +107,7 @@ export interface ClosedProgressiveBackend {
     manifests: ClosedProgressiveManifest[],
     expectedPlan?: string,
     readbacks?: ClosedProgressiveReadback[],
+    signal?: AbortSignal,
   ): Promise<ClosedProgressiveReclaimResponse>;
 }
 
@@ -1154,7 +1155,7 @@ export async function closedProgressiveJob(
   const restoreSignal = options.signal ?? AbortSignal.timeout(20 * 60_000);
   const ordinaryAssignment = options.automatic ? await assertOrdinaryRegisteredCustody(db,id,restoreSignal) : undefined;
   const manifests = source.archives.map((a) => a.manifest);
-  const plan = await engine.reclaimClosedProgressiveFiles(id, manifests);
+  const plan = await engine.reclaimClosedProgressiveFiles(id, manifests, undefined, undefined, options.signal);
   checkReceipt(plan, id, "planned");
   const keptImages = manifests.some(m => m.keepMedia !== undefined);
   if (options.automatic) {
@@ -1419,6 +1420,7 @@ export async function closedProgressiveJob(
         manifests,
         plan.plan!,
         readbacks,
+        options.signal,
       );
       checkReceipt(done, id, "reclaimed");
       if (options.preserveSolver && canonicalAnalysisJson(done.preservedSolver) !== canonicalAnalysisJson(plan.preservedSolver))
@@ -1494,19 +1496,19 @@ type AppliedFileReceipt = {
   automaticVerification?: AutomaticVerification;
 };
 
-async function reserveClosedOwner(db: DB, now: Date, ageMs: number, scanLimit: number, timeoutMs: number, automatic: boolean) {
+async function loadClosedOwnerPage(db: DB, now: Date, ageMs: number, timeoutMs: number, automatic: boolean) {
   return db.transaction(async (tx) => {
     await tx.execute(sql`SELECT set_config('statement_timeout',${String(timeoutMs)},true)`);
     const [cursor] = await tx.execute(sql`SELECT closed_progressive_retention_after_id AS after
-      FROM sweeper_state WHERE id=1 FOR UPDATE SKIP LOCKED`);
-    if (!cursor) return { owner: undefined, inspected: 0 };
+      FROM sweeper_state WHERE id=1`);
+    if (!cursor) return null;
     const after = cursor.after ? String(cursor.after) : null;
     // The point reclaim primary key starts with sim_job_id. Distinct keys bound every
     // subsequent job, media and receipt lookup; an excluded page still advances.
     const owners = await tx.execute(sql`WITH page AS MATERIALIZED (
       SELECT DISTINCT sim_job_id AS id FROM progressive_worker_archive_reclaims
       WHERE completed_at IS NOT NULL ${after ? sql`AND sim_job_id>${after}::uuid` : sql``}
-      ORDER BY sim_job_id LIMIT ${scanLimit}
+      ORDER BY sim_job_id LIMIT ${PAGE_SIZE}
     ) SELECT page.id,j.strip_report->'closedProgressiveFiles' AS receipt,
       (j.status IN ('done','failed','cancelled') AND j.stripped_at IS NULL AND j.engine_job_id=j.id::text
        AND j.request_payload?'remoteProgressiveExecution'
@@ -1517,23 +1519,17 @@ async function reserveClosedOwner(db: DB, now: Date, ageMs: number, scanLimit: n
        AND coalesce((j.strip_report#>>'{closedProgressiveScan,retryAfter}')::timestamptz,'-infinity')<=clock_timestamp()
        ${automatic ? sql`` : sql`AND (${eligible(now,ageMs)})`}) AS ready
     FROM page LEFT JOIN sim_jobs j USING(id) ORDER BY page.id`);
-    let owner: { id: string; receipt: AppliedFileReceipt | null } | undefined;
-    let inspected = 0;
-    let next: string | null = null;
-    for (const row of owners) {
-      next = String(row.id);
-      inspected++;
-      if (row.ready === true) {
-        owner = { id: next, receipt: row.receipt as AppliedFileReceipt | null };
-        break;
-      }
-    }
-    // Wrap only after an empty tail. Persist progress even if every owner was held,
-    // a later cloud read fails, or another sweeper starts before the next tick.
-    if (next !== after)
-      await tx.execute(sql`UPDATE sweeper_state SET closed_progressive_retention_after_id=${next}::uuid WHERE id=1`);
-    return { owner, inspected };
+    return { after, owners };
   });
+}
+
+async function advanceClosedCursor(db: DB, after: string | null, next: string | null) {
+  const changed = await db.execute(sql`WITH current AS (
+    SELECT id FROM sweeper_state WHERE id=1 AND closed_progressive_retention_after_id IS NOT DISTINCT FROM ${after}::uuid
+    FOR UPDATE SKIP LOCKED
+  ) UPDATE sweeper_state s SET closed_progressive_retention_after_id=${next}::uuid FROM current
+    WHERE s.id=current.id RETURNING s.id`);
+  return changed.length === 1;
 }
 
 async function confirmAutomaticFiles(db: DB, engine: ClosedProgressiveBackend, id: string, saved: AppliedFileReceipt,
@@ -1588,13 +1584,25 @@ export async function stripClosedProgressiveJobs(
   const deadline = AbortSignal.timeout(20 * 60_000);
   const signal = stop ? AbortSignal.any([deadline, stop]) : deadline;
   const automatic = typeof engine.restoreArchive === "function";
-  let completed = 0, inspected = 0, attempted = 0;
-  while (inspected < PAGE_SIZE && attempted < limit && !signal.aborted) {
-    const page = await reserveClosedOwner(db,now,ageMs,PAGE_SIZE-inspected,timeoutMs,automatic);
-    inspected += page.inspected;
-    if (!page.owner) break;
-    const { id, receipt } = page.owner;
+  const page = await loadClosedOwnerPage(db,now,ageMs,timeoutMs,automatic);
+  if (!page) return 0;
+  let { after } = page;
+  if (!page.owners.length) {
+    if (after !== null) await advanceClosedCursor(db,after,null);
+    return 0;
+  }
+  let completed = 0, attempted = 0, lastInspected = after;
+  for (const row of page.owners) {
+    if (attempted >= limit || signal.aborted) break;
+    const id = String(row.id);
+    lastInspected = id;
+    if (row.ready !== true) continue;
+    // Persist only the prefix actually reached. A process restart or a competing
+    // sweeper cannot discard the unvisited suffix of this page.
+    if (!await advanceClosedCursor(db,after,id)) return completed;
+    after = id;
     attempted++;
+    const receipt = row.receipt as AppliedFileReceipt | null;
     try {
       if (receipt?.automaticVerification?.state === "awaiting-readback") {
         if (automatic && await confirmAutomaticFiles(db,engine,id,receipt,now,ageMs,timeoutMs,signal)) completed++;
@@ -1616,5 +1624,6 @@ export async function stripClosedProgressiveJobs(
       else await record(db,id,false,reason);
     }
   }
+  if (lastInspected !== after) await advanceClosedCursor(db,after,lastInspected);
   return completed;
 }
