@@ -217,28 +217,47 @@ export async function verifyProgressivePublicationBatch(
     sequence: 3,
     status: original.updates[1].status,
   });
-  await observe(4);
-  await observe(5);
+  const thinHead = await observe(4);
+  const thinNext = await observe(5);
   status.solver_budget_progress!.observed_at = new Date(
     Date.parse(now) + 1000,
   ).toISOString();
   expect(await observe(5)).toMatchObject({ sequence: 5, replayed: true });
-  for (const seq of [4, 5]) {
-    expect(await publishProgressiveWorkerReport(db, job, relay)).toMatchObject({
-      sequence: seq,
-    });
-    expect((await wireReport(seq)).result).toBeNull();
-  }
+  // A changed numerical sample is already queued behind both live headers.
+  result.polars[0]!.points[0]!.force_history!.cl[1] = 0.211;
+  await observe(6);
+  const previousBatchPeer: typeof fetch = async (url, init) => {
+    if (JSON.parse(String(init?.body)).updates)
+      return Response.json({ error: "Repeated report results require an unstopped running source" }, { status: 409 });
+    return lost(url, init);
+  };
+  await expect(publishProgressiveWorkerReport(db, job, previousBatchPeer)).rejects.toThrow("response lost");
+  expect((await wireReport(4)).result).toBeNull();
+  expect(await wireReport(5)).toBeUndefined();
+  await expect(publishProgressiveWorkerReport(db, job, lost)).rejects.toThrow("response lost");
+  const thinRequest = bodies.at(-1)!;
+  expect(thinRequest.report.result).toBeNull();
+  expect(thinRequest.report.sequence).toBe(thinHead.sequence);
+  expect(thinRequest.updates.map((update: { contentSignature: string }) => update.contentSignature))
+    .toEqual([thinNext.contentSignature]);
+  const forged = structuredClone(thinRequest);
+  forged.updates[0].contentSignature = sigs[2]!.contentSignature;
+  expect((await post(forged)).statusCode).toBe(409);
+  expect(await publishProgressiveWorkerReport(db, job, relay)).toMatchObject({ sequence: 5 });
+  expect(await wireReport(5)).toEqual({
+    ...thinRequest.report, sequence: 5, status: thinRequest.updates[0].status,
+  });
+  expect(await wireReport(6)).toBeUndefined();
   const [prior] =
     await db.execute(sql`SELECT count(*)::int n FROM progressive_remote_report_sources
     WHERE sim_job_id=${job}::uuid AND sequence=3`);
-  const [light] =
-    await db.execute(sql`SELECT source_count FROM progressive_remote_report_inventories
-    WHERE sim_job_id=${job}::uuid AND sequence=5`);
+  const light = await db.execute(sql`SELECT i.report_content_signature,i.source_count,r.result_payload_hash
+    FROM progressive_remote_report_inventories i JOIN progressive_remote_reports r USING(sim_job_id,sequence)
+    WHERE i.sim_job_id=${job}::uuid AND i.sequence IN (4,5) ORDER BY i.sequence`);
   expect(prior!.n).toBe(1);
-  expect(light!.source_count).toBe(0);
-  result.polars[0]!.points[0]!.force_history!.cl[1] = 0.211;
-  await observe(6);
+  expect([...light]).toEqual([thinHead, thinNext].map(row => ({
+    report_content_signature: row.contentSignature, source_count: 0, result_payload_hash: null,
+  })));
   await observe(7);
   const legacy: typeof fetch = async (url, init) =>
     JSON.parse(String(init?.body)).updates

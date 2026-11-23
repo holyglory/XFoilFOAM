@@ -27,6 +27,11 @@ export function sameLiveProgressStatus(
   return isDeepStrictEqual(a, b);
 }
 
+export function canRepeatLiveReport(report: ProgressiveRemoteReport): boolean {
+  return report.status.state === "running" && report.stopProof === null &&
+    (report.result === null || report.result?.state === "running");
+}
+
 /**
  * Each follower is the original v1 envelope with only sequence and live status
  * changed. Hash the canonical bytes through the unchanged result once. SHA-256
@@ -35,11 +40,7 @@ export function sameLiveProgressStatus(
 export function progressiveRepeatedReportSigner(
   anchor: ProgressiveRemoteReport,
 ) {
-  if (
-    anchor.status.state !== "running" ||
-    anchor.result?.state !== "running" ||
-    anchor.stopProof !== null
-  )
+  if (!canRepeatLiveReport(anchor))
     throw new Error(
       "Repeated report results require an unstopped running source",
     );
