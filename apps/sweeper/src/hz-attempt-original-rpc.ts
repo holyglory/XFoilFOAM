@@ -1,3 +1,4 @@
+import { hzAttemptRpcFailure } from "./hz-attempt-transfer-fence";
 import { pathToFileURL } from "node:url";
 import { sql } from "drizzle-orm";
 import { createClient, type DB } from "@aerodb/db/client";
@@ -111,37 +112,12 @@ export async function serveOriginals() {
         else result = await originalHubRequest(ro.db, r);
         await wire.send({ id: r.id, result });
       } catch (e) {
-        const code =
-          (e as { cause?: { code?: string } })?.cause?.code ??
-          (e as { code?: string })?.code;
-        const retry =
-          (e instanceof HistoryOperationError && e.retryable) ||
-          [
-            "55P03",
-            "40001",
-            "40P01",
-            "08003",
-            "08006",
-            "57P01",
-            "57P02",
-            "57P03",
-          ].includes(code ?? "");
-        await wire.send({
-          id: r.id,
-          error: {
-            operation:
-              "original_" +
-              String(r.operation)
-                .replace(/[^a-z]/g, "")
-                .slice(0, 18),
-            category: retry
-              ? "transport"
-              : e instanceof HistoryOperationError && e.category === "denied"
-                ? "denied"
-                : "integrity",
-            retryable: retry,
-          },
-        });
+        const operation =
+          "original_" +
+          String(r.operation)
+            .replace(/[^a-z]/g, "")
+            .slice(0, 18);
+        await wire.send({ id: r.id, error: hzAttemptRpcFailure(operation, e) });
       }
       // Controller takes the shared deployment lock only for this write page.
       if (reg) return;

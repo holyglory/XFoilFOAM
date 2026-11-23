@@ -1,3 +1,7 @@
+import {
+  LEGACY_HZ_FENCE_PROBE,
+  hzFenceProgram,
+} from "./hz-attempt-fence-probe";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { once } from "node:events";
 import { randomUUID } from "node:crypto";
@@ -60,14 +64,24 @@ export class HistorySshEndpoint {
   private wire: HistoryMessages;
   private stderr = "";
   private ended: Promise<unknown>;
-  constructor(host: string, container: string, entry: string, write = false) {
+  constructor(
+    host: string,
+    container: string,
+    entry: string | typeof LEGACY_HZ_FENCE_PROBE,
+    write = false,
+  ) {
     if (
       !HOST.test(host) ||
       !CONTAINER.test(container) ||
-      !/^\/(?:[A-Za-z0-9_.-]+\/)*[A-Za-z0-9_.-]+\.ts$/.test(entry)
+      (entry === LEGACY_HZ_FENCE_PROBE
+        ? write
+        : !/^\/(?:[A-Za-z0-9_.-]+\/)*[A-Za-z0-9_.-]+\.ts$/.test(entry))
     )
       throw new HistoryOperationError("ssh_target", "input");
-    const command = `docker exec -i ${container} node --import tsx ${entry}`;
+    const command =
+      entry === LEGACY_HZ_FENCE_PROBE
+        ? `docker exec -i ${container} node --import tsx --input-type=module -e '${hzFenceProgram.replaceAll("'", "'\\''")}'`
+        : `docker exec -i ${container} node --import tsx ${entry}`;
     this.child = spawn(
       "ssh",
       [
@@ -112,7 +126,13 @@ export class HistorySshEndpoint {
         if (
           category === "transport" &&
           response.error.retryable === true &&
-          /^worker_(hello|status|scan|prepare|apply)_(lock_timeout|serialization|deadlock)$/.test(
+          operation === "worker_transfer_paused"
+        )
+          throw new HistoryOperationError(operation, "transfer_paused", true);
+        if (
+          category === "transport" &&
+          response.error.retryable === true &&
+          /^(worker_(hello|status|scan|prepare|apply)|attempt_(bound|page|pending|prepare|stage|replay|commit|confirm|restore|science|catalog)|original_(bound|inventory|prepare|register))_(lock_timeout|serialization|deadlock)$/.test(
             operation,
           )
         )
@@ -136,11 +156,12 @@ export class HistorySshEndpoint {
         error.category !== "transport"
       )
         throw error;
-      if (this.child.stdout.readableEnded && this.child.exitCode === null)
-        await Promise.race([
-          this.ended,
-          new Promise<void>((resolve) => setTimeout(resolve, 50)),
-        ]);
+      // EPIPE on the first write can precede stdout EOF, the exit status
+      // and stderr. Allow the child close event to deliver its sanitized cause.
+      await Promise.race([
+        this.ended,
+        new Promise<void>((resolve) => setTimeout(resolve, 250)),
+      ]);
       if (this.child.exitCode === 75)
         throw new HistoryOperationError("deploy_lock", "deployment_busy", true);
       if (
@@ -149,6 +170,13 @@ export class HistorySshEndpoint {
         )
       )
         throw new HistoryOperationError("ssh", "denied");
+      if (
+        this.child.exitCode === 1 &&
+        /(?:container [a-z0-9_.-]{1,128} is (?:not running|restarting)|cannot exec in a stopped container)/i.test(
+          this.stderr,
+        )
+      )
+        throw new HistoryOperationError("container_restart", "transport", true);
       if (
         this.child.exitCode !== null &&
         this.child.exitCode !== 255 &&

@@ -7,6 +7,10 @@ hub='/app/apps/sweeper/src/hz-point-history-hub.ts'
 worker='/app/apps/sweeper/src/hz-point-history-custody-cli.ts'
 api='/app/apps/api/src/hz-point-history-verify-cli.ts'
 cd "$HISTORY_TEST_REPO"
+if [[ -f "$HISTORY_TEST_STATE/recreating" ]]; then
+  echo "Error response from daemon: Container fixture-worker is restarting" >&2
+  exit 1
+fi
 case "$host $remote" in
   "fixture-hub docker exec -i hub-worker node --import tsx $hub")
     export AIRFOILFOAM_DEPLOYMENT_ROLE=hub AIRFOILFOAM_EVIDENCE_BUCKET=fixture-bucket

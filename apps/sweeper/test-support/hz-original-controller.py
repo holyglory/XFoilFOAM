@@ -22,10 +22,13 @@ with TemporaryDirectory() as tmp:
     src.write_text("".join(json.dumps(dict(attemptId=r["id"],sourceSha256=r["sha"],sourceByteSize=r["bytes"]))+"\n" for r in entries))
     acct=root/"account";acct.write_text("expected-account")
     objects={};sql={};sent=[];failed=set()
+    fences=[]
     class Endpoints:
         def __init__(self,_):pass
         def close(self):pass
         def send(self,operation,**params):
+            if fences and operation==fences[0]:
+                fences.pop(0);raise operator.RelayError("transfer_paused",True)
             if operation=="bound":return dict(high=max(ids),instance=instance,solver=solver)
             if operation=="inventory":
                 return [x for x in entries if x["id"] in params["selection"]["ids"]]
@@ -60,7 +63,9 @@ with TemporaryDirectory() as tmp:
     except operator.RelayError:pass
     else:raise AssertionError("wanted lost confirmation")
     r=run("status");assert any(x["state"]=="uploaded" and x["attempts"]==1 for x in r["rows"])
+    fences.extend(["bound","register"])
     run("backup",*scope,*apply,"--until-complete")
+    assert not fences
     assert sent==[ids[1],ids[2],ids[0]] and len(sql)==3
     entries[3]["settled"]=True
     r=run("backup",*scope,*apply,"--retry-deferred","--until-complete")

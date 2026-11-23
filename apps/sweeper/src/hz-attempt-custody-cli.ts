@@ -1,3 +1,8 @@
+import {
+  checkHzTransferFence,
+  withActiveHzTransfer,
+  hzAttemptRpcFailure,
+} from "./hz-attempt-transfer-fence";
 import { pathToFileURL } from "node:url";
 import { sql } from "drizzle-orm";
 import { createClient, type DB } from "@aerodb/db/client";
@@ -10,7 +15,6 @@ import {
   attemptPage,
   commitHzAttempt,
   confirmHzAttempt,
-  enableHzCustody,
   exactId,
   verifyHzOutboxReplay,
   hzScience,
@@ -24,10 +28,19 @@ import { HzAttemptHubStore } from "./hz-attempt-hub";
 export async function attemptWorkerOperation(db: DB, r: Record<string, any>) {
   if (process.env.AIRFOILFOAM_DEPLOYMENT_ROLE !== "remote-solver")
     throw Error("Unexpected worker role");
+  const owner = r.owner && {
+    instance: exactId(r.owner.instance),
+    solver: exactId(r.owner.solver),
+  };
+  if (
+    r.requireTransfers === true &&
+    ["pending", "prepare", "page", "stage"].includes(r.operation)
+  )
+    await checkHzTransferFence(db, owner);
   switch (r.operation) {
     case "bound": {
       const [row] =
-        await db.execute(sql`SELECT s.instance_id::text AS instance,s.remote_solver_registered_id::text AS solver,
+        await db.execute(sql`SELECT s.instance_id::text AS instance,s.remote_solver_registered_id::text AS solver,1 AS transfer_fence_protocol,
     to_regprocedure('attempt_evidence_hz_retained_limiter(uuid,uuid)') IS NOT NULL AS retained_contract,
     (SELECT a.id::text FROM result_attempts a ORDER BY a.id DESC LIMIT 1) AS high FROM sync_api_settings s
     WHERE s.id=1 AND s.remote_solver_registered_id IS NOT NULL AND s.upstream_base_url IS NOT NULL AND to_regprocedure('attempt_evidence_hz_limiter(uuid,uuid)') IS NOT NULL`);
@@ -64,8 +77,9 @@ export async function attemptWorkerOperation(db: DB, r: Record<string, any>) {
         db,
         { ...r.identity, verifiedAt: new Date(r.identity.verifiedAt) },
         packedBytes(r.packed),
+        owner,
+        r.enable === true ? { retained: r.retained === true } : undefined,
       );
-      if (r.enable === true) await enableHzCustody(db, r.retained === true);
       return { id: ar.id, attemptId: ar.attemptId };
     }
     case "replay":
@@ -74,11 +88,13 @@ export async function attemptWorkerOperation(db: DB, r: Record<string, any>) {
       return hzScience(db, exactId(r.attemptId), exactId(r.archiveId));
     case "commit":
       try {
-        return await commitHzAttempt(
-          db,
-          exactId(r.attemptId),
-          exactId(r.archiveId),
-          r.proof,
+        return await withActiveHzTransfer(db, owner, (tx) =>
+          commitHzAttempt(
+            tx,
+            exactId(r.attemptId),
+            exactId(r.archiveId),
+            r.proof,
+          ),
         );
       } catch (e) {
         if (
@@ -94,6 +110,7 @@ export async function attemptWorkerOperation(db: DB, r: Record<string, any>) {
         exactId(r.attemptId),
         exactId(r.eventId),
         r.app,
+        owner,
       );
       return { confirmed: true };
     case "restore":
@@ -156,35 +173,12 @@ export async function attemptRpc(
   try {
     await wire.send({ id: r.id, result: await handler(r) });
   } catch (e) {
-    const sqlState =
-      (e as { cause?: { code?: string } })?.cause?.code ??
-      (e as { code?: string })?.code;
-    const transient =
-      (e instanceof HistoryOperationError && e.retryable) ||
-      [
-        "55P03",
-        "40001",
-        "40P01",
-        "08003",
-        "08006",
-        "57P01",
-        "57P02",
-        "57P03",
-      ].includes(sqlState ?? "");
-    const denied =
-      e instanceof HistoryOperationError && e.category === "denied";
-    await wire.send({
-      id: r.id,
-      error: {
-        operation:
-          "attempt_" +
-          String(r.operation)
-            .replace(/[^a-z_]/g, "")
-            .slice(0, 20),
-        category: transient ? "transport" : denied ? "denied" : "integrity",
-        retryable: transient,
-      },
-    });
+    const operation =
+      "attempt_" +
+      String(r.operation)
+        .replace(/[^a-z_]/g, "")
+        .slice(0, 20);
+    await wire.send({ id: r.id, error: hzAttemptRpcFailure(operation, e) });
   } finally {
     wire.close();
   }

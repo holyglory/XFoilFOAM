@@ -132,6 +132,30 @@ export async function verifyOriginalCopyJourney(
       budget,
     ),
   ).rejects.toThrow(/Foreign/);
+  await db.execute(
+    sql`UPDATE sync_api_settings SET remote_solver_transfer_paused=true WHERE id=1`,
+  );
+  try {
+    await expect(
+      registerOriginalPage(relay, binding, upload.uploads, budget),
+    ).rejects.toMatchObject({
+      category: "transfer_paused",
+      operation: "worker_transfer_paused",
+      retryable: true,
+    });
+    expect(
+      await db.execute(
+        sql`SELECT id FROM attempt_evidence_archives WHERE result_attempt_id=${id}::uuid`,
+      ),
+    ).toHaveLength(0);
+    expect((await loadSettledAttemptEvidenceCopy(db, id)).payloadText).toBe(
+      original.payloadText,
+    );
+  } finally {
+    await db.execute(
+      sql`UPDATE sync_api_settings SET remote_solver_transfer_paused=false WHERE id=1`,
+    );
+  }
   const receipt = await registerOriginalPage(
     relay,
     binding,
@@ -139,6 +163,7 @@ export async function verifyOriginalCopyJourney(
     budget,
   );
   expect(receipt[0]?.created).toBe(true);
+  expect(receipt[0]?.generation).toBe(upload.uploads[0]?.identity.generation);
   const replay = await registerOriginalPage(
     relay,
     binding,

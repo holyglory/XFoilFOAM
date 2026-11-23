@@ -253,6 +253,25 @@ it("runs the real operator commands over fixture SSH, resumes a rejected API rea
   const baseline = await readFile(join(progress, "checkpoint.json"), "utf8");
   const saved = JSON.parse(baseline);
   const receipt = await readFile(join(progress, saved.pending), "utf8");
+  const recreating = join(fixtureRoot, "recreating");
+  await writeFile(recreating, "container undergoing restart");
+  try {
+    const failure = await cli("pass", "--readers-ready", "--apply").then(
+      () => null,
+      (e: { stderr: string }) => JSON.parse(e.stderr.trim()),
+    );
+    expect(failure).toMatchObject({
+      operation: "container_restart",
+      category: "transport",
+      retryable: true,
+    });
+    expect(await readFile(join(progress, "checkpoint.json"), "utf8")).toBe(
+      baseline,
+    );
+    expect(await readFile(join(progress, saved.pending), "utf8")).toBe(receipt);
+  } finally {
+    await rm(recreating);
+  }
   const blocker = createClient({ max: 1 });
   try {
     await blocker.sql.begin(async (held) => {

@@ -1,3 +1,5 @@
+import { checkLegacyHzFence } from "./hz-attempt-controller-fence";
+import type { HzWorkerOwner } from "./hz-attempt-transfer-fence";
 import { runOriginalCycle } from "./hz-attempt-original-cycle";
 import { parseArgs } from "node:util";
 import { pathToFileURL } from "node:url";
@@ -18,6 +20,7 @@ export async function hzAttemptStorage(
     report?: (value: unknown) => void;
     signal?: AbortSignal;
     originalCycle?: typeof runOriginalCycle;
+    checkLegacyFence?: typeof checkLegacyHzFence;
   } = {},
 ) {
   const report = io.report ?? ((value) => console.log(JSON.stringify(value)));
@@ -130,17 +133,65 @@ export async function hzAttemptStorage(
       } catch (e) {
         if (!(continuous && e instanceof HistoryOperationError && e.retryable))
           throw e;
+        if (wait === 1000)
+          report({
+            waiting: true,
+            operation: e.operation,
+            category: e.category,
+            retryable: true,
+          });
         await delay(wait, undefined, { signal: control.signal });
         wait = Math.min(30000, wait * 2);
       }
     }
   }
-  const relay: AttemptRelay = v["include-retained"]
-    ? {
-        ...transport,
-        worker: (r, write) => transport.worker({ ...r, retained: true }, write),
+  let owner: HzWorkerOwner | undefined;
+  let nativeFence = false;
+  const checkLegacy = () =>
+    (io.checkLegacyFence ?? checkLegacyHzFence)(
+      v["hz-host"],
+      v["hz-sweeper"],
+      owner!,
+    );
+  const relay: AttemptRelay = {
+    ...transport,
+    async worker(r, lock) {
+      const requireTransfers = write && mode !== "restore" && !!owner;
+      if (
+        requireTransfers &&
+        !nativeFence &&
+        ["pending", "page", "prepare", "commit"].includes(String(r.operation))
+      )
+        await checkLegacy();
+      try {
+        const result = await transport.worker(
+          {
+            ...r,
+            ...(v["include-retained"] ? { retained: true } : {}),
+            ...(requireTransfers ? { requireTransfers: true, owner } : {}),
+          },
+          lock,
+        );
+        if (r.operation === "bound")
+          nativeFence = result.transfer_fence_protocol === 1;
+        return result;
+      } catch (error) {
+        // Old workers hid the transfer flag in the replay owner predicate. A
+        // positive current pause delays this exact member. A permission or
+        // integrity failure with the fence open keeps its original meaning.
+        if (
+          requireTransfers &&
+          !nativeFence &&
+          r.operation === "replay" &&
+          error instanceof HistoryOperationError &&
+          error.operation === "attempt_replay" &&
+          error.category === "integrity"
+        )
+          await checkLegacy();
+        throw error;
       }
-    : transport;
+    },
+  };
   const dir = v.directory && resolve(v.directory);
   const originals = v["originals-directory"]
     ? {
@@ -158,6 +209,7 @@ export async function hzAttemptStorage(
   try {
     const bound = await retry(() => relay.worker({ operation: "bound" })),
       instance = exactId(bound.instance);
+    owner = { instance, solver: exactId(bound.solver) };
     if (v["include-retained"] && bound.retained_contract !== true)
       throw new HistoryOperationError("retained_worker_contract", "input");
     if (mode === "status") {
