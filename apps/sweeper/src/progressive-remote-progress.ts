@@ -1,3 +1,4 @@
+import { hasProgressStorageColumns, prepareProgressPage, pinsMatch, type ProgressPage } from "./progressive-repeated-progress";
 import { resolveStoredProgressiveReport } from "@aerodb/db/progressive-report-reader";
 import {
   acknowledgeProgressiveCfdExecutionStop,
@@ -49,11 +50,7 @@ export function progressiveReportBackpressureIsActive(
         (Number.isFinite(oldestTerminalAgeMs) && oldestTerminalAgeMs >= PROGRESSIVE_TERMINAL_REPORT_AGE_PRESSURE_MS)));
 }
 
-async function applyProgressiveRemoteProgressInTransaction(
-  db: DB,
-  executionId: string,
-) {
-  const connection = db;
+async function lockProgressOwner(connection: DB, executionId: string) {
     const [dispatch] =
       await connection.execute(sql`SELECT envelope, content_signature, solver_id, promise_id
       FROM progressive_remote_dispatches WHERE sim_job_id = ${executionId}::uuid`);
@@ -75,7 +72,7 @@ async function applyProgressiveRemoteProgressInTransaction(
     // in the same order as publication and settlement.
     const [campaign] = await connection.execute(sql`SELECT campaign.id FROM sim_campaigns campaign JOIN sim_jobs job ON job.campaign_id = campaign.id
       WHERE job.id = ${executionId}::uuid FOR UPDATE OF campaign`);
-    if (!campaign) return { kind: "waiting" as const };
+    if (!campaign) return null;
     const [job] = await connection.execute(
       sql`SELECT engine_job_id, status, engine_state, completed_cases, request_payload
       FROM sim_jobs WHERE id = ${executionId}::uuid FOR UPDATE`,
@@ -93,6 +90,13 @@ async function applyProgressiveRemoteProgressInTransaction(
       throw new Error(
         "Remote progress conflicts with immutable hub execution ownership",
       );
+    return {job,envelope};
+}
+
+async function applyProgressiveRemoteProgressInTransaction(connection: DB, executionId: string) {
+    const owner = await lockProgressOwner(connection, executionId);
+    if (!owner) return { kind: "waiting" as const };
+    const {job,envelope} = owner;
     let [stored] =
       await connection.execute(sql`SELECT report.sequence, report.content_signature, resolve_progressive_report(to_jsonb(report.*)) AS report,
         EXISTS (SELECT 1 FROM progressive_remote_progress_receipts receipt
@@ -123,6 +127,13 @@ async function applyProgressiveRemoteProgressInTransaction(
       throw new Error(
         "Remote progress bytes differ from their immutable receipt",
       );
+    return applyVerifiedProgress(connection, executionId, job, validated, {
+      progress_applied: stored.progress_applied === true, progress_indexed: stored.progress_indexed === true,
+    });
+}
+
+async function applyVerifiedProgress(connection: DB, executionId: string, job: Record<string, unknown>,
+  validated: ReturnType<typeof validateProgressiveRemoteReport>, stored: {progress_applied:boolean;progress_indexed:boolean}) {
     const report = validated.report;
     if (!stored.progress_indexed)
       await indexProgressiveRemoteReport(connection, {
@@ -225,12 +236,17 @@ async function applyProgressiveRemoteProgressBatch(
     idle: false,
     errors: [] as Array<{ executionId: string; reason: string }>,
   };
+  let previous: ProgressPage["anchor"] | undefined;
+  const canPrepare = reportLimit > 1 && await hasProgressStorageColumns(db);
   for (
     let reportPass = 0;
     reportPass < reportLimit;
     reportPass += PROGRESSIVE_REPORTS_PER_TRANSACTION
   ) {
     try {
+      const limit = Math.min(reportLimit - reportPass, PROGRESSIVE_REPORTS_PER_TRANSACTION);
+      const page = canPrepare ? await prepareProgressPage(db, executionId, limit, previous) : undefined;
+      previous = page?.anchor;
       const chunk = await db.transaction(async (transaction) => {
         const chunkReceipt = {
           applied: 0,
@@ -240,8 +256,21 @@ async function applyProgressiveRemoteProgressBatch(
           waiting: false,
         };
         const connection = transaction as unknown as DB;
+        if (page) {
+          const owner = await lockProgressOwner(connection, executionId);
+          if (!owner) return {...chunkReceipt, waiting:true};
+          if (await pinsMatch(connection, executionId, page, owner.envelope)) {
+            // Preserve every measured budget observation and its ordered receipt.
+            for (const verified of page.reports) {
+              await applyVerifiedProgress(connection, executionId, owner.job, verified, {
+                progress_applied:false, progress_indexed:true,
+              });
+              chunkReceipt.applied++;
+            }
+          }
+        }
         for (
-          let chunkPass = 0;
+          let chunkPass = chunkReceipt.applied;
           chunkPass < PROGRESSIVE_REPORTS_PER_TRANSACTION &&
           reportPass + chunkPass < reportLimit;
           chunkPass += 1

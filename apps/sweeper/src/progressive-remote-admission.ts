@@ -1,3 +1,4 @@
+import { progressiveAdmissionReportPressureSql } from "./progressive-progress-selection";
 import { randomUUID } from "node:crypto";
 import { sql } from "drizzle-orm";
 import {
@@ -416,18 +417,8 @@ async function prepareProgressiveRemoteFleetRun(db: DB) {
     waitingReasons: [] as Array<{ solverId: string; reason: string }>,
     errors: [] as Array<{ solverId: string; reason: string }>,
   };
-  const unappliedReports = await db.execute(sql`
-    SELECT report.sim_job_id, report.sequence
-    FROM progressive_remote_reports report
-    LEFT JOIN progressive_remote_progress_receipts receipt
-      ON receipt.sim_job_id = report.sim_job_id AND receipt.sequence = report.sequence
-    LEFT JOIN progressive_remote_report_inventories inventory
-      ON inventory.sim_job_id = report.sim_job_id AND inventory.sequence = report.sequence
-    WHERE receipt.sim_job_id IS NULL OR inventory.sim_job_id IS NULL
-    ORDER BY report.received_at, report.sim_job_id, report.sequence
-    LIMIT ${PROGRESSIVE_REPORT_BACKPRESSURE_LIMIT}
-  `);
-  if (unappliedReports.length >= PROGRESSIVE_REPORT_BACKPRESSURE_LIMIT) {
+  const [pressure] = await db.execute(progressiveAdmissionReportPressureSql(PROGRESSIVE_REPORT_BACKPRESSURE_LIMIT));
+  if (pressure?.throttled === true) {
     for (const solver of solvers) {
       receipt.waiting += 1;
       receipt.waitingReasons.push({
