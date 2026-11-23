@@ -6031,3 +6031,18 @@ command = ["bash", "scripts/dev/progressive-preview.sh", "web"]
 port = true
 depends_on = ["api"]
 health = { path = "/", timeout_seconds = 600 }
+
+[test.catalog-page-journey]
+timeout_seconds = 720
+
+[[test.catalog-page-journey.check]]
+name = "paging"
+tier = "release"
+timeout_seconds = 210
+command = ["node", "scripts/dev/verify-browse-pages.mjs"]
+retained_artifacts = [{name="catalog-page-journey",path=".codex-artifacts/catalog-page-journey",max_bytes=1048576}]
+
+[[test.catalog-page-journey.check]]
+name = "types"
+tier = "release"
+command = ["/usr/bin/corepack","pnpm","--filter","@aerodb/web","typecheck"]

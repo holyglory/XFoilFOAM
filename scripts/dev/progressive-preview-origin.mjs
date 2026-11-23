@@ -28,6 +28,7 @@ export function originFromDeployment(response) {
 
 export function progressivePreviewDeployment({
   deploymentId = process.env.PROGRESSIVE_PREVIEW_DEPLOYMENT_ID,
+  name = "progressive-preview",
   execute = execFileSync,
 } = {}) {
   const explicitId = deploymentId !== undefined && deploymentId !== null;
@@ -39,7 +40,7 @@ export function progressivePreviewDeployment({
   const root = fileURLToPath(new URL("../../", import.meta.url));
   const params = explicitId
     ? { deployment_id: deploymentId }
-    : { path: root, name: "progressive-preview" };
+    : { path: root, name };
   const response = JSON.parse(
     execute(
       "/usr/local/bin/devcoordinator2",
