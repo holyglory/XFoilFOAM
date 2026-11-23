@@ -8,7 +8,7 @@ import {
   type ProgressiveEvidenceCustodyReceipt,
 } from "@aerodb/db";
 import { canonicalRemoteHubBaseUrl } from "@aerodb/core";
-import { readRegisteredArchive } from "@aerodb/core/registered-archive-read";
+import { readRegisteredArchive, registeredArchiveAdmissionDelay } from "@aerodb/core/registered-archive-read";
 import { and, eq, sql } from "drizzle-orm";
 import { configuredControlPlaneToken } from "./config";
 import { recordProgressiveWorkerArchiveCustody } from "./progressive-worker-archive-custody";
@@ -43,6 +43,12 @@ export async function runArchiveReclaimPass(
   );
 }
 
+class ArchiveAdmissionBusy extends Error {
+  constructor(readonly retryAfterMs: number) {
+    super("Registered archive admission remains busy (HTTP 503)");
+  }
+}
+
 export async function preflightProgressiveArchive(
   url: string,
   token: string,
@@ -50,6 +56,11 @@ export async function preflightProgressiveArchive(
   signal: AbortSignal,
 ): Promise<void> {
   const response = await readRegisteredArchive(url, token, signal, "application/zstd");
+  const busy = await registeredArchiveAdmissionDelay(response);
+  if (busy !== null) {
+    await response.body?.cancel();
+    throw new ArchiveAdmissionBusy(busy);
+  }
   await verifyProgressiveArchiveResponse(response, remote);
 }
 
@@ -371,7 +382,9 @@ async function reclaimClaim(
     return 1;
   } catch (error) {
     await db.execute(sql`UPDATE progressive_worker_archive_reclaims SET claim_token=NULL,claim_expires_at=NULL,
-      retry_after=clock_timestamp()+make_interval(secs=>least(21600,30*power(2,least(attempt_count,9)))::double precision),
+      retry_after=clock_timestamp()+make_interval(secs=>${error instanceof ArchiveAdmissionBusy
+        ? sql`${Math.max(30, error.retryAfterMs / 1000)}::double precision`
+        : sql`least(21600,30*power(2,least(attempt_count,9)))::double precision`}),
       last_error=${String(error instanceof Error ? error.message : error).slice(0, 700)}
       WHERE sim_job_id=${claim.executionId}::uuid AND point_content_signature=${claim.signature}
         AND claim_token=${claim.token}::uuid AND completed_at IS NULL`);
