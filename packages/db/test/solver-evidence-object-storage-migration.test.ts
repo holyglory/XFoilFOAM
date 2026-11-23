@@ -13,10 +13,13 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import postgres from "postgres";
+import { randomUUID } from "node:crypto";
+import { setTimeout as delay } from "node:timers/promises";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 
 import { databaseUrl } from "../src/env";
 import type { DB } from "../src/client";
+import { prepareSolverEvidenceOwnerIndexes } from "../src/solver-evidence-owner-indexes";
 import {
   acquireEvidenceArtifactKeyLock,
   acquireEvidenceArtifactKeyLocks,
@@ -441,6 +444,109 @@ describe("artifact advisory lock transactions", () => {
     }
   }, 15_000);
 });
+
+it("prepares 0222 online and preserves explicit owners across cancellation, retry and migration", async () => {
+  const name = dbName + "_owners";
+  const url = new URL(targetUrl);
+  url.pathname = "/" + name;
+  const prior = makeMigrationFolder(221);
+  const current = makeMigrationFolder(222);
+  await admin!.unsafe(`CREATE DATABASE "${name}"`);
+  const db = postgres(url.toString(), { max: 5, connection: { application_name: "evidence-owner-index-test" } });
+  const job = randomUUID(), otherJob = randomUUID(), engine = randomUUID(), otherEngine = randomUUID();
+  const simIndex = "solver_evidence_artifacts_sim_job_idx", engineIndex = "solver_evidence_artifacts_engine_job_idx";
+  const owners = () => db`SELECT storage_key FROM solver_evidence_artifacts
+    WHERE sim_job_id=${job}::uuid OR engine_job_id=${engine} ORDER BY storage_key`;
+  const journal = () => db`SELECT hash,created_at FROM drizzle.__drizzle_migrations ORDER BY id`;
+  try {
+    await migrate(drizzle(db), { migrationsFolder: prior });
+    await db`INSERT INTO categories (id,slug,name,path) VALUES (${IDS.category},'owner-index','Owner index','owner-index')`;
+    await db`INSERT INTO airfoils (id,slug,name,category_id,source,points)
+      VALUES (${IDS.airfoil},'owner-index','Owner index',${IDS.category},'test-coordinates','[{"x":1,"y":0},{"x":0,"y":0},{"x":1,"y":0}]')`;
+    await db`INSERT INTO sim_jobs (id,engine_job_id,airfoil_id,bc_ids,job_kind,reference_chord_m,wave,status,total_cases,completed_cases,request_payload)
+      VALUES (${job},${engine},${IDS.airfoil},'[]','targeted',1,1,'done',0,0,'{}'),
+             (${otherJob},${otherEngine},${IDS.airfoil},'[]','targeted',1,1,'done',0,0,'{}')`;
+    await db`INSERT INTO solver_evidence_artifacts
+      (sim_job_id,engine_job_id,airfoil_id,kind,storage_key,mime_type,sha256,byte_size)
+      SELECT owner, native, ${IDS.airfoil}::uuid, 'log', key, 'text/plain', repeat('a',64), 1
+      FROM (VALUES (${job}::uuid,NULL::text,'sim'), (NULL,${engine},'native'),
+        (${job}::uuid,${engine},'both'), (${otherJob}::uuid,${engine},'other-sim'),
+        (${otherJob}::uuid,${otherEngine},'unrelated')) AS a(owner,native,key)`;
+    await db`INSERT INTO mediums (id,slug,name,phase,density,viscosity_model,
+      constant_dynamic_viscosity,dynamic_viscosity,kinematic_viscosity)
+      VALUES (${IDS.medium},'owner-index-air','Owner index air','gas',1.225,'constant',0.00001789,0.00001789,0.000014604)`;
+    await db`INSERT INTO boundary_conditions(id,slug,name,medium_id,reynolds)
+      VALUES (${IDS.bc},'owner-index-bc','Owner index BC',${IDS.medium},100000)`;
+    await db`INSERT INTO results(id,airfoil_id,bc_id,sim_job_id,engine_job_id,aoa_deg,status,source)
+      VALUES (${IDS.resultB},${IDS.airfoil},${IDS.bc},${otherJob},${otherEngine},0,'done','solved')`;
+    await db`INSERT INTO solver_evidence_artifacts
+      (result_id,sim_job_id,engine_job_id,airfoil_id,kind,storage_key,mime_type,sha256,byte_size)
+      VALUES (${IDS.resultB},${otherJob},${engine},${IDS.airfoil},'log','other-result','text/plain',repeat('b',64),1)`;
+    const baseline = await owners();
+    expect(baseline.map(r => r.storage_key)).toEqual(["both", "native", "other-result", "other-sim", "sim"]);
+    expect(await db`SELECT a.id FROM solver_evidence_artifacts a JOIN results r ON r.id=a.result_id
+      WHERE r.sim_job_id=${job} OR r.engine_job_id=${engine}`).toHaveLength(0);
+    const beforeJournal = await journal();
+    const migration = readFileSync(join(migrations,"0222_solver_evidence_artifact_owner_indexes.sql"), "utf8");
+    await expect(db.unsafe(migration)).rejects.toThrow(/Prepare populated evidence tables/);
+
+    // A same-named object with the wrong key must survive operator retries.
+    await db.unsafe(`CREATE INDEX ${simIndex} ON solver_evidence_artifacts(airfoil_id)`);
+    await expect(prepareSolverEvidenceOwnerIndexes(db)).rejects.toThrow(/differs/);
+    await expect(db.unsafe(migration)).rejects.toThrow(/Catalog identity/);
+    expect((await db`SELECT pg_get_indexdef(${simIndex}::regclass) AS def`)[0].def).toContain("(airfoil_id)");
+    await db.unsafe("DROP INDEX " + simIndex);
+
+    const writer = await db.reserve();
+    await writer.unsafe("BEGIN");
+    let build: Promise<unknown> | undefined;
+    try {
+      await writer`UPDATE solver_evidence_artifacts SET role=role WHERE storage_key='both'`;
+      build = prepareSolverEvidenceOwnerIndexes(db).catch(error => error);
+      let builder: number | undefined;
+      for (let i = 0; i < 200 && builder === undefined; i++) {
+        const [entry] = await db`SELECT p.pid FROM pg_stat_progress_create_index p JOIN pg_stat_activity a ON a.pid=p.pid
+          JOIN pg_index i ON i.indexrelid=p.index_relid WHERE p.datname=current_database()
+          AND a.application_name='evidence-owner-index-test' AND p.relid='public.solver_evidence_artifacts'::regclass
+          AND p.index_relid=to_regclass(${"public." + simIndex}) AND NOT i.indisvalid`;
+        builder = entry?.pid;
+        if (builder === undefined) await delay(25);
+      }
+      expect(builder).toBeDefined();
+      await db.begin(async tx => {
+        await tx.unsafe("SET LOCAL lock_timeout='1s'");
+        expect(await tx`UPDATE solver_evidence_artifacts SET role=role WHERE storage_key='native' RETURNING id`).toHaveLength(1);
+      });
+      expect((await db`SELECT pg_cancel_backend(${builder!}) AS cancelled`)[0].cancelled).toBe(true);
+    } finally {
+      await writer.unsafe("ROLLBACK");
+      writer.release();
+    }
+    expect(await build).toMatchObject({ code: "57014" });
+    expect((await db`SELECT indisvalid FROM pg_index WHERE indexrelid=${simIndex}::regclass`)[0].indisvalid).toBe(false);
+    expect((await prepareSolverEvidenceOwnerIndexes(db)).indexes).toEqual([
+      { name: simIndex, action: "rebuilt" }, { name: engineIndex, action: "created" },
+    ]);
+    expect((await prepareSolverEvidenceOwnerIndexes(db)).indexes.map(i => i.action)).toEqual(["existing","existing"]);
+    expect(await journal()).toEqual(beforeJournal);
+    const migrator = postgres(url.toString(), { max: 1, connection: { lock_timeout: "1s" } });
+    try {
+      await db.begin(async tx => {
+        await tx`UPDATE solver_evidence_artifacts SET role=role WHERE storage_key='native'`;
+        await migrate(drizzle(migrator), { migrationsFolder: current });
+      });
+    } finally {
+      await migrator.end();
+    }
+    expect((await journal()).length).toBe(beforeJournal.length + 1);
+    expect(await owners()).toEqual(baseline);
+  } finally {
+    await db.end();
+    await admin!.unsafe(`DROP DATABASE "${name}"`);
+    rmSync(prior, { recursive: true, force: true });
+    rmSync(current, { recursive: true, force: true });
+  }
+}, 120_000);
 
 describe("0067 solver evidence object storage migration", () => {
   it("leaves every legacy artifact row unchanged and creates no invented archive", async () => {

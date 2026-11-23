@@ -27,6 +27,22 @@ The migration is intentionally fail-closed:
 Do not replace any step with a raw `docker compose up --force-recreate`, a
 manual database insert, a bulk `rm`, or an unpinned GCS download.
 
+### Evidence artifact job-owner indexes
+
+Migration 0222 indexes the simulation job UUID and native engine job text
+independently on both deployment roles. To prepare a populated database before a
+release, run the following command in its normal database migration environment.
+
+```bash
+pnpm --filter @aerodb/db migrate --prepare-evidence-owner-indexes
+```
+
+The preparer builds one partial B-tree at a time with `CREATE INDEX CONCURRENTLY`.
+Check free space on the database and WAL volumes before starting a large build.
+PostgreSQL exposes its phase in `pg_stat_progress_create_index`. Rerunning the
+command checks both definitions and resumes an interrupted build. The normal
+migrate command uses the same preparation path and records 0222 in the journal.
+
 ## 1. Operator variables and audit directory
 
 Run production commands on the VPS as the deployment operator. Use the same

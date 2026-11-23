@@ -2005,6 +2005,12 @@ export const solverEvidenceArtifacts = pgTable(
       name: "solver_evidence_artifacts_attempt_owner_fk",
     }).onDelete("cascade"),
     resultIdx: index("solver_evidence_artifacts_result_idx").on(t.resultId),
+    simJobIdx: index("solver_evidence_artifacts_sim_job_idx")
+      .on(t.simJobId)
+      .where(sql`${t.simJobId} IS NOT NULL`),
+    engineJobIdx: index("solver_evidence_artifacts_engine_job_idx")
+      .on(t.engineJobId)
+      .where(sql`${t.engineJobId} IS NOT NULL`),
     attemptIdx: index("solver_evidence_artifacts_attempt_idx").on(
       t.resultAttemptId,
     ),

@@ -1555,6 +1555,13 @@
       "when": 1795363913052,
       "tag": "0221_registered_worker_hub_report_links",
       "breakpoints": true
+    },
+    {
+      "idx": 222,
+      "version": "7",
+      "when": 1795363913053,
+      "tag": "0222_solver_evidence_artifact_owner_indexes",
+      "breakpoints": true
     }
   ]
 }
