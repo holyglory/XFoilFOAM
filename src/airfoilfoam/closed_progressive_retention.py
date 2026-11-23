@@ -200,6 +200,12 @@ def _local_manifest(root, folder, proof, reported, readbacks, declared=None):
         _require(-5 <= age <= 1200 and readback["generation"] == proof["generation"] and
                  readback["storedSha256"] == receipt["remote"]["storedSha256"] and
                  readback["storedByteSize"] == receipt["remote"]["storedByteSize"], "fresh complete object readback differs")
+    return _checked_point_manifest(root, rel, proof, reported, declared, data,
+                                   receipt["remote"]["storedByteSize"], receipt["remote"]["storedSha256"])
+
+
+def _checked_point_manifest(root, rel, proof, reported, declared, data, stored_size, stored_sha):
+    case = PurePosixPath(*rel.parts[:2])
     manifest = json.loads(data)
     media = manifest.get("media") or {}
     _require(not any(media.get(k) for k in ("mean", "video")), "manifest declares separate media")
@@ -219,8 +225,8 @@ def _local_manifest(root, folder, proof, reported, readbacks, declared=None):
         if kind == "manifest":
             _require((name, size, sha) == ("evidence_manifest.json", len(data), proof["manifestSha256"]), "manifest identity changed")
         elif kind == "engine_bundle":
-            _require((name, size, sha) == ("engine_evidence.tar.zst", receipt["remote"]["storedByteSize"],
-                     receipt["remote"]["storedSha256"]), "bundle identity changed")
+            _require((name, size, sha) == ("engine_evidence.tar.zst", stored_size,
+                     stored_sha), "bundle identity changed")
         else:
             _require((name, size, sha) in members and not any(_relative(name).is_relative_to(d) for d in excluded),
                      "registered artifact is outside authenticated bundle members")
@@ -237,26 +243,15 @@ def _local_manifest(root, folder, proof, reported, readbacks, declared=None):
     return case, post, [m for m in manifest["files"] if not any(_relative(m["path"]).is_relative_to(d) for d in excluded)]
 
 
-def _inventory(root, proofs, readbacks, kept=None):
-    expected = {str(_relative(p["directory"])): p for p in proofs}
-    _require(expected and len(expected) == len(proofs), "empty or duplicate evidence identity")
-    declared = {} if kept is not None else None
-    urans = {key for key, proof in expected.items() if kept is not None and proof.get("regime") == "urans"}
-    reported = _result_manifests(root, declared, urans)
-    _require(set(reported) == set(expected),
-             "engine result and proven point inventory differ")
-    cases, solvers, declared_cases, declared_solvers, found = set(), set(), set(), set(), set()
-    if kept is not None:
-        kept.update(_kept_images(root, proofs, declared))
-    # Authenticate the point/solver mapping before admitting its dense
-    # processor and time directories. All filesystem entries are still checked.
-    authenticated = {key: _local_manifest(root, root / key, expected[key], reported[key], readbacks,
-                                          declared[key] if declared is not None else None) for key in expected}
-    urans_solvers = {authenticated[key][1] for key in urans}
-    protected = kept or {}
+_RAW_DIRS = {"openfoam", "time_directories", "VTK"}
+
+
+def _checked_job_tree(root, protected, authenticated, urans_solvers, historical_dirs=()):
+    """Apply the same source, media, continuation and case-ownership checks to both stock operations."""
+    owned_cases = {case for case, _, _ in authenticated.values()}
+    owned_solvers = {solver for _, solver, _ in authenticated.values()}
+    historical_roots = {directory / name for directory in historical_dirs for name in _RAW_DIRS}
     protected_dirs = {p.as_posix() for name in protected for p in PurePosixPath(name).parents}
-    protected_identities = {(entry["byteSize"], entry["sha256"]) for entry, _ in protected.values()}
-    candidates = {}
     seen = 0
 
     def walk_error(exc):
@@ -274,14 +269,14 @@ def _inventory(root, proofs, readbacks, kept=None):
             seen += len(names) + len(dirs)
         _require(seen <= 100_000, "job exceeds bounded filesystem inventory")
         if len(relative.parts) == 2 and relative.parts[0] == "cases":
-            cases.add(relative)
+            _require(relative in owned_cases, "unarchived case state")
         if folder.name == "transient" or folder.name.startswith("transient_a"):
             # foamToVTK names time exports after the solver and time index.
             # Only this exact layout below the authenticated solver is an export.
             vtk_time = (solver in urans_solvers and relative.parent == solver / "VTK" and
                         re.fullmatch(re.escape(solver.name) + r"_[0-9]+", folder.name))
-            if not vtk_time:
-                solvers.add(relative)
+            packaged = any(parent in historical_roots for parent in (relative, *relative.parents))
+            _require(vtk_time or packaged or relative in owned_solvers, "unarchived case state")
         for name in dirs:
             path = folder / name
             if path.is_symlink():
@@ -304,13 +299,38 @@ def _inventory(root, proofs, readbacks, kept=None):
                          all((relative / name).as_posix() in protected_dirs for name in dirs), "unknown media directory")
         for name in names:
             _require(not (folder / name).is_symlink(), "unaccounted file symlink")
-            if protected:
+            if protected or historical_dirs:
                 _require(stat.S_ISREG((folder / name).lstat().st_mode), "unaccounted special file")
         for name in (*dirs, *names):
-            _require("quarantine" not in name and name not in {"engine_evidence.tar.gz", "openfoam_evidence.tar.gz",
-                     "engine_evidence.tar.zst"}, "local package or forensic evidence remains")
+            _require("quarantine" not in name and name not in {"engine_evidence.tar.gz", "openfoam_evidence.tar.gz"}
+                     and (name != "engine_evidence.tar.zst" or relative in historical_dirs and name in names),
+                     "local package or forensic evidence remains")
             _require(not name.lower().endswith((".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".svg", ".mp4",
                      ".webm", ".mov", ".avi", ".tiff", ".tif")) or (relative / name).as_posix() in protected, "local media remains")
+        yield folder, relative, dirs, names
+
+
+def _inventory(root, proofs, readbacks, kept=None):
+    expected = {str(_relative(p["directory"])): p for p in proofs}
+    _require(expected and len(expected) == len(proofs), "empty or duplicate evidence identity")
+    declared = {} if kept is not None else None
+    urans = {key for key, proof in expected.items() if kept is not None and proof.get("regime") == "urans"}
+    reported = _result_manifests(root, declared, urans)
+    _require(set(reported) == set(expected),
+             "engine result and proven point inventory differ")
+    found = set()
+    if kept is not None:
+        kept.update(_kept_images(root, proofs, declared))
+    # Authenticate the point/solver mapping before admitting its dense
+    # processor and time directories. All filesystem entries are still checked.
+    authenticated = {key: _local_manifest(root, root / key, expected[key], reported[key], readbacks,
+                                          declared[key] if declared is not None else None) for key in expected}
+    urans_solvers = {authenticated[key][1] for key in urans}
+    protected = kept or {}
+    protected_dirs = {p.as_posix() for name in protected for p in PurePosixPath(name).parents}
+    protected_identities = {(entry["byteSize"], entry["sha256"]) for entry, _ in protected.values()}
+    candidates = {}
+    for folder, relative, dirs, names in _checked_job_tree(root, protected, authenticated, urans_solvers):
         if folder.name != "evidence" and "evidence_manifest.json" not in names:
             continue
         key = relative.as_posix()
@@ -320,8 +340,6 @@ def _inventory(root, proofs, readbacks, kept=None):
                  "brokered_local_reclaim.intent.json", "brokered_local_reclaim.json"}, "extra local evidence remains")
         found.add(key)
         case, post, members = authenticated[key]
-        declared_cases.add(case)
-        declared_solvers.add(post)
         post_dir = root / post
         latest = max((_time(t.name) for t in post_dir.iterdir() if t.is_dir() and not t.is_symlink()
                       and (t / "U").is_file() and (t / "p").is_file()), default=-1) if post_dir.is_dir() else -1
@@ -340,146 +358,119 @@ def _inventory(root, proofs, readbacks, kept=None):
             if _size_and_sha256(path) == (info.st_size, member["sha256"]):
                 candidates[path] = (member["sha256"], info)
     _require(found == set(expected), "expected evidence directory missing")
-    _require(cases <= declared_cases and solvers <= declared_solvers, "unarchived case state")
     return candidates
 
 
 def _historical_inventory(root, proofs, readbacks, kept, resuming, samples):
-    """Only exact packaged raw files may retire. All working, media, manifest and core paths stay local."""
+    """Retire only the bundle and its authenticated raw members inside the original evidence directory."""
     from .evidence_store import verify_local_archive_manifest_members
+
+    expected = {_relative(p["directory"]): p for p in proofs}
+    _require(expected and len(proofs) == len(expected), "empty or duplicate historical source")
+    urans = {path.as_posix() for path, p in expected.items() if p.get("regime") == "urans"}
     declared = {} if kept is not None else None
-    reported = _result_manifests(root, declared)
-    all_proofs = {p["directory"]: p for p in proofs}
-    _require(len(proofs) == len(all_proofs) and set(reported) == set(all_proofs), "uncovered or competing terminal point")
-    protected = _kept_images(root, proofs, declared) if kept is not None else {}
+    reported = _result_manifests(root, declared, urans)
+    _require(set(reported) == {path.as_posix() for path in expected}, "uncovered or competing terminal point")
     if kept is not None:
-        kept.update(protected)
-    found = set()
+        kept.update(_kept_images(root, proofs, declared))
     files = {}
     raw_members = {}
-    raw_dirs = {"VTK", "openfoam", "time_directories"}
-    protected_dirs = {p.as_posix() for name in protected for p in PurePosixPath(name).parents}
-    cases,solvers,owned_cases,owned_solvers=set(),set(),set(),set()
-    seen=0
-    def walk_error(error):
-        raise error
-    for folder, dirs, names in os.walk(root, followlinks=False, onerror=walk_error):
-        folder = Path(folder)
-        rel = relative = folder.relative_to(root)
-        seen+=len(names)+len(dirs)
-        _require(seen<=100_000,"job exceeds bounded filesystem inventory")
-        if len(rel.parts)==2 and rel.parts[0]=="cases": cases.add(rel)
-        if (folder.name=="transient" or folder.name.startswith("transient_a")) and not any(
-                rel.is_relative_to(_relative(key)) for key in all_proofs):
-            # A manifest-owned copy of system/log fields within evidence is not an execution namespace.
-            solvers.add(rel)
-        for name in dirs:
-            path = folder / name
-            if path.is_symlink():
-                actual = path.resolve(strict=True) if protected else path.resolve()
-                _require(name == "polyMesh" and actual.is_relative_to(root / "meshes"), "unaccounted directory symlink")
-                if protected:
-                    lexical = Path(os.path.abspath(path.parent / os.readlink(path)))
-                    _require(relative.parts[:1] == ("cases",) and relative.name == "constant" and
-                             actual.parts[-2:] == ("constant", "polyMesh") and lexical == actual and actual.is_dir(),
-                             "unverified shared-mesh link")
-        if any(part in {"images", "frames", "scaled_media", "custom_renders"} for part in relative.parts):
-            _require(all((relative / name).as_posix() in protected for name in names), "unaccounted local media remains")
-            if protected:
-                _require(relative.as_posix() in protected_dirs and
-                         all((relative / name).as_posix() in protected_dirs for name in dirs), "unknown media directory")
-        for n in names:
-            p = folder / n
-            _require(not p.is_symlink() and stat.S_ISREG(p.lstat().st_mode), "unaccounted nonregular file")
-            _require("quarantine" not in n and n not in {"engine_evidence.tar.gz","openfoam_evidence.tar.gz"},
-                     "unaccounted forensic or legacy package")
-            if n == "engine_evidence.tar.zst":
-                _require(all_proofs.get(rel.as_posix(), {}).get("historicalRaw"), "unowned local archive")
-            if n.lower().endswith((".png",".jpg",".jpeg",".gif",".bmp",".webp",".svg",".mp4",".webm",".mov",".avi",".tif",".tiff")):
-                _require(p.relative_to(root).as_posix() in protected, "local media is outside the protected keep-set")
-        if folder.name == "evidence" or "evidence_manifest.json" in names:
-            key = rel.as_posix()
-            _require(key in all_proofs and "evidence_manifest.json" in names, "unowned or incomplete evidence directory")
-            found.add(key)
-            proof = all_proofs[key]
-            if "historicalRaw" not in proof:
-                _require(set(names) == {"brokered_hub_binding.database.json","brokered_local_reclaim.intent.json","brokered_local_reclaim.json","evidence_manifest.json"} and set(dirs) <= {"scaled_media"},
-                         "ordinary sibling still has an unaccounted package or source")
-                case, post, _ = _local_manifest(root, folder, proof, reported[key], readbacks, declared)
-                owned_cases.add(case);owned_solvers.add(post)
-                continue
-            c = proof["historicalRaw"]
-            expected_marker = {"version": 1, "directory":key, "receipt":c}
-            marker = folder / "historical_raw_custody.database.json"
-            if marker.exists():
-                _require(_json(marker,8192)==expected_marker,"historical marker names a different source")
-            _require(set(names) <= {"evidence_manifest.json","engine_evidence.tar.zst",marker.name}
-                     and set(dirs) <= raw_dirs | {"scaled_media","frames"}, "historical folder contains unaccounted evidence")
-            mf = folder / "evidence_manifest.json"
-            _require(mf.stat().st_size == proof["manifestByteSize"] == c["manifest_bytes"] <= MAX_EVIDENCE_MANIFEST_BYTES, "original manifest size changed")
-            data = mf.read_bytes()
-            _require(hashlib.sha256(data).hexdigest()==proof["manifestSha256"]==c["manifest_sha256"] and c["sim_job_id"]==root.name
-                     and proof["generation"]==c["generation"], "historical manifest or generation changed")
-            items = reported[key]
-            catalog = sorted(f"{'mesh' if kind == 'mesh_evidence' else kind}\tjobs/{root.name}/{key}/{name}\t{size}\t{sha}"
-                             for kind,name,size,sha in items)
-            _require(hashlib.sha256("\n".join(catalog).encode()).hexdigest()==proof["catalogSha256"], "full signed artifact inventory differs")
-            manifest = json.loads(data)
-            case = PurePosixPath(*rel.parts[:2])
-            _require(_case_path(root.name,manifest["casePath"],case)==case and _case_path(root.name,manifest["postPath"],case).is_relative_to(case), "historical manifest has another job or case")
-            owned_cases.add(case);owned_solvers.add(_case_path(root.name,manifest["postPath"],case))
-            members = {_relative(m["path"]).as_posix():(m["byteSize"],m["sha256"]) for m in manifest["files"]}
-            _require(len(members)==len(manifest["files"]), "ambiguous historical manifest members")
-            for kind,name,n,sha in items:
-                if kind=="engine_bundle":
-                    _require((name,n,sha)==("engine_evidence.tar.zst",c["stored_bytes"],c["stored_sha256"]), "signed archive differs")
-                elif kind=="manifest":
-                    _require((name,n,sha)==("evidence_manifest.json",len(data),c["manifest_sha256"]), "signed manifest differs")
-                else:
-                    _require(members.get(name)==(n,sha), "signed artifact absent from historical manifest")
-            excluded = {str(_relative(name)) for name in manifest.get("bundleExcludes",[])}
-            _require(not raw_dirs.intersection(excluded), "candidate raw subtree is excluded from archive")
-            forces = {name for kind, name, _, _ in items if kind == "force_coefficients"}
-            candidates = [(name not in forces, size, name, sha) for name, (size, sha) in members.items()
-                          if _relative(name).parts[0] in raw_dirs]
-            samples[c["point_content_signature"]] = None
-            if candidates:
-                _,size,name,checksum=min(candidates)
-                samples[c["point_content_signature"]]={"path":name,"byteSize":size,"sha256":checksum}
-            raw_members[key]=members
-            archive=folder/"engine_evidence.tar.zst"
-            if archive.exists():
-                st=archive.lstat()
-                _require(st.st_nlink==1 and st.st_size==c["stored_bytes"],"historical archive is shared or changed")
-                rec,count=verify_local_archive_manifest_members(archive,expected_manifest=data,level=c["zstd_level"])
-                _require((rec.stored_sha256,rec.tar_sha256,rec.tar_size,count)==(c["stored_sha256"],c["tar_sha256"],c["tar_bytes"],c["bundled_file_count"]),
-                         "local full archive differs from immutable custody")
-                files[archive]=(rec.stored_sha256,st)
-            else:
-                _require(resuming and marker.exists(), "original archive disappeared before a verified intent")
-            if readbacks is not None:
-                rb=readbacks["historical:"+c["point_content_signature"]]
-                age=(datetime.now(timezone.utc)-datetime.fromisoformat(rb["verifiedAt"].replace("Z","+00:00"))).total_seconds()
-                _require(-5<=age<=1200 and (rb["generation"],rb["storedSha256"],rb["storedByteSize"])==
-                         (c["generation"],c["stored_sha256"],c["stored_bytes"]), "historical readback differs")
-                _require("verifiedMember" in rb and rb["verifiedMember"] == samples[c["point_content_signature"]],
-                         "registered member readback differs from original manifest")
+    archives = {}
+    authenticated = {}
+    marker_name = "historical_raw_custody.database.json"
+    for directory, proof in expected.items():
+        key = directory.as_posix()
+        folder = root / directory
+        _require(folder.resolve(strict=True) == folder, "unsafe evidence directory")
+        images = declared[key] if declared is not None else None
+        custody = proof.get("historicalRaw")
+        if custody is None:
+            authenticated[key] = _local_manifest(root, folder, proof, reported[key], readbacks, images)
+            continue
+
+        mf = folder / "evidence_manifest.json"
+        st = mf.lstat()
+        _require(stat.S_ISREG(st.st_mode) and st.st_size == proof["manifestByteSize"] == custody["manifest_bytes"]
+                 and st.st_size <= MAX_EVIDENCE_MANIFEST_BYTES, "original manifest size changed")
+        data = mf.read_bytes()
+        _require(hashlib.sha256(data).hexdigest() == proof["manifestSha256"] == custody["manifest_sha256"]
+                 and custody["sim_job_id"] == root.name and proof["generation"] == custody["generation"],
+                 "historical manifest or generation changed")
+        checked = _checked_point_manifest(root, directory, proof, reported[key], images, data,
+                                          custody["stored_bytes"], custody["stored_sha256"])
+        authenticated[key] = checked
+        _require(not _RAW_DIRS.intersection(json.loads(data).get("bundleExcludes", [])),
+                 "candidate raw subtree is excluded from archive")
+        members = {_relative(m["path"]): (m["byteSize"], m["sha256"]) for m in checked[2]}
+        _require(len(members) == len(checked[2]), "ambiguous historical manifest members")
+        raw_members[directory] = members
+        forces = {name for kind, name, _, _ in reported[key] if kind == "force_coefficients"}
+        # Prefer the original coefficient file. Break ties deterministically by size and path.
+        candidates = [(name.as_posix() not in forces, size, name.as_posix(), sha)
+                      for name, (size, sha) in members.items() if name.parts[0] in _RAW_DIRS]
+        sample = None
+        if candidates:
+            _, size, name, checksum = min(candidates)
+            sample = {"path": name, "byteSize": size, "sha256": checksum}
+        signature = custody["point_content_signature"]
+        samples[signature] = sample
+        marker = folder / marker_name
+        if marker.exists():
+            _require(_json(marker, 8192) == {"version": 1, "directory": key, "receipt": custody},
+                     "historical marker names a different source")
+        archive = folder / "engine_evidence.tar.zst"
+        if archive.exists():
+            st = archive.lstat()
+            _require(stat.S_ISREG(st.st_mode) and st.st_nlink == 1 and st.st_size == custody["stored_bytes"],
+                     "historical archive is shared or changed")
+            archives[archive] = (st, mf, custody)
         else:
-            for key,members in raw_members.items():
-                directory=root/key
-                if not folder.is_relative_to(directory): continue
-                parts=folder.relative_to(directory).parts
-                if not parts or parts[0] not in raw_dirs: continue
-                for n in names:
-                    p=folder/n
-                    _require(n!="core" and not re.fullmatch(r"core\.\d+",n), "forensic file under raw path")
-                    st=p.lstat();entry=members.get(p.relative_to(directory).as_posix())
-                    _require(entry and st.st_nlink==1 and entry[0]==st.st_size and _size_and_sha256(p)==entry,
-                             "unlisted, shared or different original raw file")
-                    files[p]=(entry[1],st)
-                break
-    _require(found==set(all_proofs), "expected evidence directory is missing")
-    _require(cases<=owned_cases and solvers<=owned_solvers,"unarchived case state")
+            _require(resuming and marker.exists(), "original archive disappeared before a verified intent")
+        if readbacks is not None:
+            rb = readbacks["historical:" + signature]
+            _require((rb["generation"], rb["storedSha256"], rb["storedByteSize"]) ==
+                     (custody["generation"], custody["stored_sha256"], custody["stored_bytes"]),
+                     "historical readback differs")
+            _require("verifiedMember" in rb and rb["verifiedMember"] == sample, "registered member readback differs from original manifest")
+
+    found = set()
+    protected = kept or {}
+    urans_solvers = {authenticated[key][1] for key in urans}
+    for folder, relative, dirs, names in _checked_job_tree(root, protected, authenticated, urans_solvers, raw_members):
+        if folder.name == "evidence" or "evidence_manifest.json" in names:
+            _require(relative in expected and "evidence_manifest.json" in names, "unowned or incomplete evidence directory")
+            found.add(relative)
+            if relative in raw_members:
+                _require(set(names) <= {"evidence_manifest.json", "engine_evidence.tar.zst", marker_name}
+                         and set(dirs) <= _RAW_DIRS | {"scaled_media", "frames"}, "unaccounted historical evidence")
+            else:
+                _require(set(names) == {"brokered_hub_binding.database.json", "brokered_local_reclaim.intent.json",
+                                       "brokered_local_reclaim.json", "evidence_manifest.json"}
+                         and set(dirs) <= {"scaled_media"}, "ordinary sibling still has unaccounted source")
+            continue
+        directory = next((parent for parent in relative.parents if parent in raw_members), None)
+        if directory is None or relative.relative_to(directory).parts[0] not in _RAW_DIRS:
+            continue
+        for name in names:
+            path = folder / name
+            _require(name != "core" and not re.fullmatch(r"core\.[0-9]+", name), "forensic file under raw path")
+            st = path.lstat()
+            entry = raw_members[directory].get(path.relative_to(root / directory))
+            _require(entry and st.st_nlink == 1 and entry[0] == st.st_size and _size_and_sha256(path) == entry,
+                     "unlisted, shared or different original raw file")
+            files[path] = (entry[1], st)
+    _require(found == set(expected), "expected evidence directory is missing")
+    # Refuse uncovered jobs before the expensive full archive pass. All bytes still
+    # have to verify under the same lock before any restore marker or unlink.
+    for archive, (st, manifest_path, custody) in archives.items():
+        manifest = manifest_path.read_bytes()
+        _require(hashlib.sha256(manifest).hexdigest() == custody["manifest_sha256"] and _same_file(archive, st),
+                 "historical source changed during preflight")
+        rec, count = verify_local_archive_manifest_members(archive, expected_manifest=manifest, level=custody["zstd_level"])
+        _require((rec.stored_sha256, rec.tar_sha256, rec.tar_size, count) ==
+                 (custody["stored_sha256"], custody["tar_sha256"], custody["tar_bytes"], custody["bundled_file_count"]),
+                 "local full archive differs from immutable custody")
+        files[archive] = (rec.stored_sha256, st)
     return files
 
 

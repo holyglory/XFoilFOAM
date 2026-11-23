@@ -11,7 +11,7 @@ import mimetypes
 import os
 import uuid
 from collections import Counter
-from contextlib import asynccontextmanager, contextmanager
+from contextlib import ExitStack, asynccontextmanager, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Event, Lock, Thread
@@ -565,16 +565,19 @@ def _render_source(
     """
 
     if remote_pointer is None and (evidence_dir / historical_raw_restore.MARKER).is_file():
-        try:
-            root = next(p for p in evidence_dir.parents if p.parent == settings.data_dir / "jobs")
-            scope = historical_raw_restore.original_scope(root, evidence_dir / EVIDENCE_ARCHIVE_NAME)
-            if scope is None:
-                raise ValueError("missing historical render owner")
-            with historical_raw_restore.restored(scope, settings, render=True) as restored:
-                yield restored
-            return
-        except (StopIteration, OSError, KeyError, TypeError, ValueError, EvidenceStoreError) as exc:
-            raise HTTPException(status_code=409, detail="Verified historical render source unavailable") from exc
+        with ExitStack() as stack:
+            try:
+                root = next(p for p in evidence_dir.parents if p.parent == settings.data_dir / "jobs")
+                scope = historical_raw_restore.original_scope(root, evidence_dir / EVIDENCE_ARCHIVE_NAME)
+                if scope is None:
+                    raise ValueError("missing historical render owner")
+                source = stack.enter_context(historical_raw_restore.restored(scope, settings, render=True))
+            except ConnectionError as exc:
+                raise HTTPException(status_code=503, detail="Registered archive temporarily unavailable") from exc
+            except (StopIteration, OSError, KeyError, TypeError, ValueError, EvidenceStoreError) as exc:
+                raise HTTPException(status_code=409, detail="Verified historical render source unavailable") from exc
+            yield source
+        return
     if remote_pointer is not None:
         if source_mode != "archive":
             raise HTTPException(

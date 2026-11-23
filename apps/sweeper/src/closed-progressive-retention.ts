@@ -197,30 +197,35 @@ async function assertWorkingPathsUnreferenced(
     );
 }
 
-async function readPng(url: URL, file: MediaFile, signal: AbortSignal) {
+async function readStoredFile(
+  url: URL,
+  file: MediaFile,
+  signal: AbortSignal,
+  mime = "image/png",
+) {
   const r = await fetch(url, {
     signal,
     redirect: "error",
-    headers: { accept: "image/png", "accept-encoding": "identity" },
+    headers: { accept: mime || "*/*", "accept-encoding": "identity" },
   });
   if (
     !r.ok ||
     !r.body ||
-    r.headers.get("content-type")?.split(";")[0] !== "image/png" ||
-    Number(r.headers.get("content-length")) !== file.byteSize
+    (mime && r.headers.get("content-type")?.split(";")[0] !== mime) ||
+    r.headers.get("content-length") !== String(file.byteSize)
   ) {
     await r.body?.cancel();
-    throw Error("Existing image route did not return its stored PNG identity");
+    throw Error("File route did not return its stored identity");
   }
   let length = 0;
   const hash = createHash("sha256");
   for await (const bytes of r.body as unknown as AsyncIterable<Uint8Array>) {
     length += bytes.length;
-    if (length > file.byteSize) throw Error("Image exceeded its stored size");
+    if (length > file.byteSize) throw Error("File exceeded its stored size");
     hash.update(bytes);
   }
   if (length !== file.byteSize || hash.digest("hex") !== file.sha256)
-    throw Error("Existing image route returned different bytes");
+    throw Error("File route returned different bytes");
 }
 
 async function readKeptMedia(
@@ -286,8 +291,8 @@ async function readKeptMedia(
       throw Error("Invalid protected native image identity");
     files.set(f.path, f);
     const path = f.path.split("/").map(encodeURIComponent).join("/");
-    await readPng(new URL(`/jobs/${id}/files/${path}`, engine), f, signal);
-    await readPng(new URL(`/api/media/jobs/${id}/${path}`, api), f, signal);
+    await readStoredFile(new URL(`/jobs/${id}/files/${path}`, engine), f, signal);
+    await readStoredFile(new URL(`/api/media/jobs/${id}/${path}`, api), f, signal);
   }
   const results = new Map<
     string,
@@ -311,7 +316,7 @@ async function readKeptMedia(
         );
     }
     const stable = `/api/result-media/${m.id}`;
-    await readPng(new URL(stable, api), file, signal);
+    await readStoredFile(new URL(stable, api), file, signal);
     let displayed = results.get(m.resultId);
     if (!displayed) {
       const r = await fetch(
@@ -502,6 +507,38 @@ async function historicalCustody(db: DB, id: string, signal?: AbortSignal) {
   }
   return byPoint;
 }
+function pointImages(
+  media: KeptImage[],
+  attempt: unknown,
+  result: unknown,
+  regime: unknown,
+  directory: string,
+  manifestSha: string,
+) {
+  const kept = media.filter((m) => m.attemptId === attempt);
+  if (
+    media.length &&
+    ((!kept.length && regime !== "urans") ||
+      kept.some(
+        (m) =>
+          m.resultId !== result ||
+          m.evidenceSha256 !== manifestSha ||
+          !(
+            m.path.startsWith(directory + "/scaled_media/") ||
+            (regime === "urans" &&
+              directory.endsWith("/evidence") &&
+              m.path ===
+                directory.slice(0, -"/evidence".length) +
+                  "/images/" +
+                  m.field +
+                  ".png")
+          ),
+      ))
+  )
+    throw Error("Kept images differ from the exact signed point owner");
+  return kept;
+}
+
 async function proofs(
   db: DB,
   jobId: string,
@@ -619,16 +656,7 @@ async function proofs(
         row.remote_download_url
       )
         throw Error("Historical local artifact and registered owner differ");
-      const kept = media.filter((m) => m.attemptId === row.id);
-      if (
-        kept.some(
-          (m) =>
-            m.resultId !== row.result_id ||
-            m.evidenceSha256 !== c.manifest_sha256 ||
-            !m.path.startsWith(directory + "/scaled_media/"),
-        )
-      )
-        throw Error("Historical image source differs");
+      const kept = pointImages(media, row.id, row.result_id, row.regime, directory, c.manifest_sha256);
       return {
         point: {
           attemptId: String(row.id),
@@ -665,6 +693,7 @@ async function proofs(
           manifestByteSize: c.manifest_bytes,
           generation: c.generation,
           historicalRaw: c,
+          ...(row.regime === "urans" ? { regime: "urans" as const } : {}),
           ...(media.length ? { keepMedia: kept } : {}),
         },
       };
@@ -715,20 +744,7 @@ async function proofs(
       throw new Error(
         "Job point differs from its exact hub, manifest or archive owner",
       );
-    const kept = media.filter((m) => m.attemptId === row.id);
-    if (
-      media.length &&
-      ((!kept.length && row.regime !== "urans") ||
-        kept.some(
-          (m) =>
-            m.resultId !== row.result_id ||
-            m.evidenceSha256 !== receipt.remote.manifestSha256 ||
-            !(m.path.startsWith(directory + "/scaled_media/") ||
-              (row.regime === "urans" && directory.endsWith("/evidence") &&
-               m.path === directory.slice(0, -"/evidence".length) + "/images/" + m.field + ".png")),
-        ))
-    )
-      throw Error("Kept images differ from the exact signed point owner");
+    const kept = pointImages(media, row.id, row.result_id, row.regime, directory, receipt.remote.manifestSha256);
     return {
       point: {
         attemptId: String(row.id),
@@ -1024,6 +1040,28 @@ export async function closedProgressiveJob(
             false,
           );
           verifiedMember = sample;
+        }
+        if (options.verifyCompleted) {
+          // This is the original HZ download link. Its local-first volume path is already absent.
+          const file = sample ?? {
+            path: "engine_evidence.tar.zst",
+            byteSize: c.stored_bytes,
+            sha256: c.stored_sha256,
+          };
+          const path = [archive.manifest.directory, file.path]
+            .join("/")
+            .split("/")
+            .map(encodeURIComponent)
+            .join("/");
+          await readStoredFile(
+            new URL(
+              "/api/media/jobs/" + id + "/" + path,
+              "http://node-api:4000",
+            ),
+            file,
+            signal,
+            sample ? "" : "application/zstd",
+          );
         }
       } else {
         const url = new URL(

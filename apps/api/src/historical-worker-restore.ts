@@ -65,9 +65,11 @@ export function registerHistoricalWorkerRestore(app: FastifyInstance, db: DB) {
           AND r.assignment_signature=${envelope.contentSignature} AND r.content_signature=${q.data.report}
           AND r.acknowledged_at IS NOT NULL
         JOIN solver_evidence_artifacts b ON b.result_attempt_id=a.id AND b.engine_job_id=a.engine_job_id
+          AND b.sim_job_id=a.sim_job_id AND b.result_id IS NOT DISTINCT FROM a.result_id
           AND b.engine_case_slug=a.engine_case_slug AND b.kind='engine_bundle' AND b.mime_type='application/zstd'
           AND b.sha256=${q.data.stored}
         JOIN solver_evidence_artifacts mf ON mf.result_attempt_id=a.id AND mf.engine_job_id=a.engine_job_id
+          AND mf.sim_job_id=a.sim_job_id AND mf.result_id IS NOT DISTINCT FROM a.result_id AND mf.mime_type='application/json'
           AND mf.engine_case_slug=a.engine_case_slug AND mf.kind='manifest' AND mf.sha256=${q.data.manifest}
           AND mf.storage_key=left(b.storage_key,-length('engine_evidence.tar.zst'))||'evidence_manifest.json'
         WHERE a.sim_job_id=${job}::uuid AND a.engine_job_id=${job} AND (SELECT count(*) FROM stage)=1
@@ -80,10 +82,16 @@ export function registerHistoricalWorkerRestore(app: FastifyInstance, db: DB) {
         const url =
           baseUrl +
           `/progressive-executions/${job}/historical-raw-archives/${sequence}/${point}/generations/${generation}`;
-        const response = await readRegisteredArchive(url, authToken, AbortSignal.timeout(20 * 60_000), "application/zstd");
+        const response = await readRegisteredArchive(
+          url,
+          authToken,
+          AbortSignal.timeout(20 * 60_000),
+          "application/zstd",
+        );
         if (response.status === 503) {
           const retryAfter = response.headers.get("retry-after");
-          if (retryAfter && /^[1-9][0-9]{0,4}$/.test(retryAfter)) reply.header("retry-after", retryAfter);
+          if (retryAfter && /^[1-9][0-9]{0,4}$/.test(retryAfter))
+            reply.header("retry-after", retryAfter);
         }
         if (
           !response.ok ||

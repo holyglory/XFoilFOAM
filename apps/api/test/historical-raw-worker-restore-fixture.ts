@@ -4,6 +4,9 @@ import { createHash, randomUUID } from "node:crypto";
 import { expect, vi } from "vitest";
 import type { DB } from "@aerodb/db";
 import { env } from "../src/env";
+import { VolumeMediaStore } from "../src/media-store";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { closedProgressiveJob } from "../../sweeper/src/closed-progressive-retention";
 
 export async function verifyHistoricalWorkerRestore(
@@ -82,24 +85,31 @@ export async function verifyHistoricalWorkerRestore(
             query: { ...query, ...override },
           });
         let forced = false;
+        let unforcedReads = 0;
         let generationReads = 0;
+        let malformedAdmission: string | undefined;
         const proxy = vi
           .spyOn(globalThis, "fetch")
           .mockImplementation(async (input, init = {}) => {
             const u = new URL(String(input));
             const headers = new Headers(init.headers);
             if (u.pathname.startsWith("/jobs/")) {
-              expect(headers.get("authorization")).toBe("Bearer " + token);
-              expect(
-                JSON.parse(
-                  Buffer.from(
-                    headers.get("x-historical-raw-preflight")!,
-                    "base64",
-                  ).toString(),
-                ).receipt.generation,
-              ).toBe(receipt.generation);
+              if (headers.has("x-historical-raw-preflight")) {
+                expect(headers.get("authorization")).toBe("Bearer " + token);
+                expect(
+                  JSON.parse(
+                    Buffer.from(
+                      headers.get("x-historical-raw-preflight")!,
+                      "base64",
+                    ).toString(),
+                  ).receipt.generation,
+                ).toBe(receipt.generation);
+                forced = true;
+              } else {
+                expect(headers.has("authorization")).toBe(false);
+                unforcedReads++;
+              }
               const result = await local();
-              forced = true;
               return new Response(new Uint8Array(result.rawPayload), {
                 status: result.statusCode,
                 headers: {
@@ -113,11 +123,24 @@ export async function verifyHistoricalWorkerRestore(
             }
             expect(u.origin).toBe(base);
             expect(headers.get("x-xfoilfoam-solver-token")).toBe("owner");
-            if (u.pathname.includes("/generations/") && generationReads++ === 0) {
-              const busy = JSON.stringify({ code: "sync_capacity_busy", retryAfterMs: 1000 });
-              return new Response(busy, { status: 503, headers: {
-                "content-type": "application/json", "content-length": String(Buffer.byteLength(busy)), "retry-after": "1",
-              } });
+            if (
+              u.pathname.includes("/generations/") &&
+              (++generationReads === 1 || malformedAdmission !== undefined)
+            ) {
+              const busy =
+                malformedAdmission ??
+                JSON.stringify({
+                  code: "sync_capacity_busy",
+                  retryAfterMs: 1000,
+                });
+              return new Response(busy, {
+                status: 503,
+                headers: {
+                  "content-type": "application/json",
+                  "content-length": String(Buffer.byteLength(busy)),
+                  "retry-after": "1",
+                },
+              });
             }
             process.env.AIRFOILFOAM_DEPLOYMENT_ROLE = "hub";
             try {
@@ -154,10 +177,25 @@ export async function verifyHistoricalWorkerRestore(
           expect(Date.now() - started).toBeGreaterThanOrEqual(990);
           expect(res.headers["x-gcs-generation"]).toBe(receipt.generation);
           expect(sha(res.rawPayload)).toBe(query.stored);
+          for (const malformed of [
+            null,
+            { code: "sync_capacity_busy" },
+            { retryAfterMs: 1000 },
+            { code: "sync_capacity_busy", retryAfterMs: "1000" },
+            { code: "sync_capacity_busy", retryAfterMs: 2000 },
+          ]) {
+            malformedAdmission = JSON.stringify(malformed);
+            const reads = generationReads;
+            expect((await local()).statusCode).toBe(503);
+            expect(generationReads).toBe(reads + 1);
+          }
+          malformedAdmission = undefined;
           const plan = {
             job_id: job,
             state: "planned" as const,
-            historicalSamples: { [String(receipt.point_content_signature)]: null },
+            historicalSamples: {
+              [String(receipt.point_content_signature)]: null,
+            },
             replayed: false,
             bytes: bundle.length,
             files: 1,
@@ -190,6 +228,17 @@ export async function verifyHistoricalWorkerRestore(
             generation: receipt.generation,
           });
           expect(forced).toBe(true);
+          // The normal media-store first checks the original volume and then reads through the engine.
+          const media = new VolumeMediaStore(join(tmpdir(), randomUUID()));
+          const stored = await media.stream(
+            "jobs/" + job + "/" + directory + "/engine_evidence.tar.zst",
+          );
+          const chunks: Buffer[] = [];
+          for await (const chunk of stored.stream)
+            chunks.push(Buffer.from(chunk));
+          expect(stored.size).toBe(bundle.length);
+          expect(sha(Buffer.concat(chunks))).toBe(query.stored);
+          expect(unforcedReads).toBe(1);
           await cx.execute(
             sql`UPDATE progressive_worker_delivery_failures SET state='retry',retry_after=clock_timestamp() WHERE sim_job_id=${job}::uuid`,
           );

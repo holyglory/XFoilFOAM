@@ -164,3 +164,18 @@ plan. A lost response is recovered by a read-only verification of that plan.
 Transport faults keep their pending receipts. Individual proof refusals are
 recorded and the next media row can proceed. The same supervisor controls
 quiescence and recovery for both inventories.
+
+## Closed historical raw archives
+
+Use `--historical-raw` for terminal jobs whose original registered solver stored the raw bundles under migration 0220. Use `--keep-media` as well when the job owns registered instantaneous images. Each terminal point must have a matching original archive or completed ordinary custody. An undeclared bundle, another case, unsettled delivery, conflicting owner or incomplete file proof holds the entire job.
+
+The hub Node API serves the original owner's immutable receipt and generation. The HZ Node API authenticates the local gateway and binds the request to its exact report, attempt, directory, manifest and bundle. The HZ Python file-serving API needs both `airfoilfoam.api.main` and `airfoilfoam.historical_raw_restore` from the reviewed source. Reclaim verifies their installed digests and exercises the running gateway. The physical solver worker supplies its existing volume and lock witness.
+
+```bash
+operator=scripts/deploy/hz-closed-job-maintenance.py
+python3 "$operator" proof "$job" --historical-raw >"$proof_receipt"
+plan=$(jq -er 'select(.status=="proved" and .databaseReadOnly and .plan.files>0) | .plan.plan' "$proof_receipt")
+python3 "$operator" reclaim "$job" "$plan" --historical-raw --proof-receipt "$proof_receipt"
+```
+
+The read-only proof bypasses the local copy at the original file URL and verifies the complete registered archive plus a manifest member when available. The worker's sync admission limit also applies to these reads. Under the job lock, the operator checks each candidate against the authenticated archive, creates the per-directory restore markers, and records the exact file plan before removal. The manifest, work directories, continuation inputs, retained media and core files keep their original paths. After removal the operator reopens the original file URLs and the HZ media download, and compares the scientific fingerprint and generation. The receipt reports net attributed allocated bytes separately from filesystem free-space changes caused by other work.
