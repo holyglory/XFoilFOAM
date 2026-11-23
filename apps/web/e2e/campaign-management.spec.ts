@@ -1671,9 +1671,9 @@ test.describe
     expect(overflow.panel).toBeLessThanOrEqual(0);
     expect(overflow.profile).toBeLessThanOrEqual(0);
 
-    // The label rows use different grid tracks on either side of 500px.
+    // Check the reported 501px overlap and both stage-guide breakpoints.
     // Check visible text bounds; the icons themselves have smaller boxes.
-    for (const width of [499, 500, 501, 560, 701]) {
+    for (const width of [499, 500, 501, 560, 599, 600, 601, 699, 700, 701]) {
       await page.setViewportSize({ width, height: 844 });
       const stages = await handoffRail.locator(".shared-stage strong").evaluateAll((labels) =>
         labels.map((label) => {

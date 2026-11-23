@@ -166,7 +166,7 @@ try {
     { name: "reported", width: 671, height: 907 },
     { name: "desktop", width: 1440, height: 1000 },
   ];
-  for (const boundary of [500, 700, 760, 900])
+  for (const boundary of [500, 600, 700, 760, 900])
     for (const width of [boundary - 1, boundary, boundary + 1])
       viewports.push({ name: "width-" + width, width, height: 900 });
   const allStates = ["base", ...states.map((s) => s.name)];

@@ -759,7 +759,7 @@ export function PreliminaryOutcomePanel({
         }
         @media (max-width: 700px) {
           .flow-guide {
-            grid-template-columns: 58px minmax(0, 1fr) max-content;
+            grid-template-columns: 58px minmax(120px, 1fr) 124px 26px;
             gap: 7px;
             padding-inline: 9px;
           }
@@ -790,7 +790,7 @@ export function PreliminaryOutcomePanel({
             font-size: 9.5px;
           }
         }
-        @media (max-width: 500px) {
+        @media (max-width: 600px) {
           .handoff-header {
             align-items: flex-start;
           }
