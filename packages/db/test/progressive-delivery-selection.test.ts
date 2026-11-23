@@ -1483,6 +1483,44 @@ it("preserves exact eligible deliveries, active priority, fallback and cumulativ
         }),
       ).rejects.toBe(rollback);
     }
+    const scopeRollback = new Error("Restore closed-scope delivery bindings");
+    await expect(transaction.transaction(async nested => {
+      const [p] = await nested.execute(sql`SELECT s.* FROM progressive_worker_evidence_attempts s
+        JOIN fixture_jobs j ON j.id=s.sim_job_id WHERE j.variant='eligible-active' ORDER BY s.sequence,s.result_attempt_id LIMIT 1`);
+      await nested.execute(sql`UPDATE sync_sweep_promises SET registered_solver_id=md5('other-solver')::uuid WHERE id<>${p.sim_job_id}::uuid`);
+      await nested.execute(sql`DELETE FROM progressive_worker_evidence_attempts WHERE sim_job_id=${p.sim_job_id}::uuid
+        AND point_content_signature<>${p.point_content_signature}`);
+      await nested.execute(sql`INSERT INTO progressive_worker_delivery_failures
+        (sim_job_id,point_content_signature,state,last_error,last_http_status,remote_conflict_ids,retry_after)
+        VALUES(${p.sim_job_id}::uuid,${p.point_content_signature},'conflict','Progressive evidence delivery failed (409): progressive_scope_closed',409,'[]'::jsonb,NULL)`);
+      await nested.execute(sql`UPDATE result_attempts SET evidence_payload='{"failure_disposition":"hard_solver","converged":false}'::jsonb
+        WHERE id=${p.result_attempt_id}::uuid`);
+      const pick = () => nested.execute(progressiveDeliverySelectionSql(true));
+      expect(await pick()).toEqual([]);
+      // The same point has a different, independently eligible diagnostic
+      // attempt in sequence 2. Sequence 1 must not borrow its eligibility.
+      await nested.execute(sql`INSERT INTO result_attempts
+        SELECT md5('alternate-scope-diagnostic')::uuid,sim_job_id,engine_job_id,result_id,aoa_deg,engine_case_slug,
+          '{"failure_disposition":"material_domain","converged":false}'::jsonb FROM result_attempts WHERE id=${p.result_attempt_id}::uuid`);
+      await nested.execute(sql`UPDATE progressive_worker_evidence_attempts SET result_attempt_id=md5('alternate-scope-diagnostic')::uuid
+        WHERE sim_job_id=${p.sim_job_id}::uuid AND point_content_signature=${p.point_content_signature} AND sequence=2`);
+      const [eligible] = await pick();
+      expect(eligible).toMatchObject({sim_job_id:p.sim_job_id,sequence:2,point_content_signature:p.point_content_signature});
+      expect(eligible.result_attempt_id).not.toBe(p.result_attempt_id);
+      const claimed = await nested.execute(progressiveDeliverySelectionSql(true,"44444444-4444-4444-8444-444444444444"));
+      expect(claimed).toEqual([eligible]);
+      expect(await pick()).toEqual([]);
+      await nested.execute(sql`UPDATE progressive_worker_evidence_delivery_claims SET claim_expires_at=clock_timestamp()-interval '1 second'`);
+      await nested.execute(sql`INSERT INTO progressive_worker_report_conflicts VALUES(${p.sim_job_id}::uuid,2)`);
+      expect(await pick()).toEqual([]);
+      await nested.execute(sql`UPDATE progressive_worker_delivery_failures SET last_error='transfer timed out'
+        WHERE sim_job_id=${p.sim_job_id}::uuid AND point_content_signature=${p.point_content_signature}`);
+      expect((await pick())[0]).toMatchObject({sequence:1,result_attempt_id:p.result_attempt_id});
+      await nested.execute(sql`INSERT INTO progressive_worker_hub_receipts VALUES(${p.sim_job_id}::uuid,${p.point_content_signature})`);
+      expect(await pick()).toEqual([]);
+      throw scopeRollback;
+    })).rejects.toBe(scopeRollback);
+
     const claimRollback = new Error("Rollback isolated delivery claim");
     await expect(
       transaction.transaction(async (nested) => {
@@ -1619,7 +1657,11 @@ it("preserves exact eligible deliveries, active priority, fallback and cumulativ
             outstandingEvaluations: outstanding.map((node) => node['Actual Loops']),
             jobLookups: jobLookups.map((node) => ({ type: node['Node Type'], index: node['Index Name'],
               condition: node['Index Cond'], loops: node['Actual Loops'], rows: node['Actual Rows'] })) }));
-          expect(outstanding.length).toBeGreaterThan(0);
+          expect(outstanding).toHaveLength(1);
+          const bindings = nodes.filter(node => node['Subplan Name'] === 'CTE eligible_bindings');
+          expect(bindings).toHaveLength(1);
+          expect(Number(bindings[0]['Actual Loops'])).toBe(1);
+          expect(Number(bindings[0]['Actual Rows'])).toBeLessThan(enumeratedSources);
           expect(outstanding.every((node) => Number(node['Actual Loops']) <= 1)).toBe(true);
           expect(jobLookups.length).toBeGreaterThan(0);
           expect(jobLookups.every((node) => ['Index Scan', 'Index Only Scan'].includes(String(node['Node Type'])) &&

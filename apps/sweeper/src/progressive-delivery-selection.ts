@@ -51,44 +51,47 @@ export function progressiveDeliverySelectionSql(
       ])
     )
   )`;
-  const points = sql`WITH outstanding_sources AS MATERIALIZED (
-    SELECT source.*
+  // One signed point can appear in many cumulative reports. Keep every
+  // unreceived sequence, but evaluate the claim and scientific retry gates
+  // once for each distinct point/attempt binding.
+  const pointSources = sql`outstanding_sources AS MATERIALIZED (
+    SELECT source.sim_job_id,source.sequence,source.result_attempt_id,source.point_content_signature
     FROM progressive_worker_evidence_attempts source
     WHERE NOT EXISTS (
       SELECT 1 FROM progressive_worker_hub_receipts delivered
-      WHERE delivered.sim_job_id = source.sim_job_id
-        AND delivered.point_content_signature = source.point_content_signature
-    )
-  )
-    SELECT source.sim_job_id, source.sequence, source.result_attempt_id,
-      source.point_content_signature, report.created_at, attempt.aoa_deg,
-      COALESCE(${retryableFailure}, false) AS is_retry
-    FROM progressive_worker_reports report
-    JOIN outstanding_sources source ON source.sim_job_id = report.sim_job_id AND source.sequence = report.sequence
-    JOIN result_attempts attempt ON attempt.id = source.result_attempt_id AND attempt.sim_job_id = source.sim_job_id
-      AND attempt.engine_job_id = source.sim_job_id::text
-    LEFT JOIN progressive_worker_hub_receipts delivered ON delivered.sim_job_id = source.sim_job_id
-      AND delivered.point_content_signature = source.point_content_signature
-    LEFT JOIN progressive_worker_delivery_failures failure ON failure.sim_job_id = source.sim_job_id
-      AND failure.point_content_signature = source.point_content_signature
-    LEFT JOIN progressive_worker_evidence_delivery_claims claim ON claim.sim_job_id = source.sim_job_id
-      AND claim.point_content_signature = source.point_content_signature
-    WHERE delivered.sim_job_id IS NULL AND report.acknowledged_at IS NOT NULL AND attempt.result_id IS NOT NULL
-      AND NOT EXISTS (SELECT 1 FROM progressive_worker_report_conflicts conflict
-        WHERE conflict.sim_job_id = report.sim_job_id AND conflict.sequence = report.sequence)
-      AND (claim.claim_token IS NULL OR claim.claim_expires_at <= clock_timestamp())
+      WHERE delivered.sim_job_id=source.sim_job_id AND delivered.point_content_signature=source.point_content_signature)
+  ), eligible_bindings AS MATERIALIZED (
+    SELECT binding.*,attempt.aoa_deg,failure.sim_job_id IS NOT NULL AS is_retry
+    FROM (SELECT DISTINCT sim_job_id,point_content_signature,result_attempt_id FROM outstanding_sources) binding
+    JOIN result_attempts attempt ON attempt.id=binding.result_attempt_id AND attempt.sim_job_id=binding.sim_job_id
+      AND attempt.engine_job_id=binding.sim_job_id::text
+    LEFT JOIN progressive_worker_delivery_failures failure ON failure.sim_job_id=binding.sim_job_id
+      AND failure.point_content_signature=binding.point_content_signature
+    LEFT JOIN progressive_worker_evidence_delivery_claims claim ON claim.sim_job_id=binding.sim_job_id
+      AND claim.point_content_signature=binding.point_content_signature
+    WHERE attempt.result_id IS NOT NULL AND (claim.claim_token IS NULL OR claim.claim_expires_at<=clock_timestamp())
       AND (failure.sim_job_id IS NULL OR (${retryableFailure}
-        AND (failure.retry_after IS NULL OR failure.retry_after <= clock_timestamp())))`;
+        AND (failure.retry_after IS NULL OR failure.retry_after<=clock_timestamp())))
+  ), deliverable_sources AS MATERIALIZED (
+    SELECT source.*,report.created_at FROM (
+      SELECT s.sim_job_id,s.sequence,s.result_attempt_id,s.point_content_signature,binding.aoa_deg,binding.is_retry
+      FROM eligible_bindings binding JOIN outstanding_sources s
+        USING(sim_job_id,point_content_signature,result_attempt_id)
+      -- Discard held bindings before looking up their repeated report headers.
+      OFFSET 0
+    ) source
+    JOIN progressive_worker_reports report ON report.sim_job_id=source.sim_job_id AND report.sequence=source.sequence
+    WHERE report.acknowledged_at IS NOT NULL
+      AND NOT EXISTS (SELECT 1 FROM progressive_worker_report_conflicts conflict
+        WHERE conflict.sim_job_id=source.sim_job_id AND conflict.sequence=source.sequence)
+  )`;
   const candidate = (
     active: boolean,
     excludeActive = false,
   ) => sql`SELECT point.*, job.request_payload, settings.upstream_base_url,
       settings.remote_solver_auth_token, settings.remote_solver_registered_id, settings.instance_id, settings.instance_name,
       promise.id AS promise_id
-    -- Keep outstanding-point evaluation outside the ownership lookup. An
-    -- upstream-only index estimate can otherwise put every worker job outside
-    -- this expensive subquery and repeat it thousands of times.
-    FROM (${points} OFFSET 0) point
+    FROM deliverable_sources point
     JOIN LATERAL (SELECT * FROM sim_jobs WHERE id = point.sim_job_id OFFSET 0) job ON true
     JOIN sync_sweep_promises promise ON promise.id::text = job.request_payload->>'syncPromiseId'
     JOIN sync_api_settings settings ON settings.id = 1
@@ -101,10 +104,10 @@ export function progressiveDeliverySelectionSql(
       ${excludeActive ? sql`AND NOT EXISTS (SELECT 1 FROM active)` : sql``}
     ORDER BY point.is_retry DESC, point.created_at, point.sim_job_id, point.sequence, point.aoa_deg, point.result_attempt_id LIMIT 1`;
   const selected = preferActive
-    ? sql`WITH active AS MATERIALIZED (${candidate(true)}),
+    ? sql`WITH ${pointSources},active AS MATERIALIZED (${candidate(true)}),
         fallback AS (${candidate(false, true)})
       SELECT * FROM active UNION ALL SELECT * FROM fallback`
-    : sql`${candidate(false)}`;
+    : sql`WITH ${pointSources} ${candidate(false)}`;
   const selectedCandidate = sql`SELECT selected.sim_job_id, selected.sequence, selected.result_attempt_id, selected.point_content_signature,
       report.content_signature AS report_signature, resolve_progressive_report(to_jsonb(report.*)) AS report, attempt.result_id, attempt.aoa_deg,
       attempt.engine_case_slug, attempt.evidence_payload,
