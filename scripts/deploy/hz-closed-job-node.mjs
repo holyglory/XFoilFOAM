@@ -217,9 +217,16 @@ async function run(next) {
         [scope.id,scope.preserveSolver?"closedProgressiveSiblingFiles":scope.historicalRaw?"historicalRawFiles":"closedProgressiveFiles"],
       );
       if (prior?.receipt?.complete === true) {
+        const oldWitness = prior.receipt.registeredTerminalPromise;
+        const oldStop = oldWitness ? digest(require("@aerodb/db").canonicalAnalysisJson(oldWitness)) : null;
+        const links = prior.receipt.preservedSolver?.linkedContinuation;
+        const linkedOwner = links ? links.jobId + "/" + links.caseSlug : undefined;
         if (
           prior.receipt.planSha256 !== scope.plan ||
           (scope.preserveSolver && prior.receipt.preservedSolver?.directory !== scope.preserveSolver) ||
+          linkedOwner !== scope.linkedContinuation ||
+          (prior.receipt.registeredTerminalPromiseSha256 != null && oldStop !== prior.receipt.registeredTerminalPromiseSha256) ||
+          (scope.expectedTerminalStop !== undefined && oldStop !== scope.expectedTerminalStop) ||
           Boolean(prior.receipt.mediaSha256) !== Boolean(scope.keepMedia) ||
           (scope.expectedMedia &&
             scope.expectedMedia !== prior.receipt.mediaSha256)
@@ -229,6 +236,7 @@ async function run(next) {
           status: "already-settled",
           ...(scope.historicalRaw ? {historicalRaw:true}:{}),
           ...(scope.preserveSolver ? {preserveSolver:scope.preserveSolver}:{}),
+          ...(scope.linkedContinuation ? {linkedContinuation:scope.linkedContinuation}:{}),
           record: prior.receipt,
           dependenciesSha256,
           nodePackagesSha256,
@@ -261,6 +269,7 @@ async function run(next) {
           mode: scope.mode,
           ...(scope.historicalRaw ? {historicalRaw:true} : {}),
           ...(scope.preserveSolver ? {preserveSolver:scope.preserveSolver}:{}),
+          ...(scope.linkedContinuation ? {linkedContinuation:scope.linkedContinuation}:{}),
           manifests,
           expectedPlan,
           readbacks,
@@ -305,6 +314,8 @@ async function run(next) {
           keepMedia: scope.keepMedia === true,
           historicalRaw: scope.historicalRaw === true,
           preserveSolver: scope.preserveSolver,
+          expectedRegisteredStopSha256: scope.expectedTerminalStop,
+          linkedContinuation: scope.linkedContinuation,
           expectedMediaSha256: scope.expectedMedia ?? undefined,
           signal: AbortSignal.timeout(20 * 60_000),
         }),
@@ -324,6 +335,7 @@ async function run(next) {
       ...result,
       ...(scope.historicalRaw?{historicalRaw:true}:{}),
       ...(scope.preserveSolver ? {preserveSolver:scope.preserveSolver}:{}),
+          ...(scope.linkedContinuation ? {linkedContinuation:scope.linkedContinuation}:{}),
     };
   } finally {
     await client.sql.end({ timeout: 2 });

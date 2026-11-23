@@ -2,12 +2,13 @@
 from __future__ import annotations
 
 import hashlib
+import fcntl
 import json
 import math
 import os
 import re
 import stat
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 
@@ -320,7 +321,77 @@ def _checked_job_tree(root, protected, authenticated, urans_solvers, historical_
         yield folder, relative, dirs, names
 
 
-def _preserved_mesh_inventory(root, mesh):
+@contextmanager
+def _locked_continuation(root, selection):
+    """A separate continuation may own other links to the preserved originals."""
+    if selection is None:
+        yield None
+        return
+    owner = _relative(selection)
+    _require(len(owner.parts) == 2 and re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", owner.parts[0])
+             and owner.parts[0] != root.name and re.fullmatch(r"[A-Za-z0-9_.-]+", owner.name), "invalid linked continuation")
+    child = root.parent / owner.parts[0]
+    case = child / "cases" / owner.name
+    _require(case.is_dir() and case.resolve(strict=True) == case, "linked continuation case is missing or redirected")
+    path = child / ".execute.lock"
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        st = os.fstat(fd)
+        _require(stat.S_ISREG(st.st_mode) and st.st_nlink == 1 and os.path.samestat(st, path.lstat()) and
+                 not os.path.samestat(st, (root / ".execute.lock").lstat()), "unsafe linked continuation lock")
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise JobRetentionRefused("the linked continuation still has an active writer") from exc
+        for name, limit in (("status.json", 1024**2), ("result.json", 128 * 1024**2)):
+            state = _json(child / name, limit)
+            _require(state.get("job_id") == child.name and state.get("state") in {"failed","cancelled","completed"},
+                     "linked continuation has no exact terminal engine state")
+        yield case
+        _require(os.path.samestat(st, path.lstat()), "linked continuation lock changed")
+    finally:
+        os.close(fd)
+
+
+class _ContinuationLinks:
+    def __init__(self, case):
+        self.case = case
+        self.job = case.parent.parent
+        self.digest = hashlib.sha256()
+        self.files = self.aliases = 0
+        self.mesh_dirs = [case / "constant/polyMesh"]
+        for path in sorted(case.iterdir()):
+            if re.fullmatch(r"transient(?:_a[0-9]+)?", path.name) and path.is_dir() and not path.is_symlink():
+                self.mesh_dirs.append(path / "constant/polyMesh")
+        _require(len(self.mesh_dirs) <= 257, "ambiguous continuation mesh inventory")
+
+    def verify(self, source, st, relative, *, mesh=False):
+        if st.st_nlink == 1:
+            return
+        if mesh:
+            candidates = [folder / relative for folder in self.mesh_dirs]
+        else:
+            _require(len(relative.parts) >= 3 and _time(relative.parts[1]) >= 0 and st.st_nlink == 2,
+                     "shared file is outside a retained reconstructed time")
+            candidates = [self.case / relative]
+        names = []
+        for candidate in candidates:
+            if candidate.is_file() and candidate.resolve(strict=True) == candidate and os.path.samestat(st, candidate.lstat()):
+                names.append(candidate.relative_to(self.job).as_posix())
+        _require(len(names) == st.st_nlink - 1 and len(set(names)) == len(names),
+                 "the named continuation does not account for every other hardlink")
+        self.digest.update(json.dumps([source.as_posix(), st.st_dev, st.st_ino, st.st_nlink, sorted(names)],
+                                      separators=(",", ":")).encode() + b"\n")
+        self.files += 1
+        self.aliases += len(names)
+
+    def receipt(self):
+        _require(self.files > 0, "named continuation has no proven shared files")
+        return {"jobId": self.job.name, "caseSlug": self.case.name, "sharedFiles": self.files,
+                "otherLinks": self.aliases, "pathSetSha256": self.digest.hexdigest()}
+
+
+def _preserved_mesh_inventory(root, mesh, links=None):
     digest = hashlib.sha256()
     size = count = 0
     for path in sorted(mesh.rglob("*"), key=lambda p: p.as_posix()):
@@ -335,15 +406,17 @@ def _preserved_mesh_inventory(root, mesh):
             digest.update(f"dir\0{name}\n".encode())
         else:
             _require(stat.S_ISREG(st.st_mode), "special file in retained mesh")
+            if links:
+                links.verify(path.relative_to(root), st, relative, mesh=True)
             length, sha = _size_and_sha256(path)
-            _require(length == st.st_size and _same_file(path, st), "retained mesh changed during inventory")
+            _require(length == st.st_size and _same_file(path, st, st.st_nlink if links else 1), "retained mesh changed during inventory")
             size += length
             digest.update(f"file\0{name}\0{length}\0{sha}\n".encode())
     return {"name": mesh.relative_to(root).as_posix(), "kind": "directory", "byteSize": size,
             "entryCount": count, "treeSha256": digest.hexdigest()}
 
 
-def _preserved_solver_tree(root, directory):
+def _preserved_solver_tree(root, directory, linked_case=None):
     """Pin every original entry in one unreported solver; it has no cloud disposition."""
     tree = root / directory
     _require(tree.is_dir() and tree.resolve(strict=True) == tree, "preserved solver is absent or linked")
@@ -352,6 +425,7 @@ def _preserved_solver_tree(root, directory):
     digest.update(json.dumps([".", root_stat.st_mode, root_stat.st_dev, root_stat.st_ino]).encode() + b"\n")
     samples = []
     meshes = {}
+    links = _ContinuationLinks(linked_case) if linked_case is not None else None
     entries = files = logical = allocated = 0
     def walk_error(exc):
         raise exc
@@ -369,9 +443,11 @@ def _preserved_solver_tree(root, directory):
             _require(entries <= 100_000, "preserved solver exceeds the named inventory")
             identity = [rel.as_posix(), st.st_mode, st.st_dev, st.st_ino]
             if stat.S_ISREG(st.st_mode):
-                _require(st.st_nlink == 1 and path.resolve() == path, "shared or redirected preserved source")
+                _require((st.st_nlink == 1 or links is not None) and path.resolve() == path, "shared or redirected preserved source")
+                if links:
+                    links.verify(path.relative_to(root), st, PurePosixPath(directory.name) / rel)
                 size, sha = _size_and_sha256(path)
-                _require(size == st.st_size and _same_file(path, st), "preserved source changed during inventory")
+                _require(size == st.st_size and _same_file(path, st, st.st_nlink if links else 1), "preserved source changed during inventory")
                 files += 1
                 logical += size
                 allocated += st.st_blocks * 512
@@ -386,7 +462,7 @@ def _preserved_solver_tree(root, directory):
                              "preserved solver links into another working source")
                     mesh = target.relative_to(root).as_posix()
                     if mesh not in meshes:
-                        meshes[mesh] = _preserved_mesh_inventory(root, target)
+                        meshes[mesh] = _preserved_mesh_inventory(root, target, links)
                 identity.extend([os.readlink(path), target.relative_to(root).as_posix()])
             else:
                 _require(stat.S_ISDIR(st.st_mode), "special file in preserved solver")
@@ -395,11 +471,11 @@ def _preserved_solver_tree(root, directory):
     digest.update(json.dumps(meshes, sort_keys=True, separators=(",", ":")).encode())
     return {"directory": directory.as_posix(), "treeSha256": digest.hexdigest(), "entries": entries,
             "files": files, "byteSize": logical, "allocatedBytes": allocated,
-            "sharedMeshInventories": list(meshes.values()),
+            "sharedMeshInventories": list(meshes.values()), **({"linkedContinuation": links.receipt()} if links else {}),
             "sample": min(samples, key=lambda f: ("/steady_initialization/" in f["path"], f["byteSize"], f["path"]))}
 
 
-def _inventory(root, proofs, readbacks, kept=None, preserved=None):
+def _inventory(root, proofs, readbacks, kept=None, preserved=None, linked_case=None):
     expected = {str(_relative(p["directory"])): p for p in proofs}
     _require(expected and len(expected) == len(proofs), "empty or duplicate evidence identity")
     declared = {} if kept is not None else None
@@ -459,7 +535,7 @@ def _inventory(root, proofs, readbacks, kept=None, preserved=None):
     if keep_root is not None:
         _require(all(path.relative_to(root).parts[:3] != keep_root.parts for path in candidates),
                  "candidate overlaps the preserved solver")
-        preserved.update(_preserved_solver_tree(root, keep_root))
+        preserved.update(_preserved_solver_tree(root, keep_root, linked_case))
     return candidates
 
 
@@ -576,9 +652,9 @@ def _historical_inventory(root, proofs, readbacks, kept, resuming, samples):
     return files
 
 
-def _same_file(path, original):
+def _same_file(path, original, expected_links=1):
     current = path.lstat()
-    return (path.resolve() == path and os.path.samestat(current, original) and current.st_nlink == 1 and
+    return (path.resolve() == path and os.path.samestat(current, original) and original.st_nlink == current.st_nlink == expected_links and
             current.st_size == original.st_size and current.st_mtime_ns == original.st_mtime_ns and
             current.st_ctime_ns == original.st_ctime_ns)
 
@@ -605,13 +681,15 @@ def _allocation(root, rows, files, stored, receipt_files=None):
 
 def reclaim_closed_progressive_files(job_root: Path, proofs: list[dict], expected_plan: str | None = None,
                                      readbacks: list[dict] | None = None, *, lock_identity: list[int] | None = None,
-                                     preserve_solver: str | None = None):
+                                     preserve_solver: str | None = None, linked_continuation: str | None = None):
     """Preview without writes. Apply rechecks the entire plan under the active solver's lock."""
     if not job_root.exists() and not job_root.is_symlink():
         return {"job_id": job_root.name, "state": "absent", "bytes": 0, "files": 0, "plan": None}
     _require(job_root.is_dir() and not job_root.is_symlink(), "unsafe job directory")
     try:
-        with _job_retention_guard(job_root) if expected_plan is not None else nullcontext():
+        _require(linked_continuation is None or preserve_solver is not None, "continuation links require a preserved solver")
+        with (_job_retention_guard(job_root) if expected_plan is not None else nullcontext()), \
+                _locked_continuation(job_root, linked_continuation) as linked_case:
             if lock_identity is not None:
                 held = (job_root / ".execute.lock").lstat()
                 _require(stat.S_ISREG(held.st_mode) and [held.st_dev, held.st_ino] == lock_identity,
@@ -641,7 +719,7 @@ def reclaim_closed_progressive_files(job_root: Path, proofs: list[dict], expecte
             preserved = {"directory": preserve_solver} if preserve_solver is not None else None
             def inventory(keep, original=None):
                 return (_historical_inventory(job_root, proofs, authenticated, keep, intent_file.exists(), samples)
-                        if historic else _inventory(job_root, proofs, authenticated, keep, original))
+                        if historic else _inventory(job_root, proofs, authenticated, keep, original, linked_case))
             files = inventory(kept, preserved)
             kept_rows = [entry for entry, _ in (kept or {}).values()]
             current = {path.relative_to(job_root).as_posix(): [sha, st.st_size] for path, (sha, st) in files.items()}
@@ -690,7 +768,7 @@ def reclaim_closed_progressive_files(job_root: Path, proofs: list[dict], expecte
                     _require(-5 <= (now - verified_at).total_seconds() <= 1200,
                              "registered restore proof expired during filesystem preflight")
             if preserved is not None:
-                _require(_preserved_solver_tree(job_root, _relative(preserve_solver)) == preserved,
+                _require(_preserved_solver_tree(job_root, _relative(preserve_solver), linked_case) == preserved,
                          "unreported solver changed before signed sibling removal")
             if stored is None:
                 stored = {"job_id": job_root.name, "plan": digest, "files": rows,

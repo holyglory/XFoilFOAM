@@ -65,7 +65,8 @@ export interface ClosedProgressiveReadback {
 }
 
 type PreservedSolver = { directory: string; treeSha256: string; entries: number; files: number;
-  byteSize: number; allocatedBytes: number; sample: MediaFile };
+  byteSize: number; allocatedBytes: number; sample: MediaFile;
+  linkedContinuation?: {jobId: string; caseSlug: string; sharedFiles: number; otherLinks: number; pathSetSha256: string} };
 
 export interface ClosedProgressiveReclaimResponse {
   preservedSolver?: PreservedSolver;
@@ -396,6 +397,28 @@ async function readKeptMedia(
     .digest("hex");
 }
 
+async function assertClosedContinuation(db: DB, parent: string, directory: string, selection: string, lock: boolean) {
+  const [child, destination, ...extra] = selection.split("/");
+  if (!child || child === parent || !/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(child) ||
+      !destination || !/^[a-zA-Z0-9_.-]+$/.test(destination) || [".",".."].includes(destination) || extra.length)
+    throw Error("Invalid retained continuation owner");
+  const caseSlug = directory.split("/")[1]!;
+  const rows = await db.execute(sql`SELECT c.id FROM sim_jobs c JOIN sim_jobs source ON source.id=${parent}::uuid
+    JOIN sync_sweep_promises p ON p.id::text=c.request_payload->>'syncPromiseId'
+    JOIN sync_api_settings s ON s.id=1 AND p.registered_solver_id=s.remote_solver_registered_id AND p.source_base_url=s.upstream_base_url
+    WHERE c.id=${child}::uuid AND c.engine_job_id=c.id::text AND c.status IN ('cancelled','failed','done')
+      AND c.engine_state IN ('cancelled','failed','completed') AND (c.ingest_lease_token IS NULL OR c.ingest_lease_expires_at<=clock_timestamp())
+      AND c.airfoil_id=source.airfoil_id AND c.simulation_preset_revision_id=source.simulation_preset_revision_id
+      AND c.request_payload->>'upstreamBaseUrl'=s.upstream_base_url AND p.status IN ('cancelled','expired')
+      AND c.request_payload#>>'{engineRequest,continue_from,engine_job_id}'=${parent}
+      AND c.request_payload#>>'{engineRequest,continue_from,case_slug}'=${caseSlug}
+      AND NOT EXISTS (SELECT FROM progressive_cfd_attempts a WHERE a.sim_job_id=c.id AND a.outcome='running')
+      AND NOT EXISTS (SELECT FROM sim_jobs next WHERE next.status IN ('pending','submitted','running','ingesting')
+        AND(next.parent_job_id=c.id OR next.request_payload#>>'{engineRequest,continue_from,engine_job_id}'=c.engine_job_id))
+      ${lock ? sql`FOR SHARE OF c SKIP LOCKED` : sql``}`);
+  if (rows.length !== 1) throw Error("The named linked continuation is busy or does not own this exact saved case");
+}
+
 async function checkPreservedSolver(id: string, directory: string, plan: ClosedProgressiveReclaimResponse, signal: AbortSignal) {
   const kept = plan.preservedSolver;
   const sample = kept?.sample;
@@ -420,11 +443,18 @@ type RegisteredStop = {
 };
 
 /** A stopped worker need not receive another assignment poll after its hub cancels the promise. */
-async function registeredTerminalPromise(db: DB, id: string, signal?: AbortSignal): Promise<RegisteredStop | undefined> {
-  const [mirror] = await db.execute(sql`SELECT p.status FROM sim_jobs j
+function terminalPromiseSha256(stop: RegisteredStop | undefined) {
+  return stop ? createHash("sha256").update(canonicalAnalysisJson(stop)).digest("hex") : null;
+}
+
+async function registeredTerminalPromise(db: DB, id: string, signal?: AbortSignal, pin = false): Promise<RegisteredStop | undefined> {
+  const [mirror] = await db.execute(sql`SELECT p.status,s.remote_solver_transfer_paused AS paused FROM sim_jobs j
     JOIN sync_sweep_promises p ON p.id::text=j.request_payload->>'syncPromiseId'
+    JOIN sync_api_settings s ON s.id=1 AND p.registered_solver_id=s.remote_solver_registered_id AND p.source_base_url=s.upstream_base_url
     WHERE j.id=${id}::uuid AND j.engine_job_id=${id} AND j.status='cancelled'`);
-  if (mirror?.status !== "active") return undefined;
+  if (!pin && mirror?.status !== "active") return undefined;
+  if (!mirror || mirror.paused !== false || !["active","cancelled","expired"].includes(String(mirror.status)))
+    throw Error("Job has active ownership or registered transfer is paused");
   if (process.env.AIRFOILFOAM_DEPLOYMENT_ROLE !== "remote-solver") throw Error("Job has active ownership");
   const { baseUrl, authToken, envelope } = await registeredWorkerArchiveOwner(db, id);
   const [stop] = await db.execute(sql`SELECT r.sequence,r.content_signature,r.assignment_signature,r.acknowledged_at,r.stopped_engine_job_id,
@@ -444,6 +474,11 @@ async function registeredTerminalPromise(db: DB, id: string, signal?: AbortSigna
     await r.body?.cancel();
     throw Error(`Registered assignment read refused (HTTP ${r.status})`);
   }
+  const declared = r.headers.get("content-length");
+  if (declared !== null && (!/^[0-9]+$/.test(declared) || Number(declared) > 1024 ** 2)) {
+    await r.body.cancel();
+    throw Error("Registered assignment exceeds the owner proof bound");
+  }
   let length = 0;
   const bytes: Buffer[] = [];
   for await (const chunk of r.body as unknown as AsyncIterable<Uint8Array>) {
@@ -451,6 +486,7 @@ async function registeredTerminalPromise(db: DB, id: string, signal?: AbortSigna
     if (length > 1024 ** 2) throw Error("Registered assignment exceeds the owner proof bound");
     bytes.push(Buffer.from(chunk));
   }
+  if (declared !== null && Number(declared) !== length) throw Error("Incomplete registered assignment");
   const observed = JSON.parse(Buffer.concat(bytes).toString("utf8")) as {
     assignment?: { envelope?: unknown; executionStopped?: boolean; receivedSequence?: number;
       promise?: { id?: string; status?: string }; job?: { status?: string; engineState?: string } };
@@ -1001,7 +1037,7 @@ async function record(
     jsonb_build_object('checkedAt',clock_timestamp(),'complete',${complete}::boolean,'retryAfter',CASE WHEN ${complete}::boolean THEN NULL ELSE clock_timestamp()+interval '5 minutes' END,'outcome',${outcome}::text,'bytes',${bytes}::bigint,'files',${files}::int,'planSha256',${planSha256}::text,'verifiedArchives',${verifiedArchives}::int,'scientificSha256',${scientificSha256}::text,'allocation',${JSON.stringify(allocation ?? null)}::jsonb)
     || ${mediaSha256 ? sql`jsonb_build_object('mediaSha256',${mediaSha256}::text)` : sql`'{}'::jsonb`}
     || ${preserved ? sql`jsonb_build_object('preservedSolver',${JSON.stringify(preserved)}::jsonb)` : sql`'{}'::jsonb`}
-    || ${hubStop ? sql`jsonb_build_object('registeredTerminalPromise',${JSON.stringify(hubStop)}::jsonb)` : sql`'{}'::jsonb`})
+    || ${hubStop ? sql`jsonb_build_object('registeredTerminalPromise',${JSON.stringify(hubStop)}::jsonb,'registeredTerminalPromiseSha256',${terminalPromiseSha256(hubStop)}::text)` : sql`'{}'::jsonb`})
     WHERE id=${id}::uuid AND (${historical} OR stripped_at IS NULL) AND (strip_report->${field}::text)->>'complete' IS DISTINCT FROM 'true'`);
 }
 
@@ -1016,9 +1052,11 @@ export async function closedProgressiveJob(
     inspect?: boolean;
     verifyCompleted?: boolean;
     expectedScientificSha256?: string;
+    expectedRegisteredStopSha256?: string | null;
     keepMedia?: boolean;
     historicalRaw?: boolean;
     preserveSolver?: string;
+    linkedContinuation?: string;
     expectedMediaSha256?: string;
     expectedPlan?: string;
     signal?: AbortSignal;
@@ -1037,12 +1075,21 @@ export async function closedProgressiveJob(
   const historical = options.historicalRaw
     ? await historicalCustody(db, id, options.signal)
     : undefined;
-  const hubStop = options.preserveSolver ? await registeredTerminalPromise(db, id, options.signal) : undefined;
+  if (options.linkedContinuation !== undefined && !options.preserveSolver) throw Error("Continuation links require a preserved solver");
+  const hubStop = options.preserveSolver
+    ? await registeredTerminalPromise(db, id, options.signal, Boolean(options.expectedRegisteredStopSha256))
+    : undefined;
+  const stopSha256 = terminalPromiseSha256(hubStop);
+  if ((options.expectedRegisteredStopSha256 !== undefined && options.expectedRegisteredStopSha256 !== stopSha256) ||
+      (!options.inspect && hubStop && !options.expectedRegisteredStopSha256))
+    throw Error("Registered terminal source differs from the pinned read-only proof");
   const source = await db.transaction(async (raw) => {
     const tx = raw as unknown as DB;
     await tx.execute(
       sql`SELECT set_config('statement_timeout',${String(timeoutMs)},true),set_config('lock_timeout','500ms',true)`,
     );
+    if (options.linkedContinuation !== undefined)
+      await assertClosedContinuation(tx, id, options.preserveSolver!, options.linkedContinuation, false);
     const media = options.keepMedia
       ? await registeredImages(tx, id, false, !historical)
       : [];
@@ -1058,6 +1105,12 @@ export async function closedProgressiveJob(
   const manifests = source.archives.map((a) => a.manifest);
   const plan = await engine.reclaimClosedProgressiveFiles(id, manifests);
   checkReceipt(plan, id, "planned");
+  const linked = plan.preservedSolver?.linkedContinuation;
+  if (options.linkedContinuation !== undefined ?
+      !linked || `${linked.jobId}/${linked.caseSlug}` !== options.linkedContinuation ||
+      !/^[a-f0-9]{64}$/.test(linked.pathSetSha256) || !Number.isSafeInteger(linked.sharedFiles) || linked.sharedFiles < 1 ||
+      !Number.isSafeInteger(linked.otherLinks) || linked.otherLinks < linked.sharedFiles : linked !== undefined)
+    throw Error("Native retained continuation links differ from the named owner");
   if (options.preserveSolver) {
     if (!plan.bytes || !plan.files) throw Error("Signed siblings have no positive exact duplicates");
     const caseDir = options.preserveSolver.slice(0, options.preserveSolver.lastIndexOf("/"));
@@ -1243,14 +1296,14 @@ export async function closedProgressiveJob(
       points,
       scientificSha256,
       ...(mediaSha256 ? { mediaSha256, keptMediaRows: source.media } : {}),
-      ...(hubStop ? { registeredTerminalPromise: hubStop } : {}),
+      ...(hubStop ? { registeredTerminalPromise: hubStop, registeredTerminalPromiseSha256: stopSha256! } : {}),
       settled: false,
     };
   let allocation: ClosedProgressiveReclaimResponse["allocation"] = null;
   options.signal?.throwIfAborted();
   // All authenticated network reads finish before the write transaction starts.
-  const confirmedStop = options.preserveSolver ? await registeredTerminalPromise(db, id, options.signal) : undefined;
-  if (hubStop && confirmedStop && canonicalAnalysisJson(hubStop) !== canonicalAnalysisJson(confirmedStop))
+  const confirmedStop = options.preserveSolver ? await registeredTerminalPromise(db, id, options.signal, Boolean(hubStop)) : undefined;
+  if (terminalPromiseSha256(confirmedStop) !== stopSha256)
     throw Error("Registered terminal ownership changed during preflight");
   const settled = await db.transaction(async (raw) => {
     const tx = raw as unknown as DB;
@@ -1261,6 +1314,8 @@ export async function closedProgressiveJob(
       sql`SELECT id FROM sim_jobs WHERE id=${id}::uuid FOR UPDATE SKIP LOCKED`,
     );
     if (!locked) return false;
+    if (options.linkedContinuation !== undefined)
+      await assertClosedContinuation(tx, id, options.preserveSolver!, options.linkedContinuation, true);
     const media = options.keepMedia ? await registeredImages(tx, id, true, !historical) : [];
     const [ready] = await tx.execute(
       sql`SELECT j.id FROM sim_jobs j WHERE j.id=${id}::uuid AND ${eligible(now, ageMs, undefined, media, options.historicalRaw, options.preserveSolver, confirmedStop)}`,
@@ -1327,7 +1382,7 @@ export async function closedProgressiveJob(
       mediaSha256,
       options.historicalRaw,
       plan.preservedSolver,
-      confirmedStop ?? hubStop,
+      confirmedStop,
     );
     return true;
   });
@@ -1337,7 +1392,7 @@ export async function closedProgressiveJob(
     points,
     scientificSha256,
     ...(mediaSha256 ? { mediaSha256, keptMediaRows: source.media } : {}),
-    ...((confirmedStop ?? hubStop) ? { registeredTerminalPromise: confirmedStop ?? hubStop } : {}),
+    ...(confirmedStop ? { registeredTerminalPromise: confirmedStop, registeredTerminalPromiseSha256: stopSha256! } : {}),
     allocation,
     settled,
   };

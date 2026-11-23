@@ -158,6 +158,17 @@ def host_job(package):
                 not any(part in (".","..") for part in name.split("/")) and target.get("keepMedia") is True and
                 not target.get("historicalRaw"), "invalid signed sibling preservation scope")
         scope["preserveSolver"] = name
+        if "terminalStop" in target:
+            pinned = target["terminalStop"]
+            require(pinned is None or (isinstance(pinned,str) and SHA.fullmatch(pinned)), "invalid terminal owner fingerprint")
+            scope["expectedTerminalStop"] = pinned
+    if target.get("linkedContinuation") is not None:
+        value=target["linkedContinuation"]
+        require(scope.get("preserveSolver") and isinstance(value,str) and len(value.split("/"))==2 and
+                UUID.fullmatch(value.split("/")[0]) and value.split("/")[0]!=scope["id"] and
+                re.fullmatch(r"[A-Za-z0-9_.-]+",value.split("/")[1]) and value.split("/")[1] not in (".",".."),
+                "invalid closed continuation scope")
+        scope["linkedContinuation"]=value
     if target.get("historicalRaw"):
         require(target["historicalRaw"] is True,"invalid historical source mode")
         scope["historicalRaw"] = True
@@ -253,6 +264,7 @@ def host_job(package):
                     return {"status": "refused", "reason": str(msg["reason"])[:400], "job": scope["id"]}
                 receipt = msg["value"]
                 require(receipt.get("preserveSolver") == scope.get("preserveSolver"), "unreported solver scope changed")
+                require(receipt.get("linkedContinuation")==scope.get("linkedContinuation"),"linked continuation scope changed")
                 if scope["mode"] in ("proof","verify"):
                     require(count == 1 and receipt["status"] == ("proved" if scope["mode"]=="proof" else "verified") and receipt["databaseReadOnly"] is True and
                             receipt["settled"] is False, "proof peer returned an invalid receipt")
@@ -330,6 +342,26 @@ def read_json(path):
     return json.loads(path.read_bytes())
 
 
+def terminal_stop_digest(receipt):
+    original = receipt.get("registeredTerminalPromise")
+    saved = receipt.get("registeredTerminalPromiseSha256")
+    if original is None:
+        require(saved is None, "missing original terminal witness")
+        return None
+    # df293e44 stored the complete registered witness before it also had its
+    # own hash. These fixed ASCII keys have the same order in canonicalAnalysisJson.
+    keys = {"baseUrl", "solverId", "promiseId", "executionId", "assignmentSignature",
+            "localEnvelopeSha256", "stoppedReportSignature", "receivedSequence",
+            "promiseState", "jobState", "engineState"}
+    require(isinstance(original,dict) and set(original)==keys and
+            type(original["receivedSequence"]) is int and 0<original["receivedSequence"]<=2**53-1 and
+            all(isinstance(original[k],str) and original[k].isascii() for k in keys-{"receivedSequence"}),
+            "invalid original terminal witness")
+    actual = digest(encoded(original))
+    require(saved is None or saved == actual, "terminal witness fingerprint differs from its original")
+    return actual
+
+
 def confirm_reclaim(package, target, effect, qualified=None):
     prior = effect.get("record", {})
     science = effect.get("scientificSha256") or prior.get("scientificSha256")
@@ -340,6 +372,9 @@ def confirm_reclaim(package, target, effect, qualified=None):
         check["historicalRaw"] = True
     if target.get("preserveSolver"):
         check["preserveSolver"] = target["preserveSolver"]
+        check["terminalStop"] = terminal_stop_digest(prior if effect.get("status")=="already-settled" else effect)
+        if target.get("linkedContinuation"):
+            check["linkedContinuation"] = target["linkedContinuation"]
     kept = effect.get("mediaSha256") or prior.get("mediaSha256")
     if target.get("keepMedia"):
         require(isinstance(kept, str) and SHA.fullmatch(kept), "completed keep-set lacks a served-media signature")
@@ -353,6 +388,8 @@ def confirm_reclaim(package, target, effect, qualified=None):
     if target.get("keepMedia"):
         require(after.get("mediaSha256")==kept, "media bytes, served links or legend changed after removal")
     if target.get("preserveSolver"):
+        require(terminal_stop_digest(after) == check["terminalStop"],
+                "post-removal terminal source differs from the saved owner")
         before = effect.get("plan", {}).get("preservedSolver") or prior.get("preservedSolver")
         require(before and before["directory"] == target["preserveSolver"] and after["plan"].get("preservedSolver") == before,
                 "unreported working source changed after the sibling operation")
@@ -485,6 +522,7 @@ def main():
         sub = modes.add_parser(name)
         sub.add_argument("job")
         sub.add_argument("--historical-raw",action="store_true",help="verify historical physical custody and retire only the exact original bundle and its authenticated unpacked raw members")
+        sub.add_argument("--linked-continuation",help="retain all hardlink aliases in one exact terminal continuation UUID/case")
         sub.add_argument("--preserve-solver", help="pin and retain one unreported next URANS solver while releasing only verified copies in signed siblings")
         sub.add_argument("--keep-media", action="store_true", help="retain all proven instantaneous PNGs and verify stable, legacy and engine reads")
         sub.add_argument("plan", nargs="?" if name == "proof" else None)
@@ -520,6 +558,9 @@ def main():
         if args.preserve_solver is not None:
             require(args.keep_media and not args.historical_raw, "signed sibling release requires the complete local media inventory")
             item["preserveSolver"] = args.preserve_solver
+        if args.linked_continuation is not None:
+            require(bool(args.preserve_solver), "linked continuation requires an explicitly preserved solver")
+            item["linkedContinuation"] = args.linked_continuation
         if args.historical_raw:
             item["historicalRaw"] = True
             require(args.mode != "reclaim" or args.proof_receipt is not None, "historical raw removal needs the live original-file restore proof")
@@ -533,9 +574,19 @@ def main():
                     proof["job"]==args.job and proof["plan"]["plan"]==args.plan and proof["plan"]["bytes"]>0 and
                     proof["readbacks"] and SHA.fullmatch(proof["scientificSha256"]), "invalid pinned pre-removal proof")
             require(proof.get("preserveSolver") == args.preserve_solver, "proof belongs to another sibling custody scope")
+            require(proof.get("linkedContinuation")==args.linked_continuation, "proof belongs to a different linked continuation")
+            if args.linked_continuation:
+                linked=proof["plan"]["preservedSolver"].get("linkedContinuation") or {}
+                require(str(linked.get("jobId"))+"/"+str(linked.get("caseSlug"))==args.linked_continuation and
+                        SHA.fullmatch(linked.get("pathSetSha256","")) and linked.get("sharedFiles",0)>0,
+                        "unproved continuation hardlink paths")
             if args.preserve_solver:
                 require(proof["plan"].get("preservedSolver",{}).get("directory")==args.preserve_solver,
                         "named remaining solver differs from the file proof")
+                stop = proof.get("registeredTerminalPromise")
+                require(stop is None or (isinstance(stop,dict) and stop.get("executionId")==args.job),
+                        "terminal owner proof belongs to another job")
+                item["terminalStop"] = terminal_stop_digest(proof)
             require(bool(proof.get("historicalRaw")) == args.historical_raw, "proof belongs to another custody mode")
             require(bool(proof.get("mediaSha256")) == bool(args.keep_media), "proof belongs to another retention mode")
             if args.keep_media:
