@@ -1,7 +1,7 @@
 // Retain the reviewed, authenticated preview and the ordinary public VPS
 // journey together. Production Google credentials stay in the user's browser.
 import assert from "node:assert/strict";
-import { cp, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { cp, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { chromium, expect, request } from "@playwright/test";
 import {
@@ -62,7 +62,8 @@ const pair = JSON.parse(
     "utf8",
   ),
 );
-const route = origin + "/admin?campaign=" + pair.campaignId;
+const entryRoute = origin + "/admin";
+const campaignPath = "/admin?campaign=" + pair.campaignId;
 const api = await request.newContext({ baseURL: origin });
 const socket = await mkdtemp("/tmp/airfoils-campaign-handoff-");
 const target = "campaign-selected-evidence";
@@ -96,17 +97,23 @@ try {
   await publishDirectory(
     join(qa, "campaign-evidence-delivery"),
     async (directory) => {
+      const evidencePath = "journey/campaign-selected-evidence";
+      const evidenceDir = join(directory, evidencePath);
+      await mkdir(evidenceDir, { recursive: true });
       const preview = await browser.newPage({
         storageState: await api.storageState(),
         viewport: { width: 1206, height: 954 },
       });
-      const document = await preview.goto(route, {
+      const document = await preview.goto(entryRoute, {
         waitUntil: "domcontentloaded",
       });
       assert.equal(document.status(), 200);
       assert.equal(document.headers()["x-ui-source-revision"], local.webBuild);
       const html = await document.body();
       await writeFile(join(directory, "campaign.html"), html);
+      await preview.getByRole("button", { name: "All", exact: true }).click();
+      await preview.locator(`a[href="${campaignPath}"]`).click();
+      await expect(preview).toHaveURL(origin + campaignPath);
       const cell = preview.getByTestId(
         `matrix-cell-${pair.airfoilSlug}-${pair.conditionOrd}`,
       );
@@ -139,8 +146,15 @@ try {
           await expect(
             modal.getByRole("button", { name: "custom render", exact: true }),
           ).toHaveCount(0);
+        const screenshot = stage + "-selected.png";
+        const png = await preview.screenshot({
+          path: join(evidenceDir, screenshot),
+          animations: "disabled",
+        });
         observed.push({
           stage,
+          screenshot,
+          screenshotSha256: sha(png),
           resultId: data.resultId,
           attemptId: data.resultAttemptId,
           cl: data.cl,
@@ -207,12 +221,20 @@ try {
       assert.equal(actual.resultAttemptId, input.publicAttemptId);
       assert.equal(actual.history.t.length, input.sampleCount);
       await expect(live.getByTestId("sim-modal-dialog")).toBeVisible();
-      await expect(live.getByTestId("sim-accent-stats")).toBeVisible();
+      const coefficients = live.getByTestId(
+        actual.observation ? "sim-attempt-evidence" : "sim-accent-stats",
+      );
+      await expect(coefficients).toBeVisible();
+      if (actual.observation) {
+        await expect(coefficients).toContainText(actual.cl.toFixed(4));
+        await expect(coefficients).toContainText(actual.cd.toFixed(5));
+      }
       await live.screenshot({
         path: join(directory, "live-selected-solver-result.png"),
         animations: "disabled",
       });
-      await writeJson(join(directory, "journeys.json"), {
+      await writeJson(join(evidenceDir, "downstream.json"), {
+        source_sha256: local.sourceSha256,
         fixture: {
           deployment: before.data.deployment_id,
           generation: before.data.current_generation,
@@ -257,7 +279,7 @@ try {
         file: "campaign.html",
         observed_sha256: sha(html),
         checked_at_ms: Date.now(),
-        access: route,
+        access: entryRoute,
         observation: "web_route_passed",
         deployment: {
           deployment_id: before.data.deployment_id,
@@ -279,11 +301,17 @@ try {
             expected_result:
               "The authenticated campaign preview reads the chosen fast or final attempt. The public VPS reads an exact stored production history and enforces Google authentication on the administration route.",
             evidence_refs: [
-              "journeys.json",
+              evidencePath + "/downstream.json",
               "formal-receipt.json",
               "manual-review.json",
               "product-design.json",
               "vps-deployment.json",
+              "live-selected-solver-result.png",
+            ],
+            rendered_evidence_refs: [
+              evidencePath + "/downstream.json",
+              evidencePath + "/fast-selected.png",
+              evidencePath + "/final-selected.png",
               "live-selected-solver-result.png",
             ],
           },
