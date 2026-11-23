@@ -243,7 +243,7 @@ def main():
             active=[j for j in keys if j not in holds]
             for j in set(keys)&holds:
                 results.extend(dict(j=j,r=r["r"],state="held",reason="coordinated owner hold",allocated=0)for r in groups[j])
-            width=1 if mode=="canary" else 8
+            width=1 if mode=="canary" else 128
             for i in range(0,len(active),width):
                 jobs=active[i:i+width]
                 batch=[r for j in jobs for r in (groups[j][:1] if mode=="canary" else groups[j])]

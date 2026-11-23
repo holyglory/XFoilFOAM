@@ -27,14 +27,15 @@ class Database:
         raise RuntimeError("closed-job database fence was lost")
 
     def close(self):
-        self.process.stdin.close()
+        try:self.process.stdin.close()
+        except BrokenPipeError:pass
         self.process.wait(timeout=8)
 
     @contextmanager
     def fence(self, ids):
         self.query("BEGIN")
         try:
-            self.query("SET LOCAL statement_timeout='15s'; SET LOCAL lock_timeout='300ms'; SET LOCAL idle_in_transaction_session_timeout='120s'")
+            self.query("SET LOCAL statement_timeout='75s'; SET LOCAL jit=off; SET LOCAL max_parallel_workers_per_gather=0; SET LOCAL lock_timeout='300ms'; SET LOCAL idle_in_transaction_session_timeout='120s'")
             vals=_values(ids)
             sql=f"""WITH wanted(native) AS(VALUES {vals}), owners AS MATERIALIZED(
               SELECT w.native,j.id FROM wanted w JOIN public.sim_jobs j ON j.engine_job_id=w.native::text OR j.id=w.native
@@ -71,15 +72,22 @@ class Database:
             yield result
         finally:
             # This operator only locks and reads; it never writes solver records.
-            self.query("ROLLBACK")
+            if self.process.poll() is None:
+                try:self.query("ROLLBACK")
+                except (BrokenPipeError,RuntimeError):
+                    if self.process.poll() is None:raise
 
     def references(self, mapping):
         vals=",".join("('%s'::uuid,'%s'::uuid)"%(uuid.UUID(j),uuid.UUID(db)) for j,db in mapping.items())
         # Case-scoped catalogs are authoritative even if raw data was already
         # moved. Only potentially relevant path declarations leave the database.
-        return self.query(f"""WITH k(native,id) AS(VALUES {vals}), artifacts AS MATERIALIZED(
+        return self.query(f"""WITH k(native,id) AS(VALUES {vals}), matched AS MATERIALIZED(
+           SELECT a.id,a.sim_job_id,a.engine_job_id,a.engine_case_slug,a.storage_key,a.engine_url,a.metadata
+           FROM public.solver_evidence_artifacts a WHERE a.sim_job_id IN (SELECT id FROM k)
+             OR a.engine_job_id IN (SELECT native::text FROM k)
+        ), artifacts AS MATERIALIZED(
            SELECT k.native,a.id,a.engine_case_slug AS slug,a.storage_key,a.engine_url,a.metadata
-           FROM k JOIN public.solver_evidence_artifacts a ON a.sim_job_id=k.id OR a.engine_job_id=k.native::text
+           FROM matched a JOIN k ON a.sim_job_id=k.id OR a.engine_job_id=k.native::text
         ), attempts AS MATERIALIZED(
            SELECT k.native,a.id,a.result_id FROM k JOIN public.result_attempts a ON a.sim_job_id=k.id OR a.engine_job_id=k.native::text
         ), refs AS (
