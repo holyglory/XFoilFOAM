@@ -463,7 +463,7 @@ export async function verifyCancelledReportCopyReplay(
       expect(await readProgressiveRemoteSourceClassifications(db,id)).toEqual(originalClassification);
       expect(await readProgressiveRemoteRetention(db,id)).toEqual(waiting);
       const frozenStop=await db.execute(sql`SELECT proof_signature FROM progressive_cfd_execution_stops WHERE sim_job_id=${id}::uuid`);
-      expect(await acknowledgeLatestProgressiveRemoteStop(db,id)).toBe(true);
+      expect(await acknowledgeLatestProgressiveRemoteStop(db,id)).toBe(false); // The existing stop was replayed.
       expect(await db.execute(sql`SELECT proof_signature FROM progressive_cfd_execution_stops WHERE sim_job_id=${id}::uuid`)).toEqual(frozenStop);
       const originalItem={...latePoint,progressiveEvidence:delivery.progressiveEvidence};
       const originalReplay=await post(originalItem);expect(originalReplay.statusCode,originalReplay.body).toBe(200);
