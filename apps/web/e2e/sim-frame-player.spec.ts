@@ -35,6 +35,7 @@ const frames = Array.from({ length: FRAME_COUNT }, (_, k) => ({
 const fixtureSim = {
   status: "solved",
   regime: "stalled",
+  uransFlowOutcome: "periodic",
   airfoilName: "fixture",
   alpha: 16,
   re: 200000,
@@ -84,6 +85,7 @@ const fixtureSim = {
 const ransSim = {
   status: "solved",
   regime: "attached",
+  numericalConvergence: true,
   airfoilName: "fixture",
   alpha: 4,
   re: 200000,
@@ -275,7 +277,7 @@ test.describe("URANS frame-synced player (fixture-intercepted sim payload)", () 
 
     // Header chips: regime/classification, stationarity, St/frequency.
     const chips = page.getByTestId("sim-frame-chips");
-    await expect(chips).toContainText("URANS · vortex shedding");
+    await expect(chips).toContainText("URANS · periodic flow");
     await expect(page.getByTestId("sim-chip-stationary")).toContainText("stationary ✓");
     await expect(chips).toContainText("6 periods");
     await expect(chips).toContainText("St 0.21");

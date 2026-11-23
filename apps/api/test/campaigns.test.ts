@@ -64,6 +64,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { db, sql as pgClient } from "../src/db";
 import { buildServer } from "../src/server";
 import { createExactResultAttemptFixture } from "./exact-result-fixture";
+import { insertCampaignStageAttempt } from "./campaign-stage-fixture";
 
 const RUN_STAMP = Date.now();
 const PREFIX = `pw-camp-${process.pid}-${RUN_STAMP.toString(36)}`;
@@ -4006,40 +4007,13 @@ describe("cell preliminary outcomes stay separate from ordinary RANS failures", 
       state: "rejected",
       reasons: ["not-converged"],
     });
-    const [fastAttempt] = await db
-      .insert(resultAttempts)
-      .values({
-        resultId: fastResult.id,
-        airfoilId: asymId,
-        bcId: condition.bc_id,
-        simulationPresetRevisionId: condition.revision_id,
-        aoaDeg: 4,
-        simJobId: fastChildJob.id,
-        engineJobId: `${PREFIX}-fast-final-flow`,
-        engineCaseSlug: "aoa_4.00",
-        status: "done",
-        source: "solved",
-        regime: "urans",
-        validForPolar: true,
-        cl: 0.44,
-        cd: 0.017,
-        cm: -0.02,
-        converged: true,
-        unsteady: true,
-        evidencePayload: { fidelity: "urans_precalc" },
-        solvedAt: new Date(),
-      })
-      .returning({ id: resultAttempts.id });
-    await db.insert(resultClassifications).values({
-      resultAttemptId: fastAttempt.id,
-      airfoilId: asymId,
-      simulationPresetRevisionId: condition.revision_id,
-      aoaDeg: 4,
-      regime: "urans",
-      classifierVersion: "authoritative-preliminary-flow-fast-v1",
-      state: "accepted",
-      reasons: [],
-    });
+    const cell = {
+      resultId: fastResult.id, airfoilId: asymId, bcId: condition.bc_id,
+      simulationPresetRevisionId: condition.revision_id, aoaDeg: 4,
+    };
+    const { attempt: fastAttempt } = await insertCampaignStageAttempt(
+      db, cell, "fast", fastChildJob.id, `${PREFIX}-fast-final-flow`,
+    );
     await db
       .update(results)
       .set({ currentResultAttemptId: fastAttempt.id })
@@ -4272,43 +4246,9 @@ describe("cell preliminary outcomes stay separate from ordinary RANS failures", 
       ],
     });
 
-    const [verifyAttempt] = await db
-      .insert(resultAttempts)
-      .values({
-        resultId: fastResult.id,
-        airfoilId: asymId,
-        bcId: condition.bc_id,
-        simulationPresetRevisionId: condition.revision_id,
-        aoaDeg: 4,
-        simJobId: verifyJob.id,
-        engineJobId: `${PREFIX}-verify-final-flow`,
-        engineCaseSlug: "aoa_4.00",
-        status: "done",
-        source: "solved",
-        regime: "urans",
-        validForPolar: true,
-        cl: 0.45,
-        cd: 0.018,
-        cm: -0.021,
-        converged: true,
-        unsteady: true,
-        evidencePayload: { fidelity: "urans_full" },
-        solvedAt: new Date(),
-      })
-      .returning({ id: resultAttempts.id });
-    const [verifyClassification] = await db
-      .insert(resultClassifications)
-      .values({
-        resultAttemptId: verifyAttempt.id,
-        airfoilId: asymId,
-        simulationPresetRevisionId: condition.revision_id,
-        aoaDeg: 4,
-        regime: "urans",
-        classifierVersion: "authoritative-preliminary-flow-verify-v1",
-        state: "accepted",
-        reasons: [],
-      })
-      .returning({ id: resultClassifications.id });
+    const { attempt: verifyAttempt, classification: verifyClassification } = await insertCampaignStageAttempt(
+      db, cell, "final", verifyJob.id, `${PREFIX}-verify-final-flow`,
+    );
     await db
       .update(results)
       .set({
@@ -4375,6 +4315,19 @@ describe("cell preliminary outcomes stay separate from ordinary RANS failures", 
         },
       ],
     });
+
+    for (const [attempt, fidelity, cl] of [
+      [fastAttempt, "urans_precalc", 0.44], [verifyAttempt, "urans_full", 0.45],
+    ] as const) {
+      const response = await app.inject({
+        method: "GET", url: `/api/admin/point-history/${fastResult.id}/sim?resultAttemptId=${attempt.id}`,
+      });
+      expect(response.statusCode).toBe(200);
+      expect(response.json()).toMatchObject({
+        resultId: fastResult.id, resultAttemptId: attempt.id, fidelity, cl,
+        numericalConvergence: true, uransFlowOutcome: null, renderTarget: null,
+      });
+    }
 
     // MUST-CATCH: an exact accepted final generation stays authoritative even
     // if the earlier FAST obligation genuinely exhausted. Availability and

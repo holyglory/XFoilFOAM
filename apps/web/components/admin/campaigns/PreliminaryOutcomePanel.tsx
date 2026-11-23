@@ -36,6 +36,7 @@ const angleLabel = (aoaDeg: number) => `α ${f1(aoaDeg)}°`;
 
 export interface PreliminaryResultTarget {
   resultId: string;
+  resultAttemptId: string;
   aoaDeg: number;
   sourceAoaDeg: number;
   tier: "fast" | "final";
@@ -380,7 +381,7 @@ export function PreliminaryOutcomePanel({
             44px;
           align-items: center;
         }
-        .stage-node {
+        .row-track :global(.stage-node) {
           position: relative;
           width: 44px;
           height: 44px;
@@ -389,17 +390,17 @@ export function PreliminaryOutcomePanel({
           border-radius: 999px;
           color: ${C.dimmer};
         }
-        button.stage-node {
+        .row-track :global(button.stage-node) {
           padding: 0;
           border: 0;
           background: transparent;
           font: inherit;
           cursor: pointer;
         }
-        button.stage-node:hover {
+        .row-track :global(button.stage-node:hover) {
           background: transparent;
         }
-        button.stage-node:hover::before {
+        .row-track :global(button.stage-node:hover::before) {
           content: "";
           position: absolute;
           inset: 9px;
@@ -407,57 +408,57 @@ export function PreliminaryOutcomePanel({
           border-radius: 999px;
           background: ${C.panel3};
         }
-        .stage-node > svg,
-        .stage-node > .final-icon-stack,
-        .stage-node > .sr-only {
+        .row-track :global(.stage-node > svg),
+        .row-track :global(.stage-node > .final-icon-stack),
+        .row-track :global(.stage-node > .sr-only) {
           position: relative;
           z-index: 1;
         }
-        button.stage-node:focus-visible {
+        .row-track :global(button.stage-node:focus-visible) {
           outline: 2px solid ${C.teal};
           outline-offset: 2px;
         }
-        .stage-node.screened,
-        .stage-node.accepted {
+        .row-track :global(.stage-node.screened),
+        .row-track :global(.stage-node.accepted) {
           color: ${C.teal};
         }
-        .stage-node.polar_handoff {
+        .row-track :global(.stage-node.polar_handoff) {
           color: ${C.violet};
         }
-        .stage-node.handoff {
+        .row-track :global(.stage-node.handoff) {
           color: ${C.muted};
         }
-        .stage-node.skipped {
+        .row-track :global(.stage-node.skipped) {
           color: ${C.muted};
         }
-        .stage-node.queued,
-        .stage-node.running {
+        .row-track :global(.stage-node.queued),
+        .row-track :global(.stage-node.running) {
           color: ${C.violet};
         }
-        .stage-node.automatic-next {
+        .row-track :global(.stage-node.automatic-next) {
           color: ${C.violet};
         }
-        .stage-node.critical {
+        .row-track :global(.stage-node.critical) {
           color: ${C.red};
         }
-        .stage-node.comparison-warning,
-        .stage-node.update-warning {
+        .row-track :global(.stage-node.comparison-warning),
+        .row-track :global(.stage-node.update-warning) {
           color: ${C.amber};
         }
-        .stage-node.not_started {
+        .row-track :global(.stage-node.not_started) {
           color: ${C.dimmer};
         }
-        .final-icon-stack {
+        .row-track :global(.final-icon-stack) {
           position: relative;
           width: 20px;
           height: 20px;
           display: inline-grid;
           place-items: center;
         }
-        .final-icon-stack .accepted-mark {
+        .row-track :global(.final-icon-stack .accepted-mark) {
           color: ${C.teal};
         }
-        .final-icon-stack .activity-mark {
+        .row-track :global(.final-icon-stack .activity-mark) {
           position: absolute;
           right: -3px;
           bottom: -3px;
@@ -466,11 +467,11 @@ export function PreliminaryOutcomePanel({
           background: ${C.panel};
           box-sizing: content-box;
         }
-        .final-icon-stack .activity-mark.queued,
-        .final-icon-stack .activity-mark.running {
+        .row-track :global(.final-icon-stack .activity-mark.queued),
+        .row-track :global(.final-icon-stack .activity-mark.running) {
           color: ${C.violet};
         }
-        .final-icon-stack .activity-mark.warning {
+        .row-track :global(.final-icon-stack .activity-mark.warning) {
           color: ${C.amber};
         }
         .connector {
@@ -762,6 +763,9 @@ export function PreliminaryOutcomePanel({
             gap: 7px;
             padding-inline: 9px;
           }
+          .shared-rail {
+            grid-template-columns: max-content max-content max-content minmax(12px, 1fr) max-content;
+          }
           .shared-stage {
             gap: 4px;
           }
@@ -786,7 +790,7 @@ export function PreliminaryOutcomePanel({
             font-size: 9.5px;
           }
         }
-        @media (max-width: 500px) {
+        @media (max-width: 600px) {
           .handoff-header {
             align-items: flex-start;
           }
@@ -806,9 +810,16 @@ export function PreliminaryOutcomePanel({
             grid-column: 3;
           }
           .shared-rail {
+            grid-column: 2 / -1;
             grid-template-columns:
-              auto minmax(12px, 1fr) auto minmax(12px, 1fr)
+              auto max-content auto minmax(8px, 1fr)
               auto;
+          }
+          .flow-exit {
+            grid-template-columns: auto max-content;
+          }
+          .flow-exit::before {
+            display: none;
           }
           .shared-stage svg {
             display: none;
@@ -1095,20 +1106,21 @@ export function PreliminaryOutcomePanel({
                     testId={`cell-preliminary-fast-${item.aoaDeg}`}
                     current={currentStage === "fast"}
                     title={
-                      item.fastResultId
+                      item.fastResultId && item.fastResultAttemptId
                         ? `Open preliminary URANS result: ${view.fastLabel}`
                         : `Preliminary URANS: ${view.fastLabel}`
                     }
                     openLabel={
-                      item.fastResultId
+                      item.fastResultId && item.fastResultAttemptId
                         ? `Open preliminary URANS result for ${label}`
                         : undefined
                     }
                     onOpen={
-                      item.fastResultId && onOpenResult
+                      item.fastResultId && item.fastResultAttemptId && onOpenResult
                         ? () =>
                             onOpenResult({
                               resultId: item.fastResultId!,
+                              resultAttemptId: item.fastResultAttemptId!,
                               aoaDeg: item.aoaDeg,
                               sourceAoaDeg: item.sourceAoaDeg,
                               tier: "fast",
@@ -1155,20 +1167,21 @@ export function PreliminaryOutcomePanel({
                     testId={`cell-preliminary-final-${item.aoaDeg}`}
                     current={currentStage === "final"}
                     title={
-                      item.finalResultId
+                      item.finalResultId && item.finalResultAttemptId
                         ? `Open verified URANS result: ${view.finalLabel}`
                         : `Verified URANS: ${view.finalLabel}`
                     }
                     openLabel={
-                      item.finalResultId
+                      item.finalResultId && item.finalResultAttemptId
                         ? `Open verified URANS result for ${label}`
                         : undefined
                     }
                     onOpen={
-                      item.finalResultId && onOpenResult
+                      item.finalResultId && item.finalResultAttemptId && onOpenResult
                         ? () =>
                             onOpenResult({
                               resultId: item.finalResultId!,
+                              resultAttemptId: item.finalResultAttemptId!,
                               aoaDeg: item.aoaDeg,
                               sourceAoaDeg: item.sourceAoaDeg,
                               tier: "final",

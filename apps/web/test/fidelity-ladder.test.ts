@@ -130,6 +130,20 @@ describe("fidelityChipView", () => {
     expect(
       fidelityChipView("urans_precalc", verifyInfo({ state: "done" })),
     ).toEqual({ label: "URANS final · verified", tone: "teal" });
+    expect(
+      fidelityChipView(
+        "urans_precalc",
+        verifyInfo({ state: "done" }),
+        "attempt",
+      ),
+    ).toEqual({ label: "URANS fast", tone: "amber" });
+    expect(
+      fidelityChipView(
+        "urans_full",
+        verifyInfo({ state: "disagreed" }),
+        "attempt",
+      ),
+    ).toEqual({ label: "URANS final", tone: "teal" });
   });
 
   it("urans_full: teal final-URANS verification", () => {

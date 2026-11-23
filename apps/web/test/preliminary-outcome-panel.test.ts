@@ -29,6 +29,15 @@ const source = readFileSync(
   ),
   "utf8",
 );
+const cellSidePanelSource = readFileSync(
+  fileURLToPath(
+    new URL(
+      "../components/admin/campaigns/CellSidePanel.tsx",
+      import.meta.url,
+    ),
+  ),
+  "utf8",
+);
 
 describe("per-point solver sequence panel", () => {
   it("MUST-CATCH: maps every AoA to one row containing the complete three-stage rail", () => {
@@ -63,6 +72,20 @@ describe("per-point solver sequence panel", () => {
     expect(source).toContain(
       "An accepted RANS result stops there; aerodynamic non-convergence hands off automatically",
     );
+    expect(source).toContain("resultAttemptId: item.fastResultAttemptId!");
+    expect(source).toContain("resultAttemptId: item.finalResultAttemptId!");
+    expect(source).toContain(
+      "item.fastResultId && item.fastResultAttemptId && onOpenResult",
+    );
+    expect(source).toContain(
+      "item.finalResultId && item.finalResultAttemptId && onOpenResult",
+    );
+    expect(cellSidePanelSource).toContain(
+      "resultAttemptId: target.resultAttemptId",
+    );
+    expect(cellSidePanelSource).toContain(
+      "getPointAttemptSim(simCtx.resultId!, simCtx.resultAttemptId)",
+    );
   });
 
   it("keeps technical evidence nested and collapsed, and makes critical rows system-owned and visually red", () => {
@@ -89,7 +112,7 @@ describe("per-point solver sequence panel", () => {
 
   it("keeps stage controls accessible without enlarging their visual glyphs and holds disclosure geometry stable", () => {
     expect(source).toMatch(
-      /\.stage-node \{[\s\S]*?width: 44px;[\s\S]*?height: 44px;/,
+      /\.row-track :global\(\.stage-node\) \{[\s\S]*?width: 44px;[\s\S]*?height: 44px;/,
     );
     expect(source).toContain("button.stage-node:hover::before");
     expect(source).toContain("inset: 9px");

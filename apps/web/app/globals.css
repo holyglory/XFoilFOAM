@@ -106,6 +106,16 @@ body {
 html {
   scroll-padding-top: 60px;
 }
+.campaign-detail,
+.campaign-evidence-drawer {
+  --aero-dim: var(--aero-muted);
+  --aero-dimmest: var(--aero-muted);
+  --aero-red-text: var(--aero-red);
+}
+[data-theme="light"] .simulation-evidence-dialog,
+[data-theme="light"] .campaign-evidence-drawer {
+  --aero-violet: #6345b3;
+}
 .catalog-page-shell {
   --aero-dim: var(--aero-muted);
   display: grid;
@@ -726,6 +736,10 @@ button.campaign-instrument-exception-action:focus-visible {
 
   .campaign-progress-gauge {
     width: min(390px, 100%);
+    max-width: 100%;
+    min-width: 0;
+    height: 222px;
+    aspect-ratio: auto;
   }
 
   .campaign-instrument-stage-rail {

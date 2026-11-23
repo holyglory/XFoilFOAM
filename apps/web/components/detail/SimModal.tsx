@@ -206,6 +206,7 @@ export function SimModal(props: {
   const [widthPx, setWidthPx] = useState(990);
   const [heightPx, setHeightPx] = useState(660);
   const [renderToolsOpen, setRenderToolsOpen] = useState(false);
+  const renderRequest = useRef<AbortController | null>(null);
   const [expandedRenderControl, setExpandedRenderControl] = useState<
     "role" | "zoom" | "map" | "levels" | "scale" | "resolution" | null
   >(null);
@@ -328,6 +329,17 @@ export function SimModal(props: {
       ? sim.media?.[f]
       : undefined;
   const activeStoredMedia = realField(activeFieldId);
+  const renderTarget =
+    sim?.status === "solved" &&
+    sim.resultId === ctx?.resultId &&
+    activeFieldId &&
+    (sim.availableFields.includes(activeFieldId) ||
+      playerModel?.fields.includes(activeFieldId) ||
+      sim.evidenceArtifacts?.some(
+        (artifact) => artifact.field === activeFieldId,
+      ))
+      ? sim.renderTarget
+      : null;
   const fieldChoices = useMemo(() => {
     const out: string[] = [];
     const add = (value: string | null | undefined) => {
@@ -355,6 +367,8 @@ export function SimModal(props: {
         turbulenceModel: sim.condition?.turbulenceModel,
         transportActive,
         hasRecordedFrames: Boolean(playerModel),
+        uransFlowOutcome: sim.uransFlowOutcome,
+        numericalConvergence: sim.numericalConvergence,
       })
     : null;
   const sortedTrack = useMemo(
@@ -435,7 +449,16 @@ export function SimModal(props: {
     setReviewError(null);
     setReviewHistory([]);
     setReviewDismissed(false);
-  }, [ctx?.re, ctx?.aoa, ctx?.resultId]);
+    setRenderBusy(false);
+    return () => renderRequest.current?.abort();
+  }, [
+    open,
+    ctx?.re,
+    ctx?.aoa,
+    ctx?.resultId,
+    sim?.resultAttemptId,
+    sim?.renderTarget?.manifestSha256,
+  ]);
 
   useEffect(() => {
     if (!open || !reviewLayerEligible || !ctx?.resultId) return;
@@ -682,24 +705,33 @@ export function SimModal(props: {
       : null;
 
   const requestCustomRender = async () => {
-    if (!ctx?.resultId || !activeFieldId) return;
+    if (!ctx?.resultId || !activeFieldId || !renderTarget) return;
+    renderRequest.current?.abort();
+    const controller = new AbortController();
+    renderRequest.current = controller;
     setRenderBusy(true);
     setRenderError(null);
     try {
-      const rendered = await renderResultField(ctx.resultId, {
-        field: activeFieldId,
-        role: customRole,
-        scaleMode,
-        zoomChords,
-        colormap,
-        levels,
-        vmin: scaleMode === "manual" && vmin.trim() ? Number(vmin) : null,
-        vmax: scaleMode === "manual" && vmax.trim() ? Number(vmax) : null,
-        frameIndex:
-          customRole === "instantaneous" && playerModel ? frameIdx : null,
-        widthPx,
-        heightPx,
-      });
+      const rendered = await renderResultField(
+        ctx.resultId,
+        {
+          field: activeFieldId,
+          role: customRole,
+          scaleMode,
+          zoomChords,
+          colormap,
+          levels,
+          vmin: scaleMode === "manual" && vmin.trim() ? Number(vmin) : null,
+          vmax: scaleMode === "manual" && vmax.trim() ? Number(vmax) : null,
+          frameIndex:
+            customRole === "instantaneous" && playerModel ? frameIdx : null,
+          widthPx,
+          heightPx,
+        },
+        renderTarget,
+        controller.signal,
+      );
+      if (controller.signal.aborted) return;
       setCustomRender({
         field: rendered.field,
         role: rendered.role as "instantaneous" | "mean",
@@ -707,9 +739,12 @@ export function SimModal(props: {
         cached: rendered.cached,
       });
     } catch (e) {
-      setRenderError((e as Error).message);
+      if (!controller.signal.aborted) setRenderError((e as Error).message);
     } finally {
-      setRenderBusy(false);
+      if (renderRequest.current === controller) {
+        renderRequest.current = null;
+        setRenderBusy(false);
+      }
     }
   };
 
@@ -991,7 +1026,7 @@ export function SimModal(props: {
     );
   };
   const renderTools = () => {
-    if (sim?.status !== "solved") return null;
+    if (!renderTarget) return null;
     return (
       <div style={{ display: "grid", gap: 8 }}>
         {!renderToolsOpen ? (
@@ -1694,9 +1729,15 @@ export function SimModal(props: {
     }
     return (
       <HeaderChip
-        color={C.teal}
-        border={C.tealBorder}
-        text={`converged${iterText}`}
+        color={sim.numericalConvergence === true ? C.teal : C.muted}
+        border={sim.numericalConvergence === true ? C.tealBorder : C.stroke}
+        text={
+          sim.numericalConvergence === true
+            ? `converged${iterText}`
+            : sim.numericalConvergence === false
+              ? `did not converge${iterText}`
+              : "convergence unreported"
+        }
       />
     );
   };
@@ -1880,7 +1921,12 @@ export function SimModal(props: {
             sub: `±${fmt(steadySummary.clHalfAmplitude, 3)} Cl over ${steadySummary.iterCount.toLocaleString()} iters`,
           }
         : {
-            value: "✓ steady",
+            value:
+              sim.numericalConvergence === true
+                ? "converged"
+                : sim.numericalConvergence === false
+                  ? "did not converge"
+                  : "unreported",
             sub:
               [
                 sim.condition?.mesh?.finalResidual == null
@@ -1907,20 +1953,20 @@ export function SimModal(props: {
           label="Cl"
           color={C.teal}
           value={fmt(sim.cl, 4)}
-          sub="converged coefficient"
+          sub="stored coefficient"
         />
         <AccentStat
           label="Cd"
           color={C.amber}
           value={fmt(sim.cd, 5)}
-          sub="converged coefficient"
+          sub="stored coefficient"
         />
         <AccentStat
           label="Cm"
           color={C.text}
           value={fmtOptional(sim.cm, 4)}
           sub={
-            sim.cm == null ? "coefficient unavailable" : "converged coefficient"
+            sim.cm == null ? "coefficient unavailable" : "stored coefficient"
           }
         />
         <AccentStat
@@ -2380,6 +2426,7 @@ export function SimModal(props: {
       `}</style>
       <dialog
         ref={dialogRef}
+        className="simulation-evidence-dialog"
         data-testid="sim-modal-dialog"
         role="dialog"
         aria-modal="true"
@@ -2461,7 +2508,11 @@ export function SimModal(props: {
             // Fidelity ladder chip (same truth table as every classification
             // surface): plain for RANS/pre-ladder rows.
             const view = sim
-              ? fidelityChipView(sim.fidelity ?? null, sim.uransVerify ?? null)
+              ? fidelityChipView(
+                  sim.fidelity ?? null,
+                  sim.uransVerify ?? null,
+                  sim.resultAttemptId ? "attempt" : "point",
+                )
               : null;
             if (!view) return null;
             const color =
@@ -2494,7 +2545,13 @@ export function SimModal(props: {
               </span>
             );
           })()}
-          <span style={{ fontWeight: 600, fontSize: 15 }}>{name}</span>
+          <span
+            role="heading"
+            aria-level={2}
+            style={{ fontWeight: 600, fontSize: 15 }}
+          >
+            {name}
+          </span>
           <span style={{ fontFamily: MONO, fontSize: 12, color: C.muted }}>
             Re {reStr}&nbsp;&nbsp;·&nbsp;&nbsp;M {shownMach}
           </span>

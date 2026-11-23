@@ -1,6 +1,8 @@
 import { pointStage } from "../public-point-timing";
 import {
   canonicalAoa,
+  FRAME_TRACK_PERIOD_EPSILON,
+  parseNoSheddingCertificate,
   type FieldId,
   type FieldMedia,
   type FrameTrackDetail,
@@ -39,6 +41,7 @@ import type { SimulationSetupSnapshot } from "@aerodb/db/simulation-setup";
 import { and, desc, eq, getTableColumns, inArray, isNull, sql } from "drizzle-orm";
 
 import { db } from "../db";
+import { currentRenderManifest, remoteRenderAuthorities } from "../render-target";
 import { mediaStore, resultMediaUrl } from "../media-store";
 import { readStoredForceHistory } from "../solver-history-reader";
 import { readSelectedAttemptDetailFields } from "../selected-attempt-detail-fields";
@@ -127,26 +130,28 @@ const selectedDetailColumns = {
   },
   attempt: {
     ...attemptDetailColumns,
-    detailPayload: sql`CASE WHEN ${resultAttempts.evidenceArchiveId} IS NULL THEN jsonb_build_object(
-      'frame_track', ${evidencePayload}->'frame_track',
-      'frameTrack', ${evidencePayload}->'frameTrack',
-      'steady_history', ${evidencePayload}->'steady_history',
-      'steadyHistory', ${evidencePayload}->'steadyHistory',
-      'fidelity', ${evidencePayload}->'fidelity') END`.mapWith(evidencePayload),
+    detailPayload: sql`CASE WHEN ${resultAttempts.evidenceArchiveId} IS NULL THEN (
+      WITH doc AS MATERIALIZED (SELECT ${evidencePayload} || '{}'::jsonb AS value)
+      SELECT jsonb_build_object(
+        'frame_track',value->'frame_track', 'frameTrack',value->'frameTrack',
+        'steady_history',value->'steady_history', 'steadyHistory',value->'steadyHistory', 'fidelity',value->'fidelity',
+        'no_shedding_certificate',value->'no_shedding_certificate', 'noSheddingCertificate',value->'noSheddingCertificate')
+      FROM doc) END`.mapWith(evidencePayload),
   },
 };
+
+type SelectedDetailResult = Result & { selectedAttempt: DetailAttempt; noSheddingCertificate: unknown };
 
 /** The result owns the physical cell. The public or admin selector chooses
  * the attempt that supplies the solver outputs and provenance. */
 async function selectedResultProjection(
   result: Result,
   attempt: DetailAttempt,
-): Promise<Result> {
+): Promise<SelectedDetailResult> {
   const payload = await pointStage("attemptFields", readSelectedAttemptDetailFields(db, attempt));
   return {
     ...result,
-    // A historical detail response names its own generation.
-    currentResultAttemptId: attempt.id,
+    selectedAttempt: attempt,
     status: attempt.status,
     source: attempt.source,
     regime: attempt.regime,
@@ -170,6 +175,7 @@ async function selectedResultProjection(
     error: attempt.error,
     qualityWarnings: attempt.qualityWarnings,
     frameTrack: payload.frame_track ?? payload.frameTrack ?? null,
+    noSheddingCertificate: payload.no_shedding_certificate ?? payload.noSheddingCertificate,
     fidelity: typeof payload.fidelity === "string" ? payload.fidelity : null,
     steadyHistory: payload.steady_history ?? payload.steadyHistory ?? null,
     simJobId: attempt.simJobId,
@@ -283,13 +289,37 @@ async function uransVerifyDetailOf(
   return item ?? null;
 }
 
+function hasPeriodLockedFrames(track: FrameTrackDetail | null): boolean {
+  if (!track || track.periodS === null || track.periodS <= 0 || track.frames.length < 2) return false;
+  const { tStart, tEnd } = track.window;
+  // The engine reports fractional periods available, but the statistics window
+  // covers their whole-period floor. Frames may cover just the last few periods.
+  const cycles = Math.floor(track.periodsRetained + FRAME_TRACK_PERIOD_EPSILON);
+  const windowCycles = (tEnd - tStart) / track.periodS;
+  if (cycles < 1 || Math.abs(windowCycles - cycles) > FRAME_TRACK_PERIOD_EPSILON * cycles) return false;
+  const tolerance = FRAME_TRACK_PERIOD_EPSILON * Math.max(1, Math.abs(tStart), Math.abs(tEnd));
+  return track.frames.every((frame, index, frames) => frame.t >= tStart - tolerance && frame.t <= tEnd + tolerance &&
+    (index === 0 || (frame.t > frames[index - 1]!.t && frame.i > frames[index - 1]!.i)));
+}
+
+function recordedUransFlowOutcome(
+  r: SelectedDetailResult, track: FrameTrackDetail | null,
+): SimulationDetail["uransFlowOutcome"] {
+  if (r.fidelity !== "urans_precalc" && r.fidelity !== "urans_full" &&
+      !(r.fidelity === null && r.regime === "urans")) return null;
+  const periodic = hasPeriodLockedFrames(track);
+  if (r.noSheddingCertificate != null)
+    return !periodic && parseNoSheddingCertificate(r.noSheddingCertificate).ok ? "no_shedding" : null;
+  return periodic ? "periodic" : null;
+}
+
 async function solvedDetail(
   name: string,
   re: number,
-  r: Result,
+  r: SelectedDetailResult,
   observation?: SimulationDetail["observation"],
 ): Promise<SimulationDetailWithReview | null> {
-  if (!r.currentResultAttemptId) return null;
+  const attempt = r.selectedAttempt;
   if (
     (!observation &&
       (!finiteStored(r.cl) || !finiteStored(r.cd) || r.cd <= 0)) ||
@@ -321,7 +351,7 @@ async function solvedDetail(
     .where(
       and(
         eq(resultMedia.resultId, r.id),
-        eq(resultMedia.resultAttemptId, r.currentResultAttemptId!),
+        eq(resultMedia.resultAttemptId, attempt.id),
       ),
     ));
   const rows = mediaCandidates
@@ -396,7 +426,7 @@ async function solvedDetail(
           eq(solverEvidenceArtifacts.resultId, r.id),
           eq(
             solverEvidenceArtifacts.resultAttemptId,
-            r.currentResultAttemptId!,
+            attempt.id,
           ),
           eq(solverEvidenceArtifacts.kind, FRAME_IMAGE_ARTIFACT_KIND),
         ),
@@ -410,7 +440,7 @@ async function solvedDetail(
           eq(solverEvidenceArtifacts.resultId, r.id),
           eq(
             solverEvidenceArtifacts.resultAttemptId,
-            r.currentResultAttemptId!,
+            attempt.id,
           ),
           inArray(solverEvidenceArtifacts.kind, [
             "manifest",
@@ -431,7 +461,7 @@ async function solvedDetail(
     .where(
       and(
         eq(forceHistory.resultId, r.id),
-        eq(forceHistory.resultAttemptId, r.currentResultAttemptId!),
+        eq(forceHistory.resultAttemptId, attempt.id),
       ),
     )
     .limit(1));
@@ -513,11 +543,26 @@ async function solvedDetail(
           mesh: snapshotMesh,
         }
       : null;
+  const frameTrack = frameTrackDetailOf(r, frameArtifacts);
+  const manifest = currentRenderManifest(r, attempt, evidenceRows);
+  let renderTarget: SimulationDetail["renderTarget"] = null;
+  if (manifest && rows.some(row => row.field && Object.hasOwn(ENGINE_TO_FIELD, row.field) &&
+    (!row.evidenceSha256 || row.evidenceSha256 === manifest.sha256))) {
+    const delegated = !attempt.engineJobId || !attempt.engineCaseSlug || attempt.engineJobId.startsWith("sync:");
+    const available = delegated
+      ? (await remoteRenderAuthorities({ resultId: r.id, resultAttemptId: attempt.id, evidenceSha256: manifest.sha256 })).length === 1
+      : typeof manifest.metadata?.evidenceBase === "string" && !!manifest.metadata.evidenceBase.trim() &&
+        finiteStored(r.chord) && r.chord > 0 && finiteStored(r.speed) && r.speed > 0;
+    if (available) renderTarget = { resultAttemptId: attempt.id, manifestSha256: manifest.sha256 };
+  }
   return {
+    renderTarget,
     resultId: r.id,
+    numericalConvergence: r.converged ?? null,
+    uransFlowOutcome: recordedUransFlowOutcome(r, frameTrack),
     status: observation ? "evidence" : "solved",
     ...(observation
-      ? { observation, resultAttemptId: r.currentResultAttemptId }
+      ? { observation, resultAttemptId: attempt.id }
       : {}),
     regime: r.unsteady ? "stalled" : "attached",
     airfoilName: name,
@@ -546,7 +591,7 @@ async function solvedDetail(
       metadata: row.metadata ?? {},
     })),
     history: hist ? { t: hist.t, cl: hist.cl, cd: hist.cd } : null,
-    frameTrack: frameTrackDetailOf(r, frameArtifacts),
+    frameTrack,
     fidelity: parsePointFidelity(r.fidelity),
     steadyHistory: steadyHistoryDetailOf(r),
     uransVerify: await uransVerifyDetailOf(r),
@@ -882,5 +927,6 @@ export async function assembleAdminSim(
   const projected = await selectedResultProjection(selected.result, selected.attempt);
   const effectiveRe = projected.reynolds ?? selected.revisionReynolds;
   if (!finiteStored(effectiveRe) || effectiveRe <= 0) return null;
-  return solvedDetail(selected.airfoilName, effectiveRe, projected);
+  const detail = await solvedDetail(selected.airfoilName, effectiveRe, projected);
+  return detail ? { ...detail, resultAttemptId: selected.attempt.id } : null;
 }

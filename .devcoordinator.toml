@@ -5642,7 +5642,7 @@ tier = "development"
 timeout_seconds = 600
 requires = ["seed"]
 env = { PROGRESSIVE_REPORT_ARCHIVE_DISPOSABLE_DB = "1" }
-command = ["/bin/bash", "-c", "exec /usr/bin/corepack pnpm --filter @aerodb/sweeper exec vitest run --no-file-parallelism test/progressive-report-archive.test.ts test/progressive-terminal-mirror.test.ts --reporter=default --reporter=junit --outputFile.junit=\"$DEVCOORDINATOR_DIAGNOSTICS_DIR/report.xml\""]
+command = ["/bin/bash", "scripts/dev/run-vitest-with-diagnostics.sh", "@aerodb/sweeper", "--no-file-parallelism", "test/progressive-report-archive.test.ts", "test/progressive-terminal-mirror.test.ts"]
 diagnostic_sources = [{ format = "junit", path = "report.xml" }]
 
 # The actual lock-timeout tests contend on the singleton worker identity and
@@ -5662,7 +5662,7 @@ name = "worker-replay"
 tier = "development"
 timeout_seconds = 600
 requires = ["seed"]
-command = ["/bin/bash", "-c", "exec /usr/bin/corepack pnpm --filter @aerodb/sweeper exec vitest run test/progressive-worker-outbox-replay.test.ts --reporter=default --reporter=junit --outputFile.junit=\"$DEVCOORDINATOR_DIAGNOSTICS_DIR/report.xml\""]
+command = ["/bin/bash", "scripts/dev/run-vitest-with-diagnostics.sh", "@aerodb/sweeper", "test/progressive-worker-outbox-replay.test.ts"]
 diagnostic_sources = [{ format = "junit", path = "report.xml" }]
 
 [[test.progressive-report-archive.check]]
@@ -5670,7 +5670,7 @@ name = "retained-report-api"
 tier = "development"
 timeout_seconds = 300
 requires = ["seed"]
-command = ["/bin/bash", "-c", "exec /usr/bin/corepack pnpm --filter @aerodb/api exec vitest run test/retained-report-routes.test.ts --reporter=default --reporter=junit --outputFile.junit=\"$DEVCOORDINATOR_DIAGNOSTICS_DIR/report.xml\""]
+command = ["/bin/bash", "scripts/dev/run-vitest-with-diagnostics.sh", "@aerodb/api", "test/retained-report-routes.test.ts"]
 diagnostic_sources = [{ format = "junit", path = "report.xml" }]
 
 [[test.progressive-report-archive.check]]
@@ -5679,7 +5679,7 @@ tier = "development"
 timeout_seconds = 300
 requires = ["workspace"]
 env = { VITEST_PURE_REDUCER_TEST = "1" }
-command = ["/bin/bash", "-c", "exec /usr/bin/corepack pnpm --filter @aerodb/sweeper exec vitest run test/progressive-report-archive-roundtrip.test.ts test/report-archive-broker-client.test.ts test/attempt-evidence-archive.test.ts test/legacy-worker-report-read.test.ts test/legacy-worker-report-product-read.test.ts test/legacy-report-result-transport.test.ts --reporter=default --reporter=junit --outputFile.junit=\"$DEVCOORDINATOR_DIAGNOSTICS_DIR/report.xml\""]
+command = ["/bin/bash", "scripts/dev/run-vitest-with-diagnostics.sh", "@aerodb/sweeper", "test/progressive-report-archive-roundtrip.test.ts", "test/report-archive-broker-client.test.ts", "test/attempt-evidence-archive.test.ts", "test/legacy-worker-report-read.test.ts", "test/legacy-worker-report-product-read.test.ts", "test/legacy-report-result-transport.test.ts"]
 diagnostic_sources = [{ format = "junit", path = "report.xml" }]
 
 [[test.progressive-report-archive.check]]
@@ -5688,7 +5688,7 @@ tier = "development"
 timeout_seconds = 300
 requires = ["workspace"]
 env = { VITEST_PURE_REDUCER_TEST = "1" }
-command = ["/bin/bash", "-c", "exec /usr/bin/corepack pnpm --filter @aerodb/sweeper exec vitest run test/progressive-report-archive-volume.test.ts --reporter=default --reporter=junit --outputFile.junit=\"$DEVCOORDINATOR_DIAGNOSTICS_DIR/report.xml\""]
+command = ["/bin/bash", "scripts/dev/run-vitest-with-diagnostics.sh", "@aerodb/sweeper", "test/progressive-report-archive-volume.test.ts"]
 diagnostic_sources = [{ format = "junit", path = "report.xml" }]
 
 [[test.progressive-report-archive.check]]
@@ -5696,7 +5696,7 @@ name = "solver-history-storage"
 tier = "development"
 timeout_seconds = 300
 requires = ["seed"]
-command = ["/bin/bash", "-c", "exec /usr/bin/corepack pnpm --filter @aerodb/sweeper exec vitest run test/solver-history-storage.test.ts test/result-history-storage.test.ts test/attempt-evidence-gcs.test.ts test/solver-history-service.test.ts test/result-history-service.test.ts --reporter=default --reporter=junit --outputFile.junit=\"$DEVCOORDINATOR_DIAGNOSTICS_DIR/report.xml\""]
+command = ["/bin/bash", "scripts/dev/run-vitest-with-diagnostics.sh", "@aerodb/sweeper", "test/solver-history-storage.test.ts", "test/result-history-storage.test.ts", "test/attempt-evidence-gcs.test.ts", "test/solver-history-service.test.ts", "test/result-history-service.test.ts"]
 diagnostic_sources = [{ format = "junit", path = "report.xml" }]
 
 # Legacy fixtures install their historical schema in an empty database. The
@@ -5794,7 +5794,7 @@ name = "attempt-history-transition"
 tier = "development"
 timeout_seconds = 600
 requires = ["solver-history-storage"]
-command = ["/bin/bash", "-c", "exec /usr/bin/corepack pnpm --filter @aerodb/sweeper exec vitest run test/attempt-evidence-settlement.test.ts --reporter=default --reporter=junit --outputFile.junit=\"$DEVCOORDINATOR_DIAGNOSTICS_DIR/report.xml\""]
+command = ["/bin/bash", "scripts/dev/run-vitest-with-diagnostics.sh", "@aerodb/sweeper", "test/attempt-evidence-settlement.test.ts"]
 diagnostic_sources = [{ format = "junit", path = "report.xml" }]
 
 [[test.progressive-report-archive.check]]
@@ -5803,7 +5803,7 @@ tier = "development"
 timeout_seconds = 600
 requires = ["report-readers", "attempt-history-transition"]
 env = { PROGRESSIVE_REPORT_ARCHIVE_DISPOSABLE_DB = "1" }
-command = ["/bin/bash", "-c", "exec /usr/bin/corepack pnpm --filter @aerodb/sweeper exec vitest run test/attempt-evidence-consumer-integration.test.ts --reporter=default --reporter=junit --outputFile.junit=\"$DEVCOORDINATOR_DIAGNOSTICS_DIR/report.xml\""]
+command = ["/bin/bash", "scripts/dev/run-vitest-with-diagnostics.sh", "@aerodb/sweeper", "test/attempt-evidence-consumer-integration.test.ts"]
 diagnostic_sources = [{ format = "junit", path = "report.xml" }]
 
 [[test.progressive-report-archive.check]]
@@ -5812,7 +5812,7 @@ tier = "development"
 timeout_seconds = 600
 requires = ["schema"]
 env = { VITEST_PURE_REDUCER_TEST = "1" }
-command = ["/bin/bash", "-c", "exec /usr/bin/corepack pnpm --filter @aerodb/sweeper exec vitest run test/hz-point-history-storage.test.ts test/hz-point-history-protocol.test.ts --reporter=default --reporter=junit --outputFile.junit=\"$DEVCOORDINATOR_DIAGNOSTICS_DIR/report.xml\""]
+command = ["/bin/bash", "scripts/dev/run-vitest-with-diagnostics.sh", "@aerodb/sweeper", "test/hz-point-history-storage.test.ts", "test/hz-point-history-protocol.test.ts"]
 diagnostic_sources = [{ format = "junit", path = "report.xml" }]
 
 [[test.progressive-report-archive.check]]
@@ -5828,7 +5828,7 @@ name = "report-readers"
 tier = "development"
 timeout_seconds = 300
 requires = ["schema"]
-command = ["/bin/bash", "-c", "exec /usr/bin/corepack pnpm --filter @aerodb/db exec vitest run test/progressive-report-reader.test.ts test/attempt-evidence-reader.test.ts test/attempt-evidence-consumers.test.ts --reporter=default --reporter=junit --outputFile.junit=\"$DEVCOORDINATOR_DIAGNOSTICS_DIR/report.xml\""]
+command = ["/bin/bash", "scripts/dev/run-vitest-with-diagnostics.sh", "@aerodb/db", "test/progressive-report-reader.test.ts", "test/attempt-evidence-reader.test.ts", "test/attempt-evidence-consumers.test.ts"]
 diagnostic_sources = [{ format = "junit", path = "report.xml" }]
 
 [[test.progressive-report-archive.check]]
@@ -5857,7 +5857,7 @@ name = "report-protocol"
 tier = "development"
 timeout_seconds = 600
 requires = ["schema"]
-command = ["/bin/bash", "-c", "exec /usr/bin/corepack pnpm --filter @aerodb/db exec vitest run test/progressive-report-retention.test.ts test/progressive-remote-report.test.ts --reporter=default --reporter=junit --outputFile.junit=\"$DEVCOORDINATOR_DIAGNOSTICS_DIR/report.xml\""]
+command = ["/bin/bash", "scripts/dev/run-vitest-with-diagnostics.sh", "@aerodb/db", "test/progressive-report-retention.test.ts", "test/progressive-remote-report.test.ts"]
 diagnostic_sources = [{ format = "junit", path = "report.xml" }]
 
 [[test.progressive-report-archive.check]]
@@ -5865,7 +5865,7 @@ name = "broker-and-storage-api"
 tier = "development"
 timeout_seconds = 300
 requires = ["seed"]
-command = ["/bin/bash", "-c", "exec /usr/bin/corepack pnpm --filter @aerodb/api exec vitest run test/report-archive-broker.test.ts test/progressive-report-archive-reader.test.ts test/legacy-worker-report-read.test.ts --reporter=default --reporter=junit --outputFile.junit=\"$DEVCOORDINATOR_DIAGNOSTICS_DIR/report.xml\""]
+command = ["/bin/bash", "scripts/dev/run-vitest-with-diagnostics.sh", "@aerodb/api", "test/report-archive-broker.test.ts", "test/progressive-report-archive-reader.test.ts", "test/legacy-worker-report-read.test.ts"]
 diagnostic_sources = [{ format = "junit", path = "report.xml" }]
 
 [[test.progressive-report-archive.check]]
@@ -5873,7 +5873,7 @@ name = "force-history-api"
 tier = "development"
 timeout_seconds = 1200
 requires = ["seed"]
-command = ["/bin/bash", "-c", "exec /usr/bin/corepack pnpm --filter @aerodb/api exec vitest run test/exact-generation-public.test.ts test/sync-remote-validation.test.ts --reporter=default --reporter=junit --outputFile.junit=\"$DEVCOORDINATOR_DIAGNOSTICS_DIR/report.xml\""]
+command = ["/bin/bash", "scripts/dev/run-vitest-with-diagnostics.sh", "@aerodb/api", "test/exact-generation-public.test.ts", "test/sync-remote-validation.test.ts"]
 diagnostic_sources = [{ format = "junit", path = "report.xml" }]
 
 [[test.progressive-report-archive.check]]
@@ -5881,7 +5881,7 @@ name = "terminal-recovery"
 tier = "development"
 timeout_seconds = 900
 requires = ["seed"]
-command = ["/bin/bash", "-c", "exec /usr/bin/corepack pnpm --filter @aerodb/db exec vitest run test/campaign-profile-enrollment.test.ts -t 'terminal evidence inventory preserves exact ownership|recovers an authenticated mixed RANS promotion from a fresh stage-2 execution|progressive remote dispatch pins one exact request|progressive remote dispatch composes only after authenticated capabilities' --reporter=default --reporter=junit --outputFile.junit=\"$DEVCOORDINATOR_DIAGNOSTICS_DIR/report.xml\""]
+command = ["/bin/bash", "scripts/dev/run-vitest-with-diagnostics.sh", "@aerodb/db", "test/campaign-profile-enrollment.test.ts", "-t", "terminal evidence inventory preserves exact ownership|recovers an authenticated mixed RANS promotion from a fresh stage-2 execution|progressive remote dispatch pins one exact request|progressive remote dispatch composes only after authenticated capabilities"]
 diagnostic_sources = [{ format = "junit", path = "report.xml" }]
 
 # Exact per-attempt shortening boundary: disposable schema, real 0207/0208,
@@ -6061,6 +6061,44 @@ cases = [{ id = "disposable-index-and-rewrite", args = [], postgres = "default" 
 [test.catalog-web-delivery]
 timeout_seconds = 300
 
+[test.campaign-attempt-design-audit]
+timeout_seconds = 100
+
+[[test.campaign-attempt-design-audit.check]]
+name = "capture"
+tier = "release"
+command = ["node", "scripts/dev/capture-admin-evidence-audit.mjs"]
+retained_artifacts = [{name="campaign-attempt-audit",path=".codex-artifacts/campaign-attempt-audit",max_bytes=16777216}]
+
+[test.campaign-stage-layout]
+timeout_seconds = 3600
+
+[[test.campaign-stage-layout.check]]
+name = "verifier"
+tier = "release"
+command = ["/usr/local/bin/devcoordinator2-tooling", "formal-ui", "self-test"]
+
+[[test.campaign-stage-layout.check]]
+name = "layout"
+tier = "release"
+requires = ["verifier"]
+timeout_seconds = 3000
+command = ["node", "scripts/dev/verify-admin-stage-layout.mjs"]
+
+[test.campaign-stage-attempt-evidence]
+timeout_seconds = 480
+
+[[test.campaign-stage-attempt-evidence.check]]
+name = "modal"
+tier = "release"
+timeout_seconds = 360
+command = ["node", "scripts/dev/verify-admin-attempt-journey.mjs"]
+
+[[test.campaign-stage-attempt-evidence.check]]
+name = "identity-contract"
+tier = "release"
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/web", "exec", "vitest", "run", "test/preliminary-outcome-panel.test.ts"]
+
 [[test.catalog-web-delivery.check]]
 name = "contract"
 tier = "release"
@@ -6154,6 +6192,41 @@ name = "capture"
 tier = "release"
 command = ["node", "scripts/dev/capture-catalog-audit.mjs"]
 retained_artifacts = [{ name = "catalog-audit-captures", path = ".codex-artifacts/catalog-design-audit", max_bytes = 16777216 }]
+
+# Private stopped-solver variant of the catalog deployment for campaign attempt navigation.
+[deployment.campaign-stage-preview]
+source = ["worktree"]
+components = ["db", "api", "web"]
+public = false
+ttl_seconds = 86400
+
+[deployment.campaign-stage-preview.component.db]
+type = "postgres"
+image = "postgres:16-alpine"
+database = "aerodb_campaign_stage"
+user = "aerodb"
+
+[deployment.campaign-stage-preview.component.api]
+type = "process"
+command = ["bash", "scripts/dev/catalog-paging-api.sh", "--campaign-stage-fixture"]
+port = true
+depends_on = ["db"]
+health = { path = "/health", timeout_seconds = 240 }
+
+[deployment.campaign-stage-preview.component.web]
+type = "process"
+command = ["bash", "scripts/dev/progressive-preview.sh", "web"]
+port = true
+depends_on = ["api"]
+health = { path = "/", timeout_seconds = 600 }
+
+[test.campaign-stage-preview]
+timeout_seconds = 90
+
+[[test.campaign-stage-preview.check]]
+name = "authenticated-stage-reads"
+tier = "development"
+command = ["node", "scripts/dev/verify-campaign-stage-fixture.mjs"]
 
 # Isolated measurement only. The capture step supplies the private binary PG corpus.
 [test.hz-worker-rewrite-cost]

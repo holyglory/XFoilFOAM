@@ -516,6 +516,8 @@ export async function renderResultField(
     widthPx?: number;
     heightPx?: number;
   },
+  target: NonNullable<SimulationDetail["renderTarget"]>,
+  signal?: AbortSignal,
 ): Promise<{
   id: string;
   cached: boolean;
@@ -531,7 +533,12 @@ export async function renderResultField(
     `/api/results/${encodeURIComponent(resultId)}/render`,
     {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: {
+        "content-type": "application/json",
+        "x-xfoilfoam-expected-result-attempt-id": target.resultAttemptId,
+        "x-xfoilfoam-expected-evidence-sha256": target.manifestSha256,
+      },
+      signal,
       body: JSON.stringify(body),
     },
   );

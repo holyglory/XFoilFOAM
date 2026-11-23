@@ -553,7 +553,7 @@ export function CampaignDetail({
   );
 
   return (
-    <div data-testid="campaign-detail" style={{ display: "grid", gap: 14 }}>
+    <div className="campaign-detail" data-testid="campaign-detail" style={{ display: "grid", gap: 14 }}>
       {/* One identity line: campaign name is the only headline. */}
       <div className="campaign-instrument-title-row">
         <button

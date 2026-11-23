@@ -1,8 +1,6 @@
-import { Suspense } from "react";
 import { cookies } from "next/headers";
 
-import { AdminConsole } from "@/components/admin/AdminConsole";
-import { AppShell } from "@/components/shell/AppShell";
+import { AdminPageShell } from "@/components/admin/AdminPageShell";
 import type { AdminBootstrap } from "@/components/admin/AdminConsole";
 
 export const dynamic = "force-dynamic";
@@ -53,15 +51,5 @@ export default async function AdminPage({
     !params.campaign &&
     !params.wizard;
   const initialBootstrap = isCampaignHub ? await loadAdminBootstrap() : null;
-  return (
-    <AppShell active="admin">
-      <div style={{ maxWidth: 1280, margin: "0 auto", padding: "24px 22px 56px" }}>
-        {/* AdminConsole reads useSearchParams (URL is the routing source of
-            truth, spec §11) — Next requires a Suspense boundary above it. */}
-        <Suspense fallback={null}>
-          <AdminConsole initialBootstrap={initialBootstrap} />
-        </Suspense>
-      </div>
-    </AppShell>
-  );
+  return <AdminPageShell initialBootstrap={initialBootstrap} />;
 }

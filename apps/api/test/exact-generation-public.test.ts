@@ -56,6 +56,8 @@ vi.mock("../src/db", async (original) => {
 });
 
 import { checkHzHistoryApi } from "./hz-point-history-fixture";
+import { noSheddingCertificate } from "../../../packages/core/test/no-shedding-fixture";
+import { periodicPoint } from "../../../packages/db/test-support/periodic-urans-point";
 
 const PREFIX = `api-exact-${process.pid}-${Date.now().toString(36)}`;
 const sha = (value: string): string =>
@@ -561,9 +563,102 @@ describe("public exact-generation reads", () => {
       cl: 0.63,
       cd: 0.014,
       ld: 45,
+      renderTarget: { resultAttemptId: currentAttemptId, manifestSha256: currentManifestSha },
       availableFields: ["vorticity"],
       history: { t: [10, 11], cl: [0.62, 0.63], cd: [0.013, 0.014] },
     });
+  });
+
+  it("offers a custom render only for the exact current manifest and preserves historical downloads", async () => {
+    const publicUrl = `/api/airfoils/${PREFIX}-foil/sim?resultId=${resultId}`;
+    const adminUrl = `/api/admin/point-history/${resultId}/sim?resultAttemptId=`;
+    async function read(url: string) {
+      const response = await app.inject({ method: "GET", url });
+      expect(response.statusCode, response.body).toBe(200);
+      return response.json();
+    }
+    const old = await read(adminUrl + oldAttemptId);
+    expect(old).toMatchObject({ resultAttemptId: oldAttemptId, renderTarget: null });
+    expect(old.evidenceArtifacts).toContainEqual(expect.objectContaining({ sha256: sha(`${PREFIX}-old-manifest`) }));
+    expect(await read(adminUrl + currentAttemptId)).toMatchObject({
+      renderTarget: { resultAttemptId: currentAttemptId, manifestSha256: currentManifestSha },
+    });
+
+    const rollback = new Error("roll back render manifest fixture");
+    await expect(db.transaction(async tx => {
+      attemptReadScope.connection = tx as unknown as DB;
+      try {
+        const owned = and(eq(solverEvidenceArtifacts.resultAttemptId, currentAttemptId), eq(solverEvidenceArtifacts.kind, "manifest"));
+        await tx.update(solverEvidenceArtifacts).set({ engineCaseSlug: "old-case" }).where(owned);
+        for (const url of [publicUrl, adminUrl + currentAttemptId]) {
+          expect(await read(url)).toMatchObject({ renderTarget: null,
+            evidenceArtifacts: [expect.objectContaining({ sha256: currentManifestSha })] });
+        }
+        await tx.delete(solverEvidenceArtifacts).where(owned);
+        for (const url of [publicUrl, adminUrl + currentAttemptId]) {
+          expect(await read(url)).toMatchObject({ renderTarget: null, availableFields: ["vorticity"], evidenceArtifacts: [] });
+        }
+      } finally { attemptReadScope.connection = null; }
+      throw rollback;
+    })).rejects.toBe(rollback);
+  });
+
+  it("reports only numerical convergence and URANS outcomes recorded on the requested generation", async () => {
+    const restore = new Error("rollback scoped outcome fixture");
+    await expect(db.transaction(async (tx) => {
+      attemptReadScope.connection = tx as unknown as DB;
+      try {
+        const track = periodicPoint(4, 5, true).frame_track!;
+        const publicUrl = `/api/airfoils/${PREFIX}-foil/sim?resultId=${resultId}`;
+        const adminUrl = `/api/admin/point-history/${resultId}/sim?resultAttemptId=`;
+        async function read(url: string) {
+          const res = await app.inject({ method: "GET", url });
+          expect(res.statusCode, res.body).toBe(200);
+          return res.json();
+        }
+        // Stale result-level values must never replace either exact attempt.
+        await tx.update(results).set({ converged: true, unsteady: true, frameTrack: track }).where(eq(results.id, resultId));
+        await tx.update(resultAttempts).set({ converged: false, unsteady: true, regime: "urans",
+          evidencePayload: { fidelity: "urans_precalc" } }).where(eq(resultAttempts.id, oldAttemptId));
+        expect(await read(adminUrl + oldAttemptId)).toMatchObject({
+          resultAttemptId: oldAttemptId, numericalConvergence: false, uransFlowOutcome: null, frameTrack: null,
+        });
+        const cases = [
+          [{ frame_track: track }, "periodic"],
+          [{ no_shedding_certificate: noSheddingCertificate }, "no_shedding"],
+          [{ noSheddingCertificate: noSheddingCertificate }, "no_shedding"],
+          [{ no_shedding_certificate: { ...noSheddingCertificate, certified: false } }, null],
+          [{ no_shedding_certificate: noSheddingCertificate, frame_track: track }, null],
+          [{ frame_track: { ...track, period_s: null } }, null],
+          [{ frame_track: { ...track, frames: [] } }, null],
+          [{ frame_track: { ...track, window: { t_start: 0, t_end: 0.071 } } }, null],
+          [{ frame_track: { ...track, frames: [...track.frames].reverse() } }, null],
+        ] as const;
+        for (const [evidence, expected] of cases) {
+          // Each independent source starts inline. Roll back its savepoint
+          // rather than deleting history from a previously observed generation.
+          try {
+            await tx.transaction(async (scoped) => {
+              attemptReadScope.connection = scoped as unknown as DB;
+              await scoped.update(resultAttempts).set({ converged: true, regime: "urans",
+                evidencePayload: { fidelity: "urans_full", ...evidence } })
+                .where(eq(resultAttempts.id, currentAttemptId));
+              for (const url of [publicUrl, adminUrl + currentAttemptId]) {
+                const body = await read(url);
+                expect(body).toMatchObject({ numericalConvergence: true, uransFlowOutcome: expected });
+                if (expected === "periodic") expect(body.frameTrack).toMatchObject({
+                  periodS: track.period_s, periodsRetained: track.periods_retained,
+                });
+              }
+              throw restore;
+            });
+          } catch (error) {
+            if (error !== restore) throw error;
+          } finally { attemptReadScope.connection = tx as unknown as DB; }
+        }
+      } finally { attemptReadScope.connection = null; }
+      throw restore;
+    })).rejects.toBe(restore);
   });
 
   it("opens a selected result by ID when Reynolds is stored only on its immutable setup", async () => {
@@ -694,6 +789,7 @@ describe("public exact-generation reads", () => {
       });
       expect(detail.statusCode).toBe(200);
       expect(detail.json()).toMatchObject({
+        renderTarget: null,
         availableFields: [],
         media: null,
       });
@@ -962,6 +1058,10 @@ describe("public exact-generation reads", () => {
     );
     vi.stubGlobal("fetch", fetchMock);
     try {
+      const detail = await app.inject({ method: "GET", url: `/api/airfoils/${PREFIX}-foil/sim?resultId=${resultId}` });
+      expect(detail.statusCode).toBe(200);
+      expect(detail.json().renderTarget).toEqual({ resultAttemptId: currentAttemptId, manifestSha256: currentManifestSha });
+      expect(fetchMock).not.toHaveBeenCalled();
       const response = await app.inject({
         method: "POST",
         url: `/api/results/${resultId}/render`,

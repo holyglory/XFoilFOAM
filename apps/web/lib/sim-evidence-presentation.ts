@@ -10,6 +10,8 @@ export interface SimEvidencePresentationInput {
   turbulenceModel?: string | null;
   transportActive?: boolean;
   hasRecordedFrames?: boolean;
+  uransFlowOutcome?: "periodic" | "no_shedding" | null;
+  numericalConvergence?: boolean | null;
   observation?: SimulationDetail["observation"];
 }
 
@@ -29,6 +31,8 @@ export function simEvidencePresentation({
   turbulenceModel,
   transportActive = false,
   hasRecordedFrames = false,
+  uransFlowOutcome = null,
+  numericalConvergence = null,
   observation,
 }: SimEvidencePresentationInput): SimEvidencePresentation {
   if (observation)
@@ -59,6 +63,19 @@ export function simEvidencePresentation({
   const model = turbulenceModel?.trim() || "solver";
 
   if (method === "RANS") {
+    if (!shedding && numericalConvergence !== true) {
+      return {
+        method,
+        methodChip: "RANS · steady",
+        mediaTag: "RANS · steady static",
+        provenance: `RANS ${model} · stored coefficients`,
+        historyTitle: "Recorded coefficients",
+        historyText:
+          numericalConvergence === false
+            ? "The solver recorded coefficients before reaching numerical convergence."
+            : "The stored attempt has no convergence assessment.",
+      };
+    }
     return {
       method,
       methodChip: shedding ? "RANS · stalled" : "RANS · steady",
@@ -75,27 +92,41 @@ export function simEvidencePresentation({
     };
   }
 
+  const periodic = uransFlowOutcome === "periodic";
+  if (!periodic && uransFlowOutcome !== "no_shedding") {
+    return {
+      method,
+      methodChip: "URANS",
+      mediaTag: transportActive
+        ? `RECORDED FRAMES · ${tier}`
+        : `${tier} · stored evidence`,
+      provenance: `${tier} ${model} · recorded coefficients`,
+      historyTitle: "Recorded coefficients",
+      historyText:
+        "The stored evidence does not establish whether this flow was periodic.",
+    };
+  }
   return {
     method,
-    methodChip: shedding
-      ? "URANS · vortex shedding"
+    methodChip: periodic
+      ? "URANS · periodic flow"
       : "URANS · steady (no shedding)",
     mediaTag: transportActive
       ? `RECORDED FRAMES · ${tier}`
-      : shedding
+      : periodic
         ? `${tier} · mean static`
         : `${tier} · steady static`,
-    provenance: shedding
+    provenance: periodic
       ? `${tier} ${model} · ${
           hasRecordedFrames
             ? "engine-recorded period-locked frame evidence"
             : "periodic result evidence · recorded frames unavailable"
         } · stored media/evidence only`
       : `${tier} ${model} · steady/no-shedding result evidence · stored media/evidence only`,
-    historyTitle: shedding
+    historyTitle: periodic
       ? "Recorded frame series unavailable"
       : "Steady/no-shedding coefficients recorded",
-    historyText: shedding
+    historyText: periodic
       ? `This ${tier} solve records final coefficients, but its period-locked frame series is unavailable.`
       : `This ${tier} solve certified a steady, no-shedding outcome and records its final coefficients and convergence summary, not an iteration-by-iteration coefficient series.`,
   };

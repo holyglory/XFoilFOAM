@@ -632,10 +632,17 @@ test.describe
     let maxConcurrentSolverFlowRequests = 0;
     const managementResultId = `${state.stamp}-failed-point-result`;
     const managementAttemptId = `${state.stamp}-failed-point-attempt`;
+    const acceptedResultId = `${state.stamp}-accepted-result`;
+    const manifestSha256 = "ab".repeat(32);
+    const attempts = new Map([
+      [managementAttemptId, { resultId: managementResultId, fidelity: "urans_precalc" }],
+      [`${state.stamp}-fast-attempt`, { resultId: acceptedResultId, fidelity: "urans_precalc" }],
+      [`${state.stamp}-final-attempt`, { resultId: acceptedResultId, fidelity: "urans_full" }],
+    ]);
     let managementRequeuePosts = 0;
     let managementCorrectionPosts = 0;
     await page.route(
-      `**/api/admin/point-history/${managementResultId}/*`,
+      `**/api/admin/point-history/${state.stamp}-*/*`,
       async (route) => {
         const url = new URL(route.request().url());
         if (url.pathname.endsWith("/story")) {
@@ -735,12 +742,15 @@ test.describe
           return;
         }
         if (url.pathname.endsWith("/sim")) {
-          expect(url.searchParams.get("resultAttemptId")).toBe(
-            managementAttemptId,
-          );
+          const resultId = decodeURIComponent(url.pathname.split("/").at(-2)!);
+          const attemptId = url.searchParams.get("resultAttemptId");
+          const target = attempts.get(attemptId ?? "");
+          expect(target).toBeDefined();
+          expect(target!.resultId).toBe(resultId);
           await route.fulfill({
             json: {
-              resultId: managementResultId,
+              resultId,
+              resultAttemptId: attemptId,
               status: "solved",
               regime: "attached",
               airfoilName: `${state.stamp} cam 4415`,
@@ -752,9 +762,12 @@ test.describe
               cm: -0.01,
               ld: 12,
               media: null,
-              availableFields: [],
+              availableFields: target!.fidelity === "urans_full" ? ["vorticity"] : [],
+              renderTarget: target!.fidelity === "urans_full"
+                ? { resultAttemptId: attemptId, manifestSha256 }
+                : null,
               history: null,
-              fidelity: "urans_precalc",
+              fidelity: target!.fidelity,
               steadyHistory: null,
               uransVerify: null,
               condition: null,
@@ -790,6 +803,13 @@ test.describe
         await route.continue();
       },
     );
+    await page.route(`**/api/results/${acceptedResultId}/render`, async (route) => {
+      const headers = route.request().headers();
+      expect(headers["x-xfoilfoam-expected-result-attempt-id"]).toBe(`${state.stamp}-final-attempt`);
+      expect(headers["x-xfoilfoam-expected-evidence-sha256"]).toBe(manifestSha256);
+      // Simulate a newer canonical attempt winning after the dialog was opened.
+      await route.fulfill({ status: 409, json: { error: "selected evidence generation changed before render" } });
+    });
     await page.route(
       `**/api/admin/campaigns/${launched.campaign.id}/preliminary-outcomes?*`,
       async (route) => {
@@ -940,15 +960,11 @@ test.describe
                         : finalCritical || criticalRerun
                           ? "final"
                           : null,
-                  fastResultId: fastAccepted
-                    ? `${state.stamp}-fast-result`
-                    : null,
+                  fastResultId: fastAccepted ? acceptedResultId : null,
                   fastResultAttemptId: fastAccepted
                     ? `${state.stamp}-fast-attempt`
                     : null,
-                  finalResultId: accepted
-                    ? `${state.stamp}-final-result`
-                    : null,
+                  finalResultId: accepted ? acceptedResultId : null,
                   finalResultAttemptId: accepted
                     ? `${state.stamp}-final-attempt`
                     : null,
@@ -1002,12 +1018,9 @@ test.describe
     await page.route(
       new RegExp(`/api/admin/campaigns/${launched.campaign.id}(?:\\?.*)?$`),
       async (route) => {
-        const response = await route.fetch();
-        const body = (await response.json()) as Record<string, unknown>;
         await route.fulfill({
-          response,
           json: {
-            ...body,
+            ...summary,
             solverIncidents: {
               threshold: 3,
               occurrenceCount: 7,
@@ -1052,32 +1065,9 @@ test.describe
     await page.setViewportSize({ width: 1200, height: 360 });
     await page.goto(`/admin?campaign=${launched.campaign.id}`);
     await expect(page.getByTestId("campaign-detail")).toBeVisible();
-    const incidentRail = page.getByTestId("solver-incidents-campaign");
-    await expect(incidentRail).toBeVisible();
-    await expect(incidentRail).toContainText("Solver quality log");
-    await expect(incidentRail).toContainText("2 solver follow-ups");
-    await expect(incidentRail).not.toContainText("FAST URANS");
-    await expect(incidentRail).not.toContainText(
-      "System investigation required",
-    );
-    await incidentRail.locator(":scope > summary").click();
-    await expect(incidentRail).toContainText("FAST URANS");
-    await expect(incidentRail).toContainText("continuation made no progress");
-    await expect(incidentRail).toContainText("solver follow-up");
-    await expect(incidentRail).toContainText("no user action");
-    await expect(incidentRail).not.toContainText(
-      "urans-recovery-2026-07-16-v1",
-    );
-    await expect(incidentRail).not.toContainText("FINAL URANS");
-    await expect(incidentRail).not.toContainText("media recovery exhausted");
-    await expect(
-      incidentRail.getByTestId("solver-incident-group-0"),
-    ).toHaveAttribute("data-status", "critical");
-    await incidentRail
-      .getByTestId("solver-incident-group-0")
-      .locator("summary")
-      .click();
-    await expect(incidentRail).toContainText("urans-recovery-2026-07-16-v1");
+    // Recovery details are available on the affected point. The campaign-level
+    // recovery rail was removed from the dashboard.
+    await expect(page.getByTestId("solver-incidents-campaign")).toHaveCount(0);
 
     const trigger = page.getByTestId(
       `matrix-cell-${state.camAirfoil.slug}-${condition.ord}`,
@@ -1103,8 +1093,10 @@ test.describe
       ),
     );
     await expect
-      .poll(() => page.evaluate(() => document.body.style.position))
-      .toBe("fixed");
+      .poll(() => page.evaluate(() => document.documentElement.style.overflow))
+      .toBe("hidden");
+    await expect.poll(() => page.evaluate(() => window.scrollY)).toBe(originalScrollY);
+    expect(await panel.evaluate((element) => element.matches(":modal"))).toBe(true);
     await expect
       .poll(() =>
         panel.evaluate(
@@ -1187,13 +1179,13 @@ test.describe
       preliminary.getByTestId("cell-preliminary-rans-0"),
     ).toHaveAttribute(
       "title",
-      "RANS: attempt recorded; automatic recovery exhausted before fast URANS",
+      "RANS: evidence recorded; a machine fault exhausted system recovery before FAST URANS",
     );
     await expect(
       preliminary.getByTestId("cell-preliminary-fast-0"),
     ).toHaveClass(/not_started/);
     await expect(preliminary).toContainText(
-      "CRITICAL · RANS RECOVERY EXHAUSTED",
+      "CRITICAL · PRE-URANS SYSTEM RECOVERY",
     );
 
     // The open dialog revalidates this point without page interaction. Each
@@ -1224,8 +1216,8 @@ test.describe
     await expect(preliminary).toContainText("CRITICAL · FAST URANS EXHAUSTED");
     await expect(
       preliminary.getByTestId("cell-preliminary-rans-0"),
-    ).toHaveClass(/screened/);
-    await expect(pointTrack).toHaveAccessibleName(/RANS screened/i);
+    ).toHaveClass(/handoff/);
+    await expect(pointTrack).toHaveAccessibleName(/RANS handed off/i);
     await expect(preliminary).not.toContainText("RANS failure");
     await expect(pointTrack.locator('[aria-current="step"]')).toHaveCount(1);
     await expect(currentCounts).toHaveAccessibleName(
@@ -1258,7 +1250,7 @@ test.describe
     );
 
     const recalculate = management.getByTestId("campaign-point-recalculate");
-    await recalculate.locator("summary").click();
+    await recalculate.locator(":scope > summary").click();
     const correctionForm = management.getByTestId("point-correction-form");
     await expect(correctionForm).toBeVisible();
     await expect(
@@ -1339,22 +1331,42 @@ test.describe
       preliminary.getByTestId("cell-preliminary-incident-0"),
     ).toHaveCount(0);
 
-    const exactFinalResultRequest = page.waitForRequest((request) => {
-      const url = new URL(request.url());
-      return (
-        url.pathname.endsWith(`/api/airfoils/${state.camAirfoil.slug}/sim`) &&
-        url.searchParams.get("resultId") === `${state.stamp}-final-result`
+    for (const stage of ["fast", "final"]) {
+      const resultId = acceptedResultId;
+      const attemptId = `${state.stamp}-${stage}-attempt`;
+      const exactAttempt = page.waitForResponse((response) => {
+        const url = new URL(response.url());
+        return url.pathname === `/api/admin/point-history/${resultId}/sim` &&
+          url.searchParams.get("resultAttemptId") === attemptId;
+      });
+      const trigger = preliminary.getByTestId(`cell-preliminary-${stage}-0`);
+      await trigger.click();
+      const response = await exactAttempt;
+      expect(response.status()).toBe(200);
+      expect(await response.json()).toMatchObject({
+        resultId,
+        resultAttemptId: attemptId,
+        fidelity: stage === "fast" ? "urans_precalc" : "urans_full",
+      });
+      const selectedDialog = page.getByTestId("sim-modal-dialog");
+      await expect(selectedDialog).toBeVisible();
+      await expect(selectedDialog.getByTestId("sim-fidelity-chip")).toHaveText(
+        stage === "fast" ? "URANS fast" : "URANS final",
       );
-    });
-    await preliminary.getByTestId("cell-preliminary-final-0").click();
-    const finalResultRequest = new URL((await exactFinalResultRequest).url());
-    expect(finalResultRequest.searchParams.get("aoa")).toBe("0");
-    await expect(page.getByTestId("sim-modal-dialog")).toBeVisible();
-    await page.keyboard.press("Escape");
-    await expect(page.getByTestId("sim-modal-dialog")).toHaveCount(0);
-    await expect(
-      preliminary.getByTestId("cell-preliminary-final-0"),
-    ).toBeFocused();
+      await expect(selectedDialog.getByTestId("sim-method-chip")).toHaveText("URANS");
+      const render = selectedDialog.getByRole("button", { name: "custom render" });
+      if (stage === "fast") {
+        await expect(render).toHaveCount(0);
+      } else {
+        await render.click();
+        await selectedDialog.getByRole("button", { name: "re-render", exact: true }).click();
+        await expect(selectedDialog).toContainText("selected evidence generation changed before render");
+      }
+      await expect(selectedDialog).not.toContainText("✓ steady");
+      await page.keyboard.press("Escape");
+      await expect(page.getByTestId("sim-modal-dialog")).toHaveCount(0);
+      await expect(trigger).toBeFocused();
+    }
 
     solverFlowPhase = "accepted-disagreed";
     await expect(finalStage).toHaveClass(/comparison-warning/, {
@@ -1419,8 +1431,8 @@ test.describe
 
     await expect(
       preliminary.getByTestId("cell-preliminary-rans-0"),
-    ).toHaveClass(/screened/);
-    await expect(pointTrack).toHaveAccessibleName(/RANS screened/i);
+    ).toHaveClass(/handoff/);
+    await expect(pointTrack).toHaveAccessibleName(/RANS handed off/i);
     await expect(pointTrack.locator(".connector").first()).toHaveClass(
       /handoff/,
     );
@@ -1433,7 +1445,7 @@ test.describe
     await expect(
       panel.getByRole("button", { name: "Ensure final verification" }),
     ).toBeHidden();
-    await operatorOverrides.locator("summary").click();
+    await operatorOverrides.locator(":scope > summary").click();
     await expect(
       panel.getByText("Manual whole-polar verification"),
     ).toBeVisible();
@@ -1475,7 +1487,7 @@ test.describe
       diagnostics.locator('[data-detail-stage="final"]'),
     ).toContainText("1 evidence record");
     await expect(diagnostics).toContainText(
-      "non-convergence hands off normally",
+      "Normal aerodynamic handoff to URANS fast.",
     );
     await expect(diagnostics).toContainText("Evidence · 2 RANS");
     await expect(diagnostics).toContainText("1 fast URANS evidence record");
@@ -1592,8 +1604,8 @@ test.describe
         ),
       )
       .toBe(true);
-    expect(await page.evaluate(() => document.body.style.position)).toBe(
-      "fixed",
+    expect(await page.evaluate(() => document.documentElement.style.overflow)).toBe(
+      "hidden",
     );
 
     const simFocusable = simDialog.locator(
@@ -1616,8 +1628,8 @@ test.describe
         panel.evaluate((element) => element.contains(document.activeElement)),
       )
       .toBe(true);
-    expect(await page.evaluate(() => document.body.style.position)).toBe(
-      "fixed",
+    expect(await page.evaluate(() => document.documentElement.style.overflow)).toBe(
+      "hidden",
     );
 
     await page.keyboard.press("Escape");
@@ -1626,13 +1638,18 @@ test.describe
     await expect
       .poll(() => page.evaluate(() => window.scrollY))
       .toBe(originalScrollY);
-    expect(await page.evaluate(() => document.body.style.position)).toBe("");
+    expect(await page.evaluate(() => document.documentElement.style.overflow)).toBe("");
     await page.waitForTimeout(100);
     const requestsAfterClose = solverFlowRequestCount;
     await page.waitForTimeout(2_300);
     expect(solverFlowRequestCount).toBe(requestsAfterClose);
 
     await page.setViewportSize({ width: 390, height: 844 });
+    const percentBox = await page.locator(".campaign-instrument-gauge-value b").boundingBox();
+    const sourcesBox = await page.getByTestId("campaign-completion-sources").boundingBox();
+    expect(percentBox).not.toBeNull();
+    expect(sourcesBox).not.toBeNull();
+    expect(percentBox!.y + percentBox!.height + 4).toBeLessThanOrEqual(sourcesBox!.y);
     await trigger.scrollIntoViewIfNeeded();
     await trigger.focus();
     const narrowOriginalScrollY = await page.evaluate(() => window.scrollY);
@@ -1646,8 +1663,10 @@ test.describe
     ).toHaveAttribute("d", expectedProfile.profilePath);
     const narrowTrack = preliminary.getByTestId("cell-preliminary-track-0");
     await expect(narrowTrack).toBeVisible();
-    await expect(handoffRail.getByText("normal handoff")).toBeVisible();
-    await expect(narrowTrack).toHaveAccessibleName(/RANS screened/i);
+    const handoffLabel = handoffRail.getByText("normal handoff");
+    await expect(handoffLabel).toBeVisible();
+    expect(await handoffLabel.evaluate((el) => el.scrollWidth <= el.clientWidth)).toBe(true);
+    await expect(narrowTrack).toHaveAccessibleName(/RANS handed off/i);
     const narrowConnectors = narrowTrack.locator(".connector");
     await expect(narrowConnectors).toHaveCount(2);
     await expect(narrowConnectors.nth(0)).toBeVisible();
@@ -1679,12 +1698,30 @@ test.describe
     expect(overflow.panel).toBeLessThanOrEqual(0);
     expect(overflow.profile).toBeLessThanOrEqual(0);
 
+    // Check the reported 501px overlap and both stage-guide breakpoints.
+    // Check visible text bounds; the icons themselves have smaller boxes.
+    for (const width of [499, 500, 501, 560, 599, 600, 601, 699, 700, 701]) {
+      await page.setViewportSize({ width, height: 844 });
+      const stages = await handoffRail.locator(".shared-stage strong").evaluateAll((labels) =>
+        labels.map((label) => {
+          const range = document.createRange();
+          range.selectNodeContents(label);
+          const { left, right } = range.getBoundingClientRect();
+          return { left, right };
+        }),
+      );
+      expect(stages).toHaveLength(3);
+      expect(stages[0]!.right + 2).toBeLessThanOrEqual(stages[1]!.left);
+      expect(stages[1]!.right + 2).toBeLessThanOrEqual(stages[2]!.left);
+    }
+    await page.setViewportSize({ width: 390, height: 844 });
     await page.keyboard.press("Escape");
     await expect(panel).toHaveCount(0);
     await expect(trigger).toBeFocused();
     await expect
       .poll(() => page.evaluate(() => window.scrollY))
       .toBe(narrowOriginalScrollY);
+    await page.unrouteAll({ behavior: "wait" });
   });
 
   test("campaign instrument matches the approved option-3 geometry contract", async ({
