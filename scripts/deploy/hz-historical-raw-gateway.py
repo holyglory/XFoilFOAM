@@ -145,6 +145,72 @@ def private_json(path, maximum=32768):
     return json.loads(path.read_bytes())
 
 
+def runtime_contract(container):
+    # Hash effective settings on the deployment host. Values, including server
+    # credentials, are never written to a receipt or diagnostic.
+    cfg, host, mounts = (
+        json.loads(line)
+        for line in run(
+            "docker",
+            "inspect",
+            "--format",
+            "{{json .Config}}\n{{json .HostConfig}}\n{{json .Mounts}}",
+            container,
+        ).splitlines()
+    )
+    config = {
+        k: cfg.get(k)
+        for k in (
+            "Entrypoint",
+            "Cmd",
+            "User",
+            "WorkingDir",
+            "Healthcheck",
+            "ExposedPorts",
+            "Volumes",
+            "StopSignal",
+            "StopTimeout",
+            "Tty",
+            "OpenStdin",
+        )
+    }
+    config["Env"] = sorted(cfg.get("Env") or [])
+    resources = {
+        k: host.get(k)
+        for k in (
+            "NetworkMode",
+            "PortBindings",
+            "RestartPolicy",
+            "ReadonlyRootfs",
+            "Ulimits",
+            "CapAdd",
+            "CapDrop",
+            "SecurityOpt",
+            "Privileged",
+            "PidsLimit",
+            "NanoCpus",
+            "CpuQuota",
+            "CpuPeriod",
+            "CpusetCpus",
+            "Memory",
+            "MemorySwap",
+            "Binds",
+            "Devices",
+            "Tmpfs",
+        )
+    }
+    volumes = sorted(
+        (
+            {k: m.get(k) for k in ("Type", "Source", "Destination", "Name", "RW", "Propagation")}
+            for m in mounts
+        ),
+        key=lambda m: m["Destination"],
+    )
+    return hashlib.sha256(
+        json.dumps([config, resources, volumes], sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
 def service(name, project):
     value = run("docker", "inspect", "--format", FORMAT, name).split("|")
     require(
@@ -156,7 +222,17 @@ def service(name, project):
         and value[6] in ("api", "worker"),
         "gateway or worker is outside the running Compose project",
     )
-    return dict(zip(("id", "image", "imageRef", "running", "startedAt", "project", "service"), value))
+    result = dict(zip(("id", "image", "imageRef", "running", "startedAt", "project", "service"), value))
+    result["configHash"] = run(
+        "docker",
+        "inspect",
+        "--format",
+        '{{index .Config.Labels "com.docker.compose.config-hash"}}',
+        result["id"],
+    )
+    require(HEX.fullmatch(result["configHash"]), "missing Compose service identity")
+    result["runtimeContract"] = runtime_contract(result["id"])
+    return result
 
 
 def exec_python(container, code, data=None, timeout=70):
@@ -281,6 +357,9 @@ def operate(a):
             and gateway["imageRef"] in {a.project + "-api", a.project + "-api:latest"},
             "serving gateway is outside its canonical Compose image reference",
         )
+        require(
+            gateway["configHash"] == a.config_hash, "running gateway has a different Compose specification"
+        )
         checked_tag(gateway["imageRef"], gateway["image"])
         before = exec_python(gateway["id"], PROBE)
         require(
@@ -321,6 +400,10 @@ def operate(a):
         "maintenance state, reviewed reader or original worker changed",
     )
     old = existing["base"]
+    require(
+        old["configHash"] == a.config_hash,
+        "canonical Compose gateway configuration differs from the original",
+    )
     if a.action == "build" and not existing.get("candidate"):
         gateway = service(a.project + "-api-1", a.project)
         require(gateway == old, "original gateway changed before image preparation")
@@ -371,14 +454,7 @@ def operate(a):
         compare_candidate(before, qualified, wanted)
         existing.update(phase="built", reader=qualified, candidate=candidate)
         write(state_file, existing)
-    if existing.get("candidate") and a.action not in (
-        "capture",
-        "original",
-        "phase",
-        "restore-tag",
-        "verify-original",
-        "release-holder",
-    ):
+    if a.action in ("select", "build") and existing.get("candidate"):
         checked_tag(existing["baseRef"], old["image"])
         checked_tag(existing["candidateRef"], existing["candidate"])
     if a.action in ("bind-canary", "verify"):
@@ -436,7 +512,9 @@ def operate(a):
         require(
             current["service"] == "api"
             and current["image"] == target
-            and current["imageRef"] == old["imageRef"],
+            and current["imageRef"] == old["imageRef"]
+            and current["runtimeContract"] == old["runtimeContract"]
+            and current["configHash"] == old["configHash"],
             "serving gateway image differs",
         )
         checked_tag(old["imageRef"], target)
@@ -510,6 +588,7 @@ if __name__ == "__main__":
     parser.add_argument("--state", type=Path, required=True)
     parser.add_argument("--app", type=Path, required=True)
     parser.add_argument("--project", required=True)
+    parser.add_argument("--config-hash", required=True)
     parser.add_argument("--build", required=True)
     parser.add_argument("--canary", type=Path)
     args = parser.parse_args()

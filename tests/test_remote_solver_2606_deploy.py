@@ -1162,7 +1162,7 @@ compose() {
     else cat >/dev/null; fi
     return
   fi
-  [[ "$*" == "up -d --no-build --no-deps --force-recreate api" ]]
+  [[ "$*" == "up -d --no-build --pull never --no-deps --force-recreate api" ]]
   note "recreate" "$(get image)"
   if [[ "$(get image)" == new ]]; then touch "$ROOT/gateway-replaced"; else rm -f "$ROOT/gateway-replaced"; fi
 }
@@ -1251,6 +1251,7 @@ def test_historical_gateway_image_keeps_immutable_source_and_worker(tmp_path, mo
         app=ROOT,
         state=tmp_path / "state.json",
         project="test-hz",
+        config_hash="a" * 64,
         build=BUILD_ID,
         action="capture",
         canary=tmp_path / "real-canary.json",
@@ -1269,7 +1270,14 @@ def test_historical_gateway_image_keeps_immutable_source_and_worker(tmp_path, mo
     args.canary.write_text(json.dumps(canary))
     args.canary.chmod(0o600)
     worker = {"id": "e" * 64, "service": "worker", "image": image("3"), "startedAt": "original"}
-    gateway = {"id": "d" * 64, "service": "api", "image": image("1"), "imageRef": "test-hz-api"}
+    gateway = {
+        "id": "d" * 64,
+        "service": "api",
+        "image": image("1"),
+        "imageRef": "test-hz-api",
+        "configHash": "a" * 64,
+        "runtimeContract": "b" * 64,
+    }
     wanted = {k: hashlib.sha256((ROOT / k).read_bytes()).hexdigest() for k in module.FILES}
     before = {
         "modules": {module.FILES[0]: module.BASE_MAIN, module.FILES[1]: None},
@@ -1346,6 +1354,10 @@ def test_historical_gateway_image_keeps_immutable_source_and_worker(tmp_path, mo
     act("build")
     with pytest.raises(ValueError, match="outside the two"):
         module.compare_candidate(before, {**new, "otherInstalled": "changed"}, wanted)
+    args.config_hash = "e" * 64
+    with pytest.raises(ValueError, match="Compose gateway configuration"):
+        act("select")
+    args.config_hash = gateway["configHash"]
     worker["startedAt"] = "different"
     with pytest.raises(ValueError, match="worker changed"):
         act("select")
@@ -1355,6 +1367,10 @@ def test_historical_gateway_image_keeps_immutable_source_and_worker(tmp_path, mo
     with pytest.raises(ValueError, match="serving gateway image"):
         act("verify")
     gateway.update(image=image("2"), id="c" * 64)
+    gateway["runtimeContract"] = "new mount"
+    with pytest.raises(ValueError, match="serving gateway image"):
+        act("verify")
+    gateway["runtimeContract"] = "b" * 64
     act("verify")
     act("attest")
     assert json.loads(args.state.read_bytes())["phase"] == "verified"

@@ -1,7 +1,11 @@
 # Sourced only by the complete-state HZ engine maintenance entry point.
 gateway_image() {
+  local spec hash
+  spec="$(compose config --hash api)" || return 12
+  [[ "$spec" =~ ^api[[:space:]]+([0-9a-f]{64})$ ]] || { echo "Incomplete canonical gateway configuration." >&2; return 14; }
+  hash="${BASH_REMATCH[1]}"
   local -a args=("$DEPLOY_SCRIPT_DIR/hz-historical-raw-gateway.py" "$1" --app "$APP_DIR"
-    --state "$AIRFOILS_PRO_STATE_DIR/historical-raw-gateway.json" --project "$COMPOSE_PROJECT_NAME" --build "$ACTION")
+    --state "$AIRFOILS_PRO_STATE_DIR/historical-raw-gateway.json" --project "$COMPOSE_PROJECT_NAME" --build "$ACTION" --config-hash "$hash")
   if [[ "$1" == verify || "$1" == bind-canary ]]; then args+=(--canary "$GATEWAY_CANARY"); fi
   python3 "${args[@]}"
 }
@@ -87,7 +91,7 @@ historical_gateway_recover() {
       gateway_image restore-tag
       require_maintenance_safe "stabilized before historical gateway rollback"
       if ! gateway_image original; then
-        compose up -d --no-build --no-deps --force-recreate api
+        compose up -d --no-build --pull never --no-deps --force-recreate api
       fi
       wait_http "restored original file gateway" http://127.0.0.1:8000/health
       validate_live_2606_volume_runtime "$ACTION"
@@ -192,7 +196,7 @@ historical_gateway_operation() {
     return 12
   fi
   gateway_image select
-  if ! compose up -d --no-build --no-deps --force-recreate api ||
+  if ! compose up -d --no-build --pull never --no-deps --force-recreate api ||
      ! wait_http "historical file gateway" http://127.0.0.1:8000/health ||
      ! validate_live_2606_volume_runtime "$ACTION" || ! gateway_image verify; then
     echo "Historical readback or gateway startup failed; recovering the captured gateway and writer state." >&2
