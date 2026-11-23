@@ -202,3 +202,24 @@ restores the prior build/engine/pool state, and leaves the database, migrations,
 named volumes, and backup files intact. Once a canary receipt exists, rollback
 is refused: re-run the exact target build ID and finish its attestation so
 verified 2606 evidence is not abandoned.
+
+## Refresh the closed-archive file gateway
+
+Use this mode of `rebuild-remote-solver-engine.sh` for an already attested remote solver on OpenCFD 2606 numerics revision 2. Deploy and test the registered hub and worker Node readers first. Capture a genuine 0220 receipt, its original evidence directory and a manifest member from the stock read-only file plan in a private JSON file on the HZ host. The canary contains `directory`, `receipt` and `member`; the member carries `path`, `byteSize` and `sha256`. Existing server credentials authenticate the requests.
+
+```bash
+scripts/deploy/rebuild-remote-solver-engine.sh --historical-raw-gateway prepare "$original_build"
+scripts/deploy/rebuild-remote-solver-engine.sh --historical-raw-gateway install "$original_build" "$private_canary"
+```
+
+Prepare closes the original execution pools to new assignments, captures their previous state, and returns. Existing workers continue solving. The sweeper and evidence transfers retain their previous settings, and the deployment lock is free between invocations. Install reports a deferral while any genuine drain condition remains. Call it again after the remaining work settles. Active promise leases retain their upstream identities.
+
+The install requires two empty drain samples, stops the captured writers after active transfers settle, and applies the ordinary process, queue, database and Redis guards before and after building and immediately before replacement. It derives the gateway from its exact running image without network access at build time. It verifies the two changed modules, the remainder of the installed application and the original worker's numerical fingerprint. It replaces only the Compose file-serving API. The original worker container, build ID, numerical revision and solver source must match throughout.
+
+Before reopening intake the serving gateway must return a whole cloud archive and the selected native member at the exact generation and SHA through their original file URLs. The driver restores the prior transfer fence, writer states and pool selection. The stock historical raw reclaimer then performs its own fresh proof before physical release.
+
+```bash
+scripts/deploy/rebuild-remote-solver-engine.sh --historical-raw-gateway recover "$original_build"
+```
+
+Recovery can cancel a prepared drain while jobs are still running. A failed image switch restores the original gateway only after the same live-work checks pass. Its rollback image has a stopped, networkless Docker reference until restoration. If the API is unavailable, the original worker runs the installed queue inspector against the live broker. A previously verified gateway completes the writer restoration without a second switch. The operator refuses a downgrade if any database completion or local file retirement already depends on the new gateway.

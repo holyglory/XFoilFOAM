@@ -831,7 +831,7 @@ PREPARE_RESTORE_WRITERS=false
 MAINTENANCE_QUIESCE_ARMED=false
 FAIL_SAFE_ARMED=false
 TRACE={trace}
-read_env_var() {{ echo 1; }}
+read_env_var() {{ if [[ "$1" != REMOTE_SOLVER2606_DRAIN_KIND ]]; then echo 1; fi; }}
 disable_all_opencfd_pools() {{ echo admission >>"$TRACE"; }}
 stop_writers() {{ echo stopped >>"$TRACE"; }}
 restore_writers() {{ echo restored >>"$TRACE"; }}
@@ -1001,7 +1001,8 @@ def test_maintenance_waits_only_for_live_progressive_archive_claims(function_nam
                 status text,
                 request_payload jsonb,
                 engine_job_id text,
-                ingest_lease_expires_at timestamptz
+                ingest_lease_expires_at timestamptz,
+                engine_state text
             );
             CREATE TABLE result_media_repairs (state text);
             CREATE TABLE sync_remote_result_deliveries (state text, claim_expires_at timestamptz);
@@ -1054,6 +1055,12 @@ def test_maintenance_waits_only_for_live_progressive_archive_claims(function_nam
             query("INSERT INTO progressive_worker_reports VALUES ('00000000-0000-0000-0000-000000000003', 1, NULL, NULL, '{\"status\": {\"state\": \"completed\"}}'::jsonb)")
             terminal = subprocess.run(["bash", "-c", probe], env=environment, check=True, text=True, capture_output=True)
             assert terminal.stdout.strip() == ""
+            query("INSERT INTO sim_jobs(id,status) VALUES ('00000000-0000-0000-0000-000000000004','pending')")
+            unknown = subprocess.run(["bash","-c",probe],env=environment,check=True,text=True,capture_output=True)
+            assert json.loads(unknown.stdout)["live_jobs"] == 1
+            query("UPDATE sim_jobs SET engine_state='cancelled' WHERE id='00000000-0000-0000-0000-000000000004'")
+            terminated = subprocess.run(["bash","-c",probe],env=environment,check=True,text=True,capture_output=True)
+            assert terminated.stdout.strip() == ""
     finally:
         query(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
 
@@ -1081,3 +1088,281 @@ def test_remote_maintenance_pause_is_a_real_transfer_admission_gate() -> None:
     assert "settings?.remoteSolverTransferPaused" in transfer
     assert "set_remote_transfer_paused()" in deploy
     assert "wait_remote_transfer_quiescence()" in deploy
+
+
+@pytest.mark.parametrize("fault", ["none", "build", "readback", "late-work", "lost-response"])
+def test_historical_gateway_drain_preserves_worker_and_recovers_exact_controls(tmp_path, fault):
+    """Run the versioned gateway workflow across independent operator processes and an interrupted switch."""
+    trace = tmp_path / "trace"
+    canary = tmp_path / "canary.json"
+    canary.write_text("{}")
+    for name, value in {
+        "pending": "0",
+        "pool": "true",
+        "transfer": "false",
+        "sweeper": "1",
+        "media-repair": "0",
+        "physical": "running",
+        "image": "old",
+        "phase": "",
+        "image-state": "",
+        "fault": fault,
+    }.items():
+        (tmp_path / name).write_text(value)
+    script = r"""
+set -Eeuo pipefail
+source "$HELPER"
+ACTION=original-numerical-build
+GATEWAY_ACTION="$1"
+GATEWAY_CANARY="$ROOT/canary.json"
+GATEWAY_RECOVERY_QUEUE=false
+AIRFOILS_PRO_STATE_DIR="$ROOT"
+REMOTE_TRANSFER_QUIESCE_TIMEOUT_SECONDS=5
+REMOTE_SOLVER_DRAIN_POLL_SECONDS=1
+DRAIN_TRANSFER_PAUSED=false
+DRAIN_SWEEPER_WAS_RUNNING=1
+DRAIN_MEDIA_REPAIR_WAS_RUNNING=0
+setv() { printf '%s' "$2" > "$ROOT/$1"; }
+get() { cat "$ROOT/$1"; }
+note() { printf '%s\n' "$*" >>"$TRACE"; }
+read_env_var() {
+  case "$1" in
+    REMOTE_SOLVER2606_DRAIN_PENDING) get pending;;
+    REMOTE_SOLVER2606_DRAIN_PHASE) get phase;;
+    *) echo original-numerical-build;;
+  esac
+}
+load_drain_state() { DRAIN_PHASE="$(get phase)"; }
+persist_drain_state() { DRAIN_PHASE="$1"; setv phase "$1"; }
+begin_remote_solver_drain() { setv pending 1; setv pool false; persist_drain_state draining; note prepared; }
+clear_drain_state() { setv pending 0; setv phase ""; }
+require_drain_admission_closed() { [[ "$(get pool)" == false ]]; }
+remote_solver_drain_activity() { if [[ "$(get physical)" != idle ]]; then echo "live scientist-owned job"; fi; }
+set_remote_transfer_paused() { setv transfer "$1"; note transfer "$1"; }
+remote_transfer_paused() { get transfer; }
+writer_state() { get "$1"; }
+stop_writers() { setv sweeper 0; setv media-repair 0; note stop; }
+restore_writers() { setv sweeper "$1"; setv media-repair "$2"; note restore-writers "$1" "$2"; }
+restore_drain_pool_state() { setv pool true; note resume-intake; }
+validate_live_2606_volume_runtime() { [[ "$1" == original-numerical-build ]]; }
+numerics2_preflight() { :; }
+wait_remote_transfer_quiescence() { [[ "$(get transfer)" == true ]]; }
+sleep() { :; }
+wait_http() { :; }
+require_maintenance_safe() {
+  note guard "$1"
+  [[ "$(get sweeper)" == 0 && "$(get media-repair)" == 0 && "$(get pool)" == false &&
+     "$(get transfer)" == true && "$(get physical)" == idle ]]
+  if [[ "$1" == "stabilized before historical gateway recreate" && "$(get fault)" == late-work ]]; then return 12; fi
+}
+compose() {
+  if [[ "$1" == exec ]]; then
+    if [[ "$3" == postgres ]]; then
+      if [[ "$*" == *"progressive_worker_evidence_delivery_claims"* ]]; then echo 0; else echo false; fi
+    else cat >/dev/null; fi
+    return
+  fi
+  [[ "$*" == "up -d --no-build --no-deps --force-recreate api" ]]
+  note "recreate" "$(get image)"
+  if [[ "$(get image)" == new ]]; then touch "$ROOT/gateway-replaced"; else rm -f "$ROOT/gateway-replaced"; fi
+}
+gateway_image() {
+  note image "$1"
+  case "$1" in
+    capture) setv image-state captured;;
+    original) [[ "$(get image)" == old && ! -e "$ROOT/gateway-replaced" ]];;
+    release-holder|bind-canary) :;;
+    phase) get image-state;;
+    build) [[ "$(get fault)" != build ]] || return 23; setv image-state built;;
+    select) setv image-state switching; setv image new;;
+    restore-tag) setv image-state rolling-back; setv image old;;
+    verify)
+      [[ "$(get image)" == new && "$(get fault)" != readback ]] || return 24
+      setv image-state verified
+      if [[ "$(get fault)" == lost-response ]]; then exit 25; fi;;
+    attest) [[ "$(get image-state)" == verified && "$(get image)" == new ]];;
+    verify-original) [[ "$(get image)" == old ]]; setv image-state restored;;
+    *) return 90;;
+  esac
+}
+historical_gateway_operation
+"""
+
+    def act(action):
+        return subprocess.run(
+            ["bash", "-c", script, "gateway-fixture", action],
+            text=True,
+            capture_output=True,
+            env={
+                **os.environ,
+                "ROOT": str(tmp_path),
+                "TRACE": str(trace),
+                "HELPER": str(DEPLOY / "historical-raw-gateway-maintenance.sh"),
+            },
+            timeout=8,
+        )
+
+    prepared = act("prepare")
+    assert prepared.returncode == 0, prepared.stderr
+    assert (tmp_path / "transfer").read_text() == "false" and (tmp_path / "sweeper").read_text() == "1"
+    waiting = act("install")
+    assert waiting.returncode == 0 and "deferred" in waiting.stdout
+    assert "recreate" not in trace.read_text() and (tmp_path / "pool").read_text() == "false"
+    (tmp_path / "physical").write_text("idle")
+    installed = act("install")
+    if fault == "none":
+        assert installed.returncode == 0, installed.stderr
+    else:
+        assert installed.returncode != 0
+        if fault == "lost-response":
+            assert (tmp_path / "pending").read_text() == "1"
+            recovered = act("recover")
+            assert recovered.returncode == 0, recovered.stdout + recovered.stderr
+        else:
+            assert (tmp_path / "pending").read_text() == "0"
+    assert {
+        k: (tmp_path / k).read_text() for k in ("pool", "transfer", "sweeper", "media-repair", "pending")
+    } == {"pool": "true", "transfer": "false", "sweeper": "1", "media-repair": "0", "pending": "0"}
+    calls = trace.read_text().splitlines()
+    assert calls.count("recreate new") == int(fault in ("none", "readback", "lost-response"))
+    assert calls.count("recreate old") == int(fault == "readback")
+    if fault == "readback":
+        assert "guard before historical gateway rollback" in calls and calls.index(
+            "image verify-original"
+        ) < calls.index("resume-intake")
+    if fault == "lost-response":
+        assert "image attest" in calls and (tmp_path / "image").read_text() == "new"
+    if fault == "none":
+        assert calls.index("guard before historical gateway image build") < calls.index("image build")
+        assert (
+            calls.index("guard after historical gateway image build")
+            < calls.index("guard stabilized before historical gateway recreate")
+            < calls.index("image select")
+        )
+        assert calls.index("image verify") < calls.index("restore-writers 1 0") < calls.index("resume-intake")
+
+
+def test_historical_gateway_image_keeps_immutable_source_and_worker(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    module = _module("historical_gateway_image", "hz-historical-raw-gateway.py")
+    image = lambda c: "sha256:" + c * 64
+    args = SimpleNamespace(
+        app=ROOT,
+        state=tmp_path / "state.json",
+        project="test-hz",
+        build=BUILD_ID,
+        action="capture",
+        canary=tmp_path / "real-canary.json",
+    )
+    canary = {
+        "directory": "cases/fixture/a0/evidence",
+        "receipt": {
+            "sim_job_id": str(uuid4()),
+            "stored_sha256": "a" * 64,
+            "manifest_sha256": "c" * 64,
+            "generation": "100",
+            "stored_bytes": 80,
+        },
+        "member": {"path": "openfoam/force.dat", "sha256": "b" * 64, "byteSize": 3},
+    }
+    args.canary.write_text(json.dumps(canary))
+    args.canary.chmod(0o600)
+    worker = {"id": "e" * 64, "service": "worker", "image": image("3"), "startedAt": "original"}
+    gateway = {"id": "d" * 64, "service": "api", "image": image("1"), "imageRef": "test-hz-api"}
+    wanted = {k: hashlib.sha256((ROOT / k).read_bytes()).hexdigest() for k in module.FILES}
+    before = {
+        "modules": {module.FILES[0]: module.BASE_MAIN, module.FILES[1]: None},
+        "otherInstalled": "fixed-wheel",
+        "otherSources": "fixed-source",
+        "application": "old",
+    }
+    new = {**before, "modules": wanted, "application": "new"}
+    tags = {gateway["imageRef"]: gateway["image"]}
+    ops = []
+    holders = {}
+
+    def docker(*cmd, data=None, timeout=60):
+        ops.append(cmd)
+        if cmd[:3] == ("docker", "container", "ls"):
+            return holders.get("id", "")
+        if cmd[:3] == ("docker", "container", "create"):
+            assert "--read-only" in cmd and cmd[cmd.index("--network") + 1] == "none"
+            holders["id"] = "9" * 64
+            return holders["id"]
+        if cmd[:3] == ("docker", "container", "inspect"):
+            return "|".join((holders["id"], image("1"), "created", "none", "0", "d" * 64))
+        if cmd[:3] == ("docker", "container", "rm"):
+            assert cmd[-1] == holders.pop("id")
+            return cmd[-1]
+        if cmd[:3] == ("docker", "image", "tag"):
+            tags[cmd[4]] = cmd[3]
+            return ""
+        if cmd[:3] == ("docker", "image", "inspect"):
+            return tags[cmd[-1]]
+        if cmd[:2] == ("docker", "exec"):
+            return "f" * 64
+        if cmd[:2] == ("docker", "build"):
+            assert "--network=none" in cmd and "--pull=false" in cmd
+            assert sorted(p.name for p in Path(cmd[-1]).iterdir()) == [
+                "Dockerfile",
+                "historical_raw_restore.py",
+                "main.py",
+            ]
+            tags[cmd[cmd.index("-t") + 1]] = image("2")
+            return ""
+        if cmd[:2] == ("docker", "run"):
+            return json.dumps(new)
+        pytest.fail(f"Unexpected Docker operation {cmd[:3]}")
+
+    def exec_python(container, code, data=None, timeout=None):
+        if code == module.PROBE:
+            return before if gateway["image"] == image("1") else new
+        assert code == module.READ and json.loads(data) == canary
+        return [
+            {"sha256": "a" * 64, "generation": "100", "bytes": 80},
+            {"sha256": "b" * 64, "generation": "100", "bytes": 3},
+        ]
+
+    monkeypatch.setattr(module, "run", docker)
+    monkeypatch.setattr(module, "exec_python", exec_python)
+    monkeypatch.setattr(module, "require_worker", lambda *args: {"application_source_sha256": "f" * 64})
+    monkeypatch.setattr(
+        module, "service", lambda name, _: dict(worker if name.endswith("-worker-1") else gateway)
+    )
+
+    def act(action):
+        args.action = action
+        module.operate(args)
+
+    act("capture")
+    assert not any(c[:2] == ("docker", "build") for c in ops)
+    act("bind-canary")
+    changed = {**canary, "member": {**canary["member"], "sha256": "e" * 64}}
+    args.canary.write_text(json.dumps(changed))
+    with pytest.raises(ValueError, match="differs from the pre-switch"):
+        act("bind-canary")
+    args.canary.write_text(json.dumps(canary))
+    act("build")
+    with pytest.raises(ValueError, match="outside the two"):
+        module.compare_candidate(before, {**new, "otherInstalled": "changed"}, wanted)
+    worker["startedAt"] = "different"
+    with pytest.raises(ValueError, match="worker changed"):
+        act("select")
+    worker["startedAt"] = "original"
+    act("select")
+    assert tags["test-hz-api"] == image("2")
+    with pytest.raises(ValueError, match="serving gateway image"):
+        act("verify")
+    gateway.update(image=image("2"), id="c" * 64)
+    act("verify")
+    act("attest")
+    assert json.loads(args.state.read_bytes())["phase"] == "verified"
+    act("restore-tag")
+    gateway.update(image=image("1"), id="b" * 64)
+    act("verify-original")
+    assert tags["test-hz-api"] == image("1")
+    act("release-holder")
+    assert not holders
+    act("capture")
+    assert len(list(tmp_path.glob("state-restored-*.json"))) == 1
