@@ -6004,3 +6004,30 @@ name = "engine-retention"
 tier = "development"
 timeout_seconds = 300
 command = ["/bin/bash", "-c", "export PYTHONPATH=$PWD/src; exec /home/holyglory/XFoilFOAM/.venv/bin/python -m pytest tests/test_retention.py -q"]
+
+# Loopback-only catalog with the full seed geometry and measured NeuralFoil curves.
+[deployment.catalog-paging]
+source = ["worktree"]
+components = ["db", "api", "web"]
+public = false
+ttl_seconds = 86400
+
+[deployment.catalog-paging.component.db]
+type = "postgres"
+image = "postgres:16-alpine"
+database = "aerodb_catalog"
+user = "aerodb"
+
+[deployment.catalog-paging.component.api]
+type = "process"
+command = ["bash", "scripts/dev/catalog-paging-api.sh"]
+port = true
+depends_on = ["db"]
+health = { path = "/health", timeout_seconds = 240 }
+
+[deployment.catalog-paging.component.web]
+type = "process"
+command = ["bash", "scripts/dev/progressive-preview.sh", "web"]
+port = true
+depends_on = ["api"]
+health = { path = "/", timeout_seconds = 600 }
