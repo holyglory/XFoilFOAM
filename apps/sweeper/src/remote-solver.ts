@@ -2995,6 +2995,10 @@ export async function persistClaimedRemotePromise(
     );
     const conflicts = await tx.execute(sql`
       SELECT point.promise_id,
+        (promise.request_payload->>'executionContract'='progressive-cfd-v1' OR EXISTS (
+          SELECT FROM sim_jobs old_job WHERE old_job.request_payload->>'syncPromiseId'=point.promise_id::text
+            AND old_job.request_payload ? 'remoteProgressiveExecution'
+        )) AS progressive,
         EXISTS (
           SELECT 1 FROM sim_jobs live_job
           WHERE live_job.request_payload->>'syncPromiseId' = point.promise_id::text
@@ -3020,6 +3024,10 @@ export async function persistClaimedRemotePromise(
       throw new Error(
         "claimed remote promise conflicts with a live local promise cell",
       );
+    // A replacement is authenticated for its own assignment. The previous
+    // progressive promise still owns its reports, deliveries and review rights.
+    if (conflicts.some((row) => row.progressive === true))
+      throw new Error("previous progressive promise requires registered terminal reconciliation");
     const conflictIds = [
       ...new Set(conflicts.map((row) => String(row.promise_id))),
     ];

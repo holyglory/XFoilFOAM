@@ -14,12 +14,30 @@ import {
 import { sql, type SQL } from "drizzle-orm";
 import { withArchiveFixture } from "./progressive-report-archive-fixture";
 import { verifyDiagnosticMirror } from "./progressive-terminal-diagnostic-fixture";
+import { persistClaimedRemotePromise } from "../src/remote-solver";
 import { reconcileTerminalProgressiveMirror } from "../src/progressive-terminal-mirror";
 
 const client = createClient({ max: 1 });
 afterAll(() => client.sql.end());
 const url = "https://registered.invalid/api/sync/v1",
   token = "registered-worker-test-token";
+
+function persistReplacement(
+  db: DB,
+  old: NonNullable<Awaited<ReturnType<typeof readProgressiveRemoteAssignment>>>,
+  id: string,
+) {
+  return persistClaimedRemotePromise(db, {
+    claim: { ...old.promise, id } as Parameters<
+      typeof persistClaimedRemotePromise
+    >[1]["claim"],
+    sourceBaseUrl: url,
+    solverId: old.envelope.solverId,
+    airfoilId: old.promise.airfoil.id,
+    simulationPresetRevisionId: old.promise.setupRevision.id,
+    progressive: { executionId: randomUUID(), status: "active" },
+  });
+}
 
 async function verifyUnstartedCancellation(
   db: DB,
@@ -164,6 +182,10 @@ async function verifyUnstartedCancellation(
     reports: 1,
     provedResults: 0,
   });
+  const replacement = randomUUID();
+  await expect(persistReplacement(db, remote, replacement)).rejects.toThrow(
+    "requires registered terminal reconciliation",
+  );
   for (const invalid of [
     null,
     { ...remote.terminalReceipt, reportSignature: "0".repeat(64) },
@@ -238,6 +260,16 @@ async function verifyUnstartedCancellation(
     stop: analysisContentHash(stop),
   });
   expect((await run(db, remote)).outcome).toBe("no-candidate");
+  await fork(async (conn) => {
+    await persistReplacement(conn, remote, replacement);
+    expect(
+      (
+        await conn.execute(
+          sql`SELECT status FROM sync_sweep_promise_points WHERE promise_id=${replacement}::uuid`,
+        )
+      )[0]?.status,
+    ).toBe("active");
+  });
 }
 
 describe("registered terminal progressive mirror reconciliation", () => {
@@ -484,6 +516,27 @@ describe("registered terminal progressive mirror reconciliation", () => {
                  CASE WHEN ${state}::text='pushing' THEN clock_timestamp()+interval '1 hour' END FROM result_attempts WHERE id=${attemptId}::uuid`;
             for (const state of ["pending", "pushing", "retry_wait", "blocked"])
               await reject(pending(state), "unsettled");
+            if (normalized)
+              await fork(async (c) => {
+                // The replacement overlaps the old active claim at one degree.
+                await c.execute(pending("pushing"));
+                const replacement = {
+                  ...upstream,
+                  promise: { ...upstream.promise, aoas: [1] },
+                };
+                await expect(
+                  persistReplacement(c, replacement, randomUUID()),
+                ).rejects.toThrow(
+                  "requires registered terminal reconciliation",
+                );
+                expect(
+                  (
+                    await c.execute(sql`SELECT state,claim_token IS NOT NULL AS claimed FROM sync_remote_result_deliveries
+                WHERE promise_id=${promiseId}::uuid`)
+                  )[0],
+                ).toEqual({ state: "pushing", claimed: true });
+                expect((await promise(c))[0]).toEqual(before);
+              });
             await fork(async (c) => {
               expect(
                 (
