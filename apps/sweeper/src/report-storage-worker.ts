@@ -8,6 +8,7 @@ import {
 import { runSolverHistoryStorageService } from "./solver-history-service";
 import { runResultHistoryStorageService } from "./result-history-service";
 import { runWorkerVolumeCleanup } from "./worker-report-volume-cleanup";
+import { runSharedStoppedReportStorage } from "./shared-stopped-report-service";
 import { runAttemptEvidenceStorageService } from "./attempt-evidence-service";
 import { runConfiguredAttemptEvidenceSettlementService } from "./attempt-evidence-settlement";
 
@@ -38,6 +39,7 @@ try {
     work.push(runNativeWorkerReportSharing(client.db, stop.signal));
     work.push(runWorkerVolumeCleanup(client.db, stop.signal));
   } else {
+    work.push(runSharedStoppedReportStorage(client.db, stop.signal));
     work.push(runSolverHistoryStorageService(client.db, stop.signal));
     work.push(runResultHistoryStorageService(client.db, stop.signal));
     work.push(

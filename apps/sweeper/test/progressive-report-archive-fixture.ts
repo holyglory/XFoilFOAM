@@ -61,6 +61,7 @@ export async function withArchiveFixture(
   run: (fixture: ArchiveFixture) => Promise<void>,
   options: {
     normalized?: boolean;
+    serviceAcceptance?: "pending" | "ordinary";
     stopped?: boolean;
     settled?: boolean;
     reportCount?: number;
@@ -77,6 +78,11 @@ export async function withArchiveFixture(
     };
   } = {},
 ) {
+  if (options.serviceAcceptance) {
+    const [target]=await client.sql`SELECT current_database() AS name`;
+    if(source!=="remote" || target.name!=="shared_report_service" || process.env.PROGRESSIVE_REPORT_ARCHIVE_DISPOSABLE_DB!=="1")
+      throw new Error("Committed shared-report service fixtures require their isolated PG16 database");
+  }
   if (options.stagingAcceptance) {
     const [dbName] = await client.sql`SELECT current_database() AS name`;
     if (
@@ -104,7 +110,7 @@ export async function withArchiveFixture(
       );
       let revisionId = solver.revisionId;
       let reynolds = 1_234_567;
-      if (options.stagingAcceptance) {
+      if (options.stagingAcceptance || options.serviceAcceptance) {
         const [parent] = await db.execute(
           sql`SELECT preset_id FROM simulation_preset_revisions WHERE id=${revisionId}::uuid`,
         );
@@ -233,7 +239,7 @@ export async function withArchiveFixture(
       // Retain an actual rejected attempt and its result projection, so an
       // archive cannot appear correct merely because the result tables are empty.
       // The paired workload creates its attempt later through normal ingestion.
-      const force = options.stagingAcceptance;
+      const force = options.stagingAcceptance ?? (options.serviceAcceptance ? {t:[0,1,2],cl:[0.2,0.3,0.4],cd:[0.015,0.014,0.012],cm:[-0.01,-0.02,-0.03]} : undefined);
       const runtime = {
         ...envelope.request.expected_engine!,
         build_id: "disposable-worker-staging-acceptance",
@@ -434,7 +440,7 @@ export async function withArchiveFixture(
             await db.execute(sql`INSERT INTO progressive_remote_report_sources
               (sim_job_id,sequence,point_content_signature,aoa_deg,case_slug)
               VALUES (${executionId}::uuid,${sequence},${point.point_content_signature},${point.aoa_deg},${point.case_slug})`);
-            await db.execute(sql`INSERT INTO progressive_remote_diagnostic_receipts
+            if (options.serviceAcceptance !== "pending") await db.execute(sql`INSERT INTO progressive_remote_diagnostic_receipts
               (sim_job_id,sequence,point_content_signature,receipt)
               VALUES (${executionId}::uuid,${sequence},${point.point_content_signature},'{"kind":"retained-progressive-diagnostic"}'::jsonb)
               ON CONFLICT DO NOTHING`);
@@ -474,7 +480,7 @@ export async function withArchiveFixture(
         });
       }
       await run(fixture);
-      if (!options.stagingAcceptance) throw rollback;
+      if (!options.stagingAcceptance && !options.serviceAcceptance) throw rollback;
     });
   } catch (error) {
     if (error !== rollback) throw error;

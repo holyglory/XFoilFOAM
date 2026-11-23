@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { gzipSync, gunzipSync } from "node:zlib";
 import { createHash } from "node:crypto";
 import {
@@ -59,8 +60,9 @@ export interface SharedReportInput extends SharedReportMember {
 }
 
 interface RestoredResult {
+  executionId: string;
   text: string;
-  parsed: ReportJson;
+  parsed?: ReportJson;
   canonical: string;
   sources?: ReturnType<typeof retainedReportInventory>["sources"];
 }
@@ -132,6 +134,12 @@ function verifyManifest(s: ReportObjects, value: SharedReportManifest) {
   }
 }
 
+// Keep one decoded scientific generation per storage client. Every reuse still
+// requires a successful fresh pinned media GET with the same compressed bytes.
+const lastResult = new WeakMap<
+  ReportObjects,
+  { pin: string; value: RestoredResult }
+>();
 async function resultText(
   s: ReportObjects,
   hash: string,
@@ -139,11 +147,36 @@ async function resultText(
   signal?: AbortSignal,
 ): Promise<RestoredResult> {
   checkReportObjectPin(r.pin, resultKey(s, hash), limit + 65536);
-  const text = gunzip(await s.read(r.pin, limit + 65536, signal), r.rawSize);
+  const packed = await s.read(r.pin, limit + 65536, signal);
+  if (packed.length !== r.pin.size || sha256(packed) !== r.pin.sha256)
+    throw new Error("Shared result compressed proof changed");
+  const identity = JSON.stringify([
+    s.bucket,
+    r.pin.key,
+    r.pin.generation,
+    r.pin.sha256,
+    r.pin.size,
+    r.pin.crc32c,
+    hash,
+    r.rawSize,
+  ]);
+  const previous = lastResult.get(s);
+  if (previous?.pin === identity) return previous.value;
+  lastResult.delete(s);
+  const text = gunzip(packed, r.rawSize);
   if (Buffer.byteLength(text) !== r.rawSize || sha256(text) !== hash)
     throw new Error("Shared scientific result failed raw-byte verification");
   const parsed = reportJsonObject(parseReportJson(text));
-  return { text, parsed, canonical: canonicalReportJson(parsed) };
+  if (typeof parsed.job_id !== "string")
+    throw new Error("Shared scientific result has no execution owner");
+  const value = {
+    text,
+    parsed,
+    executionId: parsed.job_id,
+    canonical: canonicalReportJson(parsed),
+  };
+  lastResult.set(s, { pin: identity, value });
+  return value;
 }
 
 function restore(
@@ -165,7 +198,10 @@ function restore(
   )
     throw new Error("Shared result root boundary changed");
   const v = cut.report;
-  if (v.archivedReport === true) throw new Error("A compact header cannot be archived as an original");
+  if (res && res.executionId !== owner.executionId)
+    throw new Error("Shared scientific result belongs to another execution");
+  if (v.archivedReport === true)
+    throw new Error("A compact header cannot be archived as an original");
   if (
     (!res && v.result !== null) ||
     v.executionId !== owner.executionId ||
@@ -187,10 +223,11 @@ function restore(
     throw new Error("Shared report application signature changed");
   const sources = res
     ? (res.sources ??= retainedReportInventory(
-        { ...v, result: res.parsed },
+        { ...v, result: res.parsed! },
         m.signature,
       ).sources)
     : [];
+  if (res && res.sources) res.parsed = undefined;
   const inventory = sha256(
     canonicalReportJson({
       kind: "progressive-remote-report-inventory-v1",
@@ -200,8 +237,11 @@ function restore(
       sources,
     }),
   );
-  if (inventory !== m.inventorySignature || sources.length !== m.sourceCount ||
-    sha256(canonicalReportJson(sources)) !== m.sourceListSha256)
+  if (
+    inventory !== m.inventorySignature ||
+    sources.length !== m.sourceCount ||
+    sha256(canonicalReportJson(sources)) !== m.sourceListSha256
+  )
     throw new Error("Shared report source inventory changed");
   return text;
 }
@@ -226,6 +266,16 @@ async function readManifest(
   return manifest;
 }
 
+interface PageReads {
+  page?: { key: string; manifest: SharedReportManifest };
+  result?: { hash: string; value: RestoredResult };
+}
+const pageReads = new AsyncLocalStorage<PageReads>();
+/** One bounded scope per reader adapter. Ordinary independent requests always
+ * refetch their generations. Keep at most one validated scientific value. */
+export const withSharedReportPageReads = <T>(f: () => Promise<T>) =>
+  pageReads.run({}, f);
+
 export async function readSharedReport(
   store: ReportObjects,
   id: ProgressiveReportArchiveReadIdentity,
@@ -241,18 +291,37 @@ export async function readSharedReport(
     !uuid.test(id.executionId)
   )
     throw new Error("Shared report requires its canonical hub generation");
-  const manifest = await readManifest(
-    store,
-    {
-      key: id.objectKey,
-      generation: id.generation,
-      sha256: id.storedSha256,
-      size: id.storedByteSize,
-      crc32c: id.crc32c,
-    },
+  signal?.throwIfAborted();
+  const cache = pageReads.getStore();
+  const cacheKey = JSON.stringify([
+    store.bucket,
+    store.prefix,
     id.executionId,
-    signal,
-  );
+    id.objectKey,
+    id.generation,
+    id.storedSha256,
+    id.storedByteSize,
+    id.crc32c,
+  ]);
+  const manifest =
+    cache?.page?.key === cacheKey
+      ? cache.page.manifest
+      : await readManifest(
+          store,
+          {
+            key: id.objectKey,
+            generation: id.generation,
+            sha256: id.storedSha256,
+            size: id.storedByteSize,
+            crc32c: id.crc32c,
+          },
+          id.executionId,
+          signal,
+        );
+  if (cache && cache.page?.key !== cacheKey) {
+    cache.page = { key: cacheKey, manifest };
+    cache.result = undefined;
+  }
   if (
     (id.memberCount !== undefined &&
       manifest.members.length !== id.memberCount) ||
@@ -270,14 +339,13 @@ export async function readSharedReport(
     m.reportByteSize !== id.reportByteSize
   )
     throw new Error("Shared report does not match the registered member");
-  const value = m.resultHash
-    ? await resultText(
-        store,
-        m.resultHash,
-        manifest.results[m.resultHash],
-        signal,
-      )
+  const hash = m.resultHash;
+  const value = hash
+    ? cache?.result?.hash === hash
+      ? cache.result.value
+      : await resultText(store, hash, manifest.results[hash], signal)
     : undefined;
+  if (cache && hash && value) cache.result = { hash, value };
   return restore(manifest, m, value);
 }
 
@@ -290,7 +358,10 @@ export async function writeSharedReportPage(
 ) {
   const results: SharedReportManifest["results"] = Object.create(null);
   const members: SharedReportMember[] = [];
-  if (!goodSize(inputs.length, 128) || inputs.reduce((sum, m) => sum + m.reportByteSize, 0) > 128 * 1024 ** 2)
+  if (
+    !goodSize(inputs.length, 128) ||
+    inputs.reduce((sum, m) => sum + m.reportByteSize, 0) > 128 * 1024 ** 2
+  )
     throw new Error("Shared report inputs exceed page bounds");
   let resultBytesSubmitted = 0;
   for (const input of inputs) {
@@ -336,16 +407,16 @@ export async function writeSharedReportPage(
   const bytes = gzipSync(plain, { level: 9 }),
     sum = sha256(bytes),
     key = manifestKey(store, owner.executionId, sum);
-  const pin = await store.create(key, bytes);
+  const pin = (await store.find(key)) ?? (await store.create(key, bytes));
   if (pin.sha256 !== sum || pin.size !== bytes.length)
     throw new Error("Stored manifest differs from the submitted page");
   const verified = await readManifest(store, pin, owner.executionId);
-  const cache = new Map<string, RestoredResult>();
-  for (const m of verified.members) {
-    const h = m.resultHash;
-    if (h && !cache.has(h))
-      cache.set(h, await resultText(store, h, verified.results[h]));
-    restore(verified, m, h ? cache.get(h) : undefined);
+  for (const h of new Set(verified.members.map((m) => m.resultHash))) {
+    const value = h
+      ? await resultText(store, h, verified.results[h])
+      : undefined;
+    for (const m of verified.members)
+      if (m.resultHash === h) restore(verified, m, value);
   }
   return { pin, manifest: verified, resultBytesSubmitted };
 }

@@ -16,7 +16,7 @@ import { pipeline } from "node:stream/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { readSharedReport, SHARED_REPORT_FORMAT } from "./shared-report-archive";
-import { HubReportObjects } from "./shared-report-objects";
+import { HubReportObjects, putImmutableReportObject } from "./shared-report-objects";
 
 const SHA256 = /^[a-f0-9]{64}$/;
 const GENERATION = /^[1-9][0-9]{0,19}$/;
@@ -129,31 +129,9 @@ export class ProgressiveReportArchiveStore {
       throw new Error("Invalid local report archive identity");
     const objectKey = `${this.prefix}/${sourceKind}/${executionId}/${identity.sha256}.jsonl.gz`;
     const bucket = this.storage.bucket(this.bucketName);
-    let created = true;
-    try {
-      await bucket.upload(path, {
-        destination: objectKey,
-        resumable: true,
-        validation: "crc32c",
-        preconditionOpts: { ifGenerationMatch: 0 },
-        metadata: {
-          cacheControl: "private, max-age=31536000, immutable",
-          contentType: "application/gzip",
-          metadata: {
-            sha256: identity.sha256,
-            byteSize: String(identity.byteSize),
-            sourceKind,
-            executionId,
-            archiveFormat: "jsonl",
-          },
-        },
-      });
-    } catch (error) {
-      const code = Number((error as { code?: unknown })?.code);
-      if (code !== 412) throw error;
-      created = false;
-    }
-    const file = bucket.file(objectKey);
+    const {created,file}=await putImmutableReportObject(bucket,objectKey,{path},{
+      sha256:identity.sha256,byteSize:String(identity.byteSize),sourceKind,executionId,archiveFormat:"jsonl"
+    });
     const [metadata] = await file.getMetadata();
     const generation = String(metadata.generation ?? "");
     const crc32c = String(metadata.crc32c ?? "");
