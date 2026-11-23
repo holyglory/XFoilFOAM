@@ -698,6 +698,18 @@ it("checks each signed envelope and preserves a one-sample history change on rep
     member.rowSha256 = hash(member.rowText);
     await expect(whole.verify()).rejects.toThrow("canonical signature");
     Object.assign(member, original);
+    // A changed canonical prefix may not borrow the prior hash midstate,
+    // even when the result, suffix, and stored original-row hint all match.
+    const prefix = `"assignmentSignature": "${f.scientific.assignmentSignature}"`;
+    const foreignPrefix = `"assignmentSignature": "${"e".repeat(64)}"`;
+    member.rowText = member.rowText.replace(prefix, foreignPrefix);
+    member.reportText = member.reportText.replace(prefix, foreignPrefix);
+    expect(member.rowText).not.toBe(original.rowText);
+    expect(member.reportText).not.toBe(original.reportText);
+    member.reportSha256 = hash(member.reportText);
+    member.rowSha256 = hash(member.rowText);
+    await expect(whole.verify()).rejects.toThrow("canonical signature");
+    Object.assign(member, original);
     // Keep the normalized row/hash hint but change the actual restored result.
     member.reportText = member.reportText.replace("0.42", "0.43");
     expect(member.reportText).not.toBe(original.reportText);

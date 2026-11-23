@@ -226,15 +226,16 @@ export function legacyNormalizeSql(
     bytes += member.reportByteSize;
     if (member.kind === "conflict") continue; // 0198 has no conflict reference column.
     blocks.push(`DO $legacy$
-DECLARE old_row public.progressive_worker_reports%ROWTYPE; new_row public.progressive_worker_reports%ROWTYPE; full_body jsonb; changed_rows integer:=0;
+DECLARE old_row public.progressive_worker_reports%ROWTYPE; new_row public.progressive_worker_reports%ROWTYPE; full_body jsonb; verified_text text; changed_rows integer:=0;
 BEGIN
  SELECT * INTO STRICT old_row FROM public.progressive_worker_reports
  WHERE sim_job_id='${member.executionId}'::uuid AND sequence=${member.sequence} FOR UPDATE;
  IF old_row.archived_at IS NOT NULL THEN RAISE EXCEPTION 'Legacy report is cold archived; retain it'; END IF;
  full_body := public.resolve_progressive_report(to_jsonb(old_row.*));
+ verified_text := full_body::text;
  IF old_row.content_signature <> '${member.contentSignature}' OR
-    encode(sha256(convert_to(full_body::text,'UTF8')),'hex') <> '${member.reportSha256}' OR
-    octet_length(full_body::text) <> ${member.reportByteSize} THEN
+    encode(sha256(convert_to(verified_text,'UTF8')),'hex') <> '${member.reportSha256}' OR
+    octet_length(verified_text) <> ${member.reportByteSize} THEN
    RAISE EXCEPTION 'Legacy source differs from verified backup; page rolled back';
  END IF;
  ${
@@ -252,9 +253,14 @@ BEGIN
  END IF;`
  }
  SELECT * INTO STRICT new_row FROM public.progressive_worker_reports WHERE sim_job_id=old_row.sim_job_id AND sequence=old_row.sequence;
- IF public.resolve_progressive_report(to_jsonb(new_row.*)) IS DISTINCT FROM full_body OR
-   (to_jsonb(new_row.*)-'report'-'result_payload_hash') IS DISTINCT FROM (to_jsonb(old_row.*)-'report'-'result_payload_hash') THEN
-   RAISE EXCEPTION 'Lossless legacy report proof failed; page rolled back';
+ -- An identical locked normalized row still names the same immutable 0198
+ -- payload. Changed representations always take the full post-write check.
+ IF old_row.result_payload_hash IS NULL OR
+    (to_jsonb(new_row.*)::text COLLATE "C") IS DISTINCT FROM (to_jsonb(old_row.*)::text COLLATE "C") THEN
+   IF public.resolve_progressive_report(to_jsonb(new_row.*)) IS DISTINCT FROM full_body OR
+      (to_jsonb(new_row.*)-'report'-'result_payload_hash') IS DISTINCT FROM (to_jsonb(old_row.*)-'report'-'result_payload_hash') THEN
+     RAISE EXCEPTION 'Lossless legacy report proof failed; page rolled back';
+   END IF;
  END IF;
  ${
    options.trackChanges
