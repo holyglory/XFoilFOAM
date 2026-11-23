@@ -561,7 +561,7 @@ export function BrowseView({
         }
         .browse-preview {
           position: sticky;
-          top: 68px;
+          top: 16px;
         }
         .browse-categories {
           position: absolute;
@@ -1130,6 +1130,7 @@ export function BrowseView({
                     </span>
                     <span className="airfoil-name-wrap">
                       <span
+                        data-ui-continuation-anchor
                         style={{
                           color: C.text,
                           fontWeight: 500,
@@ -1182,7 +1183,7 @@ export function BrowseView({
                     className="airfoil-cell airfoil-col-thicknessPct"
                     style={{
                       textAlign: "right",
-                      color: a.thicknessPct == null ? C.dimmest : C.text,
+                      color: a.thicknessPct == null ? C.muted : C.text,
                     }}
                   >
                     {solvedMetric(a.thicknessPct, 1)}
@@ -1191,7 +1192,7 @@ export function BrowseView({
                     className="airfoil-cell airfoil-col-camberPct"
                     style={{
                       textAlign: "right",
-                      color: a.camberPct == null ? C.dimmest : C.text,
+                      color: a.camberPct == null ? C.muted : C.text,
                     }}
                   >
                     {solvedMetric(a.camberPct, 1)}
@@ -1200,7 +1201,7 @@ export function BrowseView({
                     className="airfoil-cell airfoil-col-areaProfile"
                     style={{
                       textAlign: "right",
-                      color: a.areaProfile == null ? C.dimmest : C.muted,
+                      color: C.muted,
                     }}
                   >
                     {solvedMetric(a.areaProfile, 3)}
@@ -1216,7 +1217,7 @@ export function BrowseView({
                     }
                     style={{
                       textAlign: "right",
-                      color: a.ldmax == null ? C.dim : C.teal,
+                      color: a.ldmax == null ? C.muted : C.teal,
                     }}
                   >
                     {solvedMetric(a.ldmax, 1)}

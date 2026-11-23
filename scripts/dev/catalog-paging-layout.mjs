@@ -37,7 +37,7 @@ export function catalogPagingLayout(origin, repoRoot, reviewInputs) {
         waitFor: { selector: row(450) },
         continuation: {
           kind: "in-page",
-          anchor: row(151),
+          anchor: row(151) + " [data-ui-continuation-anchor]",
           focusWithin: row(151),
           maxScrollDelta: 8,
         },
@@ -165,6 +165,7 @@ export function catalogPagingLayout(origin, repoRoot, reviewInputs) {
         width: v.width,
       })),
     ),
+    execution: { maxConcurrency: 1 },
     maxPageCount: states.length * viewports.length,
     performance: { ttfbLocalOnly: true, ttfbMs: 10, lcpMs: 800 },
   };
