@@ -6026,20 +6026,20 @@ name = "types"
 tier = "development"
 requires = ["workspace"]
 timeout_seconds = 600
-command = ["scripts/dev/check-closed-retention.sh", "types"]
+command = ["/bin/sh", "scripts/dev/check-closed-retention.sh", "types"]
 
 [[test.closed-progressive-retention.check]]
 name = "retention"
 tier = "development"
 requires = ["seed"]
 timeout_seconds = 600
-command = ["scripts/dev/check-closed-retention.sh", "node"]
+command = ["/bin/sh", "scripts/dev/check-closed-retention.sh", "node"]
 
 [[test.closed-progressive-retention.check]]
 name = "engine-retention"
 tier = "development"
 timeout_seconds = 300
-command = ["scripts/dev/check-closed-retention.sh", "engine"]
+command = ["/bin/sh", "scripts/dev/check-closed-retention.sh", "engine"]
 
 [test.hz-cache-parking]
 timeout_seconds = 900
