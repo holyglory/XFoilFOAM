@@ -86,6 +86,7 @@ def discovery_step(args, seed_runner, shared, ask, durable, compact, require):
         durable(path,cursor)
     folder=directory/page["folder"]
     sub=copy.copy(args)
+    sub.priority_turn=None
     sub.keys=folder/"keys.jsonl";sub.state=folder/"state";sub.keys_sha256=page["sha256"];sub.discover_after_seed=False;sub.recheck_held_index=None;sub.recheck_held_through=None
     seed_runner(sub)
     done=json.loads((sub.state/"progress.json").read_bytes())
@@ -112,6 +113,7 @@ def revisit_held(args, index, bind, run, durable, compact, require):
                 "Recheck receipt identity changed")
         return False
     sub=copy.copy(args);sub.keys=directory/"keys.jsonl";sub.state=directory/"state"
+    sub.priority_turn=None
     sub.keys_sha256=snapshot(sub.keys,[prior["key"]],compact)
     sub.recheck_held_index=None;sub.recheck_held_through=None;sub.discover_after_seed=False;sub.limit=1
     run(sub)
@@ -169,6 +171,7 @@ def revisit_prefix(args, through, progress, bind, run, durable, compact, require
         durable(path,cursor)
     segment=folder/page["folder"]
     sub=copy.copy(args);sub.keys=segment/"keys.jsonl";sub.state=segment/"state";sub.keys_sha256=page["sha256"]
+    sub.priority_turn=None
     sub.recheck_held_index=None;sub.recheck_held_through=None;sub.discover_after_seed=False
     run(sub)
     subprogress=json.loads((sub.state/"progress.json").read_bytes())

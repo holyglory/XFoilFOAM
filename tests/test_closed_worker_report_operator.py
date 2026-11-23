@@ -14,6 +14,95 @@ SPEC.loader.exec_module(controller)
 
 
 class ClosedReportOperator(unittest.TestCase):
+    def test_priority_turn_recovers_the_same_writer_and_conserves_the_displaced_keys(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            job = "11111111-1111-4111-8111-111111111111"
+            keys = [dict(executionId=job,sequence=n,signature="a"*64) for n in range(3,11)]
+            lines = [controller.compact(key)+b"\n" for key in keys]
+            source = root/"keys.jsonl"
+            source.write_bytes(b"".join(lines))
+            scope = root/"scope.json"
+            controller.durable(scope, dict(version=1,sourceInstance=job,solverId=job,
+                                           executions=[dict(executionId=job,reportAfter=0,reportHighWater=2)]))
+            args = SimpleNamespace(keys=source, keys_sha256=controller.digest(source.read_bytes()),
+                                   frozen_scope=scope,frozen_sha256=controller.digest(controller.compact(json.loads(scope.read_bytes()))),
+                                   state=root/"state",runtime_revision="b"*40,hz_host="hz",hz_api="api",hz_sweeper="worker",
+                                   hub_host="hub",hub_sweeper="svc",limit=1,apply=True,page_members=1)
+            published, settled, lost = [], [], set()
+            def peer(_args, role, message, _program):
+                if message["op"] == "discover-worker":
+                    if message["after"]["sequence"]:
+                        return dict(keys=[],scanned=0,last=None)
+                    return dict(keys=[dict(keys[-1],sequence=11)],scanned=1,last=dict(executionId=job,sequence=11))
+                if message["op"] == "discover-hub":
+                    return dict(keys=message["keys"])
+                op, n = message["op"], message["key"]["sequence"]
+                if op == "source":
+                    return dict(source={"facts":{}},stored=2000,archivedBundle=None)
+                if op in ("hub", "cloud"):
+                    return dict(science={})
+                if op == "publish":
+                    published.append(n)
+                    return dict(generation=str(n))
+                if op == "settle":
+                    settled.append(n)
+                    return dict(outcome="retired")
+                if op == "read" and role == "api" and message["committed"] and n in (3,7) and n not in lost:
+                    lost.add(n)
+                    raise OSError("post-commit read lost")
+                return dict(storedFieldBytes=100)
+
+            def hint(indices, corrupt=False):
+                values = [{"key":keys[i], "byteSize":18*1024**2} for i in indices]
+                if corrupt:
+                    values[0] = dict(key=dict(keys[indices[0]], signature="c"*64))
+                file = root/"hint.json"
+                controller.durable(file,dict(version=1,inventory=args.keys_sha256,keys=values,
+                                             offset=sum(map(len,lines[:indices[0]]))))
+                args.priority_turn = file
+                args.priority_turn_sha256 = controller.digest(file.read_bytes())
+
+            with patch.object(controller,"run_peer",side_effect=peer),patch.object(controller.subprocess,"check_output",return_value=b"runtime"):
+                with self.assertRaisesRegex(OSError,"post-commit"):
+                    controller.run(args)
+                hint([4,5])
+                controller.run(args)
+                self.assertEqual(published, [3])
+                hint([4,5], corrupt=True)
+                with self.assertRaisesRegex(ValueError,"different from the signed inventory"):
+                    controller.run(args)
+                hint([4,5])
+                with self.assertRaisesRegex(OSError,"post-commit"):
+                    controller.run(args)
+                progress = json.loads((args.state/"progress.json").read_bytes())
+                self.assertIn("sourceOrderSha256",progress["binding"])
+                self.assertEqual(progress["pending"]["key"],keys[4])
+                with source.open("rb") as f:
+                    view = controller.OrderedInventory(f,progress["sourceOrder"]["spans"],progress["sourceOrder"]["sizes"])
+                    view.seek(progress["after"])
+                    self.assertEqual(view.page_limit(4),1)
+                    self.assertEqual(view.tell(), progress["after"])
+                args.priority_turn.unlink()
+                controller.run(args)
+                controller.run(args)
+                args.priority_turn = None
+                hint([7])
+                for _ in range(6):
+                    controller.run(args)
+                self.assertEqual(published,[3,7,8,10,4,5,6,9])
+                self.assertEqual(settled,published)
+                final = json.loads((args.state/"progress.json").read_bytes())
+                self.assertEqual((final["completed"],final["after"]),(len(keys),sum(map(len,lines))))
+                self.assertEqual(source.read_bytes(), b"".join(lines))
+                args.priority_turn.unlink()
+                args.discover_after_seed, args.scan_rows, args.discovery_interval = True, 2, 900
+                for _ in range(3):
+                    controller.run(args)
+                self.assertEqual(published, [3,7,8,10,4,5,6,9,11])
+                self.assertEqual(settled, published)
+                self.assertEqual(json.loads((args.state/"discovery/cursor.json").read_bytes())["pass"], 2)
+
     def test_pending_generation_holds_and_postcommit_replay(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

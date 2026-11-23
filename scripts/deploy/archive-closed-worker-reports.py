@@ -19,6 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from closed_worker_report_pages import process_page, qualified_width
 from closed_worker_report_sessions import ReportReadSessions, ROLE_READS
 from closed_worker_report_discovery import discovery_step, revisit_held, revisit_prefix
+from closed_worker_report_order import OrderedInventory, ordered_inventory
 
 ROOT = Path(__file__).resolve().parents[2]
 PEER = ROOT / "apps/sweeper/src/closed-worker-report-peer.mjs"
@@ -192,7 +193,7 @@ def run(args):
 
         path = args.state / "progress.json"
         progress = json.loads(path.read_bytes()) if path.exists() else dict(binding=bind, after=0, completed=0, pending=None)
-        require(progress["binding"] == bind, "Controller scope or role binding changed")
+        keys = ordered_inventory(args, keys, progress, bind, path, durable, lambda key: check_key(key, ranges))
         index = getattr(args,"recheck_held_index",None)
         if index is not None and args.apply and not progress.get("pending") and not progress.get("group"):
             require(0 <= index < progress["completed"],"Recheck requires a visited held source")
@@ -232,8 +233,11 @@ def run(args):
         while left>0:
             if getattr(args,"pause_file",None) and args.pause_file.exists():
                 return
-            if args.apply and not progress.get("pending") and (progress.get("group") or min(getattr(args,"page_members",1),left)>1):
-                used=process_page(args, keys, min(max_members,left), progress, path, bind, runtime, peer_hash,
+            page_limit = min(max_members, left)
+            if isinstance(keys, OrderedInventory) and not progress.get("group"):
+                page_limit = keys.page_limit(page_limit)
+            if args.apply and not progress.get("pending") and (progress.get("group") or page_limit > 1):
+                used=process_page(args, keys, page_limit, progress, path, bind, runtime, peer_hash,
                                   scope_for, ask, durable, require, limits)
                 if used:
                     left-=used
@@ -359,6 +363,8 @@ if __name__ == "__main__":
     parser.add_argument("--recheck-held-through",type=int,help="Automatically revisit all historical held keys before this verified cursor")
     parser.add_argument("--recheck-held-index",type=int,help="Recheck one immutable held receipt under the original writer lock")
     parser.add_argument("--discover-after-seed",action="store_true")
+    parser.add_argument("--priority-turn", type=Path, help="Optional finite signed-key range in the existing inventory")
+    parser.add_argument("--priority-turn-sha256", help="Exact digest of the private priority hint")
     parser.add_argument("--scan-rows",type=int,default=512)
     parser.add_argument("--discovery-interval",type=int,default=900)
     parser.add_argument("--reuse-read-passes",type=int,default=0)
