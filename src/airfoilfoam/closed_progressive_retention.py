@@ -250,6 +250,11 @@ def _checked_job_tree(root, protected, authenticated, urans_solvers, historical_
     """Apply the same source, media, continuation and case-ownership checks to both stock operations."""
     owned_cases = {case for case, _, _ in authenticated.values()}
     owned_solvers = {solver for _, solver, _ in authenticated.values()}
+    # The original (steady) case can retain its own decomposed state after
+    # per-angle URANS runs. Its time directories are outside every removal plan
+    # when no manifest selects that case itself as a postprocessing root.
+    uniform_roots = urans_solvers | {solver.parent for solver in urans_solvers
+                                     if solver.parent in owned_cases and solver.parent not in owned_solvers}
     historical_roots = {directory / name for directory in historical_dirs for name in _RAW_DIRS}
     protected_dirs = {p.as_posix() for name in protected for p in PurePosixPath(name).parents}
     seen = 0
@@ -281,10 +286,11 @@ def _checked_job_tree(root, protected, authenticated, urans_solvers, historical_
             path = folder / name
             if path.is_symlink():
                 actual = path.resolve(strict=True) if protected else path.resolve()
-                if (solver in urans_solvers and name == "uniform" and len(relative.parts) == 5 and
-                        re.fullmatch(r"processor[0-9]+", relative.parts[3]) and _time(relative.name) >= 0 and
+                processor_root = relative.parent.parent
+                if (name == "uniform" and processor_root in uniform_roots and
+                        re.fullmatch(r"processor[0-9]+", relative.parent.name) and _time(relative.name) >= 0 and
                         os.readlink(path) == f"../../{relative.name}/uniform" and
-                        actual == root / solver / relative.name / "uniform" and actual.is_dir()):
+                        actual == root / processor_root / relative.name / "uniform" and actual.is_dir()):
                     continue
                 _require(name == "polyMesh" and actual.is_relative_to(root / "meshes"), "unaccounted directory symlink")
                 if protected:

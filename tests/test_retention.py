@@ -1080,6 +1080,11 @@ def test_closed_progressive_exact_duplicates_require_whole_job_proof(tmp_path, m
                 protected[source] = source.read_bytes()
         link = post / "processor0/1/uniform"
         link.symlink_to("../../1/uniform", target_is_directory=True)
+        base_time = _write(case / "3180/uniform/time", b"original case time")
+        protected[base_time] = base_time.read_bytes()
+        base_link = case / "processor2/3180/uniform"
+        base_link.parent.mkdir(parents=True)
+        base_link.symlink_to("../../3180/uniform", target_is_directory=True)
     proofs, points = [], []
     retained = {}
     for index in (0, 1):
@@ -1189,6 +1194,11 @@ def test_closed_progressive_exact_duplicates_require_whole_job_proof(tmp_path, m
         foreign_vtk.mkdir()
         assert "unarchived case state" in refused()
         foreign_vtk.rmdir()
+        base_link.unlink()
+        base_link.symlink_to(post / "1/uniform", target_is_directory=True)
+        assert "symlink" in refused()
+        base_link.unlink()
+        base_link.symlink_to("../../3180/uniform", target_is_directory=True)
         intruder = _write(case / "a0/evidence/scaled_media/default_v1_zoom2/v7/unknown.png", b"foreign image")
         assert "unknown scaled-media field" in refused()
         intruder.unlink()
@@ -1277,6 +1287,7 @@ def test_closed_progressive_exact_duplicates_require_whole_job_proof(tmp_path, m
         assert not (post / "log.pimpleFoam").exists()
         assert all(p.read_bytes() == data for p, data in protected.items())
         assert link.is_symlink() and (link / "time").read_bytes() == b"1/uniform/time"
+        assert base_link.is_symlink() and (base_link / "time").read_bytes() == b"original case time"
     _write(copies[0], archived)
     refused(plan=plan["plan"])
     assert copies[0].is_file()
