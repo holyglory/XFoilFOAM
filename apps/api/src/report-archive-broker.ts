@@ -2,8 +2,8 @@ import { CRC32C, Storage, type Bucket, type File } from "@google-cloud/storage";
 import { pinExactGcsGeneration } from "@aerodb/core/gcs-exact-generation";
 import type { DB } from "@aerodb/db";
 import {
-  canonicalReportJson,
-  visitProgressiveReportArchive,
+  visitVerifiedWorkerReportArchive,
+  WorkerReportMemberMismatch,
 } from "@aerodb/db/progressive-report-archive";
 import { sql } from "drizzle-orm";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
@@ -122,38 +122,26 @@ async function inspectBundle(
   executionId: string,
   dispatch: Dispatch,
 ) {
-  await visitProgressiveReportArchive(
-    createReadStream(path),
-    identity,
-    async (entry, _line, report) => {
-      // The shared decoder already parsed these exact PG bytes losslessly.
-      // Verify the dispatch and canonical signature for every reconstructed member.
-      if (
-        entry.sourceKind !== "worker" ||
-        entry.executionId !== executionId ||
-        canonicalReportJson(report.version!) !== "1" ||
-        report.executionId !== executionId ||
-        report.solverId !== solver.id ||
-        report.promiseId !== dispatch.promiseId ||
-        report.assignmentSignature !== dispatch.assignmentSignature ||
-        canonicalReportJson(report.sequence!) !== String(entry.sequence) ||
-        createHash("sha256")
-          .update(canonicalReportJson(report))
-          .digest("hex") !== entry.contentSignature
-      )
-        reject(
-          "Worker report archive member changed the exact dispatch scope or content",
-        );
-      // Small encoded deltas can expand into many full reports in one zlib
-      // chunk. Yield to socket callbacks between members under sustained CPU work.
-      await yieldToRequests();
-    },
-    {
-      maxMembers: MAX_MEMBERS,
-      maxDecodedBytes: MAX_JSON_BYTES,
-      maxReportBytes: MAX_LINE_BYTES,
-    },
-  );
+  try {
+    await visitVerifiedWorkerReportArchive(
+      createReadStream(path),
+      identity,
+      { executionId, solverId: solver.id, ...dispatch },
+      // Small deltas may expand into many envelopes within a single zlib chunk.
+      () => yieldToRequests(),
+      {
+        maxMembers: MAX_MEMBERS,
+        maxDecodedBytes: MAX_JSON_BYTES,
+        maxReportBytes: MAX_LINE_BYTES,
+      },
+    );
+  } catch (error) {
+    if (error instanceof WorkerReportMemberMismatch)
+      reject(
+        "Worker report archive member changed the exact dispatch scope or content",
+      );
+    throw error;
+  }
 }
 
 export async function stageBrokerArchive(

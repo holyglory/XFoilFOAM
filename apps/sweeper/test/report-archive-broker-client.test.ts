@@ -489,3 +489,97 @@ it("preserves exact PG numeric tokens for text hashes and canonical signatures",
   );
   await expect(readWorkerReportArchiveText(f.db, identity)).resolves.toBe(text);
 });
+
+it.each(["prefix", "suffix"] as const)(
+  "signs the actual envelope bytes when a %s delta copies the full result",
+  async (position) => {
+    const f = await fixture();
+    const signature = (text: string) =>
+      createHash("sha256")
+        .update(canonicalReportJson(parseReportJson(text)))
+        .digest("hex");
+    const render = (sequence: number, token: string) => {
+      const { result: _result, ...header } = { ...f.reports[0]!, sequence };
+      const fields = JSON.stringify(header).slice(1, -1);
+      const result = `"result": {"history": [${token}, -0.0000000000010], "note": "🌊"}`;
+      return position === "prefix"
+        ? `{${result}, ${fields}}`
+        : `{${fields}, ${result}}`;
+    };
+    const old = "9007199254740993",
+      next = "9007199254740995";
+    const texts = [render(10, old), render(11, old), render(12, next)];
+    async function readLastOrFirst(forgeLast: boolean) {
+      const lines = texts.map((text, i) => {
+        const proof = reportTextIdentity(text);
+        const member = {
+          sourceKind: "worker",
+          kind: "report",
+          executionId: f.executionId,
+          sequence: 10 + i,
+          contentSignature: signature(
+            forgeLast && i === 2 ? render(12, old) : text,
+          ),
+          reportSha256: proof.sha256,
+          reportByteSize: proof.byteSize,
+        };
+        if (!i)
+          return `${JSON.stringify(member).slice(0, -1)},"report":${text}}`;
+        const prior = texts[i - 1]!;
+        let prefix = 0,
+          suffix = 0;
+        while (
+          prefix < Math.min(prior.length, text.length) &&
+          prior[prefix] === text[prefix]
+        )
+          prefix++;
+        while (
+          suffix < Math.min(prior.length, text.length) - prefix &&
+          prior[prior.length - 1 - suffix] === text[text.length - 1 - suffix]
+        )
+          suffix++;
+        return JSON.stringify({
+          ...member,
+          reportDelta: {
+            prefix,
+            suffix,
+            middle: text.slice(prefix, text.length - suffix),
+          },
+        });
+      });
+      const bytes = gzipSync(lines.join("\n") + "\n");
+      const storedSha256 = createHash("sha256").update(bytes).digest("hex");
+      const i = forgeLast ? 0 : 2;
+      const original = reportTextIdentity(texts[i]!);
+      const identity = {
+        ...f.identity,
+        storedSha256,
+        storedByteSize: bytes.length,
+        crc32c: checksum(bytes),
+        objectKey: f.archive.objectKey.replace(f.sha256, storedSha256),
+        sequence: 10 + i,
+        signature: signature(texts[i]!),
+        reportSha256: original.sha256,
+        reportByteSize: original.byteSize,
+      };
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(
+          async () =>
+            new Response(bytes, {
+              headers: {
+                ...f.headers,
+                "content-length": String(bytes.length),
+                "x-content-sha256": storedSha256,
+                "x-content-crc32c": identity.crc32c,
+                "x-report-archive-object-key": identity.objectKey,
+              },
+            }),
+        ),
+      );
+      return readWorkerReportArchiveText(f.db, identity);
+    }
+    await expect(readLastOrFirst(false)).resolves.toBe(texts[2]);
+    await expect(readLastOrFirst(true)).rejects.toThrow(/content verification/);
+  },
+);

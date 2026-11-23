@@ -56,7 +56,7 @@ export function parseReportJson(
 }
 
 // Offsets use UTF-16 code units, as does the immutable on-disk delta format.
-// Only the internal text-only reader can supply a previously validated span.
+// Only readers that keep the parsed result private may reuse a validated span.
 interface ResultSpan { start: number; end: number; value: ReportJson }
 interface ResultTracking {
   envelope?: boolean;
@@ -183,6 +183,10 @@ function decimalIdentity(text: string): string {
   return `${negative ? "-" : ""}${digits}e${BigInt(exponent) - BigInt(fraction.length) + BigInt(zeros)}`;
 }
 
+function canonicalEntries(value: Record<string, ReportJson>) {
+  return Object.entries(value).sort(([a], [b]) => a.localeCompare(b, "en"));
+}
+
 /** Matches analysis identities for ordinary numbers, without rounding other tokens. */
 export function canonicalReportJson(value: ReportJson): string {
   if (value instanceof ReportJsonNumber) {
@@ -197,8 +201,7 @@ export function canonicalReportJson(value: ReportJson): string {
   if (Array.isArray(value))
     return `[${value.map(canonicalReportJson).join(",")}]`;
   if (value !== null && typeof value === "object")
-    return `{${Object.entries(value)
-      .sort(([a], [b]) => a.localeCompare(b, "en"))
+    return `{${canonicalEntries(value)
       .map(
         ([key, item]) => `${JSON.stringify(key)}:${canonicalReportJson(item)}`,
       )
@@ -580,6 +583,71 @@ export async function visitProgressiveReportArchive(
   limits: ProgressiveReportArchiveLimits = {},
 ): Promise<void> {
   await consumeBundle(source, identity, visitor, limits);
+}
+
+export class WorkerReportMemberMismatch extends Error {}
+
+/** Scope and sign every reconstructed envelope. Only the immutable text is
+ * exposed to callers. The decoder reuses a parsed result solely when the delta
+ * copies its entire validated token; even then each hash receives all its bytes. */
+export async function visitVerifiedWorkerReportArchive(
+  source: Readable,
+  identity: ProgressiveReportArchiveStoredIdentity,
+  owner: {
+    executionId: string;
+    solverId: string;
+    promiseId: string;
+    assignmentSignature: string;
+  },
+  visit: (entry: ProgressiveReportArchiveEntry) => void | Promise<void>,
+  limits: ProgressiveReportArchiveLimits,
+  signal?: AbortSignal,
+): Promise<void> {
+  let previous: { result: ReportJson; bytes: Buffer } | undefined;
+  await consumeBundle(
+    source,
+    identity,
+    (entry, _line, report) => {
+      if (
+        entry.sourceKind !== "worker" ||
+        entry.executionId !== owner.executionId ||
+        report.executionId !== owner.executionId ||
+        report.solverId !== owner.solverId ||
+        report.promiseId !== owner.promiseId ||
+        report.assignmentSignature !== owner.assignmentSignature ||
+        canonicalReportJson(report.version!) !== "1" ||
+        canonicalReportJson(report.sequence!) !== String(entry.sequence)
+      )
+        throw new WorkerReportMemberMismatch(
+          "Worker report archive member changed its exact dispatch scope",
+        );
+
+      const digest = createHash("sha256").update("{");
+      let separator = "";
+      for (const [key, value] of canonicalEntries(report)) {
+        digest.update(separator + JSON.stringify(key) + ":");
+        separator = ",";
+        if (key === "result" && value !== null && typeof value === "object") {
+          if (!previous || previous.result !== value)
+            previous = {
+              result: value,
+              bytes: Buffer.from(canonicalReportJson(value), "utf8"),
+            };
+          digest.update(previous.bytes);
+        } else {
+          digest.update(canonicalReportJson(value));
+        }
+      }
+      if (digest.update("}").digest("hex") !== entry.contentSignature)
+        throw new WorkerReportMemberMismatch(
+          "Worker report archive member failed content verification",
+        );
+      return visit(entry);
+    },
+    limits,
+    signal,
+    true,
+  );
 }
 
 export async function readProgressiveReportArchiveBundle(
