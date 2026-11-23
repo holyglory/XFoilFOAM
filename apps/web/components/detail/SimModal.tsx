@@ -2494,7 +2494,9 @@ export function SimModal(props: {
               </span>
             );
           })()}
-          <span style={{ fontWeight: 600, fontSize: 15 }}>{name}</span>
+          <span role="heading" aria-level={2} style={{ fontWeight: 600, fontSize: 15 }}>
+            {name}
+          </span>
           <span style={{ fontFamily: MONO, fontSize: 12, color: C.muted }}>
             Re {reStr}&nbsp;&nbsp;·&nbsp;&nbsp;M {shownMach}
           </span>

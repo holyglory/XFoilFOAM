@@ -6053,6 +6053,21 @@ cases = [{ id = "disposable-index-and-rewrite", args = [], postgres = "default" 
 [test.catalog-web-delivery]
 timeout_seconds = 300
 
+[test.campaign-stage-layout]
+timeout_seconds = 3600
+
+[[test.campaign-stage-layout.check]]
+name = "verifier"
+tier = "release"
+command = ["/usr/local/bin/devcoordinator2-tooling", "formal-ui", "self-test"]
+
+[[test.campaign-stage-layout.check]]
+name = "layout"
+tier = "release"
+requires = ["verifier"]
+timeout_seconds = 3000
+command = ["node", "scripts/dev/verify-admin-stage-layout.mjs"]
+
 [test.campaign-stage-attempt-evidence]
 timeout_seconds = 480
 

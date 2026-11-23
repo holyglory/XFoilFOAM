@@ -673,6 +673,8 @@ export function CellSidePanel({
             </span>
             <span
               id="cell-side-panel-title"
+              role="heading"
+              aria-level={2}
               style={{
                 fontWeight: 700,
                 fontSize: 15,
