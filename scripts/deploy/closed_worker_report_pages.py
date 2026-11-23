@@ -11,7 +11,7 @@ def qualified_width(args, binding, runtime, peer_hash):
     """Return optional packing limits. A missing/stale tuning receipt leaves ordinary custody available."""
     path = getattr(args, "width_qualification", None)
     expected = getattr(args, "width_qualification_sha256", None)
-    if not path or not expected or getattr(args, "page_members", 1) != 4:
+    if not isinstance(path, Path) or not expected or getattr(args, "page_members", 1) != 4:
         return None
     try:
         with path.open("rb") as file:
@@ -49,8 +49,8 @@ def qualified_width(args, binding, runtime, peer_hash):
 def fits_wide_page(rows, limits, *, prefix=False):
     if len(rows) != (4 if prefix else 8):
         return False
-    first = rows[0]["resultMeta"]
-    if not isinstance(first.get("sha256"), str) or not re.fullmatch("[0-9a-f]{64}", first["sha256"]):
+    first = rows[0].get("resultMeta")
+    if not isinstance(first, dict) or not isinstance(first.get("sha256"), str) or not re.fullmatch("[0-9a-f]{64}", first["sha256"]):
         return False
     result_bytes = first.get("byteSize")
     if type(result_bytes) is not int or not 0 < result_bytes <= limits["maxResultBytes"]:
@@ -59,7 +59,7 @@ def fits_wide_page(rows, limits, *, prefix=False):
     for row in rows:
         facts = row["source"]["facts"]
         size = facts["byteSize"]
-        if (row["resultMeta"] != first or not 0 < size <= limits["maxMemberBytes"]
+        if (row.get("resultMeta") != first or type(size) is not int or not 0 < size <= limits["maxMemberBytes"]
                 or not 0 <= size - result_bytes <= limits["maxEnvelopeBytes"]
                 or not 0 < len(facts["points"]) <= limits["maxPointSources"]):
             return False
