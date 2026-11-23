@@ -2738,7 +2738,7 @@ command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vites
 name = "remote-transfer-integration"
 tier = "development"
 requires = ["dependencies", "types", "remote-standalone-claims"]
-command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/remote-solver-validation.test.ts", "-t", "ready evidence delivery cannot suppress independent CPU admission|keeps transfer-heartbeat failures retryable"]
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/remote-solver-validation.test.ts", "-t", "ready evidence delivery cannot suppress independent CPU admission|keeps transfer-heartbeat failures retryable|unclassified promise renewal|already elapsed mirror"]
 
 [[test.progressive.check]]
 name = "remote-terminal-recovery"
