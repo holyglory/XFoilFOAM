@@ -434,7 +434,9 @@ class BundleDecoder {
 export async function* validatedProgressiveReportArchiveLines(
   lines: AsyncIterable<string>,
 ): AsyncGenerator<Buffer> {
-  const decoder = new BundleDecoder(true);
+  // Only the encoded bytes leave this validator. A delta that copied its
+  // entire scientific result can reuse that result's private parsed value.
+  const decoder = new BundleDecoder(true, undefined, true);
   for await (const line of lines) {
     if (/[\r\n]/.test(line))
       throw new Error("Archive member must occupy exactly one JSONL line");
@@ -684,7 +686,7 @@ export async function verifyProgressiveReportArchive(
   source: Readable,
   identity: ProgressiveReportArchiveStoredIdentity,
 ): Promise<void> {
-  await consumeBundle(source, identity, () => {});
+  await consumeBundle(source, identity, () => {}, {}, undefined, true);
 }
 
 /** Returns the exact PG ::text, only after the entire generation has verified. */
