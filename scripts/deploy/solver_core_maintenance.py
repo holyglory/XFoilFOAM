@@ -155,8 +155,14 @@ def process_batch(db,volume,state,rows,mode,api, *, survey=open_jobs, local_scie
             busy=survey(volume,set(native),inodes)
             # Refresh metadata and the database session after every staged batch.
             dbpaths=defaultdict(list)
-            for v in db.references({j:proofs[j]["owner"]["id"]for _,j in pending}):
-                dbpaths[v["native"]].append((v["case"],v["ref"]))
+            try:
+                for v in db.references({j:proofs[j]["owner"]["id"]for _,j in pending}):
+                    dbpaths[v["native"]].append((v["case"],v["ref"]))
+            except Exception:
+                for r,j in pending:
+                    fds,_=native[j]
+                    core_action(volume,state,r,fds,[],[],"restore",holders=lambda:False,science_check=lambda:None)
+                raise
             refreshed={}
             for j in {j for _,j in pending}:
                 fds,_=native[j]
@@ -222,7 +228,16 @@ def main():
         binding={"project":project,"volume":str(volume),"device":volume.stat().st_dev,"inode":volume.stat().st_ino,"implementation":implementation()}
         mode=args.action
         if mode=="auto":
-            rows,next_cursor=inventory_page(volume,state)
+            rows,next_cursor=inventory_page(volume,state,limit=4096)
+            # A move may have reached private quarantine before its process
+            # exited. Such sources no longer appear in directory discovery.
+            in_flight={}
+            for receipt in (state/"files").glob("*.json"):
+                prior=load_json(receipt)
+                if prior["state"] in ("intent","quarantined","restore-intent","release-intent"):
+                    row=prior["source"];in_flight[(row["j"],row["r"],row["ino"])]=row
+            in_flight.update({(r["j"],r["r"],r["ino"]):r for r in rows})
+            rows=list(in_flight.values())
             if not rows:
                 atomic_json(state/"discovery.json",{"after":next_cursor});print(json.dumps({"state":"scanned","after":next_cursor}));return
             mode="release" if (state/"qualified.json").is_file() and load_json(state/"qualified.json")["binding"]==binding else "canary"
@@ -250,7 +265,10 @@ def main():
                 part=process_batch(db,volume,state,batch,mode,api["id"])
                 results.extend(part)
                 if mode=="canary" and any(x["state"]=="restored" and x.get("scientificProof")for x in part):
-                    atomic_json(state/"qualified.json",{"at":utc(),"binding":binding,"proof":part});break
+                    proof={"at":utc(),"binding":binding,"proof":part}
+                    key=next(x["key"] for x in part if x["state"]=="restored" and x.get("scientificProof"))
+                    atomic_json(state/"canaries"/(key+"-"+binding["implementation"]+".json"),proof)
+                    atomic_json(state/"qualified.json",proof);break
         finally:db.close()
         if args.action=="auto" and mode=="release":atomic_json(state/"discovery.json",{"after":next_cursor})
         output={"at":utc(),"binding":binding,"mode":mode,"offset":args.offset,"throughOwnerOffset":args.offset+len(keys),
