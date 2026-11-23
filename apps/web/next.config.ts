@@ -1,8 +1,12 @@
 import type { NextConfig } from "next";
+import { resolve } from "node:path";
+import { webSourceIdentity } from "./source-identity.mjs";
 
 const config: NextConfig = {
   // @aerodb/core ships raw TS (internal package) — let Next transpile it.
   transpilePackages: ["@aerodb/core"],
+  generateBuildId: async () =>
+    webSourceIdentity(resolve(process.cwd(), "../..")),
   distDir: process.env.NEXT_DIST_DIR ?? ".next",
   reactStrictMode: true,
   eslint: { ignoreDuringBuilds: true },

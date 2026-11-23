@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { chromium, expect } from "@playwright/test";
+import { webSourceIdentity } from "../../apps/web/source-identity.mjs";
 import {
   progressivePreviewDeployment,
   originFromDeployment,
@@ -57,6 +58,10 @@ try {
   assert(first.total > 340 && first.rankingId === expanded.rankingId);
   const document = await page.goto(origin, { waitUntil: "domcontentloaded" });
   assert.equal(document.status(), 200);
+  assert.equal(
+    document.headers()["x-ui-source-revision"],
+    webSourceIdentity(root),
+  );
   await expect(
     page.locator("[data-testid=browse-surface][data-hydrated=true]"),
   ).toBeVisible();

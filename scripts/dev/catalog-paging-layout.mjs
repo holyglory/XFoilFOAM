@@ -1,3 +1,5 @@
+import { webSourceIdentity } from "../../apps/web/source-identity.mjs";
+
 // The public catalog keeps the same desktop preview and narrow ranking table
 // while the server supplies rows in windows. Check actual seeded list lengths.
 export function catalogPagingLayout(origin, repoRoot, reviewInputs) {
@@ -103,6 +105,7 @@ export function catalogPagingLayout(origin, repoRoot, reviewInputs) {
   const name = "catalog-paging";
   return {
     repoRoot,
+    sourceBinding: { expected: webSourceIdentity(repoRoot) },
     viewports,
     fixtureDataShapes: states.map((state) => ({
       id: "seed-catalog-" + state,

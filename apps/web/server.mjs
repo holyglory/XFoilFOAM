@@ -1,5 +1,7 @@
 import { randomUUID, createHash } from "node:crypto";
 import { createServer } from "node:http";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { parseArgs, promisify } from "node:util";
 import { gzip } from "node:zlib";
 
@@ -14,6 +16,12 @@ const { values } = parseArgs({
 const port = Number(values.port);
 const app = next({ dev: false, hostname: values.hostname, port });
 await app.prepare();
+const buildId = readFileSync(
+  join(process.env.NEXT_DIST_DIR ?? ".next", "BUILD_ID"),
+  "utf8",
+).trim();
+if (!/^[a-f0-9]{64}$/.test(buildId))
+  throw new Error("Missing the compiled web source identity.");
 const handle = app.getRequestHandler();
 const compress = promisify(gzip);
 const refreshId = randomUUID();
@@ -118,6 +126,7 @@ function acceptedEncoding(value = "") {
 }
 
 async function serve(req, res) {
+  res.setHeader("x-ui-source-revision", buildId);
   const h = req.headers;
   const ordinary =
     req.url === "/" &&
