@@ -21,9 +21,13 @@ import {
 
 const client = createClient({ max: 1 });
 afterAll(() => client.sql.end());
-it.each([false, true])(
-  "restores a signed source-only original and conserves earlier native and hub science, normalized=%s",
-  async (normalized) => {
+it.each([
+  [false, false],
+  [true, false],
+  [false, true],
+])(
+  "restores a signed source-only original and conserves earlier native and hub science, normalized=%s, grouped=%s",
+  async (normalized, grouped) => {
     if (process.env.PROGRESSIVE_REPORT_ARCHIVE_DISPOSABLE_DB !== "1")
       throw new Error("Disposable governed PostgreSQL required");
     await withArchiveFixture(
@@ -192,6 +196,153 @@ it.each([false, true])(
               );
             }),
           );
+          if (grouped) {
+            const keys = [
+              key,
+              {
+                executionId: id,
+                sequence: f.reports[3].sequence,
+                signature: f.reports[3].contentSignature,
+              },
+            ];
+            const native = await run("source", {
+              items: keys.map((key) => ({ key })),
+            });
+            const items = keys.map((key, i) => ({
+              key,
+              source: native.rows[i].source,
+            }));
+            const hubs = (await asHub((tx) => run("hub", { items }, tx))).rows;
+            const found = await run("discover-worker", {
+              after: { executionId: id, sequence: 2 },
+              limit: 2,
+            });
+            expect(found.keys.map((k) => k.sequence)).toEqual([3, 4]);
+            const absent = await asHub((tx) =>
+              run("discover-hub", { keys }, tx),
+            );
+            expect(absent.keys).toEqual(keys);
+            const publication = await run("publish", {
+              items: items.map((item, i) => ({ ...item, hub: hubs[i] })),
+            });
+            expect(publication.deltaMembers).toBe(1);
+            const pinned = items.map((v, i) => ({
+                ...v,
+                pin: publication.pins[i],
+              })),
+              head = pinned[0].pin;
+            let corrupt = false,
+              downloaded = 0;
+            const account = "disposable@fixture.iam.gserviceaccount.com";
+            vi.stubGlobal(
+              "fetch",
+              vi.fn(async (url) => {
+                if (String(url).startsWith("http://metadata.google.internal/"))
+                  return new Response(
+                    String(url).endsWith("/email")
+                      ? account
+                      : JSON.stringify({
+                          access_token: "fixture",
+                          token_type: "Bearer",
+                        }),
+                    { headers: { "Metadata-Flavor": "Google" } },
+                  );
+                const u = new URL(url);
+                expect(u.searchParams.get("generation")).toBe(head.generation);
+                if (u.searchParams.get("alt") === "media") {
+                  downloaded++;
+                  const bytes = Buffer.from(packed);
+                  if (corrupt) bytes[bytes.length - 1] ^= 1;
+                  return new Response(bytes);
+                }
+                return new Response(
+                  JSON.stringify({
+                    bucket,
+                    name: head.objectKey,
+                    generation: head.generation,
+                    size: String(packed.length),
+                    crc32c: head.crc32c,
+                    contentType: "application/gzip",
+                    metadata: {
+                      sourceKind: "worker",
+                      executionId: id,
+                      sourceInstanceId: worker,
+                      solverId: owner.solverId,
+                      archiveFormat: "jsonl",
+                      sha256: head.storedSha256,
+                      byteSize: String(packed.length),
+                    },
+                  }),
+                );
+              }),
+            );
+            const cloudRead = (tx) =>
+              run("cloud", { items: pinned, hubAccount: account }, tx);
+            const cloud = (
+              await asHub(async (tx) => {
+                corrupt = true;
+                await expect(cloudRead(tx)).rejects.toThrow();
+                corrupt = false;
+                return cloudRead(tx);
+              })
+            ).rows;
+            const api = (
+              await run("read", {
+                items: pinned,
+                reader: "api",
+                committed: false,
+              })
+            ).rows;
+            const sweeper = (
+              await run("read", {
+                items: pinned,
+                reader: "sweeper",
+                committed: false,
+              })
+            ).rows;
+            const actions = pinned.map((item, i) => ({
+              ...item,
+              hub: hubs[i],
+              cloud: cloud[i],
+              api: api[i],
+              sweeper: sweeper[i],
+            }));
+            const wrong = actions.map((item, i) =>
+              i !== 1
+                ? item
+                : {
+                    ...item,
+                    api: { ...item.api, pin: { ...item.pin, generation: "2" } },
+                  },
+            );
+            await expect(run("settle", { items: wrong })).rejects.toThrow(
+              "different member or generation",
+            );
+            const warm = await db.execute(
+              sql`SELECT archived_at FROM progressive_worker_reports WHERE sim_job_id=${id}::uuid AND sequence IN(3,4)`,
+            );
+            expect(warm.map((r) => r.archived_at)).toEqual([null, null]);
+            const released = (await run("settle", { items: actions })).rows;
+            expect(released.map((r) => r.outcome)).toEqual([
+              "retired",
+              "retired",
+            ]);
+            expect(new Set(released.map((r) => r.bundle)).size).toBe(1);
+            for (const reader of ["sweeper", "api"])
+              expect(
+                (
+                  await run("read", { items: pinned, reader, committed: true })
+                ).rows.map((r) => r.committed),
+              ).toEqual([true, true]);
+            expect(
+              (await run("settle", { items: actions })).rows.map(
+                (r) => r.outcome,
+              ),
+            ).toEqual(["already_retired", "already_retired"]);
+            expect(puts).toBe(1);
+            expect(downloaded).toBe(2);
+            return;
+          }
           const pin = await run("publish", { source, hub: scientific });
           const cloudRead = vi
             .spyOn(ProgressiveReportArchiveStore.prototype, "read")

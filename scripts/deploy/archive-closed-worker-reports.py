@@ -15,10 +15,14 @@ import time
 import tempfile
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from closed_worker_report_pages import process_page
+from closed_worker_report_discovery import discovery_step
+
 ROOT = Path(__file__).resolve().parents[2]
 PEER = ROOT / "apps/sweeper/src/closed-worker-report-peer.mjs"
 RUNTIME = (
-    "apps/sweeper/src/config.ts", "apps/sweeper/src/hz-attempt-transfer-fence.ts",
+    "apps/sweeper/src/config.ts", "apps/sweeper/src/hz-attempt-transfer-fence.ts", "apps/sweeper/src/hub-workload-gcs.ts",
     "apps/sweeper/src/registered-worker-report-read.ts", "apps/sweeper/src/registered-worker-report-hub.ts",
     "apps/sweeper/src/report-archive-broker-client.ts", "apps/sweeper/src/worker-report-volume.ts",
     "apps/sweeper/src/progressive-report-archive-store.ts", "apps/api/src/progressive-report-archive-reader.ts",
@@ -130,8 +134,11 @@ catch (e) {
     record = json.loads(process.stdout)
     value = record.pop("value")
     if args.measure_rpc:
-        record.update(role=role,op=message["op"],sequence=message["key"]["sequence"],committed=message.get("committed"),
-                      generation=(message.get("pin") or value.get("pin") or value).get("generation"),
+        items=message.get("items") or []
+        observed=message.get("pin") or (items[0].get("pin") if items else None) or value.get("pin") or (value.get("pins") or [value])[0]
+        record.update(role=role,op=message["op"],sequence=(message.get("key") or {}).get("sequence"),members=len(items or message.get("keys") or [message.get("key")]),committed=message.get("committed"),
+                      generation=observed.get("generation"), pinnedReads=value.get("generationDownloads"),
+                      storedBytes=observed.get("storedByteSize"),deltaMembers=value.get("deltaMembers"),
                       busy=value.get("retryableBrokerStatus"),wallMs=round((time.monotonic()-started)*1000,2))
         fd=os.open(args.measure_rpc, os.O_WRONLY|os.O_CREAT|os.O_APPEND, 0o600)
         try:
@@ -141,29 +148,43 @@ catch (e) {
     return value
 
 
-def run(args):
+def inputs(args):
     require(re.fullmatch(r"[0-9a-f]{40}", args.runtime_revision), "Expected deployed source revision")
     for host in (args.hub_host, args.hz_host, args.hub_sweeper, args.hz_sweeper, args.hz_api):
         require(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", host), "Invalid existing SSH target")
     require(args.hub_host != args.hz_host and args.hz_api != args.hz_sweeper, "Independent role subjects required")
+    require(1 <= getattr(args,"page_members",1) <= 8, "Page membership must be between one and eight")
+    if getattr(args,"page_members",1)>1:
+        require(args.hub_account_file and args.hub_account_file.is_file(),"Expected existing hub workload account file")
     require(1 <= args.limit <= 128, "Expected 1 to 128 bounded operations")
     s = json.loads(args.frozen_scope.read_bytes())
     require(s["version"] == 1 and digest(compact(s)) == args.frozen_sha256 and s["executions"], "Frozen scope changed")
     ranges = {r["executionId"]: r for r in s["executions"]}
     require(len(ranges) == len(s["executions"]), "Ambiguous frozen ranges")
     runtime = {f:digest(subprocess.check_output(["git", "-C", ROOT, "show", f"{args.runtime_revision}:{f}"])) for f in RUNTIME}
-    peer = PEER.read_text()
+    bind = dict(version=1, frozen=args.frozen_sha256, inventory=args.keys_sha256, source=s["sourceInstance"], solver=s["solverId"],
+                hz=[args.hz_host,args.hz_sweeper,args.hz_api], hub=[args.hub_host,args.hub_sweeper])
+    return s,ranges,bind,runtime,PEER.read_text()
+
+
+def run(args):
+    shared=inputs(args)
+    s,ranges,bind,runtime,peer=shared
     args.state.mkdir(mode=0o700, parents=True, exist_ok=True)
     receipt_dir = args.state / "receipts"
     receipt_dir.mkdir(mode=0o700, exist_ok=True)
     with (args.state / "controller.lock").open("a+b") as lock, args.keys.open("rb") as keys:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         require(hashlib.file_digest(keys,"sha256").hexdigest() == args.keys_sha256, "Private signed-key inventory changed")
-        bind = dict(version=1, frozen=args.frozen_sha256, inventory=args.keys_sha256, source=s["sourceInstance"], solver=s["solverId"],
-                    hz=[args.hz_host,args.hz_sweeper,args.hz_api], hub=[args.hub_host,args.hub_sweeper])
+
         path = args.state / "progress.json"
         progress = json.loads(path.read_bytes()) if path.exists() else dict(binding=bind, after=0, completed=0, pending=None)
         require(progress["binding"] == bind, "Controller scope or role binding changed")
+        if (getattr(args,"discover_after_seed",False) and args.apply and progress["after"]==os.fstat(keys.fileno()).st_size
+                and not progress.get("pending") and not progress.get("group")):
+            require(1<=args.scan_rows<=1024 and args.discovery_interval>=1,"Invalid bounded discovery parameters")
+            return discovery_step(args,run,shared,
+                lambda role,msg:run_peer(args,role,{**msg,"runtime":runtime},peer),durable,compact,require)
         keys.seek(progress["after"])
         def advance(receipt, done):
             outcome = done["settled"]["outcome"]
@@ -175,15 +196,27 @@ def run(args):
             durable(path,progress)
             print(json.dumps(dict(receipt=str(receipt),sequence=done["key"]["sequence"],settled=done["settled"])),flush=True)
 
-        for _ in range(args.limit):
+        def scope_for(key):
+            entry=check_key(key,ranges)
+            return dict(sourceInstance=s["sourceInstance"],solverId=s["solverId"],sha256=args.frozen_sha256,range=entry)
+        def ask(role, message):
+            return run_peer(args,role,{**message,"runtime":runtime},peer)
+        left = args.limit
+        while left>0:
+            if args.apply and not progress.get("pending") and (progress.get("group") or min(getattr(args,"page_members",1),left)>1):
+                used=process_page(args, keys, min(getattr(args,"page_members",1),left), progress, path, bind, runtime, digest(peer.encode()),
+                                  scope_for, ask, durable, require)
+                if used:
+                    left-=used
+                    continue
+            left-=1
             line = keys.readline(2049)
             if not line:
                 require(not progress["pending"], "Saved operation missing from inventory")
                 break
             require(len(line) <= 2048 and line.endswith(b"\n"), "Incomplete or oversized inventory key")
             key = json.loads(line)
-            entry = check_key(key,ranges)
-            scope = dict(sourceInstance=s["sourceInstance"],solverId=s["solverId"],sha256=args.frozen_sha256,range=entry)
+            scope = scope_for(key)
             def rpc(role, op, **fields):
                 return run_peer(args, role, dict(scope=scope,key=key,runtime=runtime,op=op,**fields), peer)
             state = progress["pending"]
@@ -274,6 +307,11 @@ if __name__ == "__main__":
         parser.add_argument("--"+opt,required=True,type=Path)
     for opt in ("frozen-sha256","keys-sha256","runtime-revision","hub-host","hz-host","hub-sweeper","hz-sweeper","hz-api"):
         parser.add_argument("--"+opt,required=True)
+    parser.add_argument("--discover-after-seed",action="store_true")
+    parser.add_argument("--scan-rows",type=int,default=512)
+    parser.add_argument("--discovery-interval",type=int,default=900)
+    parser.add_argument("--page-members",type=int,default=1)
+    parser.add_argument("--hub-account-file",type=Path,help="Confirmed workload identity for independent grouped GCS reads on the hub")
     parser.add_argument("--measure-rpc",type=Path,help="Append per-operation timing and generation metadata for a bounded measurement")
     parser.add_argument("--limit",type=int,default=1)
     parser.add_argument("--apply",action="store_true")
