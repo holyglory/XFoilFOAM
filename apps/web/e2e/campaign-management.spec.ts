@@ -1632,8 +1632,10 @@ test.describe
     ).toHaveAttribute("d", expectedProfile.profilePath);
     const narrowTrack = preliminary.getByTestId("cell-preliminary-track-0");
     await expect(narrowTrack).toBeVisible();
-    await expect(handoffRail.getByText("normal handoff")).toBeVisible();
-    await expect(narrowTrack).toHaveAccessibleName(/RANS screened/i);
+    const handoffLabel = handoffRail.getByText("normal handoff");
+    await expect(handoffLabel).toBeVisible();
+    expect(await handoffLabel.evaluate((el) => el.scrollWidth <= el.clientWidth)).toBe(true);
+    await expect(narrowTrack).toHaveAccessibleName(/RANS handed off/i);
     const narrowConnectors = narrowTrack.locator(".connector");
     await expect(narrowConnectors).toHaveCount(2);
     await expect(narrowConnectors.nth(0)).toBeVisible();

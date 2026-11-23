@@ -807,9 +807,16 @@ export function PreliminaryOutcomePanel({
             grid-column: 3;
           }
           .shared-rail {
+            grid-column: 2 / -1;
             grid-template-columns:
-              auto minmax(12px, 1fr) auto minmax(12px, 1fr)
+              auto max-content auto minmax(8px, 1fr)
               auto;
+          }
+          .flow-exit {
+            grid-template-columns: auto max-content;
+          }
+          .flow-exit::before {
+            display: none;
           }
           .shared-stage svg {
             display: none;
