@@ -1,6 +1,13 @@
 import { createHash, randomUUID } from "node:crypto";
 import { createServer } from "node:http";
 import { once } from "node:events";
+import { execFileSync } from "node:child_process";
+import { mkdtemp, mkdir, readFile, rm, writeFile, utimes } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { retentionTick, resetRetentionMemory } from "../src/retention";
 import { createRequire } from "node:module";
 import { preflightProgressiveArchive } from "../src/progressive-archive-reclaim";
 import { recheckDeferredProgressiveArchive } from "../src/progressive-archive-readback-retry";
@@ -12,7 +19,7 @@ import {
   type DB,
   type ProgressiveEvidenceCustodyReceipt,
 } from "@aerodb/db";
-import { EngineError, OPENCFD_2606_ENGINE } from "@aerodb/engine-client";
+import { EngineError, OPENCFD_2606_ENGINE, type EngineClient } from "@aerodb/engine-client";
 import { sql } from "drizzle-orm";
 import {
   type ClosedProgressiveBackend,
@@ -56,11 +63,13 @@ const tableDefinitions = [
   "sync_sweep_promises(id uuid,source_base_url text,registered_solver_id uuid)",
 ];
 
-async function fixture(db: DB, id: string, points: number) {
+async function fixture(db: DB, id: string, points: number, opts: {
+  remote?: ProgressiveEvidenceCustodyReceipt["remote"]; base?: string;
+} = {}) {
   const req = {
     remoteProgressiveExecution: {},
     syncPromiseId: promiseId,
-    upstreamBaseUrl: root,
+    upstreamBaseUrl: opts.base ?? root,
   };
   await db.execute(
     sql`INSERT INTO sim_jobs(id,engine_job_id,status,request_payload,"finishedAt") VALUES(${id},${id},'done',${JSON.stringify(req)}::jsonb,'2025-01-01')`,
@@ -76,7 +85,7 @@ async function fixture(db: DB, id: string, points: number) {
       bundle = randomUUID(),
       caseSlug = "foil",
       base = `a${n}/evidence`;
-    const remote = {
+    const remote = opts.remote ?? {
       bucket: "bucket",
       objectKey: `evidence/${upload}`,
       generation: "18446744073709551614",
@@ -136,11 +145,11 @@ async function fixture(db: DB, id: string, points: number) {
       sql`INSERT INTO progressive_worker_archive_reclaims VALUES(${id},${signature},now())`,
     );
     await db.execute(sql`INSERT INTO solver_evidence_artifacts VALUES(${bundle},'engine_bundle',${result},${attempt},${id},${storage},${JSON.stringify({ evidenceBase: base })}::jsonb,${remote.storedSha256},${remote.storedByteSize},'application/zstd'),
-      (${randomUUID()},'manifest',${result},${attempt},${id},${storage.replace("engine_evidence.tar.zst", "evidence_manifest.json")},'{}',${remote.manifestSha256},32,'application/json')`);
+      (${randomUUID()},'manifest',${result},${attempt},${id},${storage.replace("engine_evidence.tar.zst", "evidence_manifest.json")},'{}',${remote.manifestSha256},${remote.manifestByteSize},'application/json')`);
     await db.execute(
-      sql`INSERT INTO remote_asset_references VALUES(${bundle},'evidence_artifact',${attempt},${result},${storage},${remote.storedSha256},${remote.storedByteSize},'application/zstd','remote_only',${JSON.stringify({ ...remote, brokeredUploadId: upload })}::jsonb,${receipt.canonical.resultId},${receipt.canonical.artifactId},${root + "/evidence-uploads/" + upload + "/download"})`,
+      sql`INSERT INTO remote_asset_references VALUES(${bundle},'evidence_artifact',${attempt},${result},${storage},${remote.storedSha256},${remote.storedByteSize},'application/zstd','remote_only',${JSON.stringify({ ...remote, brokeredUploadId: upload })}::jsonb,${receipt.canonical.resultId},${receipt.canonical.artifactId},${(opts.base ?? root) + "/evidence-uploads/" + upload + "/download"})`,
     );
-    objects.push({ attempt, upload, remote });
+    objects.push({ attempt, upload, remote, signed });
   }
   return objects;
 }
@@ -321,6 +330,118 @@ it("rotates blocked and 409 jobs, authenticates every object before reclaim and 
     }
   });
 }, 30000);
+
+it("runs the default sweeper past eight held jobs, restores every member, and resumes post-read verification", async () => {
+  const volume = await mkdtemp(join(tmpdir(),"automatic-closed-retention-"));
+  const jobs = join(volume,"jobs");
+  await mkdir(jobs);
+  const schema = "auto_retention_" + randomUUID().replaceAll("-","");
+  const originalRole = process.env.AIRFOILFOAM_DEPLOYMENT_ROLE;
+  process.env.AIRFOILFOAM_DEPLOYMENT_ROLE = "remote-solver";
+  const open = () => createClient({max:1,connection:{search_path:schema+",public",application_name:"automatic-retention-fixture"}});
+  let connection = open();
+  const owned = (i: number) => "00000000-0000-4000-a000-"+String(i).padStart(12,"0");
+  const original = new Map<string, { path: string; remote: ProgressiveEvidenceCustodyReceipt["remote"]; hits: number; failPost: boolean }>();
+  const server = createServer(async (req,res) => {
+    const source = original.get(req.url?.split("/").at(-2) ?? "");
+    if (!source || req.headers["x-xfoilfoam-solver-token"] !== token) { res.writeHead(403).end(); return; }
+    source.hits++;
+    if (source.failPost && source.hits===2) {res.writeHead(503).end("unavailable");return;}
+    const bytes=await readFile(source.path);
+    res.writeHead(200,{"content-type":"application/zstd","content-length":bytes.length,
+      "x-content-sha256":source.remote.storedSha256,"x-gcs-generation":source.remote.generation}).end(bytes);
+  });
+  server.listen(0,"127.0.0.1");await once(server,"listening");
+  const address=server.address();
+  if (!address || typeof address==="string") throw Error("Archive server has no address");
+  const upstream=`http://127.0.0.1:${address.port}/api/sync/v1`;
+  const rootPath=fileURLToPath(new URL("../../../",import.meta.url));
+  const python=process.env.AIRFOILFOAM_RETENTION_PYTHON || join(rootPath,".venv/bin/python");
+  const sourceFixture=fileURLToPath(new URL("../test-support/automatic-retention-source.py",import.meta.url));
+  const generate = (job: string,action: string,signed?: unknown) => JSON.parse(execFileSync(python,
+    ["-B",sourceFixture,volume,job,action],{cwd:rootPath,env:{...process.env,PYTHONPATH:join(rootPath,"src")},input:signed?JSON.stringify(signed):""}).toString());
+  const bad=owned(9),good=owned(10),scratch="orphan-closed-scratch",historical="orphan-unreported-source",referenced="orphan-path-owner";
+  const sourceFile=(job: string) => join(jobs,job,"cases/foil/transient_a0/log.pimpleFoam");
+  const engine = {maintenanceJobs:vi.fn(async () => ({items:[scratch,historical,referenced].map(job_id=>({job_id,mtime_epoch:1,bytes:null}))})),
+    maintenanceDisk:vi.fn(async()=>({used_pct:31})),deleteJob:vi.fn(()=>{throw Error("raw directory deletion was called")}),
+    stripJob:vi.fn(()=>{throw Error("raw engine strip was called")})} as unknown as EngineClient;
+  const captureErrors=vi.spyOn(console,"error");
+  const tick=async (index:number,cap:number) => {
+    await retentionTick(connection.db,engine,{mediaDir:volume,now:new Date(clock.getTime()+index*3600_000),
+      stripMinAgeMs:1,stripMaxPerTick:cap,orphanMinAgeMs:1000});
+  };
+  try {
+    await client.db.execute(sql.raw("CREATE SCHEMA "+schema));
+    for (const def of tableDefinitions) await connection.db.execute(sql.raw("CREATE TABLE "+def));
+    // Keep the fixture's positional columns while supplying other real columns
+    // consulted by generic retention on the very same normal tick.
+    for (const def of tableDefinitions) {
+      const name=def.slice(0,def.indexOf("("));
+      const missing=await connection.db.execute(sql`SELECT p.attname AS name,format_type(p.atttypid,p.atttypmod) AS type
+        FROM pg_attribute p WHERE p.attrelid=to_regclass(${"public."+name}) AND p.attnum>0 AND NOT p.attisdropped AND NOT EXISTS(
+          SELECT FROM pg_attribute f WHERE f.attrelid=to_regclass(${schema+"."+name}) AND f.attnum>0 AND NOT f.attisdropped AND f.attname=p.attname)`);
+      for (const col of missing) await connection.db.execute(sql`ALTER TABLE ${sql.identifier(name)} ADD COLUMN ${sql.identifier(String(col.name))} ${sql.raw(String(col.type))}`);
+    }
+    await connection.db.execute(sql`INSERT INTO sweeper_state(id,disk_admission_blocked) VALUES(1,false)`);
+    await connection.db.execute(sql`INSERT INTO sync_api_settings(id,remote_solver_registered_id,remote_solver_auth_token,upstream_base_url) VALUES(1,${solver},${token},${upstream})`);
+    await connection.db.execute(sql`INSERT INTO sync_sweep_promises(id,source_base_url,registered_solver_id) VALUES(${promiseId},${upstream},${solver})`);
+    for (let i=1;i<=8;i++) {
+      const [point]=await fixture(connection.db,owned(i),1,{base:upstream});
+      await connection.db.execute(sql`INSERT INTO result_media(id,result_attempt_id,storage_key) VALUES(${randomUUID()},${point!.attempt},${`jobs/${owned(i)}/unique.png`})`);
+      await mkdir(join(jobs,owned(i)),{recursive:true});await writeFile(join(jobs,owned(i),"unique.png"),"locally retained bytes");
+    }
+    for (const id of [bad,good]) {
+      const remote=generate(id,id===bad?"bad-member":"good") as ProgressiveEvidenceCustodyReceipt["remote"];
+      const [point]=await fixture(connection.db,id,1,{remote,base:upstream});generate(id,"bind",point!.signed);
+      await connection.db.execute(sql`UPDATE result_attempts SET regime='urans',status='failed',valid_for_polar=false,
+        converged=false,cl=0.43,cd=0.018,cm=-0.03,evidence_payload='{"force_history":{"t":[0.01,0.02],"cl":[0.42,0.43],"cd":[0.02,0.018]}}'::jsonb WHERE id=${point!.attempt}`);
+      original.set(point!.upload,{path:join(volume,id+".tar.zst"),remote,hits:0,failPost:id===good});
+    }
+    for (const id of [scratch,historical,referenced]) {
+      await mkdir(join(jobs,id));await writeFile(join(jobs,id,"request.json"),"{}");
+      await writeFile(join(jobs,id,"status.json"),JSON.stringify({job_id:id,state:"cancelled",completed_cases:0}));
+      await writeFile(join(jobs,id,".execute.lock"),"");
+    }
+    await mkdir(join(jobs,historical,"cases/foil"),{recursive:true});
+    await writeFile(join(jobs,historical,"cases/foil/coefficient.dat"),"unique finite coefficient history");
+    await connection.db.execute(sql`INSERT INTO field_render_cache(storage_key) VALUES(${`jobs/${referenced}/status.json`})`);
+    for(const id of [scratch,historical,referenced])await utimes(join(jobs,id),new Date(0),new Date(0));
+    const science=async()=>connection.db.execute(sql`SELECT id,result_id,status,valid_for_polar,cl,cd,cm,evidence_payload::text AS original FROM result_attempts WHERE sim_job_id=${good}::uuid`);
+    const initial=await science();
+    resetRetentionMemory();await tick(0,8);
+    expect((await connection.db.execute(sql`SELECT closed_progressive_retention_after_id AS cursor FROM sweeper_state WHERE id=1`))[0]!.cursor).toBe(owned(8));
+    expect([...original.values()].map(x=>x.hits)).toEqual([0,0]);
+    for(let i=1;i<=8;i++)expect(await readFile(join(jobs,owned(i),"unique.png"),"utf8")).toBe("locally retained bytes");
+    expect(existsSync(join(jobs,scratch))).toBe(false);
+    expect(existsSync(join(jobs,referenced,"status.json"))).toBe(true);
+    expect(await readFile(join(jobs,historical,"cases/foil/coefficient.dat"),"utf8")).toBe("unique finite coefficient history");
+    await connection.sql.end();connection=open();resetRetentionMemory();
+    await tick(1,1);
+    expect(existsSync(sourceFile(bad))).toBe(true);
+    expect((await connection.db.execute(sql`SELECT strip_report#>>'{closedProgressiveScan,reason}' AS held FROM sim_jobs WHERE id=${bad}`))[0]!.held).toBe("archive-restore");
+    await tick(2,1);
+    const receipt=async()=> (await connection.db.execute(sql`SELECT stripped_at,strip_report->'closedProgressiveFiles' AS files FROM sim_jobs WHERE id=${good}::uuid`))[0]!;
+    expect(existsSync(sourceFile(good))).toBe(false);
+    expect(await receipt()).toMatchObject({stripped_at:null,files:{complete:false,files:2,automaticVerification:{state:"awaiting-readback"}}});
+    // A different process can finish the outstanding post-read after the normal retry is due.
+    await connection.sql.end();connection=open();resetRetentionMemory();
+    await connection.db.execute(sql`UPDATE sim_jobs SET strip_report=jsonb_set(strip_report,'{closedProgressiveScan,retryAfter}',to_jsonb((clock_timestamp()-interval '1 second')::text)) WHERE id=${good}`);
+    await tick(3,1); // genuinely empty tail wraps the persisted cursor
+    await tick(4,1);
+    expect(await receipt()).toMatchObject({stripped_at:null,files:{complete:true,files:2,verifiedArchives:1,automaticVerification:{state:"verified"}}});
+    expect(await science()).toEqual(initial);
+    expect(await readFile(join(jobs,good,"cases/foil/transient_a0/0.5/U"),"utf8")).toBe("unarchived original field");
+    expect(await readFile(join(jobs,good,"cases/foil/transient_a0/1/p"),"utf8")).toBe("latest pressure");
+    expect([...original.values()].map(x=>x.hits)).toEqual([1,3]);
+    expect(engine.deleteJob).not.toHaveBeenCalled();expect(engine.stripJob).not.toHaveBeenCalled();
+    expect(captureErrors.mock.calls.flat().map(String).filter(v=>v.includes("Failed query")||v.includes("strip reaper failed"))).toEqual([]);
+  } finally {
+    captureErrors.mockRestore();resetRetentionMemory();
+    if(originalRole===undefined)delete process.env.AIRFOILFOAM_DEPLOYMENT_ROLE;else process.env.AIRFOILFOAM_DEPLOYMENT_ROLE=originalRole;
+    server.closeAllConnections();await new Promise<void>(resolve=>server.close(()=>resolve()));await connection.sql.end();
+    await client.db.execute(sql.raw("DROP SCHEMA IF EXISTS "+schema+" CASCADE"));await rm(volume,{recursive:true,force:true});
+  }
+},90000);
 
 it.each(["rans", "urans", "superseded-urans"])("keeps %s point-owned images and checks every route, legend and working-file reference", async (scenario) => {
   const superseded = scenario === "superseded-urans";
