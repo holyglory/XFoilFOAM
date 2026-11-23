@@ -9,7 +9,9 @@ import { sql } from "drizzle-orm";
 import { createHash } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
+import { CancelledReportScanCheckpoint } from "./cancelled-report-scan-checkpoint";
+import { stoppedReportArchivePrefix, stoppedReportReceiptDirectory } from "./stopped-report-receipt-files";
 import { setTimeout as delay } from "node:timers/promises";
 import { configuredDeploymentRole } from "./config";
 import {
@@ -239,6 +241,7 @@ export async function archiveProgressiveReportBatch(
   putFile: PutFile,
   cancelledSequences?: readonly number[],
   expectedSignatures?: ReadonlyMap<number,string>,
+  chronologicalCheckpoint?: CancelledReportScanCheckpoint,
 ): Promise<number> {
   if (expectedSignatures && (!cancelledSequences || expectedSignatures.size > maxMembers))
     throw new Error("Signed copy hints require a bounded cancelled report page");
@@ -298,10 +301,10 @@ export async function archiveProgressiveReportBatch(
     )
       throw new Error("Archive readback differs from the uploaded bundle");
 
-    return await db.transaction(async (tx) => {
+    const bundleId = await db.transaction(async (tx) => {
       const conn = tx as unknown as DB;
       if (!(await conn.execute(sql`${scope} FOR UPDATE OF job,promise`)).length)
-        return 0;
+        return null;
       const [inserted] =
         await conn.execute(sql`INSERT INTO progressive_report_archive_bundles
         (source_kind,sim_job_id,bucket,object_key,generation,mime_type,compression,archive_format,
@@ -319,7 +322,7 @@ export async function archiveProgressiveReportBatch(
             AND b.stored_byte_size=${local.byteSize} AND b.crc32c=${remote.crc32c}`);
         if (Number(replay?.n) !== members.length)
           throw new Error("Archive replay differs from its committed members");
-        return 0;
+        return null;
       }
       const entries = JSON.stringify(
         members.map(({ sequence, kind, signature, bytes, sha256 }) => ({
@@ -380,8 +383,15 @@ export async function archiveProgressiveReportBatch(
         )})
         AND NOT EXISTS (SELECT FROM progressive_worker_reports w WHERE w.result_payload_hash=p.content_hash)
         AND NOT EXISTS (SELECT FROM progressive_remote_reports r WHERE r.result_payload_hash=p.content_hash)`);
-      return members.length;
+      return String(inserted.id);
     });
+    if (!bundleId) return 0;
+    if (chronologicalCheckpoint && cancelledSequences && !expectedSignatures) {
+      const last = members[members.length - 1]!;
+      await chronologicalCheckpoint.save({ bundleId, object: remote, signature: last.signature,
+        reportSha256: last.sha256, reportByteSize: last.bytes });
+    }
+    return members.length;
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -435,9 +445,10 @@ export async function runProgressiveReportArchiveService(
   const source: Source =
     configuredDeploymentRole() === "remote-solver" ? "worker" : "remote";
   const bucket = process.env.AIRFOILFOAM_EVIDENCE_BUCKET?.trim();
+  const prefix = stoppedReportArchivePrefix();
   const store =
     source === "remote" && bucket
-      ? new ProgressiveReportArchiveStore(bucket)
+      ? new ProgressiveReportArchiveStore(bucket, prefix)
       : null;
   if (source === "remote" && !store) {
     // Standalone installations without cloud storage leave full reports inline.
@@ -470,7 +481,11 @@ export async function runProgressiveReportArchiveService(
         }
         return remote;
       };
-  let copyCursor: ReportCopyCursor | null = null;
+  const directory = stoppedReportReceiptDirectory();
+  const checkpoint = store && bucket && isAbsolute(directory)
+    ? new CancelledReportScanCheckpoint(directory, bucket, prefix) : undefined;
+  let copyCursor: ReportCopyCursor | null = await checkpoint?.resume(db) ?? null;
+  if (copyCursor) console.info(JSON.stringify({ component: "cancelled-report-copy-resume", ...copyCursor }));
   let nextCopyScan = 0;
   let after: string | null = null;
   let hubArchivedThisSweep = false;
@@ -522,7 +537,10 @@ export async function runProgressiveReportArchiveService(
             await selectCancelledReportCopyPage(db, copyCursor, priority);
           const preferred = page.preferred;
           // Advance past refused or concurrently changed copies on this pass.
-          if (!preferred) copyCursor = page.after;
+          if (!preferred) {
+            if (copyCursor && !page.after) await checkpoint?.save(null);
+            copyCursor = page.after;
+          }
           nextCopyScan = Date.now() + (copyCursor || preferred ? 500 : 30_000);
           if (page.executionId) {
             const members = await archiveProgressiveReportBatch(
@@ -532,6 +550,7 @@ export async function runProgressiveReportArchiveService(
               upload,
               page.sequences,
               preferred ? new Map(preferred.keys.map(k => [k.sequence,k.signature])) : undefined,
+              preferred ? undefined : checkpoint,
             );
             if (members) {
               if (!preferred && members < page.sequences.length) {
