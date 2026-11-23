@@ -37,7 +37,7 @@ try {
     let series;
     let compareMethods;
     for (let refresh = 0; refresh < 2; refresh += 1) {
-      const response = await page.request.get(`${origin}/api/airfoils/${slug}`);
+      const response = await page.request.get(`${origin}/api/airfoils/${slug}?view=curves`);
       assert(response.ok());
       detail = await response.json();
       series = detail.progressivePolars.find(
@@ -175,22 +175,44 @@ try {
     const disclosure = page
       .locator("details")
       .filter({ has: page.locator("summary", { hasText: /^CFD points$/ }) });
-    const storedPoints = detail.polars
-      .flatMap((polar) => polar.points)
+    // A running campaign can publish a point after the initial curves request.
+    // Compare the disclosure with the actual response made when it was opened.
+    const pointsStarted = Date.now();
+    const pointBudgetMs = 5000;
+    let firstFeedbackMs;
+    const [pointsResponse] = await Promise.all([
+      page.waitForResponse((response) => {
+        const url = new URL(response.url());
+        return response.request().method() === "GET" &&
+          url.pathname === `/api/airfoils/${slug}` && !url.searchParams.has("view");
+      }, { timeout: pointBudgetMs }),
+      (async () => {
+        await disclosure.locator("summary").click();
+        const feedback = disclosure.locator('[role="status"], [data-testid="polar-viewer"]')
+          .or(disclosure.getByText("No CFD points yet.", { exact: true }));
+        await expect(feedback.first()).toBeVisible({ timeout: 1000 });
+        firstFeedbackMs = Date.now() - pointsStarted;
+      })(),
+    ]);
+    assert.equal(pointsResponse.status(), 200, "The requested CFD point response failed");
+    const pointData = await pointsResponse.json();
+    assert.equal(pointData.id, detail.id);
+    assert(!pointData.cfdPointsDeferred, "The full point request returned the curve-only projection");
+    const storedPoints = pointData.polars.flatMap((polar) => polar.points)
       .filter((point) => point.source === "solved");
+    const pointsView = disclosure.getByTestId("polar-viewer");
+    const remainingMs = Math.max(1, pointBudgetMs - (Date.now() - pointsStarted));
     if (storedPoints.length) {
-      await disclosure.locator("summary").click();
-      await expect(page.getByTestId("polar-viewer")).toBeVisible();
-      await disclosure.locator("summary").click();
-      await expect(page.getByTestId("polar-viewer")).not.toBeVisible();
+      await expect(pointsView).toBeVisible({ timeout: remainingMs });
     } else {
-      await disclosure.locator("summary").click();
-      await expect(
-        disclosure.getByText("No CFD points yet.", { exact: true }),
-      ).toBeVisible();
-      await expect(page.getByTestId("polar-viewer")).not.toBeVisible();
-      await disclosure.locator("summary").click();
+      await expect(disclosure.getByText("No CFD points yet.", { exact: true }))
+        .toBeVisible({ timeout: remainingMs });
+      await expect(pointsView).not.toBeVisible();
     }
+    const pointsReadyMs = Date.now() - pointsStarted;
+    assert(pointsReadyMs <= pointBudgetMs, `CFD point disclosure took ${pointsReadyMs} ms`);
+    await disclosure.locator("summary").click();
+    if (storedPoints.length) await expect(pointsView).not.toBeVisible();
     await page.reload({ waitUntil: "domcontentloaded" });
     await expect(viewer).toHaveAttribute("aria-busy", "false");
     await expect(page.getByTestId("polar-viewer")).not.toBeVisible();
@@ -207,6 +229,7 @@ try {
       targetId: series.targetId,
       resultId: contributor.resultId,
       methods: series.curves.map((curve) => curve.method),
+      pointDisclosure: { firstFeedbackMs, pointsReadyMs, solvedPoints: storedPoints.length },
       outcome: "passed",
     });
     await page.close();
