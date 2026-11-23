@@ -21,6 +21,7 @@ interface RemoteReportInput {
   promiseId: string;
   executionId: string;
   report: unknown;
+  signal?: AbortSignal;
 }
 
 type RunningPredecessor = {
@@ -99,6 +100,7 @@ export async function storeProgressiveRemoteReport(
   db: DB,
   input: RemoteReportInput,
 ) {
+  input.signal?.throwIfAborted();
   const owner = sql`FROM progressive_remote_dispatches d JOIN registered_remote_solvers solver
     ON solver.id=d.solver_id AND solver.revoked_at IS NULL WHERE d.sim_job_id=${input.executionId}::uuid
     AND d.solver_id=${input.solverId}::uuid AND d.promise_id=${input.promiseId}::uuid`;
@@ -109,6 +111,7 @@ export async function storeProgressiveRemoteReport(
     throw new ProgressiveRemoteReportConflict(
       "Remote report sender does not own the immutable dispatch",
     );
+  input.signal?.throwIfAborted();
   const envelope = dispatch.envelope as ProgressiveRemoteExecutionEnvelope;
   let publication: ReturnType<typeof prepareProgressiveReportPublication>;
   try {
@@ -150,6 +153,7 @@ export async function storeProgressiveRemoteReport(
         canonicalAnalysisJson(inventory.sources)
     ) {
       if (!repair) return null;
+      input.signal?.throwIfAborted();
       await publication.index(connection);
     }
     return { ...receipt, replayed: true };
@@ -162,6 +166,7 @@ export async function storeProgressiveRemoteReport(
   let previous:
     | { sequence: number; signature: string; full: ProgressiveRemoteReport }
     | undefined;
+  input.signal?.throwIfAborted();
   const running = await prepareRunningReportOrder(
     db,
     envelope,
@@ -169,10 +174,13 @@ export async function storeProgressiveRemoteReport(
   );
   const encoded = JSON.stringify(report);
   for (;;) {
+    input.signal?.throwIfAborted();
     const outcome = await db.transaction(async (transaction) => {
+      input.signal?.throwIfAborted();
       const connection = transaction as unknown as DB;
       const [locked] = await connection.execute(sql`SELECT d.sim_job_id ${owner}
         AND d.content_signature=${dispatch.content_signature} FOR UPDATE OF d`);
+      input.signal?.throwIfAborted();
       if (!locked)
         throw new ProgressiveRemoteReportConflict(
           "Remote report sender does not own the immutable dispatch",
@@ -224,6 +232,7 @@ export async function storeProgressiveRemoteReport(
             : "Invalid remote report order",
         );
       }
+      input.signal?.throwIfAborted();
       await connection.execute(sql`INSERT INTO progressive_remote_reports (sim_job_id,sequence,content_signature,report)
         VALUES (${input.executionId}::uuid,${report.sequence},${contentSignature},${encoded}::jsonb)`);
       await publication.index(connection);
@@ -243,6 +252,7 @@ export async function storeProgressiveRemoteReport(
         "Remote report predecessor changed before publication",
       );
     try {
+      input.signal?.throwIfAborted();
       const full = await resolveStoredProgressiveReport(
         db,
         "remote",

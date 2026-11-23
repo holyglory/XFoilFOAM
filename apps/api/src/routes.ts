@@ -1,3 +1,5 @@
+import type { PublicPointReader, PointTiming } from "./public-point-reader";
+import { performance } from "node:perf_hooks";
 import {
   canonicalRemoteHubBaseUrl,
   exportCoordinates,
@@ -837,7 +839,7 @@ async function saveMediumTableRows(
   );
 }
 
-export async function registerRoutes(app: FastifyInstance): Promise<void> {
+export async function registerRoutes(app: FastifyInstance, publicPoints?: PublicPointReader): Promise<void> {
   app.get("/health", async () => ({ ok: true, service: "aerodb-api" }));
 
   // ---- categories ----
@@ -1004,34 +1006,82 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
     return text;
   });
 
-  app.get("/api/airfoils/:slug/sim", async (req, reply) => {
-    const { slug } = req.params as { slug: string };
-    const { re, aoa, resultId, resultAttemptId } = z
-      .object({
-        re: z.coerce.number().optional(),
-        aoa: z.coerce.number().optional(),
-        resultId: z.string().uuid().optional(),
-        resultAttemptId: z.string().uuid().optional(),
-      })
-      .refine(
-        (query) =>
-          query.resultId || (query.re !== undefined && query.aoa !== undefined),
-        {
-          message: "resultId or re+aoa is required",
-        },
-      )
-      .parse(req.query);
-    if (resultAttemptId && !resultId)
-      return reply
-        .code(400)
-        .send({ error: "An attempt requires its owning result" });
-    const sim = await assembleSim(slug, re, aoa, resultId, resultAttemptId);
-    if (!sim)
-      return reply
-        .code(404)
-        .send({ error: "no solved OpenFOAM result for this point" });
-    return sim;
-  });
+  const pointTimings = new WeakMap<
+    object,
+    { timing: PointTiming; completed: number; selector: string }
+  >();
+  app.get(
+    "/api/airfoils/:slug/sim",
+    {
+      onResponse: async (req, reply) => {
+        const item = pointTimings.get(req);
+        if (item && reply.elapsedTime >= 1000)
+          req.log.info(
+            {
+              event: "publicPointReadTiming",
+              selector: item.selector,
+              ...item.timing,
+              replyMs: Math.round(performance.now() - item.completed),
+              totalMs: Math.round(reply.elapsedTime),
+            },
+            "Slow public point read",
+          );
+      },
+    },
+    async (req, reply) => {
+      const { slug } = req.params as { slug: string };
+      const { re, aoa, resultId, resultAttemptId } = z
+        .object({
+          re: z.coerce.number().optional(),
+          aoa: z.coerce.number().optional(),
+          resultId: z.string().uuid().optional(),
+          resultAttemptId: z.string().uuid().optional(),
+        })
+        .refine(
+          (query) =>
+            query.resultId ||
+            (query.re !== undefined && query.aoa !== undefined),
+          {
+            message: "resultId or re+aoa is required",
+          },
+        )
+        .parse(req.query);
+      if (resultAttemptId && !resultId)
+        return reply
+          .code(400)
+          .send({ error: "An attempt requires its owning result" });
+      const client = publicPoints ? new AbortController() : undefined;
+      const disconnected = () => client?.abort();
+      if (client) reply.raw.once("close", disconnected);
+      let read;
+      try {
+        read = await publicPoints?.read(
+          [slug, re, aoa, resultId, resultAttemptId],
+          client?.signal,
+        );
+      } finally {
+        if (client) reply.raw.removeListener("close", disconnected);
+      }
+      if (read)
+        pointTimings.set(req, {
+          timing: read.timing,
+          completed: performance.now(),
+          selector: resultAttemptId
+            ? "attempt"
+            : resultId
+              ? "result"
+              : "coordinates",
+        });
+      const sim = read
+        ? read.detail
+        : await assembleSim(slug, re, aoa, resultId, resultAttemptId);
+      if (!sim)
+        return reply
+          .code(404)
+          .send({ error: "no solved OpenFOAM result for this point" });
+      return sim;
+    },
+  );
 
   app.get("/api/airfoils/:slug/solver-work", async (req, reply) => {
     const { slug } = req.params as { slug: string };

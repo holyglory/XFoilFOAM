@@ -1,3 +1,4 @@
+import { PublicPointReader, PUBLIC_POINT_CONNECTIONS } from "../src/public-point-reader";
 import {
   airfoils,
   boundaryConditions,
@@ -31,7 +32,7 @@ import { and, eq } from "drizzle-orm";
 import { createHash } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 
-import { db, sql as interactiveSql, syncSql, advisoryLockSql, closeDatabasePools } from "../src/db";
+import { db, sql as interactiveSql, syncSql, syncControlSql, advisoryLockSql, closeDatabasePools } from "../src/db";
 import { verifyInteractivePool } from "./interactive-pool-fixture";
 import { buildServer } from "../src/server";
 import { loadSolverHistorySource } from "@aerodb/db/solver-history-storage";
@@ -459,10 +460,57 @@ afterAll(async () => {
 
 describe("public exact-generation reads", () => {
   it("opens a selected 400-sample point and reads the catalog and admin sync view while report imports hold every sync connection", async () => {
-    expect(interactiveSql.options.max + syncSql.options.max).toBe(10);
+    expect(
+      interactiveSql.options.max +
+        PUBLIC_POINT_CONNECTIONS +
+        syncSql.options.max + syncControlSql.options.max,
+    ).toBe(10);
     expect(advisoryLockSql.options.max).toBe(16);
-    await verifyInteractivePool({ db, app, slots: syncSql.options.max, slug: `${PREFIX}-foil`, airfoilName: `${PREFIX} foil`, airfoilId,
-      revisionId, bcId, resultId, attemptId: currentAttemptId });
+    const reader = new PublicPointReader();
+    const serving = await buildServer(reader);
+    try {
+      await verifyInteractivePool({
+        db,
+        app: serving,
+        slots: syncSql.options.max,
+        slug: `${PREFIX}-foil`,
+        airfoilName: `${PREFIX} foil`,
+        airfoilId,
+        revisionId,
+        bcId,
+        resultId,
+        attemptId: currentAttemptId,
+      });
+      const selector = `/api/airfoils/${PREFIX}-foil/sim?resultId=${resultId}`;
+      for (const url of [
+        selector,
+        selector + "&resultAttemptId=" + oldAttemptId,
+        selector + "&resultAttemptId=" + currentAttemptId,
+      ]) {
+        const [expected, served] = await Promise.all([
+          app.inject({ method: "GET", url }),
+          serving.inject({ method: "GET", url }),
+        ]);
+        expect(served.statusCode).toBe(expected.statusCode);
+        expect(served.json()).toEqual(expected.json());
+      }
+      // Run the real thread while the HTTP event loop is occupied. Scientific
+      // assembly must be able to complete before the reply can run on main.
+      const isolated = reader.read([
+        `${PREFIX}-foil`,
+        undefined,
+        undefined,
+        resultId,
+        undefined,
+      ]);
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 700);
+      const completed = await isolated;
+      expect(completed.detail?.resultId).toBe(resultId);
+      expect(completed.timing.handoffMs).toBeGreaterThan(150);
+    } finally {
+      serving.server.closeAllConnections();
+      await serving.close();
+    }
   }, 45_000);
 
   it("keeps canonical attempt archive reads within configured access and leaves HZ unavailable", async () => {

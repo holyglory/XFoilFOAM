@@ -1,3 +1,4 @@
+import { pointStage } from "../public-point-timing";
 import {
   canonicalAoa,
   type FieldId,
@@ -141,7 +142,7 @@ async function selectedResultProjection(
   result: Result,
   attempt: DetailAttempt,
 ): Promise<Result> {
-  const payload = await readSelectedAttemptDetailFields(db, attempt);
+  const payload = await pointStage("attemptFields", readSelectedAttemptDetailFields(db, attempt));
   return {
     ...result,
     // A historical detail response names its own generation.
@@ -262,7 +263,7 @@ async function uransVerifyDetailOf(
   r: Result,
 ): Promise<UransVerifyDetail | null> {
   if (!r.simulationPresetRevisionId) return null;
-  const [item] = await db
+  const [item] = await pointStage("verification", db
     .select({
       state: simUransVerifyQueue.state,
       deltaCl: simUransVerifyQueue.deltaCl,
@@ -278,7 +279,7 @@ async function uransVerifyDetailOf(
       ),
     )
     .orderBy(desc(simUransVerifyQueue.createdAt))
-    .limit(1);
+    .limit(1));
   return item ?? null;
 }
 
@@ -299,9 +300,9 @@ async function solvedDetail(
   }
   const cl = r.cl;
   const cd = r.cd;
-  const review = await activeReviewVerdict(db, r.id);
+  const review = await pointStage("review", activeReviewVerdict(db, r.id));
   const media: Partial<Record<FieldId, FieldMedia>> = {};
-  const mediaCandidates = await db
+  const mediaCandidates = await pointStage("media", db
     .select({
       media: resultMedia,
       bindingId: resultMediaStorageBindings.resultMediaId,
@@ -322,7 +323,7 @@ async function solvedDetail(
         eq(resultMedia.resultId, r.id),
         eq(resultMedia.resultAttemptId, r.currentResultAttemptId!),
       ),
-    );
+    ));
   const rows = mediaCandidates
     .filter(
       (row) =>
@@ -343,10 +344,10 @@ async function solvedDetail(
     ),
   );
   const scales = scaleIds.length
-    ? await db
+    ? await pointStage("scales", db
         .select()
         .from(fieldColorScales)
-        .where(inArray(fieldColorScales.id, scaleIds))
+        .where(inArray(fieldColorScales.id, scaleIds)))
     : [];
   const scaleById = new Map(scales.map((scale) => [scale.id, scale]));
   for (const mrow of rows) {
@@ -386,7 +387,7 @@ async function solvedDetail(
   // of seconds parsing/rendering a multi-megabyte payload before media controls
   // appeared. The aggregate engine/openfoam bundle remains a lossless download
   // of every omitted mesh, dictionary, and time-directory member.
-  const [frameArtifacts, evidenceRows] = await Promise.all([
+  const [frameArtifacts, evidenceRows] = await pointStage("artifacts", Promise.all([
     db
       .select()
       .from(solverEvidenceArtifacts)
@@ -423,8 +424,8 @@ async function solvedDetail(
         ),
       )
       .orderBy(desc(solverEvidenceArtifacts.createdAt)),
-  ]);
-  const [storedHist] = await db
+  ]));
+  const [storedHist] = await pointStage("forceRow", db
     .select()
     .from(forceHistory)
     .where(
@@ -433,26 +434,26 @@ async function solvedDetail(
         eq(forceHistory.resultAttemptId, r.currentResultAttemptId!),
       ),
     )
-    .limit(1);
-  const hist = storedHist ? await readStoredForceHistory(db, storedHist) : undefined;
+    .limit(1));
+  const hist = storedHist ? await pointStage("forceHistory", readStoredForceHistory(db, storedHist)) : undefined;
   const [revision] = r.simulationPresetRevisionId
-    ? await db
+    ? await pointStage("setup", db
         .select()
         .from(simulationPresetRevisions)
         .where(eq(simulationPresetRevisions.id, r.simulationPresetRevisionId))
-        .limit(1)
+        .limit(1))
     : [];
   const snapshot = revision?.snapshot as unknown as
     | SimulationSetupSnapshot
     | undefined;
   const [legacyCondition] = snapshot
     ? []
-    : await db
+    : await pointStage("setup", db
         .select({ bc: boundaryConditions, mediumName: mediums.name })
         .from(boundaryConditions)
         .innerJoin(mediums, eq(boundaryConditions.mediumId, mediums.id))
         .where(eq(boundaryConditions.id, r.bcId))
-        .limit(1);
+        .limit(1));
   const setup = snapshotParts(snapshot);
   const mach = r.mach ?? revision?.mach ?? setup?.mach;
   if (!finiteStored(mach) || mach < 0) return null;
@@ -600,7 +601,7 @@ export async function assembleSim(
   resultId?: string,
   resultAttemptId?: string,
 ): Promise<SimulationDetail | null> {
-  const [a] = await db
+  const [a] = await pointStage("airfoil", db
     .select()
     .from(airfoils)
     .where(
@@ -610,11 +611,11 @@ export async function assembleSim(
         isNull(airfoils.deletedAt),
       ),
     )
-    .limit(1);
+    .limit(1));
   if (!a) return null;
 
   if (resultId && resultAttemptId) {
-    const [selected] = await db
+    const [selected] = await pointStage("selection", db
       .select({
         ...selectedDetailColumns,
         classification: resultClassifications.state,
@@ -690,7 +691,7 @@ export async function assembleSim(
       )`,
         ),
       )
-      .limit(1);
+      .limit(1));
     if (!selected) return null;
     return solvedDetail(
       a.name,
@@ -706,7 +707,7 @@ export async function assembleSim(
   }
 
   if (resultId) {
-    const [selected] = await db
+    const [selected] = await pointStage("selection", db
       .select({
         ...selectedDetailColumns,
         revisionReynolds: simulationPresetRevisions.reynolds,
@@ -736,7 +737,7 @@ export async function assembleSim(
           inArray(resultClassifications.state, ["accepted", "needs_urans"]),
         ),
       )
-      .limit(1);
+      .limit(1));
     if (!selected) return null;
     const r = await selectedResultProjection(selected.result, selected.attempt);
     const effectiveRe = r.reynolds ?? selected.revisionReynolds ?? re;
@@ -746,13 +747,13 @@ export async function assembleSim(
 
   if (re === undefined || aoa === undefined) return null;
 
-  const [air] = await db
+  const [air] = await pointStage("selection", db
     .select({ id: mediums.id })
     .from(mediums)
     .where(eq(mediums.slug, "air"))
-    .limit(1);
+    .limit(1));
   if (air) {
-    const presets = await db
+    const presets = await pointStage("selection", db
       .select({
         revisionId: simulationPresetRevisions.id,
         reynolds: simulationPresetRevisions.reynolds,
@@ -775,13 +776,13 @@ export async function assembleSim(
       .orderBy(
         desc(simulationPresetRevisions.createdAt),
         desc(simulationPresetRevisions.revisionNumber),
-      );
+      ));
     const revisionIds = presets.map((preset) => preset.revisionId);
     const reByRevision = new Map(
       presets.map((preset) => [preset.revisionId, preset.reynolds]),
     );
     if (revisionIds.length) {
-      const selectedRows = await db
+      const selectedRows = await pointStage("selection", db
         .select(selectedDetailColumns)
         .from(results)
         .innerJoin(
@@ -809,7 +810,7 @@ export async function assembleSim(
             eq(resultAttempts.status, "done"),
             inArray(resultClassifications.state, ["accepted", "needs_urans"]),
           ),
-        );
+        ));
       const candidates = selectedRows
         .map(({ result, attempt }) => {
           const effectiveRe =
