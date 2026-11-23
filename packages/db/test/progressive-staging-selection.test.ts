@@ -36,7 +36,9 @@ async function withWakeFixture(
       SELECT 1 id,false remote_solver_transfer_paused,'fixture-token'::text remote_solver_auth_token,
         'https://wake.invalid'::text upstream_base_url,md5('unselected')::uuid remote_solver_registered_id`);
     await transaction.execute(sql`CREATE TEMP TABLE sim_jobs (
-      id uuid PRIMARY KEY,request_payload jsonb,ingest_lease_token uuid,ingest_lease_expires_at timestamptz) ON COMMIT DROP`);
+      id uuid PRIMARY KEY,request_payload jsonb,ingest_lease_token uuid,ingest_lease_expires_at timestamptz,
+      status sim_job_status DEFAULT 'running') ON COMMIT DROP`);
+    await transaction.execute(sql`CREATE INDEX wake_fixture_ingest_lease_idx ON sim_jobs(status,ingest_lease_expires_at)`);
     await transaction.execute(sql`INSERT INTO sim_jobs
       SELECT id,jsonb_build_object('syncPromiseId',id::text,'remoteSolver',variant<>'not-remote',
         'upstreamBaseUrl',CASE WHEN variant='wrong-job-upstream' THEN 'https://foreign.invalid' ELSE 'https://wake.invalid' END),
@@ -206,6 +208,33 @@ it.each(wakeSources)(
     });
   },
 );
+
+it.each(["source", "keys"] as const)("keeps only eligible sequences and exact attempts when repeated bindings share a deadline (%s)", async (reads) => {
+  await withWakeFixture("delivery", async db => {
+    const [job] = await db.execute(sql`SELECT id FROM wake_cases WHERE variant='future-retry'`);
+    await db.execute(sql`UPDATE sync_api_settings SET remote_solver_registered_id=${job.id}::uuid`);
+    await db.execute(sql`INSERT INTO progressive_worker_reports(sim_job_id,sequence,acknowledged_at,report,created_at)
+      SELECT sim_job_id,n,acknowledged_at,report,created_at FROM progressive_worker_reports
+      CROSS JOIN generate_series(2,4)n WHERE sim_job_id=${job.id}::uuid AND sequence=1`);
+    await db.execute(sql`INSERT INTO progressive_worker_evidence_receipts SELECT ${job.id}::uuid,n FROM generate_series(2,4)n`);
+    await db.execute(sql`INSERT INTO result_attempts(id,sim_job_id,engine_job_id,result_id)
+      VALUES(md5('competing-attempt')::uuid,${job.id}::uuid,'wrong-engine',${job.id}::uuid)`);
+    await db.execute(sql`INSERT INTO progressive_worker_evidence_attempts
+      SELECT ${job.id}::uuid,n,CASE WHEN n=4 THEN md5('competing-attempt')::uuid ELSE ${job.id}::uuid END,${job.id}::text
+      FROM generate_series(2,4)n`);
+    if (reads === "keys") await useFixtureStagingKeys(db);
+    const wake = async () => (await db.execute(progressiveEvidenceWakeSql("delivery", false)))[0].wake_at;
+    const [expected] = await db.execute(sql`SELECT retry_after FROM progressive_worker_delivery_failures WHERE sim_job_id=${job.id}::uuid`);
+    await db.execute(sql`INSERT INTO progressive_worker_report_conflicts VALUES(${job.id}::uuid,1),(${job.id}::uuid,2)`);
+    expect(await wake()).toEqual(expected.retry_after);
+    await db.execute(sql`INSERT INTO progressive_worker_report_conflicts VALUES(${job.id}::uuid,3)`);
+    expect(await wake()).toBeNull();
+    await db.execute(sql`UPDATE result_attempts SET engine_job_id=${job.id}::text WHERE id=md5('competing-attempt')::uuid`);
+    expect(await wake()).toEqual(expected.retry_after);
+    await db.execute(sql`DELETE FROM progressive_worker_evidence_receipts WHERE sim_job_id=${job.id}::uuid AND sequence=4`);
+    expect(await wake()).toBeNull();
+  });
+});
 
 it.each(wakeSources)(
   "keeps $scope via $reads ownership probes bounded with forty thousand retained reports",

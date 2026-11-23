@@ -68,7 +68,8 @@ export async function nextProgressiveEvidenceWakeAt(
   if (!(await hasRegisteredWorkerJob(db))) return null;
   const scopes: ProgressiveEvidenceWakeScope[] =
     scope === "all" ? ["staging", "delivery"] : [scope];
-  for (const selected of scopes) {
+  // The scoped staging deadline checks ready work first in the same snapshot.
+  for (const selected of scope === "staging" ? [] : scopes) {
     const [ready] = await db.execute(
       progressiveEvidenceWakeSql(selected, true),
     );

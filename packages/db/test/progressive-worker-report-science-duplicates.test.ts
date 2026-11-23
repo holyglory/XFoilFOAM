@@ -486,6 +486,24 @@ it("replaces per-sequence terminal staging with one indexed proof page on the sa
     expect(JSON.stringify(plan)).toContain(
       "progressive_worker_staging_copies_pkey",
     );
+    // This is the full selector with real covered copies. A single-key plan
+    // above cannot catch an uncorrelated materialization in the outer query.
+    for (const preferActive of [false, true]) {
+      const [measured] = await f.db.execute(sql`EXPLAIN (ANALYZE,VERBOSE,BUFFERS,FORMAT JSON)
+        ${progressiveStagingSelectionSql(preferActive)}`);
+      const nodes = [(measured["QUERY PLAN"] as { Plan: Record<string, unknown> }[])[0].Plan];
+      const proofScans = [];
+      for (const node of nodes) {
+        nodes.push(...((node.Plans ?? []) as Record<string, unknown>[]));
+        if (node["Relation Name"] === "progressive_worker_staging_copies" && Number(node["Actual Loops"]) > 0)
+          proofScans.push(node);
+      }
+      expect(proofScans.length).toBeGreaterThan(0);
+      for (const scan of proofScans) {
+        expect(scan["Index Name"]).toBe("progressive_worker_staging_copies_pkey");
+        expect(String(scan["Index Cond"])).toMatch(/sim_job_id.*sequence/);
+      }
+    }
     expect(await protectedState(f)).toEqual(original);
     console.info(
       JSON.stringify({
