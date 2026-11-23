@@ -76,7 +76,8 @@ def change_tree(root: int, expected: dict, records: list[dict], *, restore: bool
             try:
                 death = select.poll()
                 death.register(handle, select.POLLIN)
-                if death.poll(0) or _entry(pid)["start"] != old["start"]:
+                live = _entry(pid)
+                if death.poll(0) or any(live[k] != old[k] for k in ("start", "namespace", "cgroup")):
                     continue
                 soft, hard = resource.prlimit(pid, resource.RLIMIT_CORE)
                 target = old["core"][0] if restore else 0
