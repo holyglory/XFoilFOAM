@@ -5586,6 +5586,12 @@ diagnostic_sources = [{ format = "junit", path = "report.xml" }]
 # Host admission time counts against the complete graph's deadline.
 timeout_seconds = 7200
 
+[[test.progressive-report-archive.check]]
+name = "deployment-storage-cleanup"
+tier = "development"
+timeout_seconds = 60
+command = ["/bin/bash", "-c", "repo_git=$(git rev-parse --path-format=absolute --git-common-dir) && exec \"${repo_git%/*}/.venv/bin/python\" -m pytest tests/test_deployment_storage_prune.py -q"]
+
 [test.progressive-report-archive.postgres]
 image = "postgres:16-alpine"
 database = "aerodb"
