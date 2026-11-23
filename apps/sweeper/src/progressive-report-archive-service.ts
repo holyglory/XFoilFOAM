@@ -3,12 +3,7 @@ import {
   type WorkerPrefixCursor,
 } from "@aerodb/db/progressive-report-prefix";
 import type { DB } from "@aerodb/db";
-import {
-  canonicalReportJson,
-  parseReportJson,
-  reportJsonObject,
-} from "@aerodb/db/progressive-report-archive";
-import { retainedReportInventory } from "@aerodb/db/retained-solver-reports";
+import { cancelledReportSourceVerifier } from "./report-archive-source-proof";
 import { sql } from "drizzle-orm";
 import { createHash } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
@@ -173,6 +168,7 @@ async function* archiveLines(
   let logicalBytes = 0;
   let encodedBytes = 0;
   let previous: string | undefined;
+  const verifySource = cancelledReportSourceVerifier(executionId);
   for (const key of keys) {
     const sequence = Number(key.sequence);
     const kind = key.kind as Kind;
@@ -199,21 +195,7 @@ async function* archiveLines(
       // Bound an individual member for the full product reader. Verify the
       // actual PG numeric tokens and scientific source inventory before upload.
       if (bytes > restoredByteTarget) continue;
-      const report = reportJsonObject(parseReportJson(raw));
-      const canonicalHash = createHash("sha256")
-        .update(canonicalReportJson(report))
-        .digest("hex");
-      const inventory = retainedReportInventory(report, signature);
-      if (
-        report.executionId !== executionId ||
-        canonicalReportJson(report.sequence!) !== String(sequence) ||
-        canonicalHash !== signature ||
-        inventory.signature !== key.inventorySignature
-      )
-        throw new Error(
-          "Cancelled report differs from the receipted source inventory",
-        );
-      sourceList = canonicalReportJson(inventory.sources);
+      sourceList = verifySource(raw, sequence, signature, key.inventorySignature);
     }
     members.push({
       sequence,

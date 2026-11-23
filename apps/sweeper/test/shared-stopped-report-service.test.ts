@@ -16,6 +16,8 @@ import {
 } from "./progressive-report-archive-fixture";
 import { startReportObjectServer } from "./shared-report-gcs-server";
 import { sharedReportTotals } from "../src/shared-report-totals";
+import { stoppedReportCopyKeys } from "../src/shared-stopped-report-custody";
+import { STALE_HZ_RESET_REASON } from "@aerodb/db/progressive-remote-stale-recovery";
 
 it("runs the stock recurring hub storage worker and serves both archive formats through the live retained-report API", async () => {
   expect(process.env.PROGRESSIVE_REPORT_ARCHIVE_DISPOSABLE_DB).toBe("1");
@@ -136,6 +138,29 @@ it("runs the stock recurring hub storage worker and serves both archive formats 
             await f.db
               .execute(sql`UPDATE sim_jobs SET status='cancelled',engine_state='failed',"ingestedAt"=NULL,
           error='Scheduling promise became inactive; evidence delivery remains unresolved' WHERE id=${f.executionId}::uuid`);
+          if (order === 1) {
+            const keys = () => stoppedReportCopyKeys(f.db, f.executionId, 0, 1);
+            await f.db.execute(sql`UPDATE sim_jobs SET error=${STALE_HZ_RESET_REASON} WHERE id=${f.executionId}::uuid`);
+            await expect(keys()).rejects.toThrow("Stopped report owner");
+            await f.db.execute(sql`UPDATE sync_sweep_promises p SET status='cancelled',"cancelledAt"=clock_timestamp(),
+              response_payload=jsonb_build_object('authoritativeLeaseLoss',true,'remoteCancellation',
+                jsonb_build_object('disposition','operator_release','reason',${STALE_HZ_RESET_REASON}::text))
+              FROM progressive_remote_dispatches d WHERE d.sim_job_id=${f.executionId}::uuid AND p.id=d.promise_id`);
+            await f.db.execute(sql`INSERT INTO sync_sweep_promise_points (promise_id,airfoil_id,simulation_preset_revision_id,aoa_deg,status)
+              SELECT p.id,p.airfoil_id,p.simulation_preset_revision_id,7,'active' FROM sync_sweep_promises p
+              JOIN progressive_remote_dispatches d ON d.promise_id=p.id WHERE d.sim_job_id=${f.executionId}::uuid`);
+            await expect(keys()).rejects.toThrow("Stopped report owner");
+            await f.db.execute(sql`UPDATE sync_sweep_promise_points s SET status='cancelled' FROM progressive_remote_dispatches d
+              WHERE d.sim_job_id=${f.executionId}::uuid AND s.promise_id=d.promise_id`);
+            expect(await keys()).toHaveLength(1);
+            await f.db.execute(sql`UPDATE sync_sweep_promises p SET response_payload=jsonb_set(p.response_payload,
+              '{remoteCancellation,reason}','"different operator decision"') FROM progressive_remote_dispatches d
+              WHERE d.sim_job_id=${f.executionId}::uuid AND p.id=d.promise_id`);
+            await expect(keys()).rejects.toThrow("Stopped report owner");
+            await f.db.execute(sql`UPDATE sync_sweep_promises p SET response_payload=jsonb_set(p.response_payload,
+              '{remoteCancellation,reason}',to_jsonb(${STALE_HZ_RESET_REASON}::text)) FROM progressive_remote_dispatches d
+              WHERE d.sim_job_id=${f.executionId}::uuid AND p.id=d.promise_id`);
+          }
           originals.push(f);
         },
         {

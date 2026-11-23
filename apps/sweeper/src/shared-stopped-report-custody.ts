@@ -24,8 +24,39 @@ import {
   type SharedReportManifest,
 } from "./shared-report-archive";
 import { sha256, type ReportObjects } from "./shared-report-objects";
+import { matchingReportResultSuffix } from "./report-archive-source-proof";
 
 const limit = 64 * 1024 ** 2;
+export function stoppedReportPageText() {
+  let prior:
+    | { prefix: string; result: string; hash: string; size: number }
+    | undefined;
+  return (env: string, storedHash: string | null, protectedBytes: number) => {
+    const suffix =
+      storedHash === null ? matchingReportResultSuffix(env, prior) : undefined;
+    if (prior && suffix !== undefined) return { ...prior, suffix };
+    prior = undefined;
+    const cut = splitProgressiveReportText(env);
+    if (storedHash && !cut.result)
+      throw new Error("Protected SQL result has no root result header");
+    if (!storedHash && cut.result !== null) {
+      prior = {
+        prefix: cut.prefix,
+        result: cut.result,
+        hash: sha256(cut.result),
+        size: Buffer.byteLength(cut.result),
+      };
+      return { ...prior, suffix: cut.suffix };
+    }
+    return {
+      prefix: cut.prefix,
+      suffix: cut.suffix,
+      result: null,
+      hash: storedHash,
+      size: storedHash ? protectedBytes : undefined,
+    };
+  };
+}
 const pointList = sql`coalesce((SELECT jsonb_agg(jsonb_build_object('point_content_signature',s.point_content_signature,
   'aoa_deg',s.aoa_deg,'case_slug',s.case_slug) ORDER BY s.point_content_signature COLLATE "C")
   FROM progressive_remote_report_sources s WHERE s.sim_job_id=r.sim_job_id AND s.sequence=r.sequence),'[]'::jsonb)`;
@@ -183,33 +214,28 @@ export async function copyStoppedReportBatch(
   }[] = [];
   let logical = 0,
     envelope = 0;
+  const pageText = stoppedReportPageText();
   for (const key of keys) {
     const [r] = await db.execute(sql`WITH original AS MATERIALIZED (
       SELECT r.sequence,r.content_signature,r.received_at::text received,r.result_payload_hash h,pg_column_size(r.report)::int stored,coalesce(pg_column_size(r.result_payload_hash),0)::int ref_bytes,
-        r.report::text AS env,public.resolve_progressive_report(r.report,r.result_payload_hash)::text AS body,
+        r.report::text AS env,CASE WHEN r.result_payload_hash IS NOT NULL THEN
+          public.resolve_progressive_report(r.report,r.result_payload_hash)::text END AS resolved,
         i.inventory_signature AS inventory,i.source_count AS n,${pointList}::text AS points,
         (SELECT byte_size FROM progressive_report_result_payloads p WHERE p.content_hash=r.result_payload_hash) AS payload_bytes
       ${base} WHERE r.sim_job_id=${job}::uuid AND r.sequence=${key.sequence} AND r.content_signature=${key.signature} AND ${signed}
         AND NOT (${scientificallyReceiptedReportCopy}) AND (${release})=${mode === "release"})
-     SELECT h,stored,ref_bytes,received,inventory,n,points,payload_bytes,octet_length(body)::int AS bytes,
-       encode(sha256(convert_to(body,'UTF8')),'hex') AS sha,CASE WHEN octet_length(env)<=${limit} THEN env END AS env FROM original`);
+     SELECT h,stored,ref_bytes,received,inventory,n,points,payload_bytes,octet_length(coalesce(resolved,env))::int AS bytes,
+       encode(sha256(convert_to(coalesce(resolved,env),'UTF8')),'hex') AS sha,CASE WHEN octet_length(env)<=${limit} THEN env END AS env FROM original`);
     if (!r || typeof r.env !== "string" || Number(r.bytes) > limit)
       throw new Error(
         "Stopped report source changed or exceeds its size bound",
       );
     if (inputs.length && logical + Number(r.bytes) > 128 * 1024 ** 2) break;
-    const cut = splitProgressiveReportText(r.env);
-    const h =
-      r.h == null ? (cut.result ? sha256(cut.result) : null) : String(r.h);
     const storedHash = r.h == null ? null : String(r.h);
-    if (storedHash && !cut.result)
-      throw new Error("Protected SQL result has no root result header");
-    const resultSize = storedHash
-      ? Number(r.payload_bytes)
-      : cut.result
-        ? Buffer.byteLength(cut.result)
-        : undefined;
-    const inline = storedHash ? null : cut.result;
+    const cut = pageText(r.env, storedHash, Number(r.payload_bytes));
+    const h = cut.hash,
+      resultSize = cut.size,
+      inline = cut.result;
     const member = {
       sequence: key.sequence,
       signature: key.signature,
