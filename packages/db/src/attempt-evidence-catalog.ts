@@ -2,6 +2,7 @@ import { sql, type SQL } from "drizzle-orm";
 import type { DB } from "./client";
 import {
   MAX_ATTEMPT_EVIDENCE_BYTES,
+  attemptHistorySizesSql,
   hasAttemptEvidenceStoragePointer,
   type AttemptEvidenceCopyPlan,
   type AttemptEvidenceCopySource,
@@ -173,14 +174,13 @@ export function attemptEvidenceArchiveCandidatesSql(
         CASE WHEN pg_column_size(a.evidence_payload)<=${MAX_ATTEMPT_EVIDENCE_BYTES} THEN a.evidence_payload END AS payload
       FROM ids JOIN result_attempts a USING(id) LEFT JOIN sim_jobs job ON job.id=a.sim_job_id
     ), measured AS MATERIALIZED (
-      SELECT *,octet_length(payload::text) AS byte_size,
-        (SELECT coalesce(sum((item->>'byteSize')::bigint),0) FROM jsonb_array_elements(attempt_evidence_series_inventory(payload)) item) AS history_bytes,
-        encode(sha256(convert_to(payload::text,'UTF8')),'hex') AS source_sha FROM sources
+      SELECT sources.*,octet_length(payload::text) AS byte_size,series.*
+      FROM sources CROSS JOIN LATERAL (${attemptHistorySizesSql(sql`payload`)}) series
     ) SELECT id,byte_size,history_bytes::text,
-      (settled AND byte_size BETWEEN 1 AND ${MAX_ATTEMPT_EVIDENCE_BYTES} AND history_bytes>=4096 AND NOT EXISTS (
+      (settled AND byte_size BETWEEN 1 AND ${MAX_ATTEMPT_EVIDENCE_BYTES} AND has_samples AND NOT EXISTS (
         SELECT 1 FROM attempt_evidence_archives archive WHERE archive.result_attempt_id=measured.id
           ${sourceInstance ? sql`AND archive.source_instance=${sourceInstance}` : sql``}
-          AND archive.source_sha256=source_sha AND archive.source_byte_size=byte_size
+          AND archive.source_sha256=encode(sha256(convert_to(payload::text,'UTF8')),'hex') AND archive.source_byte_size=byte_size
           AND archive.result_id IS NOT DISTINCT FROM measured.result_id AND archive.sim_job_id IS NOT DISTINCT FROM measured.sim_job_id)) AS eligible
     FROM measured ORDER BY id`;
 }
@@ -249,16 +249,10 @@ export function attemptEvidenceUseAuditSql(
         AND job."ingestedAt" IS NOT NULL AND (job.ingest_lease_token IS NULL OR coalesce(job.ingest_lease_expires_at<=clock_timestamp(),false))))) AS settled
     FROM ids JOIN result_attempts a USING(id) LEFT JOIN use_flags ON use_flags.id=a.id LEFT JOIN sim_jobs job ON job.id=a.sim_job_id
   ), sizes AS MATERIALIZED (
-    SELECT *,octet_length(payload::text)::bigint AS source_bytes,
-      (SELECT coalesce(sum(octet_length((payload #> path)::text)::bigint),0) FROM (VALUES
-        (ARRAY['force_history','t']),(ARRAY['force_history','cl']),(ARRAY['force_history','cd']),(ARRAY['force_history','cm']),
-        (ARRAY['forceHistory','t']),(ARRAY['forceHistory','cl']),(ARRAY['forceHistory','cd']),(ARRAY['forceHistory','cm']),
-        (ARRAY['steady_history','iterations']),(ARRAY['steady_history','cl']),(ARRAY['steady_history','cd']),(ARRAY['steady_history','cm']),
-        (ARRAY['steadyHistory','iterations']),(ARRAY['steadyHistory','cl']),(ARRAY['steadyHistory','cd']),(ARRAY['steadyHistory','cm']),
-        (ARRAY['frame_track','frames']),(ARRAY['frameTrack','frames'])) paths(path) WHERE jsonb_typeof(payload #> path)='array') AS history_bytes
-    FROM measured
+    SELECT measured.*,octet_length(payload::text)::bigint AS source_bytes,series.*
+    FROM measured CROSS JOIN LATERAL (${attemptHistorySizesSql(sql`payload`)}) series
   ), copies AS (
-    SELECT *, (settled AND source_bytes BETWEEN 1 AND ${MAX_ATTEMPT_EVIDENCE_BYTES} AND history_bytes>=4096) AS copy_eligible,
+    SELECT *, (settled AND source_bytes BETWEEN 1 AND ${MAX_ATTEMPT_EVIDENCE_BYTES} AND has_samples) AS copy_eligible,
       ${
         options.catalogReady
           ? sql`EXISTS (SELECT 1 FROM attempt_evidence_archives archive WHERE archive.result_attempt_id=sizes.id

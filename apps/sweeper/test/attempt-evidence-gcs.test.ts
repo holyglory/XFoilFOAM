@@ -178,14 +178,14 @@ describe("settled attempt GCS retention and immutable SQL receipts", () => {
       active?: boolean;
       canonical?: boolean;
       model?: boolean;
-      small?: boolean;
+      sampleCount?: number;
     } = {},
   ) {
     const attemptId = randomUUID(),
       resultId = randomUUID(),
       simJobId = randomUUID();
     const values = Array.from(
-      { length: options.small ? 2 : 600 },
+      { length: options.sampleCount ?? 600 },
       (_, i) => i / 10,
     );
     const payload = `{"cl":0.25,"cd":0.03,"metadata":{"n":9007199254740993123456789,"decimal":0.123456789012345678901},"force_history":${JSON.stringify({ t: values, cl: values, cd: values, cm: null, samples: values.length })},"evidence_artifacts":[]}`;
@@ -414,9 +414,11 @@ describe("settled attempt GCS retention and immutable SQL receipts", () => {
       registerAttemptEvidenceArchive(db, result.archive, plan),
     ).rejects.toThrow("active writer");
   });
-  it("bounds automatic GCS work, skips small and active histories, and leaves a cursor for remaining work", async () => {
-    await seed({ small: true });
-    await seed({ active: true });
+  it("backs up short nonempty histories through the bounded scan and leaves active or empty sources alone", async () => {
+    const small = await seed({ sampleCount: 2, canonical: true });
+    const empty = await seed({ sampleCount: 0 });
+    const active = await seed({ active: true });
+    const before = await onlinePoint(small.attemptId);
     for (let i = 0; i < 3; i++) await seed();
     const memory = new MemoryGcs(),
       result = await runAttemptEvidenceArchivePass(db, memoryStore(memory), {
@@ -430,5 +432,19 @@ describe("settled attempt GCS retention and immutable SQL receipts", () => {
     expect(result.onlineBytesRemoved).toBe(0);
     expect(result.next).not.toBeNull();
     expect(memory.uploads).toBe(1);
+    let after = result.next;
+    while (after !== null) {
+      const page = await runAttemptEvidenceArchivePass(db, memoryStore(memory), {
+        bucket: "fixture", sourceInstance: "hub", after, maxRows: 2,
+      });
+      expect(page.failures).toEqual([]);
+      after = page.next;
+    }
+    const records = await db.execute(sql`SELECT id,result_attempt_id FROM attempt_evidence_archives
+      WHERE result_attempt_id IN (${small.attemptId}::uuid,${empty.attemptId}::uuid,${active.attemptId}::uuid)`);
+    expect(records.map(row => row.result_attempt_id)).toEqual([small.attemptId]);
+    const restored = await memoryStore(memory).read(await getAttemptEvidenceArchive(db, String(records[0]!.id)));
+    expect(restored.payloadText).toBe(before.text);
+    expect(await onlinePoint(small.attemptId)).toEqual(before);
   });
 });
