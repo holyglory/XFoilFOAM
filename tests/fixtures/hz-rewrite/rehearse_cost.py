@@ -3,16 +3,25 @@
 import argparse
 import gzip
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
 import re
 import subprocess
+import tempfile
 import time
 
 MIB = 1024**2
 PREFIX = "progressive_worker_reports_"
 REFERENCE = PREFIX + "staging_candidate_idx"
+host_source = (
+    Path(__file__).resolve().parents[3]
+    / "scripts/deploy/hz-worker-report-rewrite-host.py"
+)
+spec = importlib.util.spec_from_file_location("hz_rewrite_host", host_source)
+host = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(host)
 MODES = ("current", "normalized", "metadata", "combined")
 FIELDS = (
     "sim_job_id",
@@ -107,7 +116,7 @@ class PG:
         ):
             raise ValueError("Could not bind the exact governed PostgreSQL fixture")
         self.container = matched[0]
-        self.directory = "/tmp/hz-report-cost-" + run
+        self.directory = "/tmp/hz-pg16-index-cost-" + run
         self.fixture(
             [
                 "install",
@@ -138,6 +147,74 @@ class PG:
         return subprocess.check_output(
             ["docker", "exec", self.container, *cmd], text=True, timeout=12
         )
+
+    def cold_sources(self, physical):
+        # The helper is shared with the governed index-crossover rehearsal.
+        # It accepts only postgres-owned source segments of this fixture.
+        source = Path(__file__).parents[1] / "hz_pg16_index_cache.c"
+        binary = self.directory + "/fadvise"
+        with tempfile.TemporaryDirectory() as tmp:
+            exe = Path(tmp) / "fadvise"
+            subprocess.run(
+                ["cc", "-O2", "-Wall", "-static", str(source), "-o", str(exe)],
+                check=True,
+                timeout=35,
+            )
+            subprocess.run(
+                [
+                    "docker",
+                    "exec",
+                    "-i",
+                    "-u",
+                    "postgres",
+                    self.container,
+                    "sh",
+                    "-ec",
+                    'umask 077; cat > "$1" && chmod 700 "$1"',
+                    "fixture",
+                    binary,
+                ],
+                input=exe.read_bytes(),
+                check=True,
+                timeout=15,
+            )
+        root = Path(physical["heapFile"]).parent
+        if not re.fullmatch(r"pg_tblspc/[0-9]+/PG_16_[0-9]+/[0-9]+", str(root)):
+            raise ValueError("Expected dedicated fixture disk tablespace")
+        base = Path(self.directory).joinpath(*root.parts[2:])
+        paths = [
+            str(base / str(n))
+            for n in (
+                physical["file"],
+                physical["toastFilenode"],
+                *physical["toastIndexFiles"].values(),
+            )
+        ]
+        self.run("CHECKPOINT")
+        out = subprocess.check_output(
+            [
+                "docker",
+                "exec",
+                "-u",
+                "postgres",
+                self.container,
+                binary,
+                "evict-fixture-sources",
+                *paths,
+            ],
+            timeout=25,
+            text=True,
+        )
+        observed = json.loads(out)
+        if (
+            observed["sourceBytes"] < physical["toast"]
+            or observed["residentAfterBytes"] >= observed["sourceBytes"]
+        ):
+            raise ValueError(
+                "Targeted fixture cold-read preparation did not remove cached source pages"
+            )
+        self.fixture(["rm", "--", binary])
+        return observed
 
     def run(self, q, data=None):
         p = subprocess.run(
@@ -214,12 +291,19 @@ def load_corpus(pg, root):
     return m, indexes
 
 
-def full_rewrite(pg):
+def full_rewrite(pg, toast_only=False, cancel_probe=None):
     start = time.monotonic()
     samples = []
+    cancelled = None
     env = dict(pg.env, PGAPPNAME="hz_full_index_rehearsal")
     p = subprocess.Popen(
-        [*pg.cmd, "-c", "VACUUM (FULL, ANALYZE) hz_cost.measured"],
+        [
+            *pg.cmd,
+            "-c",
+            (host.TOAST_VACUUM if toast_only else host.VACUUM).replace(
+                host.TABLE, "hz_cost.measured"
+            ),
+        ],
         env=env,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
@@ -229,9 +313,8 @@ def full_rewrite(pg):
             age = time.monotonic() - start
             if age > 310:
                 raise TimeoutError("Disposable rewrite deadline")
-            # Resolve the OID before launch. A name lookup would take an
-            # AccessShareLock on the target being rewritten.
-            observation = pg.value("""SELECT coalesce((SELECT jsonb_build_object('phase',v.phase,'indexes',v.index_rebuild_count,'blocks',v.heap_blks_scanned,
+            # Avoid a target name lookup while PostgreSQL holds its exclusive lock.
+            observation = pg.value("""SELECT coalesce((SELECT jsonb_build_object('pid',v.pid,'relation',v.relid::bigint,'phase',v.phase,'indexes',v.index_rebuild_count,'blocks',v.heap_blks_scanned,
               'total',v.heap_blks_total,'tuples',v.heap_tuples_written) FROM pg_stat_activity a JOIN pg_stat_progress_cluster v USING(pid)
               WHERE a.application_name='hz_full_index_rehearsal'),'null'::jsonb)""")
             if observation and (
@@ -239,14 +322,32 @@ def full_rewrite(pg):
                 or any(samples[-1][k] != observation[k] for k in ("phase", "indexes"))
             ):
                 samples.append(dict(observation, seconds=age))
+            if (
+                cancel_probe
+                and observation
+                and observation["tuples"] > 0
+                and cancelled is None
+            ):
+                cancelled = cancel_probe(observation)
             time.sleep(0.1)
-        if p.returncode:
-            raise RuntimeError(p.stderr.read().decode()[-500:])
+        stderr = p.stderr.read().decode()[-500:]
+        if cancel_probe:
+            if (
+                not cancelled
+                or not p.returncode
+                or "canceling statement due to user request" not in stderr
+            ):
+                raise AssertionError(
+                    f"Missing a genuine in-flight PostgreSQL cancellation: {stderr}"
+                )
+        elif p.returncode:
+            raise RuntimeError(stderr)
     finally:
         if p.poll() is None:
             p.terminate()
             p.wait(timeout=5)
     return {
+        "cancelled": cancelled,
         "seconds": time.monotonic() - start,
         "firstIndexSeconds": next(
             (s["seconds"] for s in samples if s["phase"] == "rebuilding index"), None
@@ -255,7 +356,34 @@ def full_rewrite(pg):
     }
 
 
-def measure(pg, indexes, mode, copies):
+def science(pg):
+    # One source per original stable key. The full-record proof independently
+    # checks every storage copy, including all unknown fields and numeric scale.
+    return pg.value("""WITH originals AS MATERIALIZED(
+      SELECT t.sim_job_id AS j,t.sequence AS n,t.content_signature AS sig,k.original_sha,k.original_bytes,
+        CASE WHEN t.archive_bundle_id IS NULL THEN public.resolve_progressive_report(t.report,t.result_payload_hash) END AS original
+      FROM hz_cost.measured t JOIN hz_cost.template k USING(sim_job_id,sequence) WHERE t.copy_no=1),
+      data AS MATERIALIZED(SELECT j,n,sig,original_sha,original_bytes,original::text AS text,original->'result' AS result FROM originals),
+      points AS MATERIALIZED(SELECT j,n,p.ordinal AS polar,x.ordinal AS ordinal,x.pt FROM data
+        CROSS JOIN LATERAL jsonb_array_elements(CASE WHEN jsonb_typeof(result->'polars')='array' THEN result->'polars' ELSE '[]' END)
+          WITH ORDINALITY p(value,ordinal)
+        CROSS JOIN LATERAL jsonb_array_elements(coalesce(p.value->'points','[]')||coalesce(p.value->'attempts','[]'))
+          WITH ORDINALITY x(pt,ordinal)),
+      subsets AS MATERIALIZED(SELECT j,n,polar,ordinal,
+        (SELECT jsonb_object_agg(k,v) FROM jsonb_each(pt) p(k,v) WHERE k IN('cl','cd','cm','cl_std','cd_std','cm_std','converged','unsteady','stalled')) coefficients,
+        (SELECT jsonb_object_agg(k,v) FROM jsonb_each(pt) p(k,v) WHERE k LIKE '%history%' OR k IN ('frame_track','frameTrack')) histories
+        FROM points)
+      SELECT jsonb_build_object('sources',count(*),'hotOrShared',count(text),'coldBindings',count(*)-count(text),
+        'badOriginals',count(*) FILTER(WHERE text IS NOT NULL AND
+         (encode(sha256(convert_to(text,'UTF8')),'hex')<>original_sha OR octet_length(text)<>original_bytes)),
+        'allSourceHash',encode(sha256(string_agg(record_send(ROW(j,n,sig,original_sha,original_bytes)),''::bytea ORDER BY j,n)),'hex'),
+        'scientificHash',encode(sha256(string_agg(sha256(record_send(ROW(j,n,result))),''::bytea ORDER BY j,n)),'hex'),
+        'coefficients',(SELECT jsonb_build_object('points',count(coefficients),'sha256',encode(sha256(string_agg(sha256(record_send(ROW(j,n,polar,ordinal,coefficients))),''::bytea ORDER BY j,n,polar,ordinal)),'hex')) FROM subsets),
+        'histories',(SELECT jsonb_build_object('points',count(histories),'sha256',encode(sha256(string_agg(sha256(record_send(ROW(j,n,polar,ordinal,histories))),''::bytea ORDER BY j,n,polar,ordinal)),'hex')) FROM subsets))
+      FROM data""")
+
+
+def measure(pg, indexes, mode, copies, toast_only=False, cancel_trial=False):
     metadata = mode in ("metadata", "combined")
     normalize = mode in ("normalized", "combined")
     pg.run(
@@ -335,6 +463,11 @@ def measure(pg, indexes, mode, copies):
         return pg.value(f"""SELECT jsonb_build_object('oid',c.oid::bigint,'file',pg_relation_filenode(c.oid)::bigint,
           'heap',pg_relation_size(c.oid),'toast',pg_relation_size(c.reltoastrelid),'indexes',pg_indexes_size(c.oid)+pg_indexes_size(c.reltoastrelid),
           'allocated',pg_total_relation_size(c.oid),'indexCount',(SELECT count(*) FROM pg_index WHERE indrelid=c.oid),
+          'toastOid',c.reltoastrelid::bigint,'toastFilenode',pg_relation_filenode(c.reltoastrelid)::bigint,
+          'parentIndexFiles',(SELECT jsonb_object_agg(indexrelid::text,pg_relation_filenode(indexrelid)::bigint) FROM pg_index WHERE indrelid=c.oid),
+          'toastIndexFiles',(SELECT jsonb_object_agg(indexrelid::text,pg_relation_filenode(indexrelid)::bigint) FROM pg_index WHERE indrelid=c.reltoastrelid),
+          'heapFile',pg_relation_filepath(c.oid),'toastFile',pg_relation_filepath(c.reltoastrelid),
+          'toastIndexBytes',pg_indexes_size(c.reltoastrelid),'parentIndexBytes',pg_indexes_size(c.oid),
           'wal',pg_current_wal_lsn()::text) FROM pg_class c WHERE c.oid='{table}'::regclass""")
 
     args = ",".join("t." + c for c in cols)
@@ -353,12 +486,139 @@ def measure(pg, indexes, mode, copies):
 
     before = physical()
     pre = prove()
-    result = full_rewrite(pg)
+    initial_science = science(pg) if toast_only else None
+    if toast_only:
+        assert (
+            initial_science["badOriginals"] == 0
+            and initial_science["coefficients"]["points"] > 0
+            and initial_science["histories"]["points"] > 0
+        )
+
+    def data_files():
+        path = Path(before["heapFile"]).parent.as_posix()
+        if not re.fullmatch(r"pg_tblspc/[0-9]+/PG_16_[0-9]+/[0-9]+", path):
+            raise ValueError("Expected the fixture's exclusive disk tablespace")
+        raw = pg.fixture(
+            [
+                "sh",
+                "-ec",
+                'cd "$PGDATA/$1"; for f in [0-9]*; do test -f "$f" && stat -c "%n|%i|%b|%s" "$f"; done',
+                "fixture",
+                path,
+            ]
+        )
+        return {
+            name: {
+                "inode": int(inode),
+                "allocated": int(blocks) * 512,
+                "size": int(size),
+            }
+            for name, inode, blocks, size in (
+                line.split("|") for line in raw.splitlines()
+            )
+        }
+
+    base_files = data_files()
+
+    def relation_files(inv, values):
+        nodes = {
+            str(x)
+            for x in [
+                inv["file"],
+                inv["toastFilenode"],
+                *inv["parentIndexFiles"].values(),
+                *inv["toastIndexFiles"].values(),
+            ]
+        }
+        return {k: v for k, v in values.items() if re.split(r"[_.]", k, 1)[0] in nodes}
+
+    def cancel(observation):
+        current = data_files()
+        transient = {
+            k: v
+            for k, v in current.items()
+            if k not in base_files and v["allocated"] > 0
+        }
+        if not transient:
+            return None
+        pid = int(observation["pid"])
+        locks = pg.value(f"""SELECT jsonb_agg(jsonb_build_object('oid',relation::bigint,'mode',mode,'granted',granted))
+          FROM pg_locks WHERE pid={pid} AND relation IN({int(before["oid"])},{int(before["toastOid"])})""")
+        assert observation["relation"] == before["toastOid"] and all(
+            any(
+                l["oid"] == oid and l["granted"] and l["mode"] == "AccessExclusiveLock"
+                for l in locks
+            )
+            for oid in (before["oid"], before["toastOid"])
+        )
+        assert (
+            pg.run(
+                f"SELECT pg_cancel_backend(pid) FROM pg_stat_activity WHERE pid={pid} AND datname=current_database() AND application_name='hz_full_index_rehearsal'"
+            )
+            == "t"
+        )
+        return {"observed": observation, "locks": locks, "files": transient}
+
+    cancel_result = None
+    if cancel_trial:
+        cancel_result = full_rewrite(pg, True, cancel)
+        stable = physical()
+        files = data_files()
+        assert all(
+            before[k] == stable[k]
+            for k in (
+                "allocated",
+                "oid",
+                "file",
+                "toastOid",
+                "toastFilenode",
+                "parentIndexFiles",
+                "toastIndexFiles",
+            )
+        )
+        assert all(
+            files.get(k, {}).get("allocated", 0) == 0
+            for k in cancel_result["cancelled"]["files"]
+        )
+        cancel_result["proofAfterRollback"] = prove()
+        assert science(pg) == initial_science
+
+    def file_bytes(o):
+        return pg.value(f"""SELECT jsonb_build_object('main',coalesce((pg_stat_file('{o["heapFile"]}',true)).size,0),
+           'toast',coalesce((pg_stat_file('{o["toastFile"]}',true)).size,0))""")
+
+    def available():
+        return (
+            int(pg.fixture(["df", "-Pk", pg.directory]).splitlines()[-1].split()[3])
+            * 1024
+        )
+
+    old_physical = file_bytes(before)
+
+    def chunks(inv):
+        rel = pg.run(f"SELECT {int(inv['toastOid'])}::regclass::text")
+        if not re.fullmatch(r"pg_toast\.pg_toast_[0-9]+", rel):
+            raise ValueError("Unknown disposable TOAST name")
+        start = time.monotonic()
+        v = pg.value(f"""SET enable_seqscan=off; SET enable_bitmapscan=off;
+          WITH chunks_by_value AS MATERIALIZED(SELECT c.chunk_id,count(*) AS n,sum(octet_length(c.chunk_data)) AS bytes,
+           {host.chunk_value_digest()} AS digest FROM {rel} c GROUP BY c.chunk_id)
+          SELECT jsonb_build_object('datums',count(*),'chunks',sum(n),'bytes',sum(bytes),
+            'digest',encode(sha256(string_agg(digest,''::bytea ORDER BY chunk_id)),'hex')) FROM chunks_by_value""")
+        return v, time.monotonic() - start
+
+    prior_chunks = chunks(before) if toast_only else None
+    cold = pg.cold_sources(before) if toast_only else None
+    free_before = available()
+    result = full_rewrite(pg, toast_only)
+    free_after = available()
     post = prove()
+    post_science = science(pg) if toast_only else None
+    assert post_science == initial_science
     after = physical()
     assert (
         before["oid"] == after["oid"]
-        and before["file"] != after["file"]
+        and (before["file"] == after["file"]) == toast_only
         and before["indexCount"] == after["indexCount"] == len(indexes)
     )
     if (
@@ -368,10 +628,59 @@ def measure(pg, indexes, mode, copies):
         != "0"
     ):
         raise ValueError("Missing usable index after rewrite")
+    old_files_after = file_bytes(before)
+    new_files = file_bytes(after)
+    after_chunks = chunks(after) if toast_only else None
+    if toast_only:
+        assert before["indexCount"] == 11 and after_chunks[0] == prior_chunks[0]
+        assert (
+            before["toastOid"] == after["toastOid"]
+            and before["toastFilenode"] != after["toastFilenode"]
+        )
+        assert (
+            before["parentIndexFiles"] == after["parentIndexFiles"]
+            and before["parentIndexBytes"] == after["parentIndexBytes"]
+        )
+        assert (
+            old_files_after["toast"] == 0
+            and old_files_after["main"] == old_physical["main"] == new_files["main"]
+        )
+        assert (
+            new_files["toast"] == after["toast"]
+            and old_physical["toast"] == before["toast"]
+        )
+        assert before["toastIndexFiles"].keys() == after[
+            "toastIndexFiles"
+        ].keys() and all(
+            before["toastIndexFiles"][k] != after["toastIndexFiles"][k]
+            for k in before["toastIndexFiles"]
+        )
+    current_files = data_files()
+    old_alloc = relation_files(before, base_files)
+    new_alloc = relation_files(after, current_files)
+    if toast_only:
+        assert all(
+            current_files.get(k, {}).get("allocated", 0) == 0
+            for k in old_alloc.keys() - new_alloc.keys()
+        )
+        assert all(
+            old_alloc[k] == new_alloc[k] for k in old_alloc.keys() & new_alloc.keys()
+        )
+        assert sum(v["allocated"] for v in old_alloc.values()) > sum(
+            v["allocated"] for v in new_alloc.values()
+        )
     start = time.monotonic()
-    pg.run("REINDEX INDEX hz_cost." + REFERENCE)
+    if not toast_only:
+        pg.run("REINDEX INDEX hz_cost." + REFERENCE)
     return dict(
         mode=mode,
+        toastOnly=toast_only,
+        oldPhysical=old_physical,
+        oldFilesAfter=old_files_after,
+        newPhysical=new_files,
+        filesystemBefore=free_before,
+        filesystemAfter=free_after,
+        filesystemDelta=free_after - free_before,
         copies=copies,
         deadCopies=dead,
         before=before,
@@ -380,7 +689,17 @@ def measure(pg, indexes, mode, copies):
         priorProof=pre,
         afterProof=post,
         spaceReturned=before["allocated"] - after["allocated"],
-        referenceIndexSeconds=time.monotonic() - start,
+        referenceIndexSeconds=None if toast_only else time.monotonic() - start,
+        allocatedFilesBefore=old_alloc,
+        allocatedFilesAfter=new_alloc,
+        allocatedFilesystemBytesReturned=sum(v["allocated"] for v in old_alloc.values())
+        - sum(v["allocated"] for v in new_alloc.values()),
+        cancellation=cancel_result,
+        scientificBefore=initial_science,
+        scientificAfter=post_science,
+        chunkProofBefore=prior_chunks,
+        chunkProofAfter=after_chunks,
+        coldSource=cold,
         **result,
     )
 
@@ -391,6 +710,7 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--copies", type=int, default=16)
     parser.add_argument("--trials", type=int, default=2)
+    parser.add_argument("--toast-only", action="store_true")
     args = parser.parse_args()
     if not 1 <= args.copies <= 64 or not 1 <= args.trials <= 3:
         parser.error("Invalid bounded sample size")
@@ -414,13 +734,24 @@ def main():
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
     for i in range(args.trials):
-        for mode in MODES if i % 2 == 0 else reversed(MODES):
+        for mode in (
+            ("current",)
+            if args.toast_only
+            else (MODES if i % 2 == 0 else reversed(MODES))
+        ):
             print(
-                f"trial {i + 1} / {mode}: full rewrite, analyze, identity and membership checks",
+                f"trial {i + 1} / {mode}: {'TOAST-only rewrite' if args.toast_only else 'full rewrite and analyze'}, identity and membership checks",
                 flush=True,
             )
             pg.run("CHECKPOINT")
-            row = measure(pg, indexes, mode, args.copies)
+            row = measure(
+                pg,
+                indexes,
+                mode,
+                args.copies,
+                args.toast_only,
+                cancel_trial=args.toast_only and i == 0,
+            )
             out["trials"].append(dict(trial=i + 1, **row))
             out["elapsedSeconds"] = time.monotonic() - start
             args.output.write_text(json.dumps(out, indent=2) + "\n")

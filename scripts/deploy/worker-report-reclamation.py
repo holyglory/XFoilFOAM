@@ -43,11 +43,25 @@ def index_files(files):
     return result
 
 
-def rewrite_outcome(before, after):
+def rewrite_outcome(before, after, mode="whole"):
     """Infer a committed rewrite from physical evidence after a lost SQL reply."""
     try:
         if (not before["serverStartedAt"] or before["serverStartedAt"] != after["serverStartedAt"]
                 or pg_oid(before["oid"]) != pg_oid(after["oid"])):
+            return None
+        if mode=="toast":
+            main=index_files(before["parentIndexFiles"])
+            if (not main or pg_oid(before["relfilenode"])!=pg_oid(after["relfilenode"])
+                    or pg_oid(before["toastOid"])!=pg_oid(after["toastOid"])
+                    or main!=index_files(after["parentIndexFiles"])):
+                return None
+            old=index_files(before["toastIndexFiles"]); new=index_files(after["toastIndexFiles"])
+            if (not old or old.keys()!=new.keys() or main.keys() & old.keys() or
+                    (main|old)!=index_files(before["indexFiles"]) or (main|new)!=index_files(after["indexFiles"])):
+                return None
+            changed=pg_oid(before["toastFilenode"])!=pg_oid(after["toastFilenode"])
+            return changed if all((old[k]!=new[k])==changed for k in old) else None
+        if mode!="whole":
             return None
         if pg_oid(before["relfilenode"]) != pg_oid(after["relfilenode"]):
             return True
@@ -364,7 +378,7 @@ COMMIT;"""
 # parent heap; it never selects the JSON value or scans its TOAST relation.
 RETURN_SNAPSHOT = """
 WITH h AS (SELECT * FROM pg_class WHERE oid='public.progressive_worker_reports'::regclass),
- idx AS (SELECT i.indexrelid AS oid FROM h JOIN pg_index i ON i.indrelid IN (h.oid,h.reltoastrelid))
+ idx AS (SELECT i.indexrelid AS oid,i.indrelid FROM h JOIN pg_index i ON i.indrelid IN (h.oid,h.reltoastrelid))
 SELECT jsonb_build_object(
  'observedAt',clock_timestamp(),'serverStartedAt',pg_postmaster_start_time(),'role','worker',
  'table','public.progressive_worker_reports','oid',h.oid::bigint,'relfilenode',pg_relation_filenode(h.oid)::bigint,
@@ -374,6 +388,10 @@ SELECT jsonb_build_object(
  'heapBytes',pg_relation_size(h.oid),'toastHeapBytes',pg_relation_size(t.oid),'toastIndexBytes',pg_indexes_size(t.oid),
  'tableBytes',pg_table_size(h.oid),'indexBytes',pg_indexes_size(h.oid),'totalBytes',pg_total_relation_size(h.oid),
  'indexFiles',(SELECT jsonb_object_agg(oid::text,pg_relation_filenode(oid)::bigint) FROM idx),
+ 'parentIndexFiles',(SELECT jsonb_object_agg(oid::text,pg_relation_filenode(oid)::bigint) FROM idx WHERE indrelid=h.oid),
+ 'parentIndexFileBytes',(SELECT jsonb_object_agg(oid::text,pg_relation_size(oid)) FROM idx WHERE indrelid=h.oid),
+ 'toastIndexFiles',(SELECT jsonb_object_agg(oid::text,pg_relation_filenode(oid)::bigint) FROM idx WHERE indrelid=t.oid),
+ 'toastTotalBytes',pg_total_relation_size(t.oid),
  'paths',jsonb_build_object('heap',pg_relation_filepath(h.oid),'toast',pg_relation_filepath(t.oid),'wal','pg_wal') ||
      (SELECT coalesce(jsonb_object_agg('index-'||oid,pg_relation_filepath(oid)),'{}') FROM idx),
  'dataDir',(SELECT setting FROM pg_settings WHERE name='data_directory'),'tempTablespaces',current_setting('temp_tablespaces'),

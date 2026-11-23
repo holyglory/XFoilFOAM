@@ -759,8 +759,56 @@ def test_full_body_mode_and_forks_on_same_device(runtime):
     restored(env, prior)
 
 
+def test_toast_scope_budgets_only_owned_auxiliary_and_requires_chunk_proof(runtime):
+    env, _, host, _ = runtime
+    f = host.measured(
+        json.loads(env["COMPACTION_IDS"])["postgres"], census=True, toast=True
+    )
+    cfg = dict(mode="toast", replacement=None, wal=None, floor=1048576, growth=524288)
+    space = host.budget(f, cfg)
+    assert not space["refusals"]
+    assert (
+        space["parentTotalBytes"]
+        == f["totalBytes"]
+        > space["allocatedBytes"]
+        == f["toastTotalBytes"]
+    )
+    assert space["replacementBytes"] == f["toastTotalBytes"]
+    assert space["indexScratchBytes"] == max(
+        f["toastIndexBytes"], f["packing"]["chunkIndexEstimate"]
+    )
+    assert (
+        space["requiredBytes"]
+        == space["replacementBytes"]
+        + space["indexScratchBytes"]
+        + space["additionalWalBytes"]
+        + cfg["floor"]
+        + cfg["growth"]
+    )
+    assert f["toastProofPlan"]["orderedByChunkIndex"] and f["auxiliaryFiles"]
+    assert host.budget(dict(f, toastReadable=False), cfg)["refusals"]
+    assert host.budget(dict(f, toastProofPlan={"orderedByChunkIndex": False}), cfg)[
+        "refusals"
+    ]
+    assert host.budget(f, dict(cfg, replacement=1))["refusals"]
+    assert host.budget(
+        dict(f, disk=dict(f["disk"], freeBytes=space["requiredBytes"] - 1)), cfg
+    )["refusals"]
+    assert (
+        host.budget(dict(f, wal=dict(f["wal"], slots=1)), cfg)["additionalWalBytes"]
+        >= f["toastTotalBytes"]
+    )
+
+
 @pytest.mark.parametrize(
-    "scenario", ["normal", "lost-reply", "checkpointed", "checkpointed-refusal"]
+    "scenario",
+    [
+        "normal",
+        "lost-reply",
+        "checkpointed",
+        "checkpointed-refusal",
+        "toast-lost-commit",
+    ],
 )
 def test_operator_recovers_the_same_rewrite_and_witnesses_collection(
     runtime, tmp_path, monkeypatch, request, scenario
@@ -897,6 +945,10 @@ def test_operator_recovers_the_same_rewrite_and_witnesses_collection(
                 )
             else:
                 assert result.returncode == 0, result.stderr
+            if scenario == "toast-lost-commit":
+                # The database commit succeeded but its acknowledgement/marker was lost.
+                (remote / "rewrite-commit.json").unlink()
+                raise RuntimeError("SSH reply lost after TOAST-only commit")
             if scenario == "lost-reply":
                 raise RuntimeError("SSH reply lost after submission")
             return ""
@@ -940,12 +992,13 @@ def test_operator_recovers_the_same_rewrite_and_witnesses_collection(
             "--rewrite-seconds",
             "30",
             *(["--checkpointed-units", str(config)] if checkpointed else []),
+            *(["--toast-only"] if scenario == "toast-lost-commit" else []),
         ],
     )
     old_file = sql(
         "SELECT pg_relation_filenode('progressive_worker_reports'::regclass)"
     )
-    if scenario == "lost-reply":
+    if scenario in ("lost-reply", "toast-lost-commit"):
         with pytest.raises(RuntimeError, match="reply lost"):
             ops.main()
     elif scenario == "checkpointed-refusal":
@@ -985,9 +1038,59 @@ def test_operator_recovers_the_same_rewrite_and_witnesses_collection(
         == "observed-new-report"
     )
     assert json.loads((run_dir / "authority-after.json").read_text())["active"] == 1
-    assert (run_dir / "rewrite-commit.json").read_bytes() == (
-        remote / "rewrite-commit.json"
-    ).read_bytes()
+    if scenario == "toast-lost-commit":
+        operator = json.loads((run_dir / "operator.json").read_text())
+        assert (
+            not (run_dir / "rewrite-commit.json").exists()
+            and operator["budget"]["mode"] == "toast"
+        )
+        before = json.loads((run_dir / "quiesced.json").read_text())
+        after = json.loads((run_dir / "resumed.json").read_text())
+        assert (
+            before["relfilenode"] == after["relfilenode"]
+            and before["parentIndexFiles"] == after["parentIndexFiles"]
+        )
+        assert (
+            before["toastOid"] == after["toastOid"]
+            and before["toastFilenode"] != after["toastFilenode"]
+        )
+        assert before["toastIndexFiles"] != after["toastIndexFiles"]
+        assert (
+            json.loads((run_dir / "identity-before.json").read_text())["toast-values"][
+                "rows"
+            ]
+            > 0
+        )
+        assert (run_dir / "identity-before.json").read_bytes() == (
+            run_dir / "identity-after.json"
+        ).read_bytes()
+        assert ops.status(operator)["committed"] is True
+        mixed = dict(
+            before,
+            relfilenode=str(before["relfilenode"]),
+            toastOid=str(before["toastOid"]),
+            toastFilenode=str(before["toastFilenode"]),
+        )
+        assert ops.audit.rewrite_outcome(mixed, before, "toast") is False
+        assert ops.audit.rewrite_outcome(mixed, after, "toast") is True
+        assert ops.audit.rewrite_outcome(mixed, dict(after, oid=1), "toast") is None
+        assert (
+            ops.audit.rewrite_outcome(mixed, dict(after, parentIndexFiles={}), "toast")
+            is None
+        )
+        assert (
+            ops.audit.rewrite_outcome(
+                mixed, dict(after, toastIndexFiles=mixed["toastIndexFiles"]), "toast"
+            )
+            is None
+        )
+        monkeypatch.setattr(sys, "argv", ["rewrite", "--recover", str(run_dir)])
+        ops.main()
+        assert submitted == ["rewrite"] and ops.status(operator)["committed"] is True
+    else:
+        assert (run_dir / "rewrite-commit.json").read_bytes() == (
+            remote / "rewrite-commit.json"
+        ).read_bytes()
     assert (
         json.loads((run_dir / "space-result.json").read_text())["relationBytesReturned"]
         > 0

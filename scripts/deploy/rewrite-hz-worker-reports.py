@@ -475,15 +475,16 @@ exec(compile(package["audit"],a.__file__,"exec"),a.__dict__)
 h=types.ModuleType("hz_rewrite_probe");h.__file__="<hz-worker-report-rewrite>"
 exec(compile(package["host"],h.__file__,"exec"),h.__dict__)
 h.load_audit=lambda:a
-print(json.dumps(h.measured(h.PG,census=package["census"],sample=package["sample"])))
+print(json.dumps(h.measured(h.PG,census=package["census"],sample=package["sample"],toast=package["toast"])))
 """
 
 
-def worker(census=False, sample=False):
+def worker(census=False, sample=False, toast=False):
     package = {
         "audit": (HERE / FILES[2]).read_text(),
         "host": (HERE / FILES[1]).read_text(),
         "census": census,
+        "toast": toast,
         "sample": sample,
     }
     return json.loads(
@@ -512,9 +513,12 @@ def authoritative(facts):
 
 def make_plan(args):
     measured_at = time.time()
-    f = worker(args.replacement_bytes is not None, args.sample_identity)
+    f = worker(
+        args.replacement_bytes is not None, args.sample_identity, args.toast_only
+    )
     hub = authoritative(f)
     cfg = dict(
+        mode="toast" if args.toast_only else "whole",
         replacement=args.replacement_bytes,
         wal=args.wal_bytes,
         growth=args.growth_bytes or 0,
@@ -565,7 +569,11 @@ def make_plan(args):
         "remainingWorkSeconds": maintenance + reserve,
         "verificationMode": "every report byte"
         if args.all_report_bytes
-        else "all signed report identities and full scientific records",
+        else (
+            "all external TOAST bytes, inline candidates, pinned parent tuples and full scientific records"
+            if args.toast_only
+            else "all signed report identities and full scientific records"
+        ),
         "availableForReplacementBytes": space["maximumAffordableReplacementBytes"],
         "leaseDeadline": measured_at + min(ttl) if ttl else None,
     }
@@ -606,7 +614,7 @@ o["result"]=dict(x.split("=",1) for x in (p/"result").read_text().splitlines()) 
 o["recovered"]=dict(x.split("=",1) for x in (p/"recovery-result").read_text().splitlines()) if (p/"recovery-result").is_file() else None
 o["committed"]=True if (p/"rewrite-commit.json").is_file() else None
 if o["committed"] is None and (p/"resumed.json").is_file() and (p/"quiesced.json").is_file():
- keys=("serverStartedAt","oid","relfilenode","toastOid","toastFilenode","indexFiles")
+ keys=("serverStartedAt","oid","relfilenode","toastOid","toastFilenode","indexFiles","parentIndexFiles","toastIndexFiles")
  o["physical"]=[{k:s[k] for k in keys if k in s} for s in (json.loads((p/n).read_text()) for n in ("quiesced.json","resumed.json"))]
 print(json.dumps(o))
 """
@@ -636,7 +644,9 @@ def status(state):
     )
     physical = observation.pop("physical", None)
     if physical is not None:
-        observation["committed"] = audit.rewrite_outcome(*physical)
+        observation["committed"] = audit.rewrite_outcome(
+            *physical, state.get("budget", {}).get("mode", "whole")
+        )
     return observation
 
 
@@ -944,6 +954,11 @@ def main():
     )
     parser.add_argument("--rewrite-seconds", type=int, default=5400)
     parser.add_argument(
+        "--toast-only",
+        action="store_true",
+        help="rewrite only the report table's TOAST heap and chunk index through its fixed parent name",
+    )
+    parser.add_argument(
         "--identity-seconds",
         type=int,
         default=1800,
@@ -996,6 +1011,7 @@ def main():
                 "localLeases": state["worker"]["database"]["leases"],
                 "pauseSeconds": state["remainingWorkSeconds"],
                 "identitySample": state["worker"].get("identitySample"),
+                "toastProofSample": state["worker"].get("toastProofSample"),
                 "solverProcesses": state["worker"]["solverProcesses"],
                 "ingress": state["worker"]["ingress"],
                 "operatorUnits": len(state["units"]),
