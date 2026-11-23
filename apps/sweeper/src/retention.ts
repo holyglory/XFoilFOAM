@@ -19,6 +19,8 @@ import { readdir, stat, unlink } from "node:fs/promises";
 import { join } from "node:path";
 
 import { stripClosedProgressiveJobs as stripVerifiedClosedJobs, type ClosedProgressiveBackend } from "./closed-progressive-retention";
+import { configuredDeploymentRole } from "./config";
+import { RetentionFiles } from "./retention-files";
 import { DISK_PRESSURE_CANCELLATION_MARKER } from "./disk-admission";
 
 export const DEFAULT_STRIP_MIN_AGE_MS = 30 * 60 * 1000;
@@ -52,6 +54,9 @@ export interface RetentionConfig {
 export interface RetentionTickOptions extends Partial<RetentionConfig> {
   now?: Date;
   closedProgressiveBackend?: ClosedProgressiveBackend;
+  fileMaintenance?: Pick<RetentionFiles, "discard" | "strip">;
+  mediaDir?: string;
+  signal?: AbortSignal;
   forceOrphanSweep?: boolean;
   /** Forecast pressure evicts unrequested restart caches, never live owners. */
   reclaimOptionalCaseState?: boolean;
@@ -149,137 +154,37 @@ async function stampStrip(
     .where(eq(simJobs.id, jobId));
 }
 
-async function stripClosedProgressiveJobs(
-  db: DB,
-  engine: EngineClient,
-  now: Date,
-  config: RetentionConfig,
-): Promise<number> {
-  const queryTimeoutMs = Math.max(
-    1_000,
-    Math.floor(
-      envNumber(
-        "SWEEPER_RETENTION_QUERY_TIMEOUT_MS",
-        DEFAULT_RETENTION_QUERY_TIMEOUT_MS,
-      ),
-    ),
-  );
-  const candidates = (await db.transaction(async (rawTransaction) => {
-    const transaction = rawTransaction as unknown as DB;
-    await transaction.execute(
-      sql`SET LOCAL statement_timeout = ${sql.raw(String(queryTimeoutMs))}`,
-    );
-    return transaction.execute(sql`
-      WITH live_continuations AS MATERIALIZED (
-        SELECT DISTINCT request_payload#>>'{engineRequest,continue_from,engine_job_id}' AS job_id
-        FROM sim_jobs
-        WHERE status IN ('pending', 'submitted', 'running', 'ingesting')
-          AND request_payload#>>'{engineRequest,continue_from,engine_job_id}' IS NOT NULL
-      ), live_children AS MATERIALIZED (
-        SELECT parent_job_id AS job_id
-        FROM sim_jobs
-        WHERE status IN ('pending', 'submitted', 'running', 'ingesting')
-          AND parent_job_id IS NOT NULL
-      ), live_attempts AS MATERIALIZED (
-        SELECT DISTINCT sim_job_id AS job_id
-        FROM progressive_cfd_attempts
-        WHERE outcome = 'running'
-      ), pending_reports AS MATERIALIZED (
-        SELECT DISTINCT sim_job_id AS job_id
-        FROM progressive_worker_reports
-        WHERE acknowledged_at IS NULL
-      ), custody AS MATERIALIZED (
-        SELECT
-          source.sim_job_id,
-          count(DISTINCT source.point_content_signature) AS custody_count,
-          count(DISTINCT hub.point_content_signature) AS hub_count,
-          count(DISTINCT reclaim.point_content_signature)
-            FILTER (WHERE reclaim.completed_at IS NOT NULL) AS reclaim_count
-        FROM progressive_worker_archive_receipts source
-        LEFT JOIN progressive_worker_hub_receipts hub
-          ON hub.sim_job_id = source.sim_job_id
-         AND hub.point_content_signature = source.point_content_signature
-        LEFT JOIN progressive_worker_archive_reclaims reclaim
-          ON reclaim.sim_job_id = source.sim_job_id
-         AND reclaim.point_content_signature = source.point_content_signature
-        GROUP BY source.sim_job_id
-      )
-      SELECT job.id, job.engine_job_id
-      FROM sim_jobs job
-      JOIN custody
-        ON custody.sim_job_id = job.id
-      LEFT JOIN live_children
-        ON live_children.job_id = job.id
-      LEFT JOIN live_attempts
-        ON live_attempts.job_id = job.id
-      LEFT JOIN pending_reports
-        ON pending_reports.job_id = job.id
-      LEFT JOIN live_continuations continuation
-        ON continuation.job_id = job.id::text
-      WHERE job.status IN ('done', 'failed', 'cancelled')
-        AND COALESCE(job.request_payload, '{}'::jsonb) ? 'remoteProgressiveExecution'
-        AND job.engine_job_id = job.id::text
-        AND COALESCE(job."finishedAt", job."ingestedAt", job."updatedAt", job."createdAt") <=
-          ${now.toISOString()}::timestamptz - (${config.stripMinAgeMs}::double precision * interval '1 millisecond')
-        AND live_children.job_id IS NULL
-        AND live_attempts.job_id IS NULL
-        AND pending_reports.job_id IS NULL
-        AND continuation.job_id IS NULL
-        AND custody.custody_count = custody.hub_count
-        AND custody.custody_count = custody.reclaim_count
-      ORDER BY job."finishedAt", job.id
-      LIMIT ${Math.min(8, config.stripMaxPerTick)}
-    `);
-  })) as unknown as Array<{ id: string; engine_job_id: string }>;
+function progressiveOwner(job: string) {
+  const row = sql.identifier(job);
+  return sql`(coalesce(${row}.request_payload ? 'remoteProgressiveExecution',false)
+    OR EXISTS(SELECT FROM progressive_remote_dispatches d WHERE d.sim_job_id=${row}.id)
+    OR EXISTS(SELECT FROM progressive_cfd_attempts a WHERE a.sim_job_id=${row}.id)
+    OR EXISTS(SELECT FROM progressive_worker_submission_intents i WHERE i.sim_job_id=${row}.id)
+    OR EXISTS(SELECT FROM progressive_worker_reports r WHERE r.sim_job_id=${row}.id))`;
+}
 
-  let stripped = 0;
-  for (const candidate of candidates) {
-    const [media] = (await db.execute(sql`
-      SELECT EXISTS (
-        SELECT 1
-        FROM result_attempts attempt
-        JOIN result_media media
-          ON media.result_attempt_id = attempt.id
-         AND media.result_id = attempt.result_id
-        LEFT JOIN result_media_storage_bindings binding
-          ON binding.result_media_id = media.id
-        WHERE (attempt.sim_job_id = ${candidate.id}::uuid OR attempt.engine_job_id = ${candidate.engine_job_id})
-          AND media.sha256 ~ '^[0-9a-fA-F]{64}$'
-          AND media.byte_size > 0
-          AND binding.result_media_id IS NULL
-      ) AS has_unbound_media
-    `)) as unknown as Array<{ has_unbound_media: boolean }>;
-    if (media?.has_unbound_media) continue;
-    try {
-      const response = await engine.deleteJob(candidate.engine_job_id);
-      await stampStrip(db, candidate.id, now, {
-        bytes_freed: response.bytes_freed,
-        files_removed: 0,
-        kept_case_state: false,
-        note: "engine job directory deleted after remote custody reclaim",
-      });
-      stripped++;
-      console.log(
-        `[sweeper] RETENTION: deleted closed progressive job ${candidate.engine_job_id} freed ${mb(response.bytes_freed)} MB`,
-      );
-    } catch (error) {
-      if (error instanceof EngineError && error.status === 404) {
-        await stampStrip(db, candidate.id, now, {
-          bytes_freed: 0,
-          files_removed: 0,
-          kept_case_state: false,
-          note: "engine job not found",
-        });
-        stripped++;
-        continue;
-      }
-      if (!(error instanceof EngineError && error.status === 409))
-        console.error(
-          `[sweeper] RETENTION: progressive delete failed for ${candidate.engine_job_id}: ${error instanceof Error ? error.message : String(error)}`,
-        );
-    }
-  }
-  return stripped;
+async function referencedDirectory(db: DB, key: string, orphan: boolean) {
+  const prefix = `jobs/${key}/`;
+  const uuid = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(key) ? key : null;
+  const [state] = await db.execute(sql`SELECT
+    EXISTS(SELECT FROM sim_jobs j WHERE (j.id=${uuid}::uuid OR j.engine_job_id=${key}) AND (${orphan} OR ${progressiveOwner("j")}))
+    OR EXISTS(SELECT FROM progressive_remote_dispatches d WHERE d.sim_job_id=${uuid}::uuid)
+    OR EXISTS(SELECT FROM progressive_worker_reports r WHERE r.sim_job_id=${uuid}::uuid)
+    OR EXISTS(SELECT FROM progressive_worker_submission_intents i WHERE i.sim_job_id=${uuid}::uuid)
+    OR EXISTS(SELECT FROM progressive_cfd_attempts a WHERE a.sim_job_id=${uuid}::uuid)
+    OR (${orphan} AND EXISTS(SELECT FROM result_attempts a WHERE a.engine_job_id=${key}))
+    OR EXISTS(SELECT FROM solver_evidence_incomplete_quarantines q WHERE q.engine_job_id=${key})
+    OR EXISTS(SELECT FROM solver_evidence_orphan_quarantines q WHERE q.engine_job_id=${key})
+    OR EXISTS(SELECT FROM solver_evidence_artifacts a WHERE a.engine_job_id=${key} OR starts_with(a.storage_key,${prefix}))
+    OR EXISTS(SELECT FROM result_media m WHERE starts_with(m.storage_key,${prefix}))
+    OR EXISTS(SELECT FROM field_render_cache c WHERE starts_with(c.storage_key,${prefix}))
+    OR EXISTS(SELECT FROM remote_asset_references a WHERE starts_with(a.local_storage_key,${prefix}) OR starts_with(a.cached_storage_key,${prefix}))
+    AS protected`);
+  return state?.protected !== false;
+}
+
+function localFiles(options: RetentionTickOptions) {
+  return new RetentionFiles(options.mediaDir ?? process.env.MEDIA_DIR ?? "/data/airfoilfoam", options.signal);
 }
 
 export async function stripTerminalJobs(
@@ -299,9 +204,12 @@ export async function stripTerminalJobs(
       ),
     ),
   );
-  const progressiveStripped = options.closedProgressiveBackend
-    ? await stripVerifiedClosedJobs(db, options.closedProgressiveBackend, now, config.stripMinAgeMs, config.stripMaxPerTick, queryTimeoutMs)
-    : await stripClosedProgressiveJobs(db, engine, now, config);
+  const native = localFiles(options);
+  const fileMaintenance = options.fileMaintenance ?? native;
+  const backend = options.closedProgressiveBackend ?? (configuredDeploymentRole() === "remote-solver" ? native : undefined);
+  const progressiveStripped = backend
+    ? await stripVerifiedClosedJobs(db,backend,now,config.stripMinAgeMs,config.stripMaxPerTick,queryTimeoutMs,options.signal)
+    : 0;
   const remainingStripMax = config.stripMaxPerTick - progressiveStripped;
   if (remainingStripMax <= 0) return progressiveStripped;
   const reclaimOptionalCaseState = options.reclaimOptionalCaseState === true;
@@ -323,6 +231,8 @@ export async function stripTerminalJobs(
         FROM sim_jobs j
         WHERE j.status IN ('done', 'failed', 'cancelled')
           AND ${solverDirectLifecycleSql("j")}
+        AND NOT ${progressiveOwner("j")}
+        AND coalesce((j.strip_report#>>'{normalFileHold,retryAfter}')::timestamptz,'-infinity')<=clock_timestamp()
           AND j.engine_job_id IS NOT NULL
           AND (
             j.error = ${DISK_PRESSURE_CANCELLATION_MARKER}
@@ -553,6 +463,7 @@ export async function stripTerminalJobs(
       JOIN candidate_jobs selected ON selected.id = j.id
       WHERE j.status IN ('done', 'failed', 'cancelled')
         AND ${solverDirectLifecycleSql("j")}
+        AND NOT ${progressiveOwner("j")}
         AND j.engine_job_id IS NOT NULL
         -- A remote-solver job owns upload source bytes until the hub has
         -- acknowledged every exact generation and the delivery loop has
@@ -659,29 +570,36 @@ export async function stripTerminalJobs(
   let stripped = 0;
   for (const candidate of candidates) {
     try {
-      if (candidate.delete_job_dir) {
-        const response = await engine.deleteJob(candidate.engine_job_id);
-        await stampStrip(db, candidate.id, now, {
-          bytes_freed: response.bytes_freed,
-          files_removed: 0,
-          kept_case_state: false,
-          note: "engine job directory deleted",
-        });
-        stripped++;
-        console.log(
-          `[sweeper] RETENTION: deleted disposable job ${candidate.engine_job_id} freed ${mb(response.bytes_freed)} MB`,
-        );
-        continue;
-      }
-      const response = await engine.stripJob(candidate.engine_job_id, {
-        keep_case_state: candidate.keep_case_state,
+      if (options.signal?.aborted) break;
+      const effect = await db.transaction(async raw => {
+        const tx = raw as unknown as DB;
+        await tx.execute(sql`SELECT set_config('statement_timeout',${String(queryTimeoutMs)},true),set_config('lock_timeout','500ms',true)`);
+        const [owner] = await tx.execute(sql`SELECT j.id FROM sim_jobs j WHERE j.id=${candidate.id}::uuid
+          AND j.engine_job_id=${candidate.engine_job_id} AND j.status IN ('done','failed','cancelled')
+          AND (j.ingest_lease_token IS NULL OR j.ingest_lease_expires_at<=clock_timestamp())
+          AND NOT ${progressiveOwner("j")} FOR UPDATE SKIP LOCKED`);
+        if (!owner) return null;
+        const nativeResult = candidate.delete_job_dir
+          ? await (async () => {
+              if (await referencedDirectory(tx,candidate.engine_job_id,false)) return null;
+              const removed = await fileMaintenance.discard(candidate.engine_job_id);
+              return removed ? {bytes_freed:removed.allocatedBytes,files_removed:removed.files,kept_case_state:false,
+                note:"verified disposable engine job directory deleted"} : undefined;
+            })()
+          : await fileMaintenance.strip(candidate.engine_job_id,candidate.keep_case_state);
+        if (nativeResult === null) return null;
+        if (nativeResult === undefined) {
+          // The shared mount can be unavailable or differ from the gateway. Only a
+          // matching 404 from the actual engine confirms a physically missing job.
+          await engine.getJob(candidate.engine_job_id);
+          throw Error("Native job directory absent for a registered engine job");
+        }
+        await stampStrip(tx,candidate.id,now,nativeResult);
+        return nativeResult;
       });
-      await stampStrip(db, candidate.id, now, response);
+      if (!effect) continue;
+      console.log(`[sweeper] RETENTION: released ${candidate.engine_job_id}, ${mb(effect.bytes_freed)} MB`);
       stripped++;
-      console.log(
-        `[sweeper] RETENTION: stripped job ${candidate.engine_job_id} freed ${mb(response.bytes_freed)} MB ` +
-          `(kept_case_state=${response.kept_case_state})`,
-      );
     } catch (error) {
       if (error instanceof EngineError && error.status === 409) continue;
       if (error instanceof EngineError && error.status === 404) {
@@ -694,6 +612,9 @@ export async function stripTerminalJobs(
         stripped++;
         continue;
       }
+      await db.execute(sql`UPDATE sim_jobs SET strip_report=jsonb_set(coalesce(strip_report,'{}'::jsonb),'{normalFileHold}',
+        jsonb_build_object('reason','native-or-registered-source','retryAfter',clock_timestamp()+interval '1 hour'))
+        WHERE id=${candidate.id}::uuid AND stripped_at IS NULL`);
       console.error(
         `[sweeper] RETENTION: ${candidate.delete_job_dir ? "delete" : "strip"} failed for job ${candidate.engine_job_id}: ${
           error instanceof Error ? error.message : String(error)
@@ -736,13 +657,11 @@ export async function runOrphanSweep(
   }
 
   const knownRows = (await db.execute(sql`
-    SELECT engine_job_id
-    FROM sim_jobs
-    WHERE engine_job_id IS NOT NULL
-  `)) as unknown as Array<{ engine_job_id: string | null }>;
+    SELECT id::text AS id,engine_job_id FROM sim_jobs
+  `)) as unknown as Array<{ id: string; engine_job_id: string | null }>;
   const knownIds = new Set(
     knownRows
-      .map((row) => row.engine_job_id)
+      .flatMap((row) => [row.id,row.engine_job_id])
       .filter((id): id is string => Boolean(id)),
   );
 
@@ -764,12 +683,13 @@ export async function runOrphanSweep(
       continue;
     }
     try {
-      const response = await engine.deleteJob(item.job_id);
+      if (options.signal?.aborted) break;
+      if (await referencedDirectory(db,item.job_id,true)) { known++; continue; }
+      const response = await (options.fileMaintenance ?? localFiles(options)).discard(item.job_id, oldestAllowedMtime);
+      if (!response) continue;
       deleted++;
-      bytesFreed += response.bytes_freed;
-      console.log(
-        `[sweeper] RETENTION: deleted orphan engine job ${item.job_id} freed ${mb(response.bytes_freed)} MB`,
-      );
+      bytesFreed += response.allocatedBytes;
+      console.log(`[sweeper] RETENTION: deleted verified disposable orphan ${item.job_id}, ${mb(response.allocatedBytes)} MB`);
     } catch (error) {
       if (
         error instanceof EngineError &&

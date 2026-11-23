@@ -94,7 +94,9 @@ export class RetentionFiles implements ClosedProgressiveBackend {
     return await this.run<{state: "removed"; files: number; allocatedBytes: number}>({ action: "discard", job, cutoff });
   }
 
-  async direct(job: string) {
-    return Boolean(await this.run<{state: "direct"}>({ action: "legacy", job }));
+  async strip(job: string, keepCaseState: boolean) {
+    return await this.run<{job_id: string; bytes_freed: number; files_removed: number; kept_case_state: boolean}>({
+      action: "legacy", job, keepCaseState,
+    });
   }
 }

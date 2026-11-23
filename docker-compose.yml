@@ -256,6 +256,7 @@ services:
     build:
       context: .
       dockerfile: docker/Dockerfile.node
+      target: sweeper
     command: sh -c "pnpm --filter @aerodb/sweeper start"
     environment:
       DATABASE_URL: postgres://aerodb:aerodb@postgres:5432/aerodb

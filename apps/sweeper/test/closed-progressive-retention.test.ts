@@ -51,6 +51,7 @@ const tableDefinitions = [
   "field_color_scales(id uuid,vmin float8,vmax float8,scale_policy text,version int,status text)",
   "field_render_cache(storage_key text)",
   "result_media_storage_uploads(result_media_id uuid)",
+  "sweeper_state(id int primary key,closed_progressive_retention_after_id uuid,disk_admission_blocked boolean)",
   "sync_api_settings(id int,remote_solver_registered_id uuid,remote_solver_auth_token text,upstream_base_url text)",
   "sync_sweep_promises(id uuid,source_base_url text,registered_solver_id uuid)",
 ];
@@ -155,6 +156,7 @@ it("rotates blocked and 409 jobs, authenticates every object before reclaim and 
     await db.execute(
       sql`INSERT INTO sync_sweep_promises VALUES(${promiseId},${root},${solver})`,
     );
+    await db.execute(sql`INSERT INTO sweeper_state(id) VALUES(1)`);
     const id = (n: number) =>
       "00000000-0000-4000-8000-" + String(n).padStart(12, "0");
     const objects = new Map<
@@ -301,6 +303,8 @@ it("rotates blocked and 409 jobs, authenticates every object before reclaim and 
       await db.execute(sql`INSERT INTO sim_jobs(id,engine_job_id,status,"finishedAt")
         SELECT ('00000000-0000-4000-8000-'||lpad(i::text,12,'0'))::uuid,'00000000-0000-4000-8000-'||lpad(i::text,12,'0'),'done','2025-01-01'
         FROM generate_series(20,90) i`);
+      await db.execute(sql`INSERT INTO progressive_worker_archive_reclaims (sim_job_id,point_content_signature,completed_at)
+        SELECT id,'ineligible',now() FROM sim_jobs WHERE status='done' AND request_payload IS NULL`);
       const late = await fixture(db, id(100), 1);
       objects.set(late[0]!.upload, late[0]!.remote);
       expect(

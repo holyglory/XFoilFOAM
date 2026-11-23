@@ -256,6 +256,7 @@ services:
     build:
       context: .
       dockerfile: docker/Dockerfile.node
+      target: sweeper
     restart: unless-stopped
     command: sh -c "pnpm --filter @aerodb/sweeper start"
     environment:

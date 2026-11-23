@@ -12,6 +12,7 @@ import {
 import { sql } from "drizzle-orm";
 import { configuredControlPlaneToken } from "./config";
 import {
+  openProgressiveArchive,
   preflightProgressiveArchive,
   verifyProgressiveArchiveResponse,
 } from "./progressive-archive-reclaim";
@@ -54,7 +55,16 @@ export interface ClosedProgressiveManifest {
   regime?: "urans";
 }
 
+export type ClosedProgressiveNativeOwner = { jobs: [string, string]; job: [string, string]; lock: [string, string] };
+export type VerifiedArchiveRestore = {
+  manifestSha256: string; memberSetSha256: string; memberCount: number; sample: MediaFile;
+};
+type AutomaticVerification = {
+  state: "awaiting-readback" | "verified"; owner: ClosedProgressiveNativeOwner; restoreSha256: string;
+};
+
 export interface ClosedProgressiveReadback {
+  restored?: VerifiedArchiveRestore;
   historicalPointSignature?: string;
   verifiedMember?: MediaFile | null;
   brokeredUploadId?: string;
@@ -69,6 +79,7 @@ type PreservedSolver = { directory: string; treeSha256: string; entries: number;
   linkedContinuation?: {jobId: string; caseSlug: string; sharedFiles: number; otherLinks: number; pathSetSha256: string} };
 
 export interface ClosedProgressiveReclaimResponse {
+  nativeOwner?: ClosedProgressiveNativeOwner;
   preservedSolver?: PreservedSolver;
   job_id: string;
   state: "absent" | "planned" | "reclaimed";
@@ -89,6 +100,8 @@ export interface ClosedProgressiveReclaimResponse {
 }
 
 export interface ClosedProgressiveBackend {
+  restoreArchive?(job: string, manifest: ClosedProgressiveManifest, remote: ProgressiveEvidenceCustodyReceipt["remote"],
+                  body: ReadableStream<Uint8Array>, signal: AbortSignal): Promise<VerifiedArchiveRestore>;
   reclaimClosedProgressiveFiles(
     jobId: string,
     manifests: ClosedProgressiveManifest[],
@@ -515,6 +528,7 @@ function eligible(
   historical = false,
   preserveSolver?: string,
   hubStop?: RegisteredStop,
+  verifyingApplied = false,
 ) {
   const receiptKey = preserveSolver ? "closedProgressiveSiblingFiles" : historical
     ? "historicalRawFiles"
@@ -545,8 +559,8 @@ function eligible(
     }
     AND ${
       completedPlan === undefined
-        ? sql`(${saved})->>'complete' IS DISTINCT FROM 'true'`
-        : sql`(${saved})->>'complete'='true' AND (${saved})->>'planSha256'=${completedPlan}`
+        ? sql`(${saved})->>'complete' IS DISTINCT FROM 'true' AND (${saved})#>>'{automaticVerification,state}' IS DISTINCT FROM 'awaiting-readback'`
+        : sql`((${saved})->>'complete'='true' OR (${verifyingApplied} AND (${saved})#>>'{automaticVerification,state}'='awaiting-readback')) AND (${saved})->>'planSha256'=${completedPlan}`
     }
     AND coalesce(((${saved})->>'retryAfter')::timestamptz,'-infinity') <= clock_timestamp()
     AND coalesce(j."finishedAt",j."ingestedAt",j."updatedAt",j."createdAt")<=${now.toISOString()}::timestamptz-(${ageMs}::float8*interval '1ms')
@@ -701,6 +715,7 @@ async function proofs(
   media: KeptImage[] = [],
   historical?: Map<string, HistoricalReceipt>,
   inspectImages = false,
+  automatic = false,
 ) {
   const prefix = `jobs/${jobId}/`;
   const [unprotected] = await db.execute(sql`SELECT EXISTS (
@@ -773,6 +788,7 @@ async function proofs(
     throw new Error("Incomplete or ambiguous job point inventory");
   // A deliberately empty set is meaningful only for a named URANS job.
   // The native peer checks every signed manifest, engine point and physical path.
+  if (automatic) inspectImages = media.length > 0 || rows.every((r) => r.regime === "urans");
   if (inspectImages && !media.length && (historical || rows.some((r) => r.regime !== "urans")))
     throw Error("The named job has no registered instantaneous PNGs");
   const archives: Archive[] = rows.map((row) => {
@@ -1031,14 +1047,17 @@ async function record(
   historical = false,
   preserved?: PreservedSolver,
   hubStop?: RegisteredStop,
+  automatic?: AutomaticVerification,
 ) {
   const field = preserved ? "closedProgressiveSiblingFiles" : historical ? "historicalRawFiles" : "closedProgressiveFiles";
   await db.execute(sql`UPDATE sim_jobs SET strip_report=jsonb_set(coalesce(strip_report,'{}'::jsonb),ARRAY[${field}::text],
-    jsonb_build_object('checkedAt',clock_timestamp(),'complete',${complete}::boolean,'retryAfter',CASE WHEN ${complete}::boolean THEN NULL ELSE clock_timestamp()+interval '5 minutes' END,'outcome',${outcome}::text,'bytes',${bytes}::bigint,'files',${files}::int,'planSha256',${planSha256}::text,'verifiedArchives',${verifiedArchives}::int,'scientificSha256',${scientificSha256}::text,'allocation',${JSON.stringify(allocation ?? null)}::jsonb)
+    jsonb_build_object('checkedAt',clock_timestamp(),'complete',${complete}::boolean,'retryAfter',CASE WHEN ${complete || Boolean(automatic)}::boolean THEN NULL ELSE clock_timestamp()+interval '5 minutes' END,'outcome',${outcome}::text,'bytes',${bytes}::bigint,'files',${files}::int,'planSha256',${planSha256}::text,'verifiedArchives',${verifiedArchives}::int,'scientificSha256',${scientificSha256}::text,'allocation',${JSON.stringify(allocation ?? null)}::jsonb)
     || ${mediaSha256 ? sql`jsonb_build_object('mediaSha256',${mediaSha256}::text)` : sql`'{}'::jsonb`}
     || ${preserved ? sql`jsonb_build_object('preservedSolver',${JSON.stringify(preserved)}::jsonb)` : sql`'{}'::jsonb`}
-    || ${hubStop ? sql`jsonb_build_object('registeredTerminalPromise',${JSON.stringify(hubStop)}::jsonb,'registeredTerminalPromiseSha256',${terminalPromiseSha256(hubStop)}::text)` : sql`'{}'::jsonb`})
-    WHERE id=${id}::uuid AND (${historical} OR stripped_at IS NULL) AND (strip_report->${field}::text)->>'complete' IS DISTINCT FROM 'true'`);
+    || ${hubStop ? sql`jsonb_build_object('registeredTerminalPromise',${JSON.stringify(hubStop)}::jsonb,'registeredTerminalPromiseSha256',${terminalPromiseSha256(hubStop)}::text)` : sql`'{}'::jsonb`}
+    || ${automatic ? sql`jsonb_build_object('automaticVerification',${JSON.stringify(automatic)}::jsonb)` : sql`'{}'::jsonb`})
+    WHERE id=${id}::uuid AND (${historical} OR stripped_at IS NULL) AND (strip_report->${field}::text)->>'complete' IS DISTINCT FROM 'true'
+      AND (strip_report->${field}::text)#>>'{automaticVerification,state}' IS DISTINCT FROM 'awaiting-readback'`);
 }
 
 export async function closedProgressiveJob(
@@ -1052,6 +1071,9 @@ export async function closedProgressiveJob(
     inspect?: boolean;
     verifyCompleted?: boolean;
     expectedScientificSha256?: string;
+    automatic?: boolean;
+    expectedNativeOwner?: ClosedProgressiveNativeOwner;
+    expectedRestoreSha256?: string;
     expectedRegisteredStopSha256?: string | null;
     keepMedia?: boolean;
     historicalRaw?: boolean;
@@ -1063,6 +1085,9 @@ export async function closedProgressiveJob(
   },
 ) {
   const { now, ageMs, timeoutMs } = options;
+  if (options.automatic && (!engine.restoreArchive || options.preserveSolver || options.historicalRaw))
+    throw Error("Automatic retention requires its verified native archive reader");
+  const inspectMedia = options.keepMedia || options.automatic;
   if (options.preserveSolver !== undefined &&
       (!options.keepMedia || options.historicalRaw || !/^cases\/[a-zA-Z0-9_.-]+\/transient_a[0-9]+$/.test(options.preserveSolver) ||
         options.preserveSolver.split("/").some(p => p === "." || p === "..")))
@@ -1090,21 +1115,30 @@ export async function closedProgressiveJob(
     );
     if (options.linkedContinuation !== undefined)
       await assertClosedContinuation(tx, id, options.preserveSolver!, options.linkedContinuation, false);
-    const media = options.keepMedia
+    const media = inspectMedia
       ? await registeredImages(tx, id, false, !historical)
       : [];
     const [ready] = await tx.execute(
-      sql`SELECT j.id FROM sim_jobs j WHERE j.id=${id}::uuid AND ${eligible(now, ageMs, options.verifyCompleted ? options.expectedPlan : undefined, media, options.historicalRaw, options.preserveSolver, hubStop)}`,
+      sql`SELECT j.id FROM sim_jobs j WHERE j.id=${id}::uuid AND ${eligible(now, ageMs, options.verifyCompleted ? options.expectedPlan : undefined, media, options.historicalRaw, options.preserveSolver, hubStop, options.automatic)}`,
     );
     if (!ready)
       throw new Error(
         "Job has active ownership, a retention refusal, unbound media or an existing completion",
       );
-    return proofs(tx, id, media, historical, options.keepMedia);
+    return proofs(tx, id, media, historical, options.keepMedia, options.automatic);
   });
   const manifests = source.archives.map((a) => a.manifest);
   const plan = await engine.reclaimClosedProgressiveFiles(id, manifests);
   checkReceipt(plan, id, "planned");
+  const keptImages = manifests.some(m => m.keepMedia !== undefined);
+  if (options.automatic) {
+    if (!plan.plan || !plan.files || !plan.bytes) throw Error("No positive verified working file copies");
+    if (!plan.nativeOwner || !Array.isArray(plan.workingPaths) || plan.workingPaths.length !== plan.files ||
+        new Set(plan.workingPaths).size !== plan.files)
+      throw Error("Incomplete native working path or owner inventory");
+    if (options.expectedNativeOwner && canonicalAnalysisJson(options.expectedNativeOwner) !== canonicalAnalysisJson(plan.nativeOwner))
+      throw Error("Native volume or worker lock changed after reclamation");
+  }
   const linked = plan.preservedSolver?.linkedContinuation;
   if (options.linkedContinuation !== undefined ?
       !linked || `${linked.jobId}/${linked.caseSlug}` !== options.linkedContinuation ||
@@ -1139,9 +1173,9 @@ export async function closedProgressiveJob(
   )
     throw new Error("Scientific point evidence differs from the pinned proof");
   let mediaSha256: string | undefined;
-  if (options.keepMedia) {
-    if (!historical)
-      await assertWorkingPathsUnreferenced(db, id, plan.workingPaths ?? []);
+  if (!historical && (keptImages || options.automatic))
+    await assertWorkingPathsUnreferenced(db, id, plan.workingPaths ?? []);
+  if (keptImages) {
     mediaSha256 = await readKeptMedia(
       id,
       source.media,
@@ -1161,6 +1195,7 @@ export async function closedProgressiveJob(
     for (const archive of source.archives) {
       const c = archive.manifest.historicalRaw;
       let verifiedMember: MediaFile | null = null;
+      let restored: VerifiedArchiveRestore | undefined;
       if (c) {
         const target = new URL(
           "/jobs/" +
@@ -1271,14 +1306,19 @@ export async function closedProgressiveJob(
           `/api/sync/v1/evidence-uploads/${archive.manifest.brokeredUploadId}/download`,
           source.base,
         );
-        await preflightProgressiveArchive(
-          url.toString(),
-          source.token,
-          archive.remote,
-          signal,
-        );
+        if (options.automatic) {
+          const body = await openProgressiveArchive(url.toString(), source.token, archive.remote, signal);
+          try {
+            restored = await engine.restoreArchive!(id, archive.manifest, archive.remote, body, signal);
+          } finally {
+            await body.cancel().catch(() => undefined);
+          }
+        } else {
+          await preflightProgressiveArchive(url.toString(), source.token, archive.remote, signal);
+        }
       }
       readbacks.push({
+        ...(restored ? {restored} : {}),
         ...(c
           ? { historicalPointSignature: c.point_content_signature, verifiedMember }
           : { brokeredUploadId: archive.manifest.brokeredUploadId }),
@@ -1289,6 +1329,14 @@ export async function closedProgressiveJob(
       });
     }
   }
+  const automatic = options.automatic ? {
+    state: "awaiting-readback" as const, owner: plan.nativeOwner!,
+    restoreSha256: createHash("sha256").update(canonicalAnalysisJson(
+      readbacks.map(({ verifiedAt: _at, ...identity }) => identity)
+    )).digest("hex"),
+  } : undefined;
+  if (options.expectedRestoreSha256 && automatic?.restoreSha256 !== options.expectedRestoreSha256)
+    throw Error("Post-removal archive membership or sample changed");
   if (options.inspect)
     return {
       plan,
@@ -1316,13 +1364,13 @@ export async function closedProgressiveJob(
     if (!locked) return false;
     if (options.linkedContinuation !== undefined)
       await assertClosedContinuation(tx, id, options.preserveSolver!, options.linkedContinuation, true);
-    const media = options.keepMedia ? await registeredImages(tx, id, true, !historical) : [];
+    const media = inspectMedia ? await registeredImages(tx, id, true, !historical) : [];
     const [ready] = await tx.execute(
       sql`SELECT j.id FROM sim_jobs j WHERE j.id=${id}::uuid AND ${eligible(now, ageMs, undefined, media, options.historicalRaw, options.preserveSolver, confirmedStop)}`,
     );
     if (!ready) return false;
-    const fresh = await proofs(tx, id, media, historical, options.keepMedia);
-    if (options.keepMedia && !historical)
+    const fresh = await proofs(tx, id, media, historical, options.keepMedia, options.automatic);
+    if ((keptImages || options.automatic) && !historical)
       await assertWorkingPathsUnreferenced(tx, id, plan.workingPaths!);
     options.signal?.throwIfAborted();
     if (
@@ -1342,7 +1390,7 @@ export async function closedProgressiveJob(
       if (options.preserveSolver && canonicalAnalysisJson(done.preservedSolver) !== canonicalAnalysisJson(plan.preservedSolver))
         throw Error("Unreported solver changed during signed sibling release");
       if (
-        options.keepMedia &&
+        keptImages &&
         (canonicalAnalysisJson(done.mediaFiles) !==
           canonicalAnalysisJson(plan.mediaFiles) ||
           (historical
@@ -1351,6 +1399,9 @@ export async function closedProgressiveJob(
               canonicalAnalysisJson(plan.workingPaths)))
       )
         throw Error("Native keep-set or removed paths changed");
+      if (options.automatic && (!done.allocation || !done.nativeOwner || canonicalAnalysisJson(done.nativeOwner) !== canonicalAnalysisJson(plan.nativeOwner) ||
+          canonicalAnalysisJson(done.workingPaths) !== canonicalAnalysisJson(plan.workingPaths)))
+        throw Error("Automatic removal differs from the measured native working set");
       allocation = done.allocation ?? null;
       if (
         done.state !== "reclaimed" ||
@@ -1365,7 +1416,7 @@ export async function closedProgressiveJob(
     await record(
       tx,
       id,
-      true,
+      !options.automatic,
       plan.state === "absent"
         ? "absent"
         : options.preserveSolver
@@ -1383,6 +1434,7 @@ export async function closedProgressiveJob(
       options.historicalRaw,
       plan.preservedSolver,
       confirmedStop,
+      automatic,
     );
     return true;
   });
@@ -1398,70 +1450,134 @@ export async function closedProgressiveJob(
   };
 }
 
-const scanCursor = new WeakMap<DB, string | null>();
 const PAGE_SIZE = 64;
 
-export async function stripClosedProgressiveJobs(
-  db: DB,
-  engine: ClosedProgressiveBackend,
-  now: Date,
-  ageMs: number,
-  limit: number,
-  timeoutMs: number,
-) {
-  const signal = AbortSignal.timeout(20 * 60_000);
-  const selected = await db.transaction(async (tx) => {
-    await tx.execute(
-      sql`SELECT set_config('statement_timeout',${String(timeoutMs)},true)`,
-    );
-    let after = scanCursor.get(db);
-    if (after === undefined) {
-      // Completed, interrupted and refused checks all record their position. Resume
-      // the last attempted job's successor on a service restart, then wrap normally.
-      const [last] = await tx.execute(sql`SELECT id FROM sim_jobs
-        WHERE strip_report#>>'{closedProgressiveFiles,checkedAt}' IS NOT NULL
-        ORDER BY (strip_report#>>'{closedProgressiveFiles,checkedAt}')::timestamptz DESC,id DESC LIMIT 1`);
-      after = last ? String(last.id) : null;
-      scanCursor.set(db, after);
+type AppliedFileReceipt = {
+  complete: boolean;
+  planSha256: string;
+  scientificSha256: string;
+  mediaSha256?: string;
+  automaticVerification?: AutomaticVerification;
+};
+
+async function reserveClosedOwner(db: DB, now: Date, ageMs: number, scanLimit: number, timeoutMs: number, automatic: boolean) {
+  return db.transaction(async (tx) => {
+    await tx.execute(sql`SELECT set_config('statement_timeout',${String(timeoutMs)},true)`);
+    const [cursor] = await tx.execute(sql`SELECT closed_progressive_retention_after_id AS after
+      FROM sweeper_state WHERE id=1 FOR UPDATE SKIP LOCKED`);
+    if (!cursor) return { owner: undefined, inspected: 0 };
+    const after = cursor.after ? String(cursor.after) : null;
+    // The point reclaim primary key starts with sim_job_id. Distinct keys bound every
+    // subsequent job, media and receipt lookup; an excluded page still advances.
+    const owners = await tx.execute(sql`WITH page AS MATERIALIZED (
+      SELECT DISTINCT sim_job_id AS id FROM progressive_worker_archive_reclaims
+      WHERE completed_at IS NOT NULL ${after ? sql`AND sim_job_id>${after}::uuid` : sql``}
+      ORDER BY sim_job_id LIMIT ${scanLimit}
+    ) SELECT page.id,j.strip_report->'closedProgressiveFiles' AS receipt,
+      (j.status IN ('done','failed','cancelled') AND j.stripped_at IS NULL AND j.engine_job_id=j.id::text
+       AND j.request_payload?'remoteProgressiveExecution'
+       AND coalesce(j."finishedAt",j."ingestedAt",j."updatedAt",j."createdAt")<=${now.toISOString()}::timestamptz-(${ageMs}::float8*interval '1ms')
+       AND (j.ingest_lease_token IS NULL OR j.ingest_lease_expires_at<=clock_timestamp())
+       AND j.strip_report#>>'{closedProgressiveFiles,complete}' IS DISTINCT FROM 'true'
+       AND coalesce((j.strip_report#>>'{closedProgressiveFiles,retryAfter}')::timestamptz,'-infinity')<=clock_timestamp()
+       AND coalesce((j.strip_report#>>'{closedProgressiveScan,retryAfter}')::timestamptz,'-infinity')<=clock_timestamp()
+       ${automatic ? sql`` : sql`AND (${eligible(now,ageMs)})`}) AS ready
+    FROM page LEFT JOIN sim_jobs j USING(id) ORDER BY page.id`);
+    let owner: { id: string; receipt: AppliedFileReceipt | null } | undefined;
+    let inspected = 0;
+    let next: string | null = null;
+    for (const row of owners) {
+      next = String(row.id);
+      inspected++;
+      if (row.ready === true) {
+        owner = { id: next, receipt: row.receipt as AppliedFileReceipt | null };
+        break;
+      }
     }
-    // Evaluate joins and TOASTed request bodies only for this keyset page. Advance over every
-    // inspected row, including SQL exclusions, an engine 409, and a failed cloud proof.
-    return tx.execute(sql`WITH page AS MATERIALIZED (
-      SELECT id FROM sim_jobs WHERE status IN ('done','failed','cancelled') AND engine_job_id=id::text
-        AND stripped_at IS NULL AND strip_report#>>'{closedProgressiveFiles,complete}' IS DISTINCT FROM 'true'
-        AND coalesce((strip_report#>>'{closedProgressiveFiles,retryAfter}')::timestamptz,'-infinity')<=clock_timestamp()
-        ${after ? sql`AND id>${after}::uuid` : sql``}
-      ORDER BY id LIMIT ${PAGE_SIZE}
-    ) SELECT j.id, (${eligible(now, ageMs)}) AS eligible FROM page JOIN sim_jobs j USING(id) ORDER BY j.id`);
+    // Wrap only after an empty tail. Persist progress even if every owner was held,
+    // a later cloud read fails, or another sweeper starts before the next tick.
+    if (next !== after)
+      await tx.execute(sql`UPDATE sweeper_state SET closed_progressive_retention_after_id=${next}::uuid WHERE id=1`);
+    return { owner, inspected };
   });
-  let completed = 0,
-    attempted = 0,
-    inspected = 0;
-  for (const candidate of selected) {
-    const id = String(candidate.id);
-    scanCursor.set(db, id);
-    inspected++;
-    if (candidate.eligible !== true) continue;
+}
+
+async function confirmAutomaticFiles(db: DB, engine: ClosedProgressiveBackend, id: string, saved: AppliedFileReceipt,
+                                    now: Date, ageMs: number, timeoutMs: number, signal: AbortSignal) {
+  const proof = saved.automaticVerification;
+  if (saved.complete || !proof || proof.state !== "awaiting-readback") return false;
+  if (!/^[a-f0-9]{64}$/.test(proof.restoreSha256) || !/^[a-f0-9]{64}$/.test(saved.scientificSha256) ||
+      !/^[a-f0-9]{64}$/.test(saved.planSha256) || !proof.owner)
+    throw Error("Missing durable automatic restore identity");
+  const after = await closedProgressiveJob(db,engine,id,{now,ageMs,timeoutMs,signal,automatic:true,inspect:true,
+    verifyCompleted:true,expectedPlan:saved.planSha256,expectedScientificSha256:saved.scientificSha256,
+    expectedMediaSha256:saved.mediaSha256,expectedNativeOwner:proof.owner,expectedRestoreSha256:proof.restoreSha256});
+  if (!after.plan.replayed || !after.readbacks.length || (after.mediaSha256 ?? null)!==(saved.mediaSha256 ?? null))
+    throw Error("Post-removal source, media or native completion is missing");
+  const rows = await db.execute(sql`UPDATE sim_jobs SET strip_report=jsonb_set(strip_report-'closedProgressiveScan',
+    '{closedProgressiveFiles}', (strip_report->'closedProgressiveFiles') || jsonb_build_object(
+      'complete',true,'automaticVerification', (strip_report#>'{closedProgressiveFiles,automaticVerification}') ||
+      jsonb_build_object('state','verified','verifiedAt',clock_timestamp())))
+    WHERE id=${id}::uuid AND stripped_at IS NULL AND strip_report->'closedProgressiveFiles'=${JSON.stringify(saved)}::jsonb
+    RETURNING id`);
+  return rows.length === 1;
+}
+
+function holdReason(error: unknown) {
+  const message = error instanceof Error ? error.message : "";
+  if (error instanceof EngineError) return `engine-${error.status ?? "unavailable"}`;
+  if (/no positive|directory is absent/i.test(message)) return "no-verified-working-copies";
+  if (/media|image|legend|PNG/.test(message)) return "media-ownership";
+  if (/lock|EAGAIN|Resource temporarily unavailable/.test(message)) return "worker-busy";
+  if (/unarchived|unreported|unowned/.test(message)) return "unresolved-source";
+  if (/manifest|member|generation|CRC|restore|download|readback/i.test(message)) return "archive-restore";
+  return "custody-proof-failed";
+}
+
+async function deferAutomaticFiles(db: DB, id: string, reason: string) {
+  const repeats = sql`CASE WHEN strip_report#>>'{closedProgressiveScan,reason}'=${reason}
+    THEN least(7,coalesce((strip_report#>>'{closedProgressiveScan,attempts}')::int,0)+1) ELSE 1 END`;
+  await db.execute(sql`UPDATE sim_jobs SET strip_report=jsonb_set(coalesce(strip_report,'{}'::jsonb),'{closedProgressiveScan}',
+    jsonb_build_object('checkedAt',clock_timestamp(),'reason',${reason}::text,'attempts',${repeats},
+      'retryAfter',clock_timestamp()+make_interval(secs=>least(21600,300*power(2,(${repeats})-1))::float8)))
+    WHERE id=${id}::uuid AND stripped_at IS NULL AND strip_report#>>'{closedProgressiveFiles,complete}' IS DISTINCT FROM 'true'`);
+}
+
+export async function stripClosedProgressiveJobs(
+  db: DB, engine: ClosedProgressiveBackend, now: Date, ageMs: number, limit: number, timeoutMs: number,
+  stop?: AbortSignal,
+) {
+  if (limit <= 0 || stop?.aborted) return 0;
+  const deadline = AbortSignal.timeout(20 * 60_000);
+  const signal = stop ? AbortSignal.any([deadline, stop]) : deadline;
+  const automatic = typeof engine.restoreArchive === "function";
+  let completed = 0, inspected = 0, attempted = 0;
+  while (inspected < PAGE_SIZE && attempted < limit && !signal.aborted) {
+    const page = await reserveClosedOwner(db,now,ageMs,PAGE_SIZE-inspected,timeoutMs,automatic);
+    inspected += page.inspected;
+    if (!page.owner) break;
+    const { id, receipt } = page.owner;
     attempted++;
     try {
-      const { settled } = await closedProgressiveJob(db, engine, id, {
-        now,
-        ageMs,
-        timeoutMs,
-        signal,
-      });
-      if (settled) completed++;
+      if (receipt?.automaticVerification?.state === "awaiting-readback") {
+        if (automatic && await confirmAutomaticFiles(db,engine,id,receipt,now,ageMs,timeoutMs,signal)) completed++;
+        continue;
+      }
+      const result = await closedProgressiveJob(db,engine,id,{now,ageMs,timeoutMs,signal,automatic});
+      if (!result.settled) {
+        if (automatic) await deferAutomaticFiles(db,id,"owner-changed");
+        continue;
+      }
+      if (automatic) {
+        const [row] = await db.execute(sql`SELECT strip_report->'closedProgressiveFiles' AS receipt FROM sim_jobs WHERE id=${id}::uuid`);
+        if (row?.receipt && await confirmAutomaticFiles(db,engine,id,row.receipt as AppliedFileReceipt,now,ageMs,timeoutMs,signal))
+          completed++;
+      } else completed++;
     } catch (error) {
-      // The retry receipt never persists signed material or an upstream error body.
-      const reason =
-        error instanceof EngineError
-          ? `engine-${error.status ?? "unavailable"}`
-          : "custody-proof-failed";
-      await record(db, id, false, reason);
+      const reason = holdReason(error);
+      if (automatic) await deferAutomaticFiles(db,id,reason);
+      else await record(db,id,false,reason);
     }
-    if (signal.aborted || attempted >= Math.min(8, limit)) break;
   }
-  if (inspected === selected.length && selected.length < PAGE_SIZE)
-    scanCursor.set(db, null);
   return completed;
 }

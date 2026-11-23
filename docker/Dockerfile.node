@@ -1,7 +1,7 @@
 # Shared image for the Airfoils.Pro Node control-plane (node-api, web, and the
 # Phase-2 sweeper). Installs the pnpm workspace; each compose service sets its
 # own command. Packages ship raw TS and run via tsx / next.
-FROM node:22-bookworm-slim
+FROM node:22-bookworm-slim AS node-workspace
 
 RUN corepack enable
 WORKDIR /app
@@ -15,3 +15,20 @@ RUN pnpm install --frozen-lockfile
 
 EXPOSE 3000 4000
 CMD ["node", "-e", "console.log('set a service command in docker-compose')"]
+
+
+# Only the sweeper has the native shared-volume proof peer. Reuse the exact
+# Python sources and dependency hashes used to verify archives in the engine.
+FROM node-workspace AS sweeper
+COPY docker/requirements.lock /tmp/engine-requirements.lock
+RUN apt-get update && apt-get install -y --no-install-recommends python3-venv \
+    && rm -rf /var/lib/apt/lists/* \
+    && python3 -m venv /opt/airfoilfoam-retention \
+    && awk '/^[[:alnum:]]/ { keep=($1 ~ /^(annotated-types|google-crc32c|pydantic|pydantic-core|pydantic-settings|python-dotenv|typing-extensions|typing-inspection|zstandard)==/) } keep {print}' /tmp/engine-requirements.lock > /tmp/retention-requirements.lock \
+    && /opt/airfoilfoam-retention/bin/pip install --no-cache-dir --require-hashes --only-binary=:all: -r /tmp/retention-requirements.lock \
+    && /opt/airfoilfoam-retention/bin/pip check \
+    && rm /tmp/*-requirements.lock
+COPY src/airfoilfoam/__init__.py src/airfoilfoam/automatic_retention.py src/airfoilfoam/closed_progressive_retention.py src/airfoilfoam/config.py src/airfoilfoam/evidence_runtime.py src/airfoilfoam/evidence_store.py src/airfoilfoam/retention.py /app/src/airfoilfoam/
+RUN PYTHONPATH=/app/src /opt/airfoilfoam-retention/bin/python -B -c "from airfoilfoam.automatic_retention import main"
+
+FROM node-workspace AS node-runtime

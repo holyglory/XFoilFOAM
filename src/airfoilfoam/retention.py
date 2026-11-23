@@ -66,7 +66,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import zstandard
 
@@ -189,7 +189,7 @@ class DeleteReport:
         }
 
 
-def strip_job_dir(job_root: Path, keep_case_state: bool = False) -> StripReport:
+def strip_job_dir(job_root: Path, keep_case_state: bool = False, *, source_guard: Callable[[Path], None] | None = None) -> StripReport:
     """Strip known bulky artifacts from one job directory.
 
     The operation is idempotent. A marker from the same or a stronger mode
@@ -201,6 +201,8 @@ def strip_job_dir(job_root: Path, keep_case_state: bool = False) -> StripReport:
     if not job_root.is_dir():
         raise FileNotFoundError(job_root)
     with _job_retention_guard(job_root):
+        if source_guard is not None:
+            source_guard(job_root)
         marker = job_root / STRIP_MARKER
         requested_strength = _mode_strength(keep_case_state)
         existing_mode = _read_marker_mode(marker)

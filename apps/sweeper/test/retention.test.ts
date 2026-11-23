@@ -56,7 +56,7 @@ import {
   processResultMediaLocalReclaims,
   type ResultMediaObjectStore,
 } from "../src/media-object-store";
-import { runOrphanSweep, stripTerminalJobs } from "../src/retention";
+import { runOrphanSweep as realOrphanSweep, stripTerminalJobs as realStripTerminal, type RetentionTickOptions } from "../src/retention";
 import { DISK_PRESSURE_CANCELLATION_MARKER } from "../src/disk-admission";
 
 const { db, sql } = createClient({ max: 2 });
@@ -138,6 +138,27 @@ function fakeEngine(
     stripCalls: StripCall[];
     deleteCalls: string[];
   };
+}
+
+// Selector and legacy policy tests use their existing engine fixture. The
+// normal-entry integration test exercises the actual installed filesystem peer.
+function testFiles(engine: EngineClient) {
+  return {
+    strip: async (job: string, keep: boolean) => {
+      const result = await engine.stripJob(job, {keep_case_state:keep});
+      return {...result, job_id:job};
+    },
+    discard: async (job: string) => {
+      const result = await engine.deleteJob(job);
+      return {state:"removed" as const, allocatedBytes:result.bytes_freed,files:0};
+    },
+  };
+}
+function stripTerminalJobs(connection: DB, engine: EngineClient, options: RetentionTickOptions) {
+  return realStripTerminal(connection,engine,{...options,fileMaintenance:testFiles(engine)});
+}
+function runOrphanSweep(connection: DB, engine: EngineClient, options: RetentionTickOptions) {
+  return realOrphanSweep(connection,engine,{...options,fileMaintenance:testFiles(engine)});
 }
 
 function aoa(): number {
@@ -999,7 +1020,7 @@ describe("terminal strip reaper", () => {
     );
     expect((await readJob(deliveredJob.id)).stripReport).toMatchObject({
       kept_case_state: false,
-      note: "engine job directory deleted",
+      note: "verified disposable engine job directory deleted",
     });
   });
 
@@ -1040,11 +1061,11 @@ describe("terminal strip reaper", () => {
     ]);
     expect((await readJob(job.id)).stripReport).toMatchObject({
       kept_case_state: false,
-      note: "engine job directory deleted",
+      note: "verified disposable engine job directory deleted",
     });
   });
 
-  it("deletes only remote-progressive jobs with complete hub custody", async () => {
+  it("retains both remote-progressive jobs when receipt counts are the only claimed deletion authority", async () => {
     const safe = await insertTerminalJob(`${PREFIX}-progressive-safe`, {
       requestPayload: { remoteProgressiveExecution: { fixture: true } },
     });
@@ -1119,7 +1140,8 @@ describe("terminal strip reaper", () => {
         stripMaxPerTick: 500,
       });
 
-      expect(engine.deleteCalls).toEqual([safe.id]);
+      expect(engine.deleteCalls).toEqual([]);
+      expect((await readJob(safe.id)).strippedAt).toBeNull();
       expect((await readJob(unsafe.id)).strippedAt).toBeNull();
     } finally {
       await db.delete(simJobs).where(inArray(simJobs.id, ownedIds));

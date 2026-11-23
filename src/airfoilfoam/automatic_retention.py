@@ -21,7 +21,7 @@ from .evidence_store import (
     MAX_EVIDENCE_MANIFEST_BYTES, RemoteEvidencePointer, _safe_extraction_capacity,
     extract_verified_evidence_archive, manifest_bundle_member_set_sha256,
 )
-from .retention import JobRetentionRefused
+from .retention import JobRetentionRefused, strip_job_dir
 
 
 def require(condition, reason):
@@ -31,11 +31,12 @@ def require(condition, reason):
 
 def regular_json(path, limit):
     require(path.resolve(strict=True) == path, "redirected metadata path")
-    with path.open("rb") as source:
+    with os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW), "rb") as source:
         st = os.fstat(source.fileno())
         require(stat.S_ISREG(st.st_mode) and st.st_size <= limit, "unsafe or oversized metadata")
         raw = source.read(limit + 1)
-    require(len(raw) == st.st_size and st.st_ctime_ns == path.stat().st_ctime_ns, "metadata changed during read")
+    current = path.lstat()
+    require(len(raw) == st.st_size and os.path.samestat(st,current) and st.st_ctime_ns == current.st_ctime_ns, "metadata changed during read")
     return raw, json.loads(raw)
 
 
@@ -159,6 +160,10 @@ def direct_request(root):
     require(isinstance(request, dict) and request.get("execution_id") is None and
             not any(k in request for k in ("remoteProgressiveExecution", "progressiveExecution", "executionContract")),
             "native request has a stable progressive execution owner")
+    # Presence of these ledgers establishes progressive/forensic provenance even
+    # if an old or incomplete request does not contain the execution marker.
+    require(not any(p.name.startswith(("closed_progressive_", "historical_raw_")) for p in root.iterdir()),
+            "native job has closed progressive custody records")
     return raw
 
 
@@ -168,12 +173,19 @@ def disposable(root, cutoff):
     previous_mtime = root.stat().st_mtime
     if cutoff is not None:
         require(previous_mtime <= cutoff, "orphan was recently written")
-    with named_owner(root, None, True, allow_create=False):
+    if not any(root.iterdir()):
+        root.rmdir()  # Atomic and refuses if any new file appeared.
+        return {"state":"removed","files":0,"allocatedBytes":0}
+    allowed = {"request.json","status.json",".execute.lock",".publication.lock","cancelled",".execution-not-started.json"}
+    require(all(p.name in allowed for p in root.iterdir()), "directory contains local scientific files or unowned state")
+    direct_request(root)
+    with named_owner(root, None, True, allow_create=True):
         direct_request(root)
         _, status = regular_json(root / "status.json", 1024 * 1024)
         require(status.get("job_id") == root.name and status.get("state") in {"failed","cancelled","completed"}
                 and status.get("completed_cases", 0) == 0, "job has a live execution or completed scientific cases")
-        allowed = {"request.json","status.json",".execute.lock",".publication.lock","cancelled",".execution-not-started.json"}
+        require(not any(status.get(k) for k in ("forces", "polars", "results", "evidence_artifacts", "frame_track",
+                        "force_history", "steady_history", "solver_budget_progress")), "status contains solver evidence")
         files = {}
         for path in root.iterdir():
             st = path.lstat()
@@ -213,8 +225,10 @@ def main():
         elif action == "discard":
             result = disposable(root, packet.get("cutoff"))
         elif action == "legacy":
-            direct_request(root)
-            result = {"state":"direct","job":inode(root)}
+            require(type(packet.get("keepCaseState")) is bool, "invalid legacy strip mode")
+            # The caller's DB ownership check and the native request check are
+            # independent. The native check and existing strip share the worker lock.
+            result = strip_job_dir(root, packet["keepCaseState"], source_guard=direct_request).to_dict()
         else:
             raise JobRetentionRefused("unknown normal retention action")
         print(json.dumps({"result":result}, separators=(",",":")))

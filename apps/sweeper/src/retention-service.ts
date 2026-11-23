@@ -35,6 +35,7 @@ export async function runRetentionService(
         }
       }
       await retentionTick(db, engine, {
+        signal,
         reclaimOptionalCaseState: state?.disk_admission_blocked === true,
       });
     } catch (error) {
