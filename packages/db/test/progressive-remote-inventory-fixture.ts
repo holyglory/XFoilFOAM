@@ -771,6 +771,10 @@ async function verifyBoundedRetentionHistory(
           FROM jsonb_to_recordset(${payload}::jsonb) AS item(sequence bigint,sources jsonb)
           CROSS JOIN LATERAL jsonb_to_recordset(item.sources)
             AS source(point_content_signature text,aoa_deg double precision,case_slug text)`);
+        // The bulk history exists only inside this transaction. Refresh the
+        // fixture statistics before the retention readers inspect it.
+        await connection.execute(sql`ANALYZE progressive_remote_reports,
+          progressive_remote_report_inventories, progressive_remote_report_sources`);
       };
       await appendHistory(Array.from({ length: 2050 }, () => repeated));
       const [history] =

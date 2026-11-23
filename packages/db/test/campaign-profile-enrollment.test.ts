@@ -269,7 +269,11 @@ const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
 const maintenanceUrl = new URL(databaseUrl());
 maintenanceUrl.pathname = "/postgres";
 const targetUrl = new URL(databaseUrl());
-targetUrl.pathname = `/${DATABASE}`;
+const useCaseDatabase = process.env.CAMPAIGN_ENROLLMENT_CASE_DB === "1";
+if (useCaseDatabase) {
+  if (!/^\/dc2_case_[0-9a-f]{32}$/.test(targetUrl.pathname))
+    throw new Error("Enrollment requires its assigned PostgreSQL case database");
+} else targetUrl.pathname = `/${DATABASE}`;
 const admin = postgres(maintenanceUrl.toString(), { max: 1 });
 let client: ReturnType<typeof createClient>;
 let db: DB;
@@ -1495,10 +1499,19 @@ async function campaign(
 }
 
 beforeAll(async () => {
-  await admin.unsafe(`CREATE DATABASE "${DATABASE}"`);
-  created = true;
+  if (!useCaseDatabase) {
+    await admin.unsafe(`CREATE DATABASE "${DATABASE}"`);
+    created = true;
+  }
   client = createClient({ url: targetUrl.toString(), max: 4 });
   db = client.db;
+  if (useCaseDatabase) {
+    const [scope] = await client.sql`SELECT current_database() AS name,
+      datdba=(SELECT oid FROM pg_roles WHERE rolname=current_user) AS owned,
+      to_regclass('public.sim_jobs') IS NULL AND to_regclass('drizzle.__drizzle_migrations') IS NULL AS empty
+      FROM pg_database WHERE datname=current_database()`;
+    expect(scope).toEqual({name:targetUrl.pathname.slice(1),owned:true,empty:true});
+  }
   await migrate(db, {
     migrationsFolder: resolve(
       dirname(fileURLToPath(import.meta.url)),
