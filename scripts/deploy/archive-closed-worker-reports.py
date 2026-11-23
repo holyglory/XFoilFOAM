@@ -19,7 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from closed_worker_report_pages import process_page, qualified_width
 from closed_worker_report_sessions import ReportReadSessions, ROLE_READS
 from closed_worker_report_discovery import discovery_step, revisit_held, revisit_prefix
-from closed_worker_report_order import OrderedInventory, ordered_inventory
+from closed_worker_report_order import OrderedInventory, ordered_inventory, remember_member_size
 
 ROOT = Path(__file__).resolve().parents[2]
 PEER = ROOT / "apps/sweeper/src/closed-worker-report-peer.mjs"
@@ -215,6 +215,7 @@ def run(args):
             # Early receipts used completed for the verified-only prefix.
             progress.setdefault("archived", progress["completed"] - progress.get("held", 0))
             progress[column] = progress.get(column, 0) + 1
+            remember_member_size(progress, done.get("pin"))
             progress.update(after=keys.tell(), completed=progress["completed"]+1, pending=None)
             durable(path,progress)
             print(json.dumps(dict(receipt=str(receipt),sequence=done["key"]["sequence"],settled=done["settled"])),flush=True)
@@ -235,7 +236,7 @@ def run(args):
                 return
             page_limit = min(max_members, left)
             if isinstance(keys, OrderedInventory) and not progress.get("group"):
-                page_limit = keys.page_limit(page_limit)
+                page_limit = keys.page_limit(page_limit, progress.get("lastPriorityMember"))
             if args.apply and not progress.get("pending") and (progress.get("group") or page_limit > 1):
                 used=process_page(args, keys, page_limit, progress, path, bind, runtime, peer_hash,
                                   scope_for, ask, durable, require, limits)

@@ -5,6 +5,7 @@ import os
 from bisect import bisect_right
 from itertools import accumulate
 
+from closed_worker_report_fair_order import fair_order
 
 MAX_PAGE_BYTES = 32 * 1024**2
 MAX_TURN_KEYS = 128
@@ -71,12 +72,19 @@ class OrderedInventory:
         self.pos += len(data)
         return data
 
-    def page_limit(self, limit):
+    def page_limit(self, limit, previous=None):
         # Hints only reduce work. The peer still authenticates and enforces its
         # exact reconstructed-byte cap on every actual member.
         pos = self.tell()
         used = 0
         try:
+            if previous:
+                line = self.readline(2049)
+                self.seek(pos)
+                if line:
+                    key = json.loads(line)
+                    if key["executionId"] == previous["executionId"] and key["sequence"] > previous["sequence"]:
+                        limit = min(limit, max(1, MAX_PAGE_BYTES // previous["byteSize"]))
             for count in range(limit):
                 size = self.sizes.get(self.tell())
                 if size is None:
@@ -99,14 +107,30 @@ def ordered_inventory(args, source, progress, bind, path, durable, validate):
     hint_file = getattr(args, "priority_turn", None)
     requested = getattr(args, "priority_turn_sha256", None)
     pending = progress.get("pending") or progress.get("group")
-    if hint_file and args.apply and not pending and (not order or order["hint"] != requested):
+    if (hint_file and args.apply and not pending and requested != progress.get("declinedPriorityHint", "")
+            and (not order or order["hint"] != requested)):
         with hint_file.open("rb") as hint_source:
             data = hint_source.read(128*1024 + 1)
         digest = hashlib.sha256(data).hexdigest()
         check(len(data) <= 128*1024 and digest == requested, "Priority hint digest differs")
         hint = json.loads(data)
         # Subordinate discovery and held-key recovery own different signed rosters.
-        if hint["inventory"] == bind["inventory"]:
+        if hint["inventory"] == bind["inventory"] and hint.get("version") == 2:
+            pos = progress["after"]
+            next_receipt = path.parent / "receipts" / f"{progress['completed']:08d}"
+            occupied = any(next_receipt.with_suffix(ext).exists() for ext in (".json", ".page.json"))
+            if not occupied and pos < size:
+                proposed = fair_order(source, trim(spans, pos, size), trim(spans, 0, pos), hint, digest, validate,
+                                      start_ordinary=bool(order and order.get("blockMembers")))
+                if proposed is None:
+                    progress["declinedPriorityHint"] = digest
+                else:
+                    order = progress["sourceOrder"] = proposed
+                    progress["binding"] = dict(bind, sourceOrderSha256=order_hash(order))
+                    progress.pop("lastPriorityMember", None)
+                    spans = order["spans"]
+                durable(path, progress)
+        elif hint["inventory"] == bind["inventory"]:
             start, keys = hint["offset"], hint["keys"]
             check(hint["version"] == 1 and type(start) is int and 0 <= start < size
                   and 0 < len(keys) <= MAX_TURN_KEYS, "Invalid finite priority turn")
@@ -164,3 +188,16 @@ def ordered_inventory(args, source, progress, bind, path, durable, validate):
         at = end
     check(at == size, "Incomplete source inventory partition")
     return OrderedInventory(source, spans, order["sizes"])
+
+
+def remember_member_size(progress, pin):
+    """Only a completed, signed member can narrow the next page of the same owner."""
+    owners = (progress.get("sourceOrder") or {}).get("owners")
+    if not owners:
+        return
+    if pin and pin["executionId"] in owners:
+        size = pin["reportByteSize"]
+        check(type(size) is int and 0 < size <= MAX_PAGE_BYTES, "Invalid completed member size")
+        progress["lastPriorityMember"] = dict(executionId=pin["executionId"], sequence=pin["sequence"], byteSize=size)
+    else:
+        progress.pop("lastPriorityMember", None)

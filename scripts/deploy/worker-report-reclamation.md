@@ -5,6 +5,38 @@ header and an immutable object reference. PostgreSQL can reuse the old pages
 after vacuum. Returning space to the filesystem depends on the location of the
 free pages.
 
+## Byte-priority turns for closed worker originals
+
+The existing `archive-closed-worker-reports.py` controller accepts a private
+priority plan with `--priority-turn PATH --priority-turn-sha256 DIGEST`. Use
+the same signed key inventory, state directory, source binding and service as
+the ordinary run. Version 1 selects a single future block. A version 2 plan
+alternates priority and ordinary work until the selected ranges are exhausted.
+
+| Version 2 field | Meaning |
+| --- | --- |
+| `inventory` | SHA-256 of the original signed key file |
+| `blockMembers` | Number of keys per turn, from 1 through 32 |
+| `owners` | Ordered list of up to 25 execution owners |
+| `owners[].executionId` | Exact worker execution UUID |
+| `owners[].ranges` | Sorted, disjoint pairs of inclusive sequence numbers |
+| `owners[].firstSequence` | Optional starting key within those ranges. Earlier selected keys follow on wraparound. |
+
+Set `version` to `2`. Choose source ranges from measured report-field sizes.
+Each selected owner receives one turn in rotation, followed by an equally sized
+turn from the ordinary remainder while both have work. Replacing an active
+rotation begins with an ordinary turn. The 32 MiB bundle cap applies to
+reconstructed report text. The previous verified member size can narrow the
+next page for the same owner.
+
+Keep the original key file, the complete `progress.json`, signed receipts and
+any pending operation together at a deployment boundary. The cursor's
+`after` position addresses the ordered spans in `sourceOrder`; its digest is
+in `binding.sourceOrderSha256`. Resume with an order-aware controller. Each
+retired member still requires the generation-pinned cloud restore and both
+native readers. Sum the changes in stored PostgreSQL field sizes separately
+from measured filesystem allocations.
+
 ## Measure the report table
 
 Run the read-only audit from the operator host. It uses the existing SSH aliases

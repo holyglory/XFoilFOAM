@@ -6,6 +6,8 @@ import re
 import time
 from pathlib import Path
 
+from closed_worker_report_order import remember_member_size
+
 
 def qualified_width(args, binding, runtime, peer_hash):
     """Return optional packing limits. A missing/stale tuning receipt leaves ordinary custody available."""
@@ -190,6 +192,7 @@ def process_page(args, stream, limit, progress, path, bind, runtime, peer_digest
         durable(receipt,saved,immutable=True)
     end=entries[-1][1]
     progress.setdefault("archived",progress["completed"]-progress.get("held",0))
+    remember_member_size(progress, saved["publication"]["pins"][-1])
     progress.update(after=end,completed=progress["completed"]+count,archived=progress["archived"]+count,group=None)
     durable(path,progress)
     stream.seek(end)

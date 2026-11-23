@@ -14,6 +14,78 @@ SPEC.loader.exec_module(controller)
 
 
 class ClosedReportOperator(unittest.TestCase):
+    def test_rotating_high_byte_owners_keeps_original_rows_and_ordinary_turns_after_restart(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            normal, hi, other = [f"{i:08}-1111-4111-8111-111111111111" for i in (1,2,3)]
+            rows = [(normal,n) for n in range(3,9)] + [(hi,n) for n in range(3,8)] + [(other,n) for n in range(3,7)]
+            keys = [dict(executionId=j,sequence=n,signature="a"*64) for j,n in rows]
+            source = root/"keys.jsonl"
+            source.write_bytes(b"".join(controller.compact(k)+b"\n" for k in keys))
+            scope = root/"scope.json"
+            controller.durable(scope,dict(version=1,sourceInstance=hi,solverId=normal,
+                                          executions=[dict(executionId=normal,reportAfter=0,reportHighWater=1)]))
+            args = SimpleNamespace(keys=source, keys_sha256=controller.digest(source.read_bytes()),apply=True,
+                frozen_scope=scope,frozen_sha256=controller.digest(controller.compact(json.loads(scope.read_bytes()))),
+                state=root/"state",runtime_revision="b"*40,hz_host="hz",hz_api="api",hz_sweeper="worker",
+                hub_host="hub",hub_sweeper="svc",limit=1,page_members=1)
+            writes, lost = [], []
+            def peer(_args, role, message, _program):
+                op, key = message["op"], message["key"]
+                identity = key["executionId"], key["sequence"]
+                if op == "source":
+                    return dict(source={"facts":{}},stored=1200,archivedBundle=None)
+                if op in ("cloud","hub"):
+                    return dict(science={})
+                if op == "publish":
+                    return dict(**key, generation=str(key["sequence"]), reportByteSize=18*1024**2)
+                if op == "settle":
+                    writes.append(identity)
+                    return dict(outcome="retired")
+                if op == "read" and role=="api" and message["committed"] and identity==(hi,5) and not lost:
+                    lost.append(identity)
+                    raise OSError("postcommit retry")
+                return dict(storedFieldBytes=100)
+            with patch.object(controller,"run_peer",side_effect=peer), patch.object(controller.subprocess,"check_output",return_value=b"runtime"):
+                controller.run(args)
+                hint=root/"priority"
+                controller.durable(hint,dict(version=2,inventory=args.keys_sha256,blockMembers=2,
+                    owners=[dict(executionId=hi,ranges=[[3,6]],firstSequence=5),dict(executionId=other,ranges=[[3,6]])]))
+                args.priority_turn, args.priority_turn_sha256 = hint, controller.digest(hint.read_bytes())
+                with self.assertRaisesRegex(OSError,"postcommit retry"):
+                    controller.run(args)
+                hint.unlink()
+                controller.run(args)
+                p=json.loads((args.state/"progress.json").read_bytes())
+                order=p["sourceOrder"]
+                self.assertEqual((order["priorityKeys"],order["ordinaryKeys"]),(8,6))
+                with source.open("rb") as fp:
+                    v=controller.OrderedInventory(fp,order["spans"],order["sizes"])
+                    v.seek(p["after"])
+                    self.assertEqual(v.page_limit(4,p["lastPriorityMember"]),1)
+                for _ in rows:
+                    controller.run(args)
+                self.assertEqual(writes,[(normal,3),(hi,5),(hi,6),(normal,4),(normal,5),(other,3),(other,4),
+                    (normal,6),(normal,7),(hi,3),(hi,4),(normal,8),(hi,7),(other,5),(other,6)])
+                self.assertCountEqual(writes,rows)
+                p=json.loads((args.state/"progress.json").read_bytes())
+                self.assertEqual((p["completed"],p["after"]),(len(rows),source.stat().st_size))
+                from closed_worker_report_fair_order import fair_order
+                next_hint = dict(blockMembers=2, owners=[dict(executionId=hi,ranges=[[3,6]],firstSequence=3),
+                                                       dict(executionId=other,ranges=[[3,6]])])
+                with source.open("rb") as fp:
+                    for _ in range(8):
+                        fp.readline()
+                    offset=fp.tell()
+                    replacement=fair_order(fp,[[offset,source.stat().st_size]],[[0,offset]],next_hint,
+                                           "qualified",lambda k: controller.check_key(k,{}),start_ordinary=True)
+                    self.assertEqual(replacement["priorityStarts"],{})
+                    self.assertTrue(replacement["startsWithOrdinary"])
+                    reader=controller.OrderedInventory(fp,replacement["spans"],replacement["sizes"])
+                    reader.seek(offset)
+                    remaining=[json.loads(reader.readline(2049)) for _ in rows[8:]]
+                    self.assertEqual(remaining,[keys[i] for i in (10,8,9,11,12,13,14)])
+
     def test_priority_turn_recovers_the_same_writer_and_conserves_the_displaced_keys(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
