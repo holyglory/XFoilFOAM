@@ -8,6 +8,7 @@ import {
   type ProgressiveEvidenceCustodyReceipt,
 } from "@aerodb/db";
 import { canonicalRemoteHubBaseUrl } from "@aerodb/core";
+import { readRegisteredArchive } from "@aerodb/core/registered-archive-read";
 import { and, eq, sql } from "drizzle-orm";
 import { configuredControlPlaneToken } from "./config";
 import { recordProgressiveWorkerArchiveCustody } from "./progressive-worker-archive-custody";
@@ -48,11 +49,7 @@ export async function preflightProgressiveArchive(
   remote: ProgressiveEvidenceCustodyReceipt["remote"],
   signal: AbortSignal,
 ): Promise<void> {
-  const response = await fetch(url, {
-    redirect: "error",
-    headers: { accept: "application/zstd", "x-xfoilfoam-solver-token": token },
-    signal,
-  });
+  const response = await readRegisteredArchive(url, token, signal, "application/zstd");
   await verifyProgressiveArchiveResponse(response, remote);
 }
 
@@ -64,8 +61,11 @@ export async function verifyProgressiveArchiveResponse(
   >,
   archive = true,
 ): Promise<void> {
+  if (!response.ok) {
+    await response.body?.cancel().catch(() => undefined);
+    throw new Error(`Progressive archive readback returned HTTP ${response.status}`);
+  }
   if (
-    !response.ok ||
     !response.body ||
     (archive &&
       response.headers.get("content-type")?.split(";", 1)[0] !==

@@ -628,7 +628,7 @@ it("lets a delayed archive response finish inside the proof deadline and restore
     admission.remaining = 1;
     await expect(
       withReadbackTransport(undici, () => read(download, 5000)),
-    ).rejects.toThrow("immutable headers");
+    ).rejects.toThrow("HTTP 503");
     expect(admission.hits).toBe(4);
     admission.corrupt = true;
     await expect(
@@ -646,6 +646,22 @@ it("lets a delayed archive response finish inside the proof deadline and restore
       withReadbackTransport(undici, () => read("/corrupt", 6000)),
     ).rejects.toThrow(/complete byte proof/);
     expect(undici.getGlobalDispatcher()).toBe(short);
+    // The ordinary point-reclaim service calls the reader directly.
+    undici.setGlobalDispatcher(previous);
+    admission.reject = true;
+    admission.remaining = 1;
+    admission.corrupt = false;
+    const directStart = admission.hits;
+    await read(download, 5000);
+    expect(admission.hits - directStart).toBe(2);
+    admission.remaining = 1;
+    admission.corrupt = true;
+    await expect(read(download, 5000)).rejects.toThrow(/complete byte proof/);
+    expect(admission.hits - directStart).toBe(4);
+    admission.reject = false;
+    admission.remaining = 1;
+    await expect(read(download, 5000)).rejects.toThrow("HTTP 503");
+    expect(admission.hits - directStart).toBe(5);
   } finally {
     undici.setGlobalDispatcher(previous);
     await short.destroy();
