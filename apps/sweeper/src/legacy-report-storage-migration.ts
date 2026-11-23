@@ -261,6 +261,12 @@ function phaseMarker(
     ? `${name}.${custodyKey(normalizer)}.${application ? "custody-applied" : "custody"}.json`
     : `${name}.normalized.json`;
 }
+export function legacyAppliedReceiptFile(
+  name: string,
+  normalizer: LegacyPageNormalizer,
+) {
+  return phaseMarker(name, normalizer, true);
+}
 async function saveCursor(path: string, value: unknown) {
   const temporary = join(dirname(path), `.cursor-${randomUUID()}.tmp`),
     file = await open(temporary, "wx", 0o600);
@@ -315,7 +321,7 @@ export async function applyVerifiedLegacyPage(input: {
     await saveProof(
       join(
         input.directory,
-        phaseMarker(input.receiptFile, input.normalizer, true),
+        legacyAppliedReceiptFile(input.receiptFile, input.normalizer),
       ),
       record,
     );

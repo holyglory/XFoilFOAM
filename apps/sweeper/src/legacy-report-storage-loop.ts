@@ -1,5 +1,6 @@
 import { LegacyStorageOperationError } from "./legacy-report-storage-gcs";
 import { legacyBound } from "@aerodb/db/legacy-report-storage";
+import { LegacyPeerOccupied } from "./legacy-report-peer-memory";
 import { LegacyOperatorPaused } from "./legacy-report-storage-operator";
 
 export async function runLegacyUntilComplete<
@@ -45,6 +46,7 @@ export async function runLegacyUntilComplete<
   let attempted = 0,
     completed = 0,
     pauses = 0,
+    peerPauses = 0,
     transientRetries = 0,
     last: T | undefined,
     previous: string | undefined,
@@ -79,8 +81,12 @@ export async function runLegacyUntilComplete<
     } catch (error) {
       if (input.signal?.aborted) return finish(false, "signal");
       let backoff: number;
-      if (error instanceof LegacyOperatorPaused) {
-        pauses++;
+      if (
+        error instanceof LegacyOperatorPaused ||
+        error instanceof LegacyPeerOccupied
+      ) {
+        if (error instanceof LegacyPeerOccupied) peerPauses++;
+        else pauses++;
         backoff = Math.max(yieldMs, 5000);
         emit({
           event: "paused",
@@ -154,6 +160,7 @@ export async function runLegacyUntilComplete<
       passesAttempted: attempted,
       passesCompleted: completed,
       deployPauses: pauses,
+      peerWorkerPauses: peerPauses,
       transientRetries,
       elapsedSeconds: (now() - started) / 1000,
       next: last?.next ?? null,

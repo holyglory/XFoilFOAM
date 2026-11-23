@@ -37,6 +37,7 @@ import {
   parseLegacyCustodyWorkerFailure,
 } from "../src/legacy-report-storage-custody-worker";
 import { LegacyHubSshStore } from "../src/legacy-report-storage-hub";
+import { LegacyPeerOccupied } from "../src/legacy-report-peer-memory";
 import { runLegacyUntilComplete } from "../src/legacy-report-storage-loop";
 import {
   LegacyOperatorPaused,
@@ -183,10 +184,12 @@ const source: LegacySqlReader = {
     }
   },
 };
-async function fixture(conflicts = true): Promise<LegacyReportScope> {
+async function fixture(
+  conflicts = true,
+  solverId: string = randomUUID(),
+): Promise<LegacyReportScope> {
   await client.sql`UPDATE public.progressive_report_storage_policy SET normalization_enabled=false`;
   const executionId = randomUUID();
-  const solverId = randomUUID();
   const common = `"version":1,"executionId":"${executionId}","solverId":"${solverId}","status":{"state":"failed","unknown":"retained"}`;
   // Sparse sequences, absent versus null, huge integer, scale and unknown fields.
   for (const sequence of [1, 3, 8, 9, 10]) {
@@ -262,6 +265,592 @@ async function logical(executionId: string) {
 }
 
 describe.sequential("worker-only legacy backup and 0198 representation", () => {
+  it.each(["front", "peer"] as const)(
+    "recovers a lost %s commit at the original generation across slot and page limits",
+    async (failed) => {
+      const a = await fixture(),
+        b = await fixture(true, a.solverId);
+      const scope = {
+        ...a,
+        executions: [...a.executions, ...b.executions].sort((x, y) =>
+          x.executionId.localeCompare(y.executionId),
+        ),
+      };
+      const store = new MemoryBackup(),
+        path = await directory(),
+        seen = new Map<string, string>();
+      // Read and preserve an ordinary serial prefix before opening a pair.
+      const base = {
+        scope,
+        source,
+        store,
+        directory: path,
+        sourceBinding: "native-owner-job-pair",
+        rows: 2,
+      };
+      const expected = await Promise.all(
+        scope.executions.map((x) => logical(x.executionId)),
+      );
+      await client.sql`UPDATE public.progressive_report_storage_policy SET normalization_enabled=true`;
+      const completed = new Set<string>();
+      let lose = true;
+      const normalizer: LegacyPageNormalizer = {
+        binding: "exact-db",
+        async apply(page) {
+          if (page.members.length)
+            await execute(
+              legacyNormalizeSql(page.members, {
+                apply: true,
+                readersReady: true,
+              }),
+            );
+          const reports = page.members.filter(
+            (m) => m.kind === "report",
+          ).length;
+          return {
+            verifiedReports: reports,
+            normalizedReports: reports,
+            transactionCommitted: true,
+            remainingWarmReports: reports,
+            archiveMembersReleased: 0,
+            rowProofs: [],
+          };
+        },
+      };
+      const good = signal();
+      let inPair = false;
+      const apply: NonNullable<
+        Parameters<typeof exportLegacyReports>[0]["applyVerifiedPage"]
+      > = async (page, receipt, receiptFile, packed, dir) => {
+        const key = JSON.stringify(page.start),
+          pin =
+            receipt.object.sha256 +
+            "/" +
+            receipt.object.generation +
+            "/" +
+            receiptFile;
+        expect(seen.get(key) ?? pin).toBe(pin);
+        seen.set(key, pin);
+        expect(packed.equals(await store.read(receipt.object))).toBe(true);
+        if (
+          inPair &&
+          page.start.execution === (failed === "front" ? 0 : 1) &&
+          lose
+        )
+          await good.reached;
+        const proof = await applyVerifiedLegacyPage({
+          page,
+          receipt,
+          receiptFile,
+          directory: dir,
+          normalizer,
+        });
+        completed.add(pin);
+        if (
+          inPair &&
+          page.start.execution === (failed === "front" ? 0 : 1) &&
+          lose
+        ) {
+          lose = false;
+          throw new Error("successful SQL reply lost");
+        }
+        if (inPair) good.release();
+        return legacyNormalizationTelemetry(proof, page.members.length);
+      };
+      const options = {
+        slots: 2 as const,
+        targetBinding: normalizer.binding,
+        peerSource: source,
+        openBudget: async () => ({
+          admit: true,
+          finish: async () => ({
+            minAvailableMiB: 12000,
+            peakWorkerRssMiB: 2500,
+            peakControllerRssMiB: 1500,
+            permitted: true,
+          }),
+        }),
+      };
+      const first = await exportLegacyReports({
+        ...base,
+        applyVerifiedPage: apply,
+        pages: 1,
+      });
+      inPair = true;
+      await expect(
+        exportLegacyReports({
+          ...base,
+          applyVerifiedPage: apply,
+          pages: 2,
+          maxBytes: 128 * 1024 ** 2,
+          executionSupervisor: options,
+        }),
+      ).rejects.toThrow(/reply lost/);
+      const raw = JSON.parse(
+        await readFile(join(path, "checkpoint.json"), "utf8"),
+      );
+      expect(raw.next.execution).toBe(0);
+      if (failed === "front") expect(raw.next).toEqual(first.next);
+      const entries = await readdir(join(path, "pending.jsonl.gz"));
+      expect(entries.some((n) => n.startsWith("page-"))).toBe(true);
+      await expect(exportLegacyReports({ ...base, pages: 1 })).rejects.toThrow(
+        /supervisor/,
+      );
+      await expect(
+        exportLegacyReports({
+          ...base,
+          pages: 2,
+          applyVerifiedPage: apply,
+          executionSupervisor: { ...options, targetBinding: "wrong-worker" },
+        }),
+      ).rejects.toThrow(/journal/);
+      const publicReceipts = () =>
+        readdir(path).then((ns) =>
+          ns.filter((n) => n.endsWith(".receipt.json")),
+        );
+      for (const name of await publicReceipts())
+        expect(
+          JSON.parse(await readFile(join(path, name), "utf8")).start.execution,
+        ).toBe(0);
+      const puts = vi.spyOn(store, "put");
+      let last;
+      // A restart at 256 MiB and one slot first consumes exactly the old 128 MiB work.
+      for (let i = 0; i < 16; i++) {
+        last = await exportLegacyReports({
+          ...base,
+          pages: 2,
+          maxBytes: 256 * 1024 ** 2,
+          applyVerifiedPage: apply,
+          executionSupervisor: { ...options, slots: 1 },
+        });
+        if (last.complete) break;
+      }
+      expect(last?.complete).toBe(true);
+      expect(new Set(puts.mock.calls.map((x) => x[0])).size).toBe(
+        puts.mock.calls.length,
+      );
+      await expect(
+        readdir(join(path, "pending.jsonl.gz")),
+      ).rejects.toMatchObject({ code: "ENOENT" });
+      expect(
+        await Promise.all(scope.executions.map((x) => logical(x.executionId))),
+      ).toEqual(expected);
+      const all = await publicReceipts();
+      const receipts = await Promise.all(
+        all.map(async (name) => ({
+          name,
+          r: JSON.parse(
+            await readFile(join(path, name), "utf8"),
+          ) as LegacyBackupReceipt,
+        })),
+      );
+      let cursor = {
+        execution: 0,
+        kind: "report" as const,
+        after: 0,
+        copied: 0,
+      } as legacyCodec.LegacyCursor;
+      const members = new Set<string>();
+      for (let i = 0; i < receipts.length; i++) {
+        const match = receipts.filter((x) =>
+          legacyCodec.sameLegacyCursor(x.r.start, cursor),
+        );
+        expect(match).toHaveLength(1);
+        const { r, name } = match[0],
+          page = decodeLegacyPage(await store.read(r.object), r);
+        expect(r.scopeSha256).toBe(legacySha256(JSON.stringify(scope)));
+        expect(
+          completed.has(
+            r.object.sha256 + "/" + r.object.generation + "/" + name,
+          ),
+        ).toBe(true);
+        const marker = JSON.parse(
+          await readFile(join(path, name + ".normalized.json"), "utf8"),
+        );
+        expect(marker.archiveReceiptSha256).toBe(name.split(".")[0]);
+        for (const m of page.members) {
+          const key = m.executionId + "/" + m.kind + "/" + m.sequence;
+          expect(members.has(key)).toBe(false);
+          members.add(key);
+        }
+        cursor = r.next;
+      }
+      expect(members.size).toBe(12);
+      expect(cursor).toEqual(last!.next);
+      expect((await exportLegacyReports({ ...base })).complete).toBe(true);
+    },
+    60000,
+  );
+
+  it("keeps a finished peer private across long execution pages and stops pairing at measured memory pressure", async () => {
+    const first = await fixture(false),
+      second = await fixture(false, first.solverId);
+    const scope = {
+      ...first,
+      executions: [...first.executions, ...second.executions].sort((a, b) =>
+        a.executionId.localeCompare(b.executionId),
+      ),
+    };
+    const [long, short] = scope.executions;
+    await client.sql`INSERT INTO progressive_worker_reports(sim_job_id,sequence,content_signature,report)
+      SELECT ${long.executionId}::uuid,n,encode(sha256(int4send(n)),'hex'),
+        jsonb_build_object('version',1,'sequence',n,'solverId',${scope.solverId}::text,'executionId',${long.executionId}::text,'result',jsonb_build_object('step',n))
+      FROM generate_series(11,1126) n`;
+    long.reports += 1116;
+    long.reportHighWater = 1126;
+    const store = new MemoryBackup(),
+      path = await directory(),
+      peerFinished = signal(),
+      allowFront = signal();
+    const inputs = {
+      source,
+      store,
+      scope,
+      directory: path,
+      sourceBinding: "long-tail",
+      pages: 2,
+      rows: 128,
+      maxBytes: 128 * 1024 ** 2,
+    };
+    let checks = 0,
+      firstFront = true;
+    const options = {
+      slots: 2 as const,
+      targetBinding: "physical-test",
+      peerSource: source,
+      openBudget: async () => {
+        checks++;
+        return {
+          admit: true,
+          finish: async () => ({
+            minAvailableMiB: 6200,
+            peakWorkerRssMiB: 4200,
+            peakControllerRssMiB: 900,
+            permitted: false,
+          }),
+        };
+      },
+    };
+    const applied = new Map<string, number>();
+    const apply: NonNullable<
+      Parameters<typeof exportLegacyReports>[0]["applyVerifiedPage"]
+    > = async (page, receipt) => {
+      expect(
+        page.members.every(
+          (m) =>
+            m.executionId ===
+            scope.executions[page.start.execution].executionId,
+        ),
+      ).toBe(true);
+      if (page.start.execution === 0 && firstFront) {
+        firstFront = false;
+        await allowFront.reached;
+      }
+      expect(
+        decodeLegacyPage(await store.read(receipt.object), receipt).members,
+      ).toEqual(page.members);
+      for (const m of page.members)
+        applied.set(m.executionId, (applied.get(m.executionId) ?? 0) + 1);
+      if (page.start.execution === 1) peerFinished.release();
+    };
+    const pair = exportLegacyReports({
+      ...inputs,
+      executionSupervisor: options,
+      applyVerifiedPage: apply,
+    });
+    try {
+      await peerFinished.reached;
+      const checkpoint = JSON.parse(
+        await readFile(join(path, "checkpoint.json"), "utf8"),
+      );
+      expect(checkpoint.next.after).toBe(0);
+      expect(
+        (await readdir(path)).filter((n) => n.endsWith(".receipt.json")),
+      ).toHaveLength(0);
+      await expect(exportLegacyReports(inputs)).rejects.toThrow(
+        /holds this backup directory/,
+      );
+    } finally {
+      allowFront.release();
+    }
+    const res = await pair;
+    expect(res.executionSupervisor).toMatchObject({
+      maxActive: 2,
+      published: 1,
+      appliedAhead: 1,
+    });
+    const hold = JSON.parse(
+      await readFile(join(path, "execution-peer-memory-hold.json"), "utf8"),
+    );
+    expect(hold.memory.peakWorkerRssMiB).toBe(4200);
+    const reopened = await exportLegacyReports({
+      ...inputs,
+      pages: 2,
+      maxBytes: 256 * 1024 ** 2,
+      executionSupervisor: options,
+      applyVerifiedPage: apply,
+    });
+    expect(reopened.next.execution).toBe(0);
+    const done = await exportLegacyReports({
+      ...inputs,
+      pages: 32,
+      executionSupervisor: options,
+      applyVerifiedPage: apply,
+    });
+    expect(done.complete).toBe(true);
+    expect(checks).toBe(1);
+    expect(applied.get(long.executionId)).toBe(long.reports);
+    expect(applied.get(short.executionId)).toBe(short.reports);
+    expect(
+      (await readdir(path)).filter((n) => n.endsWith(".receipt.json")).length,
+    ).toBeGreaterThan(8);
+  }, 90000);
+
+  it("holds a corrupted ahead receipt and resumes only from its authentic bytes", async () => {
+    const a = await fixture(false),
+      b = await fixture(false, a.solverId);
+    const scope = {
+      ...a,
+      executions: [...a.executions, ...b.executions].sort((x, y) =>
+        x.executionId.localeCompare(y.executionId),
+      ),
+    };
+    const path = await directory(),
+      store = new MemoryBackup();
+    const apply = async () => undefined;
+    const options = {
+      slots: 2 as const,
+      targetBinding: "strict-proof",
+      peerSource: source,
+      openBudget: async () => ({
+        admit: true,
+        finish: async () => ({
+          minAvailableMiB: 12000,
+          peakWorkerRssMiB: 500,
+          peakControllerRssMiB: 500,
+          permitted: true,
+        }),
+      }),
+    };
+    const base = {
+      scope,
+      source,
+      store,
+      directory: path,
+      sourceBinding: "corrupt-peer",
+      rows: 2,
+      pages: 2,
+      executionSupervisor: options,
+      applyVerifiedPage: apply,
+    };
+    const first = await exportLegacyReports(base);
+    expect(first.executionSupervisor?.appliedAhead).toBe(1);
+    const stage = join(path, "pending.jsonl.gz", "page-1-report-0-0");
+    const ready = JSON.parse(await readFile(join(stage, "ready.json"), "utf8")),
+      f = join(stage, ready.receipt);
+    const original = await readFile(f);
+    await writeFile(f, Buffer.concat([original, Buffer.from(" ")]));
+    const single = {
+      ...base,
+      pages: 32,
+      executionSupervisor: { ...options, slots: 1 as const },
+    };
+    await expect(exportLegacyReports(single)).rejects.toThrow(
+      /journal or coverage/,
+    );
+    const checkpoint = JSON.parse(
+      await readFile(join(path, "checkpoint.json"), "utf8"),
+    );
+    expect(checkpoint.next).toEqual({
+      execution: 1,
+      kind: "report",
+      after: 0,
+      copied: 0,
+    });
+    expect((await readFile(f)).length).toBe(original.length + 1);
+    await writeFile(f, original);
+    let done = await exportLegacyReports(single);
+    if (!done.complete) done = await exportLegacyReports(single);
+    expect(done.complete).toBe(true);
+  });
+
+  it("does not overlap an uncertain 256 MiB page when restarted with a 128 MiB peer", async () => {
+    const a = await fixture(false),
+      b = await fixture(false, a.solverId);
+    const scope = {
+      ...a,
+      executions: [...a.executions, ...b.executions].sort((x, y) =>
+        x.executionId.localeCompare(y.executionId),
+      ),
+    };
+    const path = await directory(),
+      store = new MemoryBackup();
+    let budgetOpens = 0;
+    const slots = {
+      slots: 2 as const,
+      targetBinding: "memory-recovery",
+      peerSource: source,
+      openBudget: async () => {
+        budgetOpens++;
+        return {
+          admit: true,
+          finish: async () => ({
+            minAvailableMiB: 20000,
+            peakWorkerRssMiB: 900,
+            peakControllerRssMiB: 500,
+            permitted: true,
+          }),
+        };
+      },
+    };
+    const base = {
+      scope,
+      source,
+      store,
+      directory: path,
+      sourceBinding: "mixed-cap",
+      rows: 1,
+      pages: 2,
+      maxBytes: 128 * 1024 ** 2,
+      executionSupervisor: slots,
+      applyVerifiedPage: async () => undefined,
+    };
+    await exportLegacyReports(base);
+    const firstCursor = JSON.parse(
+      await readFile(join(path, "checkpoint.json"), "utf8"),
+    ).next;
+    await expect(
+      exportLegacyReports({
+        ...base,
+        pages: 1,
+        maxBytes: 256 * 1024 ** 2,
+        applyVerifiedPage: async () => {
+          throw Error("uncertain wide reply");
+        },
+      }),
+    ).rejects.toThrow(/uncertain wide/);
+    const file = join(
+      path,
+      "pending.jsonl.gz",
+      `page-0-report-${firstCursor.after}-${firstCursor.copied}`,
+      "budget.json",
+    );
+    expect(JSON.parse(await readFile(file, "utf8"))).toBe(256 * 1024 ** 2);
+    const recovered = await exportLegacyReports({ ...base, pages: 2 });
+    expect(recovered.executionSupervisor?.maxActive).toBe(1);
+    expect(budgetOpens).toBe(1);
+    let done = await exportLegacyReports({ ...base, pages: 32 });
+    if (!done.complete)
+      done = await exportLegacyReports({ ...base, pages: 32 });
+    expect(done.complete).toBe(true);
+    expect(budgetOpens).toBeGreaterThan(1);
+  });
+
+  it("pairs two long executions across a short intervening job and joins the exact complete prefix", async () => {
+    const a = await fixture(false),
+      b = await fixture(false, a.solverId),
+      c = await fixture(false, a.solverId);
+    const scope = {
+      ...a,
+      executions: [...a.executions, ...b.executions, ...c.executions].sort(
+        (x, y) => x.executionId.localeCompare(y.executionId),
+      ),
+    };
+    for (const [i, extra] of [
+      [0, 1116],
+      [2, 1101],
+    ] as const) {
+      const e = scope.executions[i];
+      await client.sql`INSERT INTO progressive_worker_reports(sim_job_id,sequence,content_signature,report)
+        SELECT ${e.executionId}::uuid,n,encode(sha256(int4send(n)),'hex'),jsonb_build_object('version',1,'executionId',${e.executionId}::text,'solverId',${scope.solverId}::text,'sequence',n,'result',jsonb_build_object('step',n)) FROM generate_series(11,${10 + extra}::int) n`;
+      e.reports += extra;
+      e.reportHighWater += extra;
+    }
+    const path = await directory(),
+      store = new MemoryBackup();
+    const ids = scope.executions.map((x) => x.executionId);
+    const options = {
+      slots: 2 as const,
+      targetBinding: "long-two",
+      peerSource: source,
+      openBudget: async () => ({
+        admit: true,
+        finish: async () => ({
+          minAvailableMiB: 12000,
+          peakWorkerRssMiB: 500,
+          peakControllerRssMiB: 500,
+          permitted: true,
+        }),
+      }),
+    };
+    const specs = {
+      scope,
+      source,
+      store,
+      directory: path,
+      sourceBinding: "multi-long",
+      executionSupervisor: options,
+      rows: 128,
+      pages: 4,
+      maxBytes: 128 * 1024 ** 2,
+      applyVerifiedPage: async () => undefined,
+    };
+    const initial = await exportLegacyReports(specs);
+    expect(initial.next).toMatchObject({ execution: 0, copied: 256 });
+    expect(initial.executionSupervisor?.peerNext).toMatchObject({
+      execution: 2,
+      copied: 256,
+    });
+    expect(initial.executionSupervisor?.pairedExecutions).toEqual([
+      [ids[0], ids[2]],
+      [ids[0], ids[2]],
+    ]);
+    let next = initial.next;
+    const names = [...initial.receipts];
+    for (
+      let pass = 0;
+      pass < 16 && next.execution < scope.executions.length;
+      pass++
+    ) {
+      const run = await exportLegacyReports({
+        ...specs,
+        maxBytes: 256 * 1024 ** 2,
+        pages: 4,
+        executionSupervisor: { ...options, slots: 1 },
+      });
+      next = run.next;
+      names.push(...run.receipts);
+    }
+    expect(next.execution).toBe(3);
+    let start = {
+      execution: 0,
+      kind: "report",
+      after: 0,
+      copied: 0,
+    } as legacyCodec.LegacyCursor;
+    const memberKeys = new Set<string>();
+    for (const name of names) {
+      const bytes = await readFile(join(path, name));
+      expect(legacySha256(bytes)).toBe(name.split(".")[0]);
+      const r = JSON.parse(bytes.toString()) as LegacyBackupReceipt;
+      expect(r.start).toEqual(start);
+      const page = decodeLegacyPage(await store.read(r.object), r);
+      for (const v of page.members) {
+        const k = v.executionId + "/" + v.sequence;
+        expect(memberKeys.has(k)).toBe(false);
+        memberKeys.add(k);
+      }
+      start = r.next;
+    }
+    expect(start).toEqual(next);
+    expect(memberKeys.size).toBe(
+      scope.executions.reduce((n, e) => n + e.reports, 0),
+    );
+    await expect(readdir(join(path, "pending.jsonl.gz"))).rejects.toMatchObject(
+      { code: "ENOENT" },
+    );
+  }, 90000);
+
   it("persists custody proof for a real 64.64.generation receipt without exceeding NAME_MAX", async () => {
     const scope = await fixture(false),
       path = await directory();
@@ -391,6 +980,7 @@ describe.sequential("worker-only legacy backup and 0198 representation", () => {
             category: "gcs_server_error",
             httpStatus: 503,
           });
+        if (attempt === 4) throw new LegacyPeerOccupied();
         return { complete: true, next: 1 };
       },
       {
@@ -403,9 +993,10 @@ describe.sequential("worker-only legacy backup and 0198 representation", () => {
     expect(result).toMatchObject({
       complete: true,
       deployPauses: 1,
+      peerWorkerPauses: 1,
       transientRetries: 2,
     });
-    expect(waits).toEqual([5000, 1000, 2000]);
+    expect(waits).toEqual([5000, 1000, 2000, 5000]);
     for (const stderr of [
       "Permission denied (publickey)",
       "Host key verification failed",
