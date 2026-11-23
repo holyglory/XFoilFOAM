@@ -4325,7 +4325,7 @@ describe("cell preliminary outcomes stay separate from ordinary RANS failures", 
       expect(response.statusCode).toBe(200);
       expect(response.json()).toMatchObject({
         resultId: fastResult.id, resultAttemptId: attempt.id, fidelity, cl,
-        numericalConvergence: true, uransFlowOutcome: null,
+        numericalConvergence: true, uransFlowOutcome: null, renderTarget: null,
       });
     }
 

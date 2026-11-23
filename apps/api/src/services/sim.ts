@@ -41,6 +41,7 @@ import type { SimulationSetupSnapshot } from "@aerodb/db/simulation-setup";
 import { and, desc, eq, getTableColumns, inArray, isNull, sql } from "drizzle-orm";
 
 import { db } from "../db";
+import { currentRenderManifest, remoteRenderAuthorities } from "../render-target";
 import { mediaStore, resultMediaUrl } from "../media-store";
 import { readStoredForceHistory } from "../solver-history-reader";
 import { readSelectedAttemptDetailFields } from "../selected-attempt-detail-fields";
@@ -139,7 +140,7 @@ const selectedDetailColumns = {
   },
 };
 
-type SelectedDetailResult = Result & { noSheddingCertificate: unknown };
+type SelectedDetailResult = Result & { selectedAttempt: DetailAttempt; noSheddingCertificate: unknown };
 
 /** The result owns the physical cell. The public or admin selector chooses
  * the attempt that supplies the solver outputs and provenance. */
@@ -150,8 +151,7 @@ async function selectedResultProjection(
   const payload = await pointStage("attemptFields", readSelectedAttemptDetailFields(db, attempt));
   return {
     ...result,
-    // A historical detail response names its own generation.
-    currentResultAttemptId: attempt.id,
+    selectedAttempt: attempt,
     status: attempt.status,
     source: attempt.source,
     regime: attempt.regime,
@@ -319,7 +319,7 @@ async function solvedDetail(
   r: SelectedDetailResult,
   observation?: SimulationDetail["observation"],
 ): Promise<SimulationDetailWithReview | null> {
-  if (!r.currentResultAttemptId) return null;
+  const attempt = r.selectedAttempt;
   if (
     (!observation &&
       (!finiteStored(r.cl) || !finiteStored(r.cd) || r.cd <= 0)) ||
@@ -351,7 +351,7 @@ async function solvedDetail(
     .where(
       and(
         eq(resultMedia.resultId, r.id),
-        eq(resultMedia.resultAttemptId, r.currentResultAttemptId!),
+        eq(resultMedia.resultAttemptId, attempt.id),
       ),
     ));
   const rows = mediaCandidates
@@ -426,7 +426,7 @@ async function solvedDetail(
           eq(solverEvidenceArtifacts.resultId, r.id),
           eq(
             solverEvidenceArtifacts.resultAttemptId,
-            r.currentResultAttemptId!,
+            attempt.id,
           ),
           eq(solverEvidenceArtifacts.kind, FRAME_IMAGE_ARTIFACT_KIND),
         ),
@@ -440,7 +440,7 @@ async function solvedDetail(
           eq(solverEvidenceArtifacts.resultId, r.id),
           eq(
             solverEvidenceArtifacts.resultAttemptId,
-            r.currentResultAttemptId!,
+            attempt.id,
           ),
           inArray(solverEvidenceArtifacts.kind, [
             "manifest",
@@ -461,7 +461,7 @@ async function solvedDetail(
     .where(
       and(
         eq(forceHistory.resultId, r.id),
-        eq(forceHistory.resultAttemptId, r.currentResultAttemptId!),
+        eq(forceHistory.resultAttemptId, attempt.id),
       ),
     )
     .limit(1));
@@ -544,13 +544,25 @@ async function solvedDetail(
         }
       : null;
   const frameTrack = frameTrackDetailOf(r, frameArtifacts);
+  const manifest = currentRenderManifest(r, attempt, evidenceRows);
+  let renderTarget: SimulationDetail["renderTarget"] = null;
+  if (manifest && rows.some(row => row.field && Object.hasOwn(ENGINE_TO_FIELD, row.field) &&
+    (!row.evidenceSha256 || row.evidenceSha256 === manifest.sha256))) {
+    const delegated = !attempt.engineJobId || !attempt.engineCaseSlug || attempt.engineJobId.startsWith("sync:");
+    const available = delegated
+      ? (await remoteRenderAuthorities({ resultId: r.id, resultAttemptId: attempt.id, evidenceSha256: manifest.sha256 })).length === 1
+      : typeof manifest.metadata?.evidenceBase === "string" && !!manifest.metadata.evidenceBase.trim() &&
+        finiteStored(r.chord) && r.chord > 0 && finiteStored(r.speed) && r.speed > 0;
+    if (available) renderTarget = { resultAttemptId: attempt.id, manifestSha256: manifest.sha256 };
+  }
   return {
+    renderTarget,
     resultId: r.id,
     numericalConvergence: r.converged ?? null,
     uransFlowOutcome: recordedUransFlowOutcome(r, frameTrack),
     status: observation ? "evidence" : "solved",
     ...(observation
-      ? { observation, resultAttemptId: r.currentResultAttemptId }
+      ? { observation, resultAttemptId: attempt.id }
       : {}),
     regime: r.unsteady ? "stalled" : "attached",
     airfoilName: name,
