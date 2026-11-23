@@ -42,6 +42,8 @@ try {
     assert.deepEqual([sim.resultId, sim.alpha, sim.fidelity, sim.cl, sim.cd, sim.cm],
       [pair.resultId, pair.aoaDeg, fidelity, cl, cd, cm]);
     assert.equal(sim.resultAttemptId, id);
+    assert.equal(sim.numericalConvergence, true);
+    assert.equal(sim.uransFlowOutcome, null);
     console.log(JSON.stringify({ stage, route: exact + id, status: 200, resultId: sim.resultId,
       responseAttemptId: sim.resultAttemptId, fidelity: sim.fidelity, cl: sim.cl, cd: sim.cd, cm: sim.cm }));
   }

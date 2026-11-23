@@ -56,6 +56,8 @@ vi.mock("../src/db", async (original) => {
 });
 
 import { checkHzHistoryApi } from "./hz-point-history-fixture";
+import { noSheddingCertificate } from "../../../packages/core/test/no-shedding-fixture";
+import { periodicPoint } from "../../../packages/db/test-support/periodic-urans-point";
 
 const PREFIX = `api-exact-${process.pid}-${Date.now().toString(36)}`;
 const sha = (value: string): string =>
@@ -564,6 +566,64 @@ describe("public exact-generation reads", () => {
       availableFields: ["vorticity"],
       history: { t: [10, 11], cl: [0.62, 0.63], cd: [0.013, 0.014] },
     });
+  });
+
+  it("reports only numerical convergence and URANS outcomes recorded on the requested generation", async () => {
+    const restore = new Error("rollback scoped outcome fixture");
+    await expect(db.transaction(async (tx) => {
+      attemptReadScope.connection = tx as unknown as DB;
+      try {
+        const track = periodicPoint(4, 5, true).frame_track!;
+        const publicUrl = `/api/airfoils/${PREFIX}-foil/sim?resultId=${resultId}`;
+        const adminUrl = `/api/admin/point-history/${resultId}/sim?resultAttemptId=`;
+        async function read(url: string) {
+          const res = await app.inject({ method: "GET", url });
+          expect(res.statusCode, res.body).toBe(200);
+          return res.json();
+        }
+        // Stale result-level values must never replace either exact attempt.
+        await tx.update(results).set({ converged: true, unsteady: true, frameTrack: track }).where(eq(results.id, resultId));
+        await tx.update(resultAttempts).set({ converged: false, unsteady: true, regime: "urans",
+          evidencePayload: { fidelity: "urans_precalc" } }).where(eq(resultAttempts.id, oldAttemptId));
+        expect(await read(adminUrl + oldAttemptId)).toMatchObject({
+          resultAttemptId: oldAttemptId, numericalConvergence: false, uransFlowOutcome: null, frameTrack: null,
+        });
+        const cases = [
+          [{ frame_track: track }, "periodic"],
+          [{ no_shedding_certificate: noSheddingCertificate }, "no_shedding"],
+          [{ noSheddingCertificate: noSheddingCertificate }, "no_shedding"],
+          [{ no_shedding_certificate: { ...noSheddingCertificate, certified: false } }, null],
+          [{ no_shedding_certificate: noSheddingCertificate, frame_track: track }, null],
+          [{ frame_track: { ...track, period_s: null } }, null],
+          [{ frame_track: { ...track, frames: [] } }, null],
+          [{ frame_track: { ...track, window: { t_start: 0, t_end: 0.071 } } }, null],
+          [{ frame_track: { ...track, frames: [...track.frames].reverse() } }, null],
+        ] as const;
+        for (const [evidence, expected] of cases) {
+          // Each independent source starts inline. Roll back its savepoint
+          // rather than deleting history from a previously observed generation.
+          try {
+            await tx.transaction(async (scoped) => {
+              attemptReadScope.connection = scoped as unknown as DB;
+              await scoped.update(resultAttempts).set({ converged: true, regime: "urans",
+                evidencePayload: { fidelity: "urans_full", ...evidence } })
+                .where(eq(resultAttempts.id, currentAttemptId));
+              for (const url of [publicUrl, adminUrl + currentAttemptId]) {
+                const body = await read(url);
+                expect(body).toMatchObject({ numericalConvergence: true, uransFlowOutcome: expected });
+                if (expected === "periodic") expect(body.frameTrack).toMatchObject({
+                  periodS: track.period_s, periodsRetained: track.periods_retained,
+                });
+              }
+              throw restore;
+            });
+          } catch (error) {
+            if (error !== restore) throw error;
+          } finally { attemptReadScope.connection = tx as unknown as DB; }
+        }
+      } finally { attemptReadScope.connection = null; }
+      throw restore;
+    })).rejects.toBe(restore);
   });
 
   it("opens a selected result by ID when Reynolds is stored only on its immutable setup", async () => {

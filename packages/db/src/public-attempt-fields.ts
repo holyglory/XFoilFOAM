@@ -16,6 +16,8 @@ const detailFields = [
   "steady_history",
   "steadyHistory",
   "fidelity",
+  "no_shedding_certificate",
+  "noSheddingCertificate",
 ] as const;
 export type PublicAttemptField = (typeof detailFields)[number];
 export type PublicAttemptFieldOwner = Pick<

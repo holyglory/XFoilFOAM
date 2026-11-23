@@ -54,6 +54,8 @@ export async function selectedDetailBaseline(db: DB, attemptId: string) {
                 "steady_history",
                 "steadyHistory",
                 "fidelity",
+                "no_shedding_certificate",
+                "noSheddingCertificate",
               ].sort(),
             );
         }
