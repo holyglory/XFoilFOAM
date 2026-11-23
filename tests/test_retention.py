@@ -1472,7 +1472,9 @@ def test_media_queue_runs_original_frozen_inventory_before_the_remaining_media(t
     assert not calls and module["read"](state / "status.json")["verified"] == 2
 
 
-def test_closed_historical_raw_reclaims_only_after_whole_job_proof_and_restores_original_urls(tmp_path, monkeypatch):
+def test_closed_historical_raw_reclaims_only_after_whole_job_proof_and_restores_original_urls(
+    tmp_path, monkeypatch
+):
     import runpy
     import threading
     from datetime import datetime, timezone
@@ -1486,140 +1488,299 @@ def test_closed_historical_raw_reclaims_only_after_whole_job_proof_and_restores_
 
     job = "7fd42905-29e4-44cf-b98b-3cd6588a03c3"
     token = "isolated-local-engine"
-    settings = get_settings().model_copy(update={"data_dir":tmp_path, "control_plane_token":token, "evidence_bucket":None})
-    monkeypatch.setattr(api_main,"get_settings",lambda:settings)
+    settings = get_settings().model_copy(
+        update={"data_dir": tmp_path, "control_plane_token": token, "evidence_bucket": None}
+    )
+    monkeypatch.setattr(api_main, "get_settings", lambda: settings)
     client = TestClient(api_main.create_app())
     root = settings.job_dir(job)
-    _write(root/".execute.lock",b"")
-    _write_json(root/"status.json",{"job_id":job,"state":"cancelled"})
-    sha=lambda b:hashlib.sha256(b).hexdigest()
-    proofs,points,cloud,local=[],[],{},{}
-    for n in (1,2):
-        case=root/"cases"/f"c{n}"
-        directory=f"cases/c{n}/a0/evidence"
-        folder=root/directory
-        members={"openfoam/postProcessing/forceCoeffs.dat":(b"0 0.4 0.03 0\n"*9000)+bytes([n]),
-                 "time_directories/1/U":(b"isolated stored field fixture\n"*3200)+bytes([n]),
-                 "openfoam/logs/transient_a0/source.log":b"isolated stored log"+bytes([n])}
-        for name,data in members.items():_write(folder/name,data)
-        mf=_write_json(folder/"evidence_manifest.json",{"casePath":str(case),"postPath":str(case/"transient"),
-            "bundleExcludes":["frames"],"files":[{"path":name,"byteSize":len(data),"sha256":sha(data)} for name,data in members.items()]})
-        archive=folder/"engine_evidence.tar.zst"
-        rec=create_tar_zst(folder,archive,level=10)
-        body=archive.read_bytes();manifest=mf.read_bytes()
-        data={**members,"evidence_manifest.json":manifest,"engine_evidence.tar.zst":body}
-        kinds={"evidence_manifest.json":"manifest","engine_evidence.tar.zst":"engine_bundle",
-               "openfoam/postProcessing/forceCoeffs.dat":"force_coefficients","time_directories/1/U":"field_data",
-               "openfoam/logs/transient_a0/source.log":"log"}
-        arts=[{"kind":kinds[name],"path":"a0/evidence/"+name,"sha256":sha(buf),"byte_size":len(buf)} for name,buf in data.items()]
-        point={"case_slug":case.name,"evidence_artifacts":arts}
-        points.append(point);sig=sha(json.dumps(point,sort_keys=True).encode())
-        receipt={"sim_job_id":job,"sequence":n,"point_content_signature":sig,"report_signature":sha((job+str(n)).encode()),
-            "solver_id":job,"source_instance_id":"registered-fixture","promise_id":job,"assignment_signature":"e"*64,
-            "stop_signature":"f"*64,"stored_sha256":rec.stored_sha256,"stored_bytes":rec.stored_size,"tar_sha256":rec.tar_sha256,
-            "tar_bytes":rec.tar_size,"manifest_sha256":sha(manifest),"manifest_bytes":len(manifest),"manifest_set_sha256":"b"*64,
-            "bundled_file_count":len(members),"zstd_level":10,"generation":str(18446744073709551615-n),
-            "bucket":"fixture","object_key":"solver-evidence/v1/sha256/"+sha(body)[:2]+"/"+sha(body)+".tar.zst",
-            "crc32c":base64.b64encode(google_crc32c.value(body).to_bytes(4,"big")).decode(),"verified_at":datetime.now(timezone.utc).isoformat()}
-        catalog="\n".join(sorted(f"{kinds[k]}\tjobs/{job}/{directory}/{k}\t{len(b)}\t{sha(b)}" for k,b in data.items()))
-        proofs.append({"directory":directory,"catalogSha256":sha(catalog.encode()),"manifestSha256":sha(manifest),
-            "manifestByteSize":len(manifest),"generation":receipt["generation"],"historicalRaw":receipt})
-        cloud[sig]=body;local[sig]=data
-    result={"job_id":job,"state":"cancelled","polars":[{"points":points}]}
-    _write_json(root/"result.json",result)
-    core=_write(root/"cases/c1/core.317",b"separate forensic scope");work=_write(root/"cases/c1/transient/system/controlDict",b"separate working source")
-    calls=[]
+    _write(root / ".execute.lock", b"")
+    _write_json(root / "status.json", {"job_id": job, "state": "cancelled"})
+    sha = lambda b: hashlib.sha256(b).hexdigest()
+    proofs, points, cloud, local = [], [], {}, {}
+    for n in (1, 2):
+        case = root / "cases" / f"c{n}"
+        directory = f"cases/c{n}/a0/evidence"
+        folder = root / directory
+        members = {
+            "openfoam/postProcessing/forceCoeffs.dat": (b"0 0.4 0.03 0\n" * 9000) + bytes([n]),
+            "time_directories/1/U": (b"isolated stored field fixture\n" * 3200) + bytes([n]),
+            "openfoam/logs/transient_a0/source.log": b"isolated stored log" + bytes([n]),
+        }
+        for name, data in members.items():
+            _write(folder / name, data)
+        mf = _write_json(
+            folder / "evidence_manifest.json",
+            {
+                "casePath": str(case),
+                "postPath": str(case / ("transient_a0" if n == 2 else "transient")),
+                **({"methodKey": "openfoam.urans", "unsteady": False} if n == 2 else {}),
+                "bundleExcludes": ["frames"],
+                "files": [
+                    {"path": name, "byteSize": len(data), "sha256": sha(data)}
+                    for name, data in members.items()
+                ],
+            },
+        )
+        archive = folder / "engine_evidence.tar.zst"
+        rec = create_tar_zst(folder, archive, level=10)
+        body = archive.read_bytes()
+        manifest = mf.read_bytes()
+        data = {**members, "evidence_manifest.json": manifest, "engine_evidence.tar.zst": body}
+        kinds = {
+            "evidence_manifest.json": "manifest",
+            "engine_evidence.tar.zst": "engine_bundle",
+            "openfoam/postProcessing/forceCoeffs.dat": "force_coefficients",
+            "time_directories/1/U": "field_data",
+            "openfoam/logs/transient_a0/source.log": "log",
+        }
+        arts = [
+            {"kind": kinds[name], "path": "a0/evidence/" + name, "sha256": sha(buf), "byte_size": len(buf)}
+            for name, buf in data.items()
+        ]
+        point = {"case_slug": case.name, "evidence_artifacts": arts}
+        points.append(point)
+        sig = sha(json.dumps(point, sort_keys=True).encode())
+        receipt = {
+            "sim_job_id": job,
+            "sequence": n,
+            "point_content_signature": sig,
+            "report_signature": sha((job + str(n)).encode()),
+            "solver_id": job,
+            "source_instance_id": "registered-fixture",
+            "promise_id": job,
+            "assignment_signature": "e" * 64,
+            "stop_signature": "f" * 64,
+            "stored_sha256": rec.stored_sha256,
+            "stored_bytes": rec.stored_size,
+            "tar_sha256": rec.tar_sha256,
+            "tar_bytes": rec.tar_size,
+            "manifest_sha256": sha(manifest),
+            "manifest_bytes": len(manifest),
+            "manifest_set_sha256": "b" * 64,
+            "bundled_file_count": len(members),
+            "zstd_level": 10,
+            "generation": str(18446744073709551615 - n),
+            "bucket": "fixture",
+            "object_key": "solver-evidence/v1/sha256/" + sha(body)[:2] + "/" + sha(body) + ".tar.zst",
+            "crc32c": base64.b64encode(google_crc32c.value(body).to_bytes(4, "big")).decode(),
+            "verified_at": datetime.now(timezone.utc).isoformat(),
+        }
+        catalog = "\n".join(
+            sorted(f"{kinds[k]}\tjobs/{job}/{directory}/{k}\t{len(b)}\t{sha(b)}" for k, b in data.items())
+        )
+        proofs.append(
+            {
+                "directory": directory,
+                "catalogSha256": sha(catalog.encode()),
+                "manifestSha256": sha(manifest),
+                "manifestByteSize": len(manifest),
+                "generation": receipt["generation"],
+                "historicalRaw": receipt,
+                **({"regime": "urans"} if n == 2 else {}),
+            }
+        )
+        cloud[sig] = body
+        local[sig] = data
+    result = {"job_id": job, "state": "cancelled", "polars": [{"points": points}]}
+    _write_json(root / "result.json", result)
+    core = _write(root / "cases/c1/core.317", b"separate forensic scope")
+    work = _write(root / "cases/c1/transient/system/controlDict", b"separate working source")
+    vtk_export = _write(root / "cases/c2/transient_a0/VTK/transient_a0_0/internal.vtu", b"working VTK export")
+    calls = []
+
     class Source(BaseHTTPRequestHandler):
         def do_GET(self):
-            path=urlsplit(self.path);parts=path.path.split("/")
-            sig=parts[-2];pin=parts[-1];q=parse_qs(path.query);match=next((p for p in proofs if p["historicalRaw"]["point_content_signature"]==sig),None)
-            if not match or pin!=match["generation"] or self.headers.get("Authorization")!="Bearer "+token or q["directory"]!=[match["directory"]]:
-                self.send_error(409);return
-            body=cloud[sig];calls.append((sig,pin))
-            self.send_response(200);self.send_header("Content-Type","application/zstd")
-            self.send_header("Content-Length",str(len(body)));self.send_header("X-Gcs-Generation",pin)
-            self.send_header("X-Content-Sha256",match["historicalRaw"]["stored_sha256"]);self.end_headers();self.wfile.write(body)
-        def log_message(self,*args):pass
-    server=ThreadingHTTPServer(("127.0.0.1",0),Source)
-    thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
-    monkeypatch.setattr(historical_raw_restore,"WORKER_GATEWAY",f"http://127.0.0.1:{server.server_port}")
-    def read(proof,file="engine_evidence.tar.zst",force=False):
-        hdr={"authorization":"Bearer "+token,"x-historical-raw-preflight":base64.b64encode(json.dumps({
-            "version":1,"directory":proof["directory"],"receipt":proof["historicalRaw"]}).encode()).decode()} if force else {}
-        return client.get(f"/jobs/{job}/files/{proof['directory']}/{file}",headers=hdr)
+            path = urlsplit(self.path)
+            parts = path.path.split("/")
+            sig = parts[-2]
+            pin = parts[-1]
+            q = parse_qs(path.query)
+            receipt = next((p for p in proofs if p["historicalRaw"]["point_content_signature"] == sig), None)
+            if (
+                not receipt
+                or pin != receipt["generation"]
+                or self.headers.get("Authorization") != "Bearer " + token
+                or q["directory"] != [receipt["directory"]]
+            ):
+                self.send_error(409)
+                return
+            body = cloud[sig]
+            calls.append((sig, pin))
+            self.send_response(200)
+            self.send_header("Content-Type", "application/zstd")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("X-Gcs-Generation", pin)
+            self.send_header("X-Content-Sha256", receipt["historicalRaw"]["stored_sha256"])
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Source)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    monkeypatch.setattr(historical_raw_restore, "WORKER_GATEWAY", f"http://127.0.0.1:{server.server_port}")
+
+    def read(proof, file="engine_evidence.tar.zst", force=False):
+        hdr = (
+            {
+                "authorization": "Bearer " + token,
+                "x-historical-raw-preflight": base64.b64encode(
+                    json.dumps(
+                        {"version": 1, "directory": proof["directory"], "receipt": proof["historicalRaw"]}
+                    ).encode()
+                ).decode(),
+            }
+            if force
+            else {}
+        )
+        return client.get(f"/jobs/{job}/files/{proof['directory']}/{file}", headers=hdr)
+
     try:
         repo = Path(__file__).resolve().parents[1]
         peer = runpy.run_path(str(repo / "scripts/deploy/hz-closed-job-engine.py"))
         native = (repo / "src/airfoilfoam/closed_progressive_retention.py").read_text()
-        scope = {"historicalRaw": True, "nonce": "historical-read-test", "mode": "proof", "id": job,
-                 "helper": sha(native.encode()), "jobsInode": peer["inode"](root.parent),
-                 "jobInode": peer["inode"](root), "lockInode": peer["inode"](root / ".execute.lock")}
+        scope = {
+            "historicalRaw": True,
+            "nonce": "historical-read-test",
+            "mode": "proof",
+            "id": job,
+            "helper": sha(native.encode()),
+            "jobsInode": peer["inode"](root.parent),
+            "jobInode": peer["inode"](root),
+            "lockInode": peer["inode"](root / ".execute.lock"),
+        }
+
         def signed_request(expected=None, readbacks=()):
             mode = "proof" if expected is None else "reclaim"
-            body = json.dumps({"id": job, "historicalRaw": True, "step": 1 if expected is None else 2,
-                               "helper": scope["helper"], "mode": mode, "manifests": proofs,
-                               "expectedPlan": expected, "readbacks": list(readbacks)})
+            body = json.dumps(
+                {
+                    "id": job,
+                    "historicalRaw": True,
+                    "step": 1 if expected is None else 2,
+                    "helper": scope["helper"],
+                    "mode": mode,
+                    "manifests": proofs,
+                    "expectedPlan": expected,
+                    "readbacks": list(readbacks),
+                }
+            )
             packet = {"body": body, "mac": peer["signature"](token, "request", scope["nonce"], body)}
             response = peer["run_engine"]({**scope, "mode": mode, "plan": expected}, packet, native, settings)
             assert response["mac"] == peer["signature"](token, "response", scope["nonce"], response["body"])
             return json.loads(response["body"])["result"]
-        plan=signed_request()
-        assert plan["files"]==8 and all(not (root/p["directory"]/historical_raw_restore.MARKER).exists() for p in proofs)
-        readbacks=[]
+
+        plan = signed_request()
+        assert plan["files"] == 8 and all(
+            not (root / p["directory"] / historical_raw_restore.MARKER).exists() for p in proofs
+        )
+        readbacks = []
         for p in proofs:
-            c=p["historicalRaw"];resp=read(p,force=True)
-            assert resp.status_code==200,resp.text
-            assert resp.content==cloud[c["point_content_signature"]] and resp.headers["x-historical-raw-source"]=="registered-hub"
+            c = p["historicalRaw"]
+            resp = read(p, force=True)
+            assert resp.status_code == 200, resp.text
+            assert (
+                resp.content == cloud[c["point_content_signature"]]
+                and resp.headers["x-historical-raw-source"] == "registered-hub"
+            )
             sample = plan["historicalSamples"][c["point_content_signature"]]
             member = read(p, sample["path"], force=True)
             assert member.status_code == 200 and member.headers["x-historical-raw-source"] == "registered-hub"
             assert member.headers["x-gcs-generation"] == resp.headers["x-gcs-generation"]
             assert (len(member.content), sha(member.content)) == (sample["byteSize"], sample["sha256"])
-            readbacks.append({"historicalPointSignature":c["point_content_signature"],"generation":resp.headers["x-gcs-generation"],
-                "verifiedMember":sample,
-                "storedSha256":sha(resp.content),"storedByteSize":len(resp.content),"verifiedAt":datetime.now(timezone.utc).isoformat()})
+            readbacks.append(
+                {
+                    "historicalPointSignature": c["point_content_signature"],
+                    "generation": resp.headers["x-gcs-generation"],
+                    "verifiedMember": sample,
+                    "storedSha256": sha(resp.content),
+                    "storedByteSize": len(resp.content),
+                    "verifiedAt": datetime.now(timezone.utc).isoformat(),
+                }
+            )
+
         def apply():
             return signed_request(plan["plan"], readbacks)
+
         # A genuine undeclared point, an unowned folder, or a mismatch in the last source must protect the first.
-        points.append({"case_slug":"c2","evidence_artifacts":[]});_write_json(root/"result.json",result)
-        with pytest.raises(JobRetentionRefused):apply()
-        points.pop();_write_json(root/"result.json",result)
-        stray=_write(root/"cases/c2/transient_a9/system/controlDict")
-        with pytest.raises(JobRetentionRefused,match="unarchived case state"):apply()
+        points.append({"case_slug": "c2", "evidence_artifacts": []})
+        _write_json(root / "result.json", result)
+        with pytest.raises(JobRetentionRefused):
+            apply()
+        points.pop()
+        _write_json(root / "result.json", result)
+        stray = _write(root / "cases/c2/transient_a9/system/controlDict")
+        with pytest.raises(JobRetentionRefused, match="unarchived case state"):
+            apply()
         shutil.rmtree(stray.parent.parent)
-        unknown=_write(root/"cases/c2/unmatched/evidence/evidence_manifest.json")
-        with pytest.raises(JobRetentionRefused):apply()
+        unknown = _write(root / "cases/c2/unmatched/evidence/evidence_manifest.json")
+        with pytest.raises(JobRetentionRefused):
+            apply()
         shutil.rmtree(unknown.parent)
-        last=root/proofs[-1]["directory"]/"time_directories/1/U";original=last.read_bytes()
+        last = root / proofs[-1]["directory"] / "time_directories/1/U"
+        original = last.read_bytes()
         last.write_bytes(b"!" + original[1:])
-        with pytest.raises(JobRetentionRefused):apply()
-        assert all((root/p["directory"]/"engine_evidence.tar.zst").exists() for p in proofs)
+        with pytest.raises(JobRetentionRefused):
+            apply()
+        assert all((root / p["directory"] / "engine_evidence.tar.zst").exists() for p in proofs)
         last.write_bytes(original)
         with pytest.raises(JobRetentionRefused):
-            reclaim_closed_progressive_files(root,proofs,plan["plan"],readbacks[:-1])
+            reclaim_closed_progressive_files(root, proofs, plan["plan"], readbacks[:-1])
         with pytest.raises(JobRetentionRefused, match="member readback"):
             signed_request(plan["plan"], [*readbacks[:-1], {**readbacks[-1], "verifiedMember": None}])
-        real_unlink=Path.unlink;removed=[]
-        def fail_after_first_file(path,*args,**kwargs):
-            if path in [root/p["directory"]/"engine_evidence.tar.zst" for p in proofs]:
-                if removed:raise OSError("fixture interrupted before second archive")
+        real_unlink = Path.unlink
+        removed = []
+
+        def fail_after_first_file(path, *args, **kwargs):
+            if path in [root / p["directory"] / "engine_evidence.tar.zst" for p in proofs]:
+                if removed:
+                    raise OSError("fixture interrupted before second archive")
                 removed.append(path)
-            return real_unlink(path,*args,**kwargs)
+            return real_unlink(path, *args, **kwargs)
+
         with monkeypatch.context() as mp:
-            mp.setattr(Path,"unlink",fail_after_first_file)
-            with pytest.raises(JobRetentionRefused,match="interrupted"):apply()
-        assert removed and not removed[0].exists() and all((root/p["directory"]/historical_raw_restore.MARKER).is_file() for p in proofs)
-        done=apply();assert done["state"]=="reclaimed" and done["allocation"]["netAttributedAllocatedBytes"]>0
-        assert apply()["replayed"] and core.read_bytes()==b"separate forensic scope" and work.read_bytes()==b"separate working source"
+            mp.setattr(Path, "unlink", fail_after_first_file)
+            with pytest.raises(JobRetentionRefused, match="interrupted"):
+                apply()
+        assert (
+            removed
+            and not removed[0].exists()
+            and all((root / p["directory"] / historical_raw_restore.MARKER).is_file() for p in proofs)
+        )
+        done = apply()
+        assert done["state"] == "reclaimed" and done["allocation"]["netAttributedAllocatedBytes"] > 0
+        assert (
+            apply()["replayed"]
+            and core.read_bytes() == b"separate forensic scope"
+            and work.read_bytes() == b"separate working source"
+            and vtk_export.read_bytes() == b"working VTK export"
+        )
         for p in proofs:
-            sig=p["historicalRaw"]["point_content_signature"]
-            for name in ("engine_evidence.tar.zst","openfoam/postProcessing/forceCoeffs.dat","time_directories/1/U","openfoam/logs/transient_a0/source.log"):
-                assert not (root/p["directory"]/name).exists()
-                response=read(p,name);assert response.status_code==200,response.text
-                assert response.content==local[sig][name] and response.headers["x-gcs-generation"]==p["generation"]
-            assert read(p,"openfoam/nonexistent").status_code==404
-            assert (root/p["directory"]/"evidence_manifest.json").read_bytes()==local[sig]["evidence_manifest.json"]
-        p=proofs[-1];sig=p["historicalRaw"]["point_content_signature"];cloud[sig]=b"X"+cloud[sig][1:]
-        assert read(p).status_code!=200
+            sig = p["historicalRaw"]["point_content_signature"]
+            for name in (
+                "engine_evidence.tar.zst",
+                "openfoam/postProcessing/forceCoeffs.dat",
+                "time_directories/1/U",
+                "openfoam/logs/transient_a0/source.log",
+            ):
+                assert not (root / p["directory"] / name).exists()
+                response = read(p, name)
+                assert response.status_code == 200, response.text
+                assert (
+                    response.content == local[sig][name]
+                    and response.headers["x-gcs-generation"] == p["generation"]
+                )
+            assert read(p, "openfoam/nonexistent").status_code == 404
+            assert (root / p["directory"] / "evidence_manifest.json").read_bytes() == local[sig][
+                "evidence_manifest.json"
+            ]
+        p = proofs[-1]
+        sig = p["historicalRaw"]["point_content_signature"]
+        cloud[sig] = b"X" + cloud[sig][1:]
+        assert read(p).status_code != 200
     finally:
-        server.shutdown();server.server_close();thread.join()
+        server.shutdown()
+        server.server_close()
+        thread.join()

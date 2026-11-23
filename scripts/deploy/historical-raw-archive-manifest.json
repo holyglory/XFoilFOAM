@@ -27,5 +27,30 @@
       "apps/sweeper/src/historical-raw-archive.ts",
       "apps/sweeper/src/historical-raw-archive-cli.ts"
     ]
+  },
+  "closedOwnerRestore": {
+    "hubNodeApi": [
+      "apps/api/src/historical-raw-archive.ts",
+      "apps/api/src/historical-raw-download.ts",
+      "apps/api/src/historical-raw-source.ts",
+      "apps/api/src/report-archive-broker.ts"
+    ],
+    "workerNodeApi": [
+      "apps/api/src/historical-worker-restore.ts",
+      "packages/db/src/registered-worker-archive-owner.ts",
+      "packages/core/src/registered-archive-read.ts",
+      "apps/api/src/media-store.ts"
+    ],
+    "workerFileServingApi": [
+      "src/airfoilfoam/api/main.py",
+      "src/airfoilfoam/historical_raw_restore.py"
+    ],
+    "workerSweeper": [
+      "apps/sweeper/src/closed-progressive-retention.ts",
+      "apps/sweeper/src/progressive-archive-reclaim.ts",
+      "packages/db/src/index.ts",
+      "packages/db/src/registered-worker-archive-owner.ts",
+      "packages/core/src/registered-archive-read.ts"
+    ]
   }
 }

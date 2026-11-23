@@ -30,6 +30,11 @@ FILES = {
     "native": "src/airfoilfoam/closed_progressive_retention.py",
 }
 MEDIA_READERS = ("apps/api/src/media-store.ts", "apps/api/src/routes.ts", "apps/api/src/services/sim.ts")
+HISTORICAL_NODE_READERS = ("apps/api/src/historical-worker-restore.ts", "apps/api/src/historical-raw-archive.ts",
+                          "apps/api/src/media-store.ts", "packages/db/src/registered-worker-archive-owner.ts",
+                          "packages/core/src/registered-archive-read.ts")
+HISTORICAL_GATEWAY_MODULES = {"api.main": "src/airfoilfoam/api/main.py",
+                              "historical_raw_restore": "src/airfoilfoam/historical_raw_restore.py"}
 ENGINE_MODULES = ("retention", "evidence_store", "evidence_runtime", "config", "jobs", "tasks")
 NODE_FILES = ("apps/sweeper/src/progressive-archive-reclaim.ts", "apps/sweeper/src/config.ts",
               "packages/core/src/remote-hub-url.ts", "packages/db/src/progressive-evidence-custody.ts",
@@ -126,8 +131,13 @@ def validate_sources(package):
             "incomplete runtime dependency identity")
     require(set(package["mediaReaderHashes"]) == set(MEDIA_READERS) and
             all(SHA.fullmatch(h) for h in package["mediaReaderHashes"].values()), "incomplete media reader identity")
+    require(set(package["historicalNodeHashes"]) == set(HISTORICAL_NODE_READERS) and
+            set(package["historicalGatewayHashes"]) == set(HISTORICAL_GATEWAY_MODULES) and
+            all(SHA.fullmatch(h) for h in (*package["historicalNodeHashes"].values(),
+                                           *package["historicalGatewayHashes"].values())), "incomplete historical reader identity")
     return digest(encoded({"helpers": hashes, "engine": package["engineHashes"], "node": package["nodeHashes"],
-                           "mediaReaders": package["mediaReaderHashes"]}))
+                           "mediaReaders": package["mediaReaderHashes"], "historicalNode": package["historicalNodeHashes"],
+                           "historicalGateway": package["historicalGatewayHashes"]}))
 
 
 def send_frame(pipe, value):
@@ -158,7 +168,14 @@ def host_job(package):
         require(stat.S_ISREG(os.fstat(lock_fd).st_mode) and os.path.samestat(os.fstat(lock_fd), os.stat(DEPLOY_LOCK)),
                 "deployment lock identity changed")
         keep_media = scope.get("keepMedia") is True
-        topology = containers(keep_media)
+        historical = scope.get("historicalRaw") is True
+        include_node = keep_media or historical
+        topology = containers(include_node)
+        if historical:
+            rows = command(["docker", "exec", "-w", "/app", topology["node-api"]["id"],
+                            "sha256sum", *HISTORICAL_NODE_READERS]).decode().splitlines()
+            actual = {name: sha for sha, name in (row.split(None, 1) for row in rows)}
+            require(actual == package["historicalNodeHashes"], "installed closed-owner Node reader differs")
         if keep_media:
             rows = command(["docker", "exec", "-w", "/app", topology["node-api"]["id"], "sha256sum", *MEDIA_READERS]).decode().splitlines()
             actual = {name: sha for sha, name in (row.split(None, 1) for row in rows)}
@@ -171,8 +188,11 @@ def host_job(package):
                                       encoded({"id": scope["id"], "engineHashes": package["engineHashes"]})))
         if "refused" in observed:
             return {"status": "refused", "job": scope["id"], "reason": observed["refused"]}
+        gateway_hashes = dict(package["engineHashes"])
+        if historical:
+            gateway_hashes.update(package["historicalGatewayHashes"])
         api_observed=json.loads(command(["docker","exec","-i",pinned["api"],"python","-IB","-c",WORKER_PROBE],
-                                 encoded({"id":scope["id"],"engineHashes":package["engineHashes"]})))
+                                 encoded({"id":scope["id"],"engineHashes":gateway_hashes})))
         if "refused" in api_observed:
             return {"status":"refused","job":scope["id"],"reason":api_observed["refused"]}
         require(all(observed[k]==api_observed[k] for k in ("jobsInode","jobInode","lockInode")),"worker and gateway execution paths differ")
@@ -203,7 +223,7 @@ def host_job(package):
                     count += 1
                     require(msg["type"] == "engine" and msg["step"] == count and
                             (count == 1 or count == 2 and scope["mode"] == "reclaim"), "unexpected native call")
-                    require(containers(keep_media) == topology, "runtime changed during maintenance")
+                    require(containers(include_node) == topology, "runtime changed during maintenance")
                     boot = {"scope": scope, "packet": msg["packet"], "native": package["sources"]["native"],
                             "nativeSha": package["hashes"]["native"], "engineHashes": package["engineHashes"]}
                     answer = command(["docker", "exec", "-i", pinned["api"], "python", "-IB", "-c", package["sources"]["engine"]],
@@ -226,7 +246,7 @@ def host_job(package):
                     require(receipt["status"] == "settled" and receipt["settled"] is True and
                             receipt["plan"]["plan"] == scope["plan"] and count == (2 if receipt["plan"]["files"] else 1),
                             "apply peer returned an invalid receipt")
-                require(code == 0 and containers(keep_media) == topology, "runtime changed or receipt lost; repeat the same pinned plan")
+                require(code == 0 and containers(include_node) == topology, "runtime changed or receipt lost; repeat the same pinned plan")
             finally:
                 if proc.poll() is None:
                     proc.stdin.close()
@@ -260,6 +280,8 @@ def source_package(repo):
     require(Path(__file__).read_bytes() == sources["host"].encode(), "run the operator from its committed checkout")
     return {"revision": revision, "sources": sources, "hashes": {k: digest(v.encode()) for k,v in sources.items()},
             "mediaReaderHashes": {p: digest(source(revision, p)) for p in MEDIA_READERS},
+            "historicalNodeHashes": {p: digest(source(revision, p)) for p in HISTORICAL_NODE_READERS},
+            "historicalGatewayHashes": {n: digest(source(revision, p)) for n,p in HISTORICAL_GATEWAY_MODULES.items()},
             "nodeHashes": {p: sorted({digest(source(ref, p)) for ref in (RUNTIME_BASE, revision)}) for p in NODE_FILES},
             "engineHashes": {n: digest(source(RUNTIME_BASE, f"src/airfoilfoam/{n}.py")) for n in ENGINE_MODULES}}
 
