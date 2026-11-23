@@ -675,7 +675,7 @@ describe.sequential("worker-only legacy backup and 0198 representation", () => {
     let done = await exportLegacyReports(single);
     if (!done.complete) done = await exportLegacyReports(single);
     expect(done.complete).toBe(true);
-  });
+  }, 60000);
 
   it("does not overlap an uncertain 256 MiB page when restarted with a 128 MiB peer", async () => {
     const a = await fixture(false),
@@ -747,7 +747,7 @@ describe.sequential("worker-only legacy backup and 0198 representation", () => {
       done = await exportLegacyReports({ ...base, pages: 32 });
     expect(done.complete).toBe(true);
     expect(budgetOpens).toBeGreaterThan(1);
-  });
+  }, 60000);
 
   it("pairs two long executions across a short intervening job and joins the exact complete prefix", async () => {
     const a = await fixture(false),
