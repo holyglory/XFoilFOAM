@@ -51,6 +51,13 @@ it("restores exact PG results across shared pages including unknown, wide and nu
       mimeType:"application/gzip",compression:"gzip",archiveFormat:SHARED_REPORT_FORMAT,sourceKind:"remote" as const,memberKind:"report" as const,
       executionId:owner.executionId,sequence:m.sequence,signature:m.signature,reportSha256:m.reportSha256,reportByteSize:m.reportByteSize};
     expect(await readSharedReport(store,ref)).toBe(raws[i]);
+    const {verifySharedReportGeneration}=await import("../src/shared-report-archive");
+    await expect(verifySharedReportGeneration(store,ref,AbortSignal.timeout(1000))).resolves.toBeUndefined();
+    if(m.resultHash){
+      const changed={...store,read:async(pin:Parameters<typeof store.read>[0],limit:number)=>pin.key.includes("/results/")?gzipSync("altered receipt"):store.read(pin,limit)};
+      await expect(verifySharedReportGeneration(changed,ref,AbortSignal.timeout(1000))).rejects.toThrow();
+    }
+
     if(i===0)await expect(readSharedReport({...store,read:()=>new Promise<Buffer>(()=>{})},ref,AbortSignal.timeout(10))).rejects.toThrow();
 
     await expect(readSharedReport(store,{...ref,executionId:randomUUID()})).rejects.toThrow();

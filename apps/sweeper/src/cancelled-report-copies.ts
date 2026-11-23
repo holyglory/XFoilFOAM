@@ -115,7 +115,10 @@ export const repeatedStoppedSource = sql`EXISTS (
 // transport copies use the shared-result writer and separate read-through proof.
 export const receiptedReportCopy = scientificallyReceiptedReportCopy;
 
-/** Inspect a bounded page of the warm index. Only one job can own a bundle. */
+/** A source-less heartbeat can never satisfy the original scientific-receipt
+ * predicate. Look ahead on bounded warm primary keys and inspect at most 32
+ * actual scientific rows. Advance past the tail only when all sources in the
+ * window were considered. A bundle still belongs to one job. */
 export async function nextCancelledReportCopies(
   db: DB,
   after: ReportCopyCursor | null,
@@ -125,13 +128,20 @@ export async function nextCancelledReportCopies(
     sequence: string;
     ready: boolean;
   }>(sql`
-    WITH page AS MATERIALIZED (SELECT sim_job_id,sequence,content_signature FROM progressive_remote_reports
+    WITH warm_keys AS MATERIALIZED (SELECT sim_job_id,sequence,content_signature FROM progressive_remote_reports
       WHERE archived_at IS NULL ${after ? sql`AND (sim_job_id,sequence)>(${after.executionId}::uuid,${after.sequence}::bigint)` : sql``}
-      ORDER BY sim_job_id,sequence LIMIT 32),
+      ORDER BY sim_job_id,sequence LIMIT 512),
+    sources AS MATERIALIZED (SELECT k.* FROM warm_keys k WHERE EXISTS(
+      SELECT FROM progressive_remote_report_sources s WHERE s.sim_job_id=k.sim_job_id AND s.sequence=k.sequence)
+      ORDER BY k.sim_job_id,k.sequence LIMIT 32),
+    page AS MATERIALIZED (SELECT s.*,true AS inspect FROM sources s UNION ALL
+      SELECT last.*,false FROM (SELECT * FROM warm_keys ORDER BY sim_job_id DESC,sequence DESC LIMIT 1) last
+      WHERE (SELECT count(*) FROM sources)<32 AND NOT EXISTS(
+        SELECT FROM sources s WHERE (s.sim_job_id,s.sequence)=(last.sim_job_id,last.sequence))),
     owners AS MATERIALIZED (SELECT job.id FROM (SELECT DISTINCT sim_job_id FROM page) p
       JOIN sim_jobs job ON job.id=p.sim_job_id JOIN progressive_remote_dispatches d ON d.sim_job_id=job.id
       JOIN sync_sweep_promises promise ON promise.id=d.promise_id WHERE ${cancelledReportOwner})
-    SELECT r.sim_job_id,r.sequence,CASE WHEN o.id IS NOT NULL THEN ${receiptedReportCopy} ELSE false END AS ready
+    SELECT r.sim_job_id,r.sequence,CASE WHEN r.inspect AND o.id IS NOT NULL THEN ${receiptedReportCopy} ELSE false END AS ready
     FROM page r LEFT JOIN owners o ON o.id=r.sim_job_id ORDER BY r.sim_job_id,r.sequence`);
   const executionId = rows.find((row) => row.ready)?.sim_job_id;
   const page = executionId

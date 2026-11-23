@@ -19,7 +19,7 @@ Production Compose supplies these settings.
 | `AIRFOILFOAM_STOPPED_SHARED_REPORT_RECEIPTS` | `/data/airfoilfoam/report-archives/shared-result-v1` | Durable, private directory on the existing results volume. |
 | `AIRFOILFOAM_HUB_REPORT_API_URL` | `http://node-api:4000` | Internal address used to check the serving hub reader. |
 
-Each turn inspects up to 32 report keys from one owner and writes at most one bounded manifest. Different owners take turns. The reader caps each report and scientific result at 64 MiB of original text and each page at 128 MiB of reconstructed reports. Larger originals remain intact and produce an explicit error. Runtime role, ownership, signature, source, object or reader disagreements preserve the SQL form. A confirmed complete frontier sleeps between checks and resumes on changes to the signed report/progress frontier or scientific/diagnostic receipts.
+Each turn inspects up to 32 report keys from one owner and writes at most one bounded manifest. Different owners take turns. Within each owner, a cursor on the existing signed point-source index alternates with the ordinary sequence cursor so large scientific reports progress even behind a long prefix of null status snapshots. The reader caps each report and scientific result at 64 MiB of original text and each page at 128 MiB of reconstructed reports. Larger originals remain intact and produce an explicit error. Runtime role, ownership, signature, source, object or reader disagreements preserve the SQL form. A confirmed complete frontier sleeps between checks and resumes on changes to the signed report/progress frontier or scientific/diagnostic receipts.
 
 ## Receipts and recovery
 

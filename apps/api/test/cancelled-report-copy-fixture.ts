@@ -183,6 +183,25 @@ export async function verifyCancelledReportCopyReplay(
   const page = await nextCancelledReportCopies(db, cursor);
   expect(page.executionId).toBe(id);
   expect(page.sequences).toEqual([copy.sequence,dependent.sequence]);
+  const scanned=new Error("rollback metadata-only discovery window");
+  await expect(db.transaction(async tx=>{
+    const conn=tx as unknown as DB;
+    // A separate key-only prefix has no point, inventory or scientific receipt.
+    // Preserve the actual signed candidates from the normal caller.
+    await conn.execute(sql`CREATE TEMP TABLE progressive_remote_reports ON COMMIT DROP AS
+      SELECT sim_job_id,sequence,content_signature,archived_at,archive_bundle_id FROM public.progressive_remote_reports
+      WHERE sim_job_id=${id}::uuid`);
+    const empty="00000000-0000-0000-0000-000000000000";
+    await conn.execute(sql`INSERT INTO progressive_remote_reports(sim_job_id,sequence) SELECT ${empty}::uuid,n FROM generate_series(1,540)n`);
+    const gap=await nextCancelledReportCopies(conn,null);
+    expect(gap.sequences).toEqual([]);
+    expect(gap.after).toEqual({executionId:empty,sequence:512});
+    const found=await nextCancelledReportCopies(conn,gap.after);
+    expect(found.executionId).toBe(id);
+    expect(found.sequences).toEqual(page.sequences);
+    throw scanned;
+  })).rejects.toBe(scanned);
+
   const [original] =
     await db.execute(sql`SELECT report::text AS text, result_payload_hash AS hash
     FROM progressive_remote_reports WHERE sim_job_id=${id}::uuid AND sequence=${copy.sequence}`);
@@ -458,6 +477,10 @@ export async function verifyCancelledReportCopyReplay(
       await expect(copyStoppedReportBatch(db,store,id,anchors,"anchor",{...adapters,preserved:corruptPrevious})).rejects.toThrow();
       const heldCount=await db.execute(sql`SELECT count(*)::int n FROM progressive_remote_reports WHERE sim_job_id=${id}::uuid AND sequence IN (${anchorSequence},${gap.sequence},${final.sequence}) AND archived_at IS NULL`);
       expect(heldCount[0].n).toBe(3);
+      await expect(copyStoppedReportBatch(db,store,id,anchors,"anchor",{...adapters,preserved:copyOfOriginals,
+        beforePublish:async()=>{await db.execute(sql`UPDATE sim_jobs SET ingest_lease_token='anchor-race',ingest_lease_expires_at=now()+interval '1 hour' WHERE id=${id}::uuid`);}
+      })).rejects.toThrow("owner");
+      await db.execute(sql`UPDATE sim_jobs SET ingest_lease_token=NULL,ingest_lease_expires_at=NULL WHERE id=${id}::uuid`);
       const retired=await copyStoppedReportBatch(db,store,id,anchors,"anchor",{...adapters,preserved:copyOfOriginals});
       expect(retired.released).toBe(3);expect(retired.object).toEqual(copyOfOriginals.object);expect(retired.resultBytesSubmitted).toBe(0);
       expect(await readProgressiveRemoteSourceClassifications(db,id)).toEqual(originalClassification);

@@ -65,6 +65,7 @@ export async function withArchiveFixture(
     stopped?: boolean;
     settled?: boolean;
     reportCount?: number;
+    nullPrefix?: number;
     angles?: number[];
     historyRepeats?: number;
     legacyConflict?: "identical" | "distinct";
@@ -354,6 +355,7 @@ export async function withArchiveFixture(
         reports: [],
       };
       const count = options.reportCount ?? 3;
+      const nullPrefix=options.nullPrefix??1;
       for (let sequence = 1; sequence <= count; sequence++) {
         const report = {
           version: 1,
@@ -367,7 +369,7 @@ export async function withArchiveFixture(
             job_id: executionId,
             state: sequence === count ? "failed" : "running",
             total_cases: units.length,
-            completed_cases: sequence === 1 ? 0 : 1,
+            completed_cases: sequence <= nullPrefix ? 0 : 1,
             // Unknown diagnostic values must survive archival without JS rounding.
             diagnosticLargeInteger: force ? 2147483647 : "__LARGE_INTEGER__",
             diagnosticNull: null,
@@ -378,7 +380,7 @@ export async function withArchiveFixture(
             ].join(String.fromCharCode(10)),
           },
           result:
-            sequence === 1
+            sequence <= nullPrefix
               ? null
               : {
                   ...provenance,
