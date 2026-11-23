@@ -6104,3 +6104,12 @@ tier = "release"
 requires = ["verifier"]
 timeout_seconds = 3000
 command = ["node", "scripts/dev/verify-condition-layout.mjs", "--paging"]
+
+[test.catalog-design-audit-capture]
+timeout_seconds = 180
+
+[[test.catalog-design-audit-capture.check]]
+name = "capture"
+tier = "release"
+command = ["node", "scripts/dev/capture-catalog-audit.mjs"]
+retained_artifacts = [{ name = "catalog-audit-captures", path = ".codex-artifacts/catalog-design-audit", max_bytes = 16777216 }]
