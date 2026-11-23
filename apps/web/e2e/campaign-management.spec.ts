@@ -632,10 +632,11 @@ test.describe
     let maxConcurrentSolverFlowRequests = 0;
     const managementResultId = `${state.stamp}-failed-point-result`;
     const managementAttemptId = `${state.stamp}-failed-point-attempt`;
-    const stageTargets = new Map([
-      [managementResultId, { attemptId: managementAttemptId, fidelity: "urans_precalc" }],
-      [`${state.stamp}-fast-result`, { attemptId: `${state.stamp}-fast-attempt`, fidelity: "urans_precalc" }],
-      [`${state.stamp}-final-result`, { attemptId: `${state.stamp}-final-attempt`, fidelity: "urans_full" }],
+    const acceptedResultId = `${state.stamp}-accepted-result`;
+    const attempts = new Map([
+      [managementAttemptId, { resultId: managementResultId, fidelity: "urans_precalc" }],
+      [`${state.stamp}-fast-attempt`, { resultId: acceptedResultId, fidelity: "urans_precalc" }],
+      [`${state.stamp}-final-attempt`, { resultId: acceptedResultId, fidelity: "urans_full" }],
     ]);
     let managementRequeuePosts = 0;
     let managementCorrectionPosts = 0;
@@ -741,13 +742,14 @@ test.describe
         }
         if (url.pathname.endsWith("/sim")) {
           const resultId = decodeURIComponent(url.pathname.split("/").at(-2)!);
-          const target = stageTargets.get(resultId);
+          const attemptId = url.searchParams.get("resultAttemptId");
+          const target = attempts.get(attemptId ?? "");
           expect(target).toBeDefined();
-          expect(url.searchParams.get("resultAttemptId")).toBe(target!.attemptId);
+          expect(target!.resultId).toBe(resultId);
           await route.fulfill({
             json: {
               resultId,
-              resultAttemptId: target!.attemptId,
+              resultAttemptId: attemptId,
               status: "solved",
               regime: "attached",
               airfoilName: `${state.stamp} cam 4415`,
@@ -947,15 +949,11 @@ test.describe
                         : finalCritical || criticalRerun
                           ? "final"
                           : null,
-                  fastResultId: fastAccepted
-                    ? `${state.stamp}-fast-result`
-                    : null,
+                  fastResultId: fastAccepted ? acceptedResultId : null,
                   fastResultAttemptId: fastAccepted
                     ? `${state.stamp}-fast-attempt`
                     : null,
-                  finalResultId: accepted
-                    ? `${state.stamp}-final-result`
-                    : null,
+                  finalResultId: accepted ? acceptedResultId : null,
                   finalResultAttemptId: accepted
                     ? `${state.stamp}-final-attempt`
                     : null,
@@ -1324,8 +1322,8 @@ test.describe
     ).toHaveCount(0);
 
     for (const stage of ["fast", "final"]) {
-      const resultId = `${state.stamp}-${stage}-result`;
-      const attemptId = stageTargets.get(resultId)!.attemptId;
+      const resultId = acceptedResultId;
+      const attemptId = `${state.stamp}-${stage}-attempt`;
       const exactAttempt = page.waitForResponse((response) => {
         const url = new URL(response.url());
         return url.pathname === `/api/admin/point-history/${resultId}/sim` &&
@@ -1335,7 +1333,11 @@ test.describe
       await trigger.click();
       const response = await exactAttempt;
       expect(response.status()).toBe(200);
-      expect(await response.json()).toMatchObject({ resultId, resultAttemptId: attemptId });
+      expect(await response.json()).toMatchObject({
+        resultId,
+        resultAttemptId: attemptId,
+        fidelity: stage === "fast" ? "urans_precalc" : "urans_full",
+      });
       await expect(page.getByTestId("sim-modal-dialog")).toBeVisible();
       await page.keyboard.press("Escape");
       await expect(page.getByTestId("sim-modal-dialog")).toHaveCount(0);
