@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import { afterAll, beforeAll, expect, it } from "vitest";
 import { createClient } from "../src/client";
 import { databaseUrl } from "../src/env";
-import { maintainWorkerStagingKeys } from "../src/worker-staging-key-maintenance";
+import { backfillWorkerStagingKeyPage, maintainWorkerStagingKeys } from "../src/worker-staging-key-maintenance";
 
 const databaseName =
   "aerodb_worker_staging_keys_" + randomUUID().replaceAll("-", "");
@@ -183,6 +183,18 @@ it("keeps the original read view until a lossless, restartable bootstrap and han
     await otherBackfill`BEGIN ISOLATION LEVEL REPEATABLE READ`;
     await otherBackfill`SELECT singleton FROM progressive_worker_staging_key_backfill FOR UPDATE`;
     await expect(backfill(1)).rejects.toMatchObject({ code: "55P03" });
+    expect(await backfillWorkerStagingKeyPage(sql, 1, instance)).toEqual({
+      busy: true, visited: 0, changed: 0, complete: false,
+    });
+    await otherBackfill`SELECT pg_advisory_xact_lock(218,1)`;
+    for (const op of ["start", "enable", "disable", "stop", "restore", "retire"] as const) {
+      await expect(maintainWorkerStagingKeys(sql, op, { instance, readersRevision: "ab".repeat(20) }))
+        .rejects.toThrow("Another staging key maintenance is active");
+    }
+    expect(await backfillWorkerStagingKeyPage(sql, 1, instance)).toMatchObject({ busy: true, visited: 0 });
+    const [cursor] = await sql`SELECT after_sequence::int AS seq,reads_enabled,index_phase
+      FROM progressive_worker_staging_key_backfill`;
+    expect(cursor).toEqual({ seq: 2, reads_enabled: false, index_phase: "present" });
   } finally {
     await otherBackfill`ROLLBACK`;
     otherBackfill.release();

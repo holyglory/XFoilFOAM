@@ -6,6 +6,8 @@ Use this option when worker staging or delivery wake polls repeatedly scan retai
 
 ## Install and backfill
 
+The worker wrapper holds a shared deployment lock from role selection through each metadata command. Ordinary archive readers can continue. A real deployment or exclusive maintenance window returns exit 9 before the operator connects. PostgreSQL serializes state changes with its staging advisory lock and backfill cursor row. The separate index retirement and restoration operations retain their exclusive host fence. Retirement also verifies the exact serving release and both running readers.
+
 1. Deploy migration `0218_worker_report_staging_keys.sql` before deploying callers that use the new candidate view. The migration installs the source-backed view, an empty key table and two disabled tracking triggers. It creates no checkpoint or keys. A hub-only installation has no tracking writes. The first worker backfill, or an explicit `start INSTANCE_UUID`, enables tracking for that registered instance in a short transaction using a nonwaiting source-table lock. Backfill starts after that transaction commits.
 2. Run `scripts/deploy/worker-report-staging-keys.sh status` on the registered worker. The application may continue writing and using the source-backed view.
 3. Run `scripts/deploy/worker-report-staging-keys.sh backfill INSTANCE_UUID 128` once per desired page. The worker instance UUID comes from its existing registration. Each invocation exits after one transaction. A busy response means retry this cursor later. A genuinely empty tail marks completion. The covering partial index must be valid and usable by PostgreSQL. The operator refuses a bootstrap plan that would scan or re-evaluate report bodies.

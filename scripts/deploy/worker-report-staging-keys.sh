@@ -8,10 +8,6 @@ APP_DIR="${APP_DIR:-/opt/airfoils-pro/app}"
 AIRFOILS_PRO_STATE_DIR="${AIRFOILS_PRO_STATE_DIR:-/opt/airfoils-pro/state}"
 ENV_FILE="${ENV_FILE:-$AIRFOILS_PRO_STATE_DIR/.env.deploy}"
 LOCK_FILE="${LOCK_FILE:-/tmp/airfoils-pro-deploy.lock}"
-source "$SCRIPT_DIR/deployment-compose-profile.sh"
-configure_deployment_compose_profile
-[[ "$DEPLOYMENT_ROLE" == remote-solver ]] || { echo "Expected a registered remote worker host." >&2; exit 2; }
-
 operation="${1:-status}"
 case "$operation" in
   status|verify) [[ $# -le 1 ]] || exit 2 ;;
@@ -20,11 +16,26 @@ case "$operation" in
   retire) [[ $# == 3 && "$3" =~ ^[0-9a-f]{40}$ ]] || { echo "retire requires the worker instance UUID and exact serving commit." >&2; exit 2; } ;;
   *) echo "Expected status, start, backfill, verify, enable, retire, restore, disable or stop." >&2; exit 2 ;;
 esac
-compose=(docker compose --env-file "$ENV_FILE" -p "$COMPOSE_PROJECT_NAME" "${COMPOSE_FILE_ARGS[@]}")
 if [[ "$operation" != status ]]; then
-  exec 9>>"$LOCK_FILE"
-  flock -n -x 9 || { echo "A deployment or maintenance operation owns the worker." >&2; exit 9; }
+  # Pin the serving release alongside archive readers. PostgreSQL serializes
+  # staging mutations with its advisory lock and locked backfill cursor.
+  mode=-s
+  case "$operation" in retire|restore) mode=-x ;; esac
+  if [[ -f "$LOCK_FILE" ]]; then
+    exec 9<"$LOCK_FILE"
+  else
+    exec 9>>"$LOCK_FILE"
+  fi
+  flock "$mode" -n -E 9 9 || {
+    rc=$?
+    if ((rc == 9)); then echo "An incompatible deployment lock is held." >&2; fi
+    exit "$rc"
+  }
 fi
+source "$SCRIPT_DIR/deployment-compose-profile.sh"
+configure_deployment_compose_profile
+[[ "$DEPLOYMENT_ROLE" == remote-solver ]] || { echo "Expected a registered remote worker host." >&2; exit 2; }
+compose=(docker compose --env-file "$ENV_FILE" -p "$COMPOSE_PROJECT_NAME" "${COMPOSE_FILE_ARGS[@]}")
 if [[ "$operation" == retire ]]; then
   release="$(python3 "$APP_DIR/scripts/deploy/deployment-source-manifest.py" --verify --root "$APP_DIR" \
     --manifest "$APP_DIR/.deployment-source.json" | cut -f1)"
