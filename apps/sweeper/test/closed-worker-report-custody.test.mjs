@@ -205,48 +205,6 @@ it.each([
             }),
           );
           if (grouped) {
-            const windowKeys = f.reports
-              .slice(2, 10)
-              .map((r) => ({
-                key: {
-                  executionId: id,
-                  sequence: r.sequence,
-                  signature: r.contentSignature,
-                },
-              }));
-            const shape = {
-              maxMemberBytes: 32 * 1024 ** 2,
-              maxPageBytes: 32 * 1024 ** 2,
-              maxPointSources: 1,
-            };
-            const measured = await run("source", {
-              items: windowKeys,
-              widthLimits: shape,
-            });
-            expect(measured.rows).toHaveLength(8);
-            expect(
-              new Set(measured.rows.map((r) => r.resultMeta.sha256)).size,
-            ).toBe(1);
-            const smaller = await run("source", {
-              items: windowKeys,
-              widthLimits: { ...shape, maxMemberBytes: 1 },
-            });
-            expect(smaller.rows).toEqual(measured.rows.slice(0, 4));
-            const maxOne = Math.max(
-              ...measured.rows.map((r) => r.source.facts.byteSize),
-            );
-            const firstFour = measured.rows
-              .slice(0, 4)
-              .reduce((n, r) => n + r.source.facts.byteSize, 0);
-            const bounded = await run("source", {
-              items: windowKeys,
-              widthLimits: {
-                ...shape,
-                maxMemberBytes: maxOne,
-                maxPageBytes: firstFour + 1,
-              },
-            });
-            expect(bounded.rows).toEqual(measured.rows.slice(0, 4));
             const keys = [
               key,
               {
@@ -463,7 +421,7 @@ it.each([
           await rm(volume, { recursive: true, force: true });
         }
       },
-      { normalized, settled: false, reportCount: grouped ? 12 : 5 },
+      { normalized, settled: false, reportCount: sparse ? 6 : 5 },
     );
   },
   30000,

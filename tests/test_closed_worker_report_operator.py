@@ -256,7 +256,7 @@ class ClosedReportOperator(unittest.TestCase):
             binding={"inventory":"one","frozen":"two","solver":"three"}
             runtime={"reader":"a"*64}
             runtime_digest=hashlib.sha256(json.dumps(runtime,sort_keys=True,separators=(",",":")).encode()).hexdigest()
-            limits=dict(maxMemberBytes=20,maxPageBytes=150,maxPointSources=2)
+            limits=dict(maxMemberBytes=20,maxPageBytes=150,maxPointSources=2,minResultShareBps=4000)
             peer="b"*64
             config=dict(version=1,binding=binding,runtimeSha256=runtime_digest,peerSha256=peer,ordinaryMembers=4,wideMembers=8,
                         qualificationReceiptSha256="f"*64,**limits)
@@ -274,10 +274,58 @@ class ClosedReportOperator(unittest.TestCase):
                 return dict(resultMeta={"sha256":result*64,"byteSize":8},source={"facts":{"points":[None]*points,"byteSize":size}})
             rows=[item() for _ in range(8)]
             self.assertTrue(fits_wide_page(rows,limits))
+            self.assertTrue(fits_wide_page(rows[:4],limits,prefix=True))
             self.assertFalse(fits_wide_page(rows[:7],limits))
+            no_share = [dict(r, resultMeta=dict(r["resultMeta"],byteSize=1)) for r in rows]
+            self.assertFalse(fits_wide_page(no_share,limits))
+            self.assertFalse(fits_wide_page(rows[:4],dict(limits,maxPageBytes=80),prefix=True))
             for changed in (item(size=21),item(result="f"),item(points=3)):
                 self.assertFalse(fits_wide_page([*rows[:-1],changed],limits))
             self.assertFalse(fits_wide_page([item(size=20)for _ in range(8)],limits))
+
+    def test_controller_widens_only_the_measured_four_plus_four_prefix(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp); job="44444444-4444-4444-8444-444444444444"
+            frozen={"version":1,"sourceInstance":job,"solverId":job,"executions":[{"executionId":job,"reportHighWater":1}]}
+            scope=root/"scope.json";scope.write_bytes(controller.compact(frozen))
+            keys=[dict(executionId=job,sequence=n,signature="a"*64) for n in range(3,19)]
+            source=root/"keys.jsonl";source.write_bytes(b"".join(controller.compact(k)+b"\n" for k in keys))
+            account=root/"account";account.write_text("test")
+            args=SimpleNamespace(runtime_revision="a"*40,hz_host="hz",hub_host="hub",hz_api="api",hz_sweeper="worker",hub_sweeper="hub-worker",
+                apply=True,limit=16,keys=source,keys_sha256=controller.digest(source.read_bytes()),frozen_scope=scope,
+                frozen_sha256=controller.digest(scope.read_bytes()),state=root/"state",page_members=4,hub_account_file=account,
+                width_qualification=root/"width.json",same_execution_pages=True)
+            calls=[]
+            def rpc(_args,role,m,_peer):
+                items=m["items"];seq=[v["key"]["sequence"] for v in items]
+                self.assertEqual(m["key"],items[0]["key"])
+                calls.append((m["op"],seq))
+                if m["op"]=="source":
+                    rows=[]
+                    for n in seq:
+                        # The next eight exceed the qualified size. Their second half must be read only once.
+                        size=16 if n<11 else 160
+                        rows.append(dict(stored=size,source={"facts":{"byteSize":size,"points":[{}]}},resultMeta={"sha256":"b"*64,"byteSize":size-4}))
+                    return {"rows":rows}
+                if m["op"]=="hub":return {"rows":[{"science":{}} for _ in items]}
+                if m["op"]=="publish":return {"pins":[{"generation":str(seq[0])}for _ in items],"deltaMembers":len(items)-1}
+                if m["op"]=="cloud":return {"rows":[{"science":{}}for _ in items],"generationDownloads":1}
+                if m["op"]=="settle":return {"rows":[{"outcome":"retired"}for _ in items]}
+                return {"rows":[{"storedFieldBytes":5}for _ in items]}
+            with patch.object(controller.subprocess,"check_output",return_value=b"runtime"),patch.object(controller,"run_peer",side_effect=rpc):
+                _s,_ranges,binding,runtime,peer=controller.inputs(args)
+                policy=dict(version=1,binding=binding,ordinaryMembers=4,wideMembers=8,maxMemberBytes=20,maxPageBytes=144,
+                      maxPointSources=1,minResultShareBps=7000,qualificationReceiptSha256="c"*64,
+                      runtimeSha256=controller.digest(json.dumps(runtime,sort_keys=True,separators=(",",":")).encode()),
+                      peerSha256=controller.digest(peer.encode()))
+                args.width_qualification.write_bytes(controller.compact(policy))
+                args.width_qualification_sha256=controller.digest(args.width_qualification.read_bytes())
+                controller.run(args)
+                self.assertEqual([seq for op,seq in calls if op=="source"],[list(range(n,n+4)) for n in (3,7,11,15)])
+                self.assertEqual([len(seq) for op,seq in calls if op=="publish"],[8,4,4])
+                self.assertEqual(json.loads((args.state/"progress.json").read_bytes())["archived"],16)
+                receipts=[json.loads(p.read_bytes()) for p in sorted((args.state/"receipts").glob("*.json"))]
+                self.assertEqual([r.get("widthQualificationSha256") for r in receipts],[args.width_qualification_sha256,None,None])
 
 if __name__ == "__main__":
     unittest.main()
