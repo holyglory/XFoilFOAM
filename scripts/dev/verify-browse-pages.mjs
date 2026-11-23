@@ -71,6 +71,33 @@ try {
     rendered: first.items.length,
     documentBytes: Buffer.byteLength(html),
   };
+  const identity = await page.request.get(origin + "/", {
+    headers: { accept: "text/html", "accept-encoding": "identity" },
+  });
+  const compressed = await page.request.get(origin + "/", {
+    headers: { accept: "text/html", "accept-encoding": "gzip" },
+  });
+  assert.equal(identity.status(), 200);
+  assert.equal(compressed.status(), 200);
+  const etag = identity.headers().etag;
+  assert.match(etag, /^W\/"[a-f0-9]{64}"$/);
+  assert.equal(compressed.headers().etag, etag);
+  assert.equal(compressed.headers()["content-encoding"], "gzip");
+  assert.deepEqual(await compressed.body(), await identity.body());
+  const conditional = await page.request.get(origin + "/", {
+    headers: { accept: "text/html", "if-none-match": etag },
+  });
+  assert.equal(conditional.status(), 304);
+  const flight = await page.request.get(origin + "/", {
+    headers: { rsc: "1" },
+  });
+  assert.match(flight.headers()["content-type"], /text\/x-component/);
+  proof.document = {
+    cached: true,
+    representationsMatch: true,
+    conditionalStatus: 304,
+    flight: true,
+  };
   await page.getByRole("button", { name: "Load more", exact: true }).click();
   await waitRows(page, expanded.items);
   await expect(

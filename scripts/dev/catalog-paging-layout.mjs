@@ -165,6 +165,7 @@ export function catalogPagingLayout(origin, repoRoot, reviewInputs) {
             kind: "ui-code",
           },
           { path: "apps/web/next.config.ts", kind: "ui-code" },
+          { path: "apps/web/server.mjs", kind: "ui-code" },
         ],
         states: actions,
       },
