@@ -7,6 +7,7 @@ export type LegacyStorageOperation =
   | "gcs_upload"
   | "gcs_metadata"
   | "gcs_download"
+  | "conflict_origin"
   | "worker_read"
   | "worker_sql"
   | "worker_custody"
@@ -28,6 +29,9 @@ export type LegacyStorageCategory =
   | "database_unavailable"
   | "credentials_denied"
   | "host_key_denied"
+  | "origin_unavailable"
+  | "origin_mismatch"
+  | "member_over_budget"
   | "bad_input"
   | "integrity"
   | "protocol_error"
@@ -43,6 +47,11 @@ export interface LegacyStorageFailureDetails {
   httpStatus: number | null;
   localCode: string | null;
   sqlState?: string | null;
+  member?: {
+    executionId: string;
+    kind: "report" | "conflict";
+    sequence: number;
+  };
   workerPhase?: string;
 }
 const operations = new Set<string>([
@@ -52,6 +61,7 @@ const operations = new Set<string>([
   "gcs_upload",
   "gcs_metadata",
   "gcs_download",
+  "conflict_origin",
   "worker_read",
   "worker_sql",
   "worker_custody",
@@ -74,6 +84,9 @@ const categories = new Set<string>([
   "database_unavailable",
   "credentials_denied",
   "host_key_denied",
+  "origin_unavailable",
+  "origin_mismatch",
+  "member_over_budget",
   "bad_input",
   "integrity",
   "protocol_error",
@@ -104,6 +117,7 @@ export class LegacyStorageOperationError extends Error {
     httpStatus?: unknown;
     localCode?: unknown;
     sqlState?: unknown;
+    member?: LegacyStorageFailureDetails["member"];
     workerPhase?: unknown;
   }) {
     const operation = (
@@ -149,6 +163,21 @@ export class LegacyStorageOperationError extends Error {
       ].includes(String(input.localCode))
         ? String(input.localCode)
         : null,
+      ...(input.member &&
+      /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(
+        input.member.executionId,
+      ) &&
+      ["report", "conflict"].includes(input.member.kind) &&
+      Number.isSafeInteger(input.member.sequence) &&
+      input.member.sequence > 0
+        ? {
+            member: {
+              executionId: input.member.executionId,
+              kind: input.member.kind,
+              sequence: input.member.sequence,
+            },
+          }
+        : {}),
       ...(input.sqlState === null ||
       (typeof input.sqlState === "string" &&
         /^[0-9A-Z]{5}$/.test(input.sqlState))

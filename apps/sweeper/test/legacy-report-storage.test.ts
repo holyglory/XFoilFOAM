@@ -1928,8 +1928,8 @@ describe.sequential("worker-only legacy backup and 0198 representation", () => {
     const [worker] =
       await client.sql`SELECT report::text AS body,content_signature FROM public.progressive_worker_reports WHERE sim_job_id=${executionId} AND sequence=3`;
     await client.sql`INSERT INTO public.progressive_worker_report_conflicts(sim_job_id,sequence,content_signature,report,reason,body_source_sequence)
-      SELECT sim_job_id,sequence,content_signature,jsonb_set(report,'{result}',public.progressive_report_result_header(report->'result'),false),'aliased original',sequence
-      FROM public.progressive_worker_reports WHERE sim_job_id=${executionId} AND sequence=3`;
+        SELECT sim_job_id,sequence,content_signature,jsonb_set(report,'{result}',public.progressive_report_result_header(report->'result'),false),'aliased original',sequence
+        FROM public.progressive_worker_reports WHERE sim_job_id=${executionId} AND sequence=3`;
     scope.executions[0].conflicts = 1;
     scope.executions[0].conflictHighWater = 3;
     const page = await readLegacyPage(source, scope);
@@ -1947,14 +1947,24 @@ describe.sequential("worker-only legacy backup and 0198 representation", () => {
       )!.reportText,
     ).toBe(worker.body);
     await client.sql`UPDATE public.progressive_worker_report_conflicts SET body_source_sequence=2 WHERE sim_job_id=${executionId}`;
-    await expect(readLegacyPage(source, scope)).rejects.toThrow(
-      /missing source/,
-    );
+    await expect(readLegacyPage(source, scope)).rejects.toMatchObject({
+      details: {
+        operation: "worker_read",
+        category: "origin_unavailable",
+        member: { executionId, kind: "conflict", sequence: 3 },
+      },
+      retryable: false,
+    });
     await client.sql`UPDATE public.progressive_worker_report_conflicts SET body_source_sequence=3 WHERE sim_job_id=${executionId}`;
     await client.sql`UPDATE public.progressive_worker_reports SET archive_bundle_id=${randomUUID()} WHERE sim_job_id=${executionId} AND sequence=3`;
-    await expect(readLegacyPage(source, scope)).rejects.toThrow(
-      /cold or missing/,
-    );
+    await expect(readLegacyPage(source, scope)).rejects.toMatchObject({
+      details: {
+        operation: "worker_read",
+        category: "origin_unavailable",
+        member: { executionId, kind: "conflict", sequence: 3 },
+      },
+      retryable: false,
+    });
   });
 
   it("copies every sparse report/conflict, resumes after failure and preserves exact queries without a dispatch or cloud reader", async () => {

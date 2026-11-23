@@ -286,3 +286,22 @@ it("keeps the existing SSH command and refuses unsafe host/container inputs with
     () => new LegacySshReader("existing-worker-alias", "postgres;bad"),
   ).toThrow();
 });
+
+it("only shares a signed result after matching its complete PG bytes and canonical envelope prefix", async () => {
+  const { LegacyOriginSigner } = await import("@aerodb/db/legacy-report-signature");
+  const { parseReportJson, canonicalReportJson, reportTextIdentity } = await import("@aerodb/db/progressive-report-archive");
+  const signer = new LegacyOriginSigner();
+  const solver = "owner", job = "job";
+  const body = (seq: number, result: string, extra = "") =>
+    `{"result": ${result}, "solverId": "owner", "executionId": "job", "sequence": ${seq}${extra}}`;
+  const signed = (text: string) => reportTextIdentity(canonicalReportJson(parseReportJson(text))).sha256;
+  const result = '{"wide": 90071992547409931234567891}';
+  for (const [index, text] of [
+    body(1, result), body(2, result), body(3, result, ', "before": null'),
+    body(4, result.replace("7891", "7892")), body(5, result, ', "nested": {"result":null}'), body(6, "null"),
+  ].entries()) {
+    expect(signer.matches(text, job, solver, index + 1, signed(text))).toBe(true);
+    expect(signer.matches(text, job, solver, index + 1, "0".repeat(64))).toBe(false);
+    expect(signer.matches(text, job, "different", index + 1, signed(text))).toBe(false);
+  }
+});
