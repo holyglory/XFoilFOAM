@@ -68,7 +68,7 @@ vi.mock("../src/db", () => ({
     },
   ),
 }));
-import { listAirfoils } from "../src/services/catalog";
+import { listAirfoilPage, listAirfoils } from "../src/services/catalog";
 import { assembleDetail } from "../src/services/detail";
 import { registerRoutes } from "../src/routes";
 
@@ -1107,7 +1107,25 @@ async function verifyPublicCatalog(fullScale: boolean) {
           source: "prediction",
           modelId: first.predictionId,
         });
-        if (!fullScale) throw rollback;
+        if (!fullScale) {
+          const opts = { q: prefix, sort: "ldmax", limit: 1, includePoints: false };
+          const previous = await listAirfoilPage(opts);
+          // These newly added profiles precede the metric leaders in name order.
+          // The response ceiling must never become a pre-ranking candidate ceiling.
+          await connection.execute(sql`
+            INSERT INTO airfoils(slug,name,category_id,points)
+            SELECT ${prefix + "-added-"} || n, ${prefix + "000"} || n, category_id, points
+            FROM airfoils CROSS JOIN generate_series(1,5001) n WHERE id=${profiles[0]}::uuid`);
+          const expanded = await listAirfoilPage(opts);
+          expect(expanded.total).toBe(previous.total + 5001);
+          expect(expanded.items).toEqual(previous.items);
+          expect(expanded.rankingId).not.toBe(previous.rankingId);
+          const keys = await listAirfoilPage({ q: prefix, keysOnly: true });
+          expect(keys.items).toHaveLength(expanded.total);
+          expect(new Set(keys.items.map((key) => key.id)).size).toBe(expanded.total);
+          expect(keys.items).toContainEqual({ id: profiles[2], slug: prefix + "Missing" });
+          throw rollback;
+        }
         phase("small-correctness:done");
         const scalePrefix = `${prefix}-scale-`;
         phase("profiles:start");
