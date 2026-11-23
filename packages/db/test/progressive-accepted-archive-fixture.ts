@@ -21,7 +21,18 @@ export async function verifyProgressiveAcceptedArchiveReplay(
     await db.transaction(async (transaction) => {
       const connection = transaction as unknown as DB;
       const report = structuredClone(reported);
-      const point = report.result!.polars[0].attempts![0];
+      const polar = report.result!.polars[0];
+      const point = polar.attempts![0];
+      const nu = envelope.request.fluid!.kinematic_viscosity!;
+      polar.reynolds = polar.speed * polar.chord / nu;
+      delete polar.mach;
+      // Match the engine's explicit output fields before this report is
+      // signed. The attempt projector adds the job-level recovery version.
+      point.fidelity = "rans";
+      point.frame_track = null;
+      point.steady_history = null;
+      point.quality_warnings = [];
+      report.result!.mesh_recovery_version = envelope.request.expected_mesh_recovery_version ?? undefined;
       point.converged = true;
       point.stalled = false;
       point.error = null;

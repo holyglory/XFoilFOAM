@@ -178,3 +178,54 @@ it("bounds a stalled restore, aborts the transport and preserves the archived ro
     expect(await db.execute(sql`SELECT to_jsonb(report.*) AS row FROM ${table} report`)).toEqual(before);
   });
 });
+
+it("shares only concurrent authenticated reads of the same exact remote member and discards failures", async () => {
+  await isolated(async (db) => {
+    const { report, reference } = await fixture(db, "remote");
+    const archived = await archiveReportFixture(db, "remote", reference.executionId, reference.sequence);
+    const owner = { solverId: report.solverId, promiseId: report.promiseId, assignmentSignature: report.assignmentSignature };
+    const gate = () => {
+      let release!: () => void;
+      const pending = new Promise<void>((r) => { release = r; });
+      return { pending, release };
+    };
+    for (const damaged of [false, true]) {
+      const opened = gate(), finish = gate(), selected = gate();
+      const read = vi.fn(async () => {
+        opened.release();
+        await finish.pending;
+        return damaged ? archived.text + " " : archived.text;
+      });
+      installProgressiveReportArchiveReader({ read });
+      const secondDb = new Proxy(db, {
+        get(target, key) {
+          if (key !== "execute") return Reflect.get(target, key);
+          return async (query: Parameters<DB["execute"]>[0]) => {
+            const rows = await target.execute(query);
+            selected.release();
+            return rows;
+          };
+        },
+      });
+      const first = readProgressiveReport(db, reference, owner);
+      await opened.pending;
+      const second = readProgressiveReport(secondDb, reference, owner);
+      const both = Promise.allSettled([first, second]);
+      await selected.pending;
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      try {
+        await expect(readProgressiveReport(db, reference, { ...owner, solverId: randomUUID() })).rejects.toThrow(/another dispatch/);
+        expect(read).toHaveBeenCalledTimes(1);
+      } finally { finish.release(); }
+      const results = await both;
+      expect(results.map((r) => r.status)).toEqual(damaged ? ["rejected", "rejected"] : ["fulfilled", "fulfilled"]);
+      if (!damaged) {
+        expect(results[0]).toMatchObject({ value: report });
+        if (results[0]!.status === "fulfilled") expect(Object.isFrozen(results[0]!.value.status)).toBe(true);
+      }
+      read.mockResolvedValueOnce(archived.text);
+      await expect(readProgressiveReport(db, reference, owner)).resolves.toEqual(report);
+      expect(read).toHaveBeenCalledTimes(2);
+    }
+  });
+});

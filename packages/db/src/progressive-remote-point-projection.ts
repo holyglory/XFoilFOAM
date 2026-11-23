@@ -10,13 +10,33 @@ import {
   steadyHistoryForPoint,
 } from "../../engine-client/src";
 
-export function progressiveRemotePointProjection(
-  source: NonNullable<
-    Awaited<ReturnType<typeof resolveProgressiveRemoteEvidence>>
-  >,
+type ReportedSource = NonNullable<
+  Awaited<ReturnType<typeof resolveProgressiveRemoteEvidence>>
+>;
+type PhysicalPolar = Pick<
+  ReportedSource["polar"],
+  "speed" | "chord" | "reynolds" | "mach"
+>;
+
+export function progressiveRemotePointProjection(source: ReportedSource) {
+  return projectSignedProgressivePoint(
+    source.point,
+    source.polar,
+    source.envelope,
+    source.report.result!.engine,
+    source.report.result!.mesh_recovery_version,
+  );
+}
+
+/** Inputs are the original signed point, physical polar and dispatch. */
+export function projectSignedProgressivePoint(
+  point: ReportedSource["point"],
+  polar: PhysicalPolar,
+  envelope: ReportedSource["envelope"],
+  resultEngine: NonNullable<ReportedSource["report"]["result"]>["engine"],
+  meshRecoveryVersion: number | null | undefined,
 ) {
-  const { point, polar, report, envelope } = source;
-  const context = `progressive remote ${report.executionId}/${point.case_slug ?? "unidentified-case"}/${point.aoa_deg}`;
+  const context = `progressive remote ${envelope.scope.executionId}/${point.case_slug ?? "unidentified-case"}/${point.aoa_deg}`;
   const transient =
     typeof envelope.request.solver?.force_transient === "boolean"
       ? envelope.request.solver.force_transient
@@ -65,14 +85,14 @@ export function progressiveRemotePointProjection(
     frameTrack: frameTrack as Record<string, unknown> | null,
     steadyHistory: steadyHistory as Record<string, unknown> | null,
     methodKey: point.method_key ?? null,
-    engine: point.engine ?? report.result!.engine ?? null,
-    engineJobId: report.executionId,
+    engine: point.engine ?? resultEngine ?? null,
+    engineJobId: envelope.scope.executionId,
     engineCaseSlug: point.case_slug ?? null,
     evidencePayload: solverPointEvidencePayload(point, {
       fidelity,
       frameTrack,
       steadyHistory,
-      meshRecoveryVersion: report.result!.mesh_recovery_version,
+      meshRecoveryVersion,
     }),
     forceHistory: rawHistory
       ? {

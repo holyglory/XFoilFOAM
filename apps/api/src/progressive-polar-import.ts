@@ -75,13 +75,19 @@ export async function prepareProgressivePolarImport(
       engineCaseSlug: point.engineCaseSlug ?? null,
       progressiveEvidence: reference,
     }).catch((error: unknown) => {
-      if (reference && error instanceof ProgressiveReportArchiveTimeout)
-        Object.assign(error, { requestedPoint: {
-          promiseId: payload.promiseId,
-          pointContentSignature: reference.pointContentSignature,
-          remoteResultId: point.remoteResultId,
-          remoteResultAttemptId: point.remoteResultAttemptId,
-        } });
+      if (reference && error instanceof ProgressiveReportArchiveTimeout) {
+        // A single verified-member read can serve two independently requested
+        // points. Preserve each request's own identity on its logging error.
+        throw Object.assign(new Error(error.message, { cause: error }), {
+          member: error.member,
+          requestedPoint: {
+            promiseId: payload.promiseId,
+            pointContentSignature: reference.pointContentSignature,
+            remoteResultId: point.remoteResultId,
+            remoteResultAttemptId: point.remoteResultAttemptId,
+          },
+        });
+      }
       throw error;
     });
     if (!source) {

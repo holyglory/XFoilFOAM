@@ -27,6 +27,7 @@ import {
   settleProgressiveRemoteJob,
 } from "../../sweeper/src/progressive-remote-settlement";
 import { verifyProgressivePublicationPrecedence } from "./progressive-publication-settlement-fixture";
+import { verifyOriginalPointReceiptReturn } from "./retained-polar-point-fixture";
 import { verifyCancelledReportCopyReplay } from "./cancelled-report-copy-fixture";
 
 export async function verifyProgressivePolarArchiveImport(input: {
@@ -270,6 +271,8 @@ export async function verifyProgressivePolarArchiveImport(input: {
                 attemptIds: [input.retained.resultAttemptId],
               }),
             ).toBe(true);
+            await verifyOriginalPointReceiptReturn(connection, input.app, input.token, input.payload.sourceInstanceId!,
+              input.delivery, input.setConnection);
           }
           const accepted = await post();
           expect(accepted.statusCode, accepted.body).toBe(200);

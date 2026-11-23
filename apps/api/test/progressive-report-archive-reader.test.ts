@@ -7,7 +7,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { PassThrough, Readable } from "node:stream";
 import { gzipSync } from "node:zlib";
 import { beforeEach, expect, it, vi } from "vitest";
-import { readProgressiveReportArchive } from "../src/progressive-report-archive-reader";
+import { readProgressiveReportArchive, verifyRetainedReportGeneration } from "../src/progressive-report-archive-reader";
 
 const gcs = vi.hoisted(() => ({
   bucket: vi.fn(),
@@ -181,4 +181,35 @@ it("stops a pinned object stream at the report deadline and never opens media af
   gcs.getMetadata.mockImplementationOnce(async () => { later.abort(); return [metadata]; });
   await expect(readProgressiveReportArchive({ ...identity, signal: later.signal })).rejects.toMatchObject({ name: "AbortError" });
   expect(gcs.read).toHaveBeenCalledTimes(1);
+});
+
+it("keeps the point attribution of each request when a shared archive read times out", async () => {
+  const { identity } = fixture("remote");
+  const { ProgressiveReportArchiveTimeout } = await import("@aerodb/db/progressive-report-reader");
+  const resolver = await import("@aerodb/db/progressive-remote-evidence");
+  const { prepareProgressivePolarImport } = await import("../src/progressive-polar-import");
+  const timeout = new ProgressiveReportArchiveTimeout({ ...identity, sourceKind: "remote", memberKind: "report", signal: new AbortController().signal });
+  const read = vi.spyOn(resolver, "prepareProgressiveRemoteEvidence").mockRejectedValue(timeout);
+  const ids = [randomUUID(), randomUUID()];
+  try {
+    const failures = await Promise.allSettled(ids.map((remoteResultAttemptId) => prepareProgressivePolarImport(
+      {} as import("@aerodb/db/client").DB, { promiseId: randomUUID(), results: [{ remoteResultAttemptId, remoteResultId: randomUUID(),
+        engineJobId: identity.executionId, aoaDeg: 1, progressiveEvidence: { sequence: identity.sequence,
+          pointContentSignature: "a".repeat(64), reportContentSignature: identity.signature } }] }, randomUUID(),
+    )));
+    failures.forEach((failure, index) => expect(failure).toMatchObject({ status: "rejected", reason: {
+      message: timeout.message, member: timeout.member, requestedPoint: { remoteResultAttemptId: ids[index] },
+    } }));
+    expect(timeout).not.toHaveProperty("requestedPoint");
+  } finally { read.mockRestore(); }
+});
+
+it("verifies the complete previously authenticated compressed generation before reusing a point", async () => {
+  const { identity } = fixture("remote");
+  await expect(verifyRetainedReportGeneration(identity)).resolves.toBeUndefined();
+  gcs.read.mockImplementationOnce(() => Readable.from([Buffer.alloc(identity.storedByteSize)]));
+  await expect(verifyRetainedReportGeneration(identity)).rejects.toThrow("stored-byte proof");
+  gcs.read.mockImplementationOnce(() => Readable.from([Buffer.alloc(identity.storedByteSize + 1)]));
+  await expect(verifyRetainedReportGeneration(identity)).rejects.toThrow("registered size");
+  await expect(verifyRetainedReportGeneration({ ...identity, sourceKind: "worker" })).rejects.toThrow("hub report");
 });

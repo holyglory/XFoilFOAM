@@ -1,3 +1,4 @@
+import type { storedProgressivePointReceipt } from "@aerodb/db/progressive-remote-evidence-receipts";
 import { sql } from "drizzle-orm";
 import { z } from "zod";
 import type { DB } from "@aerodb/db/client";
@@ -127,4 +128,26 @@ export async function readBoundPolarReplayReceipt(
     },
     { isolationLevel: "repeatable read", accessMode: "read only" },
   );
+}
+
+export function originalPolarReceiptResponse(
+  original: ReturnType<typeof storedProgressivePointReceipt>,
+  promiseId: string,
+  aoaDeg: number,
+) {
+  return {
+    imported: 0,
+    attempts: 0,
+    artifacts: 0,
+    media: 0,
+    fieldExtents: 0,
+    fieldColorScales: 0,
+    conflictIds: [],
+    promiseId,
+    fulfilledAoas: [],
+    unfulfilledAoas: [aoaDeg],
+    bindingReceipts: [],
+    progressiveArchiveReceipts: [],
+    progressiveEvidenceReceipts: [original],
+  };
 }

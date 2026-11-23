@@ -117,12 +117,19 @@ async function sourceAndReceipt(
     source,
     receiptSignature: receipt ? String(receipt.anchor_signature) : null,
     receipt: receipt
-      ? {
+      ? storedProgressivePointReceipt(receipt, input.engineJobId, source.contentSignature)
+      : null,
+  };
+}
+
+/** Project an existing receipt row with its verified execution and point. */
+export function storedProgressivePointReceipt(receipt: Record<string, unknown>, executionId: string, pointContentSignature: string) {
+  return {
           version: 1 as const,
           kind: "retained-progressive-attempt" as const,
-          executionId: input.engineJobId,
+          executionId,
           sequence: Number(receipt.sequence),
-          pointContentSignature: source.contentSignature,
+          pointContentSignature,
           resultId: String(receipt.result_id),
           resultAttemptId: String(receipt.result_attempt_id),
           remoteResultId: String(receipt.remote_result_id),
@@ -132,9 +139,7 @@ async function sourceAndReceipt(
             ? receipt.received_at
             : new Date(String(receipt.received_at))
           ).toISOString(),
-        }
-      : null,
-  };
+        };
 }
 
 async function assertSignedStorageBinding(
@@ -331,6 +336,54 @@ export async function readProgressiveRemoteEvidenceReceipt(
   return (await sourceAndReceipt(db, input)).receipt;
 }
 
+/** Replays authenticate all scientific scalar outputs as well as the
+ * complete application payload. Both the report and retained-source paths use this check. */
+export function assertProgressivePointMatchesAttempt(
+  attempt: typeof resultAttempts.$inferSelect,
+  projection: ReturnType<typeof progressiveRemotePointProjection>,
+  sourceHash: unknown,
+) {
+  const sourceFields = [
+    "aoaDeg",
+    "status",
+    "source",
+    "regime",
+    "cl",
+    "cd",
+    "cm",
+    "clCd",
+    "clStd",
+    "cdStd",
+    "cmStd",
+    "stalled",
+    "unsteady",
+    "converged",
+    "finalResidual",
+    "iterations",
+    "yPlusAvg",
+    "yPlusMax",
+    "nCells",
+    "firstOrderFallback",
+    "strouhal",
+    "error",
+    "qualityWarnings",
+    "methodKey",
+    "engineJobId",
+    "engineCaseSlug",
+  ] as const;
+  if (
+    sourceFields.some(
+      (key) =>
+        analysisContentHash(attempt[key] ?? null) !==
+        analysisContentHash(projection[key] ?? null),
+    ) ||
+    sourceHash !== analysisContentHash(projection.evidencePayload)
+  )
+    throw new Error(
+      "Progressive local attempt differs from its reported source values",
+    );
+}
+
 export async function assertProgressiveRemoteEvidenceAttempt(
   db: DB,
   input: ProgressiveRemoteEvidenceDelivery & {
@@ -396,45 +449,7 @@ export async function assertProgressiveRemoteEvidenceAttempt(
   } else {
     sourceHash = analysisContentHash(attempt.evidencePayload);
   }
-  const sourceFields = [
-    "aoaDeg",
-    "status",
-    "source",
-    "regime",
-    "cl",
-    "cd",
-    "cm",
-    "clCd",
-    "clStd",
-    "cdStd",
-    "cmStd",
-    "stalled",
-    "unsteady",
-    "converged",
-    "finalResidual",
-    "iterations",
-    "yPlusAvg",
-    "yPlusMax",
-    "nCells",
-    "firstOrderFallback",
-    "strouhal",
-    "error",
-    "qualityWarnings",
-    "methodKey",
-    "engineJobId",
-    "engineCaseSlug",
-  ] as const;
-  if (
-    sourceFields.some(
-      (key) =>
-        analysisContentHash(attempt[key] ?? null) !==
-        analysisContentHash(projection[key] ?? null),
-    ) ||
-    sourceHash !== analysisContentHash(projection.evidencePayload)
-  )
-    throw new Error(
-      "Progressive local attempt differs from its reported source values",
-    );
+  assertProgressivePointMatchesAttempt(attempt, projection, sourceHash);
   if (input.recoveryScope) {
     const [revision] = await db.execute(sql`
       SELECT snapshot FROM simulation_preset_revisions

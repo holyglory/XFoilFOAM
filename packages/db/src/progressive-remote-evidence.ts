@@ -1,4 +1,5 @@
 import {
+  freezeProgressiveReport,
   recheckRemoteReportMember,
   resolveStoredProgressiveReport,
   verifiedProgressiveReportMember,
@@ -45,13 +46,6 @@ const preparedReports = new WeakMap<
     member?: { proof: VerifiedMember; source: PointSource };
   }
 >();
-
-function freezeReport(value: unknown): void {
-  if (value === null || typeof value !== "object" || Object.isFrozen(value))
-    return;
-  Object.freeze(value);
-  for (const child of Object.values(value)) freezeReport(child);
-}
 
 export function prepareProgressiveRemoteEvidence(db: DB, input: EvidenceInput) {
   if (input.progressiveEvidence)
@@ -145,6 +139,7 @@ async function resolveEvidence(
       "remote",
       stored,
       input.engineJobId,
+      prepare ? { solverId: envelope.solverId, promiseId: envelope.promiseId, assignmentSignature: envelope.contentSignature } : undefined,
     ));
   const validated = validateProgressiveRemoteReport(report, envelope);
   if (
@@ -182,7 +177,7 @@ async function resolveEvidence(
         );
       // Consumers retain the same point and polar objects as the verified report.
       // Freeze before sharing them across checks inside this one import.
-      freezeReport(validated.report);
+      freezeProgressiveReport(validated.report);
       preparedReports.set(reference, {
         report: validated.report,
         member: { proof, source: { ...selected } },
@@ -195,9 +190,7 @@ async function resolveEvidence(
 }
 
 export function assertProgressiveReportedManifest(
-  source: NonNullable<
-    Awaited<ReturnType<typeof resolveProgressiveRemoteEvidence>>
-  >,
+  source: Pick<PointSource, "point">,
   input: { manifestSha256: string; manifestByteSize: number },
 ) {
   const manifests =
