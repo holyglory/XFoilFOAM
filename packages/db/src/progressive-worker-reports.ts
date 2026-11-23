@@ -6,6 +6,7 @@ import type { DB } from "./client";
 import { canonicalAnalysisJson } from "./analysis-target";
 import {
   MAX_PROGRESSIVE_PUBLICATION_REPORTS,
+  canRepeatLiveReport,
   sameLiveProgressStatus,
   type ProgressiveReportStatusUpdate,
 } from "./progressive-report-publication-batch";
@@ -447,27 +448,33 @@ export async function readPendingProgressiveWorkerReport(
     : null;
 }
 
-/** Only the uninterrupted prefix sharing the actual immutable PG result may follow this head. */
+/** Only consecutive envelopes with the same stored result or the same explicit
+ * absence of a result may follow this head. Archived headers need normal replay. */
 export async function readPendingProgressiveReportUpdates(
   db: DB,
   anchor: ProgressiveRemoteReport,
   contentSignature: string,
 ): Promise<ProgressiveReportStatusUpdate[]> {
-  if (anchor.stopProof !== null || anchor.status.state !== "running" || anchor.result?.state !== "running")
-    return [];
+  if (!canRepeatLiveReport(anchor)) return [];
+  const statusOnly = anchor.result === null;
+  const inlineNullResult = sql`stored.archived_at IS NULL AND stored.result_payload_hash IS NULL
+    AND stored.report->'result'='null'::jsonb AND stored.report->'stopProof'='null'::jsonb`;
   const rows = await db.execute(sql`
     WITH source AS (
-      SELECT result_payload_hash FROM progressive_worker_reports
+      SELECT result_payload_hash FROM progressive_worker_reports stored
       WHERE sim_job_id=${anchor.executionId}::uuid AND sequence=${anchor.sequence}
-        AND content_signature=${contentSignature} AND result_payload_hash IS NOT NULL
+        AND content_signature=${contentSignature}
+        AND ${statusOnly ? inlineNullResult : sql`stored.result_payload_hash IS NOT NULL`}
     )
     SELECT w.sequence,w.content_signature,w.report->'status' AS status,
-      w.result_payload_hash=source.result_payload_hash AND w.acknowledged_at IS NULL
+      w.same_result AND w.acknowledged_at IS NULL
       AND w.report->'stopProof'='null'::jsonb
       AND w.report->>'executionId'=${anchor.executionId} AND w.report->>'solverId'=${anchor.solverId}
       AND w.report->>'promiseId'=${anchor.promiseId} AND w.report->>'assignmentSignature'=${anchor.assignmentSignature} AS same_source
     FROM source CROSS JOIN LATERAL (
-      SELECT sequence,content_signature,report,result_payload_hash,acknowledged_at FROM progressive_worker_reports
+      SELECT sequence,content_signature,report,acknowledged_at,
+        ${statusOnly ? inlineNullResult : sql`stored.result_payload_hash=source.result_payload_hash`} AS same_result
+      FROM progressive_worker_reports stored
       WHERE sim_job_id=${anchor.executionId}::uuid AND sequence>${anchor.sequence}
       ORDER BY sequence LIMIT ${MAX_PROGRESSIVE_PUBLICATION_REPORTS - 1}
     ) w ORDER BY w.sequence

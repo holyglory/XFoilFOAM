@@ -87,17 +87,9 @@ export async function publishProgressiveWorkerReport(
   const canBatch =
     singleReportPeer?.baseUrl !== baseUrl ||
     singleReportPeer.until <= Date.now();
-  const updates =
-    canBatch &&
-    pending.report.result?.state === "running" &&
-    pending.report.status.state === "running" &&
-    pending.report.stopProof === null
-      ? await readPendingProgressiveReportUpdates(
-          db,
-          validated.report,
-          pending.contentSignature,
-        )
-      : [];
+  const updates = canBatch
+    ? await readPendingProgressiveReportUpdates(db, validated.report, pending.contentSignature)
+    : [];
   const send = (batch: boolean) =>
     fetchProgressiveRemote(
       fetcher,

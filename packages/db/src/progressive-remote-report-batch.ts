@@ -98,8 +98,11 @@ export async function storeProgressiveRemoteReportBatch(
         "Remote report sender does not own the immutable dispatch",
       );
     signal?.throwIfAborted();
+    const statusOnly = anchor.result === null;
     const [source] = await tx.execute(sql`
       SELECT r.result_payload_hash,CASE WHEN r.result_payload_hash IS NOT NULL THEN r.report->'result' END AS header,
+        ${statusOnly ? sql`r.archived_at IS NULL AND r.result_payload_hash IS NULL
+          AND r.report->'result'='null'::jsonb AND r.report->'stopProof'='null'::jsonb` : sql`false`} AS inline_status_only,
         i.inventory_signature,i.source_count
       FROM progressive_remote_reports r JOIN progressive_remote_report_inventories i
         ON i.sim_job_id=r.sim_job_id AND i.sequence=r.sequence AND i.report_content_signature=r.content_signature
@@ -127,7 +130,7 @@ export async function storeProgressiveRemoteReportBatch(
         sources,
       });
     if (
-      sources.length !== Number(source.source_count) ||
+      (statusOnly && sources.length !== 0) || sources.length !== Number(source.source_count) ||
       inventorySignature(receipt.sequence, receipt.contentSignature) !==
         source.inventory_signature
     )
@@ -161,7 +164,7 @@ export async function storeProgressiveRemoteReportBatch(
         throw new ProgressiveRemoteReportConflict(
           "Remote reports must arrive in their durable publication order",
         );
-      if (typeof source.result_payload_hash !== "string" || !source.header)
+      if (statusOnly ? source.inline_status_only !== true : typeof source.result_payload_hash !== "string" || !source.header)
         throw new ProgressiveReportBatchUnavailable(
           "The original report needs single-report publication",
         );
