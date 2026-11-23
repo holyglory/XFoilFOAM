@@ -1,3 +1,4 @@
+import { nextCancelledReportCopies } from "../src/cancelled-report-copies";
 import { randomUUID } from "node:crypto";
 import { fork } from "node:child_process";
 import { once } from "node:events";
@@ -145,6 +146,17 @@ it("runs the stock recurring hub storage worker and serves both archive formats 
         },
       );
     }
+    // The 512-key lookahead must stop at the 32nd scientific source,
+    // even when an uninspected 33rd source is present in the same window.
+    const fullWindow = await nextCancelledReportCopies(db.db, {
+      executionId: originals[1].executionId,
+      sequence: 0,
+    });
+    expect(fullWindow.sequences).toEqual([]);
+    expect(fullWindow.after).toEqual({
+      executionId: originals[1].executionId,
+      sequence: 33,
+    });
     const physicalRead = (f: ArchiveFixture) => {
       const first = f.reports.findIndex((r) => r.payloadHash !== null);
       return f.reports[first + 1];
