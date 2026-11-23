@@ -1730,3 +1730,8 @@ it.runIf(process.env.WORKER_STAGING_KEYS_ACCEPTANCE === "1")(
   },
   180000,
 );
+
+it("retires an unstaged native report through its independent hub generation and both registered volume readers", async () => {
+  const { registeredWorkerRoundtrip } = await import("./registered-worker-report-fixture");
+  await withArchiveFixture(client, "worker", registeredWorkerRoundtrip, { normalized: false, settled: false, reportCount: 4 });
+});

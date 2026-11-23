@@ -26,6 +26,8 @@ export async function releaseUpstreamReadableVolume(db:DB, file:WorkerVolumeIden
         compression:String(row.compression),archiveFormat:String(row.archive_format),mimeType:String(row.mime_type),
         crc32c:String(row.crc32c), reportSha256:String(row.report_sha256),reportByteSize:Number(row.report_byte_size),signal
       };
+      // Hub-origin JSONL is only readable through this worker volume.
+      if(ref.archiveFormat==="jsonl" && ref.objectKey.endsWith(`/remote/${ref.executionId}/${ref.storedSha256}.jsonl.gz`)) return false;
       const raw=ref.archiveFormat==="legacy-jsonl" ? await readLegacyWorkerReportFromHub(db,ref)
         : await readWorkerReportArchiveText(db,ref,{upstreamOnly:true});
       const proof=reportTextIdentity(raw);

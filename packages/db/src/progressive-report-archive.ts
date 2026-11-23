@@ -603,13 +603,32 @@ export async function visitVerifiedWorkerReportArchive(
   limits: ProgressiveReportArchiveLimits,
   signal?: AbortSignal,
 ): Promise<void> {
+  return visitVerifiedSignedReportArchive("worker", source, identity, owner, visit, limits, signal);
+}
+
+/** A registered origin link keeps the hub's physical source kind. Both
+ * readers authenticate every signature and the complete generation at EOF. */
+export async function visitVerifiedSignedReportArchive(
+  sourceKind: "worker" | "remote",
+  source: Readable,
+  identity: ProgressiveReportArchiveStoredIdentity,
+  owner: {
+    executionId: string;
+    solverId: string;
+    promiseId: string;
+    assignmentSignature: string;
+  },
+  visit: (entry: ProgressiveReportArchiveEntry) => void | Promise<void>,
+  limits: ProgressiveReportArchiveLimits,
+  signal?: AbortSignal,
+): Promise<void> {
   let previous: { result: ReportJson; bytes: Buffer } | undefined;
   await consumeBundle(
     source,
     identity,
     (entry, _line, report) => {
       if (
-        entry.sourceKind !== "worker" ||
+        entry.sourceKind !== sourceKind ||
         entry.executionId !== owner.executionId ||
         report.executionId !== owner.executionId ||
         report.solverId !== owner.solverId ||
