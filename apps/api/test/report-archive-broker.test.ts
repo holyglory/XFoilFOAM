@@ -261,8 +261,8 @@ it("pins every metadata and media request to the exact uint64 generation string"
 
 it("serves a pinned read between delta members and refuses a forged final member", async () => {
   const f = await fixture();
-  const visit = archiveCodec.visitProgressiveReportArchive;
-  const observer = vi.spyOn(archiveCodec, "visitProgressiveReportArchive");
+  const visit = archiveCodec.visitVerifiedWorkerReportArchive;
+  const observer = vi.spyOn(archiveCodec, "visitVerifiedWorkerReportArchive");
   try {
     const source = f.bundle();
     const upload = (page: typeof source) =>
@@ -278,8 +278,8 @@ it("serves a pinned read between delta members and refuses a forged final member
     let visited = 0;
     let atReadStart: number | undefined;
     let pending: Promise<Awaited<ReturnType<typeof read>>> | undefined;
-    observer.mockImplementation((stream, identity, visitor, limits) =>
-      visit(stream, identity, async (...args) => {
+    observer.mockImplementation((stream, identity, owner, visitor, limits, signal) =>
+      visit(stream, identity, owner, async (...args) => {
         if (identity.storedSha256 === page.sha256 && ++visited === 1) {
           // A socket callback made runnable during the first member must get
           // a turn before the rest of this single decompressor chunk finishes.
@@ -289,7 +289,7 @@ it("serves a pinned read between delta members and refuses a forged final member
           });
         }
         await visitor(...args);
-      }, limits));
+      }, limits, signal));
     expect((await upload(page)).statusCode).toBe(200);
     const restored = await pending;
     expect(visited).toBe(reports.length);

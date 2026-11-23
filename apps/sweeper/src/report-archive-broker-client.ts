@@ -5,12 +5,8 @@ import { canonicalRemoteHubBaseUrl } from "@aerodb/core";
 import { verifyProgressiveRemoteExecution, type DB } from "@aerodb/db";
 import {
   assertProgressiveReportArchiveIdentity,
-  canonicalReportJson,
-  parseReportJson,
-  reportJsonObject,
   reportTextIdentity,
-  reportValidationValue,
-  visitProgressiveReportArchive,
+  visitVerifiedWorkerReportArchive,
   type ProgressiveReportArchiveReadIdentity,
   type ProgressiveReportArchiveStoredIdentity,
 } from "@aerodb/db/progressive-report-archive";
@@ -318,7 +314,9 @@ export async function readWorkerReportArchiveText(
       },
     );
     if (response.status === 403) {
-      const body = (await readArchiveBrokerResponse(response)) as { error?: unknown };
+      const body = (await readArchiveBrokerResponse(response)) as {
+        error?: unknown;
+      };
       if (body?.error === "fetch disabled for evidence_artifacts")
         throw new WorkerReportFetchDisabled();
       throw new Error("The registered worker has no access to this archive");
@@ -345,40 +343,17 @@ export async function readWorkerReportArchiveText(
     stream = Readable.fromWeb(response.body);
   }
   let found: string | undefined;
-  const abort = () =>
-    stream.destroy(new Error("Worker report archive restore was aborted"));
-  identity.signal?.addEventListener("abort", abort, { once: true });
   try {
-    if (identity.signal?.aborted)
-      throw new Error("Worker report archive restore was aborted");
-    await visitProgressiveReportArchive(
+    await visitVerifiedWorkerReportArchive(
       stream,
       identity,
+      {
+        executionId: identity.executionId,
+        solverId: owned.envelope.solverId,
+        promiseId: owned.envelope.promiseId,
+        assignmentSignature: owned.envelope.contentSignature,
+      },
       (entry) => {
-        const parsed = reportJsonObject(parseReportJson(entry.reportText));
-        const report = reportValidationValue(parsed) as Record<string, unknown>;
-        if (
-          entry.sourceKind !== "worker" ||
-          entry.executionId !== identity.executionId ||
-          !report ||
-          Array.isArray(report) ||
-          typeof report !== "object" ||
-          canonicalReportJson(parsed.version!) !== "1" ||
-          report.executionId !== identity.executionId ||
-          report.solverId !== owned.envelope.solverId ||
-          report.promiseId !== owned.envelope.promiseId ||
-          report.assignmentSignature !== owned.envelope.contentSignature ||
-          canonicalReportJson(parsed.sequence!) !== String(entry.sequence)
-        )
-          throw new Error(
-            "Worker report archive member changed its exact dispatch scope",
-          );
-        const bytes = Buffer.from(canonicalReportJson(parsed), "utf8");
-        const signature = createHash("sha256").update(bytes).digest("hex");
-        if (signature !== entry.contentSignature)
-          throw new Error(
-            "Worker report archive member failed content verification",
-          );
         if (
           entry.kind === identity.memberKind &&
           entry.sequence === identity.sequence &&
@@ -400,9 +375,9 @@ export async function readWorkerReportArchiveText(
         maxDecodedBytes: MAX_JSON_BYTES,
         maxReportBytes: MAX_LINE_BYTES,
       },
+      identity.signal,
     );
   } finally {
-    identity.signal?.removeEventListener("abort", abort);
     stream.destroy();
   }
   if (found === undefined)
