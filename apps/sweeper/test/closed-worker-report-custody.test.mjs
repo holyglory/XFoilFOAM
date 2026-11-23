@@ -7,7 +7,7 @@ import {
 import { CRC32C } from "@google-cloud/storage";
 import { sql } from "drizzle-orm";
 import { createHash, randomUUID } from "node:crypto";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Readable } from "node:stream";
@@ -22,12 +22,14 @@ import {
 const client = createClient({ max: 1 });
 afterAll(() => client.sql.end());
 it.each([
-  [false, false],
-  [true, false],
-  [false, true],
+  [false, false, false],
+  [true, false, false],
+  [false, true, false],
+  [false, false, true],
+  [true, true, false, true],
 ])(
-  "restores a signed source-only original and conserves earlier native and hub science, normalized=%s, grouped=%s",
-  async (normalized, grouped) => {
+  "restores signed native-only reports without changing points, normalized=%s grouped=%s laterWitness=%s sparse=%s",
+  async (normalized, grouped, laterWitness, sparse = false) => {
     if (process.env.PROGRESSIVE_REPORT_ARCHIVE_DISPOSABLE_DB !== "1")
       throw new Error("Disposable governed PostgreSQL required");
     await withArchiveFixture(
@@ -36,7 +38,7 @@ it.each([
       async (f) => {
         const db = f.db,
           id = f.executionId,
-          origin = f.reports[1],
+          origin = f.reports[laterWitness ? 3 : 1],
           target = f.reports[2];
         const key = {
           executionId: id,
@@ -64,8 +66,13 @@ it.each([
         const upstream = "https://source-report-fixture.invalid/api/sync/v1",
           bucket = "source-report-test";
         const volume = await mkdtemp(join(tmpdir(), "closed-report-"));
+        const comparison = { api: new Map(), sweeper: new Map() };
         const run = (op, fields = {}, connection = db) =>
-          runClosedReportPeer(connection, { op, key, scope, ...fields });
+          runClosedReportPeer(
+            connection,
+            { op, key, scope, ...fields },
+            op === "read" ? comparison[fields.reader] : undefined,
+          );
         const sha = (bytes) => createHash("sha256").update(bytes).digest("hex");
         let packed,
           puts = 0;
@@ -101,7 +108,7 @@ it.each([
               },
             }),
           ).rejects.toThrow("Frozen sequence");
-          await expect(run("source")).rejects.toThrow("earlier native science");
+          await expect(run("source")).rejects.toThrow("settled native science");
           await db.execute(
             sql`INSERT INTO progressive_worker_evidence_receipts(sim_job_id,sequence,content_signature) VALUES(${id}::uuid,${origin.sequence},${origin.contentSignature})`,
           );
@@ -114,6 +121,7 @@ it.each([
             source = initial.source;
           expect(source.facts.sha256).toBe(sha(target.text));
           expect(source.anchors[0].workerStatus).toBe("failed");
+          expect(source.anchors[0].sequence).toBe(origin.sequence);
           expect(target.text).toContain(LARGE_REPORT_INTEGER);
           // Two independent database roles on one disposable PG. Roll the hub snapshot back before HZ writes.
           const asHub = async (work) => {
@@ -154,7 +162,7 @@ it.each([
                 await tx.execute(sql`INSERT INTO progressive_remote_report_sources(sim_job_id,sequence,point_content_signature,aoa_deg,case_slug)
             VALUES(${id}::uuid,${origin.sequence},${point},0,'archive-case')`);
                 await expect(run("hub", { source }, tx)).rejects.toThrow(
-                  "every earlier scientific source",
+                  "every settled scientific source",
                 );
                 await tx.execute(sql`INSERT INTO progressive_remote_evidence_receipts(sim_job_id,sequence,point_content_signature,result_attempt_id,remote_result_attempt_id,remote_result_id)
             VALUES(${id}::uuid,${origin.sequence},${point},${hubAttempt}::uuid,${workerAttempt}::uuid,${result}::uuid)`);
@@ -201,8 +209,8 @@ it.each([
               key,
               {
                 executionId: id,
-                sequence: f.reports[3].sequence,
-                signature: f.reports[3].contentSignature,
+                sequence: f.reports[sparse ? 4 : 3].sequence,
+                signature: f.reports[sparse ? 4 : 3].contentSignature,
               },
             ];
             const native = await run("source", {
@@ -328,6 +336,29 @@ it.each([
               "retired",
             ]);
             expect(new Set(released.map((r) => r.bundle)).size).toBe(1);
+            // Corrupt the same physical generation after the comparison basis has been saved.
+            // Even a warmed ordinary reader must fail until its actual signed bytes are restored.
+            const generationPath = join(
+              volume,
+              head.storedSha256.slice(0, 2),
+              head.storedSha256 + ".jsonl.gz",
+            );
+            const bad = Buffer.from(packed);
+            bad[bad.length - 1] ^= 1;
+            await writeFile(generationPath, bad);
+            await expect(
+              run("read", { items: pinned, reader: "api", committed: true }),
+            ).rejects.toThrow();
+            await writeFile(generationPath, packed);
+            if (sparse) {
+              const untouched = await db.execute(
+                sql`SELECT archived_at,archive_bundle_id FROM progressive_worker_reports WHERE sim_job_id=${id}::uuid AND sequence=4`,
+              );
+              expect(untouched[0]).toEqual({
+                archived_at: null,
+                archive_bundle_id: null,
+              });
+            }
             for (const reader of ["sweeper", "api"])
               expect(
                 (
@@ -390,7 +421,7 @@ it.each([
           await rm(volume, { recursive: true, force: true });
         }
       },
-      { normalized, settled: false, reportCount: 5 },
+      { normalized, settled: false, reportCount: sparse ? 6 : 5 },
     );
   },
   30000,
