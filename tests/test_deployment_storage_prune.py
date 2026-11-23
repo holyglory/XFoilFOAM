@@ -333,3 +333,175 @@ def test_only_the_solver_compose_services_default_to_no_core_files() -> None:
             assert limits["core"] == {"soft": "${AIRFOILFOAM_SOLVER_CORE_SOFT_BYTES:-0}",
                                       "hard": "${AIRFOILFOAM_SOLVER_CORE_HARD_BYTES:--1}"}
             assert limits["nofile"] == {"soft": 65536, "hard": 524288}
+
+
+@pytest.fixture(scope="session")
+def ordinary_linux_core(tmp_path_factory):
+    """A real native process dump, containing only a disposable test process."""
+    import resource
+    d = tmp_path_factory.mktemp("ordinary-elf-core")
+    exe = d / "crash-fixture"
+    subprocess.run(["cc", "-x", "c", "-", "-o", str(exe)],
+                   input="#include <stdlib.h>\nint main(void){abort();}\n", text=True, check=True)
+    def enable_core():
+        _, hard = resource.getrlimit(resource.RLIMIT_CORE)
+        resource.setrlimit(resource.RLIMIT_CORE, (hard, hard))
+    crashed = subprocess.run([str(exe)], cwd=d, env={"PATH":os.defpath}, preexec_fn=enable_core)
+    assert crashed.returncode < 0
+    dumps = [f for f in d.iterdir() if f.name == "core" or f.name.startswith("core.")]
+    if not dumps:
+        dump = d / "core.1"
+        subprocess.run(["gdb", "-nx", "-batch", "-ex", "run", "-ex", "generate-core-file "+str(dump),
+                        "--args", str(exe)], cwd=d, env={"PATH":os.defpath}, check=True, capture_output=True)
+        dumps = [dump]
+    assert len(dumps) == 1 and dumps[0].read_bytes()[:4] == b"\x7fELF"
+    return dumps[0]
+
+
+@pytest.fixture
+def core_case(tmp_path, monkeypatch, ordinary_linux_core):
+    import json
+    import uuid
+    import importlib
+    from contextlib import contextmanager
+    monkeypatch.syspath_prepend(str(ROOT / "scripts/deploy"))
+    m = importlib.import_module("solver_core_maintenance")
+    files = importlib.import_module("solver_core_files")
+    job = str(uuid.uuid4())
+    volume = tmp_path/"volume"/"_data"; root = volume/"jobs"/job; case=root/"cases"/"c1_u30"
+    case.mkdir(parents=True); (root/".execute.lock").touch()
+    (root/"result.json").write_text(json.dumps({"state":"completed","polars":[{"points":[{"aoa_deg":2,"cl":0.42}]}]}))
+    (root/"status.json").write_text('{"state":"completed"}'); (case/"log.simpleFoam").write_text("end of fixture\n")
+    dump=case/"core.321";shutil.copyfile(ordinary_linux_core,dump)
+    row=dict(j=job,r="cases/c1_u30/core.321",**files.file_id(dump.stat()))
+    class Db:
+        closed=True
+        refs=[]
+        @contextmanager
+        def fence(self, ids):
+            yield {job:{"closed":self.closed,"owner":{"id":job},"refs":list(self.refs)}}
+        def references(self, ids):return [{"native":job,"case":c,"ref":v}for c,v in self.refs]
+        def science(self,native,owner):return {"owner":owner,"cl":0.42}
+    db=Db();state=tmp_path/"state"
+    def process(mode, survey=lambda *_:{}):
+        return m.process_batch(db,volume,state,[row],mode,None,survey=survey,
+             service_science=lambda _,j:json.loads((volume/"jobs"/j/"result.json").read_text()))
+    return files,m,job,volume,case,dump,row,state,db,process
+
+
+def test_core_quarantine_canary_release_and_replay_conserve_the_native_job(core_case):
+    import hashlib
+    f,m,j,vol,case,dump,row,state,db,process=core_case
+    before=m.native_science(vol,j);signature=hashlib.sha256(dump.read_bytes()).hexdigest()
+    canary=process("canary")[0]
+    assert canary["state"]=="restored" and canary["sha256"]==signature and canary["allocated"]==0
+    assert (dump.stat().st_dev,dump.stat().st_ino)==(row["dev"],row["ino"])
+    assert hashlib.sha256(dump.read_bytes()).hexdigest()==signature
+    assert canary["scientificProof"]["files"]==before
+    actual=process("release")[0]
+    assert actual["state"]=="released" and actual["allocated"]==row["allocated"] and not dump.exists()
+    assert m.native_science(vol,j)==before and process("release")[0]["allocated"]==0
+
+
+@pytest.mark.parametrize("hold",["db-open","execution-lock","manifest","db-source","diagnostic","forensic","open-fd","hardlink","symlink","wrong-inode","non-elf"])
+def test_core_guards_retain_exact_or_replaced_bytes(core_case,hold):
+    f,m,j,vol,case,dump,row,state,db,process=core_case
+    root=vol/"jobs"/j; lock=None; process_fd=None
+    try:
+        if hold=="db-open":db.closed=False
+        elif hold=="execution-lock":
+            lock=(root/".execute.lock").open("r");fcntl.flock(lock,fcntl.LOCK_EX)
+        elif hold=="manifest":
+            dest=case/"evidence"/"a2";dest.mkdir(parents=True)
+            (dest/"evidence_manifest.json").write_text('{"files":[{"sourcePath":"cases/c1_u30/core.321"}]}')
+        elif hold=="db-source":db.refs=[("c1_u30",{"file":"/jobs/"+j+"/files/cases/c1_u30/core.321"})]
+        elif hold=="diagnostic":(root/".retain-solver-core-dumps").touch()
+        elif hold=="forensic":(case/"incomplete_evidence_quarantine.receipt.json").write_text("{}")
+        elif hold=="open-fd":
+            import sys
+            process_fd=subprocess.Popen([sys.executable,"-I","-c","import sys,time;f=open(sys.argv[1],'rb');print('open',flush=True);time.sleep(25)",str(dump)],stdout=subprocess.PIPE,text=True)
+            assert process_fd.stdout.readline().strip()=="open"
+        elif hold=="hardlink":os.link(dump,case/"also-needed")
+        elif hold=="symlink":dump.rename(case/"real");dump.symlink_to("real")
+        elif hold=="wrong-inode":row["ino"]+=1
+        elif hold=="non-elf":
+            dump.write_text("scientific log");row.update(f.file_id(dump.stat()))
+        verdict=process("release")[0]
+        assert verdict["state"].startswith("held") and dump.exists()
+        assert not verdict.get("allocated") and (case/"log.simpleFoam").read_text()=="end of fixture\n"
+    finally:
+        if lock:lock.close()
+        if process_fd:process_fd.terminate();process_fd.wait(timeout=4)
+
+
+def test_core_name_replacement_during_claim_never_unlinks_the_replacement(core_case):
+    f,m,j,volume,case,dump,row,state,db,process=core_case
+    def replace():
+        dump.rename(case/"raced-original")
+        dump.write_bytes(b"valuable new scientific result")
+    with f.locked_job(volume,j) as job:
+        with pytest.raises(f.Held,match="raced"):
+            f.core_action(volume,state,row,job,[],[],"stage",holders=lambda:False,
+                          science_check=lambda:None,race_hook=replace)
+    assert dump.read_bytes()==b"valuable new scientific result"
+    assert (case/"raced-original").stat().st_ino==row["ino"]
+    assert not list((volume.parent/".airfoils-solver-core-retirement").glob("*.core"))
+
+
+def test_core_quarantine_keeps_both_files_when_source_reappears(core_case):
+    f,m,j,volume,case,dump,row,state,db,process=core_case
+    with f.locked_job(volume,j) as job:
+        claim=f.core_action(volume,state,row,job,[],[],"stage",holders=lambda:False,science_check=lambda:None)
+        dump.write_bytes(b"different generation")
+        with pytest.raises(f.Held,match="replaced"):
+            f.core_action(volume,state,row,job,[],[],"release",holders=lambda:False,science_check=lambda:None)
+        assert dump.read_bytes()==b"different generation"
+        assert (volume.parent/".airfoils-solver-core-retirement"/(claim["key"]+".core")).stat().st_ino==row["ino"]
+
+
+def test_preexisting_native_reader_holds_the_job_even_for_a_different_file(core_case, tmp_path):
+    import sys
+    from solver_core_processes import open_jobs
+    _,_,j,volume,case,_,row,_,_,process=core_case
+    proc_root=tmp_path/"observed-proc";proc_root.mkdir();(proc_root/"self").symlink_to("/proc/self")
+    child=subprocess.Popen([sys.executable,"-I","-c","import sys,time;f=open(sys.argv[1]);print(1,flush=True);time.sleep(30)",str(case/"log.simpleFoam")],stdout=subprocess.PIPE,text=True)
+    try:
+        assert child.stdout.readline().strip()=="1";(proc_root/str(child.pid)).symlink_to("/proc/"+str(child.pid))
+        def observed(v,js,ns):return open_jobs(v,js,ns,proc_root)
+        assert j in observed(volume,{j},{(row['dev'],row['ino']):j})
+        assert process("release",observed)[0]["state"]=="held"
+    finally:child.terminate();child.wait(timeout=4)
+
+
+@pytest.mark.parametrize("explicit_lib", [False, True])
+def test_real_top_level_installer_installs_and_validates_the_solver_core_dropin(tmp_path, explicit_lib):
+    from shutil import which
+
+    units=tmp_path/"units";sbin=tmp_path/"prefix"/"sbin"
+    lib=tmp_path/"private library" if explicit_lib else tmp_path/"prefix"/"lib"/"airfoils-pro"/"solver-core"
+    localbin=tmp_path/"commands";localbin.mkdir()
+    # Exercise the actual installer and actual systemd parser without contacting
+    # the host manager. Every install destination is inside this fixture.
+    for cmd,body in {"id":"printf '0\\n'", "systemctl":'printf "%s\\n" "$*" >> "$FIXTURE_CTL_LOG"'}.items():
+        tool=localbin/cmd;tool.write_text("#!/bin/sh\n"+body+"\n");tool.chmod(0o755)
+    units.mkdir()
+    # The real systemd parser must resolve the dependency in the isolated unit load path.
+    (units/"docker.service").write_text("[Service]\nExecStart=/bin/true\n")
+    env=os.environ|{"PATH":str(localbin)+os.pathsep+os.environ["PATH"],"SBIN_DIR":str(sbin),"SYSTEMD_DIR":str(units),
+                    "SYSTEMD_UNIT_PATH":str(units)+":","RUN_INITIAL_CLEANUP":"0","FIXTURE_CTL_LOG":str(tmp_path/"ctl.log")}
+    env.pop("SOLVER_CORE_LIB_DIR",None)
+    if explicit_lib:env["SOLVER_CORE_LIB_DIR"]=str(lib)
+    # The parent service has a production absolute ExecStart. Override only
+    # that path for systemd-analyze on test hosts without the installed binary.
+    drop=units/"airfoils-docker-storage-prune.service.d";drop.mkdir()
+    (drop/"fixture-exec.conf").write_text(f'[Service]\nExecStart=\nExecStart="{sbin}/airfoils-docker-storage-prune"\n')
+    run=subprocess.run(["bash",str(ROOT/"scripts/deploy/install-docker-storage-prune-timer.sh")],
+                       cwd=ROOT,env=env,text=True,capture_output=True)
+    assert run.returncode==0,run.stderr
+    assert (drop/"solver-core-maintenance.conf").read_text()==f'[Service]\nExecStartPost="{lib}/solver_core_maintenance.py" auto\n'
+    helper=lib/"solver_core_maintenance.py"
+    assert os.access(helper,os.X_OK)
+    verify=subprocess.run([which("systemd-analyze"),"verify",str(units/"airfoils-docker-storage-prune.service"),
+                           str(units/"airfoils-docker-storage-prune.timer")],env=env,text=True,capture_output=True)
+    assert verify.returncode==0,verify.stderr
+    assert "enable --now airfoils-docker-storage-prune.timer" in (tmp_path/"ctl.log").read_text()
