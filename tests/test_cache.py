@@ -9,6 +9,7 @@ import pytest
 
 from airfoilfoam import cache as cache_module
 from airfoilfoam import physics
+from airfoilfoam.openfoam.dialects import OPENCFD_2606_IDENTITY
 from airfoilfoam.airfoil import load_airfoil
 from airfoilfoam.cache import MANIFEST_NAME, EngineCache
 from airfoilfoam.meshing.blockmesh import BlockMeshCGrid
@@ -48,7 +49,7 @@ def _resolved(chord: float = 1.0, speed: float = 50.0, **overrides) -> MeshParam
 
 
 def _cache(tmp_path: Path, max_bytes: int = 10 * 1024**3) -> EngineCache:
-    return EngineCache(tmp_path / "cache", max_bytes=max_bytes)
+    return EngineCache(tmp_path / "cache", max_bytes=max_bytes, engine_identity=OPENCFD_2606_IDENTITY)
 
 
 def _fake_polymesh(base: Path, marker: str = "v1") -> Path:
@@ -609,3 +610,314 @@ def test_publish_steady_seed_skips_unsolved_cases(tmp_path, naca0012_selig_text)
     seed_key = EngineCache.seed_key(mesh_key, FLUID, 50.0)
     sig = EngineCache.solver_signature(SolverParams(), RoughnessParams())
     assert cache.find_seed(seed_key, 4.0, sig) is None
+
+
+# Exercise the maintenance operator through the same on-disk manifests, mesh
+# materializer and seed lookup as a running worker. The two filesystems are real.
+@pytest.fixture
+def parking_case(tmp_path):
+    import importlib.util
+    import tempfile
+
+    script = Path(__file__).parents[1] / "scripts/deploy/park-hz-engine-cache.py"
+    spec = importlib.util.spec_from_file_location("hz_parking", script)
+    op = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(op)
+    with tempfile.TemporaryDirectory(dir="/dev/shm") as scratch:
+        base = Path(scratch)
+        assert base.stat().st_dev != tmp_path.stat().st_dev
+        root = base / "cache"
+        ns = root / op.NAMESPACE.parent
+        cache = EngineCache(ns, 100 * 1024**3, engine_identity=OPENCFD_2606_IDENTITY, shared_root=root)
+        key = "a" * 64
+        src = _fake_polymesh(tmp_path / "original")
+        (src / "points").write_bytes(b"original mesh\n" * 20000)
+        sides = tmp_path / "sidecars"
+        sides.mkdir()
+        (sides / "force-evidence").write_bytes(b"unique original evidence\n")
+        assert cache.publish_mesh(key, src, n_cells=4321, evidence_dir=sides)
+        entry = ns / "mesh" / key
+        epoch_ns = 1234567890123456789
+        os.utime(entry / "manifest.json", ns=(epoch_ns, epoch_ns))
+        item = op.inventory(entry)
+
+        class Case:
+            def plan(self, wanted=None, protected=()):
+                if wanted is None:
+                    wanted = item["allocated"] // 2
+                total = op.free(root) + wanted
+                guard = {"role": "remote-solver", "target": "public.progressive_worker_reports", "touched": [],
+                         "worker": {"disk": {"source": "/dev/md4"}},
+                         "workspace": {"replacementBytes": total - 4, "indexScratchBytes": 1, "additionalWalBytes": 1,
+                                       "externalGrowthBytes": 1, "stopFreeBytes": 1, "requiredBytes": total}}
+                return op.select_entries(root, tmp_path, guard, 0, 65536, 8 * 1024**2, 3, 14, protected)
+
+        case = Case()
+        case.op, case.cache, case.root, case.key = op, cache, root, key
+        case.entry, case.src, case.item, case.run = entry, src, item, tmp_path / "parking"
+        yield case
+
+
+def _isolated_parking_fence(keys):
+    from contextlib import nullcontext
+    return nullcontext(lambda: None)
+
+
+def test_parking_roundtrip_budget_and_scientific_sidecars(parking_case, tmp_path):
+    c = parking_case
+    p = c.plan()
+    assert [i["key"] for i in p["entries"]] == [c.key]
+    prior = c.op.free(c.root)
+    c.op.prepare(c.run, p)
+    sealed = (c.run / "prepared.json").read_bytes()
+    assert c.op.prepare(c.run, p)["reusedSealedCopy"] and (c.run / "prepared.json").read_bytes() == sealed
+    with pytest.raises(ValueError, match="falls short"):
+        c.plan(protected={c.key})
+    parked = c.op.park(c.run, _isolated_parking_fence)
+    assert parked["parkedEntries"] == 1 and parked["meetsRequiredBytes"]
+    assert not c.entry.exists() and c.op.free(c.root) > prior
+    assert c.op.park(c.run, _isolated_parking_fence) == parked
+    restored = c.op.restore(c.run, 65536, _isolated_parking_fence)
+    assert restored["restoredEntries"] == 1
+    assert c.op.restore(c.run, 65536, _isolated_parking_fence) == restored
+    c.op.same_restored(c.entry, c.item)
+    assert (c.entry / "manifest.json").stat().st_mtime_ns == c.item["lru"]
+    assert c.cache.fetch_mesh(c.key, tmp_path / "case-mesh", tmp_path / "case-evidence")["nCells"] == 4321
+    assert (tmp_path / "case-mesh/points").read_bytes() == (c.src / "points").read_bytes()
+    assert (tmp_path / "case-evidence/force-evidence").read_bytes() == b"unique original evidence\n"
+
+
+def test_parking_refuses_real_reader_between_hash_and_copy(parking_case, tmp_path, monkeypatch):
+    import threading
+    c = parking_case
+    c.op.prepare(c.run, c.plan())
+    hit = threading.Event()
+    release = threading.Event()
+    original = c.cache._verified_manifest
+
+    def verified(entry):
+        manifest = original(entry)
+        hit.set()
+        assert release.wait(8)
+        return manifest
+
+    monkeypatch.setattr(c.cache, "_verified_manifest", verified)
+    result = []
+    t = threading.Thread(target=lambda: result.append(c.cache.fetch_mesh(c.key, tmp_path / "flight")))
+    t.start()
+    try:
+        assert hit.wait(8)
+        monkeypatch.setattr(c.op, "VOLUME", c.root.parent)
+        monkeypatch.setattr(c.op, "engine", lambda: {})
+        monkeypatch.setattr(c.op, "worker_call", lambda owner, action: {"meshKeys": [c.key]})
+        with pytest.raises(ValueError, match="Active solver"):
+            c.op.park(c.run, lambda keys: c.op.live_fence(c.run, keys))
+        assert c.entry.is_dir() and not (c.run / "reader-state.json").exists()
+    finally:
+        release.set()
+        t.join(8)
+    assert result[0] and (tmp_path / "flight/points").read_bytes() == (c.src / "points").read_bytes()
+    with pytest.raises(ValueError, match="changed"):
+        c.op.park(c.run, _isolated_parking_fence)
+
+
+def test_parking_corruption_crash_and_regenerated_generation(parking_case, monkeypatch):
+    c = parking_case
+    c.op.prepare(c.run, c.plan())
+    z = c.run / (c.key + ".zip")
+    data = z.read_bytes()
+    z.write_bytes(data + b"trailing change")
+    with pytest.raises(ValueError, match="Sealed parking ZIP"):
+        c.op.prepare(c.run, c.op.load_prepared(c.run))
+    z.write_bytes(data[:-3])
+    with pytest.raises(ValueError, match="ZIP changed"):
+        c.op.park(c.run, _isolated_parking_fence)
+    c.op.same_restored(c.entry, c.item)
+    z.write_bytes(data)
+    real = c.op.noreplace
+
+    def interrupted(a, b):
+        real(a, b)
+        raise RuntimeError("interrupted after atomic rename")
+
+    monkeypatch.setattr(c.op, "noreplace", interrupted)
+    with pytest.raises(RuntimeError, match="interrupted"):
+        c.op.park(c.run, _isolated_parking_fence)
+    assert not c.entry.exists()
+    monkeypatch.setattr(c.op, "noreplace", real)
+    assert c.op.park(c.run, _isolated_parking_fence)["parkedEntries"] == 1
+    with pytest.raises(ValueError, match="reserve"):
+        c.op.restore(c.run, c.op.free(c.root) + 1, _isolated_parking_fence)
+    (c.src / "points").write_bytes(b"changed generation")
+    assert c.cache.publish_mesh(c.key, c.src, n_cells=2)
+    conflict = c.op.restore(c.run, 65536, _isolated_parking_fence)
+    assert conflict["restoredEntries"] == 0 and conflict["conflicts"][0]["key"] == c.key
+    assert (c.entry / "polyMesh/points").read_bytes() == b"changed generation"
+    c.op.verified_zip(z, c.item)
+
+
+def test_parking_excludes_links_and_preserves_already_sufficient_volume(parking_case):
+    c = parking_case
+    assert c.plan(0)["entries"] == []
+    (c.entry / "unexpected").symlink_to(c.src / "points")
+    with pytest.raises(ValueError, match="Linked or special"):
+        c.plan()
+
+
+def test_parking_recovers_admission_with_real_prefork_worker(parking_case, tmp_path, monkeypatch, naca0012_selig_text):
+    import importlib.util
+    import signal
+    import socket
+    import subprocess
+    import sys
+    import time
+    from types import SimpleNamespace
+    import airfoilfoam.celery_app as production_celery
+    import airfoilfoam.config as config
+    from airfoilfoam.models import PolarRequest
+
+    c = parking_case
+    fixture = Path(__file__).parent / "fixtures"
+    broker = tmp_path / "broker"
+    for p in [broker, broker / "queue", broker / "bindings"]:
+        p.mkdir()
+    monkeypatch.setenv("HZ_PARKING_TEST_DIR", str(broker))
+    monkeypatch.syspath_prepend(str(fixture))
+    import hz_cache_celery_app as service
+    worker_env = {**os.environ, "PYTHONPATH": str(fixture) + os.pathsep + str(Path(__file__).parents[1] / "src")}
+    node = "celery@" + socket.gethostname()
+    proc = subprocess.Popen([sys.executable, "-m", "celery", "-A", "hz_cache_celery_app:app", "worker", "-n", node,
+                             "-P", "prefork", "-c", "1", "--without-mingle", "--without-gossip", "--without-heartbeat",
+                             "-l", "WARNING"], cwd=broker, env=worker_env, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL, start_new_session=True)
+    src = Path(c.op.__file__).with_name("hz_cache_reader_scope.py")
+    spec = importlib.util.spec_from_file_location("parking_test_scope", src)
+    reader = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(reader)
+    monkeypatch.setattr(production_celery, "celery_app", service.app)
+    monkeypatch.setattr(config, "get_settings", lambda: SimpleNamespace(celery_queue="openfoam-opencfd-2606-numerics-2", resolved_cache_dir=lambda: Path("/data/airfoilfoam/cache"), engine_identity=lambda: OPENCFD_2606_IDENTITY))
+    from airfoilfoam import jobs, pipeline
+    import hashlib, inspect
+    monkeypatch.setattr(reader, "PINS", {fn.__name__: hashlib.sha256(inspect.getsource(fn).encode()).hexdigest()
+                        for fn in (jobs.execute_job, pipeline.prepare_mesh, pipeline.prepare_mesh_with_recovery)})
+    owner = {"container": "disposable", "init": os.getpid(), "started": "fixture"}
+    monkeypatch.setattr(c.op, "VOLUME", c.root.parent)
+    monkeypatch.setattr(c.op, "engine", lambda: owner)
+    monkeypatch.setattr(reader, "RESULTS_ROOT", c.root.parent)
+    readers = c.op.open_cache_readers
+    monkeypatch.setattr(c.op, "open_cache_readers", lambda keys: readers(keys, [Path("/proc/self")]))
+    monkeypatch.setattr(c.op, "master", lambda owner, child: proc.pid if proc.pid == child else pytest.fail("foreign worker"))
+    epochs = []
+    def rpc(owner, action, prior=None):
+        if action == "fence":
+            epochs.append(dict(prior))
+        return reader.control(action, prior)
+    monkeypatch.setattr(c.op, "worker_call", rpc)
+    deadline = time.monotonic() + 20
+    try:
+        while not service.app.control.ping(destination=[node], timeout=0.5):
+            assert proc.poll() is None and time.monotonic() < deadline
+        req = PolarRequest.model_validate({"airfoil": {"name": "0012", "coordinates": naca0012_selig_text},
+                                           "chord_lengths": [1], "speeds": [30], "aoa": {"angles": [0]}})
+        service.app.send_task("airfoilfoam.run_polar", args=["fixture", req.model_dump_json()])
+        while not (broker / "reader-started").is_file():
+            assert time.monotonic() < deadline
+            time.sleep(0.04)
+        prior = reader.control("inspect")
+        assert prior["tasks"] == 1 and prior["meshKeys"] and prior["bindings"]
+        c.op.prepare(c.run, c.plan())
+        with pytest.raises(ValueError, match="Active solver"):
+            with c.op.live_fence(c.run, {prior["meshKeys"][0]}):
+                pytest.fail("Active mesh must stay accessible")
+        with (c.entry / "polyMesh/points").open("rb"):
+            with pytest.raises(ValueError, match="external process"):
+                with c.op.live_fence(c.run, {c.key}):
+                    pytest.fail("A live file handle must veto retirement")
+        with c.op.live_fence(c.run, {c.key}) as check:
+            check()
+            assert c.op.proc(proc.pid)[0] == "T"
+            # The actual solver pool child keeps executing while the consumer master holds admission.
+            t = (broker / "solver-progress").stat().st_mtime_ns
+            time.sleep(0.12)
+            assert (broker / "solver-progress").stat().st_mtime_ns > t
+        assert reader.control("inspect")["bindings"] == prior["bindings"]
+        assert c.op.proc(proc.pid)[0] != "T" and not (c.run / "reader-state.json").exists()
+        live = lambda keys: c.op.live_fence(c.run, keys)
+        assert c.op.park(c.run, live)["parkedEntries"] == 1
+        assert c.op.restore(c.run, 65536, live)["restoredEntries"] == 1
+        c.op.same_restored(c.entry, c.item)
+
+        service.app.control.cancel_consumer(prior["queue"], destination=[node], reply=True, timeout=4)
+        assert not reader.control("inspect")["bindings"]
+        with c.op.live_fence(c.run, {c.key}) as check:
+            check()
+        assert not reader.control("inspect")["bindings"]
+        service.app.control.add_consumer(prior["queue"], destination=[node], reply=True, timeout=4)
+        with pytest.raises(ValueError, match="revoked"):
+            reader.control("fence", epochs[-1])
+        assert reader.control("inspect")["bindings"] == prior["bindings"]
+
+        # Kill the foreground operator inside the hard fence. Its independent watchdog
+        # restores the same live master and the original real broker binding.
+        rd, wr = os.pipe()
+        child = os.fork()
+        if child == 0:
+            os.close(rd)
+            try:
+                with c.op.live_fence(c.run, {c.key}):
+                    os.write(wr, b"R")
+                    time.sleep(30)
+            finally:
+                os._exit(2)
+        os.close(wr)
+        import select
+        try:
+            assert select.select([rd], [], [], 15)[0] and os.read(rd, 1) == b"R"
+        finally:
+            os.kill(child, signal.SIGKILL)
+            os.waitpid(child, 0)
+            os.close(rd)
+        end = time.monotonic() + 12
+        while (c.run / "reader-state.json").exists() and time.monotonic() < end:
+            time.sleep(0.05)
+        assert not (c.run / "reader-state.json").exists()
+        assert reader.control("inspect")["bindings"] == prior["bindings"]
+    finally:
+        (broker / "reader-finished").touch()
+        if proc.poll() is None:
+            os.kill(proc.pid, signal.SIGCONT)
+            os.killpg(proc.pid, signal.SIGTERM)
+            try:
+                proc.wait(timeout=8)
+            except subprocess.TimeoutExpired:
+                os.killpg(proc.pid, signal.SIGKILL)
+                proc.wait(timeout=5)
+
+
+@pytest.mark.parametrize("geometry", ["naca0012_selig_text", "sharp_naca0012_selig_text"])
+def test_parking_protects_the_actual_mesh_recovery_ladder(tmp_path, monkeypatch, request, geometry):
+    import importlib.util
+    from airfoilfoam import jobs, pipeline as p
+    from airfoilfoam.models import PolarRequest
+    path = Path(__file__).parents[1] / "scripts/deploy/hz_cache_reader_scope.py"
+    spec = importlib.util.spec_from_file_location("mesh_scope_ladder", path)
+    reader = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(reader)
+    req = PolarRequest.model_validate({"airfoil": {"name": geometry, "coordinates": request.getfixturevalue(geometry)},
+                                       "chord_lengths": [1], "speeds": [30], "aoa": {"angles": [0]}})
+    airfoil = jobs.load_airfoil(req.airfoil.name, req.airfoil.coordinates, req.airfoil.points, req.airfoil.format)
+    base, _ = jobs.effective_mesh_params_for_airfoil(req.mesh, req.solver, airfoil, urans_mesh=req.urans_mesh,
+                                                    urans_precalc_mesh=req.urans_precalc_mesh)
+    resolved = jobs.resolve_mesh_params(base, CaseSpec(chord=1, speed=30, aoa_deg=0), req.fluid)
+    seen = set()
+
+    def rejected(mesh_dir, geometry, actual, chord, actual_mesher, runner, **kwargs):
+        seen.add(EngineCache.mesh_key(geometry, chord, actual, mesher=actual_mesher))
+        raise p.DeterministicMeshError("exercise the next registered recovery candidate")
+
+    monkeypatch.setattr(p, "prepare_mesh", rejected)
+    monkeypatch.setattr(p, "capture_mesh_attempt_diagnostic", lambda *args, **kwargs: {"message": "fixture"})
+    monkeypatch.setattr(p, "format_mesh_attempt_diagnostic", lambda item: "fixture")
+    with pytest.raises(p.DeterministicMeshError):
+        p.prepare_mesh_with_recovery(tmp_path / "mesh", airfoil, resolved, 1.0, jobs.get_mesher(resolved.mesher), None)
+    assert len(seen) >= 2 and seen <= reader.mesh_keys(req.model_dump_json())
