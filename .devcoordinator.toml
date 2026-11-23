@@ -6005,21 +6005,21 @@ user = "aerodb"
 name = "workspace"
 tier = "development"
 timeout_seconds = 600
-command = ["/usr/bin/corepack", "pnpm", "install", "--offline", "--frozen-lockfile", "--ignore-scripts"]
+command = ["/bin/sh","scripts/dev/check-closed-retention.sh","workspace"]
 
 [[test.closed-progressive-retention.check]]
 name = "schema"
 tier = "development"
 requires = ["workspace"]
 timeout_seconds = 300
-command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "migrate"]
+command = ["/bin/sh","scripts/dev/check-closed-retention.sh","schema"]
 
 [[test.closed-progressive-retention.check]]
 name = "seed"
 tier = "development"
 requires = ["schema"]
 timeout_seconds = 600
-command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "seed"]
+command = ["/bin/sh","scripts/dev/check-closed-retention.sh","seed"]
 
 [[test.closed-progressive-retention.check]]
 name = "types"
