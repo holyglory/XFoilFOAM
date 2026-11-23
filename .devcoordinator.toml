@@ -6152,3 +6152,64 @@ name = "capture"
 tier = "release"
 command = ["node", "scripts/dev/capture-catalog-audit.mjs"]
 retained_artifacts = [{ name = "catalog-audit-captures", path = ".codex-artifacts/catalog-design-audit", max_bytes = 16777216 }]
+
+# Isolated measurement only. The capture step supplies the private binary PG corpus.
+[test.hz-worker-rewrite-cost]
+timeout_seconds = 3600
+
+[test.hz-worker-rewrite-cost.postgres]
+image = "postgres:16-alpine"
+database = "hz_rewrite_cost"
+user = "aerodb"
+
+[[test.hz-worker-rewrite-cost.check]]
+name = "workspace"
+tier = "development"
+timeout_seconds = 600
+command = ["/usr/bin/corepack", "pnpm", "install", "--frozen-lockfile", "--ignore-scripts", "--offline"]
+
+[[test.hz-worker-rewrite-cost.check]]
+name = "schema"
+tier = "development"
+requires = ["workspace"]
+timeout_seconds = 360
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "migrate"]
+
+[[test.hz-worker-rewrite-cost.check]]
+name = "full-rewrites"
+tier = "development"
+requires = ["schema"]
+timeout_seconds = 3000
+env = { HZ_REWRITE_COST_DISPOSABLE = "1", PYTHONDONTWRITEBYTECODE = "1" }
+command = ["python3", "-B", "tests/fixtures/hz-rewrite/rehearse_cost.py", "--corpus", ".codex-artifacts/hz-rewrite-cost-corpus", "--output", ".codex-artifacts/hz-rewrite-cost-result/summary.json"]
+retained_artifacts = [{ name = "full-rewrite-cost", path = ".codex-artifacts/hz-rewrite-cost-result", max_bytes = 4194304 }]
+
+[test.hz-worker-toast-cost]
+timeout_seconds = 3600
+
+[test.hz-worker-toast-cost.postgres]
+image = "postgres:16-alpine"
+database = "hz_rewrite_cost"
+user = "aerodb"
+
+[[test.hz-worker-toast-cost.check]]
+name = "workspace"
+tier = "development"
+timeout_seconds = 600
+command = ["/usr/bin/corepack", "pnpm", "install", "--frozen-lockfile", "--ignore-scripts", "--offline"]
+
+[[test.hz-worker-toast-cost.check]]
+name = "schema"
+tier = "development"
+requires = ["workspace"]
+timeout_seconds = 360
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "migrate"]
+
+[[test.hz-worker-toast-cost.check]]
+name = "toast-rewrites"
+tier = "development"
+requires = ["schema"]
+timeout_seconds = 3000
+env = { HZ_REWRITE_COST_DISPOSABLE = "1", PYTHONDONTWRITEBYTECODE = "1" }
+command = ["python3", "-B", "tests/fixtures/hz-rewrite/rehearse_cost.py", "--corpus", ".codex-artifacts/hz-rewrite-cost-corpus", "--output", ".codex-artifacts/hz-toast-rewrite-cost-result/summary.json", "--toast-only", "--copies", "32"]
+retained_artifacts = [{ name = "full-rewrite-cost", path = ".codex-artifacts/hz-toast-rewrite-cost-result", max_bytes = 4194304 }]

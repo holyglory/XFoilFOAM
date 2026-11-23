@@ -218,6 +218,13 @@ class WorkerReturnCheckTest(unittest.TestCase):
         self.assertTrue(after["ingress"]["liveClaims"])
         self.assertEqual(after["ingress"]["runningJobs"], 1)
         self.assertEqual(after["freeMinusCurrentAllocationBytes"], 8000000-after["totalBytes"])
+        text_oids = dict(before)
+        for key in ("oid", "relfilenode", "toastOid", "toastFilenode"):
+            text_oids[key] = str(before[key])
+        text_oids["indexFiles"] = {k: str(v) for k, v in before["indexFiles"].items()}
+        unchanged = maintenance.worker_return_check(text_oids, session=self.session, host=self.host)
+        self.assertTrue(unchanged["change"]["samePhysicalFile"])
+        self.assertTrue(unchanged["change"]["sameIndexFiles"])
         with self.assertRaisesRegex(ValueError, "physical files"):
             maintenance.worker_return_check({**before,"toastFilenode":0}, session=self.session, host=self.host)
 

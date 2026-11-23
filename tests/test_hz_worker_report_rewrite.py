@@ -1,6 +1,7 @@
 """Run the actual HZ maintenance lifecycle against disposable PostgreSQL."""
 
 import importlib.util
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -143,6 +144,13 @@ AIRFOILFOAM_CELERY_CONCURRENCY=4
 import os,sys
 args=sys.argv[1:]
 if args and args[0]=='exec' and 'psql' in args:
+ if os.getenv('REWRITE_TEST_ROLLBACK_LAG')=='1' and 'hz_rewrite_' in args[-1]:
+  from pathlib import Path
+  import time
+  mark=Path(os.environ['REWRITE_TEST_MOUNT'])/'terminate-requested'
+  if 'pg_terminate_backend' in args[-1]:mark.write_text(str(time.monotonic()))
+  if 'SELECT count(*) FROM pg_stat_activity' in args[-1] and (not mark.exists() or time.monotonic()-float(mark.read_text())<1.6):
+   print(1);sys.exit(0)
  opts=next(x[10:] for x in args if x.startswith('PGOPTIONS='))
  os.environ['PGOPTIONS']=opts;a=args[args.index('psql')+1:]
  i=a.index('-d');a[i+1]=os.environ['DATABASE_URL'];i=a.index('-U');del a[i:i+2]
@@ -258,7 +266,9 @@ def restored(env, prior):
     )
 
 
-def test_full_shell_rewrites_only_the_worker_relation_and_restores(runtime, capsys):
+def test_full_shell_rewrites_only_the_worker_relation_and_restores(
+    runtime, capsys, monkeypatch
+):
     env, directory, host, prior = runtime
     # Stat actual main/TOAST/index files on the disposable PG server. These
     # small relations have one segment per fork.
@@ -272,6 +282,32 @@ def test_full_shell_rewrites_only_the_worker_relation_and_restores(runtime, caps
     res = shell(env, directory)
     assert res.returncode == 0, res.stdout + res.stderr
     before = json.loads((directory / "identity-before.json").read_text())
+    physical = json.loads((directory / "quiesced.json").read_text())
+    restored_snapshot = json.loads((directory / "resumed.json").read_text())
+
+    def observed(before, after):
+        monkeypatch.setattr(
+            ops,
+            "read_host",
+            lambda _: json.dumps({"committed": None, "physical": [before, after]}),
+        )
+        return ops.status({"run": directory.name})["committed"]
+
+    mixed = dict(
+        physical,
+        oid=str(physical["oid"]),
+        relfilenode=str(physical["relfilenode"]),
+        toastOid=str(physical["toastOid"]),
+        toastFilenode=str(physical["toastFilenode"]),
+        indexFiles={k: str(v) for k, v in physical["indexFiles"].items()},
+    )
+    assert observed(physical, mixed) is False
+    assert observed(mixed, restored_snapshot) is True
+    assert observed(physical, dict(mixed, toastFilenode=1)) is None
+    assert observed(physical, dict(mixed, relfilenode=False)) is None
+    assert observed(physical, dict(mixed, serverStartedAt="other")) is None
+    assert observed(physical, dict(mixed, indexFiles={})) is None
+    assert host.identity(physical) == host.identity(mixed)
     assert before == json.loads((directory / "identity-after.json").read_text())
     assert (
         before["reports"]["rows"] == 100
@@ -335,6 +371,21 @@ def test_refusal_and_postcommit_mismatch_preserve_services(runtime, fault, commi
         assert not (directory / "entered-identity-before").exists()
     else:
         assert "WAL directory exceeded" in res.stderr
+    restored(env, prior)
+
+
+def test_rollback_confirmation_outlives_the_terminate_reply(runtime):
+    env, directory, _, prior = runtime
+    env.update(REWRITE_TEST_ROLLBACK_LAG="1", REWRITE_TEST_FAULT="wal-growth")
+    before = sql("SELECT pg_relation_filenode('progressive_worker_reports'::regclass)")
+    refused = shell(env, directory)
+    assert refused.returncode != 0 and "WAL directory exceeded" in refused.stderr
+    assert (Path(env["REWRITE_TEST_MOUNT"]) / "terminate-requested").exists()
+    assert "recovery_failed=false" in (directory / "result").read_text()
+    assert (
+        sql("SELECT pg_relation_filenode('progressive_worker_reports'::regclass)")
+        == before
+    )
     restored(env, prior)
 
 
@@ -708,9 +759,59 @@ def test_full_body_mode_and_forks_on_same_device(runtime):
     restored(env, prior)
 
 
-@pytest.mark.parametrize("lose_submission_reply", [False, True])
+def test_toast_scope_budgets_only_owned_auxiliary_and_requires_chunk_proof(runtime):
+    env, _, host, _ = runtime
+    f = host.measured(
+        json.loads(env["COMPACTION_IDS"])["postgres"], census=True, toast=True
+    )
+    cfg = dict(mode="toast", replacement=None, wal=None, floor=1048576, growth=524288)
+    space = host.budget(f, cfg)
+    assert not space["refusals"]
+    assert (
+        space["parentTotalBytes"]
+        == f["totalBytes"]
+        > space["allocatedBytes"]
+        == f["toastTotalBytes"]
+    )
+    assert space["replacementBytes"] == f["toastTotalBytes"]
+    assert space["indexScratchBytes"] == max(
+        f["toastIndexBytes"], f["packing"]["chunkIndexEstimate"]
+    )
+    assert (
+        space["requiredBytes"]
+        == space["replacementBytes"]
+        + space["indexScratchBytes"]
+        + space["additionalWalBytes"]
+        + cfg["floor"]
+        + cfg["growth"]
+    )
+    assert f["toastProofPlan"]["orderedByChunkIndex"] and f["auxiliaryFiles"]
+    assert host.budget(dict(f, toastReadable=False), cfg)["refusals"]
+    assert host.budget(dict(f, toastProofPlan={"orderedByChunkIndex": False}), cfg)[
+        "refusals"
+    ]
+    assert host.budget(f, dict(cfg, replacement=1))["refusals"]
+    assert host.budget(
+        dict(f, disk=dict(f["disk"], freeBytes=space["requiredBytes"] - 1)), cfg
+    )["refusals"]
+    assert (
+        host.budget(dict(f, wal=dict(f["wal"], slots=1)), cfg)["additionalWalBytes"]
+        >= f["toastTotalBytes"]
+    )
+
+
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        "normal",
+        "lost-reply",
+        "checkpointed",
+        "checkpointed-refusal",
+        "toast-lost-commit",
+    ],
+)
 def test_operator_recovers_the_same_rewrite_and_witnesses_collection(
-    runtime, tmp_path, monkeypatch, lose_submission_reply
+    runtime, tmp_path, monkeypatch, request, scenario
 ):
     env, remote, host, prior = runtime
     run_dir = tmp_path / "operator-run"
@@ -724,9 +825,68 @@ def test_operator_recovers_the_same_rewrite_and_witnesses_collection(
     discover = lambda extra=(): json.loads(json.dumps(units))
     submitted = []
     checks = []
+    checkpointed = scenario.startswith("checkpointed")
+    archive_unit = "airfoils-report-migration-qualification.service"
+    checkpoint = tmp_path / "archive.json"
+    config = tmp_path / "checkpointed-units.json"
+    processes = []
+
+    def start_archiver():
+        proc = subprocess.Popen(
+            [
+                sys.executable,
+                "-u",
+                str(FIXTURE.with_name("checkpointed_writer.py")),
+                env["LOCK_FILE"],
+                str(checkpoint),
+            ],
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        processes.append(proc)
+        assert int(proc.stdout.readline()) == len(processes)
+        return proc.pid
+
+    def stop_fixture():
+        for proc in processes:
+            if proc.poll() is None:
+                proc.terminate()
+                proc.wait(timeout=5)
+
+    if checkpointed:
+        request.addfinalizer(stop_fixture)
+        checkpoint.write_text('{"source":"same-archive","cursor":0}')
+        config.write_text(json.dumps({archive_unit: str(checkpoint)}))
+        fragment = tmp_path / archive_unit
+        fragment.write_text("persistent test service")
+        pid = start_archiver()
+        original[archive_unit] = dict(
+            original["airfoils-hz-bulk.service"],
+            FragmentPath=str(fragment),
+            MainPID=str(pid),
+            InvocationID=str(pid),
+        )
+        units[archive_unit] = dict(original[archive_unit])
+        monkeypatch.setattr(
+            ops, "definition_digest", lambda _: ops.file_witness(fragment)["sha256"]
+        )
 
     def control(action, name):
-        if name.endswith(".timer"):
+        if name == archive_unit:
+            assert action in ("stop", "start")
+            if action == "stop":
+                processes[-1].terminate()
+                processes[-1].wait(timeout=4)
+                units[name].update(ActiveState="inactive", SubState="dead", MainPID="0")
+            else:
+                pid = start_archiver()
+                units[name].update(
+                    ActiveState="active",
+                    SubState="running",
+                    MainPID=str(pid),
+                    InvocationID=str(pid),
+                )
+        elif name.endswith(".timer"):
             units[name].update(
                 ActiveState="active" if action == "start" else "inactive",
                 SubState="waiting" if action == "start" else "dead",
@@ -771,9 +931,25 @@ def test_operator_recovers_the_same_rewrite_and_witnesses_collection(
             assert not submitted
             submitted.append("rewrite")
             assert units["airfoils-hz-bulk.service"]["FreezerState"] == "frozen"
+            if checkpointed:
+                assert units[archive_unit]["ActiveState"] == "inactive"
+                with open(env["LOCK_FILE"], "a") as lock:
+                    with pytest.raises(BlockingIOError):
+                        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            if scenario == "checkpointed-refusal":
+                env["REWRITE_TEST_FAULT"] = "space-before"
             result = shell(env, remote)
-            assert result.returncode == 0, result.stderr
-            if lose_submission_reply:
+            if scenario == "checkpointed-refusal":
+                assert (
+                    result.returncode != 0 and "Insufficient available" in result.stderr
+                )
+            else:
+                assert result.returncode == 0, result.stderr
+            if scenario == "toast-lost-commit":
+                # The database commit succeeded but its acknowledgement/marker was lost.
+                (remote / "rewrite-commit.json").unlink()
+                raise RuntimeError("SSH reply lost after TOAST-only commit")
+            if scenario == "lost-reply":
                 raise RuntimeError("SSH reply lost after submission")
             return ""
         assert args[:3] == ["python3", "-B", "-c"]
@@ -815,24 +991,106 @@ def test_operator_recovers_the_same_rewrite_and_witnesses_collection(
             "30",
             "--rewrite-seconds",
             "30",
+            *(["--checkpointed-units", str(config)] if checkpointed else []),
+            *(["--toast-only"] if scenario == "toast-lost-commit" else []),
         ],
     )
-    if lose_submission_reply:
+    old_file = sql(
+        "SELECT pg_relation_filenode('progressive_worker_reports'::regclass)"
+    )
+    if scenario in ("lost-reply", "toast-lost-commit"):
         with pytest.raises(RuntimeError, match="reply lost"):
+            ops.main()
+    elif scenario == "checkpointed-refusal":
+        with pytest.raises(RuntimeError, match="did not finish successfully"):
             ops.main()
     else:
         ops.main()
-    assert submitted == ["rewrite"] and units == original
+    assert submitted == ["rewrite"]
+    if checkpointed:
+        owner = json.loads((run_dir / "operator.json").read_text())[
+            "checkpointedOwners"
+        ][archive_unit]
+        assert owner["beforeStop"] == owner["stopped"]
+        assert owner["advancedReceipt"]["sha256"] != owner["stoppedReceipt"]["sha256"]
+        assert len(processes) == 2 and owner["restoredInvocation"] == str(
+            processes[-1].pid
+        )
+        assert json.loads(checkpoint.read_text()) == {
+            "source": "same-archive",
+            "cursor": 2,
+        }
+        assert units.pop(archive_unit)["ActiveState"] == "active"
+        original.pop(archive_unit)
+    assert units == original
     assert not (ops.CONTROL / "active-rewrite.json").exists()
     assert json.loads((run_dir / "operator.json").read_text())["touched"] == []
+    if scenario == "checkpointed-refusal":
+        assert (
+            sql("SELECT pg_relation_filenode('progressive_worker_reports'::regclass)")
+            == old_file
+        )
+        assert not (remote / "rewrite-commit.json").exists()
+        restored(env, prior)
+        return
     assert (
         json.loads((run_dir / "collection.json").read_text())["state"]
         == "observed-new-report"
     )
     assert json.loads((run_dir / "authority-after.json").read_text())["active"] == 1
-    assert (run_dir / "rewrite-commit.json").read_bytes() == (
-        remote / "rewrite-commit.json"
-    ).read_bytes()
+    if scenario == "toast-lost-commit":
+        operator = json.loads((run_dir / "operator.json").read_text())
+        assert (
+            not (run_dir / "rewrite-commit.json").exists()
+            and operator["budget"]["mode"] == "toast"
+        )
+        before = json.loads((run_dir / "quiesced.json").read_text())
+        after = json.loads((run_dir / "resumed.json").read_text())
+        assert (
+            before["relfilenode"] == after["relfilenode"]
+            and before["parentIndexFiles"] == after["parentIndexFiles"]
+        )
+        assert (
+            before["toastOid"] == after["toastOid"]
+            and before["toastFilenode"] != after["toastFilenode"]
+        )
+        assert before["toastIndexFiles"] != after["toastIndexFiles"]
+        assert (
+            json.loads((run_dir / "identity-before.json").read_text())["toast-values"][
+                "rows"
+            ]
+            > 0
+        )
+        assert (run_dir / "identity-before.json").read_bytes() == (
+            run_dir / "identity-after.json"
+        ).read_bytes()
+        assert ops.status(operator)["committed"] is True
+        mixed = dict(
+            before,
+            relfilenode=str(before["relfilenode"]),
+            toastOid=str(before["toastOid"]),
+            toastFilenode=str(before["toastFilenode"]),
+        )
+        assert ops.audit.rewrite_outcome(mixed, before, "toast") is False
+        assert ops.audit.rewrite_outcome(mixed, after, "toast") is True
+        assert ops.audit.rewrite_outcome(mixed, dict(after, oid=1), "toast") is None
+        assert (
+            ops.audit.rewrite_outcome(mixed, dict(after, parentIndexFiles={}), "toast")
+            is None
+        )
+        assert (
+            ops.audit.rewrite_outcome(
+                mixed, dict(after, toastIndexFiles=mixed["toastIndexFiles"]), "toast"
+            )
+            is None
+        )
+        monkeypatch.setattr(sys, "argv", ["rewrite", "--recover", str(run_dir)])
+        ops.main()
+        assert submitted == ["rewrite"] and ops.status(operator)["committed"] is True
+    else:
+        assert (run_dir / "rewrite-commit.json").read_bytes() == (
+            remote / "rewrite-commit.json"
+        ).read_bytes()
     assert (
         json.loads((run_dir / "space-result.json").read_text())["relationBytesReturned"]
         > 0
