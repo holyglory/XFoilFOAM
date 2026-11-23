@@ -9,6 +9,46 @@ export interface ReportCopyCursor {
   sequence: number;
 }
 
+interface SignedCopyKey {
+  sequence: number;
+  signature: string;
+  storedBytes: number;
+}
+
+/** A second scan already checks the scientific sources of stopped owners.
+ * Keep at most one of its eligible pages. Every other turn still advances
+ * the ordinary discovery cursor, including after a refused or stale page. */
+export class CancelledReportCopyPriority {
+  private page?: { executionId: string; keys: readonly SignedCopyKey[]; bytes: number };
+  private chronologicalDue = false;
+
+  offer(executionId: string, keys: readonly SignedCopyKey[]) {
+    if (!keys.length) return;
+    const bytes = keys.reduce((n, k) => n + k.storedBytes, 0);
+    if (!this.page || bytes > this.page.bytes)
+      this.page = { executionId, keys, bytes };
+  }
+
+  take() {
+    if (this.chronologicalDue) {
+      this.chronologicalDue = false;
+      return;
+    }
+    const page = this.page;
+    this.page = undefined;
+    this.chronologicalDue = page !== undefined;
+    return page;
+  }
+}
+
+export async function selectCancelledReportCopyPage(
+  db: DB, after: ReportCopyCursor | null, priority?: CancelledReportCopyPriority,
+) {
+  const preferred = priority?.take();
+  if (!preferred) return { ...await nextCancelledReportCopies(db, after), preferred };
+  return { executionId: preferred.executionId, sequences: preferred.keys.map(k => k.sequence), after, preferred };
+}
+
 // The settlement controller leaves ingestedAt unset while raw evidence is missing.
 export const cancelledReportOwner = sql`job.status='cancelled' AND job."ingestedAt" IS NULL
   AND (job.error='Scheduling promise became inactive; evidence delivery remains unresolved'
