@@ -1059,11 +1059,13 @@ export function BrowseView({
                   onKeyDown={(e) => {
                     if (e.key === "Enter") openDetail(a.slug);
                   }}
-                  onMouseEnter={() => {
-                    setPreview(a);
-                    setHoveredId(a.id);
-                  }}
+                  onMouseEnter={() => setHoveredId(a.id)}
                   onMouseLeave={() => setHoveredId(null)}
+                  onPointerMove={(event) => {
+                    if (event.pointerType === "mouse" && selected !== a.slug)
+                      setPreview(a);
+                  }}
+                  onFocus={() => setPreview(a)}
                   style={{
                     fontFamily: MONO,
                     fontSize: 12,
