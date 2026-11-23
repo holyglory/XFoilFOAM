@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import {
   type AirfoilSummary,
   type CategoryNode,
@@ -6,7 +7,10 @@ import {
 } from "@aerodb/core";
 import {
   airfoils,
+  airfoilHashtags,
   categories,
+  hashtags,
+  type DB,
   polarFitSets,
   publicProgressiveCatalog,
 } from "@aerodb/db";
@@ -129,7 +133,7 @@ function addRange(
     conds.push(lte(col, max));
 }
 
-export async function listAirfoils(opts: ListOpts): Promise<AirfoilSummary[]> {
+async function catalogCandidates(db: DB, opts: ListOpts) {
   const conds: SQL[] = [
     isNull(airfoils.archivedAt),
     isNull(airfoils.deletedAt),
@@ -205,31 +209,25 @@ export async function listAirfoils(opts: ListOpts): Promise<AirfoilSummary[]> {
   // sort below, which already sends missing values to the tail.
   const nullableMetricSort =
     sort === "thickness" || sort === "camber" || sort === "area";
+  const wantedTags = [
+    ...new Set((opts.hashtags ?? []).map((tag) => tag.trim()).filter(Boolean)),
+  ];
+  if (wantedTags.length) {
+    conds.push(
+      inArray(
+        airfoils.id,
+        db
+          .select({ id: airfoilHashtags.airfoilId })
+          .from(airfoilHashtags)
+          .innerJoin(hashtags, eq(hashtags.id, airfoilHashtags.hashtagId))
+          .where(inArray(hashtags.slug, wantedTags))
+          .groupBy(airfoilHashtags.airfoilId)
+          .having(sql`count(DISTINCT ${hashtags.slug}) = ${wantedTags.length}`),
+      ),
+    );
+  }
   const rows = await db
-    .select({
-      id: airfoils.id,
-      slug: airfoils.slug,
-      name: airfoils.name,
-      categoryId: categories.id,
-      categorySlug: categories.slug,
-      categoryPath: categories.path,
-      family: categories.name,
-      tags: airfoils.tags,
-      points: opts.includePoints === false ? sql`'[]'::jsonb` : airfoils.points,
-      thicknessPct: airfoils.thicknessPct,
-      areaProfile: airfoils.areaProfile,
-      areaUpper: airfoils.areaUpper,
-      areaLower: airfoils.areaLower,
-      areaCamber: airfoils.areaCamber,
-      areaUpperPositive: airfoils.areaUpperPositive,
-      areaUpperNegative: airfoils.areaUpperNegative,
-      areaLowerPositive: airfoils.areaLowerPositive,
-      areaLowerNegative: airfoils.areaLowerNegative,
-      areaCamberPositive: airfoils.areaCamberPositive,
-      areaCamberNegative: airfoils.areaCamberNegative,
-      camberPct: airfoils.camberPct,
-      camberPosPct: airfoils.camberXPct,
-    })
+    .select({ id: airfoils.id, slug: airfoils.slug, name: airfoils.name })
     .from(airfoils)
     .innerJoin(categories, eq(airfoils.categoryId, categories.id))
     .where(and(...conds))
@@ -244,27 +242,25 @@ export async function listAirfoils(opts: ListOpts): Promise<AirfoilSummary[]> {
             ? desc(sortCol)
             : asc(sortCol),
       asc(airfoils.name),
-    )
-    .limit(
-      solvedSort
-        ? Math.max(
-            DEFAULT_LIMIT,
-            (opts.offset ?? 0) + (opts.limit ?? DEFAULT_LIMIT),
-          )
-        : (opts.offset ?? 0) + (opts.limit ?? DEFAULT_LIMIT),
-    )
-    .offset(0);
+      asc(airfoils.id),
+    );
+  return { rows, allVisible: conds.length === 2 };
+}
 
-  const tagMap = await hashtagsByAirfoilIds(rows.map((r) => r.id));
-  const wantedTags = (opts.hashtags ?? []).map((h) => h.trim()).filter(Boolean);
-  const filtered = wantedTags.length
-    ? rows.filter((row) => {
-        const slugs = new Set((tagMap.get(row.id) ?? []).map((h) => h.slug));
-        return wantedTags.every((h) => slugs.has(h));
-      })
-    : rows;
-
-  const candidateIds = filtered.map((r) => r.id);
+async function readCatalogMetrics(
+  db: DB,
+  ids: string[],
+  key: string | undefined,
+  allVisible: boolean,
+) {
+  const progressive = await publicProgressiveCatalog(
+    db,
+    allVisible ? undefined : ids,
+    key,
+  );
+  const candidateIds = key
+    ? []
+    : ids.filter((id) => !progressive.metrics.has(id));
   const metricRows = candidateIds.length
     ? await db
         .select({
@@ -318,20 +314,81 @@ export async function listAirfoils(opts: ListOpts): Promise<AirfoilSummary[]> {
     }
   }
 
-  const progressive = await publicProgressiveCatalog(
-    db,
-    candidateIds,
-    opts.metricConditionKey,
-  );
-  const summaries = filtered.map((r) => {
+  return { progressive: progressive.metrics, legacy: metricMap };
+}
+
+type CatalogMetrics = Awaited<ReturnType<typeof readCatalogMetrics>>;
+type CatalogKey = Pick<AirfoilSummary, "id" | "slug">;
+type MetricSort = "ldmax" | "clmax" | "cdmin";
+
+function rankByMetric(
+  rows: Array<CatalogKey & { name: string }>,
+  metrics: CatalogMetrics,
+  sort: MetricSort,
+  ascending: boolean,
+) {
+  const value = (id: string) => {
+    const raw =
+      metrics.progressive.get(id)?.[sort] ?? metrics.legacy.get(id)?.[sort];
+    const n = raw == null ? NaN : Number(raw);
+    return Number.isFinite(n) ? n : null;
+  };
+  rows.sort((a, b) => {
+    const av = value(a.id),
+      bv = value(b.id);
+    if (av == null && bv != null) return 1;
+    if (av != null && bv == null) return -1;
+    const difference =
+      av == null || bv == null ? 0 : ascending ? av - bv : bv - av;
+    return difference || a.name.localeCompare(b.name);
+  });
+}
+
+async function hydrateCatalog(
+  db: DB,
+  opts: ListOpts,
+  ids: string[],
+  metrics: CatalogMetrics,
+) {
+  const rows = await db
+    .select({
+      id: airfoils.id,
+      slug: airfoils.slug,
+      name: airfoils.name,
+      categoryId: categories.id,
+      categorySlug: categories.slug,
+      categoryPath: categories.path,
+      family: categories.name,
+      tags: airfoils.tags,
+      points: opts.includePoints === false ? sql`'[]'::jsonb` : airfoils.points,
+      thicknessPct: airfoils.thicknessPct,
+      areaProfile: airfoils.areaProfile,
+      areaUpper: airfoils.areaUpper,
+      areaLower: airfoils.areaLower,
+      areaCamber: airfoils.areaCamber,
+      areaUpperPositive: airfoils.areaUpperPositive,
+      areaUpperNegative: airfoils.areaUpperNegative,
+      areaLowerPositive: airfoils.areaLowerPositive,
+      areaLowerNegative: airfoils.areaLowerNegative,
+      areaCamberPositive: airfoils.areaCamberPositive,
+      areaCamberNegative: airfoils.areaCamberNegative,
+      camberPct: airfoils.camberPct,
+      camberPosPct: airfoils.camberXPct,
+    })
+    .from(airfoils)
+    .innerJoin(categories, eq(airfoils.categoryId, categories.id))
+    .where(inArray(airfoils.id, ids));
+  const tagMap = await hashtagsByAirfoilIds(ids, db);
+  const summaries = new Map<string, AirfoilSummary>();
+  for (const r of rows) {
     const normalizedTags = tagMap.get(r.id) ?? [];
-    const progressiveMetric = progressive.metrics.get(r.id);
-    const metric = opts.metricConditionKey ? undefined : metricMap.get(r.id);
+    const progressiveMetric = metrics.progressive.get(r.id);
+    const metric = metrics.legacy.get(r.id);
     const polarCount =
       progressiveMetric?.polarCount ?? Number(metric?.pointCount ?? 0);
     const metricsSource: AirfoilSummary["metricsSource"] =
       progressiveMetric?.source ?? (polarCount > 0 ? "solved" : "queued");
-    return {
+    summaries.set(r.id, {
       id: r.id,
       slug: r.slug,
       name: r.name,
@@ -384,30 +441,94 @@ export async function listAirfoils(opts: ListOpts): Promise<AirfoilSummary[]> {
       metricModelId: progressiveMetric?.modelId ?? null,
       fitStatus: progressiveMetric ? null : (metric?.fitStatus ?? null),
       fitConfidence: progressiveMetric ? null : (metric?.fitConfidence ?? null),
-    };
-  });
-
-  if (solvedSort) {
-    const metricValue = (a: AirfoilSummary): number | null => {
-      if (sort === "ldmax") return a.ldmax;
-      if (sort === "clmax") return a.clmax;
-      return a.cdmin;
-    };
-    summaries.sort((a, b) => {
-      const av = metricValue(a);
-      const bv = metricValue(b);
-      const aMissing = av == null || !Number.isFinite(av);
-      const bMissing = bv == null || !Number.isFinite(bv);
-      if (aMissing && bMissing) return a.name.localeCompare(b.name);
-      if (aMissing) return 1;
-      if (bMissing) return -1;
-      const metricDelta = opts.dir === "asc" ? av - bv : bv - av;
-      return metricDelta || a.name.localeCompare(b.name);
     });
   }
+  return summaries;
+}
 
-  return summaries.slice(
-    opts.offset ?? 0,
-    (opts.offset ?? 0) + (opts.limit ?? DEFAULT_LIMIT),
+interface CatalogPage {
+  items: AirfoilSummary[];
+  total: number;
+  rankingId: string;
+  retained?: AirfoilSummary | null;
+}
+
+interface CatalogKeys {
+  items: CatalogKey[];
+  total: number;
+}
+
+export function listAirfoilPage(
+  opts: ListOpts & { keysOnly: true },
+): Promise<CatalogKeys>;
+export function listAirfoilPage(
+  opts: ListOpts & { keysOnly?: false; retainSlug?: string },
+): Promise<CatalogPage>;
+export async function listAirfoilPage(
+  opts: ListOpts & { keysOnly?: boolean; retainSlug?: string },
+): Promise<CatalogPage | CatalogKeys> {
+  return db.transaction(
+    async (tx) => {
+      const connection = tx as unknown as DB;
+      const { rows, allVisible } = await catalogCandidates(connection, opts);
+      const sort = opts.sort;
+      let metrics: CatalogMetrics | undefined;
+      if (
+        rows.length &&
+        (sort === "ldmax" || sort === "clmax" || sort === "cdmin")
+      ) {
+        metrics = await readCatalogMetrics(
+          connection,
+          rows.map((row) => row.id),
+          opts.metricConditionKey,
+          allVisible,
+        );
+        rankByMetric(rows, metrics, sort, opts.dir === "asc");
+      }
+      const total = rows.length;
+      const offset = opts.offset ?? 0;
+      const limit = opts.limit ?? (opts.keysOnly ? total : DEFAULT_LIMIT);
+      const window = rows.slice(offset, offset + limit);
+      if (opts.keysOnly)
+        return { items: window.map(({ id, slug }) => ({ id, slug })), total };
+
+      // UUIDs have fixed width. This digest describes membership and order across requests.
+      const digest = createHash("sha256");
+      for (const { id } of rows) digest.update(id);
+      const rankingId = digest.digest("hex");
+      const retained =
+        opts.retainSlug && !window.some((row) => row.slug === opts.retainSlug)
+          ? rows.find((row) => row.slug === opts.retainSlug)
+          : undefined;
+      const ids = window.map((row) => row.id);
+      if (retained) ids.push(retained.id);
+      const summaries = ids.length
+        ? await hydrateCatalog(
+            connection,
+            opts,
+            ids,
+            metrics ??
+              (await readCatalogMetrics(
+                connection,
+                ids,
+                opts.metricConditionKey,
+                allVisible && ids.length === total,
+              )),
+          )
+        : new Map<string, AirfoilSummary>();
+      return {
+        items: window.map((row) => summaries.get(row.id)!),
+        total,
+        rankingId,
+        ...(opts.retainSlug === undefined
+          ? {}
+          : { retained: retained ? summaries.get(retained.id)! : null }),
+      };
+    },
+    { isolationLevel: "repeatable read", accessMode: "read only" },
   );
+}
+
+export async function listAirfoils(opts: ListOpts): Promise<AirfoilSummary[]> {
+  return (await listAirfoilPage(opts)).items;
 }
