@@ -31,7 +31,11 @@ import {
   getAirfoilCurveDetail,
   getCategoriesTree,
   getHashtags,
-  listAirfoils,
+  INITIAL_BROWSE_ROWS,
+  listAirfoilKeys,
+  listAirfoilPage,
+  listAirfoilPrefix,
+  type AirfoilListParams,
 } from "@/lib/api";
 import { MetricConditionSelector } from "@/components/MetricConditionSelector";
 import { PolarMiniChart } from "@/components/PolarMiniChart";
@@ -158,12 +162,16 @@ function flattenCategories(nodes: CategoryNode[]): CategoryNode[] {
 
 export function BrowseView({
   initialItems,
+  initialTotal,
+  initialRankingId,
   categories: initialCategories,
   hashtags: initialHashtags,
   conditions,
   initialConditionKey = "",
 }: {
   initialItems: AirfoilSummary[];
+  initialTotal: number;
+  initialRankingId?: string;
   categories: CategoryNode[];
   hashtags: HashtagDTO[];
   conditions: PolarMetricCondition[];
@@ -172,14 +180,12 @@ export function BrowseView({
   const [conditionKey, setConditionKey] = useState(initialConditionKey);
   const selectCondition = (key: string) => {
     setConditionKey(key);
-    setItems([]);
     window.history.replaceState(
       null,
       "",
       withMetricCondition(window.location.href, key),
     );
   };
-  const [items, setItems] = useState(initialItems);
   const [categories, setCategories] = useState(initialCategories);
   const [hashtags, setHashtags] = useState(initialHashtags);
   const [authed, setAuthed] = useState(false);
@@ -193,13 +199,17 @@ export function BrowseView({
   const [filters, setFilters] = useState<Filters>(EMPTY_FILTERS);
   const [filterHashtags, setFilterHashtags] = useState<string[]>([]);
   const [focusedMetric, setFocusedMetric] = useState<MetricKey | null>(null);
-  const [selected, setSelected] = useState(initialItems[0]?.slug ?? "");
+  const [preview, setPreview] = useState<AirfoilSummary | undefined>(
+    initialItems[0],
+  );
+  const selected = preview?.slug ?? "";
   const [hoveredId, setHoveredId] = useState<string | null>(null);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(() => new Set());
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const [bulkHashtagIds, setBulkHashtagIds] = useState<string[]>([]);
-  const [visible, setVisible] = useState(150);
+  const [refresh, setRefresh] = useState(0);
+  const [loadingMore, setLoadingMore] = useState(false);
   const [choosingDetail, setChoosingDetail] = useState(false);
   const browseRequestSeq = useRef(0);
   const router = useRouter();
@@ -212,10 +222,71 @@ export function BrowseView({
     () => categories.reduce((sum, n) => sum + n.airfoilCount, 0),
     [categories],
   );
-  const visibleIds = useMemo(() => new Set(items.map((i) => i.id)), [items]);
-  const selectedVisibleCount = [...selectedIds].filter((id) =>
-    visibleIds.has(id),
-  ).length;
+  const filter = useMemo<AirfoilListParams>(
+    () => ({
+      q,
+      category: selectedCategory || undefined,
+      includeSubcategories,
+      sort: apiSort(sortKey),
+      metricConditionKey: conditionKey || undefined,
+      dir,
+      hashtags: filterHashtags,
+      thicknessMin: num(filters.thicknessMin),
+      thicknessMax: num(filters.thicknessMax),
+      areaMin: num(filters.areaMin),
+      areaMax: num(filters.areaMax),
+      upperAreaMin: num(filters.upperAreaMin),
+      upperAreaMax: num(filters.upperAreaMax),
+      upperPositiveMin: num(filters.upperPositiveMin),
+      upperPositiveMax: num(filters.upperPositiveMax),
+      upperNegativeMin: num(filters.upperNegativeMin),
+      upperNegativeMax: num(filters.upperNegativeMax),
+      lowerAreaMin: num(filters.lowerAreaMin),
+      lowerAreaMax: num(filters.lowerAreaMax),
+      lowerPositiveMin: num(filters.lowerPositiveMin),
+      lowerPositiveMax: num(filters.lowerPositiveMax),
+      lowerNegativeMin: num(filters.lowerNegativeMin),
+      lowerNegativeMax: num(filters.lowerNegativeMax),
+      camberAreaMin: num(filters.camberAreaMin),
+      camberAreaMax: num(filters.camberAreaMax),
+      camberPositiveMin: num(filters.camberPositiveMin),
+      camberPositiveMax: num(filters.camberPositiveMax),
+      camberNegativeMin: num(filters.camberNegativeMin),
+      camberNegativeMax: num(filters.camberNegativeMax),
+    }),
+    [
+      q,
+      selectedCategory,
+      includeSubcategories,
+      sortKey,
+      conditionKey,
+      dir,
+      filterHashtags,
+      filters,
+    ],
+  );
+  const queryKey = JSON.stringify([filter, refresh]);
+  const [page, setPage] = useState({
+    key: queryKey,
+    items: initialItems,
+    total: initialTotal,
+    rankingId: initialRankingId,
+  });
+  const appliedKey = useRef(queryKey);
+  const refreshWindow = useRef<{ filter: string; count: number } | null>(null);
+  const request = useRef<AbortController | null>(null);
+  const fetchingMore = useRef<number | null>(null);
+  const latestPreview = useRef(preview);
+  const latestSelection = useRef(selectedIds);
+  useEffect(() => {
+    latestPreview.current = preview;
+  }, [preview]);
+  useEffect(() => {
+    latestSelection.current = selectedIds;
+  }, [selectedIds]);
+  const loadingPage = page.key !== queryKey;
+  const items = loadingPage ? [] : page.items;
+  const selectedVisibleCount = loadingPage ? 0 : selectedIds.size;
 
   useEffect(() => {
     setHydrated(true);
@@ -231,67 +302,167 @@ export function BrowseView({
   }, []);
 
   useEffect(() => {
-    const requestSeq = ++browseRequestSeq.current;
-    const t = setTimeout(async () => {
+    const seq = ++browseRequestSeq.current;
+    const controller = new AbortController();
+    request.current = controller;
+    fetchingMore.current = null;
+    setLoadingMore(false);
+    setErr(null);
+
+    // The server has already supplied the first page for this exact query.
+    if (appliedKey.current === queryKey) return () => controller.abort();
+    const timer = setTimeout(async () => {
       try {
-        setErr(null);
-        const next = await listAirfoils({
-          q,
-          category: selectedCategory || undefined,
-          includeSubcategories,
-          sort: apiSort(sortKey),
-          metricConditionKey: conditionKey || undefined,
-          dir,
-          hashtags: filterHashtags,
-          thicknessMin: num(filters.thicknessMin),
-          thicknessMax: num(filters.thicknessMax),
-          areaMin: num(filters.areaMin),
-          areaMax: num(filters.areaMax),
-          upperAreaMin: num(filters.upperAreaMin),
-          upperAreaMax: num(filters.upperAreaMax),
-          upperPositiveMin: num(filters.upperPositiveMin),
-          upperPositiveMax: num(filters.upperPositiveMax),
-          upperNegativeMin: num(filters.upperNegativeMin),
-          upperNegativeMax: num(filters.upperNegativeMax),
-          lowerAreaMin: num(filters.lowerAreaMin),
-          lowerAreaMax: num(filters.lowerAreaMax),
-          lowerPositiveMin: num(filters.lowerPositiveMin),
-          lowerPositiveMax: num(filters.lowerPositiveMax),
-          lowerNegativeMin: num(filters.lowerNegativeMin),
-          lowerNegativeMax: num(filters.lowerNegativeMax),
-          camberAreaMin: num(filters.camberAreaMin),
-          camberAreaMax: num(filters.camberAreaMax),
-          camberPositiveMin: num(filters.camberPositiveMin),
-          camberPositiveMax: num(filters.camberPositiveMax),
-          camberNegativeMin: num(filters.camberNegativeMin),
-          camberNegativeMax: num(filters.camberNegativeMax),
+        const retainedWindow = refreshWindow.current;
+        refreshWindow.current = null;
+        const count =
+          retainedWindow?.filter === JSON.stringify(filter)
+            ? retainedWindow.count
+            : INITIAL_BROWSE_ROWS;
+        const next = await listAirfoilPrefix(
+          filter,
+          count,
+          latestPreview.current?.slug,
+          controller.signal,
+        );
+        let matchingIds: Set<string> | undefined;
+        if (latestSelection.current.size) {
+          const keys =
+            next.total > next.items.length
+              ? await listAirfoilKeys(filter, controller.signal)
+              : next.items;
+          matchingIds = new Set(keys.map((item) => item.id));
+        }
+        if (controller.signal.aborted || seq !== browseRequestSeq.current)
+          return;
+        appliedKey.current = queryKey;
+        setPage({
+          key: queryKey,
+          items: next.items,
+          total: next.total,
+          rankingId: next.rankingId,
         });
-        if (requestSeq !== browseRequestSeq.current) return;
-        setItems(next);
-        setVisible(150);
-        setSelected((slug) =>
-          next.some((a) => a.slug === slug) ? slug : (next[0]?.slug ?? ""),
+        setPreview(
+          (old) =>
+            next.items.find((item) => item.slug === old?.slug) ??
+            (next.retained && next.retained.slug === old?.slug
+              ? next.retained
+              : next.items[0]),
         );
-        setSelectedIds(
-          (ids) =>
-            new Set([...ids].filter((id) => next.some((a) => a.id === id))),
-        );
-      } catch (e) {
-        if (requestSeq !== browseRequestSeq.current) return;
-        setErr((e as Error).message);
+        if (matchingIds) {
+          const allowed = matchingIds;
+          setSelectedIds(
+            (ids) => new Set([...ids].filter((id) => allowed.has(id))),
+          );
+        }
+      } catch (error) {
+        if (!controller.signal.aborted && seq === browseRequestSeq.current)
+          setErr((error as Error).message);
       }
     }, 180);
-    return () => clearTimeout(t);
-  }, [
-    q,
-    selectedCategory,
-    includeSubcategories,
-    filters,
-    filterHashtags,
-    sortKey,
-    dir,
-    conditionKey,
-  ]);
+    return () => {
+      clearTimeout(timer);
+      controller.abort();
+    };
+  }, [filter, queryKey]);
+
+  const loadMore = async () => {
+    const seq = browseRequestSeq.current;
+    const signal = request.current?.signal;
+    if (
+      loadingPage ||
+      page.items.length >= page.total ||
+      fetchingMore.current === seq
+    )
+      return;
+    fetchingMore.current = seq;
+    setLoadingMore(true);
+    setErr(null);
+    try {
+      const count = page.items.length + 300;
+      const prefix = () =>
+        listAirfoilPrefix(filter, count, latestPreview.current?.slug, signal);
+      // Without a shared ranking snapshot, get the whole visible window. A new
+      // profile or revised polar can move a row across an offset boundary.
+      let replace = !page.rankingId;
+      let next = replace
+        ? await prefix()
+        : await listAirfoilPage(
+            {
+              ...filter,
+              offset: page.items.length,
+              limit: 300,
+            },
+            signal,
+          );
+      if (!replace) {
+        const loaded = new Set(page.items.map((item) => item.id));
+        if (
+          next.total !== page.total ||
+          next.rankingId !== page.rankingId ||
+          !next.items.length ||
+          next.items.some((item) => loaded.has(item.id))
+        ) {
+          next = await prefix();
+          replace = true;
+        }
+      }
+      let allowed: Set<string> | undefined;
+      if (replace && latestSelection.current.size) {
+        const keys =
+          next.total > next.items.length
+            ? await listAirfoilKeys(filter, signal)
+            : next.items;
+        allowed = new Set(keys.map((item) => item.id));
+      }
+      if (signal?.aborted || seq !== browseRequestSeq.current) return;
+      const rows = replace ? next.items : [...page.items, ...next.items];
+      setPage({
+        key: queryKey,
+        items: rows,
+        total: next.total,
+        rankingId: next.rankingId,
+      });
+      setPreview(
+        (old) =>
+          rows.find((item) => item.slug === old?.slug) ??
+          (replace ? (next.retained ?? rows[0]) : old),
+      );
+      if (allowed) {
+        const matching = allowed;
+        setSelectedIds(
+          (ids) => new Set([...ids].filter((id) => matching.has(id))),
+        );
+      }
+    } catch (error) {
+      if (!signal?.aborted && seq === browseRequestSeq.current)
+        setErr((error as Error).message);
+    } finally {
+      if (fetchingMore.current === seq) {
+        fetchingMore.current = null;
+        setLoadingMore(false);
+      }
+    }
+  };
+
+  const selectAll = async () => {
+    const seq = browseRequestSeq.current;
+    const signal = request.current?.signal;
+    setBusy(true);
+    try {
+      const rows =
+        page.items.length === page.total
+          ? page.items
+          : await listAirfoilKeys(filter, signal);
+      if (!signal?.aborted && seq === browseRequestSeq.current)
+        setSelectedIds(new Set(rows.map((item) => item.id)));
+    } catch (error) {
+      if (!signal?.aborted && seq === browseRequestSeq.current)
+        setErr((error as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
 
   const refreshMeta = async () => {
     const [tree, tagRows] = await Promise.all([
@@ -308,38 +479,11 @@ export function BrowseView({
     try {
       await fn();
       await refreshMeta();
-      const next = await listAirfoils({
-        q,
-        category: selectedCategory || undefined,
-        metricConditionKey: conditionKey || undefined,
-        includeSubcategories,
-        sort: apiSort(sortKey),
-        dir,
-        hashtags: filterHashtags,
-        thicknessMin: num(filters.thicknessMin),
-        thicknessMax: num(filters.thicknessMax),
-        areaMin: num(filters.areaMin),
-        areaMax: num(filters.areaMax),
-        upperAreaMin: num(filters.upperAreaMin),
-        upperAreaMax: num(filters.upperAreaMax),
-        upperPositiveMin: num(filters.upperPositiveMin),
-        upperPositiveMax: num(filters.upperPositiveMax),
-        upperNegativeMin: num(filters.upperNegativeMin),
-        upperNegativeMax: num(filters.upperNegativeMax),
-        lowerAreaMin: num(filters.lowerAreaMin),
-        lowerAreaMax: num(filters.lowerAreaMax),
-        lowerPositiveMin: num(filters.lowerPositiveMin),
-        lowerPositiveMax: num(filters.lowerPositiveMax),
-        lowerNegativeMin: num(filters.lowerNegativeMin),
-        lowerNegativeMax: num(filters.lowerNegativeMax),
-        camberAreaMin: num(filters.camberAreaMin),
-        camberAreaMax: num(filters.camberAreaMax),
-        camberPositiveMin: num(filters.camberPositiveMin),
-        camberPositiveMax: num(filters.camberPositiveMax),
-        camberNegativeMin: num(filters.camberNegativeMin),
-        camberNegativeMax: num(filters.camberNegativeMax),
-      });
-      setItems(next);
+      refreshWindow.current = {
+        filter: JSON.stringify(filter),
+        count: Math.max(INITIAL_BROWSE_ROWS, items.length),
+      };
+      setRefresh((value) => value + 1);
       setSelectedIds(new Set());
       setBulkHashtagIds([]);
     } catch (e) {
@@ -816,9 +960,7 @@ export function BrowseView({
               hashtags={hashtags}
               hashtagIds={bulkHashtagIds}
               setHashtagIds={setBulkHashtagIds}
-              onSelectAll={() =>
-                setSelectedIds(new Set(items.map((a) => a.id)))
-              }
+              onSelectAll={selectAll}
               onSelectNone={() => setSelectedIds(new Set())}
               onMoveTo={(categoryId) =>
                 act(() =>
@@ -901,7 +1043,7 @@ export function BrowseView({
                 </button>
               ))}
             </div>
-            {items.slice(0, visible).map((a) => {
+            {items.map((a) => {
               const checked = selectedIds.has(a.id);
               const checkVisible =
                 authed &&
@@ -918,7 +1060,7 @@ export function BrowseView({
                     if (e.key === "Enter") openDetail(a.slug);
                   }}
                   onMouseEnter={() => {
-                    setSelected(a.slug);
+                    setPreview(a);
                     setHoveredId(a.id);
                   }}
                   onMouseLeave={() => setHoveredId(null)}
@@ -1064,7 +1206,7 @@ export function BrowseView({
                 </div>
               );
             })}
-            {items.length === 0 && (
+            {items.length === 0 && !err && (
               <div
                 style={{
                   fontFamily: MONO,
@@ -1073,7 +1215,7 @@ export function BrowseView({
                   padding: "18px 14px",
                 }}
               >
-                no airfoils match.
+                {loadingPage ? "Loading profiles…" : "no airfoils match."}
               </div>
             )}
           </div>
@@ -1090,12 +1232,18 @@ export function BrowseView({
             }}
           >
             <span>
-              showing {Math.min(visible, items.length)} of {items.length}
+              {!loadingPage && (
+                <>
+                  showing {items.length} of {page.total}
+                </>
+              )}
             </span>
-            {items.length > visible && (
+            {!loadingPage && items.length < page.total && (
               <button
                 type="button"
-                onClick={() => setVisible((v) => v + 300)}
+                onClick={loadMore}
+                disabled={loadingMore}
+                aria-busy={loadingMore}
                 style={smallButton}
               >
                 Load more
@@ -1106,7 +1254,7 @@ export function BrowseView({
 
         <PreviewPane
           slug={selected}
-          summary={items.find((item) => item.slug === selected)}
+          summary={preview}
           conditionKey={conditionKey}
         />
       </div>

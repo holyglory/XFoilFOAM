@@ -4,7 +4,8 @@ import {
   getCategoriesTree,
   getHashtags,
   getPolarMetricConditions,
-  listAirfoils,
+  INITIAL_BROWSE_ROWS,
+  listAirfoilPage,
 } from "@/lib/api";
 import { metricConditionParam } from "@/lib/metric-condition";
 import { C, MONO } from "@/lib/tokens";
@@ -37,12 +38,13 @@ async function BrowseContent({
   searchParams: Promise<Record<string, string | string[] | undefined>>;
 }) {
   const conditionKey = metricConditionParam((await searchParams).condition);
-  const [items, categories, hashtags, conditions] = await Promise.all([
-    listAirfoils({
+  const [page, categories, hashtags, conditions] = await Promise.all([
+    listAirfoilPage({
       sort: "ldmax",
       dir: "desc",
       includeSubcategories: true,
       metricConditionKey: conditionKey || undefined,
+      limit: INITIAL_BROWSE_ROWS,
     }),
     getCategoriesTree(),
     getHashtags(),
@@ -72,11 +74,13 @@ async function BrowseContent({
             Airfoil catalog
           </h1>
           <span style={{ fontFamily: MONO, fontSize: 12, color: C.dim }}>
-            {items.length} profiles
+            {page.total} profiles
           </span>
         </div>
         <BrowseView
-          initialItems={items}
+          initialItems={page.items}
+          initialTotal={page.total}
+          initialRankingId={page.rankingId}
           categories={categories}
           hashtags={hashtags}
           conditions={conditions}
