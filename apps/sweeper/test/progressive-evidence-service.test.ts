@@ -9,6 +9,7 @@ import {
   stageNextProgressiveWorkerEvidence,
   withPeriodicIngestLeaseRenewal,
 } from "../src/progressive-worker-evidence";
+import { withStagingSelection } from "../src/progressive-staging-selection";
 
 function notifications() {
   const callbacks = new Map<string, Set<() => void>>();
@@ -55,6 +56,60 @@ it("returns idle when no staging candidate is available", async () => {
     stageNextProgressiveWorkerEvidence(db, {} as EngineClient),
   ).resolves.toBe(false);
   expect(execute).toHaveBeenCalledOnce();
+});
+
+it("shares an empty staging lookup only with callers that preceded its snapshot", async () => {
+  const db = {} as DB;
+  const first = gate(),
+    second = gate();
+  const started = gate();
+  const scans = vi
+    .fn()
+    .mockImplementationOnce(async () => {
+      await first.pending;
+    })
+    .mockImplementationOnce(async () => {
+      started.release();
+      await second.pending;
+    })
+    .mockResolvedValueOnce("new report");
+  const stage = () => withStagingSelection(db, true, scans);
+  const initial = stage();
+  const waiting = Array.from({ length: 14 }, stage);
+  first.release();
+  await started.pending;
+  const arrivedAfterSnapshot = stage();
+  second.release();
+  expect(await initial).toBeUndefined();
+  expect(await Promise.all(waiting)).toEqual(Array(14).fill(undefined));
+  expect(await arrivedAfterSnapshot).toBe("new report");
+  expect(scans).toHaveBeenCalledTimes(3);
+});
+
+it("gives each positive staging claim one owner and keeps the historical lane independent", async () => {
+  const db = {} as DB;
+  const started = gate();
+  const scans = vi
+    .fn()
+    .mockImplementationOnce(async () => {
+      await started.pending;
+      return "first";
+    })
+    .mockRejectedValueOnce(new Error("lost transaction"))
+    .mockResolvedValueOnce(null)
+    .mockResolvedValueOnce("second");
+  const active = () => withStagingSelection(db, true, scans);
+  const results = Promise.allSettled([active(), active(), active(), active()]);
+  await expect(
+    withStagingSelection(db, false, async () => "historical"),
+  ).resolves.toBe("historical");
+  started.release();
+  expect(await results).toEqual([
+    { status: "fulfilled", value: "first" },
+    { status: "rejected", reason: new Error("lost transaction") },
+    { status: "fulfilled", value: null },
+    { status: "fulfilled", value: "second" },
+  ]);
 });
 
 it("renews a delayed ingest without overlap and cleans up its timer", async () => {
