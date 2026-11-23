@@ -28,6 +28,46 @@ async function query(page, values) {
   return result.json();
 }
 const rows = (page) => page.locator('[data-testid^="airfoil-row-"]');
+async function renderedTextContrast(page, locator) {
+  const png = (await locator.screenshot({ animations: "disabled" })).toString(
+    "base64",
+  );
+  return page.evaluate(async (data) => {
+    const image = new Image();
+    image.src = "data:image/png;base64," + data;
+    await image.decode();
+    const canvas = document.createElement("canvas");
+    canvas.width = image.width;
+    canvas.height = image.height;
+    const context = canvas.getContext("2d");
+    context.drawImage(image, 0, 0);
+    const pixels = context.getImageData(0, 0, image.width, image.height).data;
+    const colors = new Map();
+    for (let i = 0; i < pixels.length; i += 4) {
+      const rgb = (pixels[i] << 16) | (pixels[i + 1] << 8) | pixels[i + 2];
+      colors.set(rgb, (colors.get(rgb) ?? 0) + 1);
+    }
+    // These spans contain only count text. The most frequent pixel is the
+    // actual composited page background, including the shell's gradient.
+    const background = [...colors].sort((a, b) => b[1] - a[1])[0][0];
+    const luminance = (rgb) =>
+      [16, 8, 0]
+        .map((shift) => {
+          const channel = ((rgb >> shift) & 255) / 255;
+          return channel <= 0.04045
+            ? channel / 12.92
+            : ((channel + 0.055) / 1.055) ** 2.4;
+        })
+        .reduce((sum, v, i) => sum + v * [0.2126, 0.7152, 0.0722][i], 0);
+    const bg = luminance(background);
+    return Math.max(
+      ...[...colors.keys()].map((color) => {
+        const ink = luminance(color);
+        return (Math.max(ink, bg) + 0.05) / (Math.min(ink, bg) + 0.05);
+      }),
+    );
+  }, png);
+}
 async function waitRows(page, expected) {
   await expect(rows(page)).toHaveCount(expected.length);
   assert.deepEqual(
@@ -189,6 +229,21 @@ try {
       .selectOption(condition);
     await response;
     await waitRows(page, match.items);
+    proof.countContrast = {};
+    for (const theme of ["dark", "light"]) {
+      if ((await page.locator("html").getAttribute("data-theme")) !== theme)
+        await page
+          .getByRole("button", { name: "Switch to " + theme + " theme" })
+          .click();
+      for (const id of ["catalog-profile-count", "catalog-visible-count"]) {
+        const contrast = await renderedTextContrast(page, page.getByTestId(id));
+        assert(
+          contrast >= 4.5,
+          id + " contrast in " + theme + " was " + contrast.toFixed(2),
+        );
+        proof.countContrast[theme + "/" + id] = contrast;
+      }
+    }
     await expect(page).toHaveURL(new RegExp("condition=" + condition));
     const direct = await query(page, {
       metricConditionKey: condition,

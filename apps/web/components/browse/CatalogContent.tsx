@@ -49,7 +49,10 @@ export async function CatalogContent({
           >
             Airfoil catalog
           </h1>
-          <span style={{ fontFamily: MONO, fontSize: 12, color: C.dim }}>
+          <span
+            data-testid="catalog-profile-count"
+            style={{ fontFamily: MONO, fontSize: 12, color: C.dim }}
+          >
             {page.total} profiles
           </span>
         </div>

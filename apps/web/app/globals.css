@@ -107,6 +107,7 @@ html {
   scroll-padding-top: 60px;
 }
 .catalog-page-shell {
+  --aero-dim: var(--aero-muted);
   display: grid;
   grid-template-rows: auto minmax(0, 1fr);
   height: 100vh;

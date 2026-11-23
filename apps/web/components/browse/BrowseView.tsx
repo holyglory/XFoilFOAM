@@ -1263,7 +1263,7 @@ export function BrowseView({
               color: C.dim,
             }}
           >
-            <span>
+            <span data-testid="catalog-visible-count">
               {!loadingPage && (
                 <>
                   showing {items.length} of {page.total}
