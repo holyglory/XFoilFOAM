@@ -142,12 +142,14 @@ export function legacyKeysSql(
   after: number,
   highWater: number,
   rows: number,
+  includeNormalizedHint = false,
 ): string {
   const table = target(executionId, kind);
   legacyBound(after, Number.MAX_SAFE_INTEGER, "sequence cursor", 0);
   legacyBound(highWater, Number.MAX_SAFE_INTEGER, "high water", 0);
   legacyBound(rows, 128, "page rows");
-  return legacyReadOnlySql(`SELECT jsonb_build_object('sequence', sequence)::text FROM ${table}
+  const hint = includeNormalizedHint && kind === "report" ? `, 'normalizedHash', result_payload_hash` : "";
+  return legacyReadOnlySql(`SELECT jsonb_build_object('sequence', sequence${hint})::text FROM ${table}
 WHERE sim_job_id='${executionId}'::uuid AND sequence > ${after} AND sequence <= ${highWater}
 ORDER BY sequence LIMIT ${rows};`);
 }

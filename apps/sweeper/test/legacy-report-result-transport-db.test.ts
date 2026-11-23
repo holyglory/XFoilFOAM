@@ -1,3 +1,4 @@
+import { readNormalizedPrefix } from "../src/legacy-report-normalized-batch";
 import { createHash, randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { gunzipSync } from "node:zlib";
@@ -289,6 +290,7 @@ it.each([false, true])(
       64 * 1024 ** 2,
     );
     const transport = new LegacyResultTransport(fast.source);
+    const start = performance.now();
     const optimized = await readLegacyPage(
       { ...fast.source, readMember: transport.readMember.bind(transport) },
       f.scope,
@@ -296,6 +298,90 @@ it.each([false, true])(
       128,
       64 * 1024 ** 2,
     );
+    const scalarMs = performance.now() - start;
+    const batched = reader(),
+      scalar = new LegacyResultTransport(batched.source);
+    const batchedSource: LegacySqlReader = {
+      ...batched.source,
+      readMember: scalar.readMember.bind(scalar),
+      readNormalizedPrefix: (id, keys, budget) =>
+        readNormalizedPrefix(batched.source, id, keys, budget),
+    };
+    const batchStart = performance.now();
+    const sealed = await readLegacyPage(
+      batchedSource,
+      f.scope,
+      undefined,
+      128,
+      64 * 1024 ** 2,
+    );
+    console.info(
+      "normalized-page-transport",
+      JSON.stringify({
+        normalized,
+        scalarMs: Math.round(scalarMs),
+        batchMs: Math.round(performance.now() - batchStart),
+        scalarQueries: fast.statements.length,
+        batchQueries: batched.statements.length,
+      }),
+    );
+    exactArchive(sealed, original);
+    if (normalized) {
+      expect(batched.statements.length).toBeLessThan(
+        fast.statements.length / 2,
+      );
+      expect(
+        batched.packets.filter((p) => typeof p.text === "string" && p.sha256),
+      ).toHaveLength(1);
+      expect(batched.packets.filter((p) => p.member)).toHaveLength(
+        f.sequences.length,
+      );
+      const budget =
+        original.members
+          .slice(0, 3)
+          .reduce(
+            (n, m) => n + m.reportByteSize + Buffer.byteLength(m.rowText),
+            0,
+          ) + 1;
+      const partial = await readLegacyPage(
+        batchedSource,
+        f.scope,
+        undefined,
+        128,
+        budget,
+      );
+      exactArchive(
+        partial,
+        await readLegacyPage(full.source, f.scope, undefined, 128, budget),
+      );
+      expect(partial.next.after).toBe(f.sequences[2]);
+      const resumed = await readLegacyPage(
+        batchedSource,
+        f.scope,
+        partial.next,
+        128,
+        64 * 1024 ** 2,
+      );
+      expect(
+        [...partial.members, ...resumed.members].map((m) => m.sequence),
+      ).toEqual(f.sequences);
+      const damaged: LegacySqlReader = {
+        ...batchedSource,
+        readNormalizedPrefix: async (id, keys, bytes) => {
+          const result = await readNormalizedPrefix(
+            batched.source,
+            id,
+            keys,
+            bytes,
+          );
+          if (result) result.members[1]!.reportSha256 = "0".repeat(64);
+          return result;
+        },
+      };
+      await expect(
+        readLegacyPage(damaged, f.scope, undefined, 128, budget),
+      ).rejects.toThrow();
+    }
     exactMembers(optimized, original);
     expect(optimized.members.map((member) => member.sequence)).toEqual(
       f.sequences,
@@ -321,6 +407,100 @@ it.each([false, true])(
   },
   120_000,
 );
+
+it("batches a shared result above 16 MiB when multiple decoded originals fit the page", async () => {
+  const f = await cohort({
+    normalized: true,
+    sequences: [1, 3, 5],
+    padding: 17 * 1024 ** 2,
+  });
+  const sqlReader = reader();
+  const source: LegacySqlReader = {
+    ...sqlReader.source,
+    readNormalizedPrefix: (id, seq, budget) =>
+      readNormalizedPrefix(sqlReader.source, id, seq, budget),
+  };
+  const page = await readLegacyPage(
+    source,
+    f.scope,
+    undefined,
+    3,
+    64 * 1024 ** 2,
+  );
+  expect(page.members.map((m) => m.sequence)).toEqual([1, 3, 5]);
+  expect(
+    sqlReader.packets.filter((p) => typeof p.text === "string" && p.sha256),
+  ).toHaveLength(1);
+  for (const member of page.members) {
+    const [r] = await client!
+      .sql`SELECT encode(sha256(convert_to(resolve_progressive_report(report,result_payload_hash)::text,'UTF8')),'hex') AS digest,
+       octet_length(resolve_progressive_report(report,result_payload_hash)::text)::int AS bytes FROM progressive_worker_reports
+       WHERE sim_job_id=${f.executionId} AND sequence=${member.sequence}`;
+    expect(member.reportSha256).toBe(r.digest);
+    expect(Buffer.byteLength(member.reportText)).toBe(r.bytes);
+  }
+}, 120000);
+
+it("seals only the consecutive identical normalized results and retries a lost batch on its original cursor", async () => {
+  const f = await cohort({
+    normalized: true,
+    sequences: [1, 4],
+    padding: 1024 * 256,
+  });
+  const first = reader();
+  const sqlReader = reader();
+  const body = f.result.replace("1.0000", "1.0001");
+  for (const [sequence, value] of [
+    [7, body],
+    [10, f.result],
+  ] as const) {
+    const report = `{"version":1,"executionId":"${f.executionId}","solverId":"${f.solverId}","sequence":${sequence},"result":${value}}`;
+    await client!
+      .sql`INSERT INTO progressive_worker_reports(sim_job_id,sequence,content_signature,report) VALUES (${f.executionId},${sequence},${hash(report)},${report}::jsonb)`;
+  }
+  const scope = {
+    ...f.scope,
+    executions: [{ ...f.scope.executions[0], reports: 4, reportHighWater: 10 }],
+  };
+  const scalar = new LegacyResultTransport(sqlReader.source);
+  let lose = true;
+  const source: LegacySqlReader = {
+    ...sqlReader.source,
+    readMember: scalar.readMember.bind(scalar),
+    readNormalizedPrefix: async (id, keys, budget) => {
+      const batch = await readNormalizedPrefix(
+        sqlReader.source,
+        id,
+        keys,
+        budget,
+      );
+      expect(batch?.members.map((m) => m.sequence)).toEqual([1, 4]);
+      if (lose) {
+        lose = false;
+        throw Error("lost batch reply");
+      }
+      return batch;
+    },
+  };
+  const cursor = { execution: 0, kind: "report" as const, after: 0, copied: 0 };
+  await expect(
+    readLegacyPage(source, scope, cursor, 128, 8 * 1024 ** 2),
+  ).rejects.toThrow("lost batch reply");
+  expect(cursor).toEqual({ execution: 0, kind: "report", after: 0, copied: 0 });
+  const result = await readLegacyPage(
+    source,
+    scope,
+    cursor,
+    128,
+    8 * 1024 ** 2,
+  );
+  exactArchive(
+    result,
+    await readLegacyPage(first.source, scope, cursor, 128, 8 * 1024 ** 2),
+  );
+  expect(result.members[2].reportText).toContain("1.0001");
+  expect(result.members[3].reportText).toContain("1.0000");
+});
 
 it("keeps null versus absent results, normalized versus inline rows and both conflict representations exact", async () => {
   const f = await cohort({ sequences: [1, 3], padding: 4096 });

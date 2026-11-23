@@ -12,6 +12,10 @@ import {
 } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
+import {
+  readNormalizedPrefix,
+  type NormalizedPrefix,
+} from "./legacy-report-normalized-batch";
 import { LegacyResultTransport } from "./legacy-report-result-transport";
 
 import {
@@ -58,6 +62,11 @@ export type {
 export interface LegacySqlReader {
   acceptVerifiedTransportHistory?(): void;
   query(sql: string, maxBytes: number): Promise<Record<string, unknown>[]>;
+  readNormalizedPrefix?(
+    executionId: string,
+    sequences: number[],
+    maxBytes: number,
+  ): Promise<NormalizedPrefix | null>;
   readMember?(
     executionId: string,
     kind: LegacyReportKind,
@@ -285,6 +294,21 @@ export class LegacySshReader implements LegacySqlReader {
       child.stdin.write(sql + "\n\\echo " + marker + "\n");
     });
   }
+  async readNormalizedPrefix(
+    executionId: string,
+    keys: number[],
+    budget: number,
+  ) {
+    const prefix = await readNormalizedPrefix(this, executionId, keys, budget);
+    if (prefix) {
+      const stats = this.resultTransport.stats;
+      stats.definitions++;
+      stats.reuses += prefix.members.length - 1;
+      stats.resultBytesReceived += prefix.dictionaryBytes;
+      stats.decodedBytes += prefix.decodedBytes;
+    }
+    return prefix;
+  }
   readMember(
     executionId: string,
     kind: LegacyReportKind,
@@ -358,6 +382,7 @@ export async function readLegacyPage(
         next.after,
         highWater,
         rows - members.length,
+        Boolean(source.readNormalizedPrefix),
       ),
       65536,
     );
@@ -380,27 +405,53 @@ export async function readLegacyPage(
     }
     if (keys.length > rows - members.length)
       throw new Error("Unbounded source key result");
-    for (const key of keys) {
-      const sequence = Number(key.sequence);
-      legacyBound(sequence, highWater, "source sequence");
-      if (sequence <= next.after) throw new Error("Source keys out of order");
-      queries++;
-      const result = source.readMember
-        ? await source.readMember(
+    const sequences = keys.map((key) =>
+      legacyBound(Number(key.sequence), highWater, "source sequence"),
+    );
+    if (
+      sequences.some(
+        (sequence, index) =>
+          sequence <= (index ? sequences[index - 1]! : next.after),
+      )
+    )
+      throw new Error("Source keys out of order");
+    // This hint avoids an extra round trip for inline/unique results. The
+    // batch query independently rechecks its exact keys, hash and member bytes.
+    const hint = keys[0].normalizedHash;
+    const batch =
+      next.kind === "report" &&
+      source.readNormalizedPrefix &&
+      typeof hint === "string" &&
+      hint === keys[1]?.normalizedHash
+        ? await source.readNormalizedPrefix(
             item.executionId,
-            next.kind,
-            sequence,
+            sequences,
             maxBytes - bytes,
           )
-        : await source.query(
-            legacyMemberSql(
+        : null;
+    for (const [index, sequence] of sequences.entries()) {
+      if (batch?.nextCost != null && index === batch.members.length)
+        return page();
+      queries++;
+      const sealed = batch?.members[index];
+      const result = sealed
+        ? [sealed as unknown as Record<string, unknown>]
+        : source.readMember
+          ? await source.readMember(
               item.executionId,
               next.kind,
               sequence,
               maxBytes - bytes,
-            ),
-            (maxBytes - bytes) * 6 + 1024 * 1024,
-          );
+            )
+          : await source.query(
+              legacyMemberSql(
+                item.executionId,
+                next.kind,
+                sequence,
+                maxBytes - bytes,
+              ),
+              (maxBytes - bytes) * 6 + 1024 * 1024,
+            );
       if (result.length !== 1) throw new Error("Frozen source member missing");
       if (result[0].blocked) {
         if (
