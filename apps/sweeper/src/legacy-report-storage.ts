@@ -501,7 +501,7 @@ export async function readLegacyPage(
 }
 
 // Keep only the encoded bytes and receipt fields while another page is read.
-// The apply callback receives a separate decode of the verified object.
+// An opted-in writer later receives the authenticated object-store readback.
 function packedPage(page: LegacyBackupPage, packed = encodeLegacyPage(page)) {
   const { members, ...header } = page;
   return {
@@ -976,18 +976,22 @@ export async function exportLegacyReports(input: {
         solverId: page.solverId,
         start: page.start,
         next: page.next,
-        object,
+        object: { ...object },
         memberCount: page.memberCount,
         rawByteSize: page.rawByteSize,
       };
       const restored = await input.store.read(object);
-      decodeLegacyPage(restored, receipt);
+      let verifiedPage: LegacyBackupPage | undefined = decodeLegacyPage(
+        restored,
+        receipt,
+      );
+      if (!input.applyVerifiedPage) verifiedPage = undefined;
       if (!restored.equals(page.bytes))
         throw new Error("Backup bytes changed during readback");
       add("reportRowsVerified", page.reportRows);
       add("archiveMembersVerified", page.memberCount);
       const receiptBytes = Buffer.from(JSON.stringify(receipt) + "\n");
-      const receiptFile = `${legacySha256(receiptBytes)}.${hash}.${object.generation}.receipt.json`;
+      const receiptFile = `${legacySha256(receiptBytes)}.${hash}.${receipt.object.generation}.receipt.json`;
       await durableWrite(
         join(input.directory, receiptFile),
         receiptBytes,
@@ -1000,11 +1004,18 @@ export async function exportLegacyReports(input: {
           true,
         );
       await syncDirectory(input.directory); // Receipt/optional retained copy BEFORE progress.
-      if (input.applyVerifiedPage)
+      if (input.applyVerifiedPage && verifiedPage)
         try {
+          // The store may still hold its Buffer across the receipt fsync.
+          // Match it to the durable identity before handing both to the writer.
+          if (
+            restored.length !== receipt.object.byteSize ||
+            legacySha256(restored) !== hash
+          )
+            throw new Error("Verified backup bytes changed before application");
           applied(
             await input.applyVerifiedPage(
-              decodeLegacyPage(restored, receipt),
+              verifiedPage,
               receipt,
               receiptFile,
               restored,

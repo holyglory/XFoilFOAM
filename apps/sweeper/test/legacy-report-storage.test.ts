@@ -1,3 +1,4 @@
+import * as legacyCodec from "@aerodb/db/legacy-report-storage-codec";
 import { randomUUID } from "node:crypto";
 import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -1468,6 +1469,123 @@ describe.sequential("worker-only legacy backup and 0198 representation", () => {
       });
     },
   );
+
+  it("passes the single authenticated decode to an opted-in writer after its receipt is durable", async () => {
+    const scope = await fixture(false);
+    const options = {
+      scope,
+      source,
+      store: new MemoryBackup(),
+      sourceBinding: "decode-handoff",
+      rows: 2,
+      pages: 1,
+    };
+    const actualDecode = legacyCodec.decodeLegacyPage;
+    const decode = vi
+      .spyOn(legacyCodec, "decodeLegacyPage")
+      .mockImplementation(actualDecode);
+    try {
+      const copied = await exportLegacyReports({
+        ...options,
+        directory: await directory(),
+      });
+      expect(copied.sourceDatabaseWrites).toBe(false);
+      expect(decode).toHaveBeenCalledTimes(1);
+      decode.mockClear();
+      const path = await directory();
+      let storeIdentity: LegacyBackupObject | undefined;
+      const read = options.store.read.bind(options.store);
+      vi.spyOn(options.store, "read").mockImplementation(async (identity) => {
+        storeIdentity = identity;
+        return read(identity);
+      });
+      decode.mockImplementation((bytes, receipt) => {
+        const verified = actualDecode(bytes, receipt);
+        // The provider retains its metadata. Changing that alias may not
+        // retarget the application to a different object generation.
+        queueMicrotask(() => {
+          storeIdentity!.generation = "2";
+        });
+        return verified;
+      });
+      const writer = vi.fn<
+        NonNullable<
+          Parameters<typeof exportLegacyReports>[0]["applyVerifiedPage"]
+        >
+      >(async (page, receipt, file, bytes) => {
+        expect(decode).toHaveBeenCalledTimes(1);
+        expect(page).toBe(decode.mock.results[0]!.value);
+        expect(receipt.object.generation).toBe("90071992547409931");
+        expect(JSON.parse(await readFile(join(path, file), "utf8"))).toEqual(
+          receipt,
+        );
+        expect(legacySha256(bytes)).toBe(receipt.object.sha256);
+        expect(
+          (await readFile(join(path, "pending.jsonl.gz"))).equals(bytes),
+        ).toBe(true);
+        expect(
+          JSON.parse(await readFile(join(path, "checkpoint.json"), "utf8")).next
+            .after,
+        ).toBe(0);
+      });
+      await exportLegacyReports({
+        ...options,
+        directory: path,
+        applyVerifiedPage: writer,
+      });
+      expect(writer).toHaveBeenCalledTimes(1);
+      expect(await readdir(path)).not.toContain("pending.jsonl.gz");
+    } finally {
+      decode.mockRestore();
+    }
+  });
+
+  it("holds the cursor if readback bytes change during receipt persistence and reuses the pinned object on retry", async () => {
+    const scope = await fixture(false),
+      path = await directory(),
+      store = new MemoryBackup();
+    const writer = vi.fn(async () => {}),
+      options = {
+        scope,
+        source,
+        store,
+        directory: path,
+        sourceBinding: "changed-readback",
+        rows: 2,
+        pages: 1,
+        applyVerifiedPage: writer,
+      };
+    const actual = legacyCodec.decodeLegacyPage;
+    const decode = vi
+      .spyOn(legacyCodec, "decodeLegacyPage")
+      .mockImplementationOnce((bytes, receipt) => {
+        const result = actual(bytes, receipt);
+        queueMicrotask(() => {
+          bytes[0] = bytes[0]! ^ 1;
+        });
+        return result;
+      });
+    try {
+      await expect(exportLegacyReports(options)).rejects.toThrow(
+        "changed before application",
+      );
+      expect(writer).not.toHaveBeenCalled();
+      const files = await readdir(path),
+        receipts = files.filter((f) => f.endsWith(".receipt.json"));
+      expect(receipts).toHaveLength(1);
+      expect(files).toContain("pending.jsonl.gz");
+      expect(
+        JSON.parse(await readFile(join(path, "checkpoint.json"), "utf8")).next
+          .after,
+      ).toBe(0);
+      const recovered = await exportLegacyReports(options);
+      expect(recovered.receipts).toEqual(receipts);
+      expect(writer).toHaveBeenCalledTimes(1);
+      expect(store.objects.size).toBe(1);
+    } finally {
+      decode.mockRestore();
+    }
+  });
 
   it("holds the single writer lock until a failed upload's speculative read has drained", async () => {
     const scope = await fixture(false),
