@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { setTimeout as delay } from "node:timers/promises";
 import { canonicalRemoteHubBaseUrl } from "@aerodb/core";
 import {
   progressiveReportedPointSources,
@@ -144,8 +145,13 @@ async function cancelledAtHub(m: Mirror, fetcher: typeof fetch) {
     },
   );
   if (!reply.ok) {
+    const hint = reply.headers.get("retry-after");
+    const seconds = hint === null ? 0 : Number(hint);
+    const retryMs = Number.isFinite(seconds)
+      ? Math.max(0, seconds * 1000)
+      : Math.max(0, Date.parse(hint!) - Date.now()) || 0;
     await reply.body?.cancel();
-    return { confirmed: false, httpStatus: reply.status };
+    return { confirmed: false, httpStatus: reply.status, retryMs };
   }
   const value: unknown = await reply.json();
   if (!record(value) || !record(value.assignment))
@@ -300,6 +306,7 @@ export async function reconcileTerminalProgressiveMirror(
   options: {
     promiseId?: string;
     preview?: boolean;
+    waitForCapacity?: boolean;
     fetcher?: typeof fetch;
   } = {},
 ) {
@@ -356,12 +363,29 @@ export async function reconcileTerminalProgressiveMirror(
     return { ...identity, outcome: "checking" } as const;
   }
   if (!proof) return { ...identity, outcome: "unsettled-reports" } as const;
-  const remote = await cancelledAtHub(m, fetcher);
+  let remote = await cancelledAtHub(m, fetcher);
+  // Under hub admission pressure, retain the in-memory proof during a
+  // bounded named operation. Re-read the hub and rebind every local row
+  // before writing. Normal transfer passes keep their short polling budget.
+  for (
+    let retry = 0;
+    options.promiseId &&
+    options.waitForCapacity &&
+    remote.httpStatus === 503 &&
+    retry < 2;
+    retry++
+  ) {
+    const wait = Math.max(10_000, remote.retryMs ?? 0);
+    if (wait > 30_000) break;
+    await delay(wait);
+    remote = await cancelledAtHub(m, fetcher);
+  }
   if (!remote.confirmed)
     return {
       ...identity,
       outcome: "no-terminal-proof",
       httpStatus: remote.httpStatus,
+      provedResults: scan.verified.size,
     } as const;
   const evidence = {
     reports: scan.after,

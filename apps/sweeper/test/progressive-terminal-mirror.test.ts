@@ -262,6 +262,30 @@ describe("registered terminal progressive mirror reconciliation", () => {
             expect((await run()).outcome).toBe("inactive-role");
             vi.stubEnv("AIRFOILFOAM_DEPLOYMENT_ROLE", "remote-solver");
             expect((await run(db, http(), true)).outcome).toBe("eligible");
+            if (normalized) {
+              let probes = 0;
+              const registered = http();
+              const capacityProbe: typeof fetch = (request, init) =>
+                ++probes <= 3
+                  ? Promise.resolve(
+                      new Response(null, {
+                        status: 503,
+                        headers: { "retry-after": "0" },
+                      }),
+                    )
+                  : registered(request, init);
+              expect(
+                (
+                  await reconcileTerminalProgressiveMirror(db, {
+                    promiseId,
+                    preview: true,
+                    waitForCapacity: true,
+                    fetcher: capacityProbe,
+                  })
+                ).outcome,
+              ).toBe("eligible");
+              expect(probes).toBe(4);
+            }
             expect((await promise())[0]).toEqual(before);
             const normal = () =>
               reconcileTerminalProgressiveMirror(db, { fetcher: http() });

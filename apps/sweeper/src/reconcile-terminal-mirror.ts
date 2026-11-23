@@ -25,6 +25,7 @@ try {
       await reconcileTerminalProgressiveMirror(db, {
         promiseId,
         preview: action === "--preview",
+        waitForCapacity: true,
       }),
     ),
   );
