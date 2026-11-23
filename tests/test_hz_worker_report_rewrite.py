@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import shutil
 import signal
+import sqlite3
 import subprocess
 import sys
 import time
@@ -438,6 +439,15 @@ def test_real_access_exclusive_wait_cancel_does_not_cancel_unrelated_transaction
             argv = h.pg_command("", tag, 15, True)
             argv[1] = argv[1].replace("lock_timeout=3000", "lock_timeout=12000")
             h.run_phase(argv, h.VACUUM, 15, watch, cancel)
+        # pg_cancel_backend acknowledges the signal before rollback finishes.
+        # The production shell also waits for this exact transaction to end.
+        deadline = time.monotonic() + 5
+        while int(sql(
+            f"SELECT count(*) FROM pg_stat_activity WHERE application_name='{tag}' "
+            "AND datname=current_database() AND xact_start IS NOT NULL"
+        )):
+            assert time.monotonic() < deadline, "The cancelled rewrite still owns a transaction"
+            time.sleep(0.05)
         assert (
             calls
             and sql(
@@ -807,6 +817,7 @@ def test_toast_scope_budgets_only_owned_auxiliary_and_requires_chunk_proof(runti
         "lost-reply",
         "checkpointed",
         "checkpointed-refusal",
+        "checkpointed-second-journal-changed",
         "toast-lost-commit",
     ],
 )
@@ -828,6 +839,9 @@ def test_operator_recovers_the_same_rewrite_and_witnesses_collection(
     checkpointed = scenario.startswith("checkpointed")
     archive_unit = "airfoils-report-migration-qualification.service"
     checkpoint = tmp_path / "archive.json"
+    second_journal = tmp_path / "late-originals.sqlite3"
+    second_wal = second_journal.with_name(second_journal.name + "-wal")
+    changed_second = scenario == "checkpointed-second-journal-changed"
     config = tmp_path / "checkpointed-units.json"
     processes = []
 
@@ -856,7 +870,22 @@ def test_operator_recovers_the_same_rewrite_and_witnesses_collection(
     if checkpointed:
         request.addfinalizer(stop_fixture)
         checkpoint.write_text('{"source":"same-archive","cursor":0}')
-        config.write_text(json.dumps({archive_unit: str(checkpoint)}))
+        spec = str(checkpoint)
+        if changed_second:
+            db = sqlite3.connect(second_journal)
+            request.addfinalizer(db.close)
+            assert db.execute("PRAGMA journal_mode=WAL").fetchone() == ("wal",)
+            with db:
+                db.execute("CREATE TABLE progress (sequence INTEGER)")
+                db.execute("INSERT INTO progress VALUES (41)")
+            # Keep the real WAL in place. A change to this file alone must
+            # prevent restart even though the first journal can still reopen.
+            assert second_wal.is_file()
+            spec = {
+                "checkpoint": str(checkpoint),
+                "extraCheckpoints": [str(second_journal)],
+            }
+        config.write_text(json.dumps({archive_unit: spec}))
         fragment = tmp_path / archive_unit
         fragment.write_text("persistent test service")
         pid = start_archiver()
@@ -870,6 +899,17 @@ def test_operator_recovers_the_same_rewrite_and_witnesses_collection(
         monkeypatch.setattr(
             ops, "definition_digest", lambda _: ops.file_witness(fragment)["sha256"]
         )
+        if changed_second:
+            for name in (
+                "airfoils-closed-worker-originals.service",
+                "airfoils-hz-registered-report-custody.service",
+                "hz-closed-progressive-maintenance.service",
+            ):
+                assert any(
+                    ops.fnmatch.fnmatchcase(name, pattern) for pattern in ops.PATTERNS
+                )
+                owners, reasons = ops.plan_checkpoints({}, {name: units[archive_unit]})
+                assert not owners and any(name in reason for reason in reasons)
 
     def control(action, name):
         if name == archive_unit:
@@ -945,6 +985,8 @@ def test_operator_recovers_the_same_rewrite_and_witnesses_collection(
                 )
             else:
                 assert result.returncode == 0, result.stderr
+            if changed_second:
+                second_wal.rename(tmp_path / "held-original-wal")
             if scenario == "toast-lost-commit":
                 # The database commit succeeded but its acknowledgement/marker was lost.
                 (remote / "rewrite-commit.json").unlink()
@@ -998,7 +1040,20 @@ def test_operator_recovers_the_same_rewrite_and_witnesses_collection(
     old_file = sql(
         "SELECT pg_relation_filenode('progressive_worker_reports'::regclass)"
     )
-    if scenario in ("lost-reply", "toast-lost-commit"):
+    if changed_second:
+        with pytest.raises(RuntimeError, match="Stopped checkpoint changed before restart"):
+            ops.main()
+        assert submitted == ["rewrite"]
+        assert units[archive_unit]["ActiveState"] == "inactive"
+        owner = json.loads((run_dir / "operator.json").read_text())[
+            "checkpointedOwners"
+        ][archive_unit]
+        assert owner["stopped"]["extraCheckpoints"][str(second_journal)]["wal"]["sha256"]
+        (tmp_path / "held-original-wal").rename(second_wal)
+        monkeypatch.setattr(sys, "argv", ["rewrite", "--recover", str(run_dir)])
+        ops.main()
+        assert db.execute("SELECT sequence FROM progress").fetchall() == [(41,)]
+    elif scenario in ("lost-reply", "toast-lost-commit"):
         with pytest.raises(RuntimeError, match="reply lost"):
             ops.main()
     elif scenario == "checkpointed-refusal":

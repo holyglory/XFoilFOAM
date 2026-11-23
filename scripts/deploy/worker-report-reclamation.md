@@ -121,12 +121,13 @@ python3 scripts/deploy/rewrite-hz-worker-reports.py --dry-run \
 
 A restarting operator service appears in the dry run with its systemd state and a pause refusal. Disk and lease measurements remain available. Recovery checks each captured writer directly, so an unrelated service transition can be reported after the original writer is released.
 
-Supply `--checkpointed-units "$CHECKPOINTS"` on the dry run and on execution when persistent archive services hold the shared HZ deploy lock over SSH. This private JSON maps each systemd service name to its actual restart checkpoint. A service with a separate durable progress record may use an object with `checkpoint` and `receipt` absolute paths. Choose the live controller's current paths. A fresh unchanged-data scan needs a real progress receipt from that scan. The operator records content hashes of the effective unit definition and the checkpoint, including a SQLite WAL when present. Keep this file and the run directory on the operator's persistent filesystem.
+Supply `--checkpointed-units "$CHECKPOINTS"` on the dry run and on execution when persistent archive services hold the shared HZ deploy lock over SSH. This private JSON maps each systemd service name to its actual restart checkpoint. A service with a separate durable progress record may use an object with `checkpoint` and `receipt` absolute paths. When a service advances several independent journals, include their other absolute paths in `extraCheckpoints`. The operator records the effective unit definition and verifies each stopped journal, including its SQLite WAL when present, before restarting the service. Choose the live controller's current paths. A fresh unchanged-data scan needs a real progress receipt from that scan. Keep this file and the run directory on the operator's persistent filesystem.
 
 ```json
 {
   "archive-writer.service": {
     "checkpoint": "/absolute/private/state/archive.sqlite3",
+    "extraCheckpoints": ["/absolute/private/state/late-originals.sqlite3"],
     "receipt": "/absolute/private/state/completed-page.json"
   }
 }

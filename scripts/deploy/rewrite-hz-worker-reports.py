@@ -33,6 +33,8 @@ PATTERNS = (
     "airfoils-hz-attempt-*",
     "airfoils-hz-point-history-*",
     "airfoils-hz-worker-report-*",
+    "airfoils-hz-registered-report-custody.service",
+    "airfoils-closed-worker-originals.service",
     "airfoils-hz-closed-job-*",
     "airfoils-historical-report-sharing-*",
     "airfoils-report-0209-*",
@@ -177,6 +179,9 @@ SHARED_LOCK_SERVICES = (
     "airfoils-hz-attempt-history-watch.service",
     "airfoils-hz-attempt-original-backup.service",
     "airfoils-hz-point-history-watch.service",
+    "airfoils-hz-registered-report-custody.service",
+    "airfoils-closed-worker-originals.service",
+    "hz-closed-progressive-maintenance.service",
     "airfoils-report-migration-*.service",
     "airfoils-report-0209-*.service",
 )
@@ -196,16 +201,24 @@ def checkpoint_specs(path):
             spec = {"checkpoint": spec}
         if (
             not isinstance(spec, dict)
-            or set(spec) - {"checkpoint", "receipt"}
+            or set(spec) - {"checkpoint", "extraCheckpoints", "receipt"}
             or "checkpoint" not in spec
         ):
             raise ValueError(f"Invalid checkpoint and receipt for {name}")
-        paths = [spec["checkpoint"], spec.get("receipt", spec["checkpoint"])]
+        extra = spec.get("extraCheckpoints", [])
+        if not isinstance(extra, list):
+            raise ValueError(f"Expected a list of additional checkpoints for {name}")
+        paths = [spec["checkpoint"], spec.get("receipt", spec["checkpoint"]), *extra]
         if not all(isinstance(p, str) and Path(p).is_absolute() for p in paths):
             raise ValueError(
                 f"Expected absolute checkpoint and receipt paths for {name}"
             )
         result[name] = {"checkpoint": paths[0], "receipt": paths[1]}
+        if extra:
+            journals = [Path(path) for path in [spec["checkpoint"], *extra]]
+            if len(set(journals)) != len(journals):
+                raise ValueError(f"Repeated checkpoint for {name}")
+            result[name]["extraCheckpoints"] = extra
     return result
 
 
@@ -236,14 +249,21 @@ def file_witness(path):
     raise ValueError(f"Checkpoint changed during its read: {path}")
 
 
-def durable_checkpoint(owner):
-    path = Path(owner["checkpoint"])
+def journal_witness(path):
+    path = Path(path)
     witness = {"main": file_witness(path)}
     # A clean stop may checkpoint a SQLite WAL into its main file. Capture
     # both surviving data files before resumption; the shm file is ephemeral.
     wal = Path(str(path) + "-wal")
     if wal.exists():
         witness["wal"] = file_witness(wal)
+    return witness
+
+
+def durable_checkpoint(owner):
+    witness = journal_witness(owner["checkpoint"])
+    if extra := owner.get("extraCheckpoints"):
+        witness["extraCheckpoints"] = {path: journal_witness(path) for path in extra}
     return witness
 
 
