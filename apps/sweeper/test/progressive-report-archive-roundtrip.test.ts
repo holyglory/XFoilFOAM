@@ -203,6 +203,33 @@ it("scans decompressed chunks once for a large exact member and rejects a damage
     .rejects.toThrow(/Truncated/);
 });
 
+it.each(["prefix", "suffix"] as const)("reuses only the complete validated result in a %s delta while preserving exact text", async (retained) => {
+  const token = '"unique result token 🌊"';
+  const source = `{"marker": ${token}, "n": 90071992547409931235, "nested": [{"result": 0.0000000100}]}`;
+  const report = (seq: number, result = source) => retained === "prefix"
+    ? `{"result": ${result}, "sequence": ${seq}}` : `{"sequence": ${seq}, "result": ${result}}`;
+  const rows = [report(1), report(200), report(3000), report(40000, source.replace("31235", "31236"))];
+  const encode = (values: string[]) => gzipSync(values.map((v,n) => n
+    ? JSON.stringify({ ...metadata(v,n+1), reportDelta: delta(values[n-1]!,v) }) : inline(v)).join("\n")+"\n");
+  const bytes = encode(rows);
+  const parse = JSON.parse;
+  let parsedMarkers=0;
+  const observed=vi.spyOn(JSON,"parse").mockImplementation((text,reviver) => {
+    if (text===token) parsedMarkers++;
+    return parse(text,reviver);
+  });
+  try {
+    expect(await readProgressiveReportArchiveText(Readable.from([bytes]),storedIdentity(bytes,rows[3]!,{sequence:4,memberCount:4,firstSequence:1,lastSequence:4}))).toBe(rows[3]);
+    expect(parsedMarkers).toBe(2);
+  } finally { observed.mockRestore(); }
+  const malformedInside=report(5,source.replace('"marker":', '"marker": null, "marker":'));
+  const malformedOutside=report(5).replace('"sequence":', '"sequence": 4, "sequence":');
+  for (const tail of [malformedInside,malformedOutside]) {
+    const corrupt=encode([...rows,tail]);
+    await expect(readProgressiveReportArchiveText(Readable.from([corrupt]),storedIdentity(corrupt,rows[0]!,{sequence:1,memberCount:5,firstSequence:1,lastSequence:5}))).rejects.toThrow(/Invalid report JSON/);
+  }
+});
+
 it("reads legacy inline rows with report before later metadata and without inline member hashes", async () => {
   const meta = metadata(first);
   const row = `{"kind":"report","report":${first},"sourceKind":"remote","executionId":"${executionId}","sequence":1,"contentSignature":"${meta.contentSignature}"}`;
