@@ -17,7 +17,7 @@ import {
 } from "../../../apps/sweeper/src/disk-admission";
 import { submitProgressiveRemoteJob } from "../../../apps/sweeper/src/progressive-remote-submission";
 import { PROGRESSIVE_REMOTE_START_AUTHORIZATION_MS } from "../src/progressive-remote-start";
-import { admitRemoteSolverTick } from "../../../apps/sweeper/src/remote-solver";
+import { admitRemoteSolverTick, reconcileRemoteSolverTick } from "../../../apps/sweeper/src/remote-solver";
 
 export async function verifyProgressiveWorkerSubmission(
   db: DB,
@@ -144,12 +144,68 @@ export async function verifyProgressiveWorkerSubmission(
     expect(stillUnreserved.count).toBe(0);
     if (mode === "success") {
       const previousToken = process.env.ENGINE_CONTROL_PLANE_TOKEN;
+      const busyPromise = randomUUID();
+      const [before] = await db.execute(sql`
+        INSERT INTO sync_sweep_promises (id, registered_solver_id, source_base_url, airfoil_id, simulation_preset_revision_id,
+          aoa_count, "expiresAt", "lastHeartbeatAt", request_payload)
+        SELECT ${busyPromise}::uuid, registered_solver_id, source_base_url, airfoil_id, simulation_preset_revision_id,
+          1, clock_timestamp() + interval '30 minutes', NULL, '{"remoteSolver":true,"executionContract":"progressive-cfd-v1"}'::jsonb
+        FROM sync_sweep_promises WHERE id=${envelope.promiseId}::uuid
+        RETURNING "expiresAt"::text AS expiry, "lastHeartbeatAt" AS beat
+      `);
+      await db.execute(
+        sql`UPDATE sync_sweep_promises SET "lastHeartbeatAt"=NULL WHERE id=${envelope.promiseId}::uuid`,
+      );
+      let busyAttempts = 0;
+      let healthyRenewals = 0;
       const upstream = vi
         .spyOn(globalThis, "fetch")
-        .mockImplementation(authorization);
+        .mockImplementation(async (url, options) => {
+          const { pathname } = new URL(String(url));
+          if (pathname.endsWith(`/sweeps/${busyPromise}/heartbeat`)) {
+            busyAttempts++;
+            const body = JSON.stringify({
+              code: "sync_capacity_busy",
+              retryAfterMs: 60000,
+            });
+            return new Response(body, {
+              status: 503,
+              headers: {
+                "content-type": "application/json",
+                "content-length": String(Buffer.byteLength(body)),
+                "retry-after": "60",
+              },
+            });
+          }
+          if (pathname.endsWith(`/sweeps/${envelope.promiseId}/heartbeat`)) {
+            healthyRenewals++;
+            return Response.json({
+              expiresAt: new Date(Date.now() + 3600000).toISOString(),
+            });
+          }
+          if (pathname.endsWith("/progressive-executions"))
+            return Response.json({
+              items: [],
+              cycleStartedAt: new Date().toISOString(),
+              nextCursor: null,
+              nextCreatedAt: null,
+            });
+          if (pathname.endsWith(`/solvers/${envelope.solverId}/heartbeat`))
+            return Response.json({});
+          return authorization(url, options);
+        });
       process.env.ENGINE_CONTROL_PLANE_TOKEN =
         "isolated-progressive-control-plane-token";
       try {
+        // The production tick calls this before it may request the exact start.
+        // A capacity refusal for a sibling neither renews it nor holds admission.
+        expect(await reconcileRemoteSolverTick(db, engine)).toBe(true);
+        expect(await reconcileRemoteSolverTick(db, engine)).toBe(true);
+        expect([busyAttempts, healthyRenewals]).toEqual([1, 1]);
+        const [after] =
+          await db.execute(sql`SELECT "expiresAt"::text AS expiry, "lastHeartbeatAt" AS beat
+          FROM sync_sweep_promises WHERE id=${busyPromise}::uuid`);
+        expect(after).toEqual(before);
         const admissions = await Promise.all([
           admitRemoteSolverTick(db, engine, {
             kind: "allow",
@@ -165,6 +221,9 @@ export async function verifyProgressiveWorkerSubmission(
         expect(admissions).toContain(true);
       } finally {
         upstream.mockRestore();
+        await db.execute(
+          sql`DELETE FROM sync_sweep_promises WHERE id=${busyPromise}::uuid`,
+        );
         if (previousToken === undefined)
           delete process.env.ENGINE_CONTROL_PLANE_TOKEN;
         else process.env.ENGINE_CONTROL_PLANE_TOKEN = previousToken;

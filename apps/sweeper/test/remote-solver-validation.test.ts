@@ -1931,6 +1931,78 @@ describe("remote solver submit lifecycle", () => {
     },
   );
 
+  it.each([401, 403, 404, 409, 503])(
+    "keeps authoritative and unclassified promise renewal HTTP %i semantics",
+    async (status) => {
+      const promise = await seedMirroredPromise(
+        "renewal-authority-" + status,
+        [900.437],
+      );
+      await db
+        .update(syncSweepPromises)
+        .set({ lastHeartbeatAt: null })
+        .where(eq(syncSweepPromises.id, promise.id));
+      const base = stubFetch().fetchMock;
+      let refused = 0;
+      vi.stubGlobal("fetch", async (url: string | URL, init?: RequestInit) => {
+        if (String(url).endsWith(`/sweeps/${promise.id}/heartbeat`)) {
+          refused++;
+          return Response.json({ error: "refused" }, { status });
+        }
+        return base(url, init);
+      });
+      const ready = await reconcileRemoteSolverTick(db, {} as EngineClient);
+      const mirror = await readPromise(promise.id);
+      expect(refused).toBe(1);
+      if (status === 404 || status === 409) {
+        expect(mirror.promise.status).toBe("cancelled");
+        expect(mirror.points[0]?.status).toBe("cancelled");
+      } else {
+        expect(ready).toBe(false);
+        expect(mirror.promise.status).toBe("active");
+        expect(mirror.promise.lastHeartbeatAt).toBeNull();
+        expect(mirror.promise.expiresAt).toEqual(promise.expiresAt);
+      }
+    },
+  );
+
+  it("expires an already elapsed mirror when its renewal receives typed capacity backpressure", async () => {
+    const promise = await seedMirroredPromise(
+      "renewal-busy-expired",
+      [900.438],
+    );
+    await db
+      .update(syncSweepPromises)
+      .set({ expiresAt: new Date(Date.now() - 5000), lastHeartbeatAt: null })
+      .where(eq(syncSweepPromises.id, promise.id));
+    const base = stubFetch().fetchMock;
+    const body = JSON.stringify({
+      code: "sync_capacity_busy",
+      retryAfterMs: 2000,
+    });
+    let refused = 0;
+    vi.stubGlobal("fetch", async (url: string | URL, init?: RequestInit) => {
+      if (String(url).endsWith(`/sweeps/${promise.id}/heartbeat`)) {
+        refused++;
+        return new Response(body, {
+          status: 503,
+          headers: {
+            "retry-after": "2",
+            "content-type": "application/json",
+            "content-length": String(Buffer.byteLength(body)),
+          },
+        });
+      }
+      return base(url, init);
+    });
+    await reconcileRemoteSolverTick(db, {} as EngineClient);
+    expect(refused).toBe(1);
+    const mirror = await readPromise(promise.id);
+    expect(mirror.promise.status).toBe("expired");
+    expect(mirror.promise.lastHeartbeatAt).toBeNull();
+    expect(mirror.points[0]?.status).toBe("expired");
+  });
+
   it("MUST-CATCH: reports fleet liveness while a promise renewal holds the scheduler tick", async () => {
     const promise = await seedMirroredPromise("held-lease-renewal", [900.451]);
     await db

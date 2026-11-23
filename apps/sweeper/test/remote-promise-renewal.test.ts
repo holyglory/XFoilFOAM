@@ -2,7 +2,11 @@ import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { setImmediate as nextTurn } from "node:timers/promises";
 import { expect, it, vi } from "vitest";
-import { renewIndependentPromises } from "../src/remote-promise-renewal";
+import {
+  promiseRenewalRetries,
+  remotePromiseRenewalConcurrency,
+  renewIndependentPromises,
+} from "../src/remote-promise-renewal";
 
 it("drains the full selected batch without exceeding the service cap", async () => {
   let active = 0;
@@ -237,4 +241,48 @@ it("reports an expired launch budget as untouched deferred work", async () => {
     await renewIndependentPromises([0, 1], 4, controller.signal, operation),
   ).toEqual({ processed: 0, deferred: 2 });
   expect(operation).not.toHaveBeenCalled();
+});
+
+it("bounds HZ renewal concurrency independently of active job reconciliation", () => {
+  for (const raw of ["", "0", "-2", "foo", "1.7", "16", "96"]) {
+    expect(remotePromiseRenewalConcurrency(raw)).toBe(2);
+  }
+  expect(remotePromiseRenewalConcurrency("1")).toBe(1);
+});
+
+it("backs off only the refused registered owner, honors Retry-After and retries after the deadline", () => {
+  vi.useFakeTimers();
+  try {
+    const db = {};
+    const get = () =>
+      promiseRenewalRetries(db, "https://hub.example/", "solver");
+    const retries = get();
+    retries.defer("a", 8000);
+    expect(get().deferredIds()).toEqual(["a"]);
+    vi.advanceTimersByTime(7999);
+    expect(retries.deferredIds()).toEqual(["a"]);
+    vi.advanceTimersByTime(1);
+    expect(retries.deferredIds()).toEqual([]);
+    retries.defer("a");
+    vi.advanceTimersByTime(15999);
+    expect(retries.deferredIds()).toEqual(["a"]);
+    vi.advanceTimersByTime(1);
+    expect(retries.deferredIds()).toEqual([]);
+    retries.defer("a");
+    retries.settled("a");
+    retries.defer("b");
+    expect(get().deferredIds()).toEqual(["b"]);
+    expect(
+      promiseRenewalRetries(
+        db,
+        "https://hub.example/",
+        "new-registration",
+      ).deferredIds(),
+    ).toEqual([]);
+    expect(
+      promiseRenewalRetries({}, "https://hub.example/", "solver").deferredIds(),
+    ).toEqual([]);
+  } finally {
+    vi.useRealTimers();
+  }
 });
