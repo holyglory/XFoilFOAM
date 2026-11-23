@@ -1,3 +1,13 @@
+import {
+  applyRegisteredPage,
+  sourceKey,
+  type ReaderProof,
+} from "./registered-worker-report-page";
+import {
+  assertRegisteredPage,
+  maxRegisteredPageMembers,
+  maxRegisteredPageBytes,
+} from "./registered-worker-report-read";
 import { HistoryOperationError } from "@aerodb/core/point-history-protocol";
 import {
   assertLegacyScope,
@@ -26,7 +36,8 @@ const rpc = "/app/apps/sweeper/src/registered-worker-report-rpc.ts";
 type Cursor = typeof zero;
 type Pending = { key: SourceKey; link: HubReportLink; advance: boolean };
 type Progress = {
-  version: 1;
+  version: 1 | 2;
+  group?: { links: HubReportLink[]; advance: boolean; checksum: string };
   binding: string;
   after: Cursor;
   cycle: number;
@@ -70,12 +81,15 @@ export async function runRegisteredReportCli(
       signature: { type: "string" },
       apply: { type: "boolean" },
       "max-pages": { type: "string" },
+      "bundle-members": { type: "string", default: "1" },
+      "keys-file": { type: "string" },
+      timing: { type: "boolean" },
     },
   });
   const mode = positionals[0];
   requireReportProof(
     positionals.length === 1 &&
-      ["one", "pass", "watch"].includes(mode!) &&
+      ["one", "pass", "watch", "selected"].includes(mode!) &&
       v.directory &&
       isAbsolute(v.directory) &&
       v.scope &&
@@ -113,6 +127,50 @@ export async function runRegisteredReportCli(
       !v.job && !v.seq && !v.signature,
       "Exact source filters require one",
     );
+  const memberLimit = Number(v["bundle-members"]);
+  requireReportProof(
+    Number.isSafeInteger(memberLimit) &&
+      memberLimit >= 1 &&
+      memberLimit <= maxRegisteredPageMembers,
+    "Invalid registered object page limit",
+  );
+  requireReportProof(
+    (mode === "selected") === Boolean(v["keys-file"]),
+    "Selected reports require a private key list",
+  );
+  let selected: SourceKey[] | undefined;
+  if (v["keys-file"]) {
+    const file = await import("node:fs/promises").then((fs) =>
+      fs.open(v["keys-file"]!, "r"),
+    );
+    try {
+      requireReportProof(
+        (await file.stat()).isFile() && (await file.stat()).size <= 16384,
+        "Oversize selected key list",
+      );
+      const data = Buffer.alloc(16385);
+      const read = await file.read(data, 0, data.length, 0);
+      requireReportProof(read.bytesRead <= 16384, "Oversize selected key list");
+      selected = JSON.parse(data.subarray(0, read.bytesRead).toString("utf8"));
+    } finally {
+      await file.close();
+    }
+    requireReportProof(
+      Array.isArray(selected) &&
+        selected.length > 0 &&
+        selected.length <= maxRegisteredPageMembers,
+      "Invalid selected keys",
+    );
+    selected.forEach((k, i) => {
+      assertSourceKey(k);
+      requireReportProof(
+        !i ||
+          (k.executionId === selected![0]!.executionId &&
+            k.sequence > selected![i - 1]!.sequence),
+        "Selected keys must be in one ordered execution",
+      );
+    });
+  }
   const dir = v.directory;
   const scope: LegacyReportScope = JSON.parse(await readFile(v.scope, "utf8"));
   assertLegacyScope(scope);
@@ -145,11 +203,44 @@ export async function runRegisteredReportCli(
         sessions.push(session);
         return session;
       };
-      const ask = (
+      const ask = async (
         s: Endpoint,
         operation: string,
         payload: Record<string, unknown> = {},
-      ) => s.ask({ operation, build, ...payload }, 120000);
+      ) => {
+        const began = performance.now();
+        const r = await s.ask(
+          {
+            operation,
+            build,
+            ...payload,
+            ...(v.timing ? { timing: true } : {}),
+          },
+          120000,
+        );
+        if (!v.timing) return r;
+        requireReportProof(
+          r?.timing &&
+            [
+              r.timing.ms,
+              r.timing.cpuUs,
+              r.timing.startupCpuUs,
+              r.timing.peakRssKiB,
+            ].every((n) => Number.isFinite(n) && n >= 0),
+          "Missing registered operation timing",
+        );
+        console.log(
+          JSON.stringify({
+            event: "operation",
+            operation,
+            reader: payload.reader,
+            committed: payload.committed,
+            wallMs: performance.now() - began,
+            ...r.timing,
+          }),
+        );
+        return r.value;
+      };
       const write = async (
         operation: string,
         payload: Record<string, unknown>,
@@ -200,15 +291,22 @@ export async function runRegisteredReportCli(
           pending: null,
         };
         requireReportProof(
-          state.version === 1 && state.binding === binding,
+          state.binding === binding &&
+            ((state.version === 1 && state.group === undefined) ||
+              (state.version === 2 &&
+                state.pending === null &&
+                state.group &&
+                typeof state.group.advance === "boolean")),
           "Operator checkpoint belongs to a different source",
         );
         const save = () => atomicJson(path, state);
-        async function processKey(
+        async function qualify(
           key: SourceKey,
-          advance: boolean,
           pending?: Pending,
-        ) {
+        ): Promise<
+          | { status: string; link?: undefined }
+          | { status: "ready" | "already_retired"; link: HubReportLink }
+        > {
           requireReportProof(outside(key), "Frozen worker report excluded");
           const src = await ask(worker, "key", { key });
           if (src.status !== "candidate") {
@@ -216,7 +314,7 @@ export async function runRegisteredReportCli(
               !pending || src.status === "other_storage",
               "Pending native source changed",
             );
-            return src.status;
+            return { status: src.status };
           }
           const link: HubReportLink | null = await ask(hub, "describe", {
             owner: src.owner,
@@ -227,15 +325,27 @@ export async function runRegisteredReportCli(
               link && isDeepStrictEqual(link, pending.link),
               "Pending hub member or scientific source changed",
             );
-          if (!link) return "no_receipted_hub_source";
+          if (!link) return { status: "no_receipted_hub_source" };
           const ready = await ask(worker, "state", { link });
-          if (ready !== "ready" && ready !== "already_retired") return ready;
+          if (ready !== "ready" && ready !== "already_retired")
+            return { status: ready };
+          return { link, status: ready };
+        }
+        async function processKey(
+          key: SourceKey,
+          advance: boolean,
+          pending?: Pending,
+          qualified?: Awaited<ReturnType<typeof qualify>>,
+        ) {
+          const { link, status: ready } =
+            qualified ?? (await qualify(key, pending));
+          if (!link) return ready;
           if (v.apply) {
             state.pending = { key, link, advance };
             await save();
           }
           const restored = await ask(hub, "restore", {
-            owner: src.owner,
+            owner: link.owner,
             key,
             expected: link,
             account,
@@ -286,6 +396,16 @@ export async function runRegisteredReportCli(
             ask(api, "read", { link, reader: "api", committed: true }),
             ask(worker, "read", { link, reader: "sweeper", committed: true }),
           ]);
+          await confirm(link, restored.at, apiProof, sweeperProof);
+          return status;
+        }
+        async function confirm(
+          link: HubReportLink,
+          cloudReadAt: string,
+          apiProof: ReaderProof,
+          sweeperProof: ReaderProof,
+        ) {
+          const key = sourceKey(link);
           const proof = {
             binding,
             key,
@@ -318,13 +438,12 @@ export async function runRegisteredReportCli(
               {
                 proof,
                 build,
-                cloudReadAt: restored.at,
+                cloudReadAt,
                 api: apiProof,
                 sweeper: sweeperProof,
               },
               true,
             );
-          return status;
         }
         const finish = async (
           k: SourceKey,
@@ -340,15 +459,159 @@ export async function runRegisteredReportCli(
             JSON.stringify({ status, job: k.executionId, seq: k.sequence }),
           );
         };
+        async function group(links: HubReportLink[], advance: boolean) {
+          assertRegisteredPage(links);
+          requireReportProof(
+            v.apply && links.every((l) => outside(sourceKey(l))),
+            "Frozen source or read-only page",
+          );
+          state.version = 2;
+          requireReportProof(
+            links.every(
+              (l) =>
+                l.hubInstance === h.instance &&
+                l.owner.workerInstance === w.instance &&
+                l.owner.solverId === w.solver,
+            ) &&
+              (!advance ||
+                links[0]!.pin.executionId > state.after.job ||
+                (links[0]!.pin.executionId === state.after.job &&
+                  links[0]!.pin.sequence > state.after.seq)),
+            "Registered page differs from current checkpoint owner or order",
+          );
+          state.group = {
+            links,
+            advance,
+            checksum: digest({ binding, after: state.after, links, advance }),
+          };
+          state.pending = null;
+          await save();
+          const statuses = await applyRegisteredPage(
+            {
+              hub: (op, data) => ask(hub, op, data),
+              worker: (op, data) => ask(worker, op, data),
+              api: (op, data) => ask(api, op, data),
+              write,
+            },
+            links,
+            account,
+            confirm,
+          );
+          const outcomes = links.map((l, i) => ({
+            job: l.pin.executionId,
+            seq: l.pin.sequence,
+            signature: l.pin.signature,
+            status: statuses[i]!,
+          }));
+          // A lost confirmation or write reply leaves the same guarded page in the
+          // only checkpoint. Ordinary v1 readers refuse an unfinished v2 page.
+          const record = {
+            binding,
+            generation: links[0]!.pin.generation,
+            hubBundle: links[0]!.hubBundle,
+            outcomes,
+          };
+          await atomicJson(
+            join(dir, digest(record) + ".page-outcome.json"),
+            record,
+            true,
+          );
+          const last = links.at(-1)!.pin;
+          if (advance)
+            state.after = { job: last.executionId, seq: last.sequence };
+          delete state.group;
+          state.version = 1;
+          await save();
+          for (const { job, seq, status } of outcomes)
+            console.log(JSON.stringify({ job, seq, status }));
+        }
+        async function processKeys(keys: SourceKey[], advance: boolean) {
+          let ready: HubReportLink[] = [];
+          let bytes = 0;
+          const flush = async () => {
+            if (ready.length === 1) {
+              const l = ready[0]!,
+                k = sourceKey(l);
+              await finish(
+                k,
+                advance,
+                await processKey(k, advance, undefined, {
+                  link: l,
+                  status: "ready",
+                }),
+              );
+            } else if (ready.length) await group(ready, advance);
+            ready = [];
+            bytes = 0;
+          };
+          for (const k of keys) {
+            if (stop.signal.aborted) break;
+            if (memberLimit === 1) {
+              await finish(k, advance, await processKey(k, advance));
+              continue;
+            }
+            const q = await qualify(k),
+              l = q.link;
+            if (!l) {
+              await flush();
+              await finish(k, advance, q.status);
+              continue;
+            }
+            if (
+              ready.length &&
+              (ready[0]!.hubBundle !== l.hubBundle ||
+                ready[0]!.owner.executionId !== l.owner.executionId ||
+                bytes + l.pin.reportByteSize > maxRegisteredPageBytes)
+            )
+              await flush();
+            ready.push(l);
+            bytes += l.pin.reportByteSize;
+            if (ready.length === memberLimit) await flush();
+          }
+          await flush();
+        }
+        const replayed = new Set<number>();
+        if (state.group) {
+          const g = state.group;
+          requireReportProof(
+            g.checksum ===
+              digest({
+                binding,
+                after: state.after,
+                links: g.links,
+                advance: g.advance,
+              }),
+            "Pending registered page checksum differs",
+          );
+          requireReportProof(
+            !requested &&
+              (!selected ||
+                g.links.every((l) =>
+                  selected!.some((k) => isDeepStrictEqual(k, sourceKey(l))),
+                )),
+            "Resume exact registered page first",
+          );
+          await group(g.links, g.advance);
+          if (selected) for (const l of g.links) replayed.add(l.pin.sequence);
+        }
         if (state.pending) {
           requireReportProof(
             v.apply &&
-              (!requested || isDeepStrictEqual(requested, state.pending.key)),
+              (!requested || isDeepStrictEqual(requested, state.pending.key)) &&
+              (!selected ||
+                selected.some((k) => isDeepStrictEqual(k, state.pending!.key))),
             "Resume pending exact key before another canary",
           );
           const p = state.pending;
           await finish(p.key, p.advance, await processKey(p.key, p.advance, p));
           if (requested) return;
+        }
+        if (selected) {
+          await processKeys(
+            selected.filter((k) => !replayed.has(k.sequence)),
+            false,
+          );
+          return;
         }
         if (requested) {
           await finish(requested, false, await processKey(requested, false));
@@ -364,10 +627,8 @@ export async function runRegisteredReportCli(
           solverId: w.solver,
           keys: page.keys.filter(outside),
         });
-        for (const k of keys) {
-          if (stop.signal.aborted) return;
-          await finish(k, true, await processKey(k, true));
-        }
+        await processKeys(keys, true);
+        if (stop.signal.aborted) return;
         idle = !page.after;
         state.after = page.after ?? zero;
         if (idle) state.cycle++;

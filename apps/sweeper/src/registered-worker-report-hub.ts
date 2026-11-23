@@ -1,10 +1,12 @@
+import { Readable } from "node:stream";
 import { verifyProgressiveRemoteExecution, type DB } from "@aerodb/db";
 import { sql } from "drizzle-orm";
 import { configuredDeploymentRole } from "./config";
 import { HubWorkloadGcs, boundedHubBody } from "./hub-workload-gcs";
 import {
   assertReportPin,
-  inspectHubReport,
+  assertRegisteredPage,
+  inspectHubReportPage,
   maxPacked,
   reportUuid,
   reportHash,
@@ -137,8 +139,12 @@ export async function hubReportLink(
   };
 }
 export class ExistingHubReportStore extends HubWorkloadGcs {
-  async restore(link: HubReportLink) {
-    const p = link.pin;
+  restore(link: HubReportLink) {
+    return this.restorePage([link]);
+  }
+  async restorePage(links: readonly HubReportLink[]) {
+    assertRegisteredPage(links);
+    const p = links[0]!.pin;
     assertReportPin(p);
     const prefix =
       process.env.AIRFOILFOAM_REPORT_ARCHIVE_PREFIX ?? "progressive-reports/v1";
@@ -176,7 +182,7 @@ export class ExistingHubReportStore extends HubWorkloadGcs {
       await this.call(url.toString()),
       p.storedByteSize,
     );
-    await inspectHubReport(bytes, link);
+    await inspectHubReportPage(Readable.from([bytes]), links);
     return bytes;
   }
 }
