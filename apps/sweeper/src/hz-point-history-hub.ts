@@ -109,6 +109,44 @@ export class PointHistoryHubStorage extends HubWorkloadGcs {
     return bytes;
   }
 }
+// A lost media/metadata response can follow a successful create-only upload.
+// Report only explicit fetch/stream transport failures. Validation errors
+// remain held, including a different owner, checksum or immutable generation.
+function historyHubFailure(error: unknown, operation: unknown) {
+  if (error instanceof HistoryOperationError) {
+    return {
+      operation: error.operation,
+      category: error.category,
+      retryable: error.retryable,
+    };
+  }
+  if (error instanceof Error && (operation === "put" || operation === "read")) {
+    const code =
+      (error.cause as { code?: unknown } | undefined)?.code ??
+      (error as NodeJS.ErrnoException).code;
+    if (
+      error.name === "TimeoutError" ||
+      error.name === "AbortError" ||
+      [
+        "ETIMEDOUT",
+        "ECONNRESET",
+        "EAI_AGAIN",
+        "UND_ERR_SOCKET",
+        "UND_ERR_CONNECT_TIMEOUT",
+        "UND_ERR_HEADERS_TIMEOUT",
+        "UND_ERR_BODY_TIMEOUT",
+      ].includes(String(code))
+    ) {
+      return {
+        operation: "hub_history_" + operation + "_transport",
+        category: "transport",
+        retryable: true,
+      };
+    }
+  }
+  return { operation: "hub_history", category: "integrity", retryable: false };
+}
+
 export async function runHistoryHubSession(
   channel: HistoryMessages,
   bucket: string,
@@ -151,18 +189,7 @@ export async function runHistoryHubSession(
     } catch (error) {
       await channel.send({
         id: request.id,
-        error:
-          error instanceof HistoryOperationError
-            ? {
-                operation: error.operation,
-                category: error.category,
-                retryable: error.retryable,
-              }
-            : {
-                operation: "hub_history",
-                category: "integrity",
-                retryable: false,
-              },
+        error: historyHubFailure(error, request.operation),
       });
     }
   }
