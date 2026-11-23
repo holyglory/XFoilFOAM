@@ -89,6 +89,7 @@ export async function stoppedReportCopyKeys(
   job: string,
   after: number,
   rows = 32,
+  scientific = false,
 ) {
   if (
     !Number.isSafeInteger(after) ||
@@ -100,9 +101,13 @@ export async function stoppedReportCopyKeys(
     throw new Error("Invalid stopped report key page");
   await ownership(db, job);
   // Use fixed, ordered identity windows. Existing archived rows advance the cursor.
-  const page =
-    await db.execute(sql`WITH keys AS MATERIALIZED (SELECT sim_job_id,sequence FROM progressive_remote_reports
-    WHERE sim_job_id=${job}::uuid AND sequence>${after} ORDER BY sequence LIMIT ${rows})
+  const keys = scientific
+    ? sql`SELECT DISTINCT s.sim_job_id,s.sequence FROM progressive_remote_report_sources s
+    WHERE s.sim_job_id=${job}::uuid AND s.sequence>${after} AND EXISTS (SELECT FROM progressive_remote_reports warm
+      WHERE (warm.sim_job_id,warm.sequence)=(s.sim_job_id,s.sequence) AND warm.archived_at IS NULL)
+    ORDER BY s.sim_job_id,s.sequence LIMIT ${rows}`
+    : sql`SELECT sim_job_id,sequence FROM progressive_remote_reports WHERE sim_job_id=${job}::uuid AND sequence>${after} ORDER BY sequence LIMIT ${rows}`;
+  const page = await db.execute(sql`WITH keys AS MATERIALIZED (${keys})
     SELECT r.sequence::int seq,r.content_signature sig,CASE WHEN r.archived_at IS NOT NULL THEN 'cold'
     WHEN i.report_content_signature IS DISTINCT FROM r.content_signature OR applied.content_signature IS DISTINCT FROM r.content_signature THEN 'missing'
     WHEN ${scientificallyReceiptedReportCopy} THEN 'ordinary' WHEN ${release} THEN 'release' ELSE 'preserve' END AS mode

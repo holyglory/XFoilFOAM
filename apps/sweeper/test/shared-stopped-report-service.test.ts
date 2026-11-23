@@ -124,7 +124,9 @@ it("runs the stock recurring hub storage worker and serves both archive formats 
     };
     expect(health.hubReportArchiveFormats).toContain("shared-result-v1");
     portReady = true;
-    for (const kind of ["pending", "pending", "ordinary"] as const) {
+    for (const [order, kind] of (
+      ["pending", "pending", "ordinary"] as const
+    ).entries()) {
       await withArchiveFixture(
         db,
         "remote",
@@ -138,13 +140,24 @@ it("runs the stock recurring hub storage worker and serves both archive formats 
         {
           serviceAcceptance: kind,
           normalized: true,
-          reportCount: kind === "ordinary" ? 3 : 36,
+          reportCount: kind === "ordinary" ? 3 : order === 0 ? 75 : 36,
+          nullPrefix: order === 0 ? 66 : 1,
         },
       );
     }
+    const physicalRead = (f: ArchiveFixture) => {
+      const first = f.reports.findIndex((r) => r.payloadHash !== null);
+      return f.reports[first + 1];
+    };
+    const firstPhysical = (f: ArchiveFixture) =>
+      f.reports.find((r) => r.payloadHash !== null)!;
     const apiSamples = await Promise.all(
       originals.map((f) =>
-        download(f.executionId, 3, f.reports[2].contentSignature),
+        download(
+          f.executionId,
+          physicalRead(f).sequence,
+          physicalRead(f).contentSignature,
+        ),
       ),
     );
     start(false);
@@ -178,6 +191,11 @@ it("runs the stock recurring hub storage worker and serves both archive formats 
       .map((s) => JSON.parse(s));
     const both = order.filter((x) => x.mode === "release").map((x) => x.job);
     expect(new Set(both.slice(0, 2))).toEqual(new Set(ids.slice(0, 2)));
+    const [priority] =
+      await db.sql`SELECT a.archived_at < b.archived_at AS physical_first
+      FROM progressive_remote_reports a JOIN progressive_remote_reports b ON b.sim_job_id=a.sim_job_id
+      WHERE a.sim_job_id=${ids[0]} AND a.sequence=68 AND b.sequence=65`;
+    expect(priority.physical_first).toBe(true);
     const counts = [];
     for (const f of originals.slice(0, 2)) {
       const a = await sharedReportTotals(
@@ -188,9 +206,9 @@ it("runs the stock recurring hub storage worker and serves both archive formats 
       const readback = JSON.parse(
         await readFile(join(dir, f.executionId, "totals.json"), "utf8"),
       );
-      expect(a.registeredSqlMembers).toBe(34);
+      expect(a.registeredSqlMembers).toBe(f.reports.length - 2);
       expect(a.uniqueResultGenerations).toBe(2);
-      expect(a.verifiedMembers).toBe(36);
+      expect(a.verifiedMembers).toBe(f.reports.length);
       expect(a.sqlReportFieldBytesReleased).toBe(
         readback.sqlReportFieldBytesReleased,
       );
@@ -203,7 +221,11 @@ it("runs the stock recurring hub storage worker and serves both archive formats 
     });
     for (const [i, f] of originals.entries())
       expect(
-        await download(f.executionId, 3, f.reports[2].contentSignature),
+        await download(
+          f.executionId,
+          physicalRead(f).sequence,
+          physicalRead(f).contentSignature,
+        ),
       ).toBe(apiSamples[i]);
     // Upgrade an existing 0219 checkpoint. The two original anchors already
     // reside in pinned manifests and remain fully warm until both readers pass.
@@ -216,8 +238,16 @@ it("runs the stock recurring hub storage worker and serves both archive formats 
       originals
         .slice(0, 2)
         .map(async (f) => [
-          await download(f.executionId, 2, f.reports[1].contentSignature),
-          await download(f.executionId, 36, f.reports[35].contentSignature),
+          await download(
+            f.executionId,
+            firstPhysical(f).sequence,
+            firstPhysical(f).contentSignature,
+          ),
+          await download(
+            f.executionId,
+            f.reports.at(-1)!.sequence,
+            f.reports.at(-1)!.contentSignature,
+          ),
         ]),
     );
     start();
@@ -231,17 +261,25 @@ it("runs the stock recurring hub storage worker and serves both archive formats 
     const anchorTotals = [];
     for (const [i, f] of originals.slice(0, 2).entries()) {
       expect(
-        await download(f.executionId, 2, f.reports[1].contentSignature),
+        await download(
+          f.executionId,
+          firstPhysical(f).sequence,
+          firstPhysical(f).contentSignature,
+        ),
       ).toBe(ownerReads[i][0]);
       expect(
-        await download(f.executionId, 36, f.reports[35].contentSignature),
+        await download(
+          f.executionId,
+          f.reports.at(-1)!.sequence,
+          f.reports.at(-1)!.contentSignature,
+        ),
       ).toBe(ownerReads[i][1]);
       const total = await sharedReportTotals(
         db.db,
         join(dir, f.executionId),
         f.executionId,
       );
-      expect(total.registeredSqlMembers).toBe(36);
+      expect(total.registeredSqlMembers).toBe(f.reports.length);
       expect(total.protectedResultBytesReleased).toBeGreaterThan(0);
       anchorTotals.push(total);
     }

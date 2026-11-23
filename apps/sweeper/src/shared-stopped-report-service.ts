@@ -19,6 +19,9 @@ import { HubReportObjects, sha256 } from "./shared-report-objects";
 
 const uuid = /^[a-f\d]{8}(?:-[a-f\d]{4}){3}-[a-f\d]{12}$/i;
 interface Cursor {
+  scientificAfter?: number;
+  scientificComplete?: boolean;
+  ordinaryNext?: boolean;
   after: number;
   frontier: string;
   complete: boolean;
@@ -164,28 +167,54 @@ export async function advanceSharedReportOwner(
   }
   if (prior?.complete && prior.frontier === frontier)
     return { complete: true, changed: 0 };
-  const after = prior?.frontier === frontier ? prior.after : 0;
-  const keys = await stoppedReportCopyKeys(db, id, after);
+  const cursor: Cursor =
+    prior?.frontier === frontier
+      ? prior
+      : { after: 0, frontier, complete: false };
+  const scientific = !cursor.scientificComplete && !cursor.ordinaryNext;
+  const after = scientific ? (cursor.scientificAfter ?? 0) : cursor.after;
+  const keys = await stoppedReportCopyKeys(db, id, after, 32, scientific);
   if (!keys.length) {
+    if (scientific) {
+      await write(cursorFile, {
+        ...cursor,
+        scientificComplete: true,
+        ordinaryNext: true,
+      });
+      return { complete: false, changed: 0 };
+    }
     const totals = await sharedReportTotals(db, root, id);
     await write(join(root, "totals.json"), totals);
     console.info(
       JSON.stringify({ component: "stopped-report-cloud-totals", ...totals }),
     );
-    await write(cursorFile, { after, frontier, complete: true });
-    return { complete: !(eligibleAnchors && state?.finishedAt === 0), changed: 0 };
+    await write(cursorFile, { ...cursor, complete: true });
+    return {
+      complete: !(eligibleAnchors && state?.finishedAt === 0),
+      changed: 0,
+    };
   }
   if (keys.some((k) => k.mode === "missing"))
     throw new Error("Stopped source inventory or applied progress is missing");
   let changed = 0;
   for (const mode of ["preserve", "release"] as const) {
-    const ledgerFile = join(root, "windows", String(after) + ".json");
+    const ledgerFile = join(
+      root,
+      "windows",
+      (scientific ? "sources-" : "") + String(after) + ".json",
+    );
     const ledger = (await read<PageLedger>(ledgerFile)) ?? { members: {} };
     const requested = keys.filter((k) => k.mode === mode);
     const remaining = [];
     const known = new Map<string, StoppedCopyReceipt>();
     for (const k of requested) {
-      const saved = ledger.members[k.sequence];
+      const saved =
+        ledger.members[k.sequence] ??
+        (mode === "preserve"
+          ? await read<{ signature: string; receipt: string }>(
+              join(root, "preserved-sources", k.sequence + ".json"),
+            )
+          : null);
       if (
         mode === "preserve" &&
         saved?.signature === k.signature &&
@@ -213,7 +242,10 @@ export async function advanceSharedReportOwner(
       remaining.push(k);
     }
     if (remaining.length) {
-      if (changed) return { complete: false, changed };
+      if (changed) {
+        await write(cursorFile, { ...cursor, ordinaryNext: scientific });
+        return { complete: false, changed };
+      }
       const receipt = await copyStoppedReportBatch(
         db,
         objects,
@@ -231,8 +263,15 @@ export async function advanceSharedReportOwner(
           regular: false,
         });
 
-      for (const m of receipt.members)
-        ledger.members[m.sequence] = { signature: m.signature, receipt: hash };
+      for (const m of receipt.members) {
+        const entry = { signature: m.signature, receipt: hash };
+        ledger.members[m.sequence] = entry;
+        if (mode === "preserve")
+          await write(
+            join(root, "preserved-sources", m.sequence + ".json"),
+            entry,
+          );
+      }
       await write(ledgerFile, ledger);
       remaining.splice(0, receipt.members.length);
       changed += receipt.members.length;
@@ -252,12 +291,16 @@ export async function advanceSharedReportOwner(
             receipt.storedReportFieldsBefore - receipt.storedReportFieldsAfter,
         }),
       );
-      if (remaining.length) return { complete: false, changed };
+      if (remaining.length) {
+        await write(cursorFile, { ...cursor, ordinaryNext: scientific });
+        return { complete: false, changed };
+      }
     }
   }
   await write(cursorFile, {
-    after: keys.at(-1)!.sequence,
-    frontier,
+    ...cursor,
+    [scientific ? "scientificAfter" : "after"]: keys.at(-1)!.sequence,
+    ordinaryNext: scientific,
     complete: false,
   });
   return { complete: false, changed };
