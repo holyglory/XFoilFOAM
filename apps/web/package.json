@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "next dev -p 3100",
     "build": "NEXT_DIST_DIR=.next-build next build",
-    "start": "NEXT_DIST_DIR=.next-build next start -p 3100",
+    "start": "NEXT_DIST_DIR=.next-build node server.mjs",
     "test": "vitest run --dir test",
     "typecheck": "tsc --noEmit"
   },

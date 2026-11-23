@@ -15,7 +15,7 @@ case "${1:?Expected api or web}" in
     export NEXT_TSCONFIG_PATH
     NEXT_TSCONFIG_PATH="$(node scripts/dev/prepare-progressive-tsconfig.mjs apps/web "$DC2_GENERATION")"
     corepack pnpm --filter @aerodb/web exec next build
-    exec corepack pnpm --filter @aerodb/web exec next start --hostname 127.0.0.1 --port "${PORT:?}"
+    exec corepack pnpm --filter @aerodb/web exec node server.mjs --hostname 127.0.0.1 --port "${PORT:?}"
     ;;
   solver)
     exec node scripts/dev/progressive-preview-engine.mjs solver

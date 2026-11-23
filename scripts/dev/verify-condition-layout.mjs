@@ -3,10 +3,12 @@ import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { progressivePreviewOrigin } from "./progressive-preview-origin.mjs";
+import { catalogPagingLayout } from "./catalog-paging-layout.mjs";
 
+const paging = process.argv.includes("--paging");
 const origin = process.argv.includes("--production")
   ? "https://airfoils.pro"
-  : progressivePreviewOrigin();
+  : progressivePreviewOrigin(paging ? { name: "catalog-paging" } : undefined);
 const root = resolve(new URL("../../", import.meta.url).pathname);
 const output = mkdtempSync(join(tmpdir(), "airfoil-condition-layout-"));
 const reviewInputs = [
@@ -95,20 +97,22 @@ const targets = [
     },
   ],
 }));
-const config = {
-  repoRoot: root,
-  targets,
-  viewports: [
-    { name: "desktop", width: 1440, height: 1000 },
-    { name: "reported", width: 688, height: 1118 },
-    { name: "narrow", width: 390, height: 844 },
-  ],
-  requiredCoverage: [
-    { target: "catalog", state: "base", viewport: "reported", width: 688 },
-  ],
-  maxPageCount: 18,
-  performance: { ttfbMs: 10, lcpMs: 800, ttfbLocalOnly: true },
-};
+const config = paging
+  ? catalogPagingLayout(origin, root, reviewInputs)
+  : {
+      repoRoot: root,
+      targets,
+      viewports: [
+        { name: "desktop", width: 1440, height: 1000 },
+        { name: "reported", width: 688, height: 1118 },
+        { name: "narrow", width: 390, height: 844 },
+      ],
+      requiredCoverage: [
+        { target: "catalog", state: "base", viewport: "reported", width: 688 },
+      ],
+      maxPageCount: 18,
+      performance: { ttfbMs: 10, lcpMs: 800, ttfbLocalOnly: true },
+    };
 const path = join(output, "config.json");
 writeFileSync(path, JSON.stringify(config));
 const run = spawnSync(

@@ -6047,3 +6047,60 @@ name = "postgres-replacement-sizing"
 tier = "development"
 case_command = ["/bin/bash", "-c", "exec psql \"$DATABASE_URL\" -Xq -v ON_ERROR_STOP=1 -f tests/fixtures/hz_cache_index_packing.sql"]
 cases = [{ id = "disposable-index-and-rewrite", args = [], postgres = "default" }]
+
+# Loopback-only catalog with the full seed geometry and measured NeuralFoil curves.
+[deployment.catalog-paging]
+source = ["worktree"]
+components = ["db", "api", "web"]
+public = false
+ttl_seconds = 86400
+
+[deployment.catalog-paging.component.db]
+type = "postgres"
+image = "postgres:16-alpine"
+database = "aerodb_catalog"
+user = "aerodb"
+
+[deployment.catalog-paging.component.api]
+type = "process"
+command = ["bash", "scripts/dev/catalog-paging-api.sh"]
+port = true
+depends_on = ["db"]
+health = { path = "/health", timeout_seconds = 240 }
+
+[deployment.catalog-paging.component.web]
+type = "process"
+command = ["bash", "scripts/dev/progressive-preview.sh", "web"]
+port = true
+depends_on = ["api"]
+health = { path = "/", timeout_seconds = 600 }
+
+[test.catalog-page-journey]
+timeout_seconds = 720
+
+[[test.catalog-page-journey.check]]
+name = "paging"
+tier = "release"
+timeout_seconds = 210
+command = ["node", "scripts/dev/verify-browse-pages.mjs"]
+retained_artifacts = [{name="catalog-page-journey",path=".codex-artifacts/catalog-page-journey",max_bytes=1048576}]
+
+[[test.catalog-page-journey.check]]
+name = "types"
+tier = "release"
+command = ["/usr/bin/corepack","pnpm","--filter","@aerodb/web","typecheck"]
+
+[test.catalog-page-layout]
+timeout_seconds = 3600
+
+[[test.catalog-page-layout.check]]
+name = "verifier"
+tier = "release"
+command = ["/usr/local/bin/devcoordinator2-tooling", "formal-ui", "self-test"]
+
+[[test.catalog-page-layout.check]]
+name = "layout"
+tier = "release"
+requires = ["verifier"]
+timeout_seconds = 3000
+command = ["node", "scripts/dev/verify-condition-layout.mjs", "--paging"]

@@ -10,6 +10,7 @@ import type {
   SimulationDetail,
 } from "@aerodb/core";
 import type { SolverWorkPayload } from "./solver-work";
+import { airfoilGlyphPath } from "./airfoil-glyph";
 
 const SERVER_BASE = process.env.API_URL ?? "http://localhost:4000";
 const CLIENT_BASE = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:4000";
@@ -89,43 +90,69 @@ export function getAirfoilCompareDetail(slug: string, signal?: AbortSignal) {
   return getAirfoilDetail(slug, null, signal, "compare");
 }
 
-export async function listAirfoils(
-  params: {
-    q?: string;
-    category?: string;
-    includeSubcategories?: boolean;
-    sort?: string;
-    metricConditionKey?: string;
-    dir?: "asc" | "desc";
-    includePoints?: boolean;
-    limit?: number;
-    offset?: number;
-    hashtags?: string[];
-    thicknessMin?: number;
-    thicknessMax?: number;
-    areaMin?: number;
-    areaMax?: number;
-    upperAreaMin?: number;
-    upperAreaMax?: number;
-    upperPositiveMin?: number;
-    upperPositiveMax?: number;
-    upperNegativeMin?: number;
-    upperNegativeMax?: number;
-    lowerAreaMin?: number;
-    lowerAreaMax?: number;
-    lowerPositiveMin?: number;
-    lowerPositiveMax?: number;
-    lowerNegativeMin?: number;
-    lowerNegativeMax?: number;
-    camberAreaMin?: number;
-    camberAreaMax?: number;
-    camberPositiveMin?: number;
-    camberPositiveMax?: number;
-    camberNegativeMin?: number;
-    camberNegativeMax?: number;
-  } = {},
+export const INITIAL_BROWSE_ROWS = 40;
+
+export type AirfoilListParams = {
+  q?: string;
+  category?: string;
+  includeSubcategories?: boolean;
+  sort?: string;
+  metricConditionKey?: string;
+  dir?: "asc" | "desc";
+  includePoints?: boolean;
+  limit?: number;
+  offset?: number;
+  hashtags?: string[];
+  thicknessMin?: number;
+  thicknessMax?: number;
+  areaMin?: number;
+  areaMax?: number;
+  upperAreaMin?: number;
+  upperAreaMax?: number;
+  upperPositiveMin?: number;
+  upperPositiveMax?: number;
+  upperNegativeMin?: number;
+  upperNegativeMax?: number;
+  lowerAreaMin?: number;
+  lowerAreaMax?: number;
+  lowerPositiveMin?: number;
+  lowerPositiveMax?: number;
+  lowerNegativeMin?: number;
+  lowerNegativeMax?: number;
+  camberAreaMin?: number;
+  camberAreaMax?: number;
+  camberPositiveMin?: number;
+  camberPositiveMax?: number;
+  camberNegativeMin?: number;
+  camberNegativeMax?: number;
+};
+
+type CatalogRequest = AirfoilListParams & {
+  includeTotal?: boolean;
+  keysOnly?: boolean;
+  retainSlug?: string;
+};
+
+type AirfoilKey = Pick<AirfoilSummary, "id" | "slug">;
+export type CatalogRow = Omit<AirfoilSummary, "points"> & {
+  glyphPath: string | null;
+};
+
+// The table only displays the projected contour. Its larger preview and the
+// coordinate downloads already use the exact geometry from the detail endpoint.
+function catalogRow({ points, ...metadata }: AirfoilSummary): CatalogRow {
+  return { ...metadata, glyphPath: airfoilGlyphPath(points) };
+}
+
+async function fetchCatalogRows<T>(
+  params: CatalogRequest,
   signal?: AbortSignal,
-): Promise<AirfoilSummary[]> {
+): Promise<{
+  items: T[];
+  total?: number;
+  retained?: AirfoilSummary | null;
+  rankingId?: string;
+}> {
   const qs = new URLSearchParams();
   for (const [k, v] of Object.entries(params)) {
     if (Array.isArray(v) && v.length) qs.set(k, v.join(","));
@@ -136,7 +163,117 @@ export async function listAirfoils(
     signal,
   });
   if (!res.ok) throw new Error(`GET /api/airfoils → ${res.status}`);
-  return (await res.json()).items as AirfoilSummary[];
+  return res.json();
+}
+
+export async function listAirfoils(
+  params: AirfoilListParams = {},
+  signal?: AbortSignal,
+): Promise<AirfoilSummary[]> {
+  return (await fetchCatalogRows<AirfoilSummary>(params, signal)).items;
+}
+
+export async function listAirfoilPage(
+  params: AirfoilListParams & { limit: number; retainSlug?: string },
+  signal?: AbortSignal,
+) {
+  if (params.limit > 10_000)
+    throw new RangeError("A catalog page can contain at most 10,000 profiles.");
+  const page = await fetchCatalogRows<AirfoilSummary>(
+    { ...params, includeTotal: true },
+    signal,
+  );
+  if (
+    typeof page.total === "number" &&
+    Number.isSafeInteger(page.total) &&
+    page.total >= 0
+  )
+    return {
+      items: page.items.map(catalogRow),
+      total: page.total,
+      retained: page.retained ? catalogRow(page.retained) : null,
+      rankingId: page.rankingId,
+    };
+
+  // Older API installations return only items during a rolling deployment.
+  const { limit, offset = 0, retainSlug, ...filter } = params;
+  const all =
+    offset === 0 && page.items.length < limit
+      ? page.items
+      : await listAirfoils(filter, signal);
+  const retained = retainSlug
+    ? all.find((item) => item.slug === retainSlug)
+    : undefined;
+  return {
+    items: all.slice(offset, offset + limit).map(catalogRow),
+    total: all.length,
+    retained: retained ? catalogRow(retained) : null,
+    rankingId: undefined,
+  };
+}
+
+export async function listAirfoilPrefix(
+  filter: AirfoilListParams,
+  count: number,
+  retainSlug?: string,
+  signal?: AbortSignal,
+) {
+  const first = await listAirfoilPage(
+    { ...filter, retainSlug, limit: Math.min(count, 10_000) },
+    signal,
+  );
+  const rows = [...first.items];
+  const seen = new Set(rows.map((row) => row.id));
+  const end = Math.min(first.total, count);
+  while (rows.length < end) {
+    const part = await listAirfoilPage(
+      {
+        ...filter,
+        offset: rows.length,
+        limit: Math.min(10_000, end - rows.length),
+      },
+      signal,
+    );
+    if (
+      !part.items.length ||
+      part.total !== first.total ||
+      part.rankingId !== first.rankingId ||
+      part.items.some((row) => seen.has(row.id))
+    )
+      throw new Error("The catalog changed while loading. Please try again.");
+    for (const row of part.items) {
+      seen.add(row.id);
+      rows.push(row);
+    }
+  }
+  return { ...first, items: rows };
+}
+
+export async function listAirfoilKeys(
+  params: AirfoilListParams,
+  signal?: AbortSignal,
+): Promise<AirfoilKey[]> {
+  // An explicit bulk selection needs every matching identity, but no ranking or geometry.
+  const result = await fetchCatalogRows<AirfoilKey>(
+    {
+      ...params,
+      sort: "name",
+      dir: "asc",
+      keysOnly: true,
+      includeTotal: true,
+      includePoints: false,
+      limit: undefined,
+      offset: undefined,
+    },
+    signal,
+  );
+  const keys = new Map(result.items.map(({ id, slug }) => [id, { id, slug }]));
+  if (
+    keys.size !== result.items.length ||
+    (result.total !== undefined && keys.size !== result.total)
+  )
+    throw new Error("The profile selection changed. Please select again.");
+  return [...keys.values()];
 }
 
 export async function getPolarMetricConditions(): Promise<

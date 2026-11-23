@@ -106,6 +106,17 @@ body {
 html {
   scroll-padding-top: 60px;
 }
+.catalog-page-shell {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  height: 100vh;
+  height: 100dvh;
+}
+.catalog-page-scroll {
+  min-height: 0;
+  overflow-y: auto;
+  scrollbar-gutter: stable;
+}
 body {
   transition:
     background-color 0.2s ease,
