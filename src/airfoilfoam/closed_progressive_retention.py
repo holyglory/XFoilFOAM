@@ -681,7 +681,8 @@ def _allocation(root, rows, files, stored, receipt_files=None):
 
 def reclaim_closed_progressive_files(job_root: Path, proofs: list[dict], expected_plan: str | None = None,
                                      readbacks: list[dict] | None = None, *, lock_identity: list[int] | None = None,
-                                     preserve_solver: str | None = None, linked_continuation: str | None = None):
+                                     preserve_solver: str | None = None, linked_continuation: str | None = None,
+                                     include_working_paths: bool = False):
     """Preview without writes. Apply rechecks the entire plan under the active solver's lock."""
     if not job_root.exists() and not job_root.is_symlink():
         return {"job_id": job_root.name, "state": "absent", "bytes": 0, "files": 0, "plan": None}
@@ -735,6 +736,10 @@ def reclaim_closed_progressive_files(job_root: Path, proofs: list[dict], expecte
             extra = {"mediaFiles": kept_rows, "workingPaths": [name for name, _, _ in rows],
                      "plannedAllocatedBytes": sum(info.st_blocks * 512 for _, info in files.values())
                      if stored is None else stored["allocationBaseline"]["fileAllocatedBytes"]} if keep_requested else {}
+            if include_working_paths and not keep_requested:
+                extra = {"workingPaths": [name for name, _, _ in rows],
+                         "plannedAllocatedBytes": sum(st.st_blocks * 512 for _, st in files.values()) if stored is None else
+                                                  stored["allocationBaseline"]["fileAllocatedBytes"]}
             if historic:
                 extra.pop("workingPaths",None)
                 extra["historicalSamples"]=samples.copy()

@@ -4479,6 +4479,7 @@ export const sweeperState = pgTable(
   "sweeper_state",
   {
     id: integer("id").primaryKey().default(1),
+    closedProgressiveRetentionAfterId: uuid("closed_progressive_retention_after_id"),
     enabled: boolean("enabled").notNull().default(false),
     // 0 = auto: derive concurrent polar-job admission from the worker token
     // budget (or the visible cpuSlots cap). A positive value is an explicit

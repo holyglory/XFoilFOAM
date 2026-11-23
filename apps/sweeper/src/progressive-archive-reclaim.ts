@@ -55,13 +55,23 @@ export async function preflightProgressiveArchive(
   remote: ProgressiveEvidenceCustodyReceipt["remote"],
   signal: AbortSignal,
 ): Promise<void> {
+  const body = await openProgressiveArchive(url, token, remote, signal);
+  await verifyArchiveBytes(body, remote);
+}
+
+export async function openProgressiveArchive(
+  url: string,
+  token: string,
+  remote: ProgressiveEvidenceCustodyReceipt["remote"],
+  signal: AbortSignal,
+) {
   const response = await readRegisteredArchive(url, token, signal, "application/zstd");
   const busy = await registeredArchiveAdmissionDelay(response);
   if (busy !== null) {
     await response.body?.cancel();
     throw new ArchiveAdmissionBusy(busy);
   }
-  await verifyProgressiveArchiveResponse(response, remote);
+  return verifiedArchiveBody(response, remote);
 }
 
 export async function verifyProgressiveArchiveResponse(
@@ -72,6 +82,18 @@ export async function verifyProgressiveArchiveResponse(
   >,
   archive = true,
 ): Promise<void> {
+  const body = await verifiedArchiveBody(response, remote, archive);
+  await verifyArchiveBytes(body, remote);
+}
+
+async function verifiedArchiveBody(
+  response: Response,
+  remote: Pick<
+    ProgressiveEvidenceCustodyReceipt["remote"],
+    "storedSha256" | "storedByteSize" | "generation"
+  >,
+  archive = true,
+) {
   if (!response.ok) {
     await response.body?.cancel().catch(() => undefined);
     throw new Error(`Progressive archive readback returned HTTP ${response.status}`);
@@ -90,9 +112,13 @@ export async function verifyProgressiveArchiveResponse(
       "Progressive archive readback changed its immutable headers",
     );
   }
+  return response.body;
+}
+
+async function verifyArchiveBytes(body: ReadableStream<Uint8Array>, remote: Pick<ProgressiveEvidenceCustodyReceipt["remote"], "storedSha256" | "storedByteSize">) {
   const hash = createHash("sha256");
   let size = 0;
-  for await (const bytes of response.body as unknown as AsyncIterable<Uint8Array>) {
+  for await (const bytes of body as unknown as AsyncIterable<Uint8Array>) {
     size += bytes.length;
     if (size > remote.storedByteSize)
       throw new Error("Progressive archive readback exceeds its signed size");

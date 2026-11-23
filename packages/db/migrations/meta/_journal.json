@@ -1604,6 +1604,13 @@
       "when": 1795363913059,
       "tag": "0228_verified_worker_report_science_sources",
       "breakpoints": true
+    },
+    {
+      "idx": 229,
+      "version": "7",
+      "when": 1795363913060,
+      "tag": "0229_closed_progressive_retention_cursor",
+      "breakpoints": true
     }
   ]
 }
