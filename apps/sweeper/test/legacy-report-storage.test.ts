@@ -1205,6 +1205,10 @@ describe.sequential("worker-only legacy backup and 0198 representation", () => {
       count(result_payload_hash)::int AS normalized,bool_and(archived_at IS NULL AND archive_bundle_id IS NULL) AS local
       FROM public.progressive_worker_reports WHERE sim_job_id=${scope.executions[0].executionId}`;
     expect(dedup).toEqual({ n: 5, payloads: 1, normalized: 3, local: true });
+    const normalizedTuples =
+      () => client.sql`SELECT sequence::int AS seq,concat_ws('/',tableoid,xmin,ctid) AS revision
+      FROM public.progressive_worker_reports WHERE sim_job_id=${scope.executions[0].executionId} AND result_payload_hash IS NOT NULL ORDER BY sequence`;
+    const priorTuples = await normalizedTuples();
     for (const member of members.filter((m) => m.kind === "report")) {
       // Exact reapplication/readback remains idempotent, including absent/null.
       await execute(
@@ -1217,6 +1221,23 @@ describe.sequential("worker-only legacy backup and 0198 representation", () => {
       members.find((m) => m.kind === "conflict")!.reportText,
     );
     expect(conflict.reason).toBe("original conflict");
+    expect(Array.from(await normalizedTuples())).toEqual(
+      Array.from(priorTuples),
+    );
+    const held = members.find(
+      (m) => m.kind === "report" && m.sequence === priorTuples[0].seq,
+    )!;
+    await expect(
+      execute(
+        legacyNormalizeSql([{ ...held, reportSha256: "0".repeat(64) }], {
+          apply: true,
+          readersReady: true,
+        }),
+      ),
+    ).rejects.toThrow(/differs from verified backup/);
+    expect(Array.from(await normalizedTuples())).toEqual(
+      Array.from(priorTuples),
+    );
     await client.sql`UPDATE public.progressive_report_storage_policy SET normalization_enabled=false`;
     await execute(
       legacyNormalizeSql(members, {
