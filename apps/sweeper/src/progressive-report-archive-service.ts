@@ -624,6 +624,48 @@ export async function runDuplicateReportCleanup(
   }
 }
 
+interface NativeReportVisit {
+  after: WorkerPrefixCursor | null;
+  rows: number;
+  readyAt: number;
+  range?: { executionId: string; last: number };
+}
+
+// Comma-separated executionId:first-last. A deployment can prioritize a finite
+// census without creating another worker or changing ongoing discovery.
+function nativeReportPriorityRanges(): NativeReportVisit[] {
+  const config = process.env.AIRFOILFOAM_NATIVE_REPORT_PRIORITY_RANGES?.trim();
+  if (!config) return [];
+  const entries = config.split(",");
+  const plans: NativeReportVisit[] = [];
+  const entry =
+    /^([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}):([0-9]+)-([0-9]+)$/i;
+  for (const value of entries) {
+    const match = entry.exec(value.trim());
+    const first = Number(match?.[2]),
+      last = Number(match?.[3]);
+    if (
+      entries.length > 32 ||
+      !match ||
+      !Number.isSafeInteger(first) ||
+      !Number.isSafeInteger(last) ||
+      first < 1 ||
+      first > last
+    ) {
+      console.error("[sweeper] invalid native report priority ranges");
+      return [];
+    }
+    const executionId = match[1].toLowerCase();
+    plans.push({
+      after: { executionId, sequence: first - 1 },
+      rows: 8,
+      readyAt: 0,
+      range: { executionId, last },
+    });
+  }
+  return plans;
+}
+
 /** Local historical sharing has no cloud dependency. The existing report
  * storage process owns its lifetime, signal and bounded database pool. */
 export async function runNativeWorkerReportSharing(
@@ -641,57 +683,97 @@ export async function runNativeWorkerReportSharing(
     .map((s) => s.trim())
     .filter(Boolean);
   const inspectedThrough = new Map<string, number>();
-  let rows = 8;
+  const ordinary: NativeReportVisit = { after, rows: 8, readyAt: 0 };
+  const priority = nativeReportPriorityRanges();
+  let preferPriority = true;
   while (!signal.aborted) {
+    const now = Date.now();
+    const index = priority.findIndex((item) => item.readyAt <= now);
+    const visit: NativeReportVisit =
+      index >= 0 && (preferPriority || ordinary.readyAt > now)
+        ? priority.splice(index, 1)[0]
+        : ordinary;
     let pause = 100;
-    try {
-      const result = await backfillWorkerReportPrefix(db, {
-        apply: true,
-        after,
-        excludeJobs,
-        inspectedThrough,
-        rows,
-      });
-      after = result.after;
-      if (after && result.inspectedThrough !== null)
-        inspectedThrough.set(after.executionId, result.inspectedThrough);
-      if (result.state === "disabled") {
-        inspectedThrough.clear();
-        after = null;
-      }
-      if (
-        result.normalized ||
-        result.state === "reader-unverified" ||
-        result.state === "timed-out"
-      )
-        console.info(
-          JSON.stringify({
-            component: "native-worker-report-sharing",
-            ...result,
-            physicalSpaceReleased: null,
-          }),
+    if (visit.readyAt <= now) {
+      preferPriority = visit === ordinary;
+      const { range } = visit;
+      let again = !!range;
+      try {
+        const result = await backfillWorkerReportPrefix(db, {
+          apply: true,
+          after: visit.after,
+          excludeJobs,
+          rows: visit.rows,
+          ...(range
+            ? {
+                executionId: range.executionId,
+                throughSequence: range.last,
+                minStoredBytes: 32 * 1024,
+              }
+            : { inspectedThrough }),
+        });
+        if (
+          result.normalized ||
+          result.state === "reader-unverified" ||
+          result.state === "timed-out"
+        )
+          console.info(
+            JSON.stringify({
+              component: "native-worker-report-sharing",
+              ...result,
+              ...(range ? { priorityThrough: range.last } : {}),
+              physicalSpaceReleased: null,
+            }),
+          );
+        if (result.state === "disabled") {
+          inspectedThrough.clear();
+          ordinary.after = null;
+          ordinary.rows = 8;
+          pause = 300_000;
+        } else {
+          visit.after = result.after;
+          if (!range && visit.after && result.inspectedThrough !== null)
+            inspectedThrough.set(
+              visit.after.executionId,
+              result.inspectedThrough,
+            );
+          if (result.state === "complete") visit.readyAt = Date.now() + 300_000;
+          if (result.state === "timed-out" && visit.rows > 2) {
+            visit.rows = Math.max(2, Math.floor(visit.rows / 2));
+            visit.readyAt = Date.now() + 1500;
+          } else if (
+            (result.state === "busy" || result.state === "timed-out") &&
+            visit.after
+          ) {
+            if (range) visit.readyAt = Date.now() + 30_000;
+            else
+              visit.after = {
+                executionId: visit.after.executionId,
+                sequence: null,
+              };
+          }
+          if (visit.after?.sequence == null) visit.rows = 8;
+          again =
+            !!range &&
+            visit.after?.sequence != null &&
+            visit.after.sequence < range.last;
+        }
+      } catch (error) {
+        console.error(
+          "[sweeper] native worker report sharing",
+          error instanceof Error ? error.message : String(error),
         );
-      if (result.state === "complete" || result.state === "disabled")
-        pause = 300_000;
-      if (result.state === "timed-out" && after && rows > 2) {
-        rows = Math.max(2, Math.floor(rows / 2));
-        pause = 1500;
-      } else if (
-        (result.state === "busy" || result.state === "timed-out") &&
-        after
-      ) {
-        // Revisit this execution on the next sweep instead of holding up siblings.
-        after = { executionId: after.executionId, sequence: null };
+        visit.readyAt = Date.now() + 30_000;
       }
-      if (!after || after.sequence === null) rows = 8;
-    } catch (error) {
-      console.error(
-        "[sweeper] native worker report sharing",
-        error instanceof Error ? error.message : String(error),
-      );
-      pause = 30_000;
+      if (again) priority.push(visit);
     }
-    await delay(pause, undefined, { signal }).catch((error) => {
+    const earliest = Math.min(
+      ordinary.readyAt,
+      ...priority.map((item) => item.readyAt),
+    );
+    await delay(Math.max(pause, earliest - Date.now()), undefined, {
+      signal,
+    }).catch((error) => {
       if (!signal.aborted) throw error;
     });
   }
