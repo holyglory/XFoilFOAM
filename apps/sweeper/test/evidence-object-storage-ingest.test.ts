@@ -507,6 +507,12 @@ describe("GCS Zstandard evidence ingestion", () => {
         evidence_artifacts: [manifest, ...(archived ? [bundle] : []), ...artifacts],
       };
     });
+    // One real blob may serve two different attempts. Register both owners.
+    if (!archived) {
+      const source = points[0]!.evidence_artifacts!.find(a => a.kind === "mesh_evidence")!;
+      const target = points[1]!.evidence_artifacts!;
+      target[target.findIndex(a => a.kind === "mesh_evidence")] = structuredClone(source);
+    }
     const report: JobResult = { job_id: owner.engineJobId, state: "completed", polars: [{
       speed: snapshot.flowState.speedMps, chord: snapshot.referenceGeometry.referenceLengthM,
       reynolds: snapshot.derived.reynolds, mach: snapshot.derived.mach,
@@ -518,7 +524,12 @@ describe("GCS Zstandard evidence ingestion", () => {
         presetRevisionId: revision.id, mach: snapshot.derived.mach }],
       result: report, ingestLeaseToken: lease.token, heartbeat: async () => {},
     };
-    const first = await ingestResult(input);
+    const firstQueries: Record<string, number> = {};
+    const firstStart = performance.now();
+    const firstCpu = process.cpuUsage();
+    replayQueries = firstQueries;
+    const first = await ingestResult(input).finally(() => { replayQueries = null; });
+    const initial = { wallMs: performance.now() - firstStart, cpu: process.cpuUsage(firstCpu), queries: firstQueries };
     expect(first.resultAttemptIds).toHaveLength(2);
     const exactSnapshot = async () => {
       const artifacts = await db.select().from(solverEvidenceArtifacts)
@@ -552,6 +563,18 @@ describe("GCS Zstandard evidence ingestion", () => {
     expect(before.histories).toHaveLength(2);
     expect(before.attempts.find((attempt) => attempt.aoaDeg === 9)?.validForPolar).toBe(false);
     expect(before.classifications.some((classification) => classification.state === "accepted"), JSON.stringify(before.classifications)).toBe(true);
+    // Two independent owners, one INSERT per bulk page and the original
+    // structural manifest/bundle writes. No per-member insert loop.
+    expect(firstQueries["solver_evidence_artifacts:insert"]).toBeLessThanOrEqual(
+      2 * (Math.ceil(artifactCount / 64) + (archived ? 2 : 1)),
+    );
+    if (!archived) {
+      const mesh = before.artifacts.filter(a => a.kind === "mesh");
+      expect(mesh).toHaveLength(2);
+      expect(new Set(mesh.map(a => a.resultAttemptId)).size).toBe(2);
+      expect(mesh[0]!.storageKey).toBe(mesh[1]!.storageKey);
+      expect(mesh[0]!.sha256).toBe(mesh[1]!.sha256);
+    }
     const measure = async (concurrent: boolean) => {
       const queries: Record<string, number> = {};
       replayQueries = queries;
@@ -564,6 +587,10 @@ describe("GCS Zstandard evidence ingestion", () => {
         replayQueries = null;
         for (const receipt of receipts) expect(receipt).toEqual(first);
         expect(await exactSnapshot()).toEqual(before);
+        // Only the two owners' structural manifests can revisit an INSERT
+        // on exact replay, even when two ingests race on the same points.
+        expect(queries["solver_evidence_artifact_members:insert"] ?? 0)
+          .toBeLessThanOrEqual(archived ? 2 * receipts.length : 0);
         return { concurrent, queries, wallMs, cpuUserMicros: cpu.user, cpuSystemMicros: cpu.system };
       } finally { replayQueries = null; }
     };
@@ -579,7 +606,7 @@ describe("GCS Zstandard evidence ingestion", () => {
       helperSourceHash: createHash("sha256").update(await readFile(new URL("../src/ingest.ts", import.meta.url))).digest("hex"),
       lockHelperSourceHash: createHash("sha256").update(await readFile(new URL("../../../packages/db/src/result-evidence-lock.ts", import.meta.url))).digest("hex"),
       hashes: Object.fromEntries(Object.entries(before).map(([name, rows]) => [name, analysisContentHash(JSON.parse(JSON.stringify(rows)))])),
-      measurements }));
+      initial, measurements }));
     if (artifactCount > 64) return;
     const bulk = before.artifacts.find((artifact) => artifact.kind === "time_directory")!;
     const nullable = before.artifacts.find((artifact) => artifact.kind === "time_directory" && artifact.field === null && artifact.role === null)!;
@@ -617,10 +644,22 @@ describe("GCS Zstandard evidence ingestion", () => {
       }).catch((error) => { if (error !== rollback) throw error; });
       expect(await exactSnapshot()).toEqual(before);
     }
-    await db.delete(solverEvidenceArtifacts).where(eq(solverEvidenceArtifacts.id, bulk.id));
-    expect((await ingestResult(input)).resultAttemptIds).toEqual(first.resultAttemptIds);
+    const partial = before.artifacts.filter(a => a.resultAttemptId === bulk.resultAttemptId && a.kind === "time_directory").slice(0, 17);
+    expect(partial).toHaveLength(17);
+    await db.delete(solverEvidenceArtifacts).where(inArray(solverEvidenceArtifacts.id, partial.map(a => a.id)));
+    const repairQueries: Record<string, number> = {};
+    replayQueries = repairQueries;
+    const repaired = await ingestResult(input).finally(() => { replayQueries = null; });
+    expect(repaired.resultAttemptIds).toEqual(first.resultAttemptIds);
+    expect(repairQueries["solver_evidence_artifacts:insert"]).toBeLessThanOrEqual(archived ? 3 : 1);
     const restored = await exactSnapshot();
     expect(restored.artifacts).toHaveLength(before.artifacts.length);
+    for (const old of partial) {
+      const actual = restored.artifacts.find(a => a.resultAttemptId === old.resultAttemptId && a.storageKey === old.storageKey && a.sha256 === old.sha256);
+      expect(actual).toEqual({ ...old, id: expect.any(String), createdAt: expect.any(Date) });
+    }
+    for (const previous of before.artifacts.filter(a => !partial.some(v => v.id === a.id)))
+      expect(restored.artifacts.find(a => a.id === previous.id)).toEqual(previous);
     expect(restored.classifications).toEqual(before.classifications);
     expect(restored.pointers).toEqual(before.pointers);
     if (archived) {

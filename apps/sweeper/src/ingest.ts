@@ -1565,6 +1565,7 @@ async function registerArchiveMember(opts: {
   artifact: StoredEvidenceArtifact;
   evidenceBase: string;
   artifactPath?: string;
+  existingMemberPath?: string | null;
 }): Promise<void> {
   if (!ARCHIVED_EVIDENCE_MEMBER_KINDS.has(opts.artifact.kind)) return;
   if (
@@ -1582,6 +1583,9 @@ async function registerArchiveMember(opts: {
         opts.evidenceBase,
         opts.artifact.storageKey,
       );
+  // The batch read joined on this exact archive ID and artifact ID.
+  // Ownership and the expected evidence-relative path were still checked above.
+  if (opts.existingMemberPath === memberPath) return;
   const [inserted] = await opts.db
     .insert(solverEvidenceArtifactMembers)
     .values({
@@ -1750,8 +1754,12 @@ async function registerVerifiedGcsArchive(opts: {
   // registered logical member now; later artifacts take the same idempotent
   // path after their association is inserted.
   const existingArtifacts = await opts.db
-    .select()
+    .select({ artifact: solverEvidenceArtifacts, memberPath: solverEvidenceArtifactMembers.memberPath })
     .from(solverEvidenceArtifacts)
+    .leftJoin(solverEvidenceArtifactMembers, and(
+      eq(solverEvidenceArtifactMembers.archiveId, archive.id),
+      eq(solverEvidenceArtifactMembers.artifactId, solverEvidenceArtifacts.id),
+    ))
     .where(
       and(
         eq(solverEvidenceArtifacts.resultId, opts.resultId),
@@ -1759,12 +1767,13 @@ async function registerVerifiedGcsArchive(opts: {
       ),
     )
     .orderBy(solverEvidenceArtifacts.id);
-  for (const existingArtifact of existingArtifacts) {
+  for (const { artifact, memberPath } of existingArtifacts) {
     await registerArchiveMember({
       db: opts.db,
       archive,
-      artifact: existingArtifact,
+      artifact,
       evidenceBase: opts.bundle.evidenceBase,
+      existingMemberPath: memberPath,
     });
   }
   return archive;
@@ -2239,7 +2248,7 @@ export async function registerEvidenceArtifacts(opts: {
 
 const EVIDENCE_ARTIFACT_TRANSACTION_BATCH_SIZE = 64;
 
-async function exactExistingEvidenceArtifacts(
+async function registerBulkEvidenceArtifacts(
   transaction: DB,
   base: Omit<Parameters<typeof registerEvidenceArtifacts>[0], "artifact" | "transaction">,
   artifacts: readonly EngineEvidenceArtifact[],
@@ -2252,14 +2261,29 @@ async function exactExistingEvidenceArtifacts(
     return association ? [{ artifact, association }] : [];
   });
   if (!candidates.length) return exact;
+  // One bounded, indexed join. A disjunction per member repeatedly makes
+  // the planner enumerate the same owner/blob indexes for every key.
+  const keys = [...new Map(candidates.map(({ association: a }) => [
+    evidenceArtifactAssociationKey(a),
+    { kind: a.kind, field: a.field, role: a.role, storage_key: a.storageKey, sha256: a.sha256 },
+  ])).values()];
+  const owner = base.resultAttemptId
+    ? eq(solverEvidenceArtifacts.resultAttemptId, base.resultAttemptId)
+    : isNull(solverEvidenceArtifacts.resultAttemptId);
   const existing = await transaction.select({ artifact: solverEvidenceArtifacts,
     memberPath: solverEvidenceArtifactMembers.memberPath })
     .from(solverEvidenceArtifacts)
+    .innerJoin(sql`jsonb_to_recordset(${JSON.stringify(keys)}::jsonb)
+      AS wanted(kind text,field text,role text,storage_key text,sha256 text)`, sql`
+      ${solverEvidenceArtifacts.storageKey}=wanted.storage_key AND ${solverEvidenceArtifacts.sha256}=wanted.sha256
+      AND ${solverEvidenceArtifacts.kind}::text=wanted.kind
+      AND ${solverEvidenceArtifacts.field} IS NOT DISTINCT FROM wanted.field
+      AND ${solverEvidenceArtifacts.role} IS NOT DISTINCT FROM wanted.role`)
     .leftJoin(solverEvidenceArtifactMembers, and(
       eq(solverEvidenceArtifactMembers.artifactId, solverEvidenceArtifacts.id),
       sql`${solverEvidenceArtifactMembers.archiveId} = ${archiveContext?.archive.id ?? null}::uuid`,
     ))
-    .where(or(...candidates.map(({ association }) => evidenceArtifactAssociationIdentity(association))))
+    .where(owner)
     .limit(EVIDENCE_ARTIFACT_TRANSACTION_BATCH_SIZE + 1);
   if (existing.length > EVIDENCE_ARTIFACT_TRANSACTION_BATCH_SIZE) return exact;
   const byIdentity = new Map<string, typeof existing>();
@@ -2280,6 +2304,31 @@ async function exactExistingEvidenceArtifacts(
         ? archiveMemberPathFromArtifactPath(archiveContext.evidenceBase, artifact.path)
         : archiveMemberPathFromStoredArtifact(archiveContext.evidenceBase, association.storageKey);
       if (matches[0].memberPath !== memberPath) continue;
+    }
+    exact.add(artifact);
+  }
+
+  // Structural artifacts never enter this helper. Keep the ordinary path
+  // for nullable/ambiguous owners, conflicts and incomplete archive links.
+  // An INSERT returning a new association still runs every database trigger.
+  if (!base.resultId || !base.resultAttemptId) return exact;
+  const missing = candidates.filter(({ association }) =>
+    !byIdentity.has(evidenceArtifactAssociationKey(association)));
+  if (!missing.length) return exact;
+  const inserted = await transaction.insert(solverEvidenceArtifacts)
+    .values(missing.map(({ association }) => association))
+    .onConflictDoNothing().returning();
+  const newRows = new Map(inserted.map(row => [evidenceArtifactAssociationKey(row), row]));
+  for (const { artifact, association } of missing) {
+    const row = newRows.get(evidenceArtifactAssociationKey(association));
+    if (!row) continue;
+    if (!sameEvidenceArtifactAssociation(row, association))
+      throw new Error(`evidence artifact replay changed immutable association metadata for attempt ${base.resultAttemptId}`);
+    if (archiveContext && ARCHIVED_EVIDENCE_MEMBER_KINDS.has(row.kind)) {
+      await registerArchiveMember({
+        db: transaction, archive: archiveContext.archive, artifact: row,
+        evidenceBase: archiveContext.evidenceBase, artifactPath: artifact.path,
+      });
     }
     exact.add(artifact);
   }
@@ -2348,21 +2397,13 @@ async function registerEvidenceArtifactsBatch(
       );
       await acquireEvidenceArtifactKeyLocks(transaction, lockKeys);
       if (lockKeys.length) {
-        const existing = await transaction
-          .select({ resultId: solverEvidenceArtifacts.resultId })
-          .from(solverEvidenceArtifacts)
-          .where(
-            or(
-              ...lockKeys.map((key) =>
-                and(
-                  eq(solverEvidenceArtifacts.storageKey, key.storageKey),
-                  eq(solverEvidenceArtifacts.sha256, key.sha256),
-                ),
-              ),
-            ),
-          );
+        const existing = await transaction.execute<{ result_id: string | null }>(sql`
+          SELECT DISTINCT a.result_id
+          FROM jsonb_to_recordset(${JSON.stringify(lockKeys)}::jsonb) AS k("storageKey" text, sha256 text)
+          JOIN ${solverEvidenceArtifacts} a ON a.storage_key=k."storageKey" AND a.sha256=k.sha256
+        `);
         await acquireResultEvidenceLocks(transaction, [
-          ...existing.map((row) => row.resultId),
+          ...existing.map((row) => row.result_id),
           base.resultId,
         ]);
       } else {
@@ -2377,11 +2418,11 @@ async function registerEvidenceArtifactsBatch(
               base.resultAttemptId,
             )
           : null;
-      const exactExisting = archiveContext === undefined ? new Set<EngineEvidenceArtifact>()
-        : await exactExistingEvidenceArtifacts(transaction, base, batch, archiveContext);
+      const handled = archiveContext === undefined ? new Set<EngineEvidenceArtifact>()
+        : await registerBulkEvidenceArtifacts(transaction, base, batch, archiveContext);
       const registered: PendingRemoteEvidenceCleanup[] = [];
       for (const artifact of batch) {
-        if (exactExisting.has(artifact)) continue;
+        if (handled.has(artifact)) continue;
         const cleanup = await registerEvidenceArtifacts({
           ...base,
           artifact,
