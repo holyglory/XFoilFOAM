@@ -35,6 +35,7 @@ export async function publishProgressiveWorkerReport(
   db: DB,
   executionId: string,
   fetcher: typeof fetch = fetch,
+  signal?: AbortSignal,
 ): Promise<
   | { kind: "idle" | "paused" }
   | { kind: "published" | "quarantined"; sequence: number }
@@ -101,7 +102,7 @@ export async function publishProgressiveWorkerReport(
           "x-xfoilfoam-solver-token": authToken,
         },
         redirect: "error",
-        signal: AbortSignal.timeout(30_000),
+        signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(30_000)]) : AbortSignal.timeout(30_000),
         body: JSON.stringify({
           promiseId: owned.promise_id,
           report: pending.report,
@@ -220,6 +221,7 @@ export async function publishNextProgressiveWorkerReport(
   laneCount = 1,
   pass: ProgressivePublicationPass = "active",
   cursor?: ProgressivePublicationCursor,
+  signal?: AbortSignal,
 ): Promise<boolean> {
   const [pending] = await db.execute(
     progressivePublicationSelectionSql(
@@ -235,6 +237,7 @@ export async function publishNextProgressiveWorkerReport(
     db,
     String(pending.sim_job_id),
     fetcher,
+    signal,
   );
   return result.kind === "published" || result.kind === "quarantined";
 }
@@ -245,9 +248,10 @@ export async function publishProgressiveWorkerReports(
   lane = 0,
   laneCount = 1,
   cursor: ProgressivePublicationCursor = { nextPass: "active" },
+  signal?: AbortSignal,
 ): Promise<boolean> {
   let published = false;
-  for (let index = 0; index < 32; index += 1) {
+  for (let index = 0; index < 32 && !signal?.aborted; index += 1) {
     const pass = cursor.nextPass;
     cursor.nextPass = pass === "active" ? "backlog" : "active";
     const next = await publishNextProgressiveWorkerReport(
@@ -257,6 +261,7 @@ export async function publishProgressiveWorkerReports(
       laneCount,
       pass,
       cursor,
+      signal,
     );
     if (!next) break;
     published = true;

@@ -44,6 +44,7 @@ export async function runProgressiveReportService(
         options.lane ?? 0,
         options.laneCount ?? 1,
         publicationCursor,
+        signal,
       ));
   const reportError =
     options.reportError ??

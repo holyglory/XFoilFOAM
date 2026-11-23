@@ -1,3 +1,4 @@
+import { setTimeout as delay } from "node:timers/promises";
 const RETRYABLE_STATUSES = new Set([502, 503, 504]);
 const MAX_RETRIES = 2;
 const DEFAULT_RETRY_DELAY_MS = 250;
@@ -22,12 +23,11 @@ export async function fetchProgressiveRemote(
   init?: RequestInit,
 ): Promise<Response> {
   for (let attempt = 0; ; attempt += 1) {
+    init?.signal?.throwIfAborted();
     const response = await fetcher(input, init);
     if (!RETRYABLE_STATUSES.has(response.status) || attempt >= MAX_RETRIES)
       return response;
     await response.arrayBuffer().catch(() => undefined);
-    await new Promise((resolve) =>
-      setTimeout(resolve, retryDelayMs(response, attempt)),
-    );
+    await delay(retryDelayMs(response, attempt), undefined, { signal: init?.signal ?? undefined });
   }
 }
