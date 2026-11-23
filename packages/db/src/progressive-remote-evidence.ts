@@ -190,9 +190,7 @@ async function resolveEvidence(
 }
 
 export function assertProgressiveReportedManifest(
-  source: NonNullable<
-    Awaited<ReturnType<typeof resolveProgressiveRemoteEvidence>>
-  >,
+  source: Pick<PointSource, "point">,
   input: { manifestSha256: string; manifestByteSize: number },
 ) {
   const manifests =

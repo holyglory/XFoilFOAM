@@ -7,7 +7,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { PassThrough, Readable } from "node:stream";
 import { gzipSync } from "node:zlib";
 import { beforeEach, expect, it, vi } from "vitest";
-import { readProgressiveReportArchive } from "../src/progressive-report-archive-reader";
+import { readProgressiveReportArchive, verifyRetainedReportGeneration } from "../src/progressive-report-archive-reader";
 
 const gcs = vi.hoisted(() => ({
   bucket: vi.fn(),
@@ -202,4 +202,14 @@ it("keeps the point attribution of each request when a shared archive read times
     } }));
     expect(timeout).not.toHaveProperty("requestedPoint");
   } finally { read.mockRestore(); }
+});
+
+it("verifies the complete previously authenticated compressed generation before reusing a point", async () => {
+  const { identity } = fixture("remote");
+  await expect(verifyRetainedReportGeneration(identity)).resolves.toBeUndefined();
+  gcs.read.mockImplementationOnce(() => Readable.from([Buffer.alloc(identity.storedByteSize)]));
+  await expect(verifyRetainedReportGeneration(identity)).rejects.toThrow("stored-byte proof");
+  gcs.read.mockImplementationOnce(() => Readable.from([Buffer.alloc(identity.storedByteSize + 1)]));
+  await expect(verifyRetainedReportGeneration(identity)).rejects.toThrow("registered size");
+  await expect(verifyRetainedReportGeneration({ ...identity, sourceKind: "worker" })).rejects.toThrow("hub report");
 });

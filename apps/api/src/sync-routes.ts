@@ -140,7 +140,8 @@ import { mediaStore } from "./media-store";
 import { readStoredForceHistory } from "./solver-history-reader";
 import { readStoredResultHistories } from "./result-history-reader";
 import { apiAttemptEvidenceReader, readStoredAttemptEvidenceBatch } from "./attempt-evidence-reader";
-import { isPolarReceiptReplayRequest, readBoundPolarReplayReceipt } from "./progressive-polar-receipt-replay";
+import { isPolarReceiptReplayRequest, readBoundPolarReplayReceipt, originalPolarReceiptResponse } from "./progressive-polar-receipt-replay";
+import { recoverSignedPolarReceipt } from "./retained-polar-point";
 import { prepareProgressiveRemoteEvidence } from "@aerodb/db/progressive-remote-evidence";
 import { prepareProgressiveRemoteReceiptReplay } from "@aerodb/db/progressive-remote-evidence-receipts";
 import {
@@ -4449,6 +4450,16 @@ export async function importPolarPush(
       .from(syncSweepPromises)
       .where(eq(syncSweepPromises.id, payload.promiseId))
       .limit(1);
+    if (options.referenceOnlyReplay && promise?.status === "cancelled" && promise.registeredSolverId && payload.sourceInstanceId && payload.results.length === 1) {
+      const p = payload.results[0]!;
+      if (p.progressiveEvidence && p.engineJobId && p.remoteResultId && p.remoteResultAttemptId) {
+        const original = await recoverSignedPolarReceipt(db, {
+          solverId: promise.registeredSolverId, promiseId: promise.id, engineJobId: p.engineJobId, engineCaseSlug: p.engineCaseSlug ?? null,
+          aoaDeg: p.aoaDeg, remoteResultId: p.remoteResultId, remoteResultAttemptId: p.remoteResultAttemptId, progressiveEvidence: p.progressiveEvidence,
+        }, payload.sourceInstanceId);
+        if (original) return originalPolarReceiptResponse(original, promise.id, p.aoaDeg);
+      }
+    }
     progressive = await prepareProgressivePolarImport(
       db,
       payload,
@@ -4600,11 +4611,7 @@ export async function importPolarPush(
     if (options.referenceOnlyReplay && promise?.status === "cancelled" && payload.sourceInstanceId && progressive.size === 1) {
       const entry = progressive.values().next().value!;
       const original = await readBoundPolarReplayReceipt(db, entry, payload.sourceInstanceId);
-      if (original) return {
-        imported: 0, attempts: 0, artifacts: 0, media: 0, fieldExtents: 0, fieldColorScales: 0,
-        conflictIds: [], promiseId: promise.id, fulfilledAoas: [], unfulfilledAoas: [entry.delivery.aoaDeg],
-        bindingReceipts: [], progressiveArchiveReceipts: [], progressiveEvidenceReceipts: [original],
-      };
+      if (original) return originalPolarReceiptResponse(original, promise.id, entry.delivery.aoaDeg);
     }
   }
   // Never trust a pushing instance's bc id blindly: remote solvers send THEIR

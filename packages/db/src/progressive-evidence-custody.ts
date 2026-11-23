@@ -134,6 +134,42 @@ export async function readProgressiveEvidenceCustodyReceipt(
     throw new Error(
       "Archive custody requires the exact retained source attempt",
     );
+  const raw = await readBoundProgressiveRawArchive(
+    db,
+    source,
+    retained,
+    brokeredUploadId,
+    async (manifest) => {
+      const reported = await resolveProgressiveRemoteEvidence(db, source);
+      if (!reported)
+        throw new Error("Archive custody source report is unavailable");
+      assertProgressiveReportedManifest(reported, manifest);
+    },
+  );
+  return {
+    schemaVersion: 1,
+    kind: "hub-progressive-evidence-custody",
+    source,
+    brokeredUploadId,
+    ...raw,
+  };
+}
+
+/** Existing immutable raw bindings only. This does not issue a source
+ * receipt or sign a transport acknowledgement. Callers prove the manifest
+ * against their separately authenticated original point. */
+export async function readBoundProgressiveRawArchive(
+  db: DB,
+  source: ProgressiveRemoteEvidenceDelivery,
+  retained: { resultId: string; resultAttemptId: string },
+  brokeredUploadId: string,
+  checkManifest: (manifest: {
+    manifestSha256: string;
+    manifestByteSize: number;
+  }) => void | Promise<void>,
+): Promise<
+  Pick<ProgressiveEvidenceCustodyReceipt, "remote" | "canonical" | "boundAt">
+> {
   const [stored] = await db
     .select({
       upload: syncBrokeredEvidenceUploads,
@@ -208,14 +244,20 @@ export async function readProgressiveEvidenceCustodyReceipt(
     throw new Error(
       "Archive custody binding differs from its verified source or storage identity",
     );
-  const reported = await resolveProgressiveRemoteEvidence(db, source);
-  if (!reported)
-    throw new Error("Archive custody source report is unavailable");
-  assertProgressiveReportedManifest(reported, upload);
+  await checkManifest({
+    manifestSha256: upload.manifestSha256,
+    manifestByteSize: upload.manifestByteSize,
+  });
   const members = await db
     .select({
-      member: solverEvidenceArtifactMembers,
-      artifact: solverEvidenceArtifacts,
+      member: { memberPath: solverEvidenceArtifactMembers.memberPath },
+      artifact: {
+        resultId: solverEvidenceArtifacts.resultId,
+        resultAttemptId: solverEvidenceArtifacts.resultAttemptId,
+        kind: solverEvidenceArtifacts.kind,
+        sha256: solverEvidenceArtifacts.sha256,
+        byteSize: solverEvidenceArtifacts.byteSize,
+      },
     })
     .from(solverEvidenceArtifactMembers)
     .innerJoin(
@@ -246,10 +288,6 @@ export async function readProgressiveEvidenceCustodyReceipt(
       "Archive custody requires every authenticated manifest member",
     );
   return {
-    schemaVersion: 1,
-    kind: "hub-progressive-evidence-custody",
-    source,
-    brokeredUploadId,
     remote: {
       bucket: upload.bucket,
       objectKey: upload.objectKey,

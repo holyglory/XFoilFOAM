@@ -11,6 +11,8 @@ import {
 } from "./progressive-report-archive";
 import type { ProgressiveRemoteReport } from "./progressive-remote-report";
 
+export const DEFAULT_PROGRESSIVE_REPORT_READ_TIMEOUT_MS = 15_000;
+
 export type ProgressiveReportSourceKind = "remote" | "worker";
 
 export interface ProgressiveReportReference {
@@ -108,7 +110,7 @@ export function installProgressiveReportArchiveReader(
   reader: ProgressiveReportArchiveReader | null,
   options: { timeoutMs?: number } = {},
 ): void {
-  const timeoutMs = options.timeoutMs ?? 15_000;
+  const timeoutMs = options.timeoutMs ?? DEFAULT_PROGRESSIVE_REPORT_READ_TIMEOUT_MS;
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 30_000)
     throw new Error("Progressive report reads require a 1..30000ms deadline");
   installed = reader ? { reader, timeoutMs, pending: new Map() } : null;
