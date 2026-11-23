@@ -289,6 +289,44 @@ export async function verifyProgressivePolarArchiveImport(input: {
             },
           );
           expect(receipt.canonical).toMatchObject(input.retained);
+          if (closed && !input.storageOnly) {
+            // The registered worker's evidence lane sends only these identities
+            // when it is missing the original hub receipt, even after raw binding.
+            const { aoaDeg, engineJobId, engineCaseSlug, remoteResultId, remoteResultAttemptId, progressiveEvidence } = input.delivery;
+            const identity = { aoaDeg, engineJobId, engineCaseSlug, remoteResultId, remoteResultAttemptId, progressiveEvidence };
+            const send = (point: Record<string, unknown> = identity) => input.app.inject({
+              method: "POST", url: "/api/sync/v1/polars", headers: { "x-xfoilfoam-solver-token": input.token },
+              payload: { promiseId: input.delivery.promiseId, sourceInstanceId: input.payload.sourceInstanceId, results: [point] },
+            });
+            const sparse = await send();
+            expect(sparse.statusCode, sparse.body).toBe(200);
+            expect(sparse.json(), sparse.body).toMatchObject({ conflictIds: [], attempts: 0, artifacts: 0, media: 0,
+              bindingReceipts: [], progressiveArchiveReceipts: [], fulfilledAoas: [], unfulfilledAoas: [aoaDeg],
+              progressiveEvidenceReceipts: response.progressiveEvidenceReceipts });
+            expect((await send({ ...identity, remoteResultAttemptId: randomUUID() })).statusCode).toBe(409);
+
+            const undoNegative = new Error("Rollback incomplete raw custody");
+            try {
+              await expect(connection.transaction(async (savepoint) => {
+                input.setConnection(savepoint as unknown as DB);
+                const edit = await send({ ...identity, cl: 987 });
+                expect(edit.json().conflictIds.length).toBeGreaterThan(0);
+                expect(edit.json().progressiveEvidenceReceipts).toEqual([]);
+                // Keep the original attempt and receipt. Damage one raw member
+                // association in this rollback-only database and require fresh proof.
+                const missing = await savepoint.execute(sql`DELETE FROM solver_evidence_artifact_members m
+                  USING solver_evidence_archives a WHERE a.id=m.archive_id AND a.result_attempt_id=${receipt.canonical.resultAttemptId}::uuid
+                    AND m.member_path='evidence_manifest.json' RETURNING m.artifact_id`);
+                expect(missing).toHaveLength(1);
+                const denied = await send();
+                expect(denied.statusCode, denied.body).toBeGreaterThanOrEqual(400);
+                expect(denied.json().progressiveEvidenceReceipts).toBeUndefined();
+                throw undoNegative;
+              })).rejects.toBe(undoNegative);
+            } finally { input.setConnection(connection); }
+            expect((await send()).json().progressiveEvidenceReceipts).toEqual(response.progressiveEvidenceReceipts);
+          }
+
           const [retained] =
             await connection.execute(sql`SELECT attempt.valid_for_polar, result.current_result_attempt_id,
             (SELECT count(*)::integer FROM solver_evidence_archives archive WHERE archive.result_attempt_id = attempt.id) AS archives
