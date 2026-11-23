@@ -5741,6 +5741,10 @@ describe("progressive CPU admission", () => {
             VALUES (${promiseId}::uuid,${job.airfoilId}::uuid,${job.simulationPresetRevisionId}::uuid,${lease.alpha})`);
         const { envelope } = await bindProgressiveRemoteDispatch(db, { simJobId: job.id, solverId, promiseId });
         const { verifyStoppedFailedProgressiveDelivery, verifyPriorRawStoppedProgressiveSettlement } = await import("./progressive-stopped-failed-delivery-fixture");
+        if (!priorRaw) {
+          const { verifyHistoricalRawArchive } = await import("../../../apps/api/test/historical-raw-archive-fixture");
+          await verifyHistoricalRawArchive(db, envelope);
+        }
         await (priorRaw ? verifyPriorRawStoppedProgressiveSettlement : verifyStoppedFailedProgressiveDelivery)(db, envelope);
       } finally {
         await db.update(sweeperState).set({ enabled: admission.enabled }).where(eq(sweeperState.id, 1));
