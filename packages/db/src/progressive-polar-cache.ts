@@ -499,6 +499,12 @@ export async function claimProgressivePolarFit(
       JOIN neuralfoil_predictions prediction ON prediction.id = work.prediction_id
       ${input.requireCfdEvidence || input.currentCampaignEvidenceOnly ? sql`JOIN evidence_targets ON evidence_targets.target_id=prediction.target_id` : sql``}
       WHERE prediction.epoch_id = ${epoch.id}
+        ${input.requireCfdEvidence || input.currentCampaignEvidenceOnly ? sql`AND EXISTS (
+          -- Avoid building all evidence scopes for an empty queue. A leased
+          -- row passes this coarse check; the actual claim checks its expiry.
+          SELECT 1 FROM progressive_polar_fit_work queued
+          WHERE queued.state IN ('pending','leased') OR (queued.state='ready' AND queued.model_id IS NULL)
+        )` : sql``}
         AND (NOT ${input.requireSweeperEnabled ?? false} OR (
           EXISTS (SELECT 1 FROM sweeper_state WHERE id = 1 AND enabled)
           AND NOT EXISTS (SELECT 1 FROM sync_api_settings WHERE remote_solver_enabled)))
