@@ -5,6 +5,7 @@ import { createRequire } from "node:module";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createInterface } from "node:readline";
+import { setTimeout as delay } from "node:timers/promises";
 import { compileFunction } from "node:vm";
 
 const digest = (bytes) => createHash("sha256").update(bytes).digest("hex");
@@ -17,15 +18,83 @@ function mac(key, kind, nonce, body) {
     .digest("hex");
 }
 
-/** Scope the long-read dispatcher to this one-shot operator process. Each read
- * still receives the verifier's absolute AbortSignal deadline. */
-export async function withReadbackTransport(undici, verify) {
+const brokerDownload =
+  /^\/api\/sync\/v1\/evidence-uploads\/[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\/download$/i;
+
+async function admissionDelay(response) {
+  if (
+    response.status !== 503 ||
+    response.headers.get("content-type")?.split(";")[0] !== "application/json"
+  )
+    return 0;
+  const bytes = Number(response.headers.get("content-length"));
+  const seconds = Number(response.headers.get("retry-after"));
+  if (
+    !Number.isSafeInteger(bytes) ||
+    bytes <= 0 ||
+    bytes > 1024 ||
+    !Number.isSafeInteger(seconds) ||
+    seconds <= 0 ||
+    seconds * 1000 > 2 ** 31 - 1
+  )
+    return 0;
+  const busy = await response
+    .clone()
+    .json()
+    .catch(() => null);
+  return busy?.code === "sync_capacity_busy" &&
+    busy.retryAfterMs === seconds * 1000
+    ? busy.retryAfterMs
+    : 0;
+}
+
+/** The dispatcher and Fetch override live only in the one-shot operator peer. */
+export async function withReadbackTransport(undici, verify, onBusy = () => {}) {
   const previous = undici.getGlobalDispatcher();
+  const previousFetch = globalThis.fetch;
   const agent = new undici.Agent({ headersTimeout: 0, bodyTimeout: 0 });
   undici.setGlobalDispatcher(agent);
+  globalThis.fetch = async (input, init) => {
+    const url =
+      typeof input === "string" || input instanceof URL
+        ? URL.parse(input)
+        : null;
+    if (
+      !url ||
+      !brokerDownload.test(url.pathname) ||
+      url.search ||
+      (init?.method ?? "GET") !== "GET" ||
+      init?.redirect !== "error" ||
+      !init.signal ||
+      !new Headers(init.headers).has("x-xfoilfoam-solver-token")
+    ) {
+      return previousFetch(input, init);
+    }
+    let backoff = 1000;
+    for (;;) {
+      const response = await previousFetch(input, init);
+      const wait = await admissionDelay(response);
+      if (!wait) return response;
+      await response.body?.cancel();
+      onBusy();
+      try {
+        await delay(Math.max(wait, backoff), undefined, {
+          signal: init.signal,
+        });
+      } catch (error) {
+        if (init.signal.aborted)
+          throw new Error("fetch failed: archive admission deadline expired", {
+            cause: error,
+          });
+        throw error;
+      }
+      backoff = Math.min(backoff * 2, 30_000);
+    }
+  };
   try {
     return await verify();
   } finally {
+    globalThis.fetch = previousFetch;
     undici.setGlobalDispatcher(previous);
     await agent.destroy();
   }
@@ -216,19 +285,25 @@ async function run(next) {
         return response.result;
       },
     };
-    const result = await withReadbackTransport(engineRequire("undici"), () =>
-      exports.closedProgressiveJob(client.db, backend, scope.id, {
-        now: new Date(),
-        ageMs: retentionConfigFromEnv().stripMinAgeMs,
-        timeoutMs: DEFAULT_RETENTION_QUERY_TIMEOUT_MS,
-        inspect,
-        expectedPlan: scope.plan ?? undefined,
-        verifyCompleted: scope.mode === "verify",
-        expectedScientificSha256: scope.expectedScience ?? undefined,
-        keepMedia: scope.keepMedia === true,
-        expectedMediaSha256: scope.expectedMedia ?? undefined,
-        signal: AbortSignal.timeout(20 * 60_000),
-      }),
+    let admissionRetries = 0;
+    const result = await withReadbackTransport(
+      engineRequire("undici"),
+      () =>
+        exports.closedProgressiveJob(client.db, backend, scope.id, {
+          now: new Date(),
+          ageMs: retentionConfigFromEnv().stripMinAgeMs,
+          timeoutMs: DEFAULT_RETENTION_QUERY_TIMEOUT_MS,
+          inspect,
+          expectedPlan: scope.plan ?? undefined,
+          verifyCompleted: scope.mode === "verify",
+          expectedScientificSha256: scope.expectedScience ?? undefined,
+          keepMedia: scope.keepMedia === true,
+          expectedMediaSha256: scope.expectedMedia ?? undefined,
+          signal: AbortSignal.timeout(20 * 60_000),
+        }),
+      () => {
+        admissionRetries++;
+      },
     );
     if (!inspect && !result.settled)
       throw Error("Final locked ownership or eligibility check refused");
@@ -238,6 +313,7 @@ async function run(next) {
       databaseReadOnly: inspect,
       dependenciesSha256,
       nodePackagesSha256,
+      admissionRetries,
       ...result,
     };
   } finally {

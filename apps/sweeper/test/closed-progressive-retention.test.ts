@@ -533,10 +533,34 @@ it("lets a delayed archive response finish inside the proof deadline and restore
     storedSha256: createHash("sha256").update(body).digest("hex"),
     storedByteSize: body.length,
   } as ProgressiveEvidenceCustodyReceipt["remote"];
+  const download = `/api/sync/v1/evidence-uploads/${randomUUID()}/download`;
+  const busyBody = JSON.stringify({
+    code: "sync_capacity_busy",
+    retryAfterMs: 1000,
+  });
+  const admission = { reject: true, remaining: 1, hits: 0, corrupt: false };
+  const globalFetch = globalThis.fetch;
   const server = createServer((req, res) => {
     if (req.headers["x-xfoilfoam-solver-token"] !== "fixture-token") {
       res.writeHead(403).end();
       return;
+    }
+    if (req.url === download) {
+      admission.hits++;
+      if (admission.remaining > 0) {
+        admission.remaining--;
+        const message = admission.reject
+          ? busyBody
+          : JSON.stringify({ error: "different archive owner" });
+        res
+          .writeHead(503, {
+            "content-type": "application/json",
+            "content-length": Buffer.byteLength(message),
+            "retry-after": "1",
+          })
+          .end(message);
+        return;
+      }
     }
     const send = setTimeout(
       () => {
@@ -546,7 +570,11 @@ it("lets a delayed archive response finish inside the proof deadline and restore
           "x-content-sha256": remote.storedSha256,
           "x-gcs-generation": remote.generation,
         });
-        res.end(req.url === "/corrupt" ? Buffer.alloc(body.length) : body);
+        res.end(
+          req.url === "/corrupt" || (req.url === download && admission.corrupt)
+            ? Buffer.alloc(body.length)
+            : body,
+        );
       },
       req.url === "/slow" ? 1800 : 0,
     );
@@ -569,6 +597,30 @@ it("lets a delayed archive response finish inside the proof deadline and restore
     await expect(read("/slow", 6000)).rejects.toMatchObject({
       cause: { code: "UND_ERR_HEADERS_TIMEOUT" },
     });
+    const busy = vi.fn();
+    const started = Date.now();
+    await withReadbackTransport(undici, () => read(download, 5000), busy);
+    expect(Date.now() - started).toBeGreaterThanOrEqual(990);
+    expect(admission.hits).toBe(2);
+    expect(busy).toHaveBeenCalledTimes(1);
+    expect(globalThis.fetch).toBe(globalFetch);
+    admission.remaining = 1;
+    await expect(
+      withReadbackTransport(undici, () => read(download, 75)),
+    ).rejects.toThrow("admission deadline");
+    expect(admission.hits).toBe(3);
+    admission.reject = false;
+    admission.remaining = 1;
+    await expect(
+      withReadbackTransport(undici, () => read(download, 5000)),
+    ).rejects.toThrow("immutable headers");
+    expect(admission.hits).toBe(4);
+    admission.corrupt = true;
+    await expect(
+      withReadbackTransport(undici, () => read(download, 5000)),
+    ).rejects.toThrow("complete byte proof");
+    expect(admission.hits).toBe(5);
+    expect(globalThis.fetch).toBe(globalFetch);
     await withReadbackTransport(undici, () => read("/slow", 6000));
     expect(undici.getGlobalDispatcher()).toBe(short);
     await expect(
