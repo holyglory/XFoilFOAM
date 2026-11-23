@@ -198,7 +198,7 @@ export async function createSettlementFixture(workerCustody = false, projectionS
             "0224_hz_settled_attempt_receipts.sql",
           ]
         : []),
-      ...(projectionSealing ? ["0225_attempt_projection_sealing.sql"] : []),
+      ...(projectionSealing ? ["0225_attempt_projection_sealing.sql", "0227_exact_attempt_storage_transition.sql"] : []),
     ]) {
       const body = await readFile(
         new URL(`../../../packages/db/migrations/${file}`, import.meta.url),

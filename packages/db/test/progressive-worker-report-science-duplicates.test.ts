@@ -329,6 +329,15 @@ const apply = (f: Fixture, page: Awaited<ReturnType<typeof pageFor>>) =>
     apply: true,
     readersReady: true,
   });
+function boundPageLiteral(proof: Parameters<typeof legacyReportCustodySql>[0]) {
+  const prefix = "SELECT public.register_legacy_report_archive_custody(";
+  const statement = legacyReportCustodySql(proof)
+    .split("\n")
+    .find((line) => line.startsWith(prefix));
+  if (!statement?.endsWith(")::text;"))
+    throw new Error("Expected the verified PostgreSQL custody page");
+  return sql.raw(statement.slice(prefix.length, -")::text;".length));
+}
 const range = (a: number, b: number) =>
   Array.from({ length: b - a + 1 }, (_, i) => a + i);
 
@@ -634,6 +643,60 @@ it("routes new AoA progress, changed coefficients and new failed evidence throug
   );
 });
 
+it("checks every staged envelope against its own warm status before reusing shared result text", async () => {
+  await fixture(async (f) => {
+    const second = 3510;
+    await f.append(second, {
+      mutate(report) {
+        Object.assign(report.status, {
+          diagnostics: { result: null, 'quoted "key"': ["á", "result", 0.125] },
+        });
+      },
+    });
+    await f.append(second + 1, { headerState: "cancelled" });
+    expect(await stageProgressiveWorkerEvidence(f.db, noEngine, f.executionId, {
+      reportSequence: second,
+    })).toMatchObject({ kind: "staged", sequence: second });
+    const before = await protectedState(f);
+    const sources = await pageFor(f, [f.sourceSequence, second]);
+    const [decoded] = await f.db.execute(sql`SELECT ${boundPageLiteral(sources.proof)} AS page`);
+    const claimed = decoded.page as {
+      scientificResults: { resultText: string; reports: { sequence: number; envelopeText: string }[] }[];
+      members: { sequence: number; reportSha256: string; reportByteSize: number }[];
+    };
+    expect(claimed.scientificResults).toHaveLength(1);
+    const [group] = claimed.scientificResults;
+    expect(group.reports.map((r) => r.sequence)).toEqual([f.sourceSequence, second]);
+
+    // The altered status and its claimed full-body digest agree. Only a comparison
+    // with the second warm source distinguishes the forged envelope from its original.
+    const altered = group.reports[1];
+    const [text] = await f.db.execute(sql`
+      SELECT env::text AS envelope, jsonb_set(env,'{result}',${group.resultText}::jsonb,false)::text AS body
+      FROM (SELECT jsonb_set(${altered.envelopeText}::jsonb,'{status,diagnostics,result}','1.00'::jsonb,false) env) changed`);
+    altered.envelopeText = String(text.envelope);
+    const member = claimed.members.find((row) => row.sequence === second)!;
+    const alteredHash = hash(String(text.body));
+    expect(alteredHash).not.toBe(member.reportSha256);
+    member.reportSha256 = alteredHash;
+    member.reportByteSize = Buffer.byteLength(String(text.body));
+    await expect(f.db.transaction((tx) => tx.execute(sql`
+      SELECT * FROM verified_worker_report_science_sources(${f.executionId}::uuid,${JSON.stringify(claimed)}::jsonb)`)))
+      .rejects.toThrow("Warm scientific source differs from staged body");
+
+    expect(await apply(f, sources)).toMatchObject({
+      receipt: { compactedReports: 2, registeredMembers: 2, skipped: [] },
+    });
+    const witness = await f.db.execute(sql`SELECT sequence::integer AS sequence, report_sha256 AS digest
+      FROM progressive_worker_report_science_proofs WHERE sim_job_id=${f.executionId}::uuid ORDER BY sequence`);
+    expect(witness).toEqual(sources.page.members.map((row) => ({ sequence: row.sequence, digest: row.reportSha256 })));
+    const cold = await pageFor(f, [f.sourceSequence, second]);
+    expect(cold.page.members.map((row) => row.reportText)).toEqual(sources.page.members.map((row) => row.reportText));
+    expect(await apply(f, cold)).toMatchObject({receipt: { compactedReports: 0, replayedMembers: 2 }});
+    expect(await protectedState(f)).toEqual(before);
+  });
+});
+
 it("checks each signed envelope and preserves a one-sample history change on repeated normalized results", async () => {
   await fixture(async (f) => {
     const sequences = [3510, 3511, 3512, 3513];
@@ -664,20 +727,7 @@ it("checks each signed envelope and preserves a one-sample history change on rep
       }[];
     };
     async function scientificSql(proof: typeof whole.proof): Promise<Group[]> {
-      const query = legacyReportCustodySql(proof)
-        .split("\n")
-        .find((line) =>
-          line.startsWith(
-            "SELECT public.register_legacy_report_archive_custody(",
-          ),
-        )!;
-      const literal = query.slice(
-        "SELECT public.register_legacy_report_archive_custody(".length,
-        -")::text;".length,
-      );
-      const [decoded] = await f.db.execute(
-        sql.raw(`SELECT ${literal} AS page`),
-      );
+      const [decoded] = await f.db.execute(sql`SELECT ${boundPageLiteral(proof)} AS page`);
       return (decoded.page as { scientificResults: Group[] }).scientificResults;
     }
     const joined = await scientificSql(whole.proof);

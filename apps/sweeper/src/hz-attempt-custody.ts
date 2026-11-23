@@ -1,3 +1,4 @@
+import { limitSettledReportCandidates } from "./hz-settled-report-bounds";
 import { HistoryOperationError } from "@aerodb/core/point-history-protocol";
 import {
   checkHzTransferFence,
@@ -105,7 +106,7 @@ export async function attemptPage(
 ) {
   if (!Number.isInteger(limit) || limit < 1 || limit > 64)
     throw Error("Invalid page size");
-  return db.execute(sql`WITH keys AS MATERIALIZED (
+  const rows = await db.execute(sql`WITH keys AS MATERIALIZED (
   SELECT DISTINCT a.id FROM progressive_worker_hub_receipts h JOIN result_attempts a ON a.id=h.result_attempt_id WHERE h.result_attempt_id>${exactId(after)}::uuid AND h.result_attempt_id<=${exactId(high)}::uuid
    AND ${retained ? sql`a.status IN ('done','failed') AND h.receipt->>'kind'='retained-progressive-attempt'` : sql`a.status='done' AND a.regime='rans'`} AND h.receipt->'storageOnly' IN ('true'::jsonb,${retained ? sql`'false'::jsonb` : sql`'true'::jsonb`})
   ORDER BY a.id LIMIT ${limit})
@@ -113,6 +114,7 @@ export async function attemptPage(
  CASE WHEN a.evidence_archive_id IS NULL THEN ${workerAttemptLimiter(sql`k.id`, retained, settled)} END AS limiter,
  pg_column_size(a.evidence_payload) AS stored,CASE WHEN a.evidence_archive_id IS NULL AND pg_column_size(a.evidence_payload)<=${settled ? 8388608 : 262144} THEN octet_length(a.evidence_payload::text)-octet_length(attempt_evidence_compact(a.evidence_payload)::text) END AS logical
  FROM keys k JOIN result_attempts a ON a.id=k.id LEFT JOIN attempt_evidence_storage_events e ON e.id=a.evidence_storage_event_id ORDER BY k.id`);
+  return settled ? limitSettledReportCandidates(db, rows) : rows;
 }
 export function workerAttemptLimiter(id: ReturnType<typeof sql>, retained: boolean, settled: boolean) {
   if (settled) return sql`attempt_evidence_hz_supported_limiter(${id})`;

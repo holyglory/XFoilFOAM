@@ -45,7 +45,7 @@ export async function selectCancelledReportCopyPage(
   db: DB, after: ReportCopyCursor | null, priority?: CancelledReportCopyPriority,
 ) {
   const preferred = priority?.take();
-  if (!preferred) return { ...await nextCancelledReportCopies(db, after), preferred };
+  if (!preferred) return { ...await nextCancelledReportCopies(db, after, true), preferred };
   return { executionId: preferred.executionId, sequences: preferred.keys.map(k => k.sequence), after, preferred };
 }
 
@@ -170,7 +170,21 @@ export const receiptedReportCopy = scientificallyReceiptedReportCopy;
 export async function nextCancelledReportCopies(
   db: DB,
   after: ReportCopyCursor | null,
+  requirePriorReceiptKeys = false,
 ) {
+  // The writer needs an earlier receipt for every inventoried point. This
+  // optional seek filter uses only those small indexed identities; the full
+  // source, raw, receipt, and current-owner checks still decide publication.
+  const candidates = requirePriorReceiptKeys
+    ? sql`SELECT k.* FROM warm_keys k JOIN owners o ON o.id=k.sim_job_id
+        JOIN progressive_remote_report_inventories i ON (i.sim_job_id,i.sequence,i.report_content_signature)
+          =(k.sim_job_id,k.sequence,k.content_signature)
+        WHERE i.source_count>0 AND NOT EXISTS(SELECT FROM progressive_remote_report_sources s
+          WHERE s.sim_job_id=k.sim_job_id AND s.sequence=k.sequence AND NOT EXISTS(
+            SELECT FROM progressive_remote_evidence_receipts e WHERE
+              (e.sim_job_id,e.point_content_signature)=(s.sim_job_id,s.point_content_signature) AND e.sequence<k.sequence))`
+    : sql`SELECT k.* FROM warm_keys k WHERE EXISTS(SELECT FROM progressive_remote_report_sources s
+        WHERE s.sim_job_id=k.sim_job_id AND s.sequence=k.sequence)`;
   const rows = await db.execute<{
     sim_job_id: string;
     sequence: string;
@@ -179,16 +193,15 @@ export async function nextCancelledReportCopies(
     WITH warm_keys AS MATERIALIZED (SELECT sim_job_id,sequence,content_signature FROM progressive_remote_reports
       WHERE archived_at IS NULL ${after ? sql`AND (sim_job_id,sequence)>(${after.executionId}::uuid,${after.sequence}::bigint)` : sql``}
       ORDER BY sim_job_id,sequence LIMIT 512),
-    sources AS MATERIALIZED (SELECT k.* FROM warm_keys k WHERE EXISTS(
-      SELECT FROM progressive_remote_report_sources s WHERE s.sim_job_id=k.sim_job_id AND s.sequence=k.sequence)
-      ORDER BY k.sim_job_id,k.sequence LIMIT 32),
+    owners AS MATERIALIZED (SELECT job.id FROM (SELECT DISTINCT sim_job_id FROM warm_keys) p
+      JOIN sim_jobs job ON job.id=p.sim_job_id JOIN progressive_remote_dispatches d ON d.sim_job_id=job.id
+      JOIN sync_sweep_promises promise ON promise.id=d.promise_id WHERE ${cancelledReportOwner}
+      AND EXISTS(SELECT FROM progressive_remote_evidence_receipts e WHERE e.sim_job_id=job.id)),
+    sources AS MATERIALIZED (${candidates} ORDER BY k.sim_job_id,k.sequence LIMIT 32),
     page AS MATERIALIZED (SELECT s.*,true AS inspect FROM sources s UNION ALL
       SELECT last.*,false FROM (SELECT * FROM warm_keys ORDER BY sim_job_id DESC,sequence DESC LIMIT 1) last
       WHERE (SELECT count(*) FROM sources)<32 AND NOT EXISTS(
-        SELECT FROM sources s WHERE (s.sim_job_id,s.sequence)=(last.sim_job_id,last.sequence))),
-    owners AS MATERIALIZED (SELECT job.id FROM (SELECT DISTINCT sim_job_id FROM page) p
-      JOIN sim_jobs job ON job.id=p.sim_job_id JOIN progressive_remote_dispatches d ON d.sim_job_id=job.id
-      JOIN sync_sweep_promises promise ON promise.id=d.promise_id WHERE ${cancelledReportOwner})
+        SELECT FROM sources s WHERE (s.sim_job_id,s.sequence)=(last.sim_job_id,last.sequence)))
     SELECT r.sim_job_id,r.sequence,CASE WHEN r.inspect AND o.id IS NOT NULL THEN ${receiptedReportCopy} ELSE false END AS ready
     FROM page r LEFT JOIN owners o ON o.id=r.sim_job_id ORDER BY r.sim_job_id,r.sequence`);
   const executionId = rows.find((row) => row.ready)?.sim_job_id;

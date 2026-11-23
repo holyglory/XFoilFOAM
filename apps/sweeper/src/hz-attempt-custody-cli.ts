@@ -1,3 +1,4 @@
+import { limitSettledReportCandidates } from "./hz-settled-report-bounds";
 import {
   checkHzTransferFence,
   withActiveHzTransfer,
@@ -54,7 +55,9 @@ export async function attemptWorkerOperation(db: DB, r: Record<string, any>) {
         sql`SELECT a.id,${workerAttemptLimiter(sql`a.id`, r.retained === true, r.settled === true)} AS limiter,a.evidence_archive_id AS archive,pg_column_size(a.evidence_payload) AS stored,octet_length(a.evidence_payload::text)-octet_length(attempt_evidence_compact(a.evidence_payload)::text) AS logical FROM result_attempts a WHERE a.id=${exactId(r.attemptId)}::uuid`,
       );
       if (!row) throw Error("Missing attempt");
-      return row;
+      return r.settled === true
+        ? (await limitSettledReportCandidates(db, [row]))[0]
+        : row;
     }
     case "page":
       return attemptPage(db, r.after, r.high, r.limit, r.retained === true, r.settled === true);

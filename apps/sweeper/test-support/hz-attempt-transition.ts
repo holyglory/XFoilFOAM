@@ -39,7 +39,7 @@ import { readProgressiveReportArchiveText } from "@aerodb/db/progressive-report-
 import { hzAttemptStorage } from "../src/hz-attempt-storage-cli";
 import { join } from "node:path";
 import { writeFile } from "node:fs/promises";
-import { HistoryOperationError } from "@aerodb/core/point-history-protocol";
+import { HistoryOperationError, SETTLED_REPORT_SIZE_LIMIT } from "@aerodb/core/point-history-protocol";
 
 function objectStore(originalCopy = false) {
   const objects = new Map<string, { bytes: Buffer; metadata: any }>();
@@ -255,6 +255,43 @@ export async function verifyHzAttemptTransition(
       if (!periodic) await db.execute(sql`UPDATE results SET current_result_attempt_id=${id}::uuid WHERE id=(SELECT result_id FROM result_attempts WHERE id=${id}::uuid)`);
       expect((await relay.worker({ operation: "one", retained: true, attemptId: id })).limiter).not.toBeNull();
       const candidate = () => relay.worker({ operation: "one", settled: true, retained: true, attemptId: id });
+      if (periodic) {
+        const message = "x".repeat(32 * 1024 * 1024);
+        const large = { ...final, result: { ...final.result!, message } };
+        const largeSignature = analysisContentHash(large);
+        await db.execute(sql`UPDATE progressive_worker_reports SET report=${JSON.stringify(large)}::jsonb,
+          content_signature=${largeSignature} WHERE sim_job_id=${input.executionId}::uuid AND sequence=${final.sequence}`);
+        const checkLimit = async () => {
+          expect((await candidate()).limiter).toBe(SETTLED_REPORT_SIZE_LIMIT);
+          const page = await relay.worker({ operation: "page", settled: true, retained: true,
+            after: "00000000-0000-0000-0000-000000000000", high: "ffffffff-ffff-ffff-ffff-ffffffffffff", limit: 64 });
+          expect(page.find((r: { id: string }) => r.id === id)?.limiter).toBe(SETTLED_REPORT_SIZE_LIMIT);
+          await hzAttemptStorage(["migrate", ...config, "--id", id, "--include-settled-receipts"], io);
+          expect(reports.at(-1)).toEqual({ limited: SETTLED_REPORT_SIZE_LIMIT });
+          expect(await readStoredAttemptEvidenceText(db, id)).toBe(original);
+        };
+        await checkLimit();
+        await db.execute(sql`CREATE TABLE ${sql.identifier(fixture.namespace)}.progressive_report_result_payloads
+          AS SELECT * FROM public.progressive_report_result_payloads WITH NO DATA`);
+        await db.execute(sql`WITH src AS MATERIALIZED (SELECT report->'result' AS body FROM progressive_worker_reports
+          WHERE sim_job_id=${input.executionId}::uuid AND sequence=${final.sequence}), inserted AS (
+            INSERT INTO progressive_report_result_payloads(content_hash,result,byte_size)
+            SELECT encode(sha256(convert_to(body::text,'UTF8')),'hex'),body,octet_length(body::text) FROM src RETURNING content_hash)
+          UPDATE progressive_worker_reports r SET report=r.report-'result',result_payload_hash=inserted.content_hash
+          FROM inserted WHERE r.sim_job_id=${input.executionId}::uuid AND r.sequence=${final.sequence}`);
+        await checkLimit();
+        await hzAttemptStorage(["migrate", ...config, "--include-settled-receipts", "--until-complete",
+          "--directory", join(root, "oversize-cursor")], io);
+        const checkpoint = reports.at(-1)?.checkpoint;
+        expect(reports.at(-1)).toMatchObject({ complete: true, checkpoint: { reportSizeHeld: 1, verified: 0 } });
+        expect(String(checkpoint?.after) >= id).toBe(true);
+        await db.execute(sql`UPDATE progressive_worker_reports SET acknowledged_at=NULL WHERE sim_job_id=${input.executionId}::uuid AND sequence=${final.sequence}`);
+        const unacknowledged = await candidate();
+        expect(unacknowledged.limiter).not.toBeNull();
+        expect(unacknowledged.limiter).not.toBe(SETTLED_REPORT_SIZE_LIMIT);
+        await db.execute(sql`UPDATE progressive_worker_reports SET acknowledged_at=clock_timestamp(),report=${JSON.stringify(final)}::jsonb,
+          result_payload_hash=NULL,content_signature=${analysisContentHash(final)} WHERE sim_job_id=${input.executionId}::uuid AND sequence=${final.sequence}`);
+      }
       await db.execute(sql`INSERT INTO result_media_repairs(id,result_id,result_attempt_id,state)
         SELECT gen_random_uuid(),result_id,id,'blocked' FROM result_attempts WHERE id=${id}::uuid`);
       expect((await candidate()).limiter).toBeNull();

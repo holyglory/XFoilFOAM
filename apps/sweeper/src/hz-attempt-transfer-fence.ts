@@ -1,6 +1,6 @@
 import { sql } from "drizzle-orm";
 import type { DB } from "@aerodb/db/client";
-import { HistoryOperationError } from "@aerodb/core/point-history-protocol";
+import { HistoryOperationError, SETTLED_REPORT_SIZE_LIMIT } from "@aerodb/core/point-history-protocol";
 
 export interface HzWorkerOwner {
   instance: string;
@@ -56,6 +56,8 @@ export async function withActiveHzTransfer<T>(
 /** Older controller releases retry the transport wire category. New controllers
  * distinguish an observed fence, rolled-back SQL contention, and a host flock. */
 export function hzAttemptRpcFailure(operation: string, error: unknown) {
+  if (error instanceof HistoryOperationError && error.operation === SETTLED_REPORT_SIZE_LIMIT && error.category === "input")
+    return { operation: SETTLED_REPORT_SIZE_LIMIT, category: "input", retryable: false };
   const e = error as { code?: string; cause?: { code?: string } } | null;
   const code = e?.cause?.code ?? e?.code;
   const busy =

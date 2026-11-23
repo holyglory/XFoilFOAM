@@ -182,6 +182,15 @@ it("runs the stock recurring hub storage worker and serves both archive formats 
       executionId: originals[1].executionId,
       sequence: 33,
     });
+    // None of these pending rows has a scientific receipt. The ordinary
+    // writer can rule them out ahead of its expensive raw-ownership check.
+    const ordinaryWindow = await nextCancelledReportCopies(db.db, {
+      executionId: originals[1].executionId, sequence: 0,
+    }, true);
+    expect(ordinaryWindow.sequences).toEqual([]);
+    expect(ordinaryWindow.after).not.toBeNull();
+    expect(ordinaryWindow.after!.executionId !== originals[1].executionId ||
+      ordinaryWindow.after!.sequence >= originals[1].reports.at(-1)!.sequence).toBe(true);
     const physicalRead = (f: ArchiveFixture) => {
       const first = f.reports.findIndex((r) => r.payloadHash !== null);
       return f.reports[first + 1];
