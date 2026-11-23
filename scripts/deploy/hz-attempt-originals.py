@@ -128,7 +128,13 @@ def summary(db):
             coalesce(sum(json_extract(identity,'$.sourceByteSize')),0) AS sourceBytes,
             coalesce(sum(json_extract(identity,'$.storedByteSize')),0) AS compressedBytes
             FROM original_versions GROUP BY state ORDER BY state""")]
-    return dict(versionOnly=versions,inventory=get(db,"scan"),rows=counts,excluded={r[0]:r[1] for r in db.execute("SELECT * FROM excluded")},
+    excluded = dict(db.execute("SELECT reason,attempts FROM excluded"))
+    # Older SQLite upserts used the table name "excluded" for the proposed
+    # row. In that statement it referred to the existing row and doubled it.
+    # A fresh inventory tallies each scanned page exactly.
+    exact = not excluded or get(db, "exclusionCounterVersion") == 2
+    return dict(versionOnly=versions,inventory=get(db,"scan"),rows=counts,
+                excluded=excluded if exact else dict.fromkeys(excluded),excludedCountsVerified=exact,
                 sourceAttemptPayloadWrites=False)
 
 def scope_page(path, offset, count, stamp):
@@ -156,6 +162,7 @@ def bind(db,args,b,sig):
     if prior is None:
         with db:
             save(db,"binding",key)
+            save(db,"exclusionCounterVersion",2)
             save(db,"scan",dict(after=ZERO,high=b["high"],offset=0,complete=False,scanned=0))
     if args.apply:
         dest=[args.bucket,hashlib.sha256(args.hub_account_file.read_bytes().strip()).hexdigest()]
@@ -203,7 +210,7 @@ def inventory_page(db,args,relay,b):
                 archive=coalesce(excluded.archive,originals.archive)""",
                 (r["id"],json_text(pin),r["history"],r["bytes"],r["stored"],int(r["match"] is not None),json_text(r["match"]),int(bool(r["settled"])),int(bool(r["archive"])),status,r["archive"]))
         for reason,n in excluded.items():
-            db.execute("INSERT INTO excluded VALUES(?,?) ON CONFLICT(reason) DO UPDATE SET attempts=attempts+excluded.attempts",(reason,n))
+            db.execute("INSERT INTO excluded VALUES(?,?) ON CONFLICT(reason) DO UPDATE SET attempts=attempts+?",(reason,n,n))
         scan.update(complete=len(rows)<args.limit or (refs is None and rows and rows[-1]["id"]==scan["high"]),
                     offset=offset,after=rows[-1]["id"] if rows else scan["after"],scanned=scan["scanned"]+len(rows))
         save(db,"scan",scan)
@@ -214,9 +221,14 @@ def backup_page(db,args,relay,b):
     if not get(db,"scan")["complete"]:raise ValueError("Finish inventory before priority copy")
     # A durable pinned generation always takes precedence over new uploads.
     recovering = db.execute("SELECT 1 FROM originals WHERE state='uploaded' LIMIT 1").fetchone() is not None
+    if args.capture_live_versions and not recovering and version_page(db,args,relay,b):
+        return True
     phase = "uploaded" if recovering else "pending"
-    rows=list(db.execute("""SELECT id,pin,source_bytes,remote_proof FROM originals WHERE state=?
-                          ORDER BY settled DESC,matched DESC,history DESC,id LIMIT ?""",(phase,args.limit)))
+    # The initial live inventory often rediscovers the entire frozen backup.
+    # Capture new sources before paying for another read of a catalogued object.
+    priority = "archive IS NOT NULL," if args.capture_live_versions and not recovering else ""
+    rows=list(db.execute(f"""SELECT id,pin,source_bytes,remote_proof FROM originals WHERE state=?
+                          ORDER BY {priority} settled DESC,matched DESC,history DESC,id LIMIT ?""",(phase,args.limit)))
     if not rows:return False
     pins=[];uploads=[];total=0
     for r in rows:
@@ -305,10 +317,14 @@ def parse(argv):
     ap.add_argument("--refresh-seconds",type=int,help="For cycle, revisit completed inventory or deferred frozen sources after this interval")
     ap.add_argument("--pages",type=int,default=1);ap.add_argument("--until-complete",action="store_true")
     ap.add_argument("--apply",action="store_true")
+    ap.add_argument("--capture-live-versions", action="store_true",
+                    help="Cover exact source versions from the completed live inventory in the same backup lane")
     ap.add_argument("--retry-deferred",action="store_true");ap.add_argument("--refresh",action="store_true")
     a=ap.parse_args(argv)
     if not 1<=a.limit<=64 or not 1<=a.page_bytes<=NATIVE_LIMIT or a.pages<1 or a.apply!=(a.mode in ('backup','cycle','versions')) or (a.apply and (not a.bucket or not a.hub_account_file)):
         ap.error("Check copy bounds and write options")
+    if a.capture_live_versions and (a.mode not in ("backup","cycle") or a.scope):
+        ap.error("Live version capture requires an unscoped backup or cycle")
     if a.mode=="versions" and (not a.scope or a.retry_deferred):
         ap.error("Version-only backup requires a frozen scope")
     if a.refresh and (a.scope or a.mode!='inventory') or a.retry_deferred and not a.apply:ap.error("Invalid refresh or retry scope")
@@ -348,6 +364,7 @@ def main(argv=None,relay_factory=Relay):
             if args.mode=="versions":
                 if db.execute("SELECT 1 FROM originals WHERE state IN ('pending','uploaded') LIMIT 1").fetchone():
                     raise ValueError("Finish the registered frozen pass first")
+            if args.mode=="versions" or args.capture_live_versions:
                 with db:
                     db.execute("""CREATE TABLE IF NOT EXISTS original_versions(
                         id TEXT NOT NULL,sha TEXT NOT NULL,state TEXT NOT NULL,identity TEXT,
@@ -364,6 +381,7 @@ def main(argv=None,relay_factory=Relay):
                 with db:
                     save(db,"scan",dict(after=ZERO,high=b["high"],offset=0,complete=False,scanned=0))
                     db.execute("DELETE FROM excluded")
+                    save(db,"exclusionCounterVersion",2)
             if args.retry_deferred or (due and args.scope):
                 with db:
                     db.execute("UPDATE originals SET state='pending' WHERE state='deferred'")

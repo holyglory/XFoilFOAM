@@ -97,6 +97,49 @@ with TemporaryDirectory() as tmp:
     # a frozen scan or recomputing the full aggregate in each time slice.
     summary=run("cycle",*scope,*apply,"--until-complete","--slice-seconds","1","--refresh-seconds","60")
     assert summary["inventoryComplete"] and not summary["copyPending"] and sent.count(ids[1])==1
+    # A live scan contains previously archived rows, new mutable originals,
+    # and exclusions split across pages. Its one writer honors durable
+    # uploaded generations before processing more candidates.
+    for row in entries[:3]:
+        row["archive"]=sql[row["id"]]
+    entries[3]["settled"]=False
+    del sql[ids[3]]
+    empty=[dict(entries[0],id=str(uuid.UUID(int=i)),history=0) for i in range(1,6)]
+    live_rows=sorted(empty+entries,key=lambda x:x["id"])
+    live_ops=[]
+    class LiveEndpoints(Endpoints):
+        def send(self,operation,**params):
+            if operation=="bound":return dict(high=live_rows[-1]["id"],instance=instance,solver=solver)
+            if operation=="inventory":
+                selection=params["selection"]
+                return [r for r in live_rows if selection["after"]<r["id"]<=selection["high"]][:selection["limit"]]
+            if operation in ("upload","version_put","version_read"):
+                live_ops.append((operation,params["pins"][0]["id"] if operation=="upload" else params["pin"]["id"]))
+            return super().send(operation,**params)
+    def live(*args):
+        output=io.StringIO()
+        with redirect_stdout(output):
+            operator.main([args[0],"--directory",str(root/"live"),*args[1:]],LiveEndpoints)
+        return json.loads(output.getvalue())
+    first=live("inventory","--limit","2","--until-complete")
+    assert first["excludedCountsVerified"] and first["excluded"]=={"no-inventoried-series":5}
+    capture=["--capture-live-versions","--limit","1",*apply]
+    first=live("backup",*capture,"--pages","1")
+    assert live_ops==[("upload",ids[3])] and any(r["state"]=="deferred" for r in first["rows"])
+    pending=live("backup",*capture,"--pages","1")
+    assert pending["versionOnly"][0]["state"]=="uploaded" and ids[3] not in sql
+    fences.append("version_read")
+    verified=live("backup",*capture,"--until-complete")
+    assert live_ops.count(("version_put",ids[3]))==1 and live_ops.count(("version_read",ids[3]))==2
+    assert verified["versionOnly"][0]["state"]=="verified-current" and ids[3] not in sql
+    assert sum(r["attempts"]for r in verified["rows"]if r["state"]=="verified")==3
+    with sqlite3.connect(root/"live"/"originals.sqlite3") as db:
+        db.execute("DELETE FROM meta WHERE key='exclusionCounterVersion'")
+        db.execute("UPDATE excluded SET attempts=?",(float("inf"),))
+    old=live("status")
+    assert not old["excludedCountsVerified"] and old["excluded"]=={"no-inventoried-series":None}
+    refreshed=live("inventory","--refresh","--limit","1","--until-complete")
+    assert refreshed["excludedCountsVerified"] and refreshed["excluded"]==first["excluded"]
     src.write_text(src.read_text()+"\n")
     try:run("inventory",*scope)
     except ValueError:pass
