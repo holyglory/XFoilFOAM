@@ -1187,17 +1187,24 @@ describe("point-history story endpoint", () => {
       expect(story.point.resultAttemptId).toBe(rejectedCurrentAttemptId);
       expect(story.point.viewResultAttemptId).toBe(rejectedCurrentAttemptId);
 
-      const adminSim = await app.inject({
+      // Both retained attempts are readable by their real identity even when the
+      // result has no current pointer. Each must return its own measurements.
+      for (const [attemptId, cl, cd] of [
+        [rejectedCurrentAttemptId, -0.05, 0.03],
+        [rejectedOlderAttemptId, -0.4, 0.05],
+      ] as const) {
+        const detail = await app.inject({
+          method: "GET",
+          url: `/api/admin/point-history/${resultId}/sim?resultAttemptId=${attemptId}`,
+        });
+        expect(detail.statusCode).toBe(200);
+        expect(detail.json()).toMatchObject({ resultId, resultAttemptId: attemptId, alpha: -1, cl, cd });
+      }
+      const foreign = await app.inject({
         method: "GET",
-        url: `/api/admin/point-history/${resultId}/sim?resultAttemptId=${rejectedCurrentAttemptId}`,
+        url: `/api/admin/point-history/${resultIdByAoa.get(2)}/sim?resultAttemptId=${rejectedOlderAttemptId}`,
       });
-      expect(adminSim.statusCode, JSON.stringify(adminSim.json())).toBe(200);
-      expect(adminSim.json()).toMatchObject({
-        resultId,
-        alpha: -1,
-        cl: -0.05,
-        cd: 0.03,
-      });
+      expect(foreign.statusCode).toBe(404);
       const payload = {
         resultAttemptId: story.point.resultAttemptId,
         fidelity: "precalc",

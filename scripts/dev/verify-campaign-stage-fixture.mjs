@@ -41,9 +41,9 @@ try {
     const sim = await get(exact + id);
     assert.deepEqual([sim.resultId, sim.alpha, sim.fidelity, sim.cl, sim.cd, sim.cm],
       [pair.resultId, pair.aoaDeg, fidelity, cl, cd, cm]);
-    if (Object.hasOwn(sim, "resultAttemptId")) assert.equal(sim.resultAttemptId, id);
+    assert.equal(sim.resultAttemptId, id);
     console.log(JSON.stringify({ stage, route: exact + id, status: 200, resultId: sim.resultId,
-      responseAttemptId: sim.resultAttemptId ?? null, fidelity: sim.fidelity, cl: sim.cl, cd: sim.cd, cm: sim.cm }));
+      responseAttemptId: sim.resultAttemptId, fidelity: sim.fidelity, cl: sim.cl, cd: sim.cd, cm: sim.cm }));
   }
   assert.equal((await api.get(exact + pair.campaignId)).status(), 404);
 } finally {
