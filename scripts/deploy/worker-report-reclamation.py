@@ -541,11 +541,17 @@ def worker_return_check(prior=None, live_values=False, session=vacuum_session, h
             facts["liveReportValueBytes"] = total
             facts["freeMinusLiveReportValuesBytes"] = free - total if facts["sharedDataAndWalVolume"] else None
     if prior is not None:
-        change = comparison(prior, facts)
-        if (not change["samePhysicalFile"] or not change["sameServerStart"] or
-                prior["postgresFilesystem"]["source"] != facts["postgresFilesystem"]["source"] or
-                ("toastFilenode" in prior and (pg_oid(prior["toastOid"]), pg_oid(prior["toastFilenode"])) != (pg_oid(facts["toastOid"]), pg_oid(facts["toastFilenode"])))):
-            raise ValueError("Worker, physical files, server start or data volume changed; capture a new baseline")
+        invalid = "Worker, physical files, server start or data volume changed; capture a new baseline"
+        try:
+            change = comparison(prior, facts)
+            same_toast = "toastFilenode" not in prior or all(
+                pg_oid(prior[k]) == pg_oid(facts[k]) for k in ("toastOid", "toastFilenode")
+            )
+        except (TypeError, ValueError, KeyError) as exc:
+            raise ValueError(invalid) from exc
+        if (not change["samePhysicalFile"] or not change["sameServerStart"] or not same_toast
+                or prior["postgresFilesystem"]["source"] != facts["postgresFilesystem"]["source"]):
+            raise ValueError(invalid)
         signals = []
         if change["relationFileDecreaseBytes"] > 0:
             signals.append("relation-allocation-fell")
