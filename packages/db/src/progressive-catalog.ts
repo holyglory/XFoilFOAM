@@ -60,10 +60,13 @@ const inAirScope = sql`EXISTS (
   WHERE scope.target_id = target.id AND revision.snapshot->'flowState'->>'mediumSlug' = 'air'
 )`;
 
+// Small filtered windows can look up their own targets through the airfoil index.
+const INDEXED_AIRFOIL_LIMIT = 128;
+
 function latestCatalogCurves(airfoilIds?: string[], groupId?: string) {
   // A selective page/condition can use the target and prediction indexes. The
   // whole-catalog ranking shares its generation membership and model joins.
-  if (!groupId && (!airfoilIds || airfoilIds.length > 1)) {
+  if (!groupId && (!airfoilIds || airfoilIds.length > INDEXED_AIRFOIL_LIMIT)) {
     return sql`
       WITH current_epoch AS MATERIALIZED (SELECT id FROM calculation_epochs WHERE current),
       scoped AS MATERIALIZED (
@@ -122,7 +125,17 @@ async function catalogConditions(
 ): Promise<CatalogCondition[]> {
   // The descriptor comes from the smallest eligible target ID in each group.
   // Walk the target index until a current, publishable curve is found.
-  const rows = (await db.execute(sql`
+  const query =
+    airfoilIds && airfoilIds.length <= INDEXED_AIRFOIL_LIMIT
+      ? sql`
+    WITH latest AS (${latestCatalogCurves(airfoilIds)}), groups AS (
+      SELECT condition_group_id, min(target_id) AS target_id
+      FROM latest WHERE metrics IS NOT NULL GROUP BY condition_group_id
+    )
+    SELECT groups.condition_group_id, target.physical - 'airfoilId' - 'geometry' AS condition
+    FROM groups JOIN polar_analysis_targets target ON target.id = groups.target_id
+  `
+      : sql`
     WITH groups AS MATERIALIZED (
       SELECT DISTINCT target.condition_group_id FROM polar_analysis_targets target
       WHERE ${airfoilFilter(airfoilIds)}
@@ -144,7 +157,11 @@ async function catalogConditions(
       ORDER BY target.id LIMIT 1
     ) representative ON true
     JOIN polar_analysis_targets physical_target ON physical_target.id = representative.id
-  `)) as unknown as Array<{ condition_group_id: string; condition: Condition }>;
+  `;
+  const rows = (await db.execute(query)) as unknown as Array<{
+    condition_group_id: string;
+    condition: Condition;
+  }>;
   return rows
     .map((row) => ({
       groupId: row.condition_group_id,
@@ -164,23 +181,13 @@ export async function publicProgressiveConditions(
   return (await catalogConditions(db)).map((row) => row.condition);
 }
 
-export async function publicProgressiveCatalog(
+async function rankedCatalogRows(
   db: DB,
   airfoilIds?: string[],
-  selectedConditionKey?: string,
+  groupId?: string,
 ) {
-  const metrics = new Map<string, ProgressiveCatalogMetric>();
-  if (airfoilIds?.length === 0)
-    return { conditions: [] as PolarMetricCondition[], metrics };
-  const groups = await catalogConditions(db, airfoilIds);
-  const conditions = groups.map((row) => row.condition);
-  const selected = groups.find(
-    (row) => row.condition.key === selectedConditionKey,
-  );
-  if (selectedConditionKey && !selected) return { conditions, metrics };
-  const byGroup = new Map(groups.map((row) => [row.groupId, row.condition]));
-  const rows = (await db.execute(sql`
-    WITH latest AS (${latestCatalogCurves(airfoilIds, selected?.groupId)}), ranked AS (
+  return (await db.execute(sql`
+    WITH latest AS (${latestCatalogCurves(airfoilIds, groupId)}), ranked AS (
       SELECT *, count(*) OVER (PARTITION BY airfoil_id)::int AS polar_count,
         row_number() OVER (PARTITION BY airfoil_id
           ORDER BY (metrics->>'ldmax')::float8 DESC NULLS LAST, target_id COLLATE "C") AS rank
@@ -197,6 +204,14 @@ export async function publicProgressiveCatalog(
     metrics: { ldmax: number | null; clmax: number; cdmin: number };
     polar_count: number;
   }>;
+}
+
+function catalogMetricMap(
+  rows: Awaited<ReturnType<typeof rankedCatalogRows>>,
+  groups: CatalogCondition[],
+) {
+  const byGroup = new Map(groups.map((row) => [row.groupId, row.condition]));
+  const metrics = new Map<string, ProgressiveCatalogMetric>();
   for (const row of rows) {
     const condition = byGroup.get(row.condition_group_id);
     if (!condition) continue;
@@ -209,5 +224,55 @@ export async function publicProgressiveCatalog(
       modelId: row.model_id,
     });
   }
-  return { conditions, metrics };
+  return metrics;
+}
+
+export async function publicProgressiveCatalog(
+  db: DB,
+  airfoilIds?: string[],
+  selectedConditionKey?: string,
+) {
+  const metrics = new Map<string, ProgressiveCatalogMetric>();
+  if (airfoilIds?.length === 0)
+    return { conditions: [] as PolarMetricCondition[], metrics };
+  const groups = await catalogConditions(db, airfoilIds);
+  const conditions = groups.map((row) => row.condition);
+  const selected = groups.find(
+    (row) => row.condition.key === selectedConditionKey,
+  );
+  if (selectedConditionKey && !selected) return { conditions, metrics };
+  const rows = await rankedCatalogRows(db, airfoilIds, selected?.groupId);
+  return { conditions, metrics: catalogMetricMap(rows, groups) };
+}
+
+/** The list endpoint needs descriptors for winning curves, without enumerating unrelated available conditions. */
+export async function publicProgressiveCatalogMetrics(
+  db: DB,
+  airfoilIds?: string[],
+  selectedConditionKey?: string,
+) {
+  if (selectedConditionKey)
+    return (
+      await publicProgressiveCatalog(db, airfoilIds, selectedConditionKey)
+    ).metrics;
+  if (airfoilIds?.length === 0)
+    return new Map<string, ProgressiveCatalogMetric>();
+  const rows = await rankedCatalogRows(db, airfoilIds);
+  // condition_group_id hashes the exact physical JSONB after removing airfoilId and geometry.
+  const representatives = new Map(
+    rows.map((row) => [row.condition_group_id, row.target_id]),
+  );
+  const descriptors = representatives.size
+    ? await db.execute(sql`
+    SELECT condition_group_id, physical - 'airfoilId' - 'geometry' AS condition
+    FROM polar_analysis_targets WHERE id = ANY(${sql.param([...representatives.values()])}::text[])
+  `)
+    : [];
+  return catalogMetricMap(
+    rows,
+    descriptors.map((r) => ({
+      groupId: String(r.condition_group_id),
+      condition: describeCondition(r.condition as Condition),
+    })),
+  );
 }
