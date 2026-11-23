@@ -528,6 +528,49 @@ it.each(["rans", "urans"])("keeps %s point-owned images and checks every route, 
   });
 }, 30000);
 
+it("binds an explicitly empty URANS image set to its normal per-job proof", async () => {
+  await client.db.transaction(async (tx) => {
+    const db = tx as unknown as DB;
+    for (const definition of tableDefinitions)
+      await db.execute(sql.raw("CREATE TEMP TABLE " + definition + " ON COMMIT DROP"));
+    await db.execute(sql`INSERT INTO sync_api_settings VALUES(1,${solver},${token},${root})`);
+    await db.execute(sql`INSERT INTO sync_sweep_promises VALUES(${promiseId},${root},${solver})`);
+    const id = randomUUID();
+    const [point] = await fixture(db, id, 1);
+    const opts = { inspect: true, keepMedia: true, now: clock, ageMs: 1, timeoutMs: 3000 };
+    let stray = true;
+    const native: ClosedProgressiveBackend = {
+      async reclaimClosedProgressiveFiles(job, manifests) {
+        expect(manifests).toHaveLength(1);
+        expect(manifests[0]).toMatchObject({ regime: "urans", keepMedia: [] });
+        return { job_id: job, state: "planned", plan: "e".repeat(64), files: 1, bytes: 32,
+          workingPaths: ["cases/foil/transient_a0/log.pimpleFoam"],
+          mediaFiles: stray ? [{path: "cases/foil/a0/images/pressure.png", byteSize: 1, sha256: sha("p")}] : [],
+        };
+      },
+    };
+    const spy = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      expect(new URL(String(input)).pathname).toBe(`/api/sync/v1/evidence-uploads/${point!.upload}/download`);
+      return new Response(point!.upload, {headers: {"content-type": "application/zstd",
+        "content-length": String(point!.upload.length), "x-content-sha256": point!.remote.storedSha256,
+        "x-gcs-generation": point!.remote.generation}});
+    });
+    try {
+      await expect(closedProgressiveJob(db, native, id, opts)).rejects.toThrow(/no registered instantaneous/);
+      await db.execute(sql`UPDATE result_attempts SET regime='urans' WHERE id=${point!.attempt}`);
+      await expect(closedProgressiveJob(db, native, id, opts)).rejects.toThrow(/inventory is incomplete/);
+      expect(spy).not.toHaveBeenCalled();
+      stray = false;
+      const proof = await closedProgressiveJob(db, native, id, opts);
+      expect(proof.mediaSha256).toMatch(/^[a-f0-9]{64}$/);
+      expect(proof.plan.mediaFiles).toEqual([]);
+      expect(proof.readbacks).toHaveLength(1);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+}, 30000);
+
 it("lets a delayed archive response finish inside the proof deadline and restores the previous HTTP dispatcher", async () => {
   const resolver = createRequire(
     new URL("../../../packages/engine-client/package.json", import.meta.url),

@@ -88,7 +88,8 @@ def _kept_images(root, proofs, declared):
                         _require(image.name == image.stem + ".png" and image.stem in images, "unknown scaled-media field")
                         expected.setdefault(image.relative_to(root).as_posix(), None)
                         _require(len(expected) <= 512, "media inventory exceeds the bounded job proof")
-    _require(0 < len(expected) <= 512, "media inventory exceeds the bounded job proof")
+    _require(len(expected) <= 512 and (expected or all(p.get("regime") == "urans" for p in proofs)),
+             "invalid bounded job image inventory")
     kept = {}
     total_bytes = 0
     for name, identity in sorted(expected.items()):
@@ -248,6 +249,8 @@ _RAW_DIRS = {"openfoam", "time_directories", "VTK"}
 
 def _checked_job_tree(root, protected, authenticated, urans_solvers, historical_dirs=()):
     """Apply the same source, media, continuation and case-ownership checks to both stock operations."""
+    check_media = protected is not None
+    protected = protected or {}
     owned_cases = {case for case, _, _ in authenticated.values()}
     owned_solvers = {solver for _, solver, _ in authenticated.values()}
     # The original (steady) case can retain its own decomposed state after
@@ -285,7 +288,7 @@ def _checked_job_tree(root, protected, authenticated, urans_solvers, historical_
         for name in dirs:
             path = folder / name
             if path.is_symlink():
-                actual = path.resolve(strict=True) if protected else path.resolve()
+                actual = path.resolve(strict=True) if check_media else path.resolve()
                 processor_root = relative.parent.parent
                 if (name == "uniform" and processor_root in uniform_roots and
                         re.fullmatch(r"processor[0-9]+", relative.parent.name) and _time(relative.name) >= 0 and
@@ -293,7 +296,7 @@ def _checked_job_tree(root, protected, authenticated, urans_solvers, historical_
                         actual == root / processor_root / relative.name / "uniform" and actual.is_dir()):
                     continue
                 _require(name == "polyMesh" and actual.is_relative_to(root / "meshes"), "unaccounted directory symlink")
-                if protected:
+                if check_media:
                     lexical = Path(os.path.abspath(path.parent / os.readlink(path)))
                     _require(relative.parts[:1] == ("cases",) and relative.name == "constant" and
                              actual.parts[-2:] == ("constant", "polyMesh") and lexical == actual and actual.is_dir(),
@@ -305,7 +308,7 @@ def _checked_job_tree(root, protected, authenticated, urans_solvers, historical_
                          all((relative / name).as_posix() in protected_dirs for name in dirs), "unknown media directory")
         for name in names:
             _require(not (folder / name).is_symlink(), "unaccounted file symlink")
-            if protected or historical_dirs:
+            if check_media or historical_dirs:
                 _require(stat.S_ISREG((folder / name).lstat().st_mode), "unaccounted special file")
         for name in (*dirs, *names):
             _require("quarantine" not in name and name not in {"engine_evidence.tar.gz", "openfoam_evidence.tar.gz"}
@@ -336,7 +339,7 @@ def _inventory(root, proofs, readbacks, kept=None):
     protected_dirs = {p.as_posix() for name in protected for p in PurePosixPath(name).parents}
     protected_identities = {(entry["byteSize"], entry["sha256"]) for entry, _ in protected.values()}
     candidates = {}
-    for folder, relative, dirs, names in _checked_job_tree(root, protected, authenticated, urans_solvers):
+    for folder, relative, dirs, names in _checked_job_tree(root, kept, authenticated, urans_solvers):
         if folder.name != "evidence" and "evidence_manifest.json" not in names:
             continue
         key = relative.as_posix()
@@ -442,7 +445,7 @@ def _historical_inventory(root, proofs, readbacks, kept, resuming, samples):
     found = set()
     protected = kept or {}
     urans_solvers = {authenticated[key][1] for key in urans}
-    for folder, relative, dirs, names in _checked_job_tree(root, protected, authenticated, urans_solvers, raw_members):
+    for folder, relative, dirs, names in _checked_job_tree(root, kept, authenticated, urans_solvers, raw_members):
         if folder.name == "evidence" or "evidence_manifest.json" in names:
             _require(relative in expected and "evidence_manifest.json" in names, "unowned or incomplete evidence directory")
             found.add(relative)
