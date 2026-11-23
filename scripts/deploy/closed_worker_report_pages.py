@@ -1,16 +1,17 @@
 """One atomic, bounded archive page on the original controller and inventory cursor."""
 import concurrent.futures
 import hashlib
-import re
 import json
+import re
 import time
+from pathlib import Path
 
 
 def qualified_width(args, binding, runtime, peer_hash):
     """Return optional packing limits. A missing/stale tuning receipt leaves ordinary custody available."""
     path = getattr(args, "width_qualification", None)
     expected = getattr(args, "width_qualification_sha256", None)
-    if not path or not expected or getattr(args, "page_members", 1) != 4:
+    if not isinstance(path, Path) or not expected or getattr(args, "page_members", 1) != 4:
         return None
     try:
         with path.open("rb") as file:
@@ -21,33 +22,50 @@ def qualified_width(args, binding, runtime, peer_hash):
         runtime_hash = hashlib.sha256(json.dumps(runtime, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
         if (policy["version"] != 1 or policy["binding"] != binding or policy["runtimeSha256"] != runtime_hash
                 or policy["peerSha256"] != peer_hash or policy["ordinaryMembers"] != 4 or policy["wideMembers"] != 8
-                or not re.fullmatch("[0-9a-f]{64}", policy["qualificationReceiptSha256"])):
+                or type(policy["maxKeysPerInvocation"]) is not int
+                or not 8 <= policy["maxKeysPerInvocation"] <= 128
+                or args.limit * max(1, getattr(args, "reuse_read_passes", 1)) > policy["maxKeysPerInvocation"]):
             return None
-        limits = {k: policy[k] for k in ("maxMemberBytes", "maxPageBytes", "maxPointSources")}
+        with Path(policy["qualificationReceipt"]).open("rb") as file:
+            evidence = file.read(2 * 1024**2 + 1)
+        if len(evidence) > 2 * 1024**2 or hashlib.sha256(evidence).hexdigest() != policy["qualificationReceiptSha256"]:
+            return None
+        receipt = json.loads(evidence)
+        if (receipt["qualifiedSmallEnvelope"] is not True or receipt["scopedSource"] != binding
+                or receipt["comparisonGroupBytes"] < policy["maxPageBytes"]
+                or not receipt["populationPerGeneration"] or set(receipt["populationPerGeneration"]) != {8}):
+            return None
+        limits = {k: policy[k] for k in ("maxMemberBytes", "maxPageBytes", "maxPointSources", "maxResultBytes", "maxEnvelopeBytes")}
         member, page, points = (limits[k] for k in ("maxMemberBytes", "maxPageBytes", "maxPointSources"))
-        if (any(type(n) is not int for n in (member, page, points)) or not 0 < member <= page <= 32 * 1024**2
-                or not 0 < points <= 512):
+        if (any(type(n) is not int for n in limits.values()) or not 0 < member <= page <= 32 * 1024**2
+                or not 0 < points <= 512 or not 0 < limits["maxResultBytes"] <= member
+                or not 0 < limits["maxEnvelopeBytes"] <= member):
             return None
         return limits
     except (OSError, ValueError, TypeError, KeyError):
         return None
 
 
-def fits_wide_page(rows, limits):
-    if len(rows) != 8:
+def fits_wide_page(rows, limits, *, prefix=False):
+    if len(rows) != (4 if prefix else 8):
         return False
-    first = rows[0]["resultMeta"]
-    if not isinstance(first.get("sha256"), str) or not re.fullmatch("[0-9a-f]{64}", first["sha256"]):
+    first = rows[0].get("resultMeta")
+    if not isinstance(first, dict) or not isinstance(first.get("sha256"), str) or not re.fullmatch("[0-9a-f]{64}", first["sha256"]):
+        return False
+    result_bytes = first.get("byteSize")
+    if type(result_bytes) is not int or not 0 < result_bytes <= limits["maxResultBytes"]:
         return False
     total = 0
     for row in rows:
         facts = row["source"]["facts"]
         size = facts["byteSize"]
-        if (row["resultMeta"] != first or not 0 < size <= limits["maxMemberBytes"]
+        if (row.get("resultMeta") != first or type(size) is not int or not 0 < size <= limits["maxMemberBytes"]
+                or not 0 <= size - result_bytes <= limits["maxEnvelopeBytes"]
                 or not 0 < len(facts["points"]) <= limits["maxPointSources"]):
             return False
         total += size
-    return total <= limits["maxPageBytes"]
+    # Every extra matching member must contain the entire same PostgreSQL result.
+    return total + (8 - len(rows)) * result_bytes <= limits["maxPageBytes"]
 
 
 def adjacent(stream, limit, validate, allow_gaps=False):
@@ -86,16 +104,21 @@ def process_page(args, stream, limit, progress, path, bind, runtime, peer_digest
         return 0
     scope = scope_for(entries[0][0])
     def rpc(role, op, items, **extra):
-        return ask(role, dict(key=entries[0][0],scope=scope,op=op,items=items,**extra))
+        return ask(role, dict(key=items[0]["key"],scope=scope,op=op,items=items,**extra))
     if pending:
         require([k for k,_ in entries] == [i["key"] for i in pending["items"]], "Pending page keys differ")
         items = pending["items"]
     else:
         items=[{"key":k} for k,_ in entries]
-        hint = {"widthLimits": trial} if trial else {}
-        originals = rpc("worker", "source", items, **hint)["rows"]
-        if trial and not fits_wide_page(originals, trial):
-            originals = originals[:4]
+        # Most large sources are ineligible for the measured eight-member budget.
+        # Authenticate the ordinary prefix first, then read the tail once if it can fit.
+        prefix = items[:4] if trial else items
+        originals = rpc("worker", "source", prefix)["rows"]
+        if trial and fits_wide_page(originals, trial, prefix=True):
+            tail = rpc("worker", "source", items[4:])["rows"]
+            combined = originals + tail
+            if fits_wide_page(combined, trial):
+                originals = combined
         if len(originals)<2:
             return 0
         items=[dict(key=i["key"],source=v["source"]) for i,v in zip(items,originals)]
