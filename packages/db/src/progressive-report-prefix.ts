@@ -16,6 +16,8 @@ export interface WorkerPrefixOptions {
   apply?: boolean;
   after?: WorkerPrefixCursor | null;
   executionId?: string;
+  /** Inclusive high water of an explicitly scoped historical pass. */
+  throughSequence?: number;
   excludeJobs?: readonly string[];
   /** Completed metadata ranges within the current automatic worker lifetime. */
   inspectedThrough?: ReadonlyMap<string, number>;
@@ -87,6 +89,10 @@ export async function backfillWorkerReportPrefix(
     max < 1 ||
     max > 512 * 1024 ** 2 ||
     (input.executionId !== undefined && !uuid.test(input.executionId)) ||
+    (input.throughSequence !== undefined &&
+      (!input.executionId ||
+        !Number.isSafeInteger(input.throughSequence) ||
+        input.throughSequence < 1)) ||
     input.excludeJobs?.some((id) => !uuid.test(id)) ||
     (cursor &&
       (!uuid.test(cursor.executionId) ||
@@ -105,7 +111,12 @@ export async function backfillWorkerReportPrefix(
         ${input.apply ? sql`FOR SHARE` : sql``}`);
       if (policy?.normalization_enabled !== true)
         return receipt("disabled", cursor ?? null);
-      if (input.executionId && cursor?.sequence === null)
+      if (
+        input.executionId &&
+        (cursor?.sequence === null ||
+          (input.throughSequence !== undefined &&
+            (cursor?.sequence ?? 0) >= input.throughSequence))
+      )
         return receipt("complete", null);
       let job =
         input.executionId ??
@@ -143,6 +154,13 @@ export async function backfillWorkerReportPrefix(
         ${input.apply ? sql`FOR SHARE OF j,p NOWAIT` : sql``}`);
       if (!owner) return receipt("ineligible", nextJob);
 
+      const range =
+        input.throughSequence === undefined
+          ? sql``
+          : sql`
+        AND r.sequence <= ${input.throughSequence} AND r.archive_bundle_id IS NULL
+        AND NOT EXISTS (SELECT 1 FROM public.progressive_report_archive_members m
+          WHERE m.source_kind='worker' AND m.sim_job_id=r.sim_job_id AND m.member_kind='report' AND m.sequence=r.sequence)`;
       const page = await tx.execute<{
         n: number;
         bytes: number;
@@ -150,7 +168,7 @@ export async function backfillWorkerReportPrefix(
         referenced: boolean;
       }>(sql`SELECT sequence::float8 AS n,result_payload_hash IS NOT NULL AS referenced,
         CASE WHEN result_payload_hash IS NULL THEN pg_column_size(report) ELSE 0 END AS bytes,content_signature AS signature
-        FROM public.progressive_worker_reports WHERE sim_job_id=${job}::uuid AND sequence>${sequence} AND archived_at IS NULL
+        FROM public.progressive_worker_reports r WHERE sim_job_id=${job}::uuid AND sequence>${sequence} AND archived_at IS NULL ${range}
         ORDER BY sequence LIMIT ${scanRows + 1}`);
       const eligible = (r: { bytes: number }) =>
         r.bytes >= min && r.bytes <= max;
@@ -191,7 +209,7 @@ export async function backfillWorkerReportPrefix(
       );
       const source = sql`WITH RECURSIVE src AS MATERIALIZED (
         SELECT sequence,content_signature,pg_column_size(report) AS stored_bytes,report AS original
-        FROM public.progressive_worker_reports WHERE sim_job_id=${job}::uuid AND sequence IN (${keys})
+        FROM public.progressive_worker_reports r WHERE sim_job_id=${job}::uuid AND sequence IN (${keys}) ${range}
           AND archived_at IS NULL AND result_payload_hash IS NULL ORDER BY sequence
           ${input.apply ? sql`FOR UPDATE SKIP LOCKED` : sql``}
       ), ordered AS MATERIALIZED (

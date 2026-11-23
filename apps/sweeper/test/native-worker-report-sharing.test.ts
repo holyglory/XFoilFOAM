@@ -374,6 +374,75 @@ it("runs bounded discovery in the existing HZ worker and respects the excluded p
     }
   });
 });
+it("alternates bounded priority ranges with ordinary discovery in one HZ worker", async () => {
+  await run(async (f) => {
+    const medium = randomBytes(56 * 1024).toString("base64");
+    const large = randomBytes(310 * 1024).toString("base64");
+    for (const n of [10, 11, 12, 40, 41, 42]) await append(f, n, medium);
+    for (const n of [20, 21]) await append(f, n, large);
+    const before = await originals(f);
+    await enabled(f.db, true);
+    vi.stubEnv("AIRFOILFOAM_NATIVE_REPORT_SHARING", "true");
+    vi.stubEnv("AIRFOILFOAM_DEPLOYMENT_ROLE", "remote-solver");
+    vi.stubEnv(
+      "AIRFOILFOAM_NATIVE_REPORT_PRIORITY_RANGES",
+      `${f.executionId}:10-11,${f.executionId}:40-41`,
+    );
+    const captures: Array<{
+      firstSequence: number;
+      normalized: number;
+      binaryVerified: number;
+      priorityThrough?: number;
+    }> = [];
+    const stop = new AbortController();
+    const logger = vi.spyOn(console, "info").mockImplementation((value) => {
+      const event = JSON.parse(String(value));
+      if (
+        event.component !== "native-worker-report-sharing" ||
+        event.state !== "shared"
+      )
+        return;
+      captures.push(event);
+      if (captures.length === 3) stop.abort();
+    });
+    try {
+      await runNativeWorkerReportSharing(
+        f.db,
+        AbortSignal.any([stop.signal, AbortSignal.timeout(5000)]),
+        { executionId: f.executionId, sequence: 9 },
+      );
+      expect(
+        captures.map((r) => [
+          r.firstSequence,
+          r.priorityThrough,
+          r.normalized,
+          r.binaryVerified,
+        ]),
+      ).toEqual([
+        [10, 11, 2, 2],
+        [20, undefined, 2, 2],
+        [40, 41, 2, 2],
+      ]);
+      expect(await originals(f)).toEqual(before);
+      const shared = await f.db
+        .execute(sql`SELECT sequence::int AS n FROM progressive_worker_reports
+        WHERE sim_job_id=${f.executionId}::uuid AND result_payload_hash IS NOT NULL ORDER BY sequence`);
+      expect(shared.map((r) => r.n)).toEqual([10, 11, 20, 21, 40, 41]);
+      expect(
+        await backfillWorkerReportPrefix(f.db, {
+          apply: true,
+          executionId: f.executionId,
+          throughSequence: 42,
+          after: { executionId: f.executionId, sequence: 41 },
+          excludeJobs: [f.executionId],
+        }),
+      ).toMatchObject({ state: "excluded", normalized: 0 });
+    } finally {
+      logger.mockRestore();
+      vi.unstubAllEnvs();
+    }
+  });
+});
 it("runs the portable worker entry point, pins a locked middle row, and verifies a retry through the ordinary reader", async () => {
   const job = randomUUID(),
     promise = randomUUID(),
