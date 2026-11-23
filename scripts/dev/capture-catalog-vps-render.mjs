@@ -48,6 +48,18 @@ export async function captureCatalogRender(url, expectedBuild, directory) {
     const renderedEvidence = [];
     async function capture(state, actionStart) {
       assert.equal(page.url(), url);
+      const rankingReadyMs = performance.now() - actionStart;
+      const testId = await rows.first().getAttribute("data-testid");
+      assert(testId?.startsWith("airfoil-row-"));
+      const profilePath = "/airfoils/" + testId.slice("airfoil-row-".length);
+      const preview = page.locator(".browse-preview");
+      const openProfile = preview.getByRole("link", { name: "Open profile", exact: true });
+      await expect.poll(async () => {
+        const href = await openProfile.count() === 1 ? await openProfile.getAttribute("href") : null;
+        return href ? new URL(href, url).pathname : null;
+      }, { timeout: 45_000 }).toBe(profilePath);
+      await expect(preview.locator("svg").first()).toBeVisible();
+      const previewReadyMs = performance.now() - actionStart;
       const visibleCount = await page.getByTestId("catalog-visible-count").innerText();
       const renderedRows = await rows.count();
       assert(visibleCount.startsWith("showing " + renderedRows + " of "), "count disagrees with rendered rows");
@@ -63,7 +75,8 @@ export async function captureCatalogRender(url, expectedBuild, directory) {
       await writeFile(join(directory, file), png, { mode: 0o600 });
       renderedEvidence.push({ file, sha256: sha(png), url: page.url(), path: new URL(page.url()).pathname, uiBuild: headers["x-ui-source-revision"],
         capturedAt: new Date().toISOString(), httpStatus, contentType, state, catalogCount, visibleCount,
-        renderedRows, rowsInViewport, viewport: page.viewportSize(), actionMs: performance.now() - actionStart });
+        renderedRows, rowsInViewport, viewport: page.viewportSize(), rankingReadyMs, previewReadyMs,
+        renderedProfile: profilePath, actionMs: performance.now() - actionStart });
     }
     await capture("catalog", started);
     const filterStart = performance.now();
