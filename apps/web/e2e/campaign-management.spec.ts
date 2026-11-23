@@ -1208,7 +1208,7 @@ test.describe
     await expect(preliminary).toContainText("CRITICAL · FAST URANS EXHAUSTED");
     await expect(
       preliminary.getByTestId("cell-preliminary-rans-0"),
-    ).toHaveClass(/screened/);
+    ).toHaveClass(/handoff/);
     await expect(pointTrack).toHaveAccessibleName(/RANS screened/i);
     await expect(preliminary).not.toContainText("RANS failure");
     await expect(pointTrack.locator('[aria-current="step"]')).toHaveCount(1);
@@ -1405,7 +1405,7 @@ test.describe
 
     await expect(
       preliminary.getByTestId("cell-preliminary-rans-0"),
-    ).toHaveClass(/screened/);
+    ).toHaveClass(/handoff/);
     await expect(pointTrack).toHaveAccessibleName(/RANS screened/i);
     await expect(pointTrack.locator(".connector").first()).toHaveClass(
       /handoff/,
