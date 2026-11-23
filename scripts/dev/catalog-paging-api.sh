@@ -23,6 +23,13 @@ PY
 ADMIN_PASSWORD="$(cat -- "$fixture_dir/password")"
 ADMIN_SESSION_SECRET="$(cat -- "$fixture_dir/session")"
 export ADMIN_PASSWORD ADMIN_SESSION_SECRET
+if [[ "${1:-}" == --campaign-stage-fixture ]]; then
+  [[ "${DATABASE_URL%%\?*}" == */aerodb_campaign_stage ]]
+  corepack pnpm --filter @aerodb/db migrate
+  corepack pnpm --filter @aerodb/db seed
+  corepack pnpm --filter @aerodb/api exec tsx test/seed-campaign-stage-preview.ts
+  exec corepack pnpm --filter @aerodb/api start
+fi
 corepack pnpm --filter @aerodb/db migrate
 # The ordinary preview enrolls every new profile in its campaign. On subsequent
 # starts the full catalog is present, but this fixture only needs the two
