@@ -798,8 +798,13 @@ def main():
             require(len(plan["entries"]) <= args.max_entries and plan["expectedReturn"] <= args.max_bytes
                     and plan["margin"] == args.margin_bytes, "Resumed page exceeds the supplied bounds")
         else:
-            owner = engine()
-            scope = {"meshKeys": [], "tasks": None} if args.action == "prepare" and args.all_attested else worker_call(owner, "inspect")
+            owner = None
+            if args.action == "prepare" and args.all_attested:
+                # The independent copy only reads the source. It has no dependency on solver admission.
+                scope = {"meshKeys": [], "tasks": None}
+            else:
+                owner = engine()
+                scope = worker_call(owner, "inspect")
             plan = select_entries(root, run.parent, guard, args.margin_bytes, args.parking_reserve_bytes, args.max_bytes,
                                   args.max_entries, args.min_age_days, set(scope["meshKeys"]), attestation, args.all_attested)
             plan["attestation"] = attested_sha
