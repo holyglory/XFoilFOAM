@@ -1,3 +1,7 @@
+import {
+  boundArtifactsMatchSubmission,
+  type SubmittedRawPoint,
+} from "./bound-polar-upload-replay";
 import { eq, sql } from "drizzle-orm";
 import type { DB } from "@aerodb/db/client";
 import { resultAttempts } from "@aerodb/db/schema";
@@ -21,7 +25,10 @@ import {
   type ProgressiveRemoteEvidenceDelivery,
 } from "@aerodb/db/progressive-remote-evidence-receipts";
 import { projectSignedProgressivePoint } from "@aerodb/db/progressive-remote-point-projection";
-import { readBoundProgressiveRawArchive } from "@aerodb/db/progressive-evidence-custody";
+import {
+  readBoundProgressiveRawArchive,
+  type ProgressiveEvidenceCustodyReceipt,
+} from "@aerodb/db/progressive-evidence-custody";
 import { env } from "./env";
 import { verifyRetainedReportGeneration } from "./progressive-report-archive-reader";
 
@@ -32,7 +39,7 @@ const sha = /^[a-f0-9]{64}$/;
 // solverPointEvidencePayload may add the job-level mesh recovery version.
 // Accept a reversal only if the entire original signed point, including its
 // physical polar and all declared artifacts, reproduces the inventory hash.
-function originalPoint(
+export function recoverOriginalSignedPoint(
   payload: unknown,
   envelope: Envelope,
   signature: string,
@@ -65,15 +72,31 @@ function originalPoint(
       ...polar,
       point,
     }) === signature;
-  if (hashesToSource(candidate)) return { point: candidate, polar };
+  const check = (point: Point) => {
+    if (hashesToSource(point)) return { point, polar };
+    // The engine validator deliberately projects a missing shedding frame
+    // track as a sentinel. Only an exact hash of the original JSON null is
+    // usable; re-projection below must also reproduce the entire sentinel.
+    const frame = point.frame_track as unknown;
+    if (
+      frame &&
+      typeof frame === "object" &&
+      "missing" in frame &&
+      frame.missing === true
+    ) {
+      const original = { ...point, frame_track: null };
+      if (hashesToSource(original)) return { point: original, polar };
+    }
+    return null;
+  };
+  const stored = check(candidate);
+  if (stored) return stored;
   const meshVersion = envelope.request.expected_mesh_recovery_version;
   const object = payload as Record<string, unknown>;
   if (meshVersion == null || object.mesh_recovery_version !== meshVersion)
     return null;
   const { mesh_recovery_version: _projectedVersion, ...original } = object;
-  return hashesToSource(original as unknown as Point)
-    ? { point: original as unknown as Point, polar }
-    : null;
+  return check(original as unknown as Point);
 }
 
 async function snapshot(
@@ -81,6 +104,7 @@ async function snapshot(
   input: ProgressiveRemoteEvidenceDelivery,
   instance: string,
   bucket: string,
+  proposal?: SubmittedRawPoint,
 ) {
   const ref = input.progressiveEvidence;
   const [row] =
@@ -201,7 +225,7 @@ async function snapshot(
     throw new ProgressiveRemoteEvidenceConflict(
       "Retained scientific point bytes changed",
     );
-  const recovered = originalPoint(
+  const recovered = recoverOriginalSignedPoint(
     attempt.evidencePayload,
     envelope,
     ref.pointContentSignature,
@@ -240,6 +264,18 @@ async function snapshot(
     String(row.upload_id),
     (manifest) => assertProgressiveReportedManifest({ point }, manifest),
   );
+  if (
+    proposal &&
+    (proposal.bundle.remoteEvidenceUploadId !== row.upload_id ||
+      !(await boundArtifactsMatchSubmission(
+        db,
+        proposal,
+        instance,
+        attempt,
+        raw,
+      )))
+  )
+    return null;
   if (typeof row.generation !== "string")
     throw new Error("Missing exact stored report generation");
   const identity: ProgressiveReportArchiveReadIdentity = {
@@ -275,6 +311,7 @@ async function snapshot(
     identity,
     raw,
     scope,
+    uploadId: String(row.upload_id),
     bundleId: row.archive_bundle_id,
     inventory: row.inventory_signature,
   };
@@ -283,25 +320,81 @@ async function snapshot(
 /** Read an already-issued receipt without inflating a cumulative report
  * containing unrelated points. Every byte of the previously authenticated
  * GCS generation is rechecked outside the database snapshot. */
-export async function recoverSignedPolarReceipt(
+async function verifyRetainedSource(
   db: DB,
   input: ProgressiveRemoteEvidenceDelivery,
   instance: string,
+  expectedUpload?: string,
+  proposal?: SubmittedRawPoint,
 ) {
   const bucket = env.evidenceBucket?.trim();
   if (!bucket || process.env.AIRFOILFOAM_DEPLOYMENT_ROLE !== "hub") return null;
   const prepare = () =>
     db.transaction(
-      (tx) => snapshot(tx as unknown as DB, input, instance, bucket),
+      (tx) => snapshot(tx as unknown as DB, input, instance, bucket, proposal),
       { isolationLevel: "repeatable read", accessMode: "read only" },
     );
   const proof = await prepare();
-  if (!proof) return null;
+  if (
+    !proof ||
+    (expectedUpload !== undefined && proof.uploadId !== expectedUpload)
+  )
+    return null;
   await verifyRetainedReportGeneration(proof.identity);
   const after = await prepare();
   if (!after || canonicalAnalysisJson(after) !== canonicalAnalysisJson(proof))
     throw new ProgressiveRemoteEvidenceConflict(
       "Retained source changed during report generation verification",
     );
-  return after.receipt;
+  return after;
+}
+
+export async function recoverSignedPolarReceipt(
+  db: DB,
+  input: ProgressiveRemoteEvidenceDelivery,
+  instance: string,
+) {
+  return (await verifyRetainedSource(db, input, instance))?.receipt ?? null;
+}
+
+export async function recoverSignedArchiveCustody(
+  db: DB,
+  input: ProgressiveRemoteEvidenceDelivery,
+  instance: string,
+  uploadId: string,
+): Promise<ProgressiveEvidenceCustodyReceipt | null> {
+  const source = await verifyRetainedSource(db, input, instance, uploadId);
+  return source
+    ? {
+        schemaVersion: 1,
+        kind: "hub-progressive-evidence-custody",
+        source: input,
+        brokeredUploadId: source.uploadId,
+        ...source.raw,
+      }
+    : null;
+}
+
+export async function recoverExactPolarArchiveReplay(
+  db: DB,
+  input: ProgressiveRemoteEvidenceDelivery,
+  instance: string,
+  proposal: SubmittedRawPoint,
+) {
+  const proof = await verifyRetainedSource(
+    db,
+    input,
+    instance,
+    proposal.bundle.remoteEvidenceUploadId,
+    proposal,
+  );
+  if (!proof) return null;
+  const custody: ProgressiveEvidenceCustodyReceipt = {
+    schemaVersion: 1,
+    kind: "hub-progressive-evidence-custody",
+    source: input,
+    brokeredUploadId: proof.uploadId,
+    ...proof.raw,
+  };
+  return { receipt: proof.receipt, custody };
 }

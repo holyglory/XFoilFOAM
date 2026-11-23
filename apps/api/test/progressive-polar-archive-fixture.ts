@@ -272,7 +272,7 @@ export async function verifyProgressivePolarArchiveImport(input: {
               }),
             ).toBe(true);
             await verifyOriginalPointReceiptReturn(connection, input.app, input.token, input.payload.sourceInstanceId!,
-              input.delivery, input.setConnection);
+              input.delivery, input.setConnection, { brokeredUploadId: uploadId, remote: identity });
           }
           const accepted = await post();
           expect(accepted.statusCode, accepted.body).toBe(200);

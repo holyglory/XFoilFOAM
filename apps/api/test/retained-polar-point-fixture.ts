@@ -12,6 +12,17 @@ import { settleProgressiveRemoteJob } from "../../sweeper/src/progressive-remote
 import { archiveProgressiveReportBatch } from "../../sweeper/src/progressive-report-archive-service";
 import { SettlementGcs } from "../../sweeper/test-support/attempt-settlement-fixture";
 import { env } from "../src/env";
+import { randomUUID } from "node:crypto";
+import { progressiveArchiveManifestBytes } from "../../../packages/db/test/progressive-archive-data";
+import {
+  verifyProgressiveEvidenceCustodyReceipt,
+  type ProgressiveEvidenceCustodyReceipt,
+} from "@aerodb/db/progressive-evidence-custody";
+import { verifyProgressiveRemoteExecution } from "@aerodb/db/progressive-remote-execution";
+import { progressiveReportedPointSources } from "@aerodb/db/progressive-remote-report";
+import { projectSignedProgressivePoint } from "@aerodb/db/progressive-remote-point-projection";
+import { periodicPoint } from "../../../packages/db/test-support/periodic-urans-point";
+import { recoverOriginalSignedPoint } from "../src/retained-polar-point";
 import * as reportObject from "../src/progressive-report-archive-reader";
 
 export async function verifyOriginalPointReceiptReturn(
@@ -21,6 +32,10 @@ export async function verifyOriginalPointReceiptReturn(
   sourceInstanceId: string,
   delivery: ProgressiveRemoteEvidenceDelivery,
   setConnection: (db: DB) => void,
+  archive: Pick<
+    ProgressiveEvidenceCustodyReceipt,
+    "brokeredUploadId" | "remote"
+  >,
 ) {
   const rollback = new Error("Rollback closed point receipt fixture"),
     store = new SettlementGcs();
@@ -154,6 +169,165 @@ export async function verifyOriginalPointReceiptReturn(
         });
         expect(fullReads).toBe(0);
         expect(transport).toHaveBeenCalled();
+        const readCustody = () =>
+          app.inject({
+            method: "POST",
+            url: `/api/sync/v1/evidence-uploads/${archive.brokeredUploadId}/custody`,
+            headers: { "x-xfoilfoam-solver-token": token },
+            payload: {},
+          });
+        const owned = await readCustody();
+        expect(owned.statusCode, owned.body).toBe(200);
+        const signed = verifyProgressiveEvidenceCustodyReceipt(
+          owned.json().progressiveArchiveReceipt,
+          token,
+          { source: delivery, ...archive },
+        );
+        expect(signed.canonical.resultAttemptId).toBe(
+          original.result_attempt_id,
+        );
+        expect(fullReads).toBe(0);
+
+        const [bundle] = await conn.execute(
+          sql`SELECT metadata FROM solver_evidence_artifacts WHERE id=${signed.canonical.artifactId}::uuid`,
+        );
+        const metadata = { ...(bundle.metadata as Record<string, unknown>) };
+        delete metadata.sourceInstanceId;
+        delete metadata.remoteEvidenceUploadId;
+        const archivePost = (properties: Record<string, unknown>) => {
+          const boundary = "fixture-" + randomUUID();
+          const manifest = JSON.stringify({
+            promiseId: delivery.promiseId,
+            sourceInstanceId,
+            results: [
+              {
+                ...delivery,
+                progressiveArchiveOnly: true,
+                evidenceArtifacts: [
+                  {
+                    kind: "manifest",
+                    mimeType: "application/json",
+                    sha256: archive.remote.manifestSha256,
+                    byteSize: archive.remote.manifestByteSize,
+                    uploadField: "evidence_manifest",
+                  },
+                  {
+                    kind: "engine_bundle",
+                    mimeType: "application/zstd",
+                    sha256: archive.remote.storedSha256,
+                    byteSize: archive.remote.storedByteSize,
+                    remoteEvidenceUploadId: archive.brokeredUploadId,
+                    metadata: properties,
+                  },
+                ],
+              },
+            ],
+          });
+          const payload = Buffer.concat([
+            Buffer.from(
+              `--${boundary}\r\nContent-Disposition: form-data; name="manifest"\r\nContent-Type: application/json\r\n\r\n${manifest}\r\n--${boundary}\r\nContent-Disposition: form-data; name="evidence_manifest"; filename="evidence_manifest.json"\r\nContent-Type: application/json\r\n\r\n`,
+            ),
+            progressiveArchiveManifestBytes,
+            Buffer.from(`\r\n--${boundary}--\r\n`),
+          ]);
+          return app.inject({
+            method: "POST",
+            url: "/api/sync/v1/polars",
+            payload,
+            headers: {
+              "content-type": `multipart/form-data; boundary=${boundary}`,
+              "x-xfoilfoam-solver-token": token,
+            },
+          });
+        };
+        const multipart = await archivePost(metadata);
+        expect(multipart.statusCode, multipart.body).toBe(200);
+        expect(multipart.json()).toMatchObject({
+          conflictIds: [],
+          artifacts: 0,
+          attempts: 0,
+          imported: 0,
+          fulfilledAoas: [],
+          bindingReceipts: [],
+          progressiveArchiveReceipts: [owned.json().progressiveArchiveReceipt],
+          progressiveEvidenceReceipts:
+            recovered.json().progressiveEvidenceReceipts,
+        });
+        expect(fullReads).toBe(0);
+        // A changed generation or custom artifact property cannot borrow the
+        // stored acknowledgement. Both must take full import verification.
+        for (const changed of [
+          { ...metadata, generation: "7" },
+          { ...metadata, proposedChange: true },
+        ]) {
+          const edited = await archivePost(changed);
+          expect(edited.statusCode, edited.body).toBeGreaterThanOrEqual(400);
+          expect(edited.json().progressiveArchiveReceipts).toBeUndefined();
+        }
+        expect(fullReads).toBeGreaterThan(0);
+        fullReads = 0;
+
+        // A normalized missing-frame sentinel is reversible only when the original
+        // null reproduces the complete point signature in its signed physical polar.
+        const [assigned] = await conn.execute(
+          sql`SELECT envelope,content_signature FROM progressive_remote_dispatches WHERE sim_job_id=${job}::uuid`,
+        );
+        const envelope = verifyProgressiveRemoteExecution(assigned.envelope, {
+          executionId: job,
+          solverId: delivery.solverId,
+          promiseId: delivery.promiseId,
+          contentSignature: String(assigned.content_signature),
+        });
+        const rawPoint = {
+          ...periodicPoint(aoaDeg, 2, false),
+          frame_track: null,
+          steady_history: null,
+          quality_warnings: [],
+          error: null,
+          fidelity: "urans_full" as const,
+          engine: {
+            ...envelope.request.expected_engine!,
+            build_id: "original-null-frame",
+          },
+        };
+        const polar = {
+          speed: envelope.request.speeds![0]!,
+          chord: envelope.request.chord_lengths![0]!,
+          reynolds:
+            (envelope.request.speeds![0]! *
+              envelope.request.chord_lengths![0]!) /
+            envelope.request.fluid!.kinematic_viscosity!,
+          points: [rawPoint],
+        };
+        const [witness] = progressiveReportedPointSources({
+          job_id: job,
+          state: "running",
+          polars: [polar],
+        });
+        const projection = projectSignedProgressivePoint(
+          rawPoint,
+          polar,
+          envelope,
+          rawPoint.engine,
+          envelope.request.expected_mesh_recovery_version,
+        );
+        expect(projection.evidencePayload.frame_track).toMatchObject({
+          missing: true,
+        });
+        expect(
+          recoverOriginalSignedPoint(
+            projection.evidencePayload,
+            envelope,
+            witness!.contentSignature,
+          )?.point,
+        ).toEqual(rawPoint);
+        expect(
+          recoverOriginalSignedPoint(
+            { ...projection.evidencePayload, cl: 47 },
+            envelope,
+            witness!.contentSignature,
+          ),
+        ).toBeNull();
         const check = reportObject.verifyRetainedReportGeneration;
         const revoked = vi
           .spyOn(reportObject, "verifyRetainedReportGeneration")
@@ -175,6 +349,9 @@ export async function verifyOriginalPointReceiptReturn(
           );
         }
         store.failReads = true;
+        const badCustody = await readCustody();
+        expect(badCustody.statusCode).toBe(409);
+        expect(badCustody.json().progressiveArchiveReceipt).toBeUndefined();
         const corrupt = await send();
         expect(corrupt.statusCode, corrupt.body).toBeGreaterThanOrEqual(400);
         expect(corrupt.json().progressiveEvidenceReceipts).toBeUndefined();
