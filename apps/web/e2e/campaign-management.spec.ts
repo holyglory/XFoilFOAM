@@ -1177,7 +1177,7 @@ test.describe
       preliminary.getByTestId("cell-preliminary-fast-0"),
     ).toHaveClass(/not_started/);
     await expect(preliminary).toContainText(
-      "CRITICAL · RANS RECOVERY EXHAUSTED",
+      "CRITICAL · PRE-URANS SYSTEM RECOVERY",
     );
 
     // The open dialog revalidates this point without page interaction. Each
