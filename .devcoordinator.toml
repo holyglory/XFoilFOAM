@@ -5590,7 +5590,7 @@ timeout_seconds = 7200
 name = "deployment-storage-cleanup"
 tier = "development"
 timeout_seconds = 60
-command = ["/bin/bash", "-c", "repo_git=$(git rev-parse --path-format=absolute --git-common-dir) && exec \"${repo_git%/*}/.venv/bin/python\" -m pytest tests/test_deployment_storage_prune.py -q"]
+command = ["/bin/bash", "-c", "repo_git=$(git rev-parse --path-format=absolute --git-common-dir) && exec \"${repo_git%/*}/.venv/bin/python\" -m pytest tests/test_deployment_storage_prune.py tests/test_closed_worker_report_operator.py -q"]
 
 [test.progressive-report-archive.postgres]
 image = "postgres:16-alpine"

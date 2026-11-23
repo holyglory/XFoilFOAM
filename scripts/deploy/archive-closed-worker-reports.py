@@ -11,6 +11,7 @@ import re
 import shlex
 import subprocess
 import sys
+import time
 import tempfile
 from pathlib import Path
 
@@ -102,18 +103,42 @@ def run_peer(args, role, message, source):
     wire = base64.b64encode(compact(message)).decode()
     # The program travels through stdin. No file or service in the running image is replaced.
     program = source + "\nconst request=JSON.parse(Buffer.from('" + wire + "','base64'));\n" + """
-try { const receipt=await invokeClosedReport(request); console.log(JSON.stringify(receipt)); }
-catch (e) { console.error(e.name, e.cause?.code ?? e.code ?? "", e.cause?.routine ?? "");
+const bootMs=performance.now(), cpu=process.cpuUsage();
+function send(value) {
+  const used=process.cpuUsage(cpu);
+  console.log(JSON.stringify({value,bootMs,workMs:performance.now()-bootMs,cpuMs:(used.user+used.system)/1000,peakRssKiB:process.resourceUsage().maxRSS}));
+}
+try { send(await invokeClosedReport(request)); }
+catch (e) {
+  const status = /^Worker report archive upload failed [(](429|502|503|504)[)]$/.exec(e.message);
+  if (["source","hub"].includes(request.op) && e.name === "ClosedReportHeld") {
+    send({held:e.message});
+  } else if (request.op === "publish" && status) {
+    send({retryableBrokerStatus:Number(status[1])});
+  } else {
+  console.error(e.name, e.cause?.code ?? e.code ?? "", e.cause?.routine ?? "");
   if (e.code === "ERR_ASSERTION" && !String(e.message).includes("\\n")) console.error(String(e.message).slice(0,170));
-  process.exitCode=1; }
+  process.exitCode=1; } }
 """
     cmd = ["ssh", "-T", "-C", "-oBatchMode=yes", "-oForwardAgent=no", "-oClearAllForwardings=yes",
            "-oStrictHostKeyChecking=yes", "-oConnectTimeout=10", host, shlex.join(argv)]
+    started = time.monotonic()
     process = subprocess.run(cmd, input=program, text=True, capture_output=True, timeout=170)
     if process.returncode:
         raise RuntimeError(f"{role} {message['op']} refused ({process.returncode}): {process.stderr[-340:]}")
     require(len(process.stdout) < 2 * 1024**2, "Oversized peer response")
-    return json.loads(process.stdout)
+    record = json.loads(process.stdout)
+    value = record.pop("value")
+    if args.measure_rpc:
+        record.update(role=role,op=message["op"],sequence=message["key"]["sequence"],committed=message.get("committed"),
+                      generation=(message.get("pin") or value.get("pin") or value).get("generation"),
+                      busy=value.get("retryableBrokerStatus"),wallMs=round((time.monotonic()-started)*1000,2))
+        fd=os.open(args.measure_rpc, os.O_WRONLY|os.O_CREAT|os.O_APPEND, 0o600)
+        try:
+            os.write(fd,compact(record)+b"\n")
+        finally:
+            os.close(fd)
+    return value
 
 
 def run(args):
@@ -140,6 +165,16 @@ def run(args):
         progress = json.loads(path.read_bytes()) if path.exists() else dict(binding=bind, after=0, completed=0, pending=None)
         require(progress["binding"] == bind, "Controller scope or role binding changed")
         keys.seek(progress["after"])
+        def advance(receipt, done):
+            outcome = done["settled"]["outcome"]
+            column = "held" if outcome == "held" else "archived"
+            # Early receipts used completed for the verified-only prefix.
+            progress.setdefault("archived", progress["completed"] - progress.get("held", 0))
+            progress[column] = progress.get(column, 0) + 1
+            progress.update(after=keys.tell(), completed=progress["completed"]+1, pending=None)
+            durable(path,progress)
+            print(json.dumps(dict(receipt=str(receipt),sequence=done["key"]["sequence"],settled=done["settled"])),flush=True)
+
         for _ in range(args.limit):
             line = keys.readline(2049)
             if not line:
@@ -153,6 +188,16 @@ def run(args):
                 return run_peer(args, role, dict(scope=scope,key=key,runtime=runtime,op=op,**fields), peer)
             state = progress["pending"]
             receipt = receipt_dir / f"{progress['completed']:08d}.json"
+            def hold(proof):
+                # Once any upload may have begun, keep its exact pending intent until reconciliation.
+                require(not (state and (state.get("publishing") or state.get("pin") or state.get("settled"))), "Eligibility changed with a pending archive; retain intent")
+                held = dict(binding=bind,key=key,runtimeRevision=args.runtime_revision,peerSha256=digest(peer.encode()),
+                            settled={"outcome":"held","reason":proof["held"]})
+                if args.apply:
+                    durable(receipt, held, immutable=True)
+                    advance(receipt, held)
+                else:
+                    print(json.dumps(held))
             if receipt.exists():
                 done = json.loads(receipt.read_bytes())
                 require(done["key"] == key and done["binding"] == bind, "Saved receipt scope changed")
@@ -164,6 +209,11 @@ def run(args):
                     require(state["key"] == key, "Pending source changed")
                 else:
                     initial = rpc("worker","source")
+                    if "held" in initial:
+                        hold(initial)
+                        if args.apply:
+                            continue
+                        return
                     require(not initial["archivedBundle"], "Use the existing native receipt")
                     state = dict(key=key, initial=initial, pin=None)
                     if args.apply:
@@ -171,12 +221,30 @@ def run(args):
                         durable(path,progress)
                 source = state["initial"]["source"]
                 hub = rpc("hub","hub",source=source)
+                if "held" in hub:
+                    hold(hub)
+                    if args.apply:
+                        continue
+                    return
                 if not args.apply:
                     print(json.dumps(dict(key=key,stored=state["initial"]["stored"],facts=source["facts"],earlier=len(hub["science"]["earlier"]))))
                     return
                 if not state["pin"]:
-                    state["pin"] = rpc("worker","publish",source=source,hub=hub)
+                    state["publishing"] = True
                     durable(path, progress)
+                    for attempt in range(3):
+                        candidate = rpc("worker","publish",source=source,hub=hub)
+                        status = candidate.get("retryableBrokerStatus")
+                        if status is None:
+                            state["pin"] = candidate
+                            durable(path, progress)
+                            break
+                        require(status in (429,502,503,504), "Unexpected broker refusal")
+                        if attempt == 2:
+                            raise RuntimeError(f"Broker returned {status}; exact pending source retained for retry")
+                        time.sleep(5 * (2**attempt))
+                        hub = rpc("hub","hub",source=source)
+                        require("held" not in hub, "Hub eligibility changed with a pending upload")
                 pin = state["pin"]
                 def reads(committed):
                     with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
@@ -191,12 +259,13 @@ def run(args):
                     durable(path,progress)
                 after = reads(True)
                 require(after["cloud"]["science"] == hub["science"], "Post-retirement hub science changed")
+                check_size = after["api"]["storedFieldBytes"]
+                require(check_size == after["sweeper"]["storedFieldBytes"], "Committed PG field size changed across normal readers")
                 done = dict(binding=bind,key=key,runtimeRevision=args.runtime_revision,installed=runtime,peerSha256=digest(peer.encode()),
+                            committedStoredFieldBytes=check_size,
                             initial=state["initial"],pin=pin,settled=state["settled"],before=before,after=after)
                 durable(receipt,done,immutable=True)
-            progress.update(after=keys.tell(), completed=progress["completed"]+1, pending=None)
-            durable(path,progress)
-            print(json.dumps(dict(receipt=str(receipt),sequence=key["sequence"],settled=done["settled"])),flush=True)
+            advance(receipt, done)
 
 
 if __name__ == "__main__":
@@ -205,6 +274,7 @@ if __name__ == "__main__":
         parser.add_argument("--"+opt,required=True,type=Path)
     for opt in ("frozen-sha256","keys-sha256","runtime-revision","hub-host","hz-host","hub-sweeper","hz-sweeper","hz-api"):
         parser.add_argument("--"+opt,required=True)
+    parser.add_argument("--measure-rpc",type=Path,help="Append per-operation timing and generation metadata for a bounded measurement")
     parser.add_argument("--limit",type=int,default=1)
     parser.add_argument("--apply",action="store_true")
     try:

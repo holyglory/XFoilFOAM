@@ -219,7 +219,12 @@ it.each([false, true])(
             sql`SELECT archived_at FROM progressive_worker_reports WHERE sim_job_id=${id}::uuid AND sequence=${key.sequence}`,
           );
           expect(warm.archived_at).toBeNull();
-          expect((await run("settle", fields)).outcome).toBe("retired");
+          const settlement = await run("settle", fields);
+          expect(settlement.outcome).toBe("retired");
+          const [committedRow] =
+            await db.execute(sql`SELECT pg_column_size(report) AS stored FROM progressive_worker_reports
+            WHERE sim_job_id=${id}::uuid AND sequence=${key.sequence}`);
+          expect(settlement.stored).toBe(committedRow.stored);
           for (const reader of ["api", "sweeper"])
             expect(
               (await run("read", { source, pin, reader, committed: true }))
