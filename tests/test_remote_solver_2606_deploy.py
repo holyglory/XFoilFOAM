@@ -1208,6 +1208,27 @@ historical_gateway_operation
     waiting = act("install")
     assert waiting.returncode == 0 and "deferred" in waiting.stdout
     assert "recreate" not in trace.read_text() and (tmp_path / "pool").read_text() == "false"
+    if fault == "none":
+        # End a still-captured window with a running solver. Only original admission and transfer
+        # settings are restored. A later normal prepare can use the same retained source.
+        frozen = canary.read_bytes()
+        recovered_while_busy = act("recover")
+        assert recovered_while_busy.returncode == 0, recovered_while_busy.stderr
+        assert {key:(tmp_path/key).read_text() for key in ("pending","pool","transfer","sweeper","media-repair","physical","image")} == {
+            "pending":"0","pool":"true","transfer":"false","sweeper":"1","media-repair":"0","physical":"running","image":"old"}
+        prior = trace.read_text().splitlines()
+        assert "image original" in prior and "resume-intake" in prior
+        assert "stop" not in prior and not any(line.startswith("recreate") for line in prior)
+        assert (tmp_path / "image-state").read_text() == "captured"
+        assert canary.read_bytes() == frozen
+        trace.rename(tmp_path / "captured-recovery.trace")
+        prepared_again = act("prepare")
+        assert prepared_again.returncode == 0, prepared_again.stderr
+        assert (tmp_path / "pending").read_text() == "1" and (tmp_path / "pool").read_text() == "false"
+        assert (tmp_path / "transfer").read_text() == "false" and (tmp_path / "physical").read_text() == "running"
+        deferred_again = act("install")
+        assert deferred_again.returncode == 0 and "deferred" in deferred_again.stdout
+        assert (tmp_path / "image").read_text() == "old" and canary.read_bytes() == frozen
     (tmp_path / "physical").write_text("idle")
     installed = act("install")
     if fault == "none":
