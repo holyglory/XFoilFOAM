@@ -1597,6 +1597,13 @@
       "when": 1795363913058,
       "tag": "0227_exact_attempt_storage_transition",
       "breakpoints": true
+    },
+    {
+      "idx": 228,
+      "version": "7",
+      "when": 1795363913059,
+      "tag": "0228_verified_worker_report_science_sources",
+      "breakpoints": true
     }
   ]
 }
