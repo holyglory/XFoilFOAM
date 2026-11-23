@@ -1,4 +1,5 @@
 import { sql } from "drizzle-orm";
+import { requireBoundedSettledReport } from "./hz-settled-report-bounds";
 import type { DB } from "@aerodb/db/client";
 import { getAttemptEvidenceArchive } from "@aerodb/db/attempt-evidence-catalog";
 import { readProgressiveReport } from "@aerodb/db/progressive-report-reader";
@@ -54,17 +55,7 @@ export async function readSettledWorkerPoint(db: DB, scope: HzSettledReceiptScop
   });
   async function reportAt(sequence: number, signature: string) {
     signal?.throwIfAborted();
-    const [bounded] = await db.execute(sql`SELECT 1 FROM progressive_worker_reports w
-      LEFT JOIN progressive_report_archive_bundles b ON b.id=w.archive_bundle_id
-      LEFT JOIN progressive_report_archive_members m ON m.bundle_id=b.id AND m.sim_job_id=w.sim_job_id
-        AND m.sequence=w.sequence AND m.content_signature=w.content_signature AND m.member_kind='report' AND m.source_kind='worker'
-      LEFT JOIN progressive_report_result_payloads shared ON shared.content_hash=w.result_payload_hash
-      WHERE w.sim_job_id=${scope.job}::uuid AND w.sequence=${sequence} AND w.content_signature=${signature}
-        AND w.acknowledged_at IS NOT NULL AND
-        CASE WHEN w.archived_at IS NOT NULL THEN m.report_byte_size BETWEEN 1 AND 33554432 AND b.stored_byte_size BETWEEN 1 AND 33554432
-        ELSE w.archive_bundle_id IS NULL AND (w.result_payload_hash IS NULL OR shared.content_hash IS NOT NULL)
-          AND coalesce(shared.byte_size,0)+octet_length(w.report::text)<=33554432 END`);
-    if (!bounded) throw new Error("Worker report lacks a bounded exact source");
+    await requireBoundedSettledReport(db, scope.job, sequence, signature);
     const body = await readProgressiveReport(db, { sourceKind: "worker", executionId: scope.job, sequence, contentSignature: signature }, owner);
     signal?.throwIfAborted();
     const validated = validateProgressiveRemoteReport(body, envelope);

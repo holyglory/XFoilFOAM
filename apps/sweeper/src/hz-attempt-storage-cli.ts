@@ -7,7 +7,7 @@ import { join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { setTimeout as delay } from "node:timers/promises";
-import { HistoryOperationError } from "@aerodb/core/point-history-protocol";
+import { HistoryOperationError, SETTLED_REPORT_SIZE_LIMIT } from "@aerodb/core/point-history-protocol";
 import { HistorySshEndpoint } from "./hz-point-history-relay";
 import { atomicJson, lockDirectory } from "./hz-point-history-relay-service";
 import { ZERO_ID, exactId } from "./hz-attempt-custody";
@@ -269,6 +269,7 @@ export async function hzAttemptStorage(
       eligible: 0,
       verified: 0,
       limited: 0,
+      reportSizeHeld: 0,
       sourceStoredBytes: 0,
       excluded: 0,
       alreadyArchived: 0,
@@ -335,7 +336,10 @@ export async function hzAttemptStorage(
               const r = await retry(() =>
                 migrateHzAttempt(relay, key, instance),
               );
-              if (r.limited) state.limited++;
+              if (r.limited) {
+                state.limited++;
+                if (r.limited === SETTLED_REPORT_SIZE_LIMIT) state.reportSizeHeld = (state.reportSizeHeld ?? 0) + 1;
+              }
               else {
                 state.verified++;
                 state.netBytes += r.netValueBytesReclaimed ?? 0;
@@ -346,7 +350,10 @@ export async function hzAttemptStorage(
             state.logicalBytes += Number(row.logical);
           }
           if (row.archive) state.alreadyArchived++;
-          else if (row.limiter !== null) state.excluded++;
+          else if (row.limiter !== null) {
+            state.excluded++;
+            if (row.limiter === SETTLED_REPORT_SIZE_LIMIT) state.reportSizeHeld = (state.reportSizeHeld ?? 0) + 1;
+          }
           state.scanned++;
           state.after = key;
           if (file) await atomicJson(file, state);
@@ -392,6 +399,7 @@ export async function hzAttemptStorage(
         eligible: 0,
         verified: 0,
         limited: 0,
+        reportSizeHeld: 0,
         sourceStoredBytes: 0,
         excluded: 0,
         alreadyArchived: 0,

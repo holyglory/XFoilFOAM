@@ -3,7 +3,7 @@ import type { AttemptEvidenceArchiveIdentity } from "@aerodb/db/attempt-evidence
 import type { AttemptEvidenceFreshVerification } from "@aerodb/db/attempt-evidence-projection";
 import { readAttemptEvidenceCopy } from "./attempt-evidence-archive";
 import { packedBytes } from "./hz-attempt-custody";
-import { HistoryOperationError } from "@aerodb/core/point-history-protocol";
+import { HistoryOperationError, SETTLED_REPORT_SIZE_LIMIT } from "@aerodb/core/point-history-protocol";
 export interface AttemptRelay {
   worker: (request: Record<string, unknown>, write?: boolean) => Promise<any>;
   api: (request: Record<string, unknown>) => Promise<any>;
@@ -34,6 +34,19 @@ export async function migrateHzAttempt(
   instance: string,
   restore = false,
 ) {
+  try {
+    return await transferHzAttempt(relay, id, instance, restore);
+  } catch (error) {
+    // A report can change representation after selection. The transition
+    // restores a committed row before propagating a failed post-read.
+    if (!restore && error instanceof HistoryOperationError &&
+        error.operation === SETTLED_REPORT_SIZE_LIMIT && error.category === "input")
+      return { limited: SETTLED_REPORT_SIZE_LIMIT };
+    throw error;
+  }
+}
+
+async function transferHzAttempt(relay: AttemptRelay, id: string, instance: string, restore: boolean) {
   const prep = await relay.worker({ operation: "prepare", attemptId: id });
   if (prep.limited) return { limited: prep.limited };
   if (restore && !prep.cold) return { alreadyInline: true };

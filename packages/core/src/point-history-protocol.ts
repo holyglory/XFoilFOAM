@@ -2,6 +2,7 @@ import type { Readable, Writable } from "node:stream";
 import { MAX_POINT_HISTORY_PACKED_BYTES } from "./point-history-working-copy";
 
 export const MAX_HISTORY_MESSAGE = 2 * MAX_POINT_HISTORY_PACKED_BYTES + 16384;
+export const SETTLED_REPORT_SIZE_LIMIT = "worker-signed-report-byte-limit";
 export class HistoryOperationError extends Error {
   constructor(
     readonly operation: string,

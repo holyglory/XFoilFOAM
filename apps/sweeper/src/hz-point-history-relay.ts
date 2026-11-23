@@ -10,6 +10,7 @@ import {
   HistoryMessages,
   boundedPacked,
   HistoryOperationError,
+  SETTLED_REPORT_SIZE_LIMIT,
 } from "@aerodb/core/point-history-protocol";
 import {
   decodePointHistory,
@@ -142,6 +143,8 @@ export class HistorySshEndpoint {
       if (response.error) {
         const category = response.error.category;
         const operation = String(response.error.operation ?? "worker");
+        if (category === "input" && operation === SETTLED_REPORT_SIZE_LIMIT && response.error.retryable === false)
+          throw new HistoryOperationError(operation, "input");
         if (
           category === "transport" &&
           response.error.retryable === true &&
