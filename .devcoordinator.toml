@@ -5879,7 +5879,6 @@ name = "terminal-recovery"
 tier = "development"
 timeout_seconds = 900
 requires = ["seed"]
-env = { AIRFOILFOAM_STOPPED_REPORT_COPY_SCOPE = "all" }
 command = ["/bin/bash", "-c", "exec /usr/bin/corepack pnpm --filter @aerodb/db exec vitest run test/campaign-profile-enrollment.test.ts -t 'terminal evidence inventory preserves exact ownership|recovers an authenticated mixed RANS promotion from a fresh stage-2 execution|progressive remote dispatch pins one exact request' --reporter=default --reporter=junit --outputFile.junit=\"$DEVCOORDINATOR_DIAGNOSTICS_DIR/report.xml\""]
 diagnostic_sources = [{ format = "junit", path = "report.xml" }]
 
@@ -6285,3 +6284,48 @@ tier = "development"
 requires = ["workspace"]
 timeout_seconds = 300
 command = ["/usr/bin/corepack", "pnpm", "-r", "typecheck"]
+
+[test.shared-report-daemon]
+timeout_seconds = 1100
+
+[test.shared-report-daemon.postgres]
+image = "postgres:16-alpine"
+database = "shared_report_service"
+user = "aerodb"
+
+[[test.shared-report-daemon.check]]
+name = "workspace"
+tier = "development"
+command = ["/usr/bin/corepack","pnpm","install","--frozen-lockfile","--ignore-scripts","--offline"]
+
+[[test.shared-report-daemon.check]]
+name = "schema"
+tier = "development"
+requires = ["workspace"]
+command = ["/usr/bin/corepack","pnpm","--filter","@aerodb/db","migrate"]
+
+[[test.shared-report-daemon.check]]
+name = "seed"
+tier = "development"
+requires = ["schema"]
+command = ["/usr/bin/corepack","pnpm","--filter","@aerodb/db","seed"]
+
+[[test.shared-report-daemon.check]]
+name = "recurring-service"
+tier = "development"
+timeout_seconds = 360
+requires = ["seed"]
+env = { PROGRESSIVE_REPORT_ARCHIVE_DISPOSABLE_DB="1", NODE_ENV="test", AIRFOILFOAM_DEPLOYMENT_ROLE="hub", AIRFOILFOAM_EVIDENCE_BUCKET="shared-fixture", LOG_LEVEL="error" }
+command = ["/usr/bin/corepack","pnpm","--filter","@aerodb/sweeper","exec","vitest","run","test/shared-stopped-report-service.test.ts"]
+
+[[test.shared-report-daemon.check]]
+name = "types"
+tier = "development"
+requires = ["workspace"]
+command = ["/usr/bin/corepack","pnpm","-r","typecheck"]
+
+[[test.shared-report-daemon.check]]
+name = "transport"
+tier = "development"
+requires = ["workspace"]
+command = ["/usr/bin/corepack","pnpm","--filter","@aerodb/sweeper","exec","vitest","run","test/progressive-report-archive-roundtrip.test.ts"]

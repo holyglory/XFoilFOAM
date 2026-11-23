@@ -840,7 +840,11 @@ async function saveMediumTableRows(
 }
 
 export async function registerRoutes(app: FastifyInstance, publicPoints?: PublicPointReader): Promise<void> {
-  app.get("/health", async () => ({ ok: true, service: "aerodb-api" }));
+  app.get("/health", async () => ({
+    ok: true, service: "aerodb-api",
+    ...(env.evidenceBucket && process.env.AIRFOILFOAM_DEPLOYMENT_ROLE !== "remote-solver"
+      ? { hubReportArchiveFormats: ["jsonl", "shared-result-v1"] } : {}),
+  }));
 
   // ---- categories ----
   app.get("/api/categories/tree", async () => categoriesTree());

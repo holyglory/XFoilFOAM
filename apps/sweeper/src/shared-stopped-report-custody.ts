@@ -1,3 +1,7 @@
+import {
+  verifySharedReportReaders,
+  type SharedReportReaderPair,
+} from "./shared-report-reader-verification";
 import { sql } from "drizzle-orm";
 import type { DB } from "@aerodb/db/client";
 import {
@@ -16,6 +20,7 @@ import {
   type SharedReportInput,
   type SharedReportMember,
   type SharedReportOwner,
+  type SharedReportManifest,
 } from "./shared-report-archive";
 import { sha256, type ReportObjects } from "./shared-report-objects";
 
@@ -69,9 +74,13 @@ export interface StoppedCopyReceipt {
     | "sourceListSha256"
     | "resultHash"
   >[];
+  bucket: string;
+  results: SharedReportManifest["results"];
   storedReportFieldsBefore: number;
   storedReportFieldsAfter: number;
   released: number;
+  releasedReferenceBytes: number;
+  releasedProtectedResults: { hash: string; storedBytes: number }[];
   resultBytesSubmitted: number;
 }
 export async function stoppedReportCopyKeys(
@@ -112,7 +121,14 @@ export async function copyStoppedReportBatch(
   job: string,
   keys: readonly StoppedReportKey[],
   mode: "release" | "preserve",
+  options: {
+    beforePublish?: (receipt: StoppedCopyReceipt) => Promise<void>;
+    beforeCommit?: (receipt: StoppedCopyReceipt) => Promise<void>;
+    readers?: SharedReportReaderPair;
+  } = {},
 ): Promise<StoppedCopyReceipt> {
+  if (process.env.AIRFOILFOAM_DEPLOYMENT_ROLE === "remote-solver")
+    throw new Error("Stopped report cloud custody belongs to the hub");
   if (
     !keys.length ||
     keys.length > 128 ||
@@ -135,18 +151,19 @@ export async function copyStoppedReportBatch(
     received: string;
     hash: string | null;
     stored: number;
+    refBytes: number;
   }[] = [];
   let logical = 0,
     envelope = 0;
   for (const key of keys) {
     const [r] = await db.execute(sql`WITH original AS MATERIALIZED (
-      SELECT r.sequence,r.content_signature,r.received_at::text received,r.result_payload_hash h,pg_column_size(r.report)::int stored,
+      SELECT r.sequence,r.content_signature,r.received_at::text received,r.result_payload_hash h,pg_column_size(r.report)::int stored,coalesce(pg_column_size(r.result_payload_hash),0)::int ref_bytes,
         r.report::text AS env,public.resolve_progressive_report(r.report,r.result_payload_hash)::text AS body,
         i.inventory_signature AS inventory,i.source_count AS n,${pointList}::text AS points,
         (SELECT byte_size FROM progressive_report_result_payloads p WHERE p.content_hash=r.result_payload_hash) AS payload_bytes
       ${base} WHERE r.sim_job_id=${job}::uuid AND r.sequence=${key.sequence} AND r.content_signature=${key.signature} AND ${signed}
         AND NOT (${scientificallyReceiptedReportCopy}) AND (${release})=${mode === "release"})
-     SELECT h,stored,received,inventory,n,points,payload_bytes,octet_length(body)::int AS bytes,
+     SELECT h,stored,ref_bytes,received,inventory,n,points,payload_bytes,octet_length(body)::int AS bytes,
        encode(sha256(convert_to(body,'UTF8')),'hex') AS sha,CASE WHEN octet_length(env)<=${limit} THEN env END AS env FROM original`);
     if (!r || typeof r.env !== "string" || Number(r.bytes) > limit)
       throw new Error(
@@ -157,6 +174,8 @@ export async function copyStoppedReportBatch(
     const h =
       r.h == null ? (cut.result ? sha256(cut.result) : null) : String(r.h);
     const storedHash = r.h == null ? null : String(r.h);
+    if (storedHash && !cut.result)
+      throw new Error("Protected SQL result has no root result header");
     const resultSize = storedHash
       ? Number(r.payload_bytes)
       : cut.result
@@ -204,12 +223,47 @@ export async function copyStoppedReportBatch(
       received: String(r.received),
       hash: storedHash,
       stored: Number(r.stored),
+      refBytes: Number(r.ref_bytes),
     });
   }
   const copied = await writeSharedReportPage(objects, selected.owner, inputs);
+  const receipt: StoppedCopyReceipt = {
+    mode,
+    ...selected,
+    bucket: objects.bucket,
+    object: copied.pin,
+    results: copied.manifest.results,
+    members: copied.manifest.members.map(
+      ({
+        sequence,
+        signature,
+        reportSha256,
+        reportByteSize,
+        inventorySignature,
+        sourceListSha256,
+        resultHash,
+      }) => ({
+        sequence,
+        signature,
+        reportSha256,
+        reportByteSize,
+        inventorySignature,
+        sourceListSha256,
+        resultHash,
+      }),
+    ),
+    storedReportFieldsBefore: frozen.reduce((n, r) => n + r.stored, 0),
+    storedReportFieldsAfter: frozen.reduce((n, r) => n + r.stored, 0),
+    released: 0,
+    releasedReferenceBytes: 0,
+    releasedProtectedResults: [],
+    resultBytesSubmitted: copied.resultBytesSubmitted,
+  };
+  await verifySharedReportReaders(receipt, options.readers);
+  if (options.beforePublish) await options.beforePublish(receipt);
   // A failed/crashed copy can leave a content-addressed object. Only this
   // transaction attaches its pinned, authenticated manifest to the live rows.
-  const sizes = await db.transaction(async (tx) => {
+  return db.transaction(async (tx) => {
     const conn = tx as unknown as DB;
     const live = await ownership(conn, job, true);
     if (
@@ -232,7 +286,7 @@ export async function copyStoppedReportBatch(
         "Stopped report identity or eligibility changed during cloud verification",
       );
     const before = frozen.reduce((n, r) => n + r.stored, 0);
-    if (mode === "preserve") return { before, after: before };
+    if (mode === "preserve") return receipt;
     const { pin, manifest } = copied;
     const [b] =
       await conn.execute(sql`INSERT INTO progressive_report_archive_bundles
@@ -250,47 +304,38 @@ export async function copyStoppedReportBatch(
       await conn.execute(sql`UPDATE progressive_remote_reports r SET archive_bundle_id=${b.id}::uuid,archived_at=clock_timestamp(),
       report=progressive_report_compact_header(r.report),result_payload_hash=NULL
       FROM progressive_report_archive_members m WHERE m.bundle_id=${b.id}::uuid AND (r.sim_job_id,r.sequence,r.content_signature)=(m.sim_job_id,m.sequence,m.content_signature)
-      AND r.archive_bundle_id IS NULL AND r.archived_at IS NULL RETURNING pg_column_size(r.report)::int AS stored`);
+      AND r.archive_bundle_id IS NULL AND r.archived_at IS NULL RETURNING r.sequence`);
     if (changed.length !== frozen.length)
       throw new Error("Incomplete shared report publication");
     const hashes = [
       ...new Set(frozen.flatMap((r) => (r.hash ? [r.hash] : []))),
     ];
-    if (hashes.length)
-      await conn.execute(sql`DELETE FROM progressive_report_result_payloads p WHERE p.content_hash IN (${sql.join(
-        hashes.map((h) => sql`${h}`),
-        sql`,`,
-      )})
+    const removed = hashes.length
+      ? await conn.execute(sql`DELETE FROM progressive_report_result_payloads p WHERE p.content_hash IN (${sql.join(
+          hashes.map((h) => sql`${h}`),
+          sql`,`,
+        )})
       AND NOT EXISTS (SELECT FROM progressive_remote_reports r WHERE r.result_payload_hash=p.content_hash)
-      AND NOT EXISTS (SELECT FROM progressive_worker_reports w WHERE w.result_payload_hash=p.content_hash)`);
-    return { before, after: changed.reduce((n, r) => n + Number(r.stored), 0) };
+      AND NOT EXISTS (SELECT FROM progressive_worker_reports w WHERE w.result_payload_hash=p.content_hash) RETURNING p.content_hash AS hash,pg_column_size(p.result)::int AS size`)
+      : [];
+    const [size] =
+      await conn.execute(sql`SELECT sum(pg_column_size(r.report))::text AS stored FROM progressive_report_archive_members m
+      JOIN progressive_remote_reports r ON (r.sim_job_id,r.sequence,r.archive_bundle_id)=(m.sim_job_id,m.sequence,m.bundle_id)
+      WHERE m.bundle_id=${b.id}::uuid AND m.source_kind='remote' AND m.member_kind='report'`);
+    const committed: StoppedCopyReceipt = {
+      ...receipt,
+      storedReportFieldsBefore: before,
+      storedReportFieldsAfter: Number(size.stored),
+      released: inputs.length,
+      releasedReferenceBytes: frozen.reduce((n, r) => n + r.refBytes, 0),
+      releasedProtectedResults: removed.map((r) => ({
+        hash: String(r.hash),
+        storedBytes: Number(r.size),
+      })),
+    };
+    // A durable local measurement is accepted only alongside the subsequently
+    // committed matching SQL bundle. An abandoned transaction cannot inflate it.
+    await options.beforeCommit?.(committed);
+    return committed;
   });
-  return {
-    mode,
-    ...selected,
-    object: copied.pin,
-    members: copied.manifest.members.map(
-      ({
-        sequence,
-        signature,
-        reportSha256,
-        reportByteSize,
-        inventorySignature,
-        sourceListSha256,
-        resultHash,
-      }) => ({
-        sequence,
-        signature,
-        reportSha256,
-        reportByteSize,
-        inventorySignature,
-        sourceListSha256,
-        resultHash,
-      }),
-    ),
-    storedReportFieldsBefore: sizes.before,
-    storedReportFieldsAfter: sizes.after,
-    released: mode === "release" ? inputs.length : 0,
-    resultBytesSubmitted: copied.resultBytesSubmitted,
-  };
 }

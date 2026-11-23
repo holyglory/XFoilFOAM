@@ -1,4 +1,4 @@
-import { CRC32C, Storage, type File } from "@google-cloud/storage";
+import { CRC32C, Storage, type File, type Bucket } from "@google-cloud/storage";
 import { pinExactGcsGeneration } from "@aerodb/core/gcs-exact-generation";
 import { createHash } from "node:crypto";
 import { addAbortSignal } from "node:stream";
@@ -37,6 +37,7 @@ export function checkReportObjectPin(
     typeof pin.generation !== "string" ||
     !generationPattern.test(pin.generation) ||
     BigInt(pin.generation) > 18446744073709551615n ||
+    typeof pin.sha256 !== "string" ||
     !hashPattern.test(pin.sha256) ||
     !Number.isSafeInteger(pin.size) ||
     pin.size < 1 ||
@@ -47,6 +48,39 @@ export function checkReportObjectPin(
     throw new Error("Invalid shared report object identity");
 }
 
+/** Canonical report upload contract for both legacy JSONL and factored
+ * objects. A pre-existing object must still pass the caller's subsequent
+ * generation metadata, compressed-byte, and format-specific readback. */
+export async function putImmutableReportObject(
+  bucket: Bucket,
+  key: string,
+  source: { path: string } | { bytes: Buffer },
+  metadata: Record<string, string>,
+) {
+  const file = bucket.file(key);
+  const options = {
+    validation: "crc32c" as const,
+    preconditionOpts: { ifGenerationMatch: 0 },
+    metadata: {
+      cacheControl: "private, max-age=31536000, immutable",
+      contentType: "application/gzip",
+      metadata,
+    },
+  };
+  try {
+    if ("path" in source)
+      await bucket.upload(source.path, {
+        ...options,
+        resumable: true,
+        destination: key,
+      });
+    else await file.save(source.bytes, { ...options, resumable: false });
+    return { file, created: true };
+  } catch (e) {
+    if (Number((e as { code?: unknown }).code) !== 412) throw e;
+    return { file, created: false };
+  }
+}
 /** Same create-only upload and exact-generation/CRC read used by canonical report storage. */
 export class HubReportObjects implements ReportObjects {
   constructor(
@@ -54,10 +88,13 @@ export class HubReportObjects implements ReportObjects {
     readonly prefix: string,
     private readonly storage = new Storage(),
   ) {
+    this.prefix = prefix.replace(/^\/+|\/+$/g, "");
     if (
       !bucket.trim() ||
-      !prefix ||
-      prefix.split("/").some((part) => !part || part === "." || part === "..")
+      !this.prefix ||
+      this.prefix
+        .split("/")
+        .some((part) => !part || part === "." || part === "..")
     )
       throw new Error("Invalid hub report object namespace");
   }
@@ -87,21 +124,12 @@ export class HubReportObjects implements ReportObjects {
     }
   }
   async create(key: string, compressed: Buffer) {
-    const file = this.storage.bucket(this.bucket).file(key);
-    try {
-      await file.save(compressed, {
-        resumable: false,
-        validation: "crc32c",
-        preconditionOpts: { ifGenerationMatch: 0 },
-        metadata: {
-          contentType: "application/gzip",
-          cacheControl: "private, immutable",
-          metadata: { sha256: sha256(compressed) },
-        },
-      });
-    } catch (e) {
-      if (Number((e as { code?: unknown }).code) !== 412) throw e;
-    }
+    const { file } = await putImmutableReportObject(
+      this.storage.bucket(this.bucket),
+      key,
+      { bytes: compressed },
+      { sha256: sha256(compressed) },
+    );
     return this.metadata(file);
   }
   async read(pin: ReportObjectPin, limit: number, signal?: AbortSignal) {
