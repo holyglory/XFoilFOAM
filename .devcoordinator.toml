@@ -6046,3 +6046,18 @@ retained_artifacts = [{name="catalog-page-journey",path=".codex-artifacts/catalo
 name = "types"
 tier = "release"
 command = ["/usr/bin/corepack","pnpm","--filter","@aerodb/web","typecheck"]
+
+[test.catalog-page-layout]
+timeout_seconds = 3600
+
+[[test.catalog-page-layout.check]]
+name = "verifier"
+tier = "release"
+command = ["/usr/local/bin/devcoordinator2-tooling", "formal-ui", "self-test"]
+
+[[test.catalog-page-layout.check]]
+name = "layout"
+tier = "release"
+requires = ["verifier"]
+timeout_seconds = 3000
+command = ["node", "scripts/dev/verify-condition-layout.mjs", "--paging"]
