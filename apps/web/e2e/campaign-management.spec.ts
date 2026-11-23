@@ -1461,7 +1461,7 @@ test.describe
       diagnostics.locator('[data-detail-stage="final"]'),
     ).toContainText("1 evidence record");
     await expect(diagnostics).toContainText(
-      "non-convergence hands off normally",
+      "Normal aerodynamic handoff to URANS fast.",
     );
     await expect(diagnostics).toContainText("Evidence · 2 RANS");
     await expect(diagnostics).toContainText("1 fast URANS evidence record");
