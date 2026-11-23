@@ -1,6 +1,7 @@
 import { readSweeperAttemptEvidence, sweeperAttemptArchiveReader } from "./attempt-evidence-consumer-reader";
 import { installProgressiveRetentionReader } from "@aerodb/db/progressive-remote-retention";
 import { runRemoteTransferSteps } from "./remote-transfer-steps";
+import { reconcileTerminalProgressiveMirror } from "./progressive-terminal-mirror";
 import { activeReconcileConcurrency, runWithConcurrency } from "./reconcile";
 import { renewIndependentPromises } from "./remote-promise-renewal";
 import { measureRemoteReconciliationStep } from "./remote-reconciliation-timing";
@@ -7452,6 +7453,10 @@ export async function transferRemoteSolverTick(
         name: "restart-checkpoints",
         run: () =>
           processRestartableRemotePrecalcCheckpoint(db, engine, settings),
+      },
+      {
+        name: "terminal-progressive-mirror",
+        run: async () => (await reconcileTerminalProgressiveMirror(db)).outcome === "reconciled",
       },
     ]);
     const processedDurableDelivery =

@@ -72,6 +72,7 @@ export async function readProgressiveRemoteAssignment(
     FROM progressive_remote_dispatches dispatch
     JOIN registered_remote_solvers solver ON solver.id = dispatch.solver_id AND solver.revoked_at IS NULL
     JOIN sync_sweep_promises promise ON promise.id = dispatch.promise_id
+      AND promise.registered_solver_id = dispatch.solver_id
     JOIN sim_jobs job ON job.id = dispatch.sim_job_id
     JOIN airfoils airfoil ON airfoil.id = job.airfoil_id
     JOIN simulation_preset_revisions revision ON revision.id = job.simulation_preset_revision_id
