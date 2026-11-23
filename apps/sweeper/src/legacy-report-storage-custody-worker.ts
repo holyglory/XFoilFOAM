@@ -608,6 +608,8 @@ export async function applyLegacyCustodyWorkerTransaction(
 }
 
 export async function legacyCustodyWorkerStdin(): Promise<void> {
+  const startCpu = process.cpuUsage(),
+    start = performance.now();
   let header = Buffer.alloc(0),
     request: LegacyCustodyWorkerRequest | undefined,
     size = 0;
@@ -640,9 +642,16 @@ export async function legacyCustodyWorkerStdin(): Promise<void> {
   }
   if (!request || size !== request.receipt.object.byteSize)
     throw new Error("Truncated custody input");
+  const result = await runLegacyCustodyWorker(request, Buffer.concat(parts));
+  const cpu = process.cpuUsage(startCpu);
   process.stdout.write(
-    JSON.stringify(
-      await runLegacyCustodyWorker(request, Buffer.concat(parts)),
-    ) + "\n",
+    JSON.stringify({
+      ...result,
+      workerCost: {
+        elapsedMs: performance.now() - start,
+        cpuMs: (cpu.user + cpu.system) / 1000,
+        peakRssKiB: process.resourceUsage().maxRSS,
+      },
+    }) + "\n",
   );
 }

@@ -36,6 +36,7 @@ export interface LegacySlotOptions<T> {
   slots: 1 | 2;
   targetBinding: string;
   peerSource?: T;
+  pairOrder?: "serial" | "concurrent";
   applicationMarker?: (name: string) => string;
   openBudget?: () => Promise<PeerBudget>;
 }
@@ -287,8 +288,22 @@ export async function runLegacyExecutionSlots<T>(input: Inputs<T>) {
     state.peer.execution === peer || same(state.peer, startOf(scope, peer + 1)),
   );
   stageName(state.peer);
+  const pairOrder = options.pairOrder ?? "concurrent";
+  requireProof(pairOrder === "concurrent" || pairOrder === "serial");
   const report = {
     maxActive: 0,
+    pairOrder,
+    pageWork: [] as {
+      execution: string;
+      role: "front" | "peer";
+      start: LegacyCursor;
+      next: LegacyCursor;
+      generation: string;
+      members: number;
+      packedBytes: number;
+      startedAt: string;
+      elapsedMs: number;
+    }[],
     appliedAhead: 0,
     pairedExecutions: [] as [string, string][],
     peerReceipts: [] as string[],
@@ -462,6 +477,23 @@ export async function runLegacyExecutionSlots<T>(input: Inputs<T>) {
     checkReceipt(receipt, start);
     return receipt;
   }
+  async function timedStage(start: LegacyCursor, second: boolean, cap: number) {
+    const began = performance.now(),
+      startedAt = new Date().toISOString();
+    const r = await stage(start, second, cap);
+    report.pageWork.push({
+      execution: scope.executions[start.execution].executionId,
+      role: second ? "peer" : "front",
+      start: r.start,
+      next: r.next,
+      generation: r.object.generation,
+      members: r.memberCount,
+      packedBytes: r.object.byteSize,
+      startedAt,
+      elapsedMs: performance.now() - began,
+    });
+    return r;
+  }
   async function publish(start: LegacyCursor) {
     const dir = join(journal, stageName(start));
     const { ready, receipt } = await readReady(dir, start);
@@ -591,17 +623,32 @@ export async function runLegacyExecutionSlots<T>(input: Inputs<T>) {
       await probe?.finish();
       break;
     }
-    report.maxActive = Math.max(report.maxActive, admit ? 2 : 1);
-    const jobs = [stage(front, false, admit ? pairedCap : input.maxBytes)];
-    if (admit) {
+    const overlap = admit && pairOrder === "concurrent";
+    report.maxActive = Math.max(report.maxActive, overlap ? 2 : 1);
+    const jobs = [timedStage(front, false, admit ? pairedCap : input.maxBytes)];
+    if (overlap) jobs.push(timedStage(state.peer, true, pairedCap));
+    const settled = await Promise.allSettled(jobs);
+    // A matched serial control uses the same two native cursor edges. Start
+    // the peer only after the front's complete durable application receipt.
+    if (
+      admit &&
+      !overlap &&
+      settled[0].status === "fulfilled" &&
+      !input.shouldStop?.()
+    ) {
+      settled.push(
+        ...(await Promise.allSettled([
+          timedStage(state.peer, true, pairedCap),
+        ])),
+      );
+    }
+    if (settled.length === 2)
       report.pairedExecutions.push([
         scope.executions[front.execution].executionId,
         scope.executions[peer].executionId,
       ]);
-      jobs.push(stage(state.peer, true, pairedCap));
-    }
-    const [first, other] = await Promise.allSettled(jobs);
-    used += jobs.length;
+    const [first, other] = settled;
+    used += settled.length;
     let sampleFailure: unknown;
     if (probe)
       try {
