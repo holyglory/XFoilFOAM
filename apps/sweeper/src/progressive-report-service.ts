@@ -5,6 +5,20 @@ import {
 } from "./progressive-remote-publication";
 import { runNotificationDrain } from "./notification-drain";
 
+export function configuredReportPublicationLanes(
+  env: NodeJS.ProcessEnv = process.env,
+): number {
+  const count = Number(
+    env.SWEEPER_PROGRESSIVE_REPORT_PUBLICATION_LANES?.trim() || "8",
+  );
+  if (!Number.isSafeInteger(count) || count < 1 || count > 8) {
+    throw new Error(
+      "SWEEPER_PROGRESSIVE_REPORT_PUBLICATION_LANES must be an integer from 1 through 8",
+    );
+  }
+  return count;
+}
+
 export async function runProgressiveReportService(
   db: DB,
   notifications: Pick<Sql, "listen">,

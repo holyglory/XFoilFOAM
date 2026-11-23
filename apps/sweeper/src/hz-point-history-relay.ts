@@ -108,8 +108,17 @@ export class HistorySshEndpoint {
         throw new HistoryOperationError("response", "integrity");
       if (response.error) {
         const category = response.error.category;
+        const operation = String(response.error.operation ?? "worker");
+        if (
+          category === "transport" &&
+          response.error.retryable === true &&
+          /^worker_(hello|status|scan|prepare|apply)_(lock_timeout|serialization|deadlock)$/.test(
+            operation,
+          )
+        )
+          throw new HistoryOperationError(operation, "database_busy", true);
         throw new HistoryOperationError(
-          String(response.error.operation ?? "worker"),
+          operation,
           category === "denied"
             ? "denied"
             : category === "transport"

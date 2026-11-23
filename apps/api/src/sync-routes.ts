@@ -1,3 +1,5 @@
+import { storeProgressiveRemoteReportBatch, ProgressiveReportBatchUnavailable } from "@aerodb/db/progressive-remote-report-batch";
+import { MAX_PROGRESSIVE_PUBLICATION_REPORTS } from "@aerodb/db/progressive-report-publication-batch";
 import {
   airfoilHashtags,
   airfoils,
@@ -7322,6 +7324,11 @@ export async function registerSyncRoutes(app: FastifyInstance): Promise<void> {
       const body = z
         .object({
           promiseId: z.string().uuid(), report: z.record(z.unknown()),
+          updates: z.array(z.object({
+            sequence: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+            status: z.record(z.unknown()),
+            contentSignature: z.string().regex(/^[a-f0-9]{64}$/),
+          }).strict()).min(1).max(MAX_PROGRESSIVE_PUBLICATION_REPORTS - 1).optional(),
           diagnostic: z.object({
             pointContentSignature: z.string().regex(/^[a-f0-9]{64}$/),
             remoteResultId: z.string().uuid(), remoteResultAttemptId: z.string().uuid(),
@@ -7334,6 +7341,7 @@ export async function registerSyncRoutes(app: FastifyInstance): Promise<void> {
         return reply
           .code(400)
           .send({ error: "invalid progressive report request" });
+      if (reply.raw.destroyed) return;
       const [dispatch] = await db
         .select({ id: progressiveRemoteDispatches.simJobId })
         .from(progressiveRemoteDispatches)
@@ -7349,13 +7357,23 @@ export async function registerSyncRoutes(app: FastifyInstance): Promise<void> {
         return reply
           .code(403)
           .send({ error: "remote solver does not own this execution" });
+      if (reply.raw.destroyed) return;
+      const client = new AbortController();
+      const disconnect = () => { if (!reply.raw.writableFinished) client.abort(); };
+      reply.raw.once("close", disconnect);
       try {
-        const receipt = await storeProgressiveRemoteReport(db, {
+        if (body.data.diagnostic && body.data.updates)
+          return reply.code(400).send({ error: "A diagnostic report requires its own publication" });
+        const publication = {
           solverId: solver.id,
           promiseId: body.data.promiseId,
           executionId: params.data.executionId,
           report: body.data.report,
-        });
+        };
+        const receipts = body.data.updates
+          ? await storeProgressiveRemoteReportBatch(db, publication, body.data.updates, client.signal)
+          : [await storeProgressiveRemoteReport(db, publication)];
+        const receipt = receipts[0]!;
         const retainedAttempt = body.data.diagnostic ? await prepareProgressiveRemoteReceiptReplay(db, {
           solverId: solver.id, promiseId: body.data.promiseId, engineJobId: params.data.executionId,
           aoaDeg: body.data.diagnostic.aoaDeg, engineCaseSlug: body.data.diagnostic.engineCaseSlug,
@@ -7371,9 +7389,11 @@ export async function registerSyncRoutes(app: FastifyInstance): Promise<void> {
             pointContentSignature: body.data.diagnostic.pointContentSignature,
           },
         }) : undefined;
-        return { received: true, receipt, ...(diagnosticReceipt ? { diagnosticReceipt } : {}),
+        return { received: true, receipt, ...(body.data.updates ? { receipts } : {}), ...(diagnosticReceipt ? { diagnosticReceipt } : {}),
           ...(retainedAttempt ? { progressiveEvidenceReceipts: [retainedAttempt] } : {}) };
       } catch (error) {
+        if (error instanceof ProgressiveReportBatchUnavailable)
+          return reply.code(409).send({ code: "progressive_report_batch_unavailable", error: error.message });
         if (error instanceof ProgressiveRemoteReportConflict)
           return reply.code(409).send({ error: error.message });
         if (error instanceof ProgressiveRemoteEvidenceConflict)
@@ -7381,6 +7401,8 @@ export async function registerSyncRoutes(app: FastifyInstance): Promise<void> {
         if (error instanceof ProgressiveCfdEvidenceScopePending)
           return reply.code(503).send({ code: "progressive_diagnostic_scope_pending", error: error.message });
         throw error;
+      } finally {
+        reply.raw.off("close", disconnect);
       }
     },
   );

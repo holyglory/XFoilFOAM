@@ -18,10 +18,11 @@ export async function createProgressiveReportFixture(input: {
   airfoilId: string;
   revisionId: string;
   bcId: string;
-  alpha: number;
+  alpha: number | number[];
 }) {
   const executionId = randomUUID();
-  const token = randomUUID();
+  const angles = Array.isArray(input.alpha) ? input.alpha : [input.alpha];
+  const tokens = angles.map(() => randomUUID());
   const scope: ProgressiveExecutionScope = {
     executionContract: "progressive-cfd-v1",
     executionId,
@@ -30,15 +31,13 @@ export async function createProgressiveReportFixture(input: {
     targetId: "a".repeat(64),
     recipeId: "b".repeat(64),
     stage: 2,
-    tokens: [token],
-    units: [
-      {
-        unitId: randomUUID(),
-        token,
-        alpha: input.alpha,
-        activeBudgetSeconds: 900,
-      },
-    ],
+    tokens,
+    units: angles.map((alpha, index) => ({
+      unitId: randomUUID(),
+      token: tokens[index]!,
+      alpha,
+      activeBudgetSeconds: 900,
+    })),
   };
   const envelope = sealProgressiveRemoteExecution({
     solverId: input.solverId,
@@ -53,7 +52,7 @@ export async function createProgressiveReportFixture(input: {
       airfoil: { name: "isolated non-executing report fixture" },
       chord_lengths: [1],
       speeds: [30],
-      aoa: { angles: [input.alpha] },
+      aoa: { angles },
       solver: { warm_start: true },
       resources: { case_concurrency: 1, case_solver_budget_seconds: 900 },
     },
@@ -65,7 +64,7 @@ export async function createProgressiveReportFixture(input: {
     bcIds: [input.bcId],
     referenceChordM: 1,
     status: "pending",
-    totalCases: 1,
+    totalCases: angles.length,
     admissionCpuSlots: 1,
     requestPayload: { progressive: scope, engineRequest: envelope.request },
   });
@@ -92,7 +91,7 @@ export async function createProgressiveReportFixture(input: {
     status: {
       job_id: executionId,
       state: "pending",
-      total_cases: 1,
+      total_cases: angles.length,
       completed_cases: 0,
     },
     result: null,

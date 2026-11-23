@@ -180,6 +180,29 @@ it("writes without a Storage client and restores exact text from both source kin
   }
 });
 
+it("scans decompressed chunks once for a large exact member and rejects a damaged tail", async () => {
+  const text = JSON.stringify({ manifest: "λ🌊".repeat(180_000), history: [1, 2, 3] });
+  const row = inline(text);
+  const good = gzipSync(row + "\r\n" + inline(second, 2) + "\n");
+  const ref = storedIdentity(good, text, { sequence: 1, memberCount: 2, firstSequence: 1, lastSequence: 2 });
+  const indexOf = String.prototype.indexOf;
+  let missedScanUnits = 0;
+  const scanned = vi.spyOn(String.prototype, "indexOf").mockImplementation(function (this: string, search, at) {
+    const found = indexOf.call(this, search, at);
+    if (search === "\n" && found < 0) missedScanUnits += this.length - (at ?? 0);
+    return found;
+  });
+  try {
+    const restored = await readProgressiveReportArchiveText(Readable.from([good]), ref);
+    expect(restored).toBe(text);
+  } finally { scanned.mockRestore(); }
+  expect(missedScanUnits).toBeLessThan(2 * row.length);
+  const truncated = gzipSync(row + "\n" + inline(second, 2));
+  await expect(readProgressiveReportArchiveText(Readable.from([truncated]),
+    storedIdentity(truncated, text, { sequence: 1, memberCount: 2, firstSequence: 1, lastSequence: 2 })))
+    .rejects.toThrow(/Truncated/);
+});
+
 it("reads legacy inline rows with report before later metadata and without inline member hashes", async () => {
   const meta = metadata(first);
   const row = `{"kind":"report","report":${first},"sourceKind":"remote","executionId":"${executionId}","sequence":1,"contentSignature":"${meta.contentSignature}"}`;

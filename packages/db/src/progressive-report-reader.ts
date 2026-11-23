@@ -32,6 +32,52 @@ export interface ProgressiveReportArchiveIdentity extends ProgressiveReportArchi
   signal: AbortSignal;
 }
 
+// Minted only after the exact generation, member bytes and signed content
+// have all verified. A parsed report supplied by a caller has no such pin.
+interface VerifiedArchiveMember {
+  identity: ProgressiveReportArchiveReadIdentity;
+  bundleId: string;
+}
+const archivedMembers = new WeakMap<ProgressiveRemoteReport, VerifiedArchiveMember>();
+export function verifiedProgressiveReportMember(report: ProgressiveRemoteReport) {
+  return archivedMembers.get(report);
+}
+
+export async function recheckRemoteReportMember(db: DB, proof: VerifiedArchiveMember) {
+  const i = proof.identity;
+  const [row] = await db.execute(sql`SELECT 1 FROM progressive_remote_reports r
+    JOIN public.progressive_report_archive_bundles b ON b.id=r.archive_bundle_id
+      AND b.source_kind='remote' AND b.sim_job_id=r.sim_job_id AND b.verified_at IS NOT NULL
+    JOIN public.progressive_report_archive_members m ON m.bundle_id=b.id AND m.source_kind=b.source_kind
+      AND m.sim_job_id=r.sim_job_id AND m.member_kind='report' AND m.sequence=r.sequence AND m.content_signature=r.content_signature
+    WHERE r.sim_job_id=${i.executionId}::uuid AND r.sequence=${i.sequence} AND r.content_signature=${i.signature}
+      AND r.archived_at IS NOT NULL AND b.id=${proof.bundleId}::uuid AND b.bucket=${i.bucket}
+      AND b.object_key=${i.objectKey} AND b.generation=${i.generation} AND b.crc32c=${i.crc32c}
+      AND b.stored_sha256=${i.storedSha256} AND b.stored_byte_size=${i.storedByteSize}
+      AND b.mime_type=${i.mimeType} AND b.archive_format=${i.archiveFormat} AND b.compression=${i.compression}
+      AND b.member_count=${i.memberCount} AND b.first_sequence=${i.firstSequence} AND b.last_sequence=${i.lastSequence}
+      AND m.report_sha256=${i.reportSha256} AND m.report_byte_size=${i.reportByteSize}`);
+  return Boolean(row);
+}
+
+/** The normal API logger records these verified identifiers. Its HTTP error
+ * response contains only the message. Do not attach report bodies or credentials. */
+export class ProgressiveReportArchiveTimeout extends Error {
+  readonly member;
+  constructor(identity: ProgressiveReportArchiveIdentity) {
+    super("Archived progressive full report read timed out");
+    this.member = {
+      sourceKind: identity.sourceKind,
+      executionId: identity.executionId,
+      sequence: identity.sequence,
+      contentSignature: identity.signature,
+      generation: identity.generation,
+      reportSha256: identity.reportSha256,
+      reportByteSize: identity.reportByteSize,
+    };
+  }
+}
+
 export interface ProgressiveReportArchiveReader {
   read(identity: ProgressiveReportArchiveIdentity, connection: DB): Promise<string>;
 }
@@ -133,8 +179,7 @@ export async function readProgressiveReport(
   const controller = new AbortController();
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
-    const body = await Promise.race([
-      active.reader.read({
+    const identity: ProgressiveReportArchiveIdentity = {
         sourceKind: reference.sourceKind, memberKind: "report", executionId: reference.executionId,
         sequence: reference.sequence, signature: reference.contentSignature,
         reportSha256: String(stored.report_sha256), reportByteSize,
@@ -149,10 +194,13 @@ export async function readProgressiveReport(
           ...(stored.legacy_local_storage_key ? { legacyLocalStorageKey: String(stored.legacy_local_storage_key) } : {}),
         } : {}),
         signal: controller.signal,
-      }, db),
+    };
+    Object.freeze(identity);
+    const body = await Promise.race([
+      active.reader.read(identity, db),
       new Promise<never>((_, reject) => {
         timer = setTimeout(() => {
-          reject(new Error("Archived progressive full report read timed out"));
+          reject(new ProgressiveReportArchiveTimeout(identity));
           controller.abort();
         }, active.timeoutMs);
       }),
@@ -166,7 +214,10 @@ export async function readProgressiveReport(
       throw new Error("Archived progressive full report member bytes changed");
     const parsed = parseReportJson(body);
     const signature = createHash("sha256").update(canonicalReportJson(parsed), "utf8").digest("hex");
-    return verifyBody(reportValidationValue(parsed), reference, signature);
+    const report = verifyBody(reportValidationValue(parsed), reference, signature);
+    if (identity.sourceKind === "remote")
+      archivedMembers.set(report, Object.freeze({ bundleId: String(stored.archive_bundle_id), identity }));
+    return report;
   } finally {
     clearTimeout(timer);
     controller.abort();

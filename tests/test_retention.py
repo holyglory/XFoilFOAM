@@ -1287,3 +1287,121 @@ def test_keep_media_pins_the_read_only_api_mount_without_changing_the_original_s
     writable_api = True
     with pytest.raises(ValueError, match="node-api container/volume"):
         lookup(True)
+
+
+def test_media_queue_uses_the_same_lane_and_recovers_a_real_persisted_effect(tmp_path, monkeypatch):
+    import runpy
+    operator = runpy.run_path(str(Path(__file__).resolve().parents[1] / "scripts/deploy/hz-closed-job-media-queue.py"))
+    process = operator["process"]
+    job, result, attempt, img = (f"00000000-0000-4000-8000-{n:012d}" for n in range(4))
+    path = "cases/point/evidence/scaled_media/p.png"
+    readback = {"brokeredUploadId": "source", "generation": "1", "storedSha256": "a"*64, "storedByteSize": 123}
+    plan = {"plan": "b"*64, "files": 1, "bytes": 9, "plannedAllocatedBytes": 4096,
+            "workingPaths": ["cases/old/p"], "mediaFiles": [{"path": path}, {"path": "cases/point/images/p.png"}]}
+    row = {"id": job, "expectedPointCount": 1, "media": [{"id": img, "attempt": attempt, "result": result, "field": "p",
+           "path": f"jobs/{job}/{path}", "sha": "c"*64, "bytes": 20, "hubAttempt": attempt,
+           "hubResult": result, "manifest": "d"*64}],
+           "objects": [{"upload": "source", "generation": "1", "sha": "a"*64, "bytes": 123}]}
+    receipt = {
+        "job": job, "helperRevision": "source", "helperSha256": "helper", "dependenciesSha256": "dependencies",
+        "nodePackagesSha256": "node", "nativePackages": {"worker": "worker", "gateway": "api"}, "jobsInode": [3, 4],
+        "deployLockInode": [5, 6], "lockInode": [7, 8], "jobInode": [9, 10], "containers": {"api": "frozen"},
+        "deployedRevision": "release", "readbacks": [readback], "points": [{"attemptId": attempt, "resultId": result,
+                                                      "canonicalAttemptId": attempt, "canonicalResultId": result}],
+        "scientificSha256": "science", "mediaSha256": "images", "plan": plan,
+        "keptMediaRows": [{"id": img, "resultId": result, "attemptId": attempt, "field": "p",
+                           "path": path, "sha256": "c"*64, "byteSize": 20, "evidenceSha256": "d"*64}],
+    }
+    with pytest.raises(ValueError, match="canonical point owners"):
+        operator["match_roster"](row, dict(receipt, databaseReadOnly=True, status="proved", settled=False,
+                                 points=[{**receipt["points"][0], "canonicalResultId": job}]))
+    calls = []
+
+    def invoke(_, mode, jid, expected=None, proof=None):
+        assert jid == job
+        calls.append(mode)
+        if mode == "proof":
+            return dict(receipt, databaseReadOnly=True, status="proved", settled=False)
+        assert expected == plan["plan"]
+        if mode == "reclaim":
+            assert json.loads(proof.read_bytes())["plan"] == plan
+            assert operator["read"](tmp_path / "pending" / (job + ".json"))["applying"]
+            raise RuntimeError("lost reply after native completion")
+        assert mode == "verify"
+        return dict(receipt, databaseReadOnly=True, status="verified", plan={**plan, "replayed": True})
+
+    monkeypatch.setitem(process.__globals__, "invoke", invoke)
+    lock = tmp_path / "operator.lock"
+    with operator["exclusive"](lock, create=True):
+        with pytest.raises(BlockingIOError), operator["exclusive"](lock):
+            pytest.fail("second operator acquired the active lane")
+        with pytest.raises(RuntimeError, match="lost reply"):
+            process(row, tmp_path, {}, receipt)
+        assert process(row, tmp_path, {}, receipt) == "verified"
+        assert process(row, tmp_path, {}, receipt) == "verified"
+    assert calls == ["proof", "reclaim", "verify"]
+    assert not list((tmp_path / "pending").glob("*.json"))
+    missing = tmp_path / "prior"
+    missing.mkdir()
+    operator["publish"](missing / "status.json", {"phase": "attention"})
+    assert not operator["predecessor_complete"]({"state": str(missing)}, [])
+    operator["publish"](missing / "status.json", {"phase": "complete", "total": 1, "nextOffset": 1,
+                                                   "examined": 1, "verified": 1, "deferred": 0})
+    with pytest.raises(ValueError, match="missing predecessor receipts"):
+        operator["predecessor_complete"]({"state": str(missing)}, [{"id": job, "plan": plan["plan"]}])
+
+
+@pytest.mark.parametrize("boundary", ["clear", "original-effect", "original-uncertain", "interrupted-read-only-slot"])
+def test_media_queue_runs_original_frozen_inventory_before_the_remaining_media(tmp_path, monkeypatch, boundary):
+    import runpy
+    module = runpy.run_path(str(Path(__file__).resolve().parents[1] / "scripts/deploy/hz-closed-job-media-queue.py"))
+    publish, run = module["publish"], module["run"]
+    state, old = tmp_path / "media", tmp_path / "original"
+    state.mkdir(mode=0o700)
+    old.mkdir()
+    (old / "operator.lock").touch()
+    lead, other, original, anchor = [f"00000000-0000-4000-8000-{n:012d}" for n in range(4)]
+    original_row = {"id": original, "plan": "a"*64}
+    previous, selected = tmp_path / "previous.jsonl", tmp_path / "selected.jsonl"
+    previous.write_text(json.dumps(original_row)+"\n")
+    selected.write_text("\n".join(json.dumps(r) for r in [{"id": lead, "measured": {"plan": "b"*64}}, {"id": other}])+"\n")
+    publish(old / "manifest.json", {})
+    publish(old / "status.json", {"phase": "checking"})
+    proof = tmp_path / "canary.json"
+    publish(proof, {"job": anchor})
+    if boundary == "original-effect":
+        publish(old / "pending" / "work.json", {"effect": {"settled": True}})
+    if boundary == "original-uncertain":
+        publish(old / "pending" / "work.json", {"startedAt": "before lost response"})
+    if boundary == "interrupted-read-only-slot":
+        publish(state / "named-slot.json", {"job": lead})
+    sha = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
+    old_config = {"repository": str(old), "state": str(old), "inventory": str(previous), "sha256": sha(previous),
+                  "manifestSha256": sha(old / "manifest.json"), "runtimeProof": str(proof), "runtimeProofSha256": sha(proof)}
+    config = {"state": str(state), "previous": old_config, "operator": {}, "runtimeProof": str(proof),
+              "runtimeProofSha256": sha(proof), "inventory": str(selected), "sha256": sha(selected), "lead": lead}
+    calls = []
+    def one(row, s, installation, runtime):
+        calls.append(row["id"])
+        with pytest.raises(BlockingIOError), module["exclusive"](old / "operator.lock"):
+            pytest.fail("media and raw inventory overlapped")
+        publish(s / "receipts" / (row["id"]+".json"), {"job": row["id"], "outcome": "verified"})
+        return "verified"
+    def prior(argv, cwd, check):
+        assert argv[1:] == ["run-inventory", str(previous), "--sha256", sha(previous), "--state", str(old),
+                            "--runtime-proof", str(proof), "--apply"]
+        with module["exclusive"](old / "operator.lock"):
+            calls.append(original)
+            (old / "pending" / "work.json").unlink(missing_ok=True)
+            publish(old / "receipts" / "00000.json", {"index": 0, "target": original_row, "outcome": "verified"})
+            publish(old / "status.json", {"phase": "complete", "verified": 1, "deferred": 0, "total": 1,
+                                          "nextOffset": 1, "examined": 1})
+    monkeypatch.setitem(run.__globals__, "process", one)
+    monkeypatch.setitem(run.__globals__, "command", lambda _: ["frozen"])
+    monkeypatch.setitem(run.__globals__, "anchor_read", lambda *_: {})
+    monkeypatch.setattr(module["subprocess"], "run", prior)
+    run(config, "contract")
+    assert calls == ([lead, original, other] if boundary == "clear" else [original, lead, other])
+    calls.clear()
+    run(config, "contract")
+    assert not calls and module["read"](state / "status.json")["verified"] == 2

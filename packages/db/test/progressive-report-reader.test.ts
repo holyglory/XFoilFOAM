@@ -170,7 +170,10 @@ it("bounds a stalled restore, aborts the transport and preserves the archived ro
       return new Promise<string>((_resolve, reject) => identity.signal.addEventListener("abort", () => reject(new Error("aborted")), { once: true }));
     } }, { timeoutMs: 20 });
     const before = await db.execute(sql`SELECT to_jsonb(report.*) AS row FROM ${table} report`);
-    await expect(readProgressiveReport(db, reference)).rejects.toThrow("timed out");
+    await expect(readProgressiveReport(db, reference)).rejects.toMatchObject({
+      message: "Archived progressive full report read timed out",
+      member: { ...reference, generation: expect.any(String), reportSha256: expect.stringMatching(/^[a-f0-9]{64}$/), reportByteSize: expect.any(Number) },
+    });
     expect(signal?.aborted).toBe(true);
     expect(await db.execute(sql`SELECT to_jsonb(report.*) AS row FROM ${table} report`)).toEqual(before);
   });

@@ -14,6 +14,7 @@ import type { EngineClient, JobResult } from "@aerodb/engine-client";
 import { assertProgressiveWorkerEvidenceJob } from "./progressive-remote-jobs";
 import { progressiveStagingSelectionSql } from "./progressive-staging-selection";
 import { ingestResult } from "./ingest";
+import { coverHistoricalWorkerStagingCopies } from "./progressive-worker-staging-copies";
 import { existingProgressiveReportAttempts } from "./progressive-evidence-reuse";
 import {
   DEFAULT_INGEST_LEASE_MS,
@@ -84,7 +85,12 @@ async function claimProgressiveWorkerEvidence(
       ORDER BY report.sequence LIMIT 1 FOR UPDATE OF job SKIP LOCKED
     `);
     if (!candidate) return null;
-    const report = await resolveStoredProgressiveReport(connection, "worker", candidate, executionId);
+    const report = await resolveStoredProgressiveReport(
+      connection,
+      "worker",
+      candidate,
+      executionId,
+    );
     const sequence = Number(candidate.sequence);
     const result = report.result as JobResult;
     await assertProgressiveWorkerEvidenceJob(connection, {
@@ -312,14 +318,30 @@ export async function stageNextProgressiveWorkerEvidence(
   try {
     const claimed = await db.transaction(async (transaction) => {
       const connection = transaction as unknown as DB;
-      const [selected] = await connection.execute(
-        progressiveStagingSelectionSql(hooks.preferActive === true),
-      );
+      const [selected] = await connection.execute(sql`
+        SELECT pick.*, EXISTS(SELECT 1 FROM public.sim_jobs j WHERE j.id=pick.sim_job_id
+          AND j.status IN ('done','failed','cancelled') AND j."ingestedAt" IS NOT NULL) AS closed_history
+        FROM (${progressiveStagingSelectionSql(hooks.preferActive === true)}) pick`);
       if (!selected) return null;
       pending = {
         sim_job_id: String(selected.sim_job_id),
         sequence: Number(selected.sequence),
       };
+      if (selected.closed_history === true) {
+        const { sim_job_id, sequence } = pending;
+        // An unavailable optional proof must not create a staging-failure
+        // receipt for a usable report. Roll its entire proof page back first.
+        const covered = await connection
+          .transaction((tx) =>
+            coverHistoricalWorkerStagingCopies(
+              tx as unknown as DB,
+              sim_job_id,
+              sequence,
+            ),
+          )
+          .catch(() => 0);
+        if (covered > 0) return { covered };
+      }
       return claimProgressiveWorkerEvidence(
         connection,
         pending.sim_job_id,
@@ -327,6 +349,7 @@ export async function stageNextProgressiveWorkerEvidence(
       );
     });
     if (!claimed) return false;
+    if ("covered" in claimed) return true;
     return (
       (await stageClaimedProgressiveWorkerEvidence(db, engine, claimed, hooks))
         .kind === "staged"

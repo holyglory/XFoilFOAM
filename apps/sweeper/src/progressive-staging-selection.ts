@@ -16,6 +16,8 @@ export function progressiveStagingSelectionSql(preferActive: boolean) {
         AND settings.upstream_base_url IS NOT NULL
         AND report.acknowledged_at IS NOT NULL
         AND jsonb_typeof(report.report->'result') = 'object'
+        AND NOT EXISTS (SELECT 1 FROM public.progressive_worker_closed_staging_copies covered
+          WHERE covered.sim_job_id=report.sim_job_id AND covered.sequence=report.sequence)
         AND NOT EXISTS (SELECT 1 FROM progressive_worker_report_conflicts conflict
           WHERE conflict.sim_job_id = report.sim_job_id AND conflict.sequence = report.sequence)
         AND (failure.sim_job_id IS NULL OR failure.retry_after <= clock_timestamp())

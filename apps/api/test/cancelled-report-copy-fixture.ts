@@ -12,6 +12,7 @@ import {
   type ProgressiveRemoteEvidenceDelivery,
   type ProgressiveRemoteReport,
 } from "@aerodb/db";
+import { prepareProgressiveRemoteEvidence, resolveProgressiveRemoteEvidence } from "@aerodb/db/progressive-remote-evidence";
 import { readProgressiveRemoteRetention } from "@aerodb/db/progressive-remote-retention";
 import { resolveProgressiveReportedPoint } from "@aerodb/db/progressive-remote-report";
 import {
@@ -20,6 +21,7 @@ import {
 } from "@aerodb/db/progressive-report-archive";
 import {
   installProgressiveReportArchiveReader,
+  recheckRemoteReportMember, verifiedProgressiveReportMember,
   readProgressiveReport,
 } from "@aerodb/db/progressive-report-reader";
 import { nextCancelledReportCopies } from "../../sweeper/src/cancelled-report-copies";
@@ -245,7 +247,31 @@ export async function verifyCancelledReportCopyReplay(
       warmBody.progressiveArchiveReceipts,
     );
     expect(replay.json().fulfilledAoas).toEqual([]);
-    expect(reads).toBeGreaterThan(0);
+    expect(reads).toBe(1);
+    const reference = { ...delivery, progressiveEvidence: { ...latePoint.progressiveEvidence } };
+    const selected = await prepareProgressiveRemoteEvidence(db, reference);
+    expect(selected?.contentSignature).toBe(delivery.progressiveEvidence.pointContentSignature);
+    const rechecked = await resolveProgressiveRemoteEvidence(db, reference);
+    expect(rechecked!.report).toBe(selected!.report);
+    expect(Object.isFrozen(rechecked!.point)).toBe(true);
+    const archived = await readProgressiveReport(db, {
+      sourceKind: "remote", executionId: id, sequence: copy.sequence, contentSignature: copyReceipt.contentSignature,
+    });
+    const pin = verifiedProgressiveReportMember(archived)!;
+    expect(await recheckRemoteReportMember(db, pin)).toBe(true);
+    for (const changed of [{ generation: String(BigInt(pin.identity.generation) - 1n) },
+      { reportSha256: "0".repeat(64) }, { reportByteSize: pin.identity.reportByteSize + 1 }]) {
+      expect(await recheckRemoteReportMember(db, { ...pin, identity: { ...pin.identity, ...changed } })).toBe(false);
+    }
+    const preparedReads = reads;
+    for (const changed of [
+      { ...reference, engineCaseSlug: "foreign-solver-case" },
+      { ...reference, aoaDeg: reference.aoaDeg + 0.25 },
+      { ...reference, solverId: randomUUID() },
+    ]) {
+      await expect(resolveProgressiveRemoteEvidence(db, changed)).rejects.toThrow();
+    }
+    expect(reads).toBe(preparedReads);
     expect(
       (
         await readProgressiveReport(db, {

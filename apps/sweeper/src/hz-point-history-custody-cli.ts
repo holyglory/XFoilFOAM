@@ -88,6 +88,59 @@ export async function handleHzHistoryRequest(
     hubReadbackAt: request.hubReadbackAt,
   });
 }
+/** All retryable SQL states here mean PostgreSQL refused/rolled back the
+ * bounded transaction. Never infer a retry from error text or stderr. */
+export function hzHistoryWorkerFailure(operation: unknown, error: unknown) {
+  if (error instanceof HistoryOperationError) return error;
+  const step =
+    typeof operation === "string" &&
+    ["hello", "status", "scan", "prepare", "store", "apply"].includes(operation)
+      ? operation
+      : "request";
+  let cause: unknown = error;
+  const reasons: Record<string, string> = {
+    "55P03": "lock_timeout",
+    "40001": "serialization",
+    "40P01": "deadlock",
+  };
+  for (
+    let depth = 0;
+    depth < 4 && cause && typeof cause === "object";
+    depth++
+  ) {
+    const { code, cause: next } = cause as { code?: unknown; cause?: unknown };
+    if (
+      step !== "store" &&
+      step !== "request" &&
+      typeof code === "string" &&
+      Object.hasOwn(reasons, code)
+    ) {
+      // Protocol-v1 controllers already back off on this wire category.
+      // The operation names the exact reason; new controllers display it as DB contention.
+      return new HistoryOperationError(
+        `worker_${step}_${reasons[code]}`,
+        "transport",
+        true,
+      );
+    }
+    if (
+      typeof code === "string" &&
+      [
+        "23503",
+        "23505",
+        "23514",
+        "42P01",
+        "57014",
+        "ENOSPC",
+        "EIO",
+        "EACCES",
+      ].includes(code)
+    )
+      return new HistoryOperationError(`worker_${step}_${code}`, "integrity");
+    cause = next;
+  }
+  return new HistoryOperationError(`worker_${step}`, "integrity");
+}
 export async function runHzHistoryWorker() {
   if (
     process.env.AIRFOILFOAM_DEPLOYMENT_ROLE !== "remote-solver" ||
@@ -118,20 +171,14 @@ export async function runHzHistoryWorker() {
         const result = await handleHzHistoryRequest(client.db, request);
         await channel.send({ id: request.id, result });
       } catch (error) {
+        const failure = hzHistoryWorkerFailure(request.operation, error);
         await channel.send({
           id: request.id,
-          error:
-            error instanceof HistoryOperationError
-              ? {
-                  operation: error.operation,
-                  category: error.category,
-                  retryable: error.retryable,
-                }
-              : {
-                  operation: "worker",
-                  category: "integrity",
-                  retryable: false,
-                },
+          error: {
+            operation: failure.operation,
+            category: failure.category,
+            retryable: failure.retryable,
+          },
         });
       }
     }

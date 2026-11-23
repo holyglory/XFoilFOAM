@@ -10,6 +10,7 @@ export class HistoryOperationError extends Error {
       | "denied"
       | "integrity"
       | "deployment_busy"
+      | "database_busy"
       | "input"
       | "local_io",
     readonly retryable = false,
