@@ -129,6 +129,7 @@ import { z } from "zod";
 import { requireAdmin } from "./admin-auth";
 // Machine sync requests and their nested helpers share the sync pool. Admin
 // GETs explicitly pass the interactive connection through their read model.
+import { installSyncAdmission, assertSyncClientActive, syncRequestSignal, syncLookupTime } from "./sync-admission";
 import { advisoryLockSql, syncDb as db, db as interactiveDb } from "./db";
 import {
   resolveEngineRuntimeBuild,
@@ -772,16 +773,18 @@ async function ensureSyncRows(): Promise<void> {
 }
 
 async function getSettings(database: DB = db) {
-  const [settings] = await database
-    .select()
-    .from(syncApiSettings)
-    .where(eq(syncApiSettings.id, 1))
-    .limit(1);
-  const permissions = await database
-    .select()
-    .from(syncApiPermissions)
-    .orderBy(asc(syncApiPermissions.dataType));
-  return { settings: settings!, permissions };
+  return syncLookupTime("settingsMs", async () => {
+    const [settings] = await database
+      .select()
+      .from(syncApiSettings)
+      .where(eq(syncApiSettings.id, 1))
+      .limit(1);
+    const permissions = await database
+      .select()
+      .from(syncApiPermissions)
+      .orderBy(asc(syncApiPermissions.dataType));
+    return { settings: settings!, permissions };
+  });
 }
 
 async function expirePromises(): Promise<void> {
@@ -859,6 +862,7 @@ async function requireSync(
       return null;
     }
   }
+  assertSyncClientActive();
   return ctx;
 }
 
@@ -882,7 +886,7 @@ async function requireRegisteredRemoteSolver(
     return null;
   }
   const digest = solverTokenHash(token);
-  const rows = await db
+  const rows = await syncLookupTime("registrationMs", () => db
     .select()
     .from(registeredRemoteSolvers)
     .where(
@@ -897,7 +901,7 @@ async function requireRegisteredRemoteSolver(
             isNull(registeredRemoteSolvers.revokedAt),
           ),
     )
-    .limit(2);
+    .limit(2));
   const [solver] = rows;
   if (rows.length !== 1 || !solver?.authTokenHash) {
     reply
@@ -916,6 +920,7 @@ async function requireRegisteredRemoteSolver(
       .send({ error: "invalid or revoked remote solver credential" });
     return null;
   }
+  assertSyncClientActive();
   return solver;
 }
 
@@ -7129,6 +7134,7 @@ async function runUpstreamSync(
 }
 
 export async function registerSyncRoutes(app: FastifyInstance): Promise<void> {
+  installSyncAdmission(app);
   await ensureSyncRows();
   await registerLegacyWorkerReportReadRoutes(app, {
     authenticate: requireRegisteredRemoteSolver,
@@ -7375,13 +7381,14 @@ export async function registerSyncRoutes(app: FastifyInstance): Promise<void> {
         if (body.data.diagnostic && body.data.updates)
           return reply.code(400).send({ error: "A diagnostic report requires its own publication" });
         const publication = {
+          signal: syncRequestSignal() ?? client.signal,
           solverId: solver.id,
           promiseId: body.data.promiseId,
           executionId: params.data.executionId,
           report: body.data.report,
         };
         const receipts = body.data.updates
-          ? await storeProgressiveRemoteReportBatch(db, publication, body.data.updates, client.signal)
+          ? await storeProgressiveRemoteReportBatch(db, publication, body.data.updates, publication.signal)
           : [await storeProgressiveRemoteReport(db, publication)];
         const receipt = receipts[0]!;
         const retainedAttempt = body.data.diagnostic ? await prepareProgressiveRemoteReceiptReplay(db, {

@@ -32,7 +32,7 @@ import { and, eq } from "drizzle-orm";
 import { createHash } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 
-import { db, sql as interactiveSql, syncSql, advisoryLockSql, closeDatabasePools } from "../src/db";
+import { db, sql as interactiveSql, syncSql, syncControlSql, advisoryLockSql, closeDatabasePools } from "../src/db";
 import { verifyInteractivePool } from "./interactive-pool-fixture";
 import { buildServer } from "../src/server";
 import { loadSolverHistorySource } from "@aerodb/db/solver-history-storage";
@@ -463,7 +463,7 @@ describe("public exact-generation reads", () => {
     expect(
       interactiveSql.options.max +
         PUBLIC_POINT_CONNECTIONS +
-        syncSql.options.max,
+        syncSql.options.max + syncControlSql.options.max,
     ).toBe(10);
     expect(advisoryLockSql.options.max).toBe(16);
     const reader = new PublicPointReader();
@@ -508,6 +508,7 @@ describe("public exact-generation reads", () => {
       expect(completed.detail?.resultId).toBe(resultId);
       expect(completed.timing.handoffMs).toBeGreaterThan(150);
     } finally {
+      serving.server.closeAllConnections();
       await serving.close();
     }
   }, 45_000);
