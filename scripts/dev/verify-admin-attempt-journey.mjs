@@ -9,7 +9,7 @@ import {
   originFromDeployment,
 } from "./progressive-preview-origin.mjs";
 
-const deployment = progressivePreviewDeployment({ name: "catalog-paging" });
+const deployment = progressivePreviewDeployment({ name: "campaign-stage-preview" });
 const origin = originFromDeployment(deployment);
 assert.equal(new URL(origin).hostname, "127.0.0.1");
 const api = await request.newContext({ baseURL: origin });
