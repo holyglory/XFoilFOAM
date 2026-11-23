@@ -32,6 +32,7 @@ it("acknowledges the real hub handshake before any upload, keeps exact generatio
       string,
       { bytes: Buffer; generation: string; crc32c: string; metadata: any }
     >();
+  let interruptMedia: (() => Promise<never>) | undefined;
   let wrongAccount = false,
     corrupt = false,
     puts = 0;
@@ -82,10 +83,16 @@ it("acknowledges the real hub handshake before any upload, keeps exact generatio
     if (!object) return new Response("missing", { status: 404 });
     if (url.searchParams.has("generation"))
       expect(url.searchParams.get("generation")).toBe(object.generation);
-    if (url.searchParams.get("alt") === "media")
+    if (url.searchParams.get("alt") === "media") {
+      if (interruptMedia) {
+        const fail = interruptMedia;
+        interruptMedia = undefined;
+        await fail();
+      }
       return new Response(
         new Uint8Array(corrupt ? Buffer.from("bad") : object.bytes),
       );
+    }
     return new Response(
       JSON.stringify({
         ...object.metadata,
@@ -143,8 +150,57 @@ it("acknowledges the real hub handshake before any upload, keeps exact generatio
   expect(puts).toBe(1);
   expect(second.identity.generation).toBe(first.identity.generation);
   expect((await store.read(first.identity)).equals(first.packed)).toBe(true);
+  for (const fail of [
+    async () => {
+      const deadline = AbortSignal.timeout(2);
+      await new Promise<void>((done) =>
+        deadline.addEventListener("abort", () => done(), { once: true }),
+      );
+      throw deadline.reason;
+    },
+    async () => {
+      throw new TypeError("private URL and secret", {
+        cause: Object.assign(new Error("sensitive transport detail"), {
+          code: "ECONNRESET",
+        }),
+      });
+    },
+  ]) {
+    interruptMedia = fail;
+    await client.send({
+      id: "lost-after-upload",
+      operation: "put",
+      instance: "fixture-hz",
+      source,
+    });
+    const lost = await client.read();
+    expect(lost.error).toEqual({
+      operation: "hub_history_put_transport",
+      category: "transport",
+      retryable: true,
+    });
+    await client.send({
+      id: "retry-exact",
+      operation: "read",
+      identity: putResponse.result.identity,
+    });
+    const recovered = await client.read();
+    expect(boundedPacked(recovered.result.packed)).toEqual(first.packed);
+    expect(objects.size).toBe(1);
+    expect(puts).toBe(1);
+  }
   corrupt = true;
   await expect(store.read(first.identity)).rejects.toThrow();
+  await client.send({
+    id: "corrupt",
+    operation: "read",
+    identity: putResponse.result.identity,
+  });
+  expect((await client.read()).error).toEqual({
+    operation: "hub_history",
+    category: "integrity",
+    retryable: false,
+  });
   corrupt = false;
   wrongAccount = true;
   await expect(store.read(first.identity)).rejects.toThrow(/identity/);
