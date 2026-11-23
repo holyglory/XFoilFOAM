@@ -1007,12 +1007,9 @@ test.describe
     await page.route(
       new RegExp(`/api/admin/campaigns/${launched.campaign.id}(?:\\?.*)?$`),
       async (route) => {
-        const response = await route.fetch();
-        const body = (await response.json()) as Record<string, unknown>;
         await route.fulfill({
-          response,
           json: {
-            ...body,
+            ...summary,
             solverIncidents: {
               threshold: 3,
               occurrenceCount: 7,
@@ -1694,6 +1691,7 @@ test.describe
     await expect
       .poll(() => page.evaluate(() => window.scrollY))
       .toBe(narrowOriginalScrollY);
+    await page.unrouteAll({ behavior: "wait" });
   });
 
   test("campaign instrument matches the approved option-3 geometry contract", async ({
