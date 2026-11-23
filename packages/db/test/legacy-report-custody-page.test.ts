@@ -222,6 +222,78 @@ it("rejects invalid UTF-8 even when the stored chunk and every reference agree o
   expect(() => inspectLegacyPage(packed)).toThrow("Invalid legacy UTF-8 bytes");
 });
 
+it.each([0, 1])("restores every sibling across a shared UTF-8 prefix split %i bytes into a character", async (split) => {
+  const input = fixture(2);
+  const chunks = new Map<string, string>();
+  const reference = (value: Buffer) => {
+    const key = digest(value);
+    chunks.set(key, value.toString("base64"));
+    return key;
+  };
+  const members = input.page.members.map((original) => {
+    const report = { note: "stored 🚀", ...JSON.parse(original.reportText) };
+    const reportText = JSON.stringify(report);
+    const contentSignature = analysisContentHash(report);
+    const rowText = JSON.stringify({ ...JSON.parse(original.rowText), content_signature: contentSignature, report });
+    return { ...original, contentSignature, reportText, rowText, reportSha256: digest(reportText),
+      reportByteSize: Buffer.byteLength(reportText), rowSha256: digest(rowText) };
+  });
+  const cut = Buffer.byteLength('{"note":"stored ') + split;
+  const records = members.map(({ rowText, reportText, ...identity }) => {
+    const body = Buffer.from(reportText);
+    return { type: "member", ...identity, rowChunks: [reference(Buffer.from(rowText))],
+      reportChunks: [reference(body.subarray(0, cut)), reference(body.subarray(cut))] };
+  });
+  const { members: _members, ...header } = input.page;
+  const pack = () => gzipSync([
+    { ...header, type: "header", encoding: "sha256-chunks-v1" },
+    ...Array.from(chunks, ([sha256, base64]) => ({ type: "chunk", sha256, base64 })),
+    ...records, { type: "end", memberCount: records.length },
+  ].map((line) => JSON.stringify(line)).join("\n") + "\n");
+  const bytes = pack();
+  const page = inspectLegacyPage(bytes).page;
+  expect(page.members).toEqual(members);
+  const sha256 = digest(bytes);
+  const object = { ...input.object, sha256, byteSize: bytes.length,
+    objectKey: input.object.objectKey.replace(input.object.sha256, sha256) };
+  const readPage = vi.fn(async () => Buffer.from(bytes));
+  const proof = await verifyLegacyReportCustodyPage({ page, object, access: { mode: "registered-get", reader: { readPage } } });
+  expect(readPage).toHaveBeenCalledOnce();
+  expect(proof.memberProofs.map((p) => p.reportSha256)).toEqual(members.map((m) => m.reportSha256));
+  records[1].reportChunks[1] = records[0].reportChunks[1];
+  expect(() => inspectLegacyPage(pack())).toThrow("Exact legacy member proof failed");
+});
+
+it.each(["rowText", "reportText", "rowSha256", "reportSha256"] as const)(
+  "checks the actual snapshot when a decoded member's %s is changed", async (field) => {
+    const input = fixture(2);
+    const page = inspectLegacyPage(input.bytes).page;
+    page.members[0][field] = page.members[1][field];
+    const readPage = vi.fn(async () => input.bytes);
+    await expect(verifyLegacyReportCustodyPage({ page, object: input.object,
+      access: { mode: "registered-get", reader: { readPage } } })).rejects.toThrow("exact exported PostgreSQL text");
+    expect(readPage).not.toHaveBeenCalled();
+  },
+);
+
+it("charges every occurrence of a shared prefix against the logical page limit", () => {
+  const { members: [first], ...header } = fixture(1).page;
+  const bytes = Buffer.alloc(64 * 1024, "a"), chunk = digest(bytes);
+  const count = 33;
+  const report = Buffer.concat(Array<Buffer>(count).fill(bytes));
+  const { rowText, reportText: _report, ...identity } = first;
+  const member = { ...identity, type: "member", rowChunks: [digest(rowText)], reportChunks: Array<string>(count).fill(chunk),
+    reportSha256: digest(report), reportByteSize: report.length };
+  const packed = gzipSync([
+    { ...header, type: "header", encoding: "sha256-chunks-v1" },
+    { type: "chunk", sha256: chunk, base64: bytes.toString("base64") },
+    { type: "chunk", sha256: digest(rowText), base64: Buffer.from(rowText).toString("base64") },
+    ...Array.from({ length: 128 }, (_, index) => ({ ...member, sequence: index + 1 })),
+    { type: "end", memberCount: 128 },
+  ].map((line) => JSON.stringify(line)).join("\n") + "\n");
+  expect(() => inspectLegacyPage(packed)).toThrow("Legacy decoded page exceeds logical byte bound");
+});
+
 it("refuses an oversized page object before either transport reads it", async () => {
   const input = fixture();
   const readHubObject = vi.fn(async () => input.bytes);

@@ -5,7 +5,7 @@ import { LEGACY_HASH, LEGACY_UUID, legacyBound, type LegacyReportMember } from "
 import { canonicalReportJson, reportJsonObject, parseReportJson, reportTextIdentity, reportValidationValue, type ProgressiveReportArchiveReadIdentity } from "./progressive-report-archive";
 import type { JobResult } from "../../engine-client/src/types";
 import { progressiveReportedPointSources } from "./progressive-remote-report";
-import { readLegacyPageMembers } from "./legacy-report-storage-codec";
+import { legacyMemberTextProof, readLegacyPageMembers, sameLegacyMemberText } from "./legacy-report-storage-codec";
 
 export interface LegacyCustodyObject {
   bucket: string;
@@ -284,7 +284,8 @@ export async function verifyLegacyReportCustodyPage(
   // Copy scalar identities before any asynchronous operation. A caller cannot
   // retarget a verified read by mutating its receipt while the GET is pending.
   if (!input.page || !Array.isArray(input.page.members)) throw new Error("Invalid legacy custody page");
-  const page = { ...input.page, members: input.page.members.map((member) => ({ ...member })) };
+  const sourceMembers = [...input.page.members];
+  const page = { ...input.page, members: sourceMembers.map((member) => ({ ...member })) };
   const object = Object.freeze({ ...input.object });
   const sourceAccess = input.access;
   if (!sourceAccess || !["registered-get", "hub-local-reader"].includes(sourceAccess.mode))
@@ -307,15 +308,14 @@ export async function verifyLegacyReportCustodyPage(
   let previousScientific: VerifiedScientificResult | undefined;
   const keys = new Set<string>();
   let bytes = 0;
-  for (const member of page.members) {
+  for (const [index, member] of page.members.entries()) {
     if (!["report", "conflict"].includes(member.kind) || !LEGACY_UUID.test(member.executionId) ||
       !LEGACY_HASH.test(member.contentSignature) || !LEGACY_HASH.test(member.reportSha256) ||
       !LEGACY_HASH.test(member.rowSha256) || member.solverId !== page.solverId)
       throw new Error("Legacy custody member has an invalid or foreign immutable identity");
     legacyBound(member.sequence, Number.MAX_SAFE_INTEGER, "legacy member sequence");
-    const body = reportTextIdentity(member.reportText);
-    const row = reportTextIdentity(member.rowText);
-    if (body.sha256 !== member.reportSha256 || body.byteSize !== member.reportByteSize || row.sha256 !== member.rowSha256)
+    const text = legacyMemberTextProof(member, sourceMembers[index]);
+    if (text.reportSha256 !== member.reportSha256 || text.reportByteSize !== member.reportByteSize || text.rowSha256 !== member.rowSha256)
       throw new Error("Legacy member differs from its exact exported PostgreSQL text");
     const rowFields = previousScientific && member.kind === "report" && member.rowText.length < member.reportText.length
       ? new Map<string, string>() : undefined;
@@ -326,11 +326,10 @@ export async function verifyLegacyReportCustodyPage(
     const key = `${member.kind}:${member.executionId}:${member.sequence}`;
     if (keys.has(key)) throw new Error("Duplicate legacy custody member");
     keys.add(key);
-    bytes += body.byteSize + row.byteSize;
+    bytes += text.reportByteSize + text.rowByteSize;
     legacyBound(bytes, MAX_PAGE_BYTES, "legacy custody page bytes");
     members.push({ kind: member.kind, executionId: member.executionId, sequence: member.sequence,
-      contentSignature: member.contentSignature, reportSha256: body.sha256, reportByteSize: body.byteSize,
-      rowSha256: row.sha256, rowByteSize: row.byteSize });
+      contentSignature: member.contentSignature, ...text });
     previousScientific = collectScientificSource(member, scientificResults, previousScientific,
       source.result_payload_hash, rowFields?.get("report"));
   }
@@ -366,7 +365,7 @@ export async function verifyLegacyReportCustodyPage(
           sourceInstance: page.sourceInstance, solverId: page.solverId, scopeSha256: page.scopeSha256, members: memberProofs,
         });
         for (let index = 0; index < reconstructed.length; index++)
-          if (reconstructed[index].reportText !== page.members[index].reportText || reconstructed[index].rowText !== page.members[index].rowText)
+          if (!sameLegacyMemberText(reconstructed[index], page.members[index], sourceMembers[index]))
             throw new Error("Product page reader returned different exact legacy member bytes");
         checkActive();
       };
