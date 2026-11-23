@@ -37,7 +37,10 @@ import {
   parseLegacyCustodyWorkerFailure,
 } from "../src/legacy-report-storage-custody-worker";
 import { LegacyHubSshStore } from "../src/legacy-report-storage-hub";
-import { LegacyPeerOccupied } from "../src/legacy-report-peer-memory";
+import {
+  LegacyPeerOccupied,
+  openLegacyPeerBudget,
+} from "../src/legacy-report-peer-memory";
 import { runLegacyUntilComplete } from "../src/legacy-report-storage-loop";
 import {
   LegacyOperatorPaused,
@@ -769,10 +772,21 @@ describe.sequential("worker-only legacy backup and 0198 representation", () => {
     const path = await directory(),
       store = new MemoryBackup();
     const ids = scope.executions.map((x) => x.executionId);
+    const firstBudgets = new Map<string, number>();
+    const watched: LegacySqlReader = {
+      ...source,
+      async readMember(id, kind, seq, cap) {
+        if (!firstBudgets.has(id)) firstBudgets.set(id, cap);
+        return source.query(
+          legacyMemberSql(id, kind, seq, cap),
+          cap * 6 + 1024 ** 2,
+        );
+      },
+    };
     const options = {
       slots: 2 as const,
       targetBinding: "long-two",
-      peerSource: source,
+      peerSource: watched,
       openBudget: async () => ({
         admit: true,
         finish: async () => ({
@@ -785,14 +799,14 @@ describe.sequential("worker-only legacy backup and 0198 representation", () => {
     };
     const specs = {
       scope,
-      source,
+      source: watched,
       store,
       directory: path,
       sourceBinding: "multi-long",
       executionSupervisor: options,
       rows: 128,
       pages: 4,
-      maxBytes: 128 * 1024 ** 2,
+      maxBytes: 256 * 1024 ** 2,
       applyVerifiedPage: async () => undefined,
     };
     const initial = await exportLegacyReports(specs);
@@ -842,6 +856,9 @@ describe.sequential("worker-only legacy backup and 0198 representation", () => {
       }
       start = r.next;
     }
+    expect(firstBudgets.get(ids[0])).toBe(128 * 1024 ** 2);
+    expect(firstBudgets.get(ids[2])).toBe(128 * 1024 ** 2);
+    expect(firstBudgets.get(ids[1])).toBe(256 * 1024 ** 2);
     expect(start).toEqual(next);
     expect(memberKeys.size).toBe(
       scope.executions.reduce((n, e) => n + e.reports, 0),
@@ -851,6 +868,85 @@ describe.sequential("worker-only legacy backup and 0198 representation", () => {
     );
   }, 90000);
 
+  it("runs a full ordinary 256 MiB head when the optional sampler is unavailable", async () => {
+    const a = await fixture(false),
+      b = await fixture(false, a.solverId);
+    const scope = {
+      ...a,
+      executions: [...a.executions, ...b.executions].sort((x, y) =>
+        x.executionId.localeCompare(y.executionId),
+      ),
+    };
+    const path = await directory(),
+      store = new MemoryBackup(),
+      budgets: number[] = [];
+    const real = {
+      ...source,
+      async readMember(
+        id: string,
+        kind: legacyCodec.LegacyBackupPage["members"][number]["kind"],
+        seq: number,
+        bytes: number,
+      ) {
+        budgets.push(bytes);
+        return source.query(
+          legacyMemberSql(id, kind, seq, bytes),
+          bytes * 6 + 1024 ** 2,
+        );
+      },
+    };
+    const previousPath = process.env.PATH;
+    await writeFile(
+      join(path, "ssh"),
+      "#!/bin/sh\nprintf invalid-sample\\n\nexit 1\n",
+      { mode: 0o700 },
+    );
+    vi.stubEnv("PATH", path + ":" + previousPath);
+    try {
+      const result = await exportLegacyReports({
+        scope,
+        directory: path,
+        store,
+        source: real,
+        sourceBinding: "capacity-fallback",
+        rows: 2,
+        pages: 2,
+        maxBytes: 256 * 1024 ** 2,
+        executionSupervisor: {
+          slots: 2,
+          targetBinding: "working-volume",
+          peerSource: real,
+          openBudget: () =>
+            openLegacyPeerBudget(
+              "fixture-worker.invalid",
+              "fixture-sweeper",
+              8192,
+              4096,
+            ),
+        },
+        applyVerifiedPage: async (page, receipt) => {
+          expect(
+            decodeLegacyPage(await store.read(receipt.object), receipt).members,
+          ).toEqual(page.members);
+        },
+      });
+      expect(result.executionSupervisor).toMatchObject({
+        maxActive: 1,
+        appliedAhead: 0,
+        admissionReasons: ["capacity_unavailable"],
+        published: 2,
+        pendingPeerExecution: null,
+      });
+      expect(budgets[0]).toBe(268435456);
+      expect(result.next).toMatchObject({ execution: 0, copied: 4 });
+      expect(result.receipts.length).toBe(2);
+      await expect(
+        readdir(join(path, "pending.jsonl.gz")),
+      ).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
   it("persists custody proof for a real 64.64.generation receipt without exceeding NAME_MAX", async () => {
     const scope = await fixture(false),
       path = await directory();

@@ -25,7 +25,12 @@ import {
   type LegacyBackupStore,
 } from "./legacy-report-storage-gcs";
 
-import type { PeerBudget, PeerMemory } from "./legacy-report-peer-memory";
+import {
+  capacitySamplingFailed,
+  type PeerBudget,
+  type PeerCapacityReason,
+  type PeerMemory,
+} from "./legacy-report-peer-memory";
 
 export interface LegacySlotOptions<T> {
   slots: 1 | 2;
@@ -219,6 +224,7 @@ function checkMembers(
  * pathname fences pre-supervisor writers until every speculative edge is joined. */
 export async function runLegacyExecutionSlots<T>(input: Inputs<T>) {
   const { scope, directory, pendingPath: journal, options } = input;
+  const pairedCap = Math.min(input.maxBytes, limit);
   const sessionPath = join(journal, "session.json"),
     publicationPath = join(journal, "publishing.json");
   const retired = join(directory, ".joined-executions");
@@ -234,7 +240,9 @@ export async function runLegacyExecutionSlots<T>(input: Inputs<T>) {
       requireProof(
         old.binding === input.binding &&
           old.target === options.targetBinding &&
-          input.cursor().next.execution >= old.peerExecution,
+          (input.cursor().next.execution >= old.peerExecution ||
+            (input.cursor().next.execution >= old.first &&
+              same(old.peer, startOf(scope, old.peerExecution)))),
       );
     }
     await rm(retired, { recursive: true });
@@ -252,7 +260,7 @@ export async function runLegacyExecutionSlots<T>(input: Inputs<T>) {
       first,
       peerExecution,
       peer: startOf(scope, peerExecution),
-      cap: input.maxBytes,
+      cap: pairedCap,
     };
     const tmp = join(directory, ".execution-pair-" + randomUUID());
     await mkdir(tmp, { mode: 0o700 });
@@ -293,6 +301,7 @@ export async function runLegacyExecutionSlots<T>(input: Inputs<T>) {
     peerAdmissionDeferred: 0,
     pendingPeerExecution: null as number | null,
     memory: [] as PeerMemory[],
+    admissionReasons: [] as PeerCapacityReason[],
   };
   function checkReceipt(r: LegacyBackupReceipt, start: LegacyCursor) {
     requireProof(
@@ -356,17 +365,15 @@ export async function runLegacyExecutionSlots<T>(input: Inputs<T>) {
     }
     return { ready, receipt };
   }
-  async function pageBudget(start: LegacyCursor) {
+  async function pageBudget(start: LegacyCursor, newCap: number) {
     const path = join(journal, stageName(start), "budget.json");
-    const recorded = (await stat(path))
-      ? await json<number>(path)
-      : input.maxBytes;
+    const recorded = (await stat(path)) ? await json<number>(path) : newCap;
     requireProof(
       Number.isSafeInteger(recorded) && recorded > 0 && recorded <= 2 * limit,
     );
     return recorded;
   }
-  async function stage(start: LegacyCursor, second: boolean) {
+  async function stage(start: LegacyCursor, second: boolean, newCap: number) {
     const dir = join(journal, stageName(start));
     await mkdir(dir, { recursive: true, mode: 0o700 });
     await syncDirectory(journal);
@@ -390,7 +397,7 @@ export async function runLegacyExecutionSlots<T>(input: Inputs<T>) {
     const entries = await readdir(dir),
       pins = entries.filter((n) => namePattern.test(n));
     requireProof(pins.length <= 1);
-    const cap = await pageBudget(start);
+    const cap = await pageBudget(start, newCap);
     await save(join(dir, "budget.json"), cap, true);
     let pinned: LegacyBackupReceipt | undefined;
     if (pins.length) {
@@ -522,6 +529,18 @@ export async function runLegacyExecutionSlots<T>(input: Inputs<T>) {
       await publish(saved.start);
     }
   }
+  async function retireJoined() {
+    requireProof(
+      (await readdir(journal)).every(
+        (n) => n === "session.json" || /^\.legacy-[a-f0-9-]+\.tmp$/.test(n),
+      ),
+    );
+    requireProof(!(await stat(retired)));
+    await rename(journal, retired);
+    await syncDirectory(directory);
+    await rm(retired, { recursive: true });
+    await syncDirectory(directory);
+  }
   let used = report.published;
   let closed = false;
   for (;;) {
@@ -530,16 +549,7 @@ export async function runLegacyExecutionSlots<T>(input: Inputs<T>) {
     if (front.execution >= peer) {
       const dir = join(journal, stageName(front));
       if (same(front, state.peer) && !(await stat(dir))) {
-        requireProof(
-          (await readdir(journal)).every(
-            (n) => n === "session.json" || /^\.legacy-[a-f0-9-]+\.tmp$/.test(n),
-          ),
-        );
-        requireProof(!(await stat(retired)));
-        await rename(journal, retired);
-        await syncDirectory(directory);
-        await rm(retired, { recursive: true });
-        await syncDirectory(directory);
+        await retireJoined();
         closed = true;
         break;
       }
@@ -547,7 +557,7 @@ export async function runLegacyExecutionSlots<T>(input: Inputs<T>) {
       if (!same(front, state.peer))
         requireProof(await stat(join(dir, "ready.json")));
       // Reopen an uncertain peer at its exact start, even in one-slot mode.
-      const receipt = await stage(front, false);
+      const receipt = await stage(front, false, input.maxBytes);
       if (same(front, state.peer)) {
         state.peer = receipt.next;
         await save(sessionPath, state);
@@ -560,30 +570,35 @@ export async function runLegacyExecutionSlots<T>(input: Inputs<T>) {
     if (used >= input.pages || input.shouldStop?.()) break;
     const requestPeer =
       options.slots === 2 &&
-      input.maxBytes <= limit &&
       used + 2 <= input.pages &&
       state.peer.execution === peer &&
-      (await pageBudget(front)) <= limit &&
-      (await pageBudget(state.peer)) <= limit;
+      (await pageBudget(front, pairedCap)) <= limit &&
+      (await pageBudget(state.peer, pairedCap)) <= limit;
     const hold = join(directory, "execution-peer-memory-hold.json");
     const probe =
       requestPeer && !(await stat(hold))
         ? await options.openBudget?.()
         : undefined;
     const admit = probe?.admit === true;
-    if (requestPeer && !admit) report.peerAdmissionDeferred++;
+    if (requestPeer && !admit) {
+      report.peerAdmissionDeferred++;
+      report.admissionReasons.push(
+        probe?.reason ??
+          ((await stat(hold)) ? "prior_capacity_hold" : "capacity_unavailable"),
+      );
+    }
     if (input.shouldStop?.()) {
       await probe?.finish();
       break;
     }
     report.maxActive = Math.max(report.maxActive, admit ? 2 : 1);
-    const jobs = [stage(front, false)];
+    const jobs = [stage(front, false, admit ? pairedCap : input.maxBytes)];
     if (admit) {
       report.pairedExecutions.push([
         scope.executions[front.execution].executionId,
         scope.executions[peer].executionId,
       ]);
-      jobs.push(stage(state.peer, true));
+      jobs.push(stage(state.peer, true, pairedCap));
     }
     const [first, other] = await Promise.allSettled(jobs);
     used += jobs.length;
@@ -591,13 +606,22 @@ export async function runLegacyExecutionSlots<T>(input: Inputs<T>) {
     if (probe)
       try {
         const memory = await probe.finish();
-        report.memory.push(memory);
-        if (admit && !memory.permitted) {
+        if (memory) report.memory.push(memory);
+        if (admit && (!memory || !memory.permitted)) {
           await save(hold, { binding: input.binding, memory });
           await syncDirectory(directory);
         }
       } catch (e) {
-        sampleFailure = e;
+        if (capacitySamplingFailed(e)) {
+          report.admissionReasons.push("capacity_unavailable");
+          if (admit) {
+            await save(hold, {
+              binding: input.binding,
+              reason: "capacity_unavailable",
+            });
+            await syncDirectory(directory);
+          }
+        } else sampleFailure = e;
       }
     // Persist a successful late-range edge even if the first reply was lost.
     if (other?.status === "fulfilled") {
@@ -621,6 +645,19 @@ export async function runLegacyExecutionSlots<T>(input: Inputs<T>) {
       if (f?.status === "rejected") throw f.reason;
     }
     if (sampleFailure) throw sampleFailure;
+  }
+  // A declined pair can leave a verified, ordinary front receipt and no
+  // speculative work. Return immediately to the scalar checkpoint layout.
+  if (
+    !closed &&
+    (options.slots === 1 || report.peerAdmissionDeferred > 0) &&
+    same(state.peer, startOf(scope, peer))
+  ) {
+    const names = await readdir(journal);
+    if (names.length === 1 && names[0] === "session.json") {
+      await retireJoined();
+      closed = true;
+    }
   }
   report.peerNext = { ...state.peer };
   if (!closed) report.pendingPeerExecution = peer;

@@ -132,7 +132,7 @@ through the sole service that owns the directory lock.
 legacy_reports migrate "${legacy_targets[@]}" \
   --scope="$LEGACY_REPORT_SCOPE" --directory="$LEGACY_REPORT_PROGRESS" \
   --worker-sweeper-container="$HZ_SWEEPER_CONTAINER" --registered-get=denied \
-  --execution-slots=2 --rows=128 --pages=4 --max-bytes=134217728 \
+  --execution-slots=2 --rows=128 --pages=4 --max-bytes=268435456 \
   --slot-min-available-mib=8192 --slot-max-rss-mib=4096 \
   --until-complete --max-passes=1 --readers-ready --apply
 ```
@@ -150,18 +150,36 @@ execution's contiguous prefix. The next execution is admitted after that
 pair joins. The per-pass page budget counts both slots and promotion of a
 previously completed peer page. Per-pass worker and receipt counts can differ.
 
-At most two pages of up to 128 MiB each may run together. A new page above
-128 MiB runs alone. Recovery uses the budget recorded with each pending page,
+At most two pages of up to 128 MiB each may run together. Each fresh
+single-worker head can use the full configured 256 MiB budget. Recovery uses the budget recorded with each pending page,
 including after a switch between 128 and 256 MiB. The supervisor samples
 controller and worker host/cgroup headroom and RSS every half second during a
 paired wave. Defaults require 8,192 MiB available on each host and limit the
 controller process RSS and combined custody-worker RSS separately to 4,096 MiB.
-An active worker from an earlier connection postpones admission. Low initial
-headroom selects one worker. A measured breach during a paired wave allows the
+The initial sample includes all current custody workers in the selected cgroup.
+Their aggregate RSS plus the measured reservation for a new pair must fit the
+RSS limit. The initial pair reservation defaults to 3,072 MiB and can be set
+with `--slot-pair-reserve-mib`. Low initial headroom selects one worker.
+Unavailable capacity measurements are reported as `capacity_unavailable`.
+The ordinary head still verifies its exact source, cloud generation and
+working-volume receipt. Authentication and host-key failures retain their
+existing error categories. A measured breach during a paired wave allows the
 in-flight transactions to finish and writes `execution-peer-memory-hold.json`.
 Subsequent waves use one worker. After reviewing the host and receipt evidence,
 the operator can clear that hold at a service boundary. These are sampled
 admission limits. The operating system's cgroup limits govern allocations.
+
+For a production trial, compare windows of the same ordinary 256 MiB command
+with the candidate. The packaged `legacy_report_host_capacity.py` evaluator
+accepts host and cgroup-v2 counter samples from a read-only operator observer.
+It reports host free and available memory separately. For PostgreSQL it reports
+anonymous memory, file-backed memory, shared memory and the inactive file
+cache. It credits at most the lesser of inactive file pages and non-shared
+file pages when estimating the working set. Actual cgroup high/max margins,
+memory events, pressure, throttling, signed progress and solver CPU relative
+to the ordinary window still bound admission. A cache-heavy PostgreSQL can
+therefore coexist with a second worker while measured resource margins hold.
+
 
 During a pair, `pending.jsonl.gz` is a directory with a transfer file per
 active slot, exact archive receipts, and a short publication record. The
