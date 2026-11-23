@@ -267,7 +267,8 @@ async function logical(executionId: string) {
     WHERE sim_job_id=${executionId} ORDER BY sequence`;
 }
 
-describe.sequential("worker-only legacy backup and 0198 representation", () => {
+// Each recovery may commit several real PostgreSQL pages and fsync their journals.
+describe.sequential("worker-only legacy backup and 0198 representation", { timeout: 60_000 }, () => {
   it.each(["front", "peer"] as const)(
     "recovers a lost %s commit at the original generation across slot and page limits",
     async (failed) => {
@@ -482,7 +483,6 @@ describe.sequential("worker-only legacy backup and 0198 representation", () => {
       expect(cursor).toEqual(last!.next);
       expect((await exportLegacyReports({ ...base })).complete).toBe(true);
     },
-    60000,
   );
 
   it("keeps a finished peer private across long execution pages and stops pairing at measured memory pressure", async () => {
@@ -675,7 +675,7 @@ describe.sequential("worker-only legacy backup and 0198 representation", () => {
     let done = await exportLegacyReports(single);
     if (!done.complete) done = await exportLegacyReports(single);
     expect(done.complete).toBe(true);
-  }, 60000);
+  });
 
   it("does not overlap an uncertain 256 MiB page when restarted with a 128 MiB peer", async () => {
     const a = await fixture(false),
@@ -747,7 +747,7 @@ describe.sequential("worker-only legacy backup and 0198 representation", () => {
       done = await exportLegacyReports({ ...base, pages: 32 });
     expect(done.complete).toBe(true);
     expect(budgetOpens).toBeGreaterThan(1);
-  }, 60000);
+  });
 
   it("pairs two long executions across a short intervening job and joins the exact complete prefix", async () => {
     const a = await fixture(false),
