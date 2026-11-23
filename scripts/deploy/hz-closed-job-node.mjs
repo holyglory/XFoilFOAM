@@ -214,11 +214,12 @@ async function run(next) {
       // It neither authorizes a second unlink nor fabricates a new cloud readback.
       const [prior] = await client.sql.unsafe(
         "SELECT strip_report->$2::text AS receipt FROM sim_jobs WHERE id=$1::uuid",
-        [scope.id,scope.historicalRaw?"historicalRawFiles":"closedProgressiveFiles"],
+        [scope.id,scope.preserveSolver?"closedProgressiveSiblingFiles":scope.historicalRaw?"historicalRawFiles":"closedProgressiveFiles"],
       );
       if (prior?.receipt?.complete === true) {
         if (
           prior.receipt.planSha256 !== scope.plan ||
+          (scope.preserveSolver && prior.receipt.preservedSolver?.directory !== scope.preserveSolver) ||
           Boolean(prior.receipt.mediaSha256) !== Boolean(scope.keepMedia) ||
           (scope.expectedMedia &&
             scope.expectedMedia !== prior.receipt.mediaSha256)
@@ -227,6 +228,7 @@ async function run(next) {
         return {
           status: "already-settled",
           ...(scope.historicalRaw ? {historicalRaw:true}:{}),
+          ...(scope.preserveSolver ? {preserveSolver:scope.preserveSolver}:{}),
           record: prior.receipt,
           dependenciesSha256,
           nodePackagesSha256,
@@ -258,6 +260,7 @@ async function run(next) {
           ...(scope.keepMedia ? { keepMedia: true } : {}),
           mode: scope.mode,
           ...(scope.historicalRaw ? {historicalRaw:true} : {}),
+          ...(scope.preserveSolver ? {preserveSolver:scope.preserveSolver}:{}),
           manifests,
           expectedPlan,
           readbacks,
@@ -301,6 +304,7 @@ async function run(next) {
           expectedScientificSha256: scope.expectedScience ?? undefined,
           keepMedia: scope.keepMedia === true,
           historicalRaw: scope.historicalRaw === true,
+          preserveSolver: scope.preserveSolver,
           expectedMediaSha256: scope.expectedMedia ?? undefined,
           signal: AbortSignal.timeout(20 * 60_000),
         }),
@@ -319,6 +323,7 @@ async function run(next) {
       admissionRetries,
       ...result,
       ...(scope.historicalRaw?{historicalRaw:true}:{}),
+      ...(scope.preserveSolver ? {preserveSolver:scope.preserveSolver}:{}),
     };
   } finally {
     await client.sql.end({ timeout: 2 });

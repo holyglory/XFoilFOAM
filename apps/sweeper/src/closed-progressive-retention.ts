@@ -63,7 +63,11 @@ export interface ClosedProgressiveReadback {
   verifiedAt: string;
 }
 
+type PreservedSolver = { directory: string; treeSha256: string; entries: number; files: number;
+  byteSize: number; allocatedBytes: number; sample: MediaFile };
+
 export interface ClosedProgressiveReclaimResponse {
+  preservedSolver?: PreservedSolver;
   job_id: string;
   state: "absent" | "planned" | "reclaimed";
   replayed?: boolean;
@@ -391,6 +395,23 @@ async function readKeptMedia(
     .digest("hex");
 }
 
+async function checkPreservedSolver(id: string, directory: string, plan: ClosedProgressiveReclaimResponse, signal: AbortSignal) {
+  const kept = plan.preservedSolver;
+  const sample = kept?.sample;
+  if (!kept || kept.directory !== directory || !/^[a-f0-9]{64}$/.test(kept.treeSha256) ||
+      ![kept.entries, kept.files, kept.byteSize, kept.allocatedBytes].every(n => Number.isSafeInteger(n) && n >= 0) ||
+      !kept.files || kept.entries < kept.files || !sample || !sample.path.startsWith(directory + "/") ||
+      sample.path.split("/").some(c => !c || c === "." || c === "..") || !/\/postProcessing\/.*\/(?:coefficient|forceCoeffs)\.dat$/.test(sample.path) ||
+      !Number.isSafeInteger(sample.byteSize) || sample.byteSize <= 0 || sample.byteSize > kept.byteSize ||
+      !/^[a-f0-9]{64}$/.test(sample.sha256) || !Array.isArray(plan.workingPaths) ||
+      plan.workingPaths.some(p => p === directory || p.startsWith(directory + "/")))
+    throw Error("Unreported solver or signed sibling path inventory differs");
+  const path = sample.path.split("/").map(encodeURIComponent).join("/");
+  const engine = process.env.ENGINE_URL ?? "http://api:8000";
+  await readStoredFile(new URL(`/jobs/${id}/files/${path}`, engine), sample, signal, "");
+  await readStoredFile(new URL(`/api/media/jobs/${id}/${path}`, "http://node-api:4000"), sample, signal, "");
+}
+
 const LIVE = sql`('pending','submitted','running','ingesting')`;
 function eligible(
   now: Date,
@@ -398,13 +419,19 @@ function eligible(
   completedPlan?: string,
   media: KeptImage[] = [],
   historical = false,
+  preserveSolver?: string,
 ) {
-  const receiptKey = historical
+  const receiptKey = preserveSolver ? "closedProgressiveSiblingFiles" : historical
     ? "historicalRawFiles"
     : "closedProgressiveFiles";
   const saved = sql`j.strip_report->${receiptKey}::text`;
   return sql`j.status IN ('done','failed','cancelled') AND j.engine_job_id=j.id::text
-    AND j.request_payload ? 'remoteProgressiveExecution' AND ${
+    AND j.request_payload ? 'remoteProgressiveExecution'
+    ${preserveSolver ? sql`AND j.status='cancelled' AND (j.strip_report->'closedProgressiveFiles'->>'complete') IS DISTINCT FROM 'true'
+      AND EXISTS(SELECT FROM sync_sweep_promises p JOIN sync_api_settings s ON s.id=1
+        WHERE p.id::text=j.request_payload->>'syncPromiseId' AND p.registered_solver_id=s.remote_solver_registered_id
+          AND p.source_base_url=s.upstream_base_url AND p.status IN ('cancelled','expired') AND NOT s.remote_solver_transfer_paused)` : sql``}
+    AND ${
       historical
         ? sql`j.status='cancelled' AND j."ingestedAt" IS NOT NULL
       AND EXISTS(SELECT FROM sync_sweep_promises hp JOIN sync_api_settings hs ON hs.id=1
@@ -899,11 +926,13 @@ async function record(
   allocation: ClosedProgressiveReclaimResponse["allocation"] = null,
   mediaSha256?: string,
   historical = false,
+  preserved?: PreservedSolver,
 ) {
-  const field = historical ? "historicalRawFiles" : "closedProgressiveFiles";
+  const field = preserved ? "closedProgressiveSiblingFiles" : historical ? "historicalRawFiles" : "closedProgressiveFiles";
   await db.execute(sql`UPDATE sim_jobs SET strip_report=jsonb_set(coalesce(strip_report,'{}'::jsonb),ARRAY[${field}::text],
     jsonb_build_object('checkedAt',clock_timestamp(),'complete',${complete}::boolean,'retryAfter',CASE WHEN ${complete}::boolean THEN NULL ELSE clock_timestamp()+interval '5 minutes' END,'outcome',${outcome}::text,'bytes',${bytes}::bigint,'files',${files}::int,'planSha256',${planSha256}::text,'verifiedArchives',${verifiedArchives}::int,'scientificSha256',${scientificSha256}::text,'allocation',${JSON.stringify(allocation ?? null)}::jsonb)
-    || ${mediaSha256 ? sql`jsonb_build_object('mediaSha256',${mediaSha256}::text)` : sql`'{}'::jsonb`})
+    || ${mediaSha256 ? sql`jsonb_build_object('mediaSha256',${mediaSha256}::text)` : sql`'{}'::jsonb`}
+    || ${preserved ? sql`jsonb_build_object('preservedSolver',${JSON.stringify(preserved)}::jsonb)` : sql`'{}'::jsonb`})
     WHERE id=${id}::uuid AND (${historical} OR stripped_at IS NULL) AND (strip_report->${field}::text)->>'complete' IS DISTINCT FROM 'true'`);
 }
 
@@ -920,12 +949,20 @@ export async function closedProgressiveJob(
     expectedScientificSha256?: string;
     keepMedia?: boolean;
     historicalRaw?: boolean;
+    preserveSolver?: string;
     expectedMediaSha256?: string;
     expectedPlan?: string;
     signal?: AbortSignal;
   },
 ) {
   const { now, ageMs, timeoutMs } = options;
+  if (options.preserveSolver !== undefined &&
+      (!options.keepMedia || options.historicalRaw || !/^cases\/[a-zA-Z0-9_.-]+\/transient_a[0-9]+$/.test(options.preserveSolver) ||
+        options.preserveSolver.split("/").some(p => p === "." || p === "..")))
+    throw Error("Invalid named solver preservation scope");
+  if (options.preserveSolver && !options.inspect &&
+      (!options.expectedPlan || !options.expectedScientificSha256 || !options.expectedMediaSha256))
+    throw Error("Signed sibling removal requires the exact plan, scientific evidence and media proof");
   if (options.verifyCompleted && (!options.inspect || !options.expectedPlan))
     throw new Error("Completed-plan verification must be read-only and exact");
   const historical = options.historicalRaw
@@ -940,7 +977,7 @@ export async function closedProgressiveJob(
       ? await registeredImages(tx, id, false, !historical)
       : [];
     const [ready] = await tx.execute(
-      sql`SELECT j.id FROM sim_jobs j WHERE j.id=${id}::uuid AND ${eligible(now, ageMs, options.verifyCompleted ? options.expectedPlan : undefined, media, options.historicalRaw)}`,
+      sql`SELECT j.id FROM sim_jobs j WHERE j.id=${id}::uuid AND ${eligible(now, ageMs, options.verifyCompleted ? options.expectedPlan : undefined, media, options.historicalRaw, options.preserveSolver)}`,
     );
     if (!ready)
       throw new Error(
@@ -951,6 +988,18 @@ export async function closedProgressiveJob(
   const manifests = source.archives.map((a) => a.manifest);
   const plan = await engine.reclaimClosedProgressiveFiles(id, manifests);
   checkReceipt(plan, id, "planned");
+  if (options.preserveSolver) {
+    if (!plan.bytes || !plan.files) throw Error("Signed siblings have no positive exact duplicates");
+    const caseDir = options.preserveSolver.slice(0, options.preserveSolver.lastIndexOf("/"));
+    const owners = new Set(manifests.map(m => m.directory));
+    if (!manifests.length || manifests.some(m => m.regime !== "urans" || m.historicalRaw) ||
+        options.preserveSolver !== `${caseDir}/transient_a${manifests.length}` ||
+        manifests.some((_, i) => !owners.has(`${caseDir}/a${i}/evidence`)))
+      throw Error("Named solver is not the next unreported sibling");
+    await checkPreservedSolver(id, options.preserveSolver, plan, options.signal ?? AbortSignal.timeout(120_000));
+  } else if (plan.preservedSolver) {
+    throw Error("Unexpected preserved solver proof");
+  }
   if (options.expectedPlan !== undefined && options.expectedPlan !== plan.plan)
     throw new Error(
       "The requested canary plan differs from the current filesystem plan",
@@ -1139,7 +1188,7 @@ export async function closedProgressiveJob(
     if (!locked) return false;
     const media = options.keepMedia ? await registeredImages(tx, id, true, !historical) : [];
     const [ready] = await tx.execute(
-      sql`SELECT j.id FROM sim_jobs j WHERE j.id=${id}::uuid AND ${eligible(now, ageMs, undefined, media, options.historicalRaw)}`,
+      sql`SELECT j.id FROM sim_jobs j WHERE j.id=${id}::uuid AND ${eligible(now, ageMs, undefined, media, options.historicalRaw, options.preserveSolver)}`,
     );
     if (!ready) return false;
     const fresh = await proofs(tx, id, media, historical, options.keepMedia);
@@ -1160,6 +1209,8 @@ export async function closedProgressiveJob(
         readbacks,
       );
       checkReceipt(done, id, "reclaimed");
+      if (options.preserveSolver && canonicalAnalysisJson(done.preservedSolver) !== canonicalAnalysisJson(plan.preservedSolver))
+        throw Error("Unreported solver changed during signed sibling release");
       if (
         options.keepMedia &&
         (canonicalAnalysisJson(done.mediaFiles) !==
@@ -1187,7 +1238,9 @@ export async function closedProgressiveJob(
       true,
       plan.state === "absent"
         ? "absent"
-        : options.historicalRaw
+        : options.preserveSolver
+          ? "signed-sibling-working-files"
+          : options.historicalRaw
           ? "historical-raw-files"
           : "duplicate-files",
       plan.bytes,
@@ -1198,6 +1251,7 @@ export async function closedProgressiveJob(
       allocation,
       mediaSha256,
       options.historicalRaw,
+      plan.preservedSolver,
     );
     return true;
   });

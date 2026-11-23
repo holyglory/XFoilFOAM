@@ -606,6 +606,76 @@ it("binds an explicitly empty URANS image set to its normal per-job proof", asyn
   });
 }, 30000);
 
+it("keeps an unreported solver readable and records only its signed siblings as released", async () => {
+  await client.db.transaction(async (tx) => {
+    const db = tx as unknown as DB;
+    for (const definition of tableDefinitions)
+      await db.execute(sql.raw("CREATE TEMP TABLE " + definition + " ON COMMIT DROP"));
+    await db.execute(sql`ALTER TABLE sync_sweep_promises ADD status text`);
+    await db.execute(sql`ALTER TABLE sync_api_settings ADD remote_solver_transfer_paused boolean DEFAULT false`);
+    await db.execute(sql`INSERT INTO sync_api_settings VALUES(1,${solver},${token},${root})`);
+    await db.execute(sql`INSERT INTO sync_sweep_promises VALUES(${promiseId},${root},${solver},'cancelled')`);
+    const id = randomUUID();
+    const [signed] = await fixture(db, id, 1);
+    await db.execute(sql`UPDATE sim_jobs SET status='cancelled' WHERE id=${id}`);
+    await db.execute(sql`UPDATE result_attempts SET regime='urans' WHERE id=${signed!.attempt}`);
+    const directory = "cases/foil/transient_a1";
+    const sample = { path: directory + "/postProcessing/forces/0/coefficient.dat", sha256: sha("0.1 0.03"), byteSize: 8 };
+    const kept = { directory, treeSha256: "a".repeat(64), entries: 6, files: 2, byteSize: 80, allocatedBytes: 8192, sample };
+    let applied = 0, broken = false, overlap = false;
+    const backend: ClosedProgressiveBackend = {
+      async reclaimClosedProgressiveFiles(job, manifests, expected, objects) {
+        expect(manifests).toHaveLength(1);
+        expect(manifests[0]).toMatchObject({ directory: "cases/foil/a0/evidence", regime: "urans" });
+        if (expected) {
+          expect(objects?.map(o => o.brokeredUploadId)).toEqual([signed!.upload]);
+          applied++;
+        }
+        return { job_id: job, state: expected ? "reclaimed" : "planned", replayed: applied > 0,
+          plan: "5".repeat(64), files: 1, bytes: 30, mediaFiles: [],
+          workingPaths: [overlap ? sample.path : "cases/foil/transient_a0/log.pimpleFoam"], preservedSolver: kept };
+      },
+    };
+    const routes: string[] = [];
+    const fetcher = vi.spyOn(globalThis, "fetch").mockImplementation(async (url) => {
+      const path = new URL(String(url)).pathname;
+      routes.push(path);
+      if (path.endsWith("/download"))
+        return new Response(signed!.upload, {headers: {"content-type":"application/zstd","content-length":String(signed!.upload.length),
+          "x-content-sha256":signed!.remote.storedSha256,"x-gcs-generation":signed!.remote.generation}});
+      expect(path.endsWith(sample.path)).toBe(true);
+      return new Response(broken ? "different" : "0.1 0.03", {headers:{"content-length":"8"}});
+    });
+    const options = {now:clock,ageMs:1,timeoutMs:3000,keepMedia:true,preserveSolver:directory};
+    try {
+      const preview = await closedProgressiveJob(db,backend,id,{...options,inspect:true});
+      const pinned = {...options, expectedPlan:preview.plan.plan!,expectedMediaSha256:preview.mediaSha256,expectedScientificSha256:preview.scientificSha256};
+      expect(routes).toContain(`/jobs/${id}/files/${sample.path}`);
+      expect(routes).toContain(`/api/media/jobs/${id}/${sample.path}`);
+      await expect(closedProgressiveJob(db,backend,id,{...options,inspect:true,preserveSolver:undefined})).rejects.toThrow(/Unexpected preserved/);
+      await expect(closedProgressiveJob(db,backend,id,{...options,inspect:true,preserveSolver:"cases/foil/transient_a0"})).rejects.toThrow(/next unreported/);
+      await expect(closedProgressiveJob(db,backend,id,options)).rejects.toThrow(/exact plan/);
+      overlap = true;
+      await expect(closedProgressiveJob(db,backend,id,pinned)).rejects.toThrow(/inventory differs/);
+      overlap = false;broken = true;
+      await expect(closedProgressiveJob(db,backend,id,pinned)).rejects.toThrow();
+      broken = false;
+      await db.execute(sql`UPDATE sync_sweep_promises SET status='active'`);
+      await expect(closedProgressiveJob(db,backend,id,pinned)).rejects.toThrow(/active ownership/);
+      await db.execute(sql`UPDATE sync_sweep_promises SET status='cancelled'`);
+      expect(applied).toBe(0);
+      expect((await closedProgressiveJob(db,backend,id,pinned)).settled).toBe(true);
+      const after = await closedProgressiveJob(db,backend,id,{...pinned,inspect:true,verifyCompleted:true});
+      expect(after.plan.preservedSolver).toEqual(kept);
+      const [job] = await db.execute(sql`SELECT stripped_at,strip_report FROM sim_jobs WHERE id=${id}`);
+      expect(job!.stripped_at).toBeNull();
+      expect(job!.strip_report).toMatchObject({closedProgressiveSiblingFiles:{complete:true,outcome:"signed-sibling-working-files",preservedSolver:kept}});
+      expect(job!.strip_report).not.toHaveProperty("closedProgressiveFiles");
+      expect(applied).toBe(1);
+    } finally { fetcher.mockRestore(); }
+  });
+},30000);
+
 it("lets a delayed archive response finish inside the proof deadline and restores the previous HTTP dispatcher", async () => {
   const resolver = createRequire(
     new URL("../../../packages/engine-client/package.json", import.meta.url),

@@ -60,6 +60,11 @@ def run_engine(scope, packet, source, settings):
             "media keep-set differs from the explicitly named operation")
     require(isinstance(manifests, list) and 1 <= len(manifests) <= 256 and
             isinstance(readbacks, list) and len(readbacks) <= 256, "invalid custody inventory")
+    preserved = scope.get("preserveSolver")
+    require(preserved == req.get("preserveSolver") and (preserved is None or
+            (keep_media and not scope.get("historicalRaw") and isinstance(preserved,str) and
+             re.fullmatch(r"cases/[A-Za-z0-9_.-]+/transient_a[0-9]+",preserved) and
+             not any(p in (".","..") for p in preserved.split("/")))), "signed unreported solver scope differs")
     historical=scope.get("historicalRaw") is True
     require((req.get("historicalRaw") is True)==historical and any("historicalRaw" in m for m in manifests)==historical,
             "historical proof belongs to another scope")
@@ -101,7 +106,7 @@ def run_engine(scope, packet, source, settings):
         module.__package__ = "airfoilfoam"
         exec(compile(source, "<closed-progressive-retention>", "exec"), module.__dict__)
         result = module.reclaim_closed_progressive_files(root, req["manifests"], plan, req["readbacks"],
-                                                        lock_identity=scope["lockInode"])
+                                                        lock_identity=scope["lockInode"], preserve_solver=preserved)
         require(inode(lock) == scope["lockInode"], "execution lock was replaced")
     finally:
         os.close(descriptor)
