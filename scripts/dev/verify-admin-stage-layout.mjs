@@ -145,7 +145,13 @@ try {
           { action: "press", selector: button, value: "Enter" },
         ],
         waitFor: {
-          selector: dialog + " " + testId("sim-fidelity-chip"),
+          selector:
+            dialog +
+            " " +
+            testId("sim-fidelity-chip") +
+            ':text-is("URANS ' +
+            stage +
+            '")',
           responseUrl:
             origin +
             `/api/admin/point-history/${fixture.resultId}/sim?resultAttemptId=${attempt}`,

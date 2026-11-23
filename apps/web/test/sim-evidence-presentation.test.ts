@@ -32,6 +32,7 @@ describe("simEvidencePresentation", () => {
       fidelity: "rans",
       regime: "attached",
       turbulenceModel: "kOmegaSST",
+      numericalConvergence: true,
     });
 
     expect(view).toEqual({
@@ -71,6 +72,7 @@ describe("simEvidencePresentation", () => {
         fidelity,
         regime: "attached",
         turbulenceModel: "kOmegaSST",
+        uransFlowOutcome: "no_shedding",
       });
 
       expect(view.methodChip).toBe("URANS · steady (no shedding)");
@@ -100,9 +102,10 @@ describe("simEvidencePresentation", () => {
         turbulenceModel: "kOmegaSST",
         transportActive: true,
         hasRecordedFrames: true,
+        uransFlowOutcome: "periodic",
       });
 
-      expect(view.methodChip).toBe("URANS · vortex shedding");
+      expect(view.methodChip).toBe("URANS · periodic flow");
       expect(view.mediaTag).toBe(`RECORDED FRAMES · ${tier}`);
       expect(view.provenance).toContain(
         `${tier} kOmegaSST · engine-recorded period-locked frame evidence`,
@@ -111,7 +114,7 @@ describe("simEvidencePresentation", () => {
     },
   );
 
-  it("keeps a legacy stalled row visibly URANS when explicit fidelity is absent", () => {
+  it("does not infer shedding from a legacy stalled row without a period record", () => {
     const view = simEvidencePresentation({
       fidelity: null,
       regime: "stalled",
@@ -119,11 +122,10 @@ describe("simEvidencePresentation", () => {
     });
 
     expect(view.method).toBe("URANS");
-    expect(view.methodChip).toBe("URANS · vortex shedding");
-    expect(view.mediaTag).toBe("URANS · mean static");
-    expect(view.provenance).toContain(
-      "URANS solver · periodic result evidence",
-    );
+    expect(view.methodChip).toBe("URANS");
+    expect(view.mediaTag).toBe("URANS · stored evidence");
+    expect(view.provenance).toBe("URANS solver · recorded coefficients");
+    expect(view.historyText).toContain("does not establish");
   });
 
   it("keeps a legacy attached row RANS when no URANS provenance exists", () => {

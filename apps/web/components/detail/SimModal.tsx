@@ -355,6 +355,8 @@ export function SimModal(props: {
         turbulenceModel: sim.condition?.turbulenceModel,
         transportActive,
         hasRecordedFrames: Boolean(playerModel),
+        uransFlowOutcome: sim.uransFlowOutcome,
+        numericalConvergence: sim.numericalConvergence,
       })
     : null;
   const sortedTrack = useMemo(
@@ -1694,9 +1696,15 @@ export function SimModal(props: {
     }
     return (
       <HeaderChip
-        color={C.teal}
-        border={C.tealBorder}
-        text={`converged${iterText}`}
+        color={sim.numericalConvergence === true ? C.teal : C.muted}
+        border={sim.numericalConvergence === true ? C.tealBorder : C.stroke}
+        text={
+          sim.numericalConvergence === true
+            ? `converged${iterText}`
+            : sim.numericalConvergence === false
+              ? `did not converge${iterText}`
+              : "convergence unreported"
+        }
       />
     );
   };
@@ -1880,7 +1888,12 @@ export function SimModal(props: {
             sub: `±${fmt(steadySummary.clHalfAmplitude, 3)} Cl over ${steadySummary.iterCount.toLocaleString()} iters`,
           }
         : {
-            value: "✓ steady",
+            value:
+              sim.numericalConvergence === true
+                ? "converged"
+                : sim.numericalConvergence === false
+                  ? "did not converge"
+                  : "unreported",
             sub:
               [
                 sim.condition?.mesh?.finalResidual == null
@@ -1907,20 +1920,20 @@ export function SimModal(props: {
           label="Cl"
           color={C.teal}
           value={fmt(sim.cl, 4)}
-          sub="converged coefficient"
+          sub="stored coefficient"
         />
         <AccentStat
           label="Cd"
           color={C.amber}
           value={fmt(sim.cd, 5)}
-          sub="converged coefficient"
+          sub="stored coefficient"
         />
         <AccentStat
           label="Cm"
           color={C.text}
           value={fmtOptional(sim.cm, 4)}
           sub={
-            sim.cm == null ? "coefficient unavailable" : "converged coefficient"
+            sim.cm == null ? "coefficient unavailable" : "stored coefficient"
           }
         />
         <AccentStat
@@ -2462,7 +2475,11 @@ export function SimModal(props: {
             // Fidelity ladder chip (same truth table as every classification
             // surface): plain for RANS/pre-ladder rows.
             const view = sim
-              ? fidelityChipView(sim.fidelity ?? null, sim.uransVerify ?? null)
+              ? fidelityChipView(
+                  sim.fidelity ?? null,
+                  sim.uransVerify ?? null,
+                  sim.resultAttemptId ? "attempt" : "point",
+                )
               : null;
             if (!view) return null;
             const color =
@@ -2495,7 +2512,11 @@ export function SimModal(props: {
               </span>
             );
           })()}
-          <span role="heading" aria-level={2} style={{ fontWeight: 600, fontSize: 15 }}>
+          <span
+            role="heading"
+            aria-level={2}
+            style={{ fontWeight: 600, fontSize: 15 }}
+          >
             {name}
           </span>
           <span style={{ fontFamily: MONO, fontSize: 12, color: C.muted }}>

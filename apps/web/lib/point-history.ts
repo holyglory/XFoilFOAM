@@ -706,7 +706,15 @@ export function disagreedDeltaLabel(verify: PointVerifyInfo): string {
 export function fidelityChipView(
   fidelity: string | null,
   verify: PointVerifyInfo | null,
+  scope: "point" | "attempt" = "point",
 ): FidelityChipView | null {
+  if (scope === "attempt") {
+    if (fidelity === "urans_precalc")
+      return { label: "URANS fast", tone: "amber" };
+    if (fidelity === "urans_full")
+      return { label: "URANS final", tone: "teal" };
+    return null;
+  }
   if (verify?.state === "disagreed") {
     const deltas = disagreedDeltaLabel(verify);
     return {

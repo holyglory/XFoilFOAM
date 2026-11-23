@@ -1337,7 +1337,13 @@ test.describe
         resultAttemptId: attemptId,
         fidelity: stage === "fast" ? "urans_precalc" : "urans_full",
       });
-      await expect(page.getByTestId("sim-modal-dialog")).toBeVisible();
+      const selectedDialog = page.getByTestId("sim-modal-dialog");
+      await expect(selectedDialog).toBeVisible();
+      await expect(selectedDialog.getByTestId("sim-fidelity-chip")).toHaveText(
+        stage === "fast" ? "URANS fast" : "URANS final",
+      );
+      await expect(selectedDialog.getByTestId("sim-method-chip")).toHaveText("URANS");
+      await expect(selectedDialog).not.toContainText("✓ steady");
       await page.keyboard.press("Escape");
       await expect(page.getByTestId("sim-modal-dialog")).toHaveCount(0);
       await expect(trigger).toBeFocused();
@@ -1620,6 +1626,11 @@ test.describe
     expect(solverFlowRequestCount).toBe(requestsAfterClose);
 
     await page.setViewportSize({ width: 390, height: 844 });
+    const percentBox = await page.locator(".campaign-instrument-gauge-value b").boundingBox();
+    const sourcesBox = await page.getByTestId("campaign-completion-sources").boundingBox();
+    expect(percentBox).not.toBeNull();
+    expect(sourcesBox).not.toBeNull();
+    expect(percentBox!.y + percentBox!.height + 4).toBeLessThanOrEqual(sourcesBox!.y);
     await trigger.scrollIntoViewIfNeeded();
     await trigger.focus();
     const narrowOriginalScrollY = await page.evaluate(() => window.scrollY);
