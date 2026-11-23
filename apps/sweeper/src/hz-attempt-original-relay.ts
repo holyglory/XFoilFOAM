@@ -1,3 +1,7 @@
+import { Readable } from "node:stream";
+import { readAttemptEvidenceCopy } from "./attempt-evidence-archive";
+import { prepareAttemptEvidenceCopy } from "@aerodb/db/attempt-evidence-storage";
+import { sameArchive } from "./hz-attempt-custody";
 import { checkLegacyHzFence } from "./hz-attempt-controller-fence";
 import { pathToFileURL } from "node:url";
 import { readFile } from "node:fs/promises";
@@ -5,7 +9,10 @@ import {
   HistoryMessages,
   HistoryOperationError,
 } from "@aerodb/core/point-history-protocol";
-import { HistorySshEndpoint } from "./hz-point-history-relay";
+import {
+  HZ_ORIGINAL_VERSION_READ,
+  HistorySshEndpoint,
+} from "./hz-point-history-relay";
 import {
   type OriginalPin,
   type OriginalRow,
@@ -17,6 +24,7 @@ import {
   checkOriginalBudget,
   checkPin,
   samePin,
+  originalPacked,
 } from "./hz-attempt-originals";
 
 export interface OriginalEndpoints {
@@ -150,6 +158,69 @@ export async function registerOriginalPage(
     throw Error("Incomplete HZ registration");
   return receipts;
 }
+/** This receipt proves a snapshot only. No worker register or shorten RPC is used. */
+export async function copyFrozenOriginalVersion(
+  relay: Pick<OriginalEndpoints, "hub">,
+  binding: SourceBinding,
+  pin: OriginalPin,
+  snapshot: (inspectOnly: boolean) => Promise<any>,
+  previous?: VerifiedOriginal["identity"],
+) {
+  checkPin(pin);
+  const current = await snapshot(Boolean(previous));
+  if (current.changed && !previous) return { changed: current.changed };
+  const item = previous ? { pin, identity: previous } : current.item;
+  if (!item || !samePin(item.pin, pin))
+    throw Error("Missing frozen original snapshot");
+  const objects = (await relay.hub({
+    operation: "objects",
+    binding,
+    budget: pin.bytes,
+    items: [item],
+  })) as VerifiedOriginal[];
+  if (objects.length !== 1) throw Error("Incomplete original version readback");
+  const verified = objects[0]!;
+  if (
+    !verified ||
+    !samePin(verified.pin, pin) ||
+    verified.identity.sourceInstance !== binding.instance ||
+    verified.identity.attemptId !== pin.id ||
+    verified.identity.simJobId !== pin.job ||
+    verified.identity.resultId !== pin.result ||
+    verified.identity.sourceSha256 !== pin.sha ||
+    verified.identity.sourceByteSize !== pin.bytes
+  )
+    throw Error("Version copy differs from the frozen HZ source");
+  const source = await readAttemptEvidenceCopy(
+    Readable.from([originalPacked(verified.packed)]),
+    verified.identity,
+  );
+  if (
+    prepareAttemptEvidenceCopy(source).historySeries.reduce(
+      (n, x) => n + x.byteSize,
+      0,
+    ) !== pin.history
+  )
+    throw Error("Version history inventory differs from the frozen source");
+  if (previous) {
+    const latest = await snapshot(true);
+    if (latest.current !== true && !latest.changed)
+      throw Error("Missing current HZ version observation");
+    sameArchive(
+      { ...previous, verifiedAt: new Date(previous.verifiedAt) },
+      {
+        ...verified.identity,
+        verifiedAt: new Date(verified.identity.verifiedAt),
+      },
+    );
+    return {
+      identity: verified.identity,
+      current: latest.current === true,
+      changed: latest.changed,
+    };
+  }
+  return { identity: verified.identity };
+}
 /** The private controller receives metadata only. Packed bodies stay in a
  * bounded relay page and travel over the two independent SSH aliases. */
 async function main() {
@@ -223,7 +294,46 @@ async function main() {
         }
         if (req.operation === "bound")
           result = binding = await relay.worker({ operation: "bound" });
-        else if (req.operation === "inventory")
+        else if (
+          (req.operation === "version_put" ||
+            req.operation === "version_read") &&
+          cfg.apply === true &&
+          cfg.bucket &&
+          account
+        ) {
+          binding ??= await relay.worker({ operation: "bound" });
+          if (
+            !binding ||
+            binding.instance !== req.binding?.instance ||
+            binding.solver !== req.binding?.solver
+          )
+            throw new HistoryOperationError("worker_registration", "denied");
+          if ((req.operation === "version_read") !== !!req.identity)
+            throw Error("A version read requires a pinned generation");
+          const snapshot = async (inspectOnly: boolean) => {
+            const peer = new HistorySshEndpoint(
+              cfg.hzHost,
+              cfg.hzContainer,
+              HZ_ORIGINAL_VERSION_READ,
+            );
+            try {
+              return await peer.ask({
+                operation: inspectOnly ? "recheck" : "snapshot",
+                binding: req.binding,
+                pin: req.pin,
+              });
+            } finally {
+              await peer.close();
+            }
+          };
+          result = await copyFrozenOriginalVersion(
+            relay,
+            binding,
+            req.pin,
+            snapshot,
+            req.identity,
+          );
+        } else if (req.operation === "inventory")
           result = await inventoryOriginalPage(
             relay,
             req.binding,

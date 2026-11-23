@@ -17,6 +17,7 @@ import {
   type OriginalPin,
 } from "../src/hz-attempt-originals";
 import {
+  copyFrozenOriginalVersion,
   uploadOriginalPage,
   registerOriginalPage,
   inventoryOriginalPage,
@@ -113,6 +114,124 @@ export async function verifyOriginalCopyJourney(
     packed.proof,
     Buffer.from(packed.packed, "base64"),
   );
+  const { readOriginalVersion } = await import(
+    new URL("../src/hz-attempt-original-version-worker.mjs", import.meta.url)
+      .href
+  );
+  const [job] = await db.execute(
+    sql`SELECT status,"ingestedAt"::text AS ingested FROM sim_jobs WHERE id=${pin.job}::uuid`,
+  );
+  await db.execute(
+    sql`UPDATE sim_jobs SET status='running',"ingestedAt"=NULL WHERE id=${pin.job}::uuid`,
+  );
+  const snapshot = (only: boolean) =>
+    readOriginalVersion(db, binding, pin, only);
+  try {
+    expect(
+      (await prepareOriginals(db, binding, [pin], budget)).deferred,
+    ).toEqual([pin.id]);
+    const first = await copyFrozenOriginalVersion(
+      relay,
+      binding,
+      pin,
+      snapshot,
+    );
+    expect(first.identity).toMatchObject({
+      sourceInstance: binding.instance,
+      attemptId: id,
+      resultId: pin.result,
+      simJobId: pin.job,
+      sourceSha256: pin.sha,
+      sourceByteSize: pin.bytes,
+    });
+    const second = await copyFrozenOriginalVersion(
+      relay,
+      binding,
+      pin,
+      snapshot,
+      first.identity,
+    );
+    expect(second).toMatchObject({
+      current: true,
+      identity: {
+        generation: first.identity!.generation,
+        objectKey: first.identity!.objectKey,
+      },
+    });
+    await expect(
+      registerOriginalPage(
+        relay,
+        binding,
+        [{ pin, identity: first.identity! }],
+        budget,
+      ),
+    ).rejects.toThrow();
+    expect(
+      await db.execute(
+        sql`SELECT id FROM attempt_evidence_archives WHERE result_attempt_id=${id}::uuid`,
+      ),
+    ).toHaveLength(0);
+    const [present] = await db.execute(
+      sql`SELECT evidence_archive_id AS pointer,evidence_storage_event_id AS event,evidence_payload::text AS body FROM result_attempts WHERE id=${id}::uuid`,
+    );
+    expect(present).toMatchObject({
+      pointer: null,
+      event: null,
+      body: original.payloadText,
+    });
+    await db.execute(
+      sql`UPDATE result_attempts SET evidence_payload=evidence_payload||'{"laterRevision":true}'::jsonb WHERE id=${id}::uuid`,
+    );
+    const changed = (await inspectOriginals(db, binding, { ids: [id] }))[0]!;
+    expect(
+      await copyFrozenOriginalVersion(relay, binding, pin, snapshot),
+    ).toEqual({ changed: { sha: changed.sha, bytes: changed.bytes } });
+    const retained = await copyFrozenOriginalVersion(
+      relay,
+      binding,
+      pin,
+      snapshot,
+      first.identity,
+    );
+    expect(retained).toMatchObject({
+      current: false,
+      changed: { sha: changed.sha },
+      identity: { sourceSha256: pin.sha },
+    });
+    const later = await copyFrozenOriginalVersion(
+      relay,
+      binding,
+      changed,
+      (only) => readOriginalVersion(db, binding, changed, only),
+    );
+    expect(later.identity!.objectKey).not.toBe(first.identity!.objectKey);
+    await db.execute(
+      sql`UPDATE sync_api_settings SET remote_solver_transfer_paused=true WHERE id=1`,
+    );
+    await expect(snapshot(true)).rejects.toMatchObject({
+      operation: "worker_transfer_paused",
+      retryable: true,
+    });
+    await db.execute(
+      sql`UPDATE sync_api_settings SET remote_solver_transfer_paused=false WHERE id=1`,
+    );
+    await db.execute(
+      sql`UPDATE result_attempts SET engine_job_id='foreign-owner' WHERE id=${id}::uuid`,
+    );
+    await expect(
+      readOriginalVersion(db, binding, changed, false),
+    ).rejects.toThrow("owner");
+  } finally {
+    await db.execute(
+      sql`UPDATE sync_api_settings SET remote_solver_transfer_paused=false WHERE id=1`,
+    );
+    await db.execute(
+      sql`UPDATE result_attempts SET evidence_payload=${original.payloadText}::jsonb,engine_job_id=${pin.job} WHERE id=${id}::uuid`,
+    );
+    await db.execute(
+      sql`UPDATE sim_jobs SET status=${job.status},"ingestedAt"=${job.ingested}::timestamptz WHERE id=${pin.job}::uuid`,
+    );
+  }
   const upload = await uploadOriginalPage(relay, binding, [pin], budget);
   expect(upload.deferred).toEqual([]);
   expect(upload.uploads[0]?.identity.objectKey).not.toBe(

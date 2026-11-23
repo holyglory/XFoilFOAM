@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import {
   LEGACY_HZ_FENCE_PROBE,
   hzFenceProgram,
@@ -59,6 +60,7 @@ export function validateRelayOptions(value: HZRelayOptions) {
   )
     throw new HistoryOperationError("options", "input");
 }
+export const HZ_ORIGINAL_VERSION_READ = Symbol("hzOriginalVersionRead");
 export class HistorySshEndpoint {
   private child: ChildProcessWithoutNullStreams;
   private wire: HistoryMessages;
@@ -67,21 +69,38 @@ export class HistorySshEndpoint {
   constructor(
     host: string,
     container: string,
-    entry: string | typeof LEGACY_HZ_FENCE_PROBE,
+    entry:
+      | string
+      | typeof LEGACY_HZ_FENCE_PROBE
+      | typeof HZ_ORIGINAL_VERSION_READ,
     write = false,
   ) {
     if (
       !HOST.test(host) ||
       !CONTAINER.test(container) ||
-      (entry === LEGACY_HZ_FENCE_PROBE
-        ? write
+      (typeof entry !== "string"
+        ? write ||
+          (entry !== LEGACY_HZ_FENCE_PROBE &&
+            entry !== HZ_ORIGINAL_VERSION_READ)
         : !/^\/(?:[A-Za-z0-9_.-]+\/)*[A-Za-z0-9_.-]+\.ts$/.test(entry))
     )
       throw new HistoryOperationError("ssh_target", "input");
-    const command =
+    const program =
       entry === LEGACY_HZ_FENCE_PROBE
-        ? `docker exec -i ${container} node --import tsx --input-type=module -e '${hzFenceProgram.replaceAll("'", "'\\''")}'`
-        : `docker exec -i ${container} node --import tsx ${entry}`;
+        ? hzFenceProgram
+        : entry === HZ_ORIGINAL_VERSION_READ
+          ? readFileSync(
+              new URL(
+                "./hz-attempt-original-version-worker.mjs",
+                import.meta.url,
+              ),
+              "utf8",
+            ) + "\nawait serveOriginalVersion();"
+          : null;
+    const command =
+      program !== null
+        ? `docker exec -i ${container} node --import tsx --input-type=module -e '${program.replaceAll("'", "'\\''")}'`
+        : `docker exec -i ${container} node --import tsx ${String(entry)}`;
     this.child = spawn(
       "ssh",
       [
@@ -95,7 +114,7 @@ export class HistorySshEndpoint {
         "-oServerAliveInterval=15",
         "-oServerAliveCountMax=3",
         host,
-        write
+        write || entry === HZ_ORIGINAL_VERSION_READ
           ? `flock -s -w 15 -E 75 /tmp/airfoils-pro-deploy.lock ${command}`
           : command,
       ],
