@@ -5835,9 +5835,11 @@ diagnostic_sources = [{ format = "junit", path = "report.xml" }]
 name = "legacy-custody"
 tier = "development"
 timeout_seconds = 300
-requires = ["seed"]
+# This fixture changes both instance identity and report normalization for its transaction.
+requires = ["workspace"]
 env = { PROGRESSIVE_REPORT_ARCHIVE_DISPOSABLE_DB = "1" }
-command = ["/bin/bash", "-c", "exec /usr/bin/corepack pnpm --filter @aerodb/db exec vitest run test/legacy-report-custody.test.ts test/legacy-report-custody-page.test.ts --reporter=default --reporter=junit --outputFile.junit=\"$DEVCOORDINATOR_DIAGNOSTICS_DIR/report.xml\""]
+case_command = ["/bin/bash", "-c", "/usr/bin/corepack pnpm --filter @aerodb/db migrate && /usr/bin/corepack pnpm --filter @aerodb/db seed && exec /usr/bin/corepack pnpm --filter @aerodb/db exec vitest run test/legacy-report-custody.test.ts test/legacy-report-custody-page.test.ts --reporter=default --reporter=junit --outputFile.junit=\"$DEVCOORDINATOR_DIAGNOSTICS_DIR/report.xml\""]
+cases = [{ id = "isolated-custody", args = [], postgres = "default" }]
 diagnostic_sources = [{ format = "junit", path = "report.xml" }]
 
 [[test.progressive-report-archive.check]]
