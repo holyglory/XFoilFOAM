@@ -60,7 +60,20 @@ it("restores exact PG results across shared pages including unknown, wide and nu
       await expect(verifySharedReportGeneration(changed,ref,AbortSignal.timeout(1000))).rejects.toThrow();
     }
 
-    if(i===0)await expect(readSharedReport({...store,read:()=>new Promise<Buffer>(()=>{})},ref,AbortSignal.timeout(10))).rejects.toThrow();
+    if (i === 0) {
+      const stalled = { ...store, read: () => new Promise<Buffer>(() => {}) };
+      await expect(readSharedReport(stalled, ref, AbortSignal.timeout(10))).rejects.toThrow();
+      await expect(verifySharedReportGeneration(stalled, ref, AbortSignal.timeout(10))).rejects.toThrow();
+      const { withSharedReportPageReads } = await import("../src/shared-report-archive");
+      await withSharedReportPageReads(async () => {
+        await readSharedReport(store, ref);
+        const unavailable = { ...store, read: async (pin: typeof copy.pin, limit: number) => {
+          if (pin.key === copy.pin.key) throw new Error("missing prior manifest");
+          return store.read(pin, limit);
+        } };
+        await expect(verifySharedReportGeneration(unavailable, ref)).rejects.toThrow("missing prior manifest");
+      });
+    }
 
     await expect(readSharedReport(store,{...ref,executionId:randomUUID()})).rejects.toThrow();
   }

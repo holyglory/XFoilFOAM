@@ -11,6 +11,8 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { CancelledReportScanCheckpoint } from "./cancelled-report-scan-checkpoint";
+import { ColdReportWitnesses } from "./cold-report-witnesses";
+import { HubReportObjects } from "./shared-report-objects";
 import { stoppedReportArchivePrefix, stoppedReportReceiptDirectory } from "./stopped-report-receipt-files";
 import { setTimeout as delay } from "node:timers/promises";
 import { configuredDeploymentRole } from "./config";
@@ -241,7 +243,7 @@ export async function archiveProgressiveReportBatch(
   putFile: PutFile,
   cancelledSequences?: readonly number[],
   expectedSignatures?: ReadonlyMap<number,string>,
-  chronologicalCheckpoint?: CancelledReportScanCheckpoint,
+  options: { checkpoint?: CancelledReportScanCheckpoint; witnesses?: ColdReportWitnesses } = {},
 ): Promise<number> {
   if (expectedSignatures && (!cancelledSequences || expectedSignatures.size > maxMembers))
     throw new Error("Signed copy hints require a bounded cancelled report page");
@@ -278,7 +280,7 @@ export async function archiveProgressiveReportBatch(
         ({ sequence, kind }) => ({ sequence, kind }),
       );
   if (!keys.length) return 0;
-  if(cancelledSequences)await verifyColdReceiptSources(db,executionId,keys.map(k=>Number(k.sequence)));
+  if(cancelledSequences)await verifyColdReceiptSources(db,executionId,keys.map(k=>Number(k.sequence)),options.witnesses);
   const dir = await mkdtemp(join(tmpdir(), "progressive-reports-"));
   const members: Member[] = [];
   try {
@@ -386,9 +388,9 @@ export async function archiveProgressiveReportBatch(
       return String(inserted.id);
     });
     if (!bundleId) return 0;
-    if (chronologicalCheckpoint && cancelledSequences && !expectedSignatures) {
+    if (options.checkpoint && cancelledSequences && !expectedSignatures) {
       const last = members[members.length - 1]!;
-      await chronologicalCheckpoint.save({ bundleId, object: remote, signature: last.signature,
+      await options.checkpoint.save({ bundleId, object: remote, signature: last.signature,
         reportSha256: last.sha256, reportByteSize: last.bytes });
     }
     return members.length;
@@ -482,6 +484,7 @@ export async function runProgressiveReportArchiveService(
         return remote;
       };
   const directory = stoppedReportReceiptDirectory();
+  const witnesses = store && bucket ? new ColdReportWitnesses(new HubReportObjects(bucket, prefix)) : undefined;
   const checkpoint = store && bucket && isAbsolute(directory)
     ? new CancelledReportScanCheckpoint(directory, bucket, prefix) : undefined;
   let copyCursor: ReportCopyCursor | null = await checkpoint?.resume(db) ?? null;
@@ -550,7 +553,7 @@ export async function runProgressiveReportArchiveService(
               upload,
               page.sequences,
               preferred ? new Map(preferred.keys.map(k => [k.sequence,k.signature])) : undefined,
-              preferred ? undefined : checkpoint,
+              { checkpoint: preferred ? undefined : checkpoint, witnesses },
             );
             if (members) {
               if (!preferred && members < page.sequences.length) {

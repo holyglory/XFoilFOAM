@@ -1,6 +1,5 @@
 import type { DB } from "@aerodb/db";
-import { readProgressiveReport } from "@aerodb/db/progressive-report-reader";
-import { progressiveReportedPointSources } from "@aerodb/db/progressive-remote-report";
+import { ColdReportWitnesses, type ReceiptPoint } from "./cold-report-witnesses";
 import { STALE_HZ_RESET_REASON } from "@aerodb/db/progressive-remote-stale-recovery";
 import { sql } from "drizzle-orm";
 
@@ -96,26 +95,15 @@ function availableSource(alias:"anchor"|"warm"){
 
 // The catalogue only identifies the stored scientific witness. Reopen a cold
 // original outside the archive transaction before retiring any dependent copy.
-export async function verifyColdReceiptSources(db:DB,job:string,sequences:readonly number[]){
-  const rows=await db.execute(sql`SELECT DISTINCT e.sequence::int seq,a.content_signature sig,s.point_content_signature point,s.aoa_deg aoa,s.case_slug slug
+export async function verifyColdReceiptSources(db:DB,job:string,sequences:readonly number[], witnesses = new ColdReportWitnesses()){
+  const rows=await db.execute<ReceiptPoint>(sql`SELECT DISTINCT e.sequence::int seq,a.content_signature sig,s.point_content_signature point,s.aoa_deg aoa,s.case_slug slug
     FROM progressive_remote_report_sources s JOIN progressive_remote_evidence_receipts e ON e.sim_job_id=s.sim_job_id
       AND e.point_content_signature=s.point_content_signature AND e.sequence<s.sequence
     JOIN progressive_remote_reports a ON a.sim_job_id=e.sim_job_id AND a.sequence=e.sequence AND a.archived_at IS NOT NULL
     WHERE s.sim_job_id=${job}::uuid AND s.sequence IN (${sql.join(sequences.map(n=>sql`${n}::bigint`),sql`,`)})
     ORDER BY seq,point LIMIT 2049`);
   if(rows.length>2048)throw new Error("Cold receipt witnesses exceed the bounded source inventory");
-  let last=-1;
-  let points=new Map<string,{aoa_deg:number;case_slug?:string|null}>();
-  for(const row of rows){
-    const seq=Number(row.seq);
-    if(seq!==last){
-      const body=await readProgressiveReport(db,{sourceKind:"remote",executionId:job,sequence:seq,contentSignature:String(row.sig)});
-      if(!body.result)throw new Error("Cold scientific witness has no result");
-      points=new Map(progressiveReportedPointSources(body.result).map(x=>[x.contentSignature,x.point]));last=seq;
-    }
-    const point=points.get(String(row.point));
-    if(!point||point.aoa_deg!==Number(row.aoa)||(point.case_slug??null)!==(row.slug??null))throw new Error("Cold scientific witness changed its exact point");
-  }
+  await witnesses.verify(db, job, rows);
 }
 
 // Every source must have its own physical receipt and bound raw archive. The

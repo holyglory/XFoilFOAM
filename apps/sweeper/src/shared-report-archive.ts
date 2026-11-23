@@ -263,10 +263,9 @@ const pageReads = new AsyncLocalStorage<PageReads>();
 export const withSharedReportPageReads = <T>(f: () => Promise<T>) =>
   pageReads.run({}, f);
 
-export async function readSharedReport(
-  store: ReportObjects,
-  id: ProgressiveReportArchiveReadIdentity,
-  signal?: AbortSignal,
+async function withSharedReadDeadline<T>(
+  signal: AbortSignal | undefined,
+  read: (bounded: AbortSignal) => Promise<T>,
 ) {
   const deadline = AbortSignal.timeout(
     DEFAULT_PROGRESSIVE_REPORT_READ_TIMEOUT_MS,
@@ -280,12 +279,20 @@ export async function readSharedReport(
       bounded.addEventListener("abort", onAbort, { once: true });
     });
     return await Promise.race([
-      readPinnedSharedReport(store, id, bounded),
+      read(bounded),
       aborted,
     ]);
   } finally {
     bounded.removeEventListener("abort", onAbort);
   }
+}
+
+export function readSharedReport(
+  store: ReportObjects,
+  id: ProgressiveReportArchiveReadIdentity,
+  signal?: AbortSignal,
+) {
+  return withSharedReadDeadline(signal, bounded => readPinnedSharedReport(store, id, bounded));
 }
 
 async function selectSharedMember(
@@ -373,7 +380,16 @@ async function readPinnedSharedReport(
 /** A previously issued polar/raw receipt already proves the exact point.
  * Authenticate both registered generations and reconstruct the original byte
  * digest without parsing or retaining unrelated points from a cumulative result. */
-export async function verifySharedReportGeneration(
+export function verifySharedReportGeneration(
+  store: ReportObjects,
+  id: ProgressiveReportArchiveReadIdentity,
+  signal?: AbortSignal,
+) {
+  return withSharedReadDeadline(signal, bounded =>
+    pageReads.exit(() => verifyPinnedSharedGeneration(store, id, bounded)));
+}
+
+async function verifyPinnedSharedGeneration(
   store: ReportObjects,
   id: ProgressiveReportArchiveReadIdentity,
   signal: AbortSignal,
