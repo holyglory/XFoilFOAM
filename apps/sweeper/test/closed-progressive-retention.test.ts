@@ -316,7 +316,9 @@ it("rotates blocked and 409 jobs, authenticates every object before reclaim and 
   });
 }, 30000);
 
-it.each(["rans", "urans"])("keeps %s point-owned images and checks every route, legend and working-file reference", async (regime) => {
+it.each(["rans", "urans", "superseded-urans"])("keeps %s point-owned images and checks every route, legend and working-file reference", async (scenario) => {
+  const superseded = scenario === "superseded-urans";
+  const regime = superseded ? "urans" : scenario;
   await client.db.transaction(async (transaction) => {
     const db = transaction as unknown as DB;
     for (const def of tableDefinitions)
@@ -371,6 +373,15 @@ it.each(["rans", "urans"])("keeps %s point-owned images and checks every route, 
     );
     await db.execute(sql`INSERT INTO result_media(id,result_id,result_attempt_id,storage_key,kind,role,field,mime_type,sha256,byte_size,evidence_sha256,color_scale_id)
       VALUES(${media},${rid},${item!.attempt},${`jobs/${id}/${registered}`},'image','instantaneous',${field},'image/png',${sha(registeredBytes)},6,${item!.remote.manifestSha256},${scale})`);
+    const pickedAttempt = randomUUID(), pickedJob = randomUUID(), pickedMedia = randomUUID();
+    if (superseded) {
+      await db.execute(sql`INSERT INTO result_attempts(id,result_id,sim_job_id,engine_job_id,airfoil_id,regime)
+        VALUES(${pickedAttempt},${rid},${pickedJob},${pickedJob},${foil},'urans')`);
+      await db.execute(sql`INSERT INTO result_media(id,result_id,result_attempt_id,storage_key,kind,role,field,mime_type,sha256,byte_size,color_scale_id)
+        VALUES(${pickedMedia},${rid},${pickedAttempt},${`jobs/${pickedJob}/${nativePath}`},'image','instantaneous',${field},'image/png',${sha("newpng")},6,${scale})`);
+      await db.execute(sql`UPDATE results SET current_result_attempt_id=${pickedAttempt} WHERE id=${rid}`);
+    }
+    let priorStatus = 404, wrongPriorError = false, pickedUsesOldMedia = false, corruptPicked = false;
     let applied = 0,
       brokenPath = false,
       wrongLegend = false,
@@ -414,18 +425,22 @@ it.each(["rans", "urans"])("keeps %s point-owned images and checks every route, 
               "x-gcs-generation": item!.remote.generation,
             },
           });
+        const prior = u.searchParams.get("resultAttemptId") === item!.attempt;
+        if (path.endsWith("/sim") && prior && priorStatus !== 200)
+          return Response.json({error: wrongPriorError ? "unknown route" : "no solved OpenFOAM result for this point"}, {status: priorStatus});
         if (path.endsWith("/sim"))
           return Response.json({
             resultId: rid,
             media: {
               [swapped ? "vorticity" : "pressure"]: {
                 kind: "image",
-                url: `/api/result-media/${media}`,
+                url: `/api/result-media/${superseded && !prior && !pickedUsesOldMedia ? pickedMedia : media}`,
                 scale: wrongLegend ? { ...legend, vmax: 2 } : legend,
               },
             },
           });
-        const value = path === `/api/result-media/${media}` ? registeredBytes :
+        const value = path === `/api/result-media/${pickedMedia}` ? (corruptPicked ? "broken" : "newpng") :
+          path === `/api/result-media/${media}` ? registeredBytes :
           path.endsWith(nativePath) ? "engine" : path.includes("/v7/") ? "oldpng" : "scaled";
         if (brokenPath && path.startsWith("/api/media/"))
           return new Response("broken", {
@@ -461,6 +476,26 @@ it.each(["rans", "urans"])("keeps %s point-owned images and checks every route, 
         locals.push({ path: scaledPath.replace("pressure.png", "foreign.png"), sha256: sha("scaled"), byteSize: 6 });
         await expect(closedProgressiveJob(db, native, id, opts)).rejects.toThrow(/incomplete/);
         locals.pop();
+      }
+      if (superseded) {
+        expect(routes).toContain(`/api/result-media/${pickedMedia}`);
+        pickedUsesOldMedia = true;
+        await expect(closedProgressiveJob(db, native, id, opts)).rejects.toThrow(/link or color legend/);
+        pickedUsesOldMedia = false;
+        corruptPicked = true;
+        await expect(closedProgressiveJob(db, native, id, opts)).rejects.toThrow(/different bytes/);
+        corruptPicked = false;
+        wrongPriorError = true;
+        await expect(closedProgressiveJob(db, native, id, opts)).rejects.toThrow(/changed owner/);
+        wrongPriorError = false;
+        priorStatus = 403;
+        await expect(closedProgressiveJob(db, native, id, opts)).rejects.toThrow(/unavailable/);
+        priorStatus = 200;
+        await expect(closedProgressiveJob(db, native, id, { ...opts, expectedMediaSha256: preview.mediaSha256 })).rejects.toThrow(/differ from the pinned proof/);
+        priorStatus = 404;
+        await db.execute(sql`UPDATE result_media SET result_id=${randomUUID()} WHERE id=${pickedMedia}`);
+        await expect(closedProgressiveJob(db, native, id, opts)).rejects.toThrow(/exact current-job/);
+        await db.execute(sql`UPDATE result_media SET result_id=${rid} WHERE id=${pickedMedia}`);
       }
       missingOriginal = true;
       await expect(closedProgressiveJob(db, native, id, opts)).rejects.toThrow(
