@@ -6066,9 +6066,17 @@ command = ["node", "scripts/dev/verify-catalog-web-delivery.mjs", "reviewed-loca
 retained_artifacts = [{name="catalog-paging-public-local",path=".codex-artifacts/catalog-web-delivery/local",max_bytes=67108864}]
 
 [[test.catalog-web-delivery.check]]
+name = "external-render"
+tier = "release"
+requires = ["local"]
+timeout_seconds = 120
+command = ["node", "scripts/dev/capture-catalog-vps-render.mjs"]
+retained_artifacts = [{name="catalog-vps-render",path=".codex-artifacts/catalog-web-delivery/vps-render",max_bytes=8388608}]
+
+[[test.catalog-web-delivery.check]]
 name = "handoff"
 tier = "release"
-requires = ["contract"]
+requires = ["external-render"]
 command = ["node", "scripts/dev/verify-catalog-web-delivery.mjs", "handoff"]
 retained_artifacts = [{name="catalog-paging-public",path=".codex-artifacts/catalog-web-delivery/handoff",max_bytes=67108864}]
 

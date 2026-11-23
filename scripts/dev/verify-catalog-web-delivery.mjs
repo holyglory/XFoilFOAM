@@ -20,8 +20,9 @@
  * httpStatus, contentType, deployedAt, uiBuild, sourceRevision,
  * repositorySourceSha256, deploymentId, imageDigest and httpArtifactSha256.
  * provenance is {file,sha256} for the real operator record with its rollout,
- * revision and image IDs. Each renderedEvidence entry has file, sha256, url,
- * uiBuild and capturedAt for the actual public browser screenshot.
+ * revision and image IDs. The governed external-render check supplies actual
+ * public screenshots and timings to handoff. Additional operator-provided
+ * renderedEvidence entries may name file, sha256, url, uiBuild and capturedAt.
  *
  * Never substitute the public rollout ID for the owned local generation in
  * delivery.json. The parent submits the retained artifact to the Coordinator.

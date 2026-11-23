@@ -11,6 +11,7 @@ import {
   observeHttp,
   publicRoute,
   publishDirectory,
+  root,
   sha,
   target,
   verifyRepresentations,
@@ -544,11 +545,20 @@ export async function packageHandoff(filename) {
     dirname(deployPath),
     deployment.provenance,
   );
-  assert(
-    Array.isArray(deployment.renderedEvidence) &&
-      deployment.renderedEvidence.length,
-    "live render evidence required",
-  );
+  const renderDir = join(artifactRoot, "vps-render");
+  const renderBytes = await fileBytes(join(renderDir, "rendered-evidence.json"));
+  const render = JSON.parse(renderBytes);
+  assert.match(render.governedRunId, /^t[0-9]{8}T[0-9]{6}Z-[a-z0-9]+$/);
+  assert.equal(render.governedCheck, "external-render");
+  if (render.governedRunId !== process.env.DEVCOORDINATOR_RUN_ID || process.env.DEVCOORDINATOR_CHECK_NAME !== "handoff") {
+    const retained = coordinator("test.artifact.catalog", {path: root, run_id: render.governedRunId,
+      check: "external-render", artifact: "catalog-vps-render", limit: 20});
+    assert(retained.run_status === "passed" && retained.entries.some(e =>
+      e.path === "rendered-evidence.json" && e.sha256 === sha(renderBytes)), "unverified external browser capture");
+  }
+  checkBindings(render, { httpArtifactSha256: deployment.httpArtifactSha256,
+    formalRunId: bindings.formalRunId, productDesignReceiptId: bindings.productDesignReceiptId });
+  assert(Array.isArray(render.renderedEvidence) && render.renderedEvidence.length, "governed live render required");
   const liveFiles = new Map();
   const importLive = (name, bytes) => {
     assert(
@@ -565,7 +575,12 @@ export async function packageHandoff(filename) {
     liveFiles.set(name, bytes);
   };
   importLive(deployment.provenance.file, deployProof);
-  for (const ref of deployment.renderedEvidence) {
+  importLive("browser/rendered-evidence.json", renderBytes);
+  const refs = [
+    ...(deployment.renderedEvidence ?? []).map(ref => ({ref, directory: dirname(deployPath), prefix: ""})),
+    ...render.renderedEvidence.map(ref => ({ref, directory: renderDir, prefix: "browser/"})),
+  ];
+  for (const {ref, directory, prefix} of refs) {
     assert.equal(
       ref.url,
       publicRoute,
@@ -580,7 +595,7 @@ export async function packageHandoff(filename) {
       Date.parse(ref.capturedAt) >= Date.parse(deployment.deployedAt),
       "live screenshot predates deployment",
     );
-    importLive(ref.file, (await imageFile(dirname(deployPath), ref)).bytes);
+    importLive(prefix + ref.file, (await imageFile(directory, ref)).bytes);
   }
   const captureBytes = await fileBytes(join(dir, "capture.json"));
   const httpBytes = await fileBytes(join(dir, httpRecord));
@@ -622,6 +637,7 @@ export async function packageHandoff(filename) {
         route: publicRoute,
         deploymentId: deployment.deploymentId,
         imageDigest: deployment.imageDigest,
+        renderedEvidence: {file: "vps/browser/rendered-evidence.json", sha256: sha(renderBytes)},
       },
       files: Object.fromEntries(
         [...files].map(([name, bytes]) => [
