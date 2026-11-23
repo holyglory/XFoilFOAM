@@ -68,6 +68,7 @@ it("authenticates to the configured owner and reads every byte of the pinned arc
     signal,
     headers: {
       accept: "application/zstd",
+      "accept-encoding": "identity",
       "x-xfoilfoam-solver-token": "test-token",
     },
   });
