@@ -1,6 +1,11 @@
 #!/bin/sh
 set -eu
 case "$1" in
+  workspace) exec corepack pnpm install --offline --frozen-lockfile --ignore-scripts ;;
+  schema|seed)
+    action="$1"
+    if [ "$action" = schema ]; then action=migrate; fi
+    exec corepack pnpm --filter @aerodb/db "$action" ;;
   types)
     exec corepack pnpm --filter @aerodb/sweeper --filter @aerodb/api --filter @aerodb/engine-client typecheck ;;
   node|engine)
