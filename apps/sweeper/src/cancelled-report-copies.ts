@@ -15,18 +15,31 @@ interface SignedCopyKey {
   storedBytes: number;
 }
 
-/** A second scan already checks the scientific sources of stopped owners.
- * Keep at most one of its eligible pages. Every other turn still advances
- * the ordinary discovery cursor, including after a refused or stale page. */
+interface SignedCopyPage {
+  executionId: string;
+  keys: readonly SignedCopyKey[];
+  bytes: number;
+}
+
+/** Keep the two largest offered pages from different owners. When both are
+ * ready, a continuing owner gives the other a turn. The ordinary discovery
+ * cursor still advances between priority writes, including after a refusal. */
 export class CancelledReportCopyPriority {
-  private page?: { executionId: string; keys: readonly SignedCopyKey[]; bytes: number };
+  private readonly pages: SignedCopyPage[] = [];
+  private lastExecutionId?: string;
   private chronologicalDue = false;
 
   offer(executionId: string, keys: readonly SignedCopyKey[]) {
     if (!keys.length) return;
     const bytes = keys.reduce((n, k) => n + k.storedBytes, 0);
-    if (!this.page || bytes > this.page.bytes)
-      this.page = { executionId, keys, bytes };
+    const prior = this.pages.findIndex(p => p.executionId === executionId);
+    if (prior >= 0) {
+      if (this.pages[prior]!.bytes >= bytes) return;
+      this.pages.splice(prior, 1);
+    }
+    this.pages.push({ executionId, keys, bytes });
+    this.pages.sort((a, b) => b.bytes - a.bytes);
+    if (this.pages.length > 2) this.pages.pop();
   }
 
   take() {
@@ -34,9 +47,11 @@ export class CancelledReportCopyPriority {
       this.chronologicalDue = false;
       return;
     }
-    const page = this.page;
-    this.page = undefined;
-    this.chronologicalDue = page !== undefined;
+    if (!this.pages.length) return;
+    const index = this.pages.length === 2 && this.pages[0]!.executionId === this.lastExecutionId ? 1 : 0;
+    const [page] = this.pages.splice(index, 1);
+    this.lastExecutionId = page!.executionId;
+    this.chronologicalDue = true;
     return page;
   }
 }
