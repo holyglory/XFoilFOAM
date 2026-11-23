@@ -505,3 +505,52 @@ def test_real_top_level_installer_installs_and_validates_the_solver_core_dropin(
                            str(units/"airfoils-docker-storage-prune.timer")],env=env,text=True,capture_output=True)
     assert verify.returncode==0,verify.stderr
     assert "enable --now airfoils-docker-storage-prune.timer" in (tmp_path/"ctl.log").read_text()
+
+
+def test_core_inspection_of_an_interrupted_claim_is_strictly_read_only(core_case):
+    f,_,j,volume,_,dump,row,state,_,_=core_case
+    with f.locked_job(volume,j) as job:
+        claim=f.core_action(volume,state,row,job,[],[],"stage",holders=lambda:False,science_check=lambda:None)
+        journal=state/"files"/(claim["key"]+".json")
+        before=journal.read_bytes()
+        view=f.core_action(volume,state,row,job,[],[],"inspect",holders=lambda:False,science_check=lambda:None)
+        assert view["state"]=="pending-quarantined" and journal.read_bytes()==before and not dump.exists()
+        assert f.core_action(volume,state,row,job,[],[],"restore",holders=lambda:False,science_check=lambda:None)["state"]=="restored"
+    assert dump.stat().st_ino==row["ino"]
+
+
+def test_core_catalog_owner_arms_match_exactly_with_and_without_postgres_indexes(monkeypatch):
+    import uuid
+    import json
+    from collections import Counter
+    monkeypatch.syspath_prepend(str(ROOT/"scripts/deploy"))
+    from solver_core_database import Database
+    url=os.environ.get("DATABASE_URL")
+    if not url:pytest.skip("requires the governed disposable PostgreSQL component")
+    class Temporary(Database):
+        def query(self,sql):return super().query(sql.replace("public.","pg_temp."))
+    db=Temporary(["psql",url])
+    native,job,other=[str(uuid.uuid4())for _ in range(3)]
+    try:
+        db.query("BEGIN")
+        definitions={
+            "solver_evidence_artifacts":"id uuid PRIMARY KEY,sim_job_id uuid,engine_job_id text,engine_case_slug text,storage_key text,engine_url text,metadata jsonb",
+            "result_attempts":"id uuid PRIMARY KEY,sim_job_id uuid,engine_job_id text,result_id uuid,engine_case_slug text,evidence_payload jsonb",
+            "result_media":"result_id uuid,result_attempt_id uuid,storage_key text",
+            "results":"id uuid,sim_job_id uuid",
+            "solver_evidence_artifact_members":"artifact_id uuid,member_path text",
+            "sim_solver_incidents":"sim_job_id uuid,metadata jsonb",
+            "remote_asset_references":"local_kind text,local_row_id uuid,local_storage_key text,result_attempt_id uuid",
+        }
+        for name,cols in definitions.items():db.query(f"CREATE TEMP TABLE {name} ({cols})")
+        for i,(sim,engine) in enumerate([(job,other),(other,native),(job,native),(other,other)]):
+            db.query(f"INSERT INTO solver_evidence_artifacts VALUES ('{uuid.uuid4()}','{sim}','{engine}','c1_u30','job/cases/c1_u30/core.{i+1}',NULL,'{{}}')")
+        def paths():
+            rows=db.references({native:job})
+            return Counter((r["native"],r["case"],r["ref"]) for r in rows)
+        expected=Counter((native,"c1_u30",f"job/cases/c1_u30/core.{i}")for i in (1,2,3))
+        assert paths()==expected
+        db.query("CREATE INDEX core_fixture_sim ON solver_evidence_artifacts(sim_job_id) WHERE sim_job_id IS NOT NULL")
+        db.query("CREATE INDEX core_fixture_engine ON solver_evidence_artifacts(engine_job_id) WHERE engine_job_id IS NOT NULL")
+        assert paths()==expected
+    finally:db.query("ROLLBACK");db.close()

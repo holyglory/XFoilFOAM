@@ -283,11 +283,15 @@ def core_action(volume, state, subject_row, job_fds, documents, db_paths, action
         # A named-volume sibling is on the same filesystem and outside all
         # container mounts. Only this host's root operator can name its entries.
         staging=volume.parent/".airfoils-solver-core-retirement"
-        if action=="inspect" and record["state"] in ("new","restored"):
-            f=_enter(stack,name,FILE,cf);expect=dict(subject_row,ctimeNs=record.get("restoredCtimeNs",subject_row["ctimeNs"]))
-            require(identity_matches(os.fstat(f),expect),"inventoried source changed")
-            elf_core(f)
-            return {"state":"eligible","key":key,"allocated":0}
+        if action=="inspect":
+            if record["state"] in ("new","restored"):
+                f=_enter(stack,name,FILE,cf)
+                expect=dict(subject_row,ctimeNs=record.get("restoredCtimeNs",subject_row["ctimeNs"]))
+                require(identity_matches(os.fstat(f),expect),"inventoried source changed")
+                elf_core(f)
+                return {"state":"eligible","key":key,"allocated":0}
+            return {"state":"already-released" if record["state"]=="released" else "pending-"+record["state"],
+                    "key":key,"allocated":0}
         staging.mkdir(mode=0o700,exist_ok=True)
         q=_enter(stack,staging,DIR);qs=os.fstat(q)
         require(qs.st_uid==os.geteuid() and stat.S_IMODE(qs.st_mode)==0o700 and qs.st_dev==os.fstat(cf).st_dev,
