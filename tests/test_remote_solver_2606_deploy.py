@@ -1170,7 +1170,7 @@ gateway_image() {
   note image "$1"
   case "$1" in
     capture) setv image-state captured;;
-    original) [[ "$(get image)" == old && ! -e "$ROOT/gateway-replaced" ]];;
+    original|bind-original) [[ "$(get image)" == old && ! -e "$ROOT/gateway-replaced" ]];;
     release-holder|bind-canary) :;;
     phase) get image-state;;
     build) [[ "$(get fault)" != build ]] || return 23; setv image-state built;;
@@ -1382,3 +1382,208 @@ def test_historical_gateway_image_keeps_immutable_source_and_worker(tmp_path, mo
     assert not holders
     act("capture")
     assert len(list(tmp_path.glob("state-restored-*.json"))) == 1
+
+
+@pytest.fixture
+def previous_gateway_drain(tmp_path, monkeypatch):
+    """Original W23 wire format and source fingerprints with disposable service identities."""
+    from types import SimpleNamespace
+
+    m = _module("historical_gateway_capture_replay", "hz-historical-raw-gateway.py")
+    journal = tmp_path / "gateway.json"
+    raw = (ROOT / "tests/fixtures/historical-raw-gateway-captured-v1.json").read_bytes()
+    journal.write_bytes(raw)
+    journal.chmod(0o600)
+    old = json.loads(raw)
+    gateway = {**old["base"], "configHash": "a" * 64, "runtimeContract": "b" * 64}
+    worker = {**old["worker"], "configHash": "c" * 64, "runtimeContract": "d" * 64}
+    flags = {
+        "PENDING": "1",
+        "KIND": "historical-raw-gateway",
+        "PHASE": "draining",
+        "TARGET_BUILD_ID": old["build"],
+        "SOURCE_REVISION": REVISION,
+        "SOURCE_TREE_SHA256": TREE,
+        "POOL_2406_WAS_ENABLED": "false",
+        "POOL_2606_WAS_ENABLED": "false",
+        "POOL_NUMERICS2_WAS_ENABLED": "true",
+        "SWEEPER_WAS_RUNNING": "1",
+        "MEDIA_REPAIR_WAS_RUNNING": "1",
+        "TRANSFER_PAUSED": "false",
+    }
+    env = tmp_path / "deploy.env"
+    env.write_text("".join("REMOTE_SOLVER2606_DRAIN_" + k + "=" + value + "\n" for k, value in flags.items()))
+    env.chmod(0o600)
+    a = SimpleNamespace(
+        action="bind-original",
+        app=ROOT,
+        state=journal,
+        project=old["project"],
+        build=old["build"],
+        config_hash=gateway["configHash"],
+        drain_env=env,
+        pool_state="false|false|false",
+        transfer_state="false",
+        sweeper_state="1",
+        media_state="1",
+    )
+    actual = {"proof": dict(old["before"]), "workerNumerical": dict(old["workerNumerical"])}
+    monkeypatch.setattr(
+        m, "service", lambda name, project: dict(gateway if name == project + "-api-1" else worker)
+    )
+
+    def tag(ref, expected):
+        assert ref == gateway["imageRef"] and expected == gateway["image"]
+
+    monkeypatch.setattr(m, "checked_tag", tag)
+    monkeypatch.setattr(
+        m,
+        "exec_python",
+        lambda cid, code: actual["proof"]
+        if cid == gateway["id"] and code == m.PROBE
+        else pytest.fail("unqualified gateway probe"),
+    )
+    monkeypatch.setattr(m, "require_worker", lambda *_: actual["workerNumerical"])
+    return SimpleNamespace(m=m, a=a, raw=raw, old=old, gateway=gateway, worker=worker, actual=actual, env=env)
+
+
+@pytest.mark.parametrize("fault", ["none", "building-evidence", "published", "after-replace"])
+def test_previous_gateway_capture_can_resume_at_both_atomic_boundaries(
+    previous_gateway_drain, monkeypatch, fault
+):
+    f = previous_gateway_drain
+    m, a = f.m, f.a
+    state = a.state
+    original_env = f.env.read_bytes()
+    original_sha = hashlib.sha256(f.raw).hexdigest()
+    archive = m.capture_directory(state, original_sha)
+    real_replace = m.replace_bytes
+    real_publish = m.publish_transition
+
+    def replace(path, data):
+        if fault == "building-evidence" and path.name == "sealed.json":
+            raise OSError("interrupted staging")
+        real_replace(path, data)
+        if fault == "after-replace" and path == state:
+            raise OSError("interrupted after journal rename")
+
+    def publish(*args):
+        real_publish(*args)
+        if fault == "published":
+            raise OSError("interrupted after receipt publication")
+
+    if fault != "none":
+        with monkeypatch.context() as patch:
+            patch.setattr(m, "replace_bytes", replace)
+            patch.setattr(m, "publish_transition", publish)
+            with pytest.raises(OSError, match="interrupted"):
+                m.operate(a)
+        assert (state.read_bytes() == f.raw) == (fault != "after-replace")
+        assert archive.exists() == (fault != "building-evidence")
+    m.operate(a)
+    upgraded = json.loads(state.read_bytes())
+    assert archive.joinpath("original.json").read_bytes() == f.raw
+    assert state.read_bytes() == archive.joinpath("sealed.json").read_bytes()
+    assert upgraded["base"] == f.gateway and upgraded["worker"] == f.worker
+    assert upgraded["originalCaptureSha256"] == original_sha
+    audit = json.loads(archive.joinpath("transition.json").read_bytes())
+    assert (
+        audit["originalSha256"] == original_sha
+        and audit["sealedSha256"] == hashlib.sha256(state.read_bytes()).hexdigest()
+    )
+    assert audit["drain"]["PHASE"] == "draining" and audit["drain"]["TRANSFER_PAUSED"] == "false"
+    identities = [(p, p.stat().st_ino, p.stat().st_mtime_ns) for p in [state, *archive.iterdir()]]
+    m.operate(a)
+    a.action = "original"
+    m.operate(a)
+    assert identities == [(p, p.stat().st_ino, p.stat().st_mtime_ns) for p, _, _ in identities]
+    assert f.env.read_bytes() == original_env
+
+
+@pytest.mark.parametrize(
+    "drift",
+    [
+        "gateway",
+        "worker",
+        "tag",
+        "compose",
+        "module",
+        "numerical",
+        "operator",
+        "already-built",
+        "partial-identity",
+        "different-wanted",
+        "phase",
+        "fence",
+        "writer",
+        "transfer",
+        "wrong-action",
+        "candidate-present",
+        "changed-before-seal",
+    ],
+)
+def test_previous_gateway_capture_refuses_drift_without_rewriting_original(
+    previous_gateway_drain, monkeypatch, drift
+):
+    f = previous_gateway_drain
+    a, m = f.a, f.m
+    if drift == "gateway":
+        f.gateway["id"] = "9" * 64
+    elif drift == "worker":
+        f.worker["startedAt"] = "new-worker"
+    elif drift == "tag":
+        monkeypatch.setattr(m, "checked_tag", lambda *_: m.require(False, "different image tag"))
+    elif drift == "compose":
+        a.config_hash = "e" * 64
+    elif drift == "module":
+        f.actual["proof"]["otherInstalled"] = "different"
+    elif drift == "numerical":
+        f.actual["workerNumerical"]["application_source_sha256"] = "e" * 64
+    elif drift == "operator":
+        f.old["control"]["rebuild-remote-solver-engine.sh"] = "e" * 64
+    elif drift == "already-built":
+        f.old["phase"] = "built"
+    elif drift == "partial-identity":
+        f.old["worker"]["configHash"] = "9" * 64
+    elif drift == "different-wanted":
+        f.old["wanted"][m.FILES[0]] = "7" * 64
+    elif drift == "phase":
+        f.env.write_text(f.env.read_text().replace("PHASE=draining", "PHASE=maintenance"))
+    elif drift == "fence":
+        a.pool_state = "false|false|true"
+    elif drift == "writer":
+        a.sweeper_state = "0"
+    elif drift == "transfer":
+        a.transfer_state = "true"
+    elif drift == "wrong-action":
+        a.action = "select"
+    elif drift == "candidate-present":
+        f.old["candidate"] = "sha256:" + "9" * 64
+    else:
+        publish = m.publish_transition
+
+        def lost_worker(*args):
+            publish(*args)
+            f.worker["image"] = "sha256:" + "8" * 64
+
+        monkeypatch.setattr(m, "publish_transition", lost_worker)
+    a.state.write_bytes(m.json_bytes(f.old))
+    original = a.state.read_bytes()
+    env = f.env.read_bytes()
+    with pytest.raises(ValueError):
+        m.operate(a)
+    assert a.state.read_bytes() == original and f.env.read_bytes() == env
+
+
+def test_sealed_gateway_predecessor_remains_required(previous_gateway_drain):
+    f = previous_gateway_drain
+    f.m.operate(f.a)
+    next_bytes = f.a.state.read_bytes()
+    archive = f.m.capture_directory(f.a.state, hashlib.sha256(f.raw).hexdigest())
+    proof = archive / "transition.json"
+    altered = json.loads(proof.read_bytes())
+    altered["drain"]["POOL_NUMERICS2_WAS_ENABLED"] = "false"
+    f.m.write(proof, altered)
+    with pytest.raises(ValueError):
+        f.m.operate(f.a)
+    assert f.a.state.read_bytes() == next_bytes

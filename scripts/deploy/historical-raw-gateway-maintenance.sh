@@ -7,6 +7,14 @@ gateway_image() {
   local -a args=("$DEPLOY_SCRIPT_DIR/hz-historical-raw-gateway.py" "$1" --app "$APP_DIR"
     --state "$AIRFOILS_PRO_STATE_DIR/historical-raw-gateway.json" --project "$COMPOSE_PROJECT_NAME" --build "$ACTION" --config-hash "$hash")
   if [[ "$1" == verify || "$1" == bind-canary ]]; then args+=(--canary "$GATEWAY_CANARY"); fi
+  if [[ "$1" == bind-original ]]; then
+    local pools transfer sweeper media
+    pools="$(opencfd_pool_state)" || return 12
+    transfer="$(remote_transfer_paused)" || return 12
+    sweeper="$(writer_state sweeper)" || return 12
+    media="$(writer_state media-repair)" || return 12
+    args+=(--drain-env "$ENV_FILE" --pool-state "$pools" --transfer-state "$transfer" --sweeper-state "$sweeper" --media-state "$media")
+  fi
   python3 "${args[@]}"
 }
 
@@ -132,7 +140,7 @@ historical_gateway_operation() {
     # Unrelated Node releases may continue during this long drain. Rebinding
     # only the draining phase also requires identical qualified gateway modules.
     if [[ "$(read_env_var REMOTE_SOLVER2606_DRAIN_PHASE)" == draining ]]; then
-      gateway_image original
+      gateway_image bind-original
       DRAIN_REBIND=true
     fi
     load_drain_state
