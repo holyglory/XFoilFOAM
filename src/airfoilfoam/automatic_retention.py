@@ -168,17 +168,32 @@ def direct_request(root):
     cases = root / "cases"
     if cases.exists():
         require(cases.resolve(strict=True) == cases and cases.is_dir(), "unsafe case directory")
-        for folder in cases.rglob("evidence"):
-            require(folder.resolve(strict=True) == folder, "redirected native evidence")
-            for marker in ("historical_raw_custody.database.json", "incomplete_evidence_quarantine.receipt.json",
-                           "orphan_evidence_quarantine.receipt.json"):
-                require(not (folder / marker).exists(), "another workflow owns this evidence directory")
-            binding = folder / "brokered_hub_binding.database.json"
-            if binding.exists():
-                _, ack = regular_json(binding, 65536)
-                require(ack.get("state") != "hub_progressive_custody" and
-                        ack.get("authorization",{}).get("receipt",{}).get("kind") != "hub-progressive-evidence-custody",
-                        "native point has a registered progressive owner")
+        require("execution_id" in request, "scientific files have no positive direct-request provenance")
+        def walk_error(error):
+            raise error
+        for parent, dirs, names in os.walk(cases, followlinks=False, onerror=walk_error):
+            folder = Path(parent)
+            if any("quarantine" in n.lower() or "forensic" in n.lower() or "cache" in n.lower()
+                   for n in (*dirs,*names)):
+                raise JobRetentionRefused("unknown cache or forensic source remains")
+            for name in dirs:
+                link = folder / name
+                if not link.is_symlink():
+                    continue
+                destination = link.resolve(strict=True)
+                mesh = name == "polyMesh" and folder.name == "constant" and destination.is_relative_to(root / "meshes")
+                processor_uniform = (name == "uniform" and re.fullmatch(r"processor[0-9]+", folder.parent.name) and
+                    os.readlink(link) == f"../../{folder.name}/uniform" and destination == folder.parent.parent / folder.name / "uniform")
+                require(destination.is_dir() and (mesh or processor_uniform), "unknown linked case directory")
+            require(not any((folder / name).is_symlink() for name in names), "unknown linked case file")
+            if folder.name == "evidence" or "evidence_manifest.json" in names:
+                require("historical_raw_custody.database.json" not in names, "historical gateway owns this evidence")
+                binding = folder / "brokered_hub_binding.database.json"
+                if binding.exists():
+                    _, ack = regular_json(binding, 65536)
+                    require(ack.get("state") != "hub_progressive_custody" and
+                            ack.get("authorization",{}).get("receipt",{}).get("kind") != "hub-progressive-evidence-custody",
+                            "native point has a registered progressive owner")
     return request
 
 

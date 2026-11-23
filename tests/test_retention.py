@@ -1018,7 +1018,7 @@ def test_api_strip_preserves_served_media_and_reports_maintenance():
 def test_api_running_guard_and_delete_status_codes(tmp_path):
     from airfoilfoam.automatic_retention import direct_request, disposable
     local = tmp_path / "legacy-mirror"
-    _write_json(local / "request.json", {})
+    _write_json(local / "request.json", {"execution_id":None})
     _write_json(local / "status.json", {"job_id":local.name,"state":"cancelled","completed_cases":0})
     _write(local / ".execute.lock", b"")
     record = _write(local / "cases/c0/a0/evidence/historical_raw_custody.database.json", b"registered physical custody")
@@ -1028,6 +1028,15 @@ def test_api_running_guard_and_delete_status_codes(tmp_path):
     with pytest.raises(JobRetentionRefused):
         strip_job_dir(local, keep_case_state=False, source_guard=direct_request)
     assert original.read_bytes() == b"original stored bytes" and record.is_file()
+    redirected = tmp_path / "direct-case-with-alias"
+    _write_json(redirected / "request.json", {"execution_id":None})
+    _write_json(redirected / "status.json", {"job_id":redirected.name,"state":"failed","completed_cases":0})
+    (redirected/"cases").mkdir()
+    (redirected/"cases/other").symlink_to(local/"cases/c0",target_is_directory=True)
+    with pytest.raises(JobRetentionRefused, match="unknown linked case"):
+        strip_job_dir(redirected, keep_case_state=False, source_guard=direct_request)
+    assert original.read_bytes() == b"original stored bytes"
+
     client = TestClient(app)
     running_id = "retention-api-running"
     running_root = _clean_store_job(running_id)
