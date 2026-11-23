@@ -1317,6 +1317,13 @@ describe.sequential("worker-only legacy backup and 0198 representation", { timeo
       path = await directory(),
       store = new MemoryBackup();
     await client.sql`UPDATE progressive_report_storage_policy SET normalization_enabled=true`;
+    const put = store.put.bind(store);
+    let puts = 0;
+    store.put = async (key, bytes) => {
+      const object = await put(key, bytes);
+      object.verifiedAt = new Date(1800000000000 + puts++).toISOString();
+      return object;
+    };
     const waits: number[] = [],
       events: Record<string, unknown>[] = [];
     const query = vi.spyOn(source, "query");
@@ -1429,6 +1436,7 @@ describe.sequential("worker-only legacy backup and 0198 representation", { timeo
         readFile(join(path, "pending.jsonl.gz")),
       ).rejects.toMatchObject({ code: "ENOENT" });
       expect(JSON.stringify(events)).not.toMatch(/sensitive|private\/path/);
+      expect(puts).toBe(1);
     } finally {
       query.mockRestore();
     }

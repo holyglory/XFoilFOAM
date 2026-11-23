@@ -23,6 +23,9 @@ export type LegacyStorageCategory =
   | "container_restarting"
   | "gcs_rate_limited"
   | "gcs_server_error"
+  | "database_statement_timeout"
+  | "database_user_cancelled"
+  | "database_query_cancelled"
   | "database_lock_timeout"
   | "database_deadlock"
   | "database_serialization_failure"
@@ -52,6 +55,8 @@ export interface LegacyStorageFailureDetails {
     kind: "report" | "conflict";
     sequence: number;
   };
+  transactionRolledBack?: boolean;
+  registrationElapsedMs?: number;
   workerPhase?: string;
 }
 const operations = new Set<string>([
@@ -78,6 +83,9 @@ const categories = new Set<string>([
   "container_restarting",
   "gcs_rate_limited",
   "gcs_server_error",
+  "database_statement_timeout",
+  "database_user_cancelled",
+  "database_query_cancelled",
   "database_lock_timeout",
   "database_deadlock",
   "database_serialization_failure",
@@ -118,6 +126,8 @@ export class LegacyStorageOperationError extends Error {
     localCode?: unknown;
     sqlState?: unknown;
     member?: LegacyStorageFailureDetails["member"];
+    transactionRolledBack?: unknown;
+    registrationElapsedMs?: unknown;
     workerPhase?: unknown;
   }) {
     const operation = (
@@ -177,6 +187,15 @@ export class LegacyStorageOperationError extends Error {
               sequence: input.member.sequence,
             },
           }
+        : {}),
+      ...(input.sqlState === "57014" &&
+      typeof input.transactionRolledBack === "boolean"
+        ? { transactionRolledBack: input.transactionRolledBack }
+        : {}),
+      ...(input.workerPhase === "custody_registration" &&
+      Number.isSafeInteger(input.registrationElapsedMs) &&
+      Number(input.registrationElapsedMs) >= 0
+        ? { registrationElapsedMs: Number(input.registrationElapsedMs) }
         : {}),
       ...(input.sqlState === null ||
       (typeof input.sqlState === "string" &&

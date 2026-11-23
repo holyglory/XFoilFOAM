@@ -22,6 +22,23 @@ share one decoded generation index within a bounded output page. The controller
 rechecks the PostgreSQL pointers before sealing the page. A missing origin or
 proof mismatch holds the checkpoint and identifies the execution and sequence.
 
+The normal database migration prepares the non-null report payload reference
+indexes concurrently before adopting migration 0223. Operators can run
+`pnpm --filter @aerodb/db migrate --prepare-report-payload-indexes` to perform
+that preparation separately. It verifies the full index definition and catalog
+state. Both 0198 foreign keys keep their original RESTRICT behavior. The worker
+and remote scalar reference indexes bound the final orphan check after a page
+is released.
+
+A custody registration retains its 30-second SQL deadline. When PostgreSQL
+specifically reports a statement timeout and acknowledges rollback, the
+controller can retry that same durable receipt once. It repeats the pinned hub
+restore and independent worker readback before opening a new transaction.
+Administrative and unrecognized cancellations hold the page. Diagnostics record
+the phase, elapsed registration time and bounded cancellation reason. On
+restart, a saved scalar transfer can reuse a previously sealed receipt for
+the same bytes and generation, including receipts from older releases.
+
 ## Configure an operation
 
 Run from a checkout with dependencies installed. Supply nonsecret targets and

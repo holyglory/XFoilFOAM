@@ -900,7 +900,11 @@ it("normal migrate prepares 0223 online, recovers an interrupted build and prese
     ).toBe(false);
     expect(await countJournal()).toBe(n);
     await normal();
-    expect(await countJournal()).toBe(n + 1);
+    const journalAfter = await countJournal();
+    expect(journalAfter).toBeGreaterThan(n);
+    expect(
+      await db`SELECT FROM drizzle.__drizzle_migrations WHERE created_at=1795363913054`,
+    ).toHaveLength(1);
     expect((await prepareReportPayloadReferenceIndexes(db)).indexes).toEqual([
       { name: worker, action: "existing" },
       { name: remote, action: "existing" },
@@ -916,7 +920,7 @@ it("normal migrate prepares 0223 online, recovers an interrupted build and prese
     ).rejects.toThrow(/referenced|foreign key/i);
     expect(await identity()).toEqual(before);
     await normal();
-    expect(await countJournal()).toBe(n + 1);
+    expect(await countJournal()).toBe(journalAfter);
   } finally {
     await db.end();
     await admin!.unsafe(`DROP DATABASE "${name}"`);

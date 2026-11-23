@@ -8,6 +8,7 @@ import type {
 import { decodeLegacyPage } from "@aerodb/db/legacy-report-storage-codec";
 import {
   legacySha256,
+  LegacyStorageOperationError,
   type LegacyBackupStore,
 } from "./legacy-report-storage-gcs";
 import {
@@ -20,6 +21,39 @@ import type {
 } from "./legacy-report-storage-migration";
 
 const quote = (text: string) => "'" + text.replace(/'/g, "'\\''") + "'";
+
+/** A bounded retry is private to this durable receipt. Each attempt reopens
+ * that exact generation and the real worker reader before a fresh transaction.
+ * The general transfer loop must never retry arbitrary 57014 cancellations. */
+export async function applyPinnedCustodyWithRetry(
+  receipt: Pick<LegacyBackupReceipt, "object"> | undefined,
+  apply: () => Promise<LegacyNormalizationProof>,
+): Promise<LegacyNormalizationProof> {
+  try {
+    return await apply();
+  } catch (error) {
+    if (
+      !receipt ||
+      !(error instanceof LegacyStorageOperationError) ||
+      error.details.operation !== "worker_custody" ||
+      error.details.category !== "database_statement_timeout" ||
+      error.details.workerPhase !== "custody_registration" ||
+      error.details.sqlState !== "57014" ||
+      !error.details.transactionRolledBack
+    )
+      throw error;
+    const result = await apply();
+    return {
+      ...result,
+      custody: {
+        ...result.custody,
+        registrationTimeoutRetries: 1,
+        priorRegistrationElapsedMs: error.details.registrationElapsedMs,
+        retriedGeneration: receipt.object.generation,
+      },
+    };
+  }
+}
 
 /** Prefer exact local-volume custody; old releases and denied/unproven readers
  * retain full 0198 access. The logical source binding deliberately stays stable. */
@@ -53,7 +87,15 @@ export class LegacyWorkingVolumeNormalizer implements LegacyPageNormalizer {
     );
     this.fallbackEligibility = fallback.fallbackEligibility;
   }
-  async apply(
+  apply(
+    page: LegacyBackupPage,
+    receipt?: LegacyBackupReceipt,
+  ): Promise<LegacyNormalizationProof> {
+    return applyPinnedCustodyWithRetry(receipt, () =>
+      this.applyOnce(page, receipt),
+    );
+  }
+  private async applyOnce(
     page: LegacyBackupPage,
     receipt?: LegacyBackupReceipt,
   ): Promise<LegacyNormalizationProof> {

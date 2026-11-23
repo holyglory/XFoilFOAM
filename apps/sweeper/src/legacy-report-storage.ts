@@ -5,8 +5,16 @@ import {
 } from "./legacy-report-conflict-origin";
 import { randomUUID } from "node:crypto";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { isDeepStrictEqual } from "node:util";
 import { StringDecoder } from "node:string_decoder";
-import { mkdir, open, readFile, lstat, unlink } from "node:fs/promises";
+import {
+  mkdir,
+  open,
+  opendir,
+  readFile,
+  lstat,
+  unlink,
+} from "node:fs/promises";
 import { syncDirectory, durableWrite } from "./legacy-report-storage-files";
 import {
   runLegacyExecutionSlots,
@@ -30,6 +38,7 @@ import {
   type LegacyReportKind,
 } from "@aerodb/db/legacy-report-storage";
 import {
+  assertLegacyObject,
   legacySha256,
   LegacyStorageOperationError,
   legacySshOperationError,
@@ -577,6 +586,45 @@ async function reportWindowVersion(
   return result.version;
 }
 
+/** Only the scalar crash-recovery path searches the receipt directory. Earlier
+ * binaries could seal a new verification timestamp for the same immutable
+ * generation on each retry. Reuse the earliest matching receipt and retain all
+ * evidence. No ordinary forward page performs this scan. */
+async function findPendingReceipt(directory: string, packed: Buffer) {
+  const hash = legacySha256(packed);
+  let saved: LegacyBackupReceipt | undefined, identity: unknown;
+  const suffix = new RegExp(
+    "^([a-f0-9]{64})\\." + hash + "\\.([1-9][0-9]{0,19})\\.receipt\\.json$",
+  );
+  for await (const file of await opendir(directory)) {
+    const match = suffix.exec(file.name);
+    if (!match) continue;
+    const path = join(directory, file.name);
+    if (!file.isFile() || (await lstat(path)).size > 65536)
+      throw new Error("Invalid saved legacy receipt");
+    const raw = await readFile(path);
+    const r = JSON.parse(raw.toString("utf8")) as LegacyBackupReceipt;
+    assertLegacyObject(r.object);
+    if (
+      legacySha256(raw) !== match[1] ||
+      r.object.sha256 !== hash ||
+      r.object.byteSize !== packed.length ||
+      r.object.generation !== match[2]
+    )
+      throw new Error("Saved legacy receipt differs from pending bytes");
+    const same = { ...r, object: { ...r.object, verifiedAt: null } };
+    if (saved && !isDeepStrictEqual(identity, same))
+      throw new Error("Conflicting receipts for the pending legacy page");
+    if (
+      !saved ||
+      Date.parse(r.object.verifiedAt) < Date.parse(saved.object.verifiedAt)
+    )
+      saved = r;
+    identity = same;
+  }
+  return saved;
+}
+
 /** Kernel-owned lock: stdin closes on process death, releasing flock without a stale directory. */
 async function acquireLegacyCopyLock(
   path: string,
@@ -918,6 +966,7 @@ export async function exportLegacyReports(input: {
       ) {
         if (input.shouldStop?.()) break;
         let page: Packed;
+        let resuming = false;
         try {
           const details = await lstat(pendingPath);
           if (!details.isFile() || details.size > 512 * 1024 ** 2)
@@ -965,6 +1014,7 @@ export async function exportLegacyReports(input: {
             if (next.execution === input.scope.executions.length) break;
             continue;
           }
+          resuming = true;
         } catch (error) {
           if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
           if (next.execution === input.scope.executions.length) break;
@@ -1015,7 +1065,13 @@ export async function exportLegacyReports(input: {
           // handler now, and finish the current durable operation first.
           ahead = speculate(following).catch((error: unknown) => ({ error }));
         }
-        const receiptFile = await commitPacked(page, input.directory);
+        const receiptFile = await commitPacked(
+          page,
+          input.directory,
+          resuming
+            ? await findPendingReceipt(input.directory, page.bytes)
+            : undefined,
+        );
         next = page.next;
         lastReceipt = receiptFile;
         await saveState();
