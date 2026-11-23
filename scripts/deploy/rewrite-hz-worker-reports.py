@@ -309,7 +309,7 @@ def checkpoint_unit_matches(prior, current, owner, paused):
     if same_unit(prior, current, paused=False):
         return True  # The attempted stop failed before changing anything.
     return bool(
-        owner.get("restartIntent")
+        (owner.get("restartIntent") or owner.get("restoredViaDependency"))
         and current["ActiveState"] == "active"
         and current["SubState"] == prior["SubState"]
         and current.get("MainPID", "0") != "0"
@@ -324,7 +324,8 @@ def verify_restarted_checkpoints(state, save):
     pending = {
         n: o
         for n, o in state.get("checkpointedOwners", {}).items()
-        if o.get("restartIntent") and not o.get("advancedReceipt")
+        if (o.get("restartIntent") or o.get("restoredViaDependency"))
+        and not o.get("advancedReceipt")
     }
     deadline = time.monotonic() + state.get("restoreReserve", 300)
     while pending:
@@ -423,6 +424,164 @@ def check_units(state, paused, discover=inventory):
         raise RuntimeError("Another report maintenance unit became active")
 
 
+def activation(unit):
+    properties = "ActiveState,SubState,MainPID,ControlGroup,InvocationID,ExecMainStartTimestampMonotonic,Restart,NRestarts,Requires,Wants,BindsTo,Upholds,After"
+    return dict(
+        line.split("=", 1)
+        for line in ctl("show", unit, "--property=" + properties).splitlines()
+    )
+
+
+def dependency_activation(state, name, owner, current):
+    """Recognize a systemd job started by another exact captured service."""
+    prior = state["units"][name]
+    if (
+        not owner.get("stopped")
+        or owner.get("restartIntent")
+        or not current
+        or current.get("captureRefusal")
+        or current.get("ActiveState") != "active"
+        or current.get("SubState") != "running"
+        or current.get("MainPID", "0") == "0"
+        or not current.get("InvocationID")
+        or current.get("InvocationID") == prior["InvocationID"]
+        or current.get("ControlGroup") != prior["ControlGroup"]
+        or any(
+            prior[k] != current.get(k)
+            for k in ("FragmentPath", "UnitFileState", "FreezerState")
+        )
+        or definition_digest(name) != owner["definitionSha256"]
+    ):
+        return None
+    actual = activation(name)
+    if (
+        actual.get("InvocationID") != current["InvocationID"]
+        or actual.get("MainPID") != current["MainPID"]
+    ):
+        return None
+    child_start = int(actual.get("ExecMainStartTimestampMonotonic") or 0)
+    if not child_start:
+        return None
+    for peer, saved in state["checkpointedOwners"].items():
+        if (
+            peer == name
+            or not saved.get("restartIntent")
+            or not saved.get("restoredInvocation")
+        ):
+            continue
+        props = activation(peer)
+        if (
+            props.get("InvocationID") != saved["restoredInvocation"]
+            or props.get("ActiveState") != "active"
+            or definition_digest(peer) != saved["definitionSha256"]
+        ):
+            continue
+        edges = [
+            k
+            for k in ("Wants", "Requires", "BindsTo", "Upholds")
+            if name in props.get(k, "").split()
+        ]
+        if not edges:
+            continue
+        if "startRequestUs" in saved and "startConfirmedUs" in saved:
+            if not saved["startRequestUs"] <= child_start <= saved["startConfirmedUs"]:
+                continue
+        else:
+            # Old run receipts did not include a monotonic start bracket. Only
+            # adopt an ordered strong dependency which has already made fresh
+            # progress and started in the verified peer's start-command window.
+            peer_start = int(props.get("ExecMainStartTimestampMonotonic") or 0)
+            if not (
+                "BindsTo" in edges
+                and name in props.get("After", "").split()
+                and 0 <= peer_start - child_start <= 20_000_000
+            ):
+                continue
+            receipt = file_witness(owner["receipt"])
+            if (
+                receipt["sha256"] == owner["stoppedReceipt"]["sha256"]
+                or receipt["mtimeNs"] <= owner["stoppedReceipt"]["mtimeNs"]
+            ):
+                continue
+        return {
+            "activatedBy": peer,
+            "sourceInvocation": props["InvocationID"],
+            "edges": edges,
+            "invocation": actual["InvocationID"],
+            "startMonotonicUs": child_start,
+        }
+    return None
+
+
+def verify_restored_units(state, save, discover):
+    deadline = time.monotonic() + state.get("restoreReserve", 300)
+    while True:
+        current = discover(state["extraUnits"])
+        waiting = []
+        for name, owner in state.get("checkpointedOwners", {}).items():
+            if not owner.get("restoredInvocation"):
+                continue
+            actual = current.get(name)
+            if checkpoint_unit_matches(state["units"][name], actual, owner, False):
+                continue
+            props = activation(name)
+            if (
+                not actual
+                or definition_digest(name) != owner["definitionSha256"]
+                or props.get("Restart") in (None, "", "no")
+                or int(props.get("NRestarts") or 0) < 1
+            ):
+                raise RuntimeError("Unexpected restored invocation: " + name)
+            if (
+                props.get("ActiveState") == "activating"
+                and props.get("SubState") == "auto-restart"
+            ):
+                waiting.append(name)
+                continue
+            # A documented automatic retry must retain its definition, cgroup
+            # and configuration and produce a new durable receipt. A user start
+            # or an unrelated replacement cannot establish this transition.
+            same_shape = checkpoint_unit_matches(
+                state["units"][name],
+                actual,
+                dict(owner, restoredInvocation=actual.get("InvocationID")),
+                False,
+            )
+            if (
+                not same_shape
+                or props.get("InvocationID") != actual.get("InvocationID")
+                or actual.get("ControlGroup")
+                != state["units"][name].get("ControlGroup")
+            ):
+                raise RuntimeError("Unexpected restarted service state: " + name)
+            progress = file_witness(owner["receipt"])
+            if (
+                progress["sha256"] == owner["stoppedReceipt"]["sha256"]
+                or progress["mtimeNs"] <= owner["stoppedReceipt"]["mtimeNs"]
+            ):
+                waiting.append(name)
+                continue
+            owner.setdefault("automaticRestarts", []).append(
+                {
+                    "from": owner["restoredInvocation"],
+                    "to": actual["InvocationID"],
+                    "systemdCount": int(props["NRestarts"]),
+                    "receipt": progress,
+                }
+            )
+            owner["restoredInvocation"] = actual["InvocationID"]
+            save()
+        if not waiting:
+            check_units(state, False, lambda _: current)
+            return
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                "Restored systemd services still retry without a fresh receipt: "
+                + ", ".join(waiting)
+            )
+        time.sleep(2)
+
+
 def restore_units(state, save, discover=None, control=ctl):
     # Release each captured process independently even when a different writer
     # is restarting or systemd cannot enumerate the full inventory.
@@ -433,6 +592,12 @@ def restore_units(state, save, discover=None, control=ctl):
         owner = state.get("checkpointedOwners", {}).get(name)
         try:
             now = lookup([name]).get(name)
+            if owner and not checkpoint_unit_matches(prior, now, owner, False):
+                activation_proof = dependency_activation(state, name, owner, now)
+                if activation_proof:
+                    owner["restoredViaDependency"] = activation_proof
+                    owner["restoredInvocation"] = activation_proof["invocation"]
+                    save()
             if not checkpoint_unit_matches(prior, now, owner, False):
                 if not checkpoint_unit_matches(prior, now, owner, True):
                     raise RuntimeError("Unit identity or state changed")
@@ -446,8 +611,11 @@ def restore_units(state, save, discover=None, control=ctl):
                     owner["stopped"] = current
                     owner.setdefault("stoppedReceipt", file_witness(owner["receipt"]))
                     owner["restartIntent"] = True
+                    owner["startRequestUs"] = time.monotonic_ns() // 1000
                     save()
                 control("start" if owner or name.endswith(".timer") else "thaw", name)
+                if owner:
+                    owner["startConfirmedUs"] = time.monotonic_ns() // 1000
                 if not checkpoint_unit_matches(
                     prior, lookup([name]).get(name), owner, False
                 ):
@@ -464,7 +632,7 @@ def restore_units(state, save, discover=None, control=ctl):
             failures.append(f"{name}: {exc}")
     if failures:
         raise RuntimeError("Operator recovery incomplete: " + "; ".join(failures))
-    check_units(state, False, discover or inventory)
+    verify_restored_units(state, save, discover or inventory)
 
 
 PROBE = """
