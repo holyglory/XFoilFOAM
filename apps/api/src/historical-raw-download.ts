@@ -5,6 +5,7 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { createReadStream } from "node:fs";
 import { z } from "zod";
 import { env } from "./env";
+import { registerRetentionOwnerRead } from "./registered-retention-owner";
 import type { HistoricalRawOwner } from "./historical-raw-source";
 import {
   brokerArchiveStorage,
@@ -71,6 +72,7 @@ export async function registerHistoricalRawDownloads(
     }
     return p;
   }
+  registerRetentionOwnerRead(app, db, principal);
   app.get(base + "/receipts", async (req, reply) => {
     const solver = await principal(req, reply);
     if (!solver) return;

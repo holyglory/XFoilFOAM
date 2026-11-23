@@ -607,6 +607,30 @@ type Archive = {
   manifest: ClosedProgressiveManifest;
   remote: ProgressiveEvidenceCustodyReceipt["remote"];
 };
+async function assertOrdinaryRegisteredCustody(db: DB, id: string, signal: AbortSignal) {
+  const {baseUrl,authToken,envelope} = await registeredWorkerArchiveOwner(db,id);
+  const {readRegisteredArchive} = await import("@aerodb/core/registered-archive-read");
+  const res = await readRegisteredArchive(`${baseUrl}/progressive-executions/${id}/historical-raw-archives/retention-owner`,
+    authToken,signal,"application/json");
+  if (res.status !== 200 || !res.body || res.headers.get("content-type")?.split(";")[0] !== "application/json") {
+    await res.body?.cancel();
+    throw Error(`Registered retention owner unavailable (HTTP ${res.status})`);
+  }
+  const chunks: Buffer[] = [];
+  let size = 0;
+  for await (const part of res.body as unknown as AsyncIterable<Uint8Array>) {
+    size += part.length;
+    if (size > 1024) throw Error("Registered retention owner exceeded its byte bound");
+    chunks.push(Buffer.from(part));
+  }
+  const owner = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+  if (owner?.version !== 1 || owner.executionId !== id || owner.solverId !== envelope.solverId ||
+      owner.promiseId !== envelope.promiseId || owner.assignmentSignature !== envelope.contentSignature ||
+      typeof owner.historicalRaw !== "boolean") throw Error("Registered retention owner changed or was ambiguous");
+  if (owner.historicalRaw) throw Error("Historical raw gateway owns this execution");
+  return envelope.contentSignature;
+}
+
 async function historicalCustody(db: DB, id: string, signal?: AbortSignal) {
   if (process.env.AIRFOILFOAM_DEPLOYMENT_ROLE !== "remote-solver")
     throw Error("Historical reclaim requires the registered source worker");
@@ -1127,6 +1151,8 @@ export async function closedProgressiveJob(
       );
     return proofs(tx, id, media, historical, options.keepMedia, options.automatic);
   });
+  const restoreSignal = options.signal ?? AbortSignal.timeout(20 * 60_000);
+  const ordinaryAssignment = options.automatic ? await assertOrdinaryRegisteredCustody(db,id,restoreSignal) : undefined;
   const manifests = source.archives.map((a) => a.manifest);
   const plan = await engine.reclaimClosedProgressiveFiles(id, manifests);
   checkReceipt(plan, id, "planned");
@@ -1353,6 +1379,8 @@ export async function closedProgressiveJob(
   const confirmedStop = options.preserveSolver ? await registeredTerminalPromise(db, id, options.signal, Boolean(hubStop)) : undefined;
   if (terminalPromiseSha256(confirmedStop) !== stopSha256)
     throw Error("Registered terminal ownership changed during preflight");
+  if (options.automatic && await assertOrdinaryRegisteredCustody(db,id,restoreSignal) !== ordinaryAssignment)
+    throw Error("Registered retention assignment changed during restore");
   const settled = await db.transaction(async (raw) => {
     const tx = raw as unknown as DB;
     await tx.execute(
@@ -1369,6 +1397,12 @@ export async function closedProgressiveJob(
       sql`SELECT j.id FROM sim_jobs j WHERE j.id=${id}::uuid AND ${eligible(now, ageMs, undefined, media, options.historicalRaw, options.preserveSolver, confirmedStop)}`,
     );
     if (!ready) return false;
+    if (options.automatic) {
+      const [local] = await tx.execute(sql`SELECT j.request_payload#>>'{remoteProgressiveExecution,contentSignature}' AS assignment,
+        EXISTS(SELECT FROM progressive_historical_raw_archives c WHERE c.sim_job_id=j.id) AS historical FROM sim_jobs j WHERE j.id=${id}::uuid`);
+      if (local?.historical !== false || local.assignment !== ordinaryAssignment)
+        throw Error("Registered retention owner changed before removal");
+    }
     const fresh = await proofs(tx, id, media, historical, options.keepMedia, options.automatic);
     if ((keptImages || options.automatic) && !historical)
       await assertWorkingPathsUnreferenced(tx, id, plan.workingPaths!);
@@ -1526,6 +1560,9 @@ async function confirmAutomaticFiles(db: DB, engine: ClosedProgressiveBackend, i
 function holdReason(error: unknown) {
   const message = error instanceof Error ? error.message : "";
   if (error instanceof EngineError) return `engine-${error.status ?? "unavailable"}`;
+  if (message === "Historical raw gateway owns this execution") return "historical-raw-owner";
+  if (message.startsWith("Registered retention owner")) return "registered-owner-unavailable";
+  if (message.startsWith("Job has active ownership")) return "ineligible-at-proof";
   if (/no positive|directory is absent/i.test(message)) return "no-verified-working-copies";
   if (/media|image|legend|PNG/.test(message)) return "media-ownership";
   if (/lock|EAGAIN|Resource temporarily unavailable/.test(message)) return "worker-busy";

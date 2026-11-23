@@ -391,6 +391,25 @@ class _ContinuationLinks:
                 "otherLinks": self.aliases, "pathSetSha256": self.digest.hexdigest()}
 
 
+def _ordinary_working_copy(name):
+    parts = _relative(name).parts
+    if len(parts) < 4 or parts[0] != "cases":
+        return False
+    for part in parts[2:]:
+        lower = part.lower()
+        if (lower in {"evidence", "frames", "images", "scaled_media", "custom_renders", "meshes", "polymesh"} or
+                any(word in lower for word in ("quarantine", "forensic", "cache")) or
+                re.fullmatch(r"core(?:\\.[0-9]+)?", lower) or
+                lower.endswith((".gz", ".zst", ".zip", ".tar", ".png", ".jpg", ".mp4"))):
+            return False
+    relative = parts[2:]
+    if re.fullmatch(r"transient(?:_a[0-9]+)?", relative[0]):
+        relative = relative[1:]
+        if relative == ("log.pimpleFoam",):
+            return True
+    return len(relative) >= 2 and (relative[0] == "postProcessing" or _time(relative[0]) > 0)
+
+
 def _preserved_mesh_inventory(root, mesh, links=None):
     digest = hashlib.sha256()
     size = count = 0
@@ -725,6 +744,9 @@ def reclaim_closed_progressive_files(job_root: Path, proofs: list[dict], expecte
             kept_rows = [entry for entry, _ in (kept or {}).values()]
             current = {path.relative_to(job_root).as_posix(): [sha, st.st_size] for path, (sha, st) in files.items()}
             rows = stored["files"] if stored is not None else [[name, *current[name]] for name in sorted(current)]
+            if not historic:
+                _require(all(_ordinary_working_copy(row[0]) for row in rows),
+                         "ordinary plan contains cache, raw, forensic or unsupported working paths")
             fingerprint = [proofs, rows, kept_rows] if keep_requested else [proofs, rows]
             if preserved is not None:
                 fingerprint.append({"preservedSolver": preserved})

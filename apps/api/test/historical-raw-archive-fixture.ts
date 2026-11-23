@@ -550,6 +550,17 @@ export async function verifyHistoricalRawArchive(
               url: target + "/generations/" + pin,
               headers: { "x-xfoilfoam-solver-token": ownerToken },
             });
+          const retentionOwner = (token: string, execution = job) => app.inject({
+            method:"GET",url:`/api/sync/v1/progressive-executions/${execution}/historical-raw-archives/retention-owner`,
+            headers:{"x-xfoilfoam-solver-token":token},
+          });
+          expect((await retentionOwner("foreign")).statusCode).toBe(404);
+          expect((await retentionOwner("invalid")).statusCode).toBe(401);
+          expect((await retentionOwner("owner",randomUUID())).statusCode).toBe(404);
+          const noHistoricalCustody = await retentionOwner("owner");
+          expect(noHistoricalCustody.statusCode,noHistoricalCustody.body).toBe(200);
+          expect(noHistoricalCustody.json()).toEqual({version:1,executionId:job,promiseId:envelope.promiseId,
+            solverId:owner.id,assignmentSignature:envelope.contentSignature,historicalRaw:false});
           expect((await download("owner")).statusCode).toBe(409);
           const saved = await verify();
           expect(saved.statusCode, saved.body).toBe(200);
@@ -560,6 +571,10 @@ export async function verifyHistoricalRawArchive(
             manifest_sha256: sha(manifest),
             solver_id: owner.id,
           });
+          const protectedOwner=await retentionOwner("owner");
+          expect(protectedOwner.statusCode).toBe(200);
+          expect(protectedOwner.json()).toEqual({...noHistoricalCustody.json(),historicalRaw:true});
+          expect((await retentionOwner("foreign")).statusCode).toBe(404);
           const { verifyHistoricalWorkerRestore } =
             await import("./historical-raw-worker-restore-fixture");
           await verifyHistoricalWorkerRestore(

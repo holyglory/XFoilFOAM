@@ -6418,3 +6418,12 @@ name = "transport"
 tier = "development"
 requires = ["workspace"]
 command = ["/usr/bin/corepack","pnpm","--filter","@aerodb/sweeper","exec","vitest","run","test/progressive-report-archive-roundtrip.test.ts"]
+
+[test.automatic-retention-image]
+timeout_seconds = 1800
+
+[[test.automatic-retention-image.check]]
+name = "installed-sweeper-image"
+tier = "development"
+timeout_seconds = 1800
+command = ["/bin/bash", "scripts/dev/verify-sweeper-retention-image.sh"]

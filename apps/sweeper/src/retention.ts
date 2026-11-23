@@ -168,6 +168,7 @@ async function referencedDirectory(db: DB, key: string, orphan: boolean) {
   const uuid = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(key) ? key : null;
   const [state] = await db.execute(sql`SELECT
     EXISTS(SELECT FROM sim_jobs j WHERE (j.id=${uuid}::uuid OR j.engine_job_id=${key}) AND (${orphan} OR ${progressiveOwner("j")}))
+    OR EXISTS(SELECT FROM progressive_historical_raw_archives h WHERE h.sim_job_id=${uuid}::uuid)
     OR EXISTS(SELECT FROM progressive_remote_dispatches d WHERE d.sim_job_id=${uuid}::uuid)
     OR EXISTS(SELECT FROM progressive_worker_reports r WHERE r.sim_job_id=${uuid}::uuid)
     OR EXISTS(SELECT FROM progressive_worker_submission_intents i WHERE i.sim_job_id=${uuid}::uuid)
@@ -941,7 +942,7 @@ async function runRetentionPass(
   ) {
     lastSyncImportGcAtMs = nowMs;
     try {
-      await sweepSyncImportOrphans(db, { now: options.now });
+      await sweepSyncImportOrphans(db, { now: options.now, mediaDir: options.mediaDir });
     } catch (error) {
       console.error(
         `[sweeper] RETENTION: sync import GC failed: ${error instanceof Error ? error.message : String(error)}`,

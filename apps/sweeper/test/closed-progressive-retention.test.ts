@@ -66,11 +66,15 @@ const tableDefinitions = [
 async function fixture(db: DB, id: string, points: number, opts: {
   remote?: ProgressiveEvidenceCustodyReceipt["remote"]; base?: string;
 } = {}) {
-  const req = {
-    remoteProgressiveExecution: {},
-    syncPromiseId: promiseId,
-    upstreamBaseUrl: opts.base ?? root,
-  };
+  const unit = {unitId:randomUUID(),token:randomUUID(),alpha:0,activeBudgetSeconds:900};
+  const assignment = opts.base ? sealProgressiveRemoteExecution({solverId:solver,promiseId,
+    scope:{executionContract:"progressive-cfd-v1",executionId:id,epochId:randomUUID(),generationId:randomUUID(),
+      targetId:"a".repeat(64),recipeId:"b".repeat(64),stage:2,units:[unit],tokens:[unit.token]},
+    request:{execution_id:id,expected_engine:{...OPENCFD_2606_ENGINE},expected_execution_pool:"test-pool",
+      expected_solver_budget_version:2,expected_mesh_recovery_version:1,airfoil:{name:"normal retention fixture"},
+      chord_lengths:[1],speeds:[30],aoa:{angles:[0]},solver:{warm_start:true},
+      resources:{case_concurrency:1,case_solver_budget_seconds:900}}}) : undefined;
+  const req = {remoteSolver:true,remoteProgressiveExecution:assignment ?? {},syncPromiseId:promiseId,upstreamBaseUrl:opts.base ?? root};
   await db.execute(
     sql`INSERT INTO sim_jobs(id,engine_job_id,status,request_payload,"finishedAt") VALUES(${id},${id},'done',${JSON.stringify(req)}::jsonb,'2025-01-01')`,
   );
@@ -149,7 +153,7 @@ async function fixture(db: DB, id: string, points: number, opts: {
     await db.execute(
       sql`INSERT INTO remote_asset_references VALUES(${bundle},'evidence_artifact',${attempt},${result},${storage},${remote.storedSha256},${remote.storedByteSize},'application/zstd','remote_only',${JSON.stringify({ ...remote, brokeredUploadId: upload })}::jsonb,${receipt.canonical.resultId},${receipt.canonical.artifactId},${(opts.base ?? root) + "/evidence-uploads/" + upload + "/download"})`,
     );
-    objects.push({ attempt, upload, remote, signed });
+    objects.push({ attempt, upload, remote, signed, assignment });
   }
   return objects;
 }
@@ -342,10 +346,22 @@ it("runs the default sweeper past eight held jobs, restores every member, and re
   let connection = open();
   const owned = (i: number) => "00000000-0000-4000-a000-"+String(i).padStart(12,"0");
   const original = new Map<string, { path: string; remote: ProgressiveEvidenceCustodyReceipt["remote"]; hits: number; failPost: boolean }>();
+  const historicalOwner=owned(9), bad=owned(10), good=owned(11), transferred=owned(12), oldHub=owned(13);
+  const assignments=new Map<string,string>(), protectedJobs=new Set([historicalOwner]), ownerProbes=new Map<string,number>();
   const server = createServer(async (req,res) => {
+    if (req.headers["x-xfoilfoam-solver-token"]!==token) {res.writeHead(403).end();return;}
+    const owner = req.url?.match(/^\/api\/sync\/v1\/progressive-executions\/([a-f0-9-]+)\/historical-raw-archives\/retention-owner$/)?.[1];
+    if (owner) {
+      ownerProbes.set(owner,(ownerProbes.get(owner)??0)+1);
+      if (owner===oldHub) { res.writeHead(404).end();return; }
+      res.writeHead(200,{"content-type":"application/json"}).end(JSON.stringify({version:1,executionId:owner,solverId:solver,promiseId,
+        assignmentSignature:assignments.get(owner),historicalRaw:protectedJobs.has(owner)}));
+      return;
+    }
     const source = original.get(req.url?.split("/").at(-2) ?? "");
     if (!source || req.headers["x-xfoilfoam-solver-token"] !== token) { res.writeHead(403).end(); return; }
     source.hits++;
+    if (source.path.endsWith(transferred+".tar.zst")) protectedJobs.add(transferred);
     if (source.failPost && source.hits===2) {res.writeHead(503).end("unavailable");return;}
     const bytes=await readFile(source.path);
     res.writeHead(200,{"content-type":"application/zstd","content-length":bytes.length,
@@ -360,7 +376,7 @@ it("runs the default sweeper past eight held jobs, restores every member, and re
   const sourceFixture=fileURLToPath(new URL("../test-support/automatic-retention-source.py",import.meta.url));
   const generate = (job: string,action: string,signed?: unknown) => JSON.parse(execFileSync(python,
     ["-B",sourceFixture,volume,job,action],{cwd:rootPath,env:{...process.env,PYTHONPATH:join(rootPath,"src")},input:signed?JSON.stringify(signed):""}).toString());
-  const bad=owned(9),good=owned(10),scratch="orphan-closed-scratch",historical="orphan-unreported-source",referenced="orphan-path-owner";
+  const scratch="orphan-closed-scratch",historical="orphan-unreported-source",referenced="orphan-path-owner";
   const sourceFile=(job: string) => join(jobs,job,"cases/foil/transient_a0/log.pimpleFoam");
   const engine = {maintenanceJobs:vi.fn(async () => ({items:[scratch,historical,referenced].map(job_id=>({job_id,mtime_epoch:1,bytes:null}))})),
     maintenanceDisk:vi.fn(async()=>({used_pct:31})),deleteJob:vi.fn(()=>{throw Error("raw directory deletion was called")}),
@@ -390,9 +406,10 @@ it("runs the default sweeper past eight held jobs, restores every member, and re
       await connection.db.execute(sql`INSERT INTO result_media(id,result_attempt_id,storage_key) VALUES(${randomUUID()},${point!.attempt},${`jobs/${owned(i)}/unique.png`})`);
       await mkdir(join(jobs,owned(i)),{recursive:true});await writeFile(join(jobs,owned(i),"unique.png"),"locally retained bytes");
     }
-    for (const id of [bad,good]) {
+    for (const id of [historicalOwner,bad,good,transferred,oldHub]) {
       const remote=generate(id,id===bad?"bad-member":"good") as ProgressiveEvidenceCustodyReceipt["remote"];
-      const [point]=await fixture(connection.db,id,1,{remote,base:upstream});generate(id,"bind",point!.signed);
+      const [point]=await fixture(connection.db,id,1,{remote,base:upstream});assignments.set(id,point!.assignment!.contentSignature);
+      if (id!==historicalOwner) generate(id,"bind",point!.signed);
       await connection.db.execute(sql`UPDATE result_attempts SET regime='urans',status='failed',valid_for_polar=false,
         converged=false,cl=0.43,cd=0.018,cm=-0.03,evidence_payload='{"force_history":{"t":[0.01,0.02],"cl":[0.42,0.43],"cd":[0.02,0.018]}}'::jsonb WHERE id=${point!.attempt}`);
       original.set(point!.upload,{path:join(volume,id+".tar.zst"),remote,hits:0,failPost:id===good});
@@ -410,13 +427,15 @@ it("runs the default sweeper past eight held jobs, restores every member, and re
     const initial=await science();
     resetRetentionMemory();await tick(0,8);
     expect((await connection.db.execute(sql`SELECT closed_progressive_retention_after_id AS cursor FROM sweeper_state WHERE id=1`))[0]!.cursor).toBe(owned(8));
-    expect([...original.values()].map(x=>x.hits)).toEqual([0,0]);
+    expect([...original.values()].every(x=>x.hits===0)).toBe(true);
     for(let i=1;i<=8;i++)expect(await readFile(join(jobs,owned(i),"unique.png"),"utf8")).toBe("locally retained bytes");
     expect(existsSync(join(jobs,scratch))).toBe(false);
     expect(existsSync(join(jobs,referenced,"status.json"))).toBe(true);
     expect(await readFile(join(jobs,historical,"cases/foil/coefficient.dat"),"utf8")).toBe("unique finite coefficient history");
     await connection.sql.end();connection=open();resetRetentionMemory();
-    await tick(1,1);
+    await tick(1,2);
+    expect(await readFile(join(jobs,historicalOwner,"cases/foil/a0/evidence/engine_evidence.tar.zst"))).toEqual(await readFile(join(volume,historicalOwner+".tar.zst")));
+    expect((await connection.db.execute(sql`SELECT strip_report#>>'{closedProgressiveScan,reason}' AS held FROM sim_jobs WHERE id=${historicalOwner}`))[0]!.held).toBe("historical-raw-owner");
     expect(existsSync(sourceFile(bad))).toBe(true);
     expect((await connection.db.execute(sql`SELECT strip_report#>>'{closedProgressiveScan,reason}' AS held FROM sim_jobs WHERE id=${bad}`))[0]!.held).toBe("archive-restore");
     await tick(2,1);
@@ -426,13 +445,18 @@ it("runs the default sweeper past eight held jobs, restores every member, and re
     // A different process can finish the outstanding post-read after the normal retry is due.
     await connection.sql.end();connection=open();resetRetentionMemory();
     await connection.db.execute(sql`UPDATE sim_jobs SET strip_report=jsonb_set(strip_report,'{closedProgressiveScan,retryAfter}',to_jsonb((clock_timestamp()-interval '1 second')::text)) WHERE id=${good}`);
-    await tick(3,1); // genuinely empty tail wraps the persisted cursor
-    await tick(4,1);
+    await tick(3,2);
+    expect(existsSync(sourceFile(transferred))).toBe(true);
+    expect(existsSync(sourceFile(oldHub))).toBe(true);
+    expect((await connection.db.execute(sql`SELECT strip_report#>>'{closedProgressiveScan,reason}' AS held FROM sim_jobs WHERE id=${oldHub}`))[0]!.held).toBe("registered-owner-unavailable");
+    expect(ownerProbes.get(transferred)).toBe(2);
+    await tick(4,1); // genuinely empty tail wraps the persisted cursor
+    await tick(5,1);
     expect(await receipt()).toMatchObject({stripped_at:null,files:{complete:true,files:2,verifiedArchives:1,automaticVerification:{state:"verified"}}});
     expect(await science()).toEqual(initial);
     expect(await readFile(join(jobs,good,"cases/foil/transient_a0/0.5/U"),"utf8")).toBe("unarchived original field");
     expect(await readFile(join(jobs,good,"cases/foil/transient_a0/1/p"),"utf8")).toBe("latest pressure");
-    expect([...original.values()].map(x=>x.hits)).toEqual([1,3]);
+    expect([...original.values()].map(x=>x.hits)).toEqual([0,1,3,1,0]);
     expect(engine.deleteJob).not.toHaveBeenCalled();expect(engine.stripJob).not.toHaveBeenCalled();
     expect(captureErrors.mock.calls.flat().map(String).filter(v=>v.includes("Failed query")||v.includes("strip reaper failed"))).toEqual([]);
   } finally {
