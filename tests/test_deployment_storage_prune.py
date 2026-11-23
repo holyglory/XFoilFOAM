@@ -275,3 +275,61 @@ def test_cleanup_rejects_unbounded_or_malformed_settings(
     assert completed.returncode == 2
     assert "must be" in completed.stderr
     assert not docker_log.exists()
+
+
+def test_solver_core_soft_limit_is_inherited_and_reversible_for_the_exact_tree(tmp_path: Path) -> None:
+    import json
+    import resource
+    import runpy
+    import sys
+
+    policy = runpy.run_path(str(ROOT / "scripts/deploy/solver_core_limits.py"))
+    script = """import json,resource,subprocess,sys
+hard=resource.getrlimit(resource.RLIMIT_CORE)[1]
+start=min(8388608, hard) if hard>=0 else 8388608
+resource.setrlimit(resource.RLIMIT_CORE,(start,hard))
+p=subprocess.Popen([sys.executable,'-I','-S','-c','import time;time.sleep(25)'])
+print(json.dumps([p.pid,start]),flush=True)
+for line in sys.stdin:
+ if line.strip()=='inherit':
+  print(subprocess.check_output([sys.executable,'-I','-S','-c','import resource;print(resource.getrlimit(resource.RLIMIT_CORE)[0])'],text=True).strip(),flush=True)
+ else:break
+p.terminate();p.wait()
+"""
+    process = subprocess.Popen([sys.executable, "-I", "-S", "-c", script], stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE, text=True, cwd=tmp_path, env={"PATH": os.defpath})
+    assert process.stdin and process.stdout
+    try:
+        child, initial = json.loads(process.stdout.readline())
+        assert initial > 0
+        leader, originals = policy["inspect_tree"](process.pid)
+        assert {r["pid"] for r in originals} == {process.pid, child}
+        own = resource.getrlimit(resource.RLIMIT_CORE)
+        actual = policy["change_tree"](process.pid, leader, originals, restore=False)
+        assert not actual["held"]
+        assert all(item["after"] == 0 for item in actual["verified"])
+        process.stdin.write("inherit\n"); process.stdin.flush()
+        assert process.stdout.readline().strip() == "0"
+        # A stale recorded birth identity cannot authorize changing a new process.
+        stale = [{**r, "start": r["start"]-1} for r in originals]
+        assert policy["change_tree"](process.pid, leader, stale, restore=True)["verified"] == []
+        restored = policy["change_tree"](process.pid, leader, originals, restore=True)
+        assert all(item["after"] == initial for item in restored["verified"])
+        assert resource.getrlimit(resource.RLIMIT_CORE) == own
+        assert policy["inspect_tree"](process.pid)[1] == originals
+    finally:
+        process.stdin.write("exit\n"); process.stdin.flush(); process.wait(timeout=8)
+
+
+def test_only_the_solver_compose_services_default_to_no_core_files() -> None:
+    import yaml
+
+    for name in ("docker-compose.yml", "docker-compose.deploy.yml"):
+        services = yaml.safe_load((ROOT / name).read_text())["services"]
+        scoped = {name for name, service in services.items() if "core" in service.get("ulimits", {})}
+        assert scoped == {"worker", "worker-foundation14"}
+        for name in scoped:
+            limits = services[name]["ulimits"]
+            assert limits["core"] == {"soft": "${AIRFOILFOAM_SOLVER_CORE_SOFT_BYTES:-0}",
+                                      "hard": "${AIRFOILFOAM_SOLVER_CORE_HARD_BYTES:--1}"}
+            assert limits["nofile"] == {"soft": 65536, "hard": 524288}
