@@ -633,22 +633,36 @@ def budget(facts, config):
     }
 
 
-def identity(f):
+def normalized_identity(key):
+    columns, staging, heap, heap_file, toast, toast_file, indexes, *pins = key
+    audit = load_audit()
     return [
-        f["columns"],
-        f["stagingCopies"],
-        f["oid"],
-        f["relfilenode"],
-        f["toastOid"],
-        f["toastFilenode"],
-        f["indexFiles"],
-        f["serverStartedAt"],
-        f["device"],
-        f["disk"]["source"],
-        f["database"]["instance"],
-        f["database"]["registration"],
-        f["services"]["postgres"][0]["id"],
+        columns,
+        staging,
+        *(audit.pg_oid(i) for i in (heap, heap_file, toast, toast_file)),
+        audit.index_files(indexes),
+        *pins,
     ]
+
+
+def identity(f):
+    return normalized_identity(
+        [
+            f["columns"],
+            f["stagingCopies"],
+            f["oid"],
+            f["relfilenode"],
+            f["toastOid"],
+            f["toastFilenode"],
+            f["indexFiles"],
+            f["serverStartedAt"],
+            f["device"],
+            f["disk"]["source"],
+            f["database"]["instance"],
+            f["database"]["registration"],
+            f["services"]["postgres"][0]["id"],
+        ]
+    )
 
 
 def check_phase_space(f, config):
@@ -744,7 +758,7 @@ def host_phase(action, directory, pg):
                     "Container identity/state changed since operator preflight"
                 )
         if action in ("preflight", "quiesced", "ready"):
-            if identity(f) != opts["identity"]:
+            if identity(f) != normalized_identity(opts["identity"]):
                 raise RuntimeError(
                     "Database, volume, registration or table files changed since preflight"
                 )
@@ -812,11 +826,7 @@ def host_phase(action, directory, pg):
             dump(directory / "resumed.json", f)
         if action == "after":
             before = json.loads((directory / "quiesced.json").read_text())
-            if (
-                f["oid"] != before["oid"]
-                or f["relfilenode"] == before["relfilenode"]
-                or f["serverStartedAt"] != before["serverStartedAt"]
-            ):
+            if load_audit().rewrite_outcome(before, f) is not True:
                 raise RuntimeError(
                     "Committed rewrite did not preserve table/server identity and replace the physical file"
                 )

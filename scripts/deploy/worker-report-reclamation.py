@@ -25,6 +25,39 @@ TARGETS = {
 SMALL_BODY_BYTES = 8192
 
 
+def pg_oid(value):
+    """PostgreSQL emits oid as decimal text in JSON, but oid::bigint as an integer."""
+    if isinstance(value, str) and re.fullmatch(r"[0-9]{1,10}", value):
+        value = int(value)
+    if type(value) is not int or not 0 < value <= 0xFFFFFFFF:
+        raise ValueError("Invalid PostgreSQL object or file OID")
+    return value
+
+
+def index_files(files):
+    if not isinstance(files, dict):
+        raise ValueError("Invalid PostgreSQL index file inventory")
+    result = {str(pg_oid(index)): pg_oid(filenode) for index, filenode in files.items()}
+    if len(result) != len(files):
+        raise ValueError("Duplicate PostgreSQL index identity")
+    return result
+
+
+def rewrite_outcome(before, after):
+    """Infer a committed rewrite from physical evidence after a lost SQL reply."""
+    try:
+        if (not before["serverStartedAt"] or before["serverStartedAt"] != after["serverStartedAt"]
+                or pg_oid(before["oid"]) != pg_oid(after["oid"])):
+            return None
+        if pg_oid(before["relfilenode"]) != pg_oid(after["relfilenode"]):
+            return True
+        if all(pg_oid(before[k]) == pg_oid(after[k]) for k in ("toastOid","toastFilenode")) and index_files(before["indexFiles"]) == index_files(after["indexFiles"]):
+            return False
+    except (KeyError, TypeError, ValueError):
+        pass
+    return None
+
+
 def ssh(role: str, command: list[str], sql: str = "") -> str:
     host = TARGETS[role][0]
     result = subprocess.run(
@@ -161,14 +194,14 @@ def sample_estimates(facts: dict) -> dict:
 
 
 def comparison(before: dict, after: dict) -> dict:
-    if (before["role"],before["table"],before["oid"]) != (after["role"],after["table"],after["oid"]):
+    if (before["role"],before["table"],pg_oid(before["oid"])) != (after["role"],after["table"],pg_oid(after["oid"])):
         raise ValueError("Cannot compare different relation identities")
     delta = before["totalBytes"]-after["totalBytes"]
     return {"table": after["table"], "observedBefore": before["observedAt"], "observedAfter": after["observedAt"],
         "relationFileDecreaseBytes": delta, "relationShrank": delta>0,
         "toastHeapDecreaseBytes": before["toastHeapBytes"]-after["toastHeapBytes"],
         "postgresFilesystemFreeDeltaBytes": after["postgresFilesystem"]["freeBytes"]-before["postgresFilesystem"]["freeBytes"],
-        "samePhysicalFile": before["relfilenode"]==after["relfilenode"],
+        "samePhysicalFile": pg_oid(before["relfilenode"])==pg_oid(after["relfilenode"]),
         "sameServerStart": before.get("serverStartedAt")==after.get("serverStartedAt"),
         "note": "Observed net file changes only. Concurrent writers/WAL/case activity prevent filesystem-level attribution."}
 
@@ -511,7 +544,7 @@ def worker_return_check(prior=None, live_values=False, session=vacuum_session, h
         change = comparison(prior, facts)
         if (not change["samePhysicalFile"] or not change["sameServerStart"] or
                 prior["postgresFilesystem"]["source"] != facts["postgresFilesystem"]["source"] or
-                ("toastFilenode" in prior and (prior["toastOid"], prior["toastFilenode"]) != (facts["toastOid"], facts["toastFilenode"]))):
+                ("toastFilenode" in prior and (pg_oid(prior["toastOid"]), pg_oid(prior["toastFilenode"])) != (pg_oid(facts["toastOid"]), pg_oid(facts["toastFilenode"])))):
             raise ValueError("Worker, physical files, server start or data volume changed; capture a new baseline")
         signals = []
         if change["relationFileDecreaseBytes"] > 0:
@@ -536,7 +569,7 @@ def worker_return_check(prior=None, live_values=False, session=vacuum_session, h
             if changed:
                 signals.append("service-state-changed")
         if "indexFiles" in prior:
-            change["sameIndexFiles"] = prior["indexFiles"] == facts["indexFiles"]
+            change["sameIndexFiles"] = index_files(prior["indexFiles"]) == index_files(facts["indexFiles"])
         if "ingress" in prior:
             keys = ("unacknowledgedReport", "liveClaims", "livePromises", "ingestingJobs")
             old_ingress = any(prior["ingress"][k] for k in keys)

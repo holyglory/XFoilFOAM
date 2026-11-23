@@ -155,7 +155,20 @@ if [[ -e "$LOCK_FILE" ]]; then
 else
   exec 9>>"$LOCK_FILE"
 fi
-flock -n 9 || die 9 'Another deployment or maintenance operation holds the deployment lock.'
+if [[ "$hz" == true ]]; then
+  # A gracefully stopped SSH client can leave a finishing PostgreSQL/docker
+  # subprocess on the worker. Wait on the actual deploy inode; keep fd 9
+  # through the whole operation. The live lease and space checks follow.
+  if ! flock -w "$COMMAND_TIMEOUT_SECONDS" 9; then
+    if [[ "$restore_only" == false && ! -e "$SCRIPT_DIR/prior-state.tsv" && ! -e "$SCRIPT_DIR/result" ]]; then
+      printf 'operation_exit=9\nrecovery_failed=false\nreadiness_failed=false\nexit=9\n' >"$SCRIPT_DIR/result.tmp"
+      mv "$SCRIPT_DIR/result.tmp" "$SCRIPT_DIR/result"
+    fi
+    die 9 'Another deployment or maintenance operation still holds the HZ deployment lock.'
+  fi
+else
+  flock -n 9 || die 9 'Another deployment or maintenance operation holds the deployment lock.'
+fi
 
 DEADLINE=$((SECONDS + MAINTENANCE_TIMEOUT_SECONDS))
 ACTIVE_PID=""
@@ -259,7 +272,7 @@ verify_readiness() {
   [[ "$failed" == false ]]
 }
 cleanup() {
-  local original_rc=$? failed=false readiness_failed=false service pending attempt
+  local original_rc=$? failed=false readiness_failed=false service pending attempt rollback_deadline
   trap - EXIT
   trap '' HUP INT TERM PIPE
   set +e
@@ -283,7 +296,16 @@ cleanup() {
       # The HZ session tag is unique to the retained run. A lost docker-exec
       # reply can leave that backend alive after its client is gone.
       psql_cleanup -Atc "SELECT pg_terminate_backend(pid, 3000) FROM pg_stat_activity WHERE application_name='${SQL_TAG}' AND datname=current_database() AND pid<>pg_backend_pid();" || failed=true
-      pending="$(psql_cleanup -Atc "SELECT count(*) FROM pg_stat_activity WHERE application_name='${SQL_TAG}' AND datname=current_database() AND xact_start IS NOT NULL;")" || pending=unknown
+      # Rolling back a large, uncommitted heap can outlive the terminate
+      # acknowledgement. Use part of the existing restoration allowance to
+      # verify that the same transaction has actually gone away.
+      rollback_deadline=$((SECONDS + RESTORE_TIMEOUT_SECONDS / 3))
+      while :; do
+        pending="$(psql_cleanup -Atc "SELECT count(*) FROM pg_stat_activity WHERE application_name='${SQL_TAG}' AND datname=current_database() AND xact_start IS NOT NULL;")" || pending=unknown
+        [[ "$pending" == 0 ]] && break
+        (( SECONDS < rollback_deadline )) || break
+        run_bounded 1 sleep 0.5
+      done
       if [[ "$pending" != 0 ]]; then RESTORE_ARMED=false; fi
     fi
     [[ "$pending" == 0 ]] || { printf 'CRITICAL: SQL cancellation could not be confirmed.\n' >&2; failed=true; }

@@ -84,10 +84,23 @@ Run the worker command from the operator machine that owns the report maintenanc
 
 ```sh
 python3 scripts/deploy/rewrite-hz-worker-reports.py --dry-run \
-  --growth-bytes "$growth_bytes" --sample-identity --output "$plan_file"
+  --checkpointed-units "$CHECKPOINTS" --growth-bytes "$growth_bytes" --sample-identity --output "$plan_file"
 ```
 
 A restarting operator service appears in the dry run with its systemd state and a pause refusal. Disk and lease measurements remain available. Recovery checks each captured writer directly, so an unrelated service transition can be reported after the original writer is released.
+
+Supply `--checkpointed-units "$CHECKPOINTS"` on the dry run and on execution when persistent archive services hold the shared HZ deploy lock over SSH. This private JSON maps each systemd service name to its actual restart checkpoint. A service with a separate durable progress record may use an object with `checkpoint` and `receipt` absolute paths. Choose the live controller's current paths. A fresh unchanged-data scan needs a real progress receipt from that scan. The operator records content hashes of the effective unit definition and the checkpoint, including a SQLite WAL when present. Keep this file and the run directory on the operator's persistent filesystem.
+
+```json
+{
+  "archive-writer.service": {
+    "checkpoint": "/absolute/private/state/archive.sqlite3",
+    "receipt": "/absolute/private/state/completed-page.json"
+  }
+}
+```
+
+Active checkpointed services stop gracefully before other maintenance processes are frozen. PostgreSQL gets the original exclusive deploy lock only after remote readers release it. The lock wait is bounded, and a refusal before any HZ writer stop still restores the previously running checkpointed services. Recovery verifies the exact stopped checkpoint and unit definition before starting the service. The durable run records its new invocation and the next changed progress receipt. If the receipt arrives late, `--recover RUN_DIR` can finish verification without repeating the SQL. Previously inactive or already frozen services keep their captured states.
 
 The plan binds the HZ registration on both instances, the configured remote-solver role, the PostgreSQL 16 primary, and the exact heap, TOAST and index files of `public.progressive_worker_reports`. It resolves their actual Docker mount and device, WAL and sort workspace, usable filesystem bytes, archive mode and replication slots. It reports local collection and outstanding delivery, physical solver processes, operator units and both hosts’ earliest active promise expiry. A running physical solver can keep computing throughout the rewrite.
 
@@ -97,11 +110,11 @@ With a reviewed packed budget, the census reports a second, independent planning
 
 Allow time for the pre- and post-rewrite identity proofs, the SQL command, restoration, and a normal heartbeat. Defaults are 1,800 seconds for **each** proof and 5,400 seconds for the rewrite. `--identity-seconds` and `--rewrite-seconds` set their deadlines. The bounded identity sample measures database hashing on one small set of rows. Whole-table proof and rewrite times can differ substantially. A window that will outlive the earliest captured active promise is refused. During maintenance a shortening upstream lease, a cancellation request, low usable space or excess WAL triggers cancellation. Sustained lock contention also stops the attempt. Interrupted or expired solver work keeps its ordinary controller and evidence semantics.
 
-After user notice, approval, workspace preparation and a fresh passing plan, execute with the **same reviewed budgets** and a new private directory. Add `--unit NAME` on both commands for an additional operator-side HZ maintenance writer. The operator records the exact prior user unit status, timers and service invocations. It stops active timers and freezes running maintenance service cgroups. On HZ a detached, time-limited service takes the existing deploy lock and stops the captured running control-plane containers by ID. It preserves engine and worker processes, Redis, database, prior maintenance settings and already stopped services. During the pause the sweeper cannot collect or deliver intermediate reports or renew promises. After restoring writers the command checks their actual availability, registration, policy and collection process, and observes a subsequent stored sequence when a sampled execution produces one. The receipt distinguishes a quiet execution.
+After user notice, approval, workspace preparation and a fresh passing plan, execute with the **same reviewed budgets** and a new private directory. Add `--unit NAME` on both commands for an additional operator-side HZ maintenance writer. The operator records the exact prior user unit status, timers and service invocations. It stops triggering timers and checkpointed SSH writers, then freezes the other originally running maintenance service cgroups. On HZ a detached, time-limited service takes the existing deploy lock and stops the captured running control-plane containers by ID. It preserves engine and worker processes, Redis, database, prior maintenance settings and already stopped services. During the pause the sweeper cannot collect or deliver intermediate reports or renew promises. After restoring writers the command checks their actual availability, registration, policy and collection process, and observes a subsequent stored sequence when a sampled execution produces one. The receipt distinguishes a quiet execution.
 
 ```sh
 python3 scripts/deploy/rewrite-hz-worker-reports.py --execute \
-  --growth-bytes "$growth_bytes" --run-dir "$new_private_directory"
+  --checkpointed-units "$CHECKPOINTS" --growth-bytes "$growth_bytes" --run-dir "$new_private_directory"
 python3 scripts/deploy/rewrite-hz-worker-reports.py --status "$new_private_directory"
 python3 scripts/deploy/rewrite-hz-worker-reports.py --cancel "$new_private_directory"
 python3 scripts/deploy/rewrite-hz-worker-reports.py --recover "$new_private_directory"
