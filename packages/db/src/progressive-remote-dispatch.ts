@@ -1,4 +1,4 @@
-import { sql } from "drizzle-orm";
+import { sql, type SQL } from "drizzle-orm";
 import { effectiveProgressiveStageSql } from "./progressive-execution-policy";
 import type { PolarRequest } from "../../engine-client/src/types";
 import type { DB } from "./client";
@@ -45,15 +45,12 @@ export async function progressiveRemoteReservedSlots(
   return Number(row.reserved);
 }
 
-export async function progressiveRemoteAdmissionReservedSlots(
-  db: DB,
-  solverId: string,
-): Promise<number> {
-  const [row] = await db.execute(sql`
+export function progressiveRemoteAdmissionReservedSlotsSql(solverId: SQL) {
+  return sql`
     SELECT coalesce(sum(dispatch.cpu_slots), 0)::integer AS reserved
     FROM progressive_remote_dispatches dispatch
     JOIN sync_sweep_promises promise ON promise.id = dispatch.promise_id
-    WHERE dispatch.solver_id = ${solverId}::uuid
+    WHERE dispatch.solver_id = ${solverId}
       AND promise.status = 'active' AND promise."expiresAt" > clock_timestamp()
       AND NOT EXISTS (SELECT 1 FROM progressive_cfd_execution_stops stopped
         WHERE stopped.sim_job_id = dispatch.sim_job_id AND stopped.engine_job_id = dispatch.sim_job_id::text)
@@ -91,7 +88,14 @@ export async function progressiveRemoteAdmissionReservedSlots(
             )
           )
       )
-  `);
+  `;
+}
+
+export async function progressiveRemoteAdmissionReservedSlots(
+  db: DB,
+  solverId: string,
+): Promise<number> {
+  const [row] = await db.execute(progressiveRemoteAdmissionReservedSlotsSql(sql`${solverId}::uuid`));
   return Number(row.reserved);
 }
 
