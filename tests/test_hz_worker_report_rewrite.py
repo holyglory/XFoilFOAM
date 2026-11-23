@@ -417,11 +417,14 @@ def units_fixture():
             ControlGroup=f"/fixture.slice/maintenance-{pid}.service",
         )
 
+    # systemd timers have no service process or cgroup properties.
+    timer = unit("active", "waiting", "0")
+    del timer["ControlGroup"], timer["MainPID"]
     return {
         "airfoils-hz-bulk.service": unit("active", "running", "44"),
         "airfoils-hz-maint.service": unit("active", "running", "42", "frozen"),
         "airfoils-hz-failed.service": unit("failed", "failed", "0"),
-        "airfoils-hz-maint.timer": unit("active", "waiting", "0"),
+        "airfoils-hz-maint.timer": timer,
         "airfoils-hz-idle.service": unit("inactive", "dead", "0"),
     }
 
