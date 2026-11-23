@@ -1,6 +1,7 @@
 import type { DB } from "@aerodb/db";
 import { readProgressiveReport } from "@aerodb/db/progressive-report-reader";
 import { progressiveReportedPointSources } from "@aerodb/db/progressive-remote-report";
+import { STALE_HZ_RESET_REASON } from "@aerodb/db/progressive-remote-stale-recovery";
 import { sql } from "drizzle-orm";
 
 export interface ReportCopyCursor {
@@ -10,7 +11,14 @@ export interface ReportCopyCursor {
 
 // The settlement controller leaves ingestedAt unset while raw evidence is missing.
 export const cancelledReportOwner = sql`job.status='cancelled' AND job."ingestedAt" IS NULL
-  AND job.error='Scheduling promise became inactive; evidence delivery remains unresolved'
+  AND (job.error='Scheduling promise became inactive; evidence delivery remains unresolved'
+    OR (job.error=${STALE_HZ_RESET_REASON} AND promise.status='cancelled' AND promise."cancelledAt" IS NOT NULL
+      AND promise.response_payload->'authoritativeLeaseLoss'='true'::jsonb
+      AND promise.response_payload #>> '{remoteCancellation,disposition}'='operator_release'
+      AND promise.response_payload #>> '{remoteCancellation,reason}'=job.error
+      AND EXISTS(SELECT FROM progressive_remote_dispatches bound JOIN registered_remote_solvers peer ON peer.id=bound.solver_id
+        WHERE bound.sim_job_id=job.id AND bound.promise_id=promise.id AND bound.solver_id=promise.registered_solver_id)
+      AND NOT EXISTS(SELECT FROM sync_sweep_promise_points open_point WHERE open_point.promise_id=promise.id AND open_point.status='active')))
   AND job.engine_job_id=job.id::text AND job.engine_state IN ('completed','failed','cancelled')
   AND (job.ingest_lease_token IS NULL OR job.ingest_lease_expires_at<=clock_timestamp())
   AND promise.status IN ('cancelled','expired')
