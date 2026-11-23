@@ -149,6 +149,16 @@ function parseWithResultSpan(text: string, rootFields?: Map<string, string>, tra
   return result;
 }
 
+/** Slice only the root result token. Strings, nested lookalikes, number
+ * spellings, and whitespace on either side stay in the original PG text. */
+export function splitProgressiveReportText(text: string) {
+  const tracking: ResultTracking = {};
+  const report = reportJsonObject(parseWithResultSpan(text, undefined, tracking));
+  if (!tracking.found) return { report, prefix: text, suffix: "", result: null };
+  const { start, end } = tracking.found;
+  return { report, prefix: text.slice(0, start), suffix: text.slice(end), result: text.slice(start, end) };
+}
+
 export function reportJsonObject(value: ReportJson): {
   [key: string]: ReportJson;
 } {

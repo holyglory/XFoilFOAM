@@ -8300,9 +8300,9 @@ export const progressiveReportArchiveBundles = pgTable(
       sql`${table.compression} = 'gzip'`,
     ),
     archiveFormatCheck: check("progressive_report_archive_bundles_archive_format_check",
-      sql`${table.archiveFormat} IN ('jsonl','legacy-jsonl')`),
+      sql`${table.archiveFormat} IN ('jsonl','legacy-jsonl','shared-result-v1')`),
     legacyCheck: check("progressive_report_archive_bundles_legacy_check", sql`
-      (${table.archiveFormat}='jsonl' AND ${table.legacyInstanceId} IS NULL AND ${table.legacySolverId} IS NULL
+      ((${table.archiveFormat}='jsonl' OR (${table.archiveFormat}='shared-result-v1' AND ${table.sourceKind}='remote' AND ${table.mimeType}='application/gzip')) AND ${table.legacyInstanceId} IS NULL AND ${table.legacySolverId} IS NULL
         AND ${table.legacyScopeSha256} IS NULL AND ${table.legacyPageMemberCount} IS NULL
         AND ${table.legacyReadMode} IS NULL AND ${table.legacyLocalStorageKey} IS NULL AND ${table.legacyLocalVerifiedAt} IS NULL)
       OR (${table.archiveFormat}='legacy-jsonl' AND ${table.sourceKind}='worker' AND ${table.mimeType}='application/gzip'
