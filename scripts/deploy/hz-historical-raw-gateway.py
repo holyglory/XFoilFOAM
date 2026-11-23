@@ -243,6 +243,9 @@ def check_transition(journal, current):
 
 def publish_transition(archive, original, sealed, proof):
     if archive.exists() or archive.is_symlink():
+        # A previous process may have stopped between rename and the directory fsync.
+        # Make the published predecessor durable before the caller replaces the journal.
+        sync_directory(archive.parent)
         return
     # Rename a fully fsynced directory. A crash cannot publish a partial predecessor or transition.
     with tempfile.TemporaryDirectory(dir=archive.parent, prefix=".gateway-transition-") as tmp:

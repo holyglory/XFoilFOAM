@@ -1447,7 +1447,7 @@ def previous_gateway_drain(tmp_path, monkeypatch):
     return SimpleNamespace(m=m, a=a, raw=raw, old=old, gateway=gateway, worker=worker, actual=actual, env=env)
 
 
-@pytest.mark.parametrize("fault", ["none", "building-evidence", "published", "after-replace"])
+@pytest.mark.parametrize("fault", ["none", "building-evidence", "rename-before-sync", "published", "after-replace"])
 def test_previous_gateway_capture_can_resume_at_both_atomic_boundaries(
     previous_gateway_drain, monkeypatch, fault
 ):
@@ -1472,15 +1472,41 @@ def test_previous_gateway_capture_can_resume_at_both_atomic_boundaries(
         if fault == "published":
             raise OSError("interrupted after receipt publication")
 
+    sync = m.sync_directory
+
+    def interrupted_sync(path):
+        if fault == "rename-before-sync" and path == state.parent and archive.is_dir():
+            raise OSError("interrupted after directory rename")
+        sync(path)
+
     if fault != "none":
         with monkeypatch.context() as patch:
+            patch.setattr(m, "sync_directory", interrupted_sync)
             patch.setattr(m, "replace_bytes", replace)
             patch.setattr(m, "publish_transition", publish)
             with pytest.raises(OSError, match="interrupted"):
                 m.operate(a)
         assert (state.read_bytes() == f.raw) == (fault != "after-replace")
         assert archive.exists() == (fault != "building-evidence")
-    m.operate(a)
+    if fault == "rename-before-sync":
+        order = []
+
+        def synced(path):
+            sync(path)
+            if path == state.parent:
+                order.append("synced")
+
+        def replaced(path, data):
+            if path == state:
+                assert "synced" in order
+            real_replace(path, data)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(m, "sync_directory", synced)
+            patch.setattr(m, "replace_bytes", replaced)
+            m.operate(a)
+    else:
+        m.operate(a)
     upgraded = json.loads(state.read_bytes())
     assert archive.joinpath("original.json").read_bytes() == f.raw
     assert state.read_bytes() == archive.joinpath("sealed.json").read_bytes()
