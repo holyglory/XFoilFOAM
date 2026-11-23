@@ -249,7 +249,7 @@ export async function readProgressiveReport(
         report.assignmentSignature !== preparedOwner.assignmentSignature))
         throw new Error("Verified report belongs to another dispatch");
       if (identity.sourceKind === "remote")
-        archivedMembers.set(report, Object.freeze({ bundleId: String(stored.archive_bundle_id), identity }));
+        archivedMembers.set(report, Object.freeze({ bundleId: String(stored.archive_bundle_id), identity: Object.freeze(storedIdentity) }));
       if (scoped) freezeProgressiveReport(report);
       return report;
     } finally {

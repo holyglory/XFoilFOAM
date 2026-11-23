@@ -428,6 +428,9 @@ export async function verifyCancelledReportCopyReplay(
       expect(restored).toEqual(repeat);
       const member = verifiedProgressiveReportMember(restored)!.identity;
       expect(member.archiveFormat).toBe(SHARED_REPORT_FORMAT);
+      // A completed read's timeout signal cannot become part of the durable
+      // member identity used by a second, independently cancellable reader.
+      expect(member).not.toHaveProperty("signal");
       expect(await restore(member)).toBe(original.body);
       expect(await readProgressiveReport(db,{...reference,sequence:second.sequence,contentSignature:second.signature})).toEqual(nextRepeat);
       expect(await readProgressiveRemoteRetention(db, id)).toEqual(waiting);
