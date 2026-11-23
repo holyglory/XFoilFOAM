@@ -460,6 +460,7 @@ export async function legacyReportStorageCli(args: string[]): Promise<void> {
         maxBytes,
         pages,
         keepLocal: options.has("keep-local"),
+        prepareNextPage: true,
         shouldStop: () => stopping.signal.aborted,
         onVerifiedHistory: () => normalizer?.acceptVerifiedTransportHistory?.(),
         sourceBinding: normalizer
