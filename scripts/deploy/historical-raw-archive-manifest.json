@@ -1,0 +1,31 @@
+{
+  "schemaVersion": 1,
+  "journal": "packages/db/migrations/meta/_journal.json",
+  "migrations": [
+    {
+      "idx": 219,
+      "tag": "0219_hub_shared_report_objects",
+      "when": 1795363913050,
+      "sha256": "6921fc1a790f824fd94fe1198fd18229088fab4d7b7fc36dcba38b7ba2c04ab6"
+    },
+    {
+      "idx": 220,
+      "tag": "0220_historical_raw_archive_custody",
+      "when": 1795363913051,
+      "sha256": "6dee9a61bb6902b667389dd51eece45e833a519d0a84675f727596cc9feddfb2"
+    }
+  ],
+  "runtimeFiles": {
+    "hub": [
+      "apps/api/src/sync-routes.ts",
+      "apps/api/src/report-archive-broker.ts",
+      "apps/api/src/historical-raw-archive.ts",
+      "apps/api/src/historical-raw-source.ts"
+    ],
+    "worker": [
+      "apps/sweeper/src/report-archive-broker-client.ts",
+      "apps/sweeper/src/historical-raw-archive.ts",
+      "apps/sweeper/src/historical-raw-archive-cli.ts"
+    ]
+  }
+}
