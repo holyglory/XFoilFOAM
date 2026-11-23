@@ -198,7 +198,8 @@ export async function verifyCancelledReportCopyReplay(
   priority.offer(id,ready);
   const chronological = await selectCancelledReportCopyPage(db, cursor, priority);
   expect(chronological.preferred).toBeUndefined();
-  expect(chronological.after).toEqual(page.after);
+  expect(chronological.sequences).toEqual(page.sequences);
+  expect(chronological.after).toEqual((await nextCancelledReportCopies(db,cursor,true)).after);
   expect((await selectCancelledReportCopyPage(db, chronological.after, priority)).preferred?.executionId).toBe(id);
   const exact = new Map(preferred.keys.map(k=>[k.sequence,k.signature]));
   const scanned=new Error("rollback metadata-only discovery window");
@@ -217,6 +218,12 @@ export async function verifyCancelledReportCopyReplay(
     const found=await nextCancelledReportCopies(conn,gap.after);
     expect(found.executionId).toBe(id);
     expect(found.sequences).toEqual(page.sequences);
+    const indexedGap=await nextCancelledReportCopies(conn,null,true);
+    expect(indexedGap.after).toEqual(gap.after);
+    expect(indexedGap.sequences).toEqual([]);
+    const indexedFound=await nextCancelledReportCopies(conn,indexedGap.after,true);
+    expect(indexedFound.executionId).toBe(id);
+    expect(indexedFound.sequences).toEqual(page.sequences);
     throw scanned;
   })).rejects.toBe(scanned);
 
