@@ -12,7 +12,7 @@ import {
   hashtags,
   type DB,
   polarFitSets,
-  publicProgressiveCatalog,
+  publicProgressiveCatalogMetrics,
 } from "@aerodb/db";
 import { progressiveRevisionHasBenchmarkSql } from "@aerodb/db/progressive-recipe-policy";
 import {
@@ -253,14 +253,12 @@ async function readCatalogMetrics(
   key: string | undefined,
   allVisible: boolean,
 ) {
-  const progressive = await publicProgressiveCatalog(
+  const progressive = await publicProgressiveCatalogMetrics(
     db,
     allVisible ? undefined : ids,
     key,
   );
-  const candidateIds = key
-    ? []
-    : ids.filter((id) => !progressive.metrics.has(id));
+  const candidateIds = key ? [] : ids.filter((id) => !progressive.has(id));
   const metricRows = candidateIds.length
     ? await db
         .select({
@@ -277,7 +275,7 @@ async function readCatalogMetrics(
         .from(polarFitSets)
         .where(
           and(
-            inArray(polarFitSets.airfoilId, candidateIds),
+            sql`${polarFitSets.airfoilId} = ANY(${sql.param(candidateIds)}::uuid[])`,
             eq(polarFitSets.isCurrent, true),
             sql`NOT ${progressiveRevisionHasBenchmarkSql(sql`${polarFitSets.airfoilId}`, sql`${polarFitSets.simulationPresetRevisionId}`)}`,
             eq(polarFitSets.fitVersion, POLAR_FIT_VERSION),
@@ -314,7 +312,7 @@ async function readCatalogMetrics(
     }
   }
 
-  return { progressive: progressive.metrics, legacy: metricMap };
+  return { progressive, legacy: metricMap };
 }
 
 type CatalogMetrics = Awaited<ReturnType<typeof readCatalogMetrics>>;
