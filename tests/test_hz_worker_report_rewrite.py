@@ -1096,3 +1096,106 @@ def test_operator_recovers_the_same_rewrite_and_witnesses_collection(
         > 0
     )
     restored(env, prior)
+
+
+def test_recovery_adopts_only_a_bound_systemd_dependency_and_its_progress(
+    tmp_path, monkeypatch
+):
+    """Older operator state: starting the captured backup also started its watcher."""
+    watcher, backup = "fixture-watcher.service", "fixture-backup.service"
+    example = units_fixture()["airfoils-hz-bulk.service"]
+    prior = {
+        n: dict(
+            example,
+            InvocationID="old-" + n,
+            MainPID=str(i + 10),
+            ControlGroup="/fixture/" + n,
+        )
+        for i, n in enumerate((watcher, backup))
+    }
+    live = {
+        n: dict(v, InvocationID="new-" + n, MainPID=str(i + 110))
+        for i, (n, v) in enumerate(prior.items())
+    }
+    props = {
+        n: dict(
+            v,
+            ExecMainStartTimestampMonotonic=str(50000 + i * 1000),
+            Wants="",
+            Requires="",
+            After="",
+            BindsTo="",
+            Restart="on-failure",
+            NRestarts="0",
+        )
+        for i, (n, v) in enumerate(live.items())
+    }
+    state = {
+        "units": prior,
+        "extraUnits": [],
+        "touched": [watcher],
+        "checkpointedOwners": {},
+    }
+    for name in (watcher, backup):
+        p = tmp_path / name
+        p.write_text("saved source 7")
+        first = ops.file_witness(p)
+        state["checkpointedOwners"][name] = {
+            "checkpoint": str(p),
+            "receipt": str(p),
+            "definitionSha256": "definition:" + name,
+            "stopped": {"main": first},
+            "stoppedReceipt": first,
+            "stopIntent": True,
+        }
+        p.write_text("verified source 8")
+        stat = p.stat()
+        os.utime(p, ns=(stat.st_atime_ns, first["mtimeNs"] + 1_000_000))
+    w, b = state["checkpointedOwners"].values()
+    b.update(restartIntent=True, restoredInvocation=live[backup]["InvocationID"])
+    monkeypatch.setattr(ops, "activation", lambda n: props[n])
+    monkeypatch.setattr(ops, "definition_digest", lambda n: "definition:" + n)
+    actions = []
+
+    def recover():
+        ops.restore_units(
+            state, lambda: None, lambda _: live, lambda *c: actions.append(c)
+        )
+
+    for changes in (
+        {"BindsTo": "", "After": watcher},
+        {"BindsTo": watcher, "After": ""},
+        {"BindsTo": watcher, "After": watcher, "InvocationID": "unrelated-invocation"},
+    ):
+        props[backup].update(changes)
+        with pytest.raises(RuntimeError, match="recovery incomplete"):
+            recover()
+        assert (
+            state["touched"] == [watcher]
+            and not actions
+            and "restoredViaDependency" not in w
+        )
+    props[backup].update(
+        BindsTo=watcher, After=watcher, InvocationID=live[backup]["InvocationID"]
+    )
+    mismatch = state["checkpointedOwners"][watcher]["definitionSha256"]
+    w["definitionSha256"] = "different"
+    with pytest.raises(RuntimeError, match="recovery incomplete"):
+        recover()
+    w["definitionSha256"] = mismatch
+    recover()
+    ops.verify_restarted_checkpoints(state, lambda: None)
+    assert not actions and state["touched"] == []
+    assert (
+        w["restoredViaDependency"]["activatedBy"] == backup
+        and w["restoredInvocation"] == live[watcher]["InvocationID"]
+    )
+    assert w["advancedReceipt"]["sha256"] != w["stoppedReceipt"]["sha256"]
+    # A later manual replacement has no recorded systemd retry.
+    live[backup] = dict(live[backup], InvocationID="new-retry")
+    props[backup].update(InvocationID="new-retry")
+    with pytest.raises(RuntimeError, match="Unexpected restored invocation"):
+        recover()
+    props[backup]["NRestarts"] = "1"
+    recover()
+    assert b["automaticRestarts"][-1]["to"] == "new-retry" and not actions
