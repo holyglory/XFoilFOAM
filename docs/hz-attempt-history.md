@@ -16,6 +16,13 @@ are verified first. An earlier running report can prove an already received
 point even when the normal final-only requeue command refuses that sequence.
 An absent point receipt or an open claim keeps the original inline.
 
+When a job lock delays confirmation after shortening, the watcher retries the
+native confirmation with the same event and verified application read. A
+persistently busy event stays in the database's pending-readback list. The
+watcher revisits it between ordinary candidates and reports the source as
+confirmed only after the native readback succeeds. A deployment or transfer
+pause continues to fence the whole operation.
+
 An attempt has an HZ attempt ID, an HZ result ID and an execution ID. The hub assigns its own IDs when it retains the delivered point. The worker acknowledgment records both pairs. A hub 0207 object contains the hub pair in its compressed envelope. Keep both pairs and their original roles when comparing or restoring the payload.
 
 ## Read one settled attempt

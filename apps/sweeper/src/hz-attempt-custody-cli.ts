@@ -44,6 +44,7 @@ export async function attemptWorkerOperation(db: DB, r: Record<string, any>) {
       const [row] =
         await db.execute(sql`SELECT s.instance_id::text AS instance,s.remote_solver_registered_id::text AS solver,1 AS transfer_fence_protocol,
     to_regprocedure('attempt_evidence_hz_retained_limiter(uuid,uuid)') IS NOT NULL AS retained_contract,
+    1 AS pending_cursor_protocol,
     to_regprocedure('attempt_evidence_hz_settled_limiter(uuid,uuid)') IS NOT NULL AS settled_receipt_contract,
     (SELECT a.id::text FROM result_attempts a ORDER BY a.id DESC LIMIT 1) AS high FROM sync_api_settings s
     WHERE s.id=1 AND s.remote_solver_registered_id IS NOT NULL AND s.upstream_base_url IS NOT NULL AND to_regprocedure('attempt_evidence_hz_limiter(uuid,uuid)') IS NOT NULL`);
@@ -71,10 +72,14 @@ export async function attemptWorkerOperation(db: DB, r: Record<string, any>) {
         WHERE e.action='shorten' AND e.completed AND e.verification#>>'{dependencies,verifier}' IN ('server-consumers/hz-worker-steady-rans-v1','server-consumers/hz-retained-original-v2','server-consumers/hz-settled-receipt-v3')`);
       return row;
     }
-    case "pending":
-      return db.execute(sql`SELECT a.id::text AS id FROM attempt_evidence_storage_events e JOIN result_attempts a ON a.evidence_storage_event_id=e.id
+    case "pending": {
+      const after = r.afterEvent === undefined ? null : exactId(r.afterEvent);
+      return db.execute(sql`SELECT a.id::text AS id,e.id::text AS event FROM attempt_evidence_storage_events e JOIN result_attempts a
+        ON a.evidence_storage_event_id=e.id AND a.evidence_archive_id=e.archive_id AND a.id=e.result_attempt_id
   WHERE e.action='shorten' AND e.completed AND e.app_readback_at IS NULL AND e.verification#>>'{dependencies,verifier}' IN ('server-consumers/hz-worker-steady-rans-v1','server-consumers/hz-retained-original-v2','server-consumers/hz-settled-receipt-v3')
-  ORDER BY e.created_at,e.id LIMIT 8`);
+  ${r.attemptId === undefined ? sql`` : sql`AND a.id=${exactId(r.attemptId)}::uuid`}
+  ${after === null ? sql`ORDER BY e.created_at,e.id LIMIT 8` : sql`AND e.id>${after}::uuid ORDER BY e.id LIMIT 1`}`);
+    }
     case "prepare":
       return prepareHzEnvelope(db, exactId(r.attemptId), r.retained === true, r.settled === true);
     case "stage": {
