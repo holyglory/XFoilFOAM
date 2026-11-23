@@ -3,27 +3,60 @@ import { EngineError } from "@aerodb/engine-client";
 import { canonicalRemoteHubBaseUrl } from "@aerodb/core";
 import {
   canonicalAnalysisJson,
+  registeredWorkerArchiveOwner,
   verifyProgressiveEvidenceCustodyReceipt,
   type DB,
   type ProgressiveEvidenceCustodyReceipt,
 } from "@aerodb/db";
 import { sql } from "drizzle-orm";
-import { preflightProgressiveArchive } from "./progressive-archive-reclaim";
+import { configuredControlPlaneToken } from "./config";
+import {
+  preflightProgressiveArchive,
+  verifyProgressiveArchiveResponse,
+} from "./progressive-archive-reclaim";
 
+type HistoricalReceipt = {
+  sim_job_id: string;
+  sequence: number;
+  point_content_signature: string;
+  report_signature: string;
+  solver_id: string;
+  source_instance_id: string;
+  promise_id: string;
+  assignment_signature: string;
+  stop_signature: string;
+  stored_sha256: string;
+  stored_bytes: number;
+  tar_sha256: string;
+  tar_bytes: number;
+  manifest_sha256: string;
+  manifest_bytes: number;
+  manifest_set_sha256: string;
+  bundled_file_count: number;
+  zstd_level: number;
+  bucket: string;
+  object_key: string;
+  generation: string;
+  crc32c: string;
+  verified_at: string;
+};
 export interface ClosedProgressiveManifest {
   directory: string;
   catalogSha256: string;
   manifestSha256: string;
   manifestByteSize: number;
-  brokeredUploadId: string;
+  brokeredUploadId?: string;
   generation: string;
-  receiptHmac: string;
+  receiptHmac?: string;
+  historicalRaw?: HistoricalReceipt;
   keepMedia?: KeptImage[];
   regime?: "urans";
 }
 
 export interface ClosedProgressiveReadback {
-  brokeredUploadId: string;
+  historicalPointSignature?: string;
+  verifiedMember?: MediaFile | null;
+  brokeredUploadId?: string;
   generation: string;
   storedSha256: string;
   storedByteSize: number;
@@ -36,6 +69,8 @@ export interface ClosedProgressiveReclaimResponse {
   replayed?: boolean;
   mediaFiles?: MediaFile[];
   workingPaths?: string[];
+  historicalPathsSha256?: string;
+  historicalSamples?: Record<string, MediaFile | null>;
   plannedAllocatedBytes?: number;
   allocation?: {
     fileAllocatedBytes: number;
@@ -193,12 +228,15 @@ async function readKeptMedia(
   media: KeptImage[],
   plan: ClosedProgressiveReclaimResponse,
   signal: AbortSignal,
+  historical = false,
 ) {
   if (
     !plan.mediaFiles?.length ||
     plan.mediaFiles.length > 512 ||
-    !Array.isArray(plan.workingPaths) ||
-    plan.workingPaths.length !== plan.files
+    (historical
+      ? !/^[a-f0-9]{64}$/.test(plan.historicalPathsSha256 ?? "")
+      : !Array.isArray(plan.workingPaths) ||
+        plan.workingPaths.length !== plan.files)
   )
     throw Error(
       "Native peer omitted the protected image or working-file inventory",
@@ -226,8 +264,9 @@ async function readKeptMedia(
   if (
     plan.mediaFiles.length !== expectedPaths.size ||
     plan.mediaFiles.some((file) => !expectedPaths.has(file.path)) ||
-    new Set(plan.workingPaths).size !== plan.files ||
-    plan.workingPaths.some((path) => expectedPaths.has(path))
+    (!historical &&
+      (new Set(plan.workingPaths).size !== plan.files ||
+        plan.workingPaths!.some((path) => expectedPaths.has(path))))
   )
     throw Error(
       "Protected image/working-file inventory is incomplete or overlaps",
@@ -327,15 +366,28 @@ function eligible(
   ageMs: number,
   completedPlan?: string,
   media: KeptImage[] = [],
+  historical = false,
 ) {
+  const receiptKey = historical
+    ? "historicalRawFiles"
+    : "closedProgressiveFiles";
+  const saved = sql`j.strip_report->${receiptKey}::text`;
   return sql`j.status IN ('done','failed','cancelled') AND j.engine_job_id=j.id::text
-    AND j.request_payload ? 'remoteProgressiveExecution' AND j.stripped_at IS NULL
+    AND j.request_payload ? 'remoteProgressiveExecution' AND ${
+      historical
+        ? sql`j.status='cancelled' AND j."ingestedAt" IS NOT NULL
+      AND EXISTS(SELECT FROM sync_sweep_promises hp JOIN sync_api_settings hs ON hs.id=1
+        WHERE hp.id::text=j.request_payload->>'syncPromiseId' AND hp.registered_solver_id=hs.remote_solver_registered_id
+          AND hp.source_base_url=hs.upstream_base_url AND hp.status IN ('expired','cancelled') AND NOT hs.remote_solver_transfer_paused)
+      AND NOT EXISTS(SELECT FROM progressive_worker_evidence_delivery_claims hc WHERE hc.sim_job_id=j.id AND hc.claim_expires_at>now())`
+        : sql`j.stripped_at IS NULL`
+    }
     AND ${
       completedPlan === undefined
-        ? sql`j.strip_report#>>'{closedProgressiveFiles,complete}' IS DISTINCT FROM 'true'`
-        : sql`j.strip_report#>>'{closedProgressiveFiles,complete}'='true' AND j.strip_report#>>'{closedProgressiveFiles,planSha256}'=${completedPlan}`
+        ? sql`(${saved})->>'complete' IS DISTINCT FROM 'true'`
+        : sql`(${saved})->>'complete'='true' AND (${saved})->>'planSha256'=${completedPlan}`
     }
-    AND coalesce((j.strip_report#>>'{closedProgressiveFiles,retryAfter}')::timestamptz,'-infinity') <= clock_timestamp()
+    AND coalesce(((${saved})->>'retryAfter')::timestamptz,'-infinity') <= clock_timestamp()
     AND coalesce(j."finishedAt",j."ingestedAt",j."updatedAt",j."createdAt")<=${now.toISOString()}::timestamptz-(${ageMs}::float8*interval '1ms')
     AND (j.ingest_lease_token IS NULL OR j.ingest_lease_expires_at<=clock_timestamp())
     AND NOT EXISTS(SELECT 1 FROM sim_jobs child WHERE child.status IN ${LIVE} AND
@@ -349,7 +401,7 @@ function eligible(
       JOIN result_attempts a ON a.id=o.result_attempt_id WHERE a.sim_job_id=j.id AND p.state IN ('pending','running'))
     AND NOT EXISTS(SELECT 1 FROM sim_urans_verify_queue v JOIN result_attempts a ON a.id=v.latest_result_attempt_id
       WHERE a.sim_job_id=j.id AND v.state IN ('pending','running') AND v.last_outcome IN ('continuation_pending','continuation_retry_wait'))
-    AND EXISTS(SELECT 1 FROM progressive_worker_archive_receipts ar WHERE ar.sim_job_id=j.id)
+    AND ${historical ? sql`EXISTS(SELECT FROM progressive_worker_evidence_attempts a WHERE a.sim_job_id=j.id)` : sql`EXISTS(SELECT 1 FROM progressive_worker_archive_receipts ar WHERE ar.sim_job_id=j.id)`}
     AND NOT EXISTS(SELECT 1 FROM progressive_worker_archive_receipts ar
       LEFT JOIN progressive_worker_hub_receipts h USING(sim_job_id,point_content_signature)
       LEFT JOIN progressive_worker_archive_reclaims r USING(sim_job_id,point_content_signature)
@@ -363,9 +415,9 @@ function eligible(
 
 type ScientificPoint = {
   attemptId: string;
-  resultId: string;
-  canonicalAttemptId: string;
-  canonicalResultId: string;
+  resultId: string | null;
+  canonicalAttemptId: string | null;
+  canonicalResultId: string | null;
   pointSignature: string;
   payloadSha256: string;
   aoa: string | null;
@@ -380,7 +432,82 @@ type Archive = {
   manifest: ClosedProgressiveManifest;
   remote: ProgressiveEvidenceCustodyReceipt["remote"];
 };
-async function proofs(db: DB, jobId: string, media: KeptImage[] = []) {
+async function historicalCustody(db: DB, id: string, signal?: AbortSignal) {
+  if (process.env.AIRFOILFOAM_DEPLOYMENT_ROLE !== "remote-solver")
+    throw Error("Historical reclaim requires the registered source worker");
+  const { baseUrl, authToken, envelope } = await registeredWorkerArchiveOwner(
+    db,
+    id,
+  );
+  const { readRegisteredArchive } = await import("@aerodb/core/registered-archive-read");
+  const res = await readRegisteredArchive(
+    baseUrl +
+      "/progressive-executions/" +
+      id +
+      "/historical-raw-archives/receipts",
+    authToken,
+    signal ?? AbortSignal.timeout(60_000),
+    "application/json",
+  );
+  if (!res.ok || !res.body) {
+    await res.body?.cancel();
+    throw Error(
+      "Registered hub historical receipts unavailable (" + res.status + ")",
+    );
+  }
+  let size = 0;
+  const parts: Buffer[] = [];
+  for await (const raw of res.body as unknown as AsyncIterable<Uint8Array>) {
+    size += raw.length;
+    if (size > 512 * 1024) throw Error("Oversized receipt inventory");
+    parts.push(Buffer.from(raw));
+  }
+  const rows = JSON.parse(Buffer.concat(parts).toString("utf8"))
+    .receipts as HistoricalReceipt[];
+  if (!Array.isArray(rows) || !rows.length || rows.length > 256)
+    throw Error("No complete historical custody");
+  const byPoint = new Map<string, HistoricalReceipt>();
+  for (const c of rows) {
+    if (
+      c.sim_job_id !== id ||
+      c.solver_id !== envelope.solverId ||
+      c.promise_id !== envelope.promiseId ||
+      c.assignment_signature !== envelope.contentSignature ||
+      ![
+        c.point_content_signature,
+        c.report_signature,
+        c.stored_sha256,
+        c.tar_sha256,
+        c.manifest_sha256,
+        c.manifest_set_sha256,
+        c.stop_signature,
+      ].every((v) => typeof v === "string" && /^[0-9a-f]{64}$/.test(v)) ||
+      ![
+        c.sequence,
+        c.stored_bytes,
+        c.tar_bytes,
+        c.manifest_bytes,
+        c.bundled_file_count,
+        c.zstd_level,
+      ].every((v) => Number.isSafeInteger(v) && v > 0) ||
+      !/^[1-9][0-9]{0,19}$/.test(c.generation) ||
+      BigInt(c.generation) > 18446744073709551615n ||
+      !c.bucket ||
+      c.object_key !==
+        `solver-evidence/v1/sha256/${c.stored_sha256.slice(0, 2)}/${c.stored_sha256}.tar.zst` ||
+      byPoint.has(c.point_content_signature)
+    )
+      throw Error("Historical custody owner or identity conflict");
+    byPoint.set(c.point_content_signature, c);
+  }
+  return byPoint;
+}
+async function proofs(
+  db: DB,
+  jobId: string,
+  media: KeptImage[] = [],
+  historical?: Map<string, HistoricalReceipt>,
+) {
   const prefix = `jobs/${jobId}/`;
   const [unprotected] = await db.execute(sql`SELECT EXISTS (
     SELECT 1 FROM result_media m LEFT JOIN result_media_storage_bindings b ON b.result_media_id=m.id AND b.local_storage_key=m.storage_key
@@ -393,7 +520,7 @@ async function proofs(db: DB, jobId: string, media: KeptImage[] = []) {
     throw new Error("Job has unbound path-owned media or forensic custody");
   const [settings] =
     await db.execute(sql`SELECT s.remote_solver_registered_id AS solver,s.remote_solver_auth_token AS token,
-    s.upstream_base_url AS base,p.id AS promise FROM sync_api_settings s JOIN sim_jobs j ON j.id=${jobId}::uuid
+    s.upstream_base_url AS base,p.id AS promise ${historical ? sql`,s.instance_id` : sql``} FROM sync_api_settings s JOIN sim_jobs j ON j.id=${jobId}::uuid
     JOIN sync_sweep_promises p ON p.id::text=j.request_payload->>'syncPromiseId'
     WHERE s.id=1 AND p.source_base_url=s.upstream_base_url AND p.registered_solver_id=s.remote_solver_registered_id
       AND j.request_payload->>'upstreamBaseUrl'=s.upstream_base_url`);
@@ -415,14 +542,20 @@ async function proofs(db: DB, jobId: string, media: KeptImage[] = []) {
       UNION SELECT result_attempt_id,point_content_signature FROM progressive_worker_hub_receipts WHERE sim_job_id=${jobId}::uuid
     ) SELECT a.id,a.result_id,a.engine_case_slug,a.payload_sha,a.aoa_deg::text AS aoa,a.cl::text,a.cd::text,a.cm::text,
       a.status::text,a.regime::text,s.point_content_signature,ar.brokered_upload_id,ar.receipt,h.receipt AS hub,
-      catalog.signature AS catalog_sha,b.storage_key,b.metadata,mf.storage_key AS manifest_key,mf.sha256 AS manifest_sha,mf.byte_size AS manifest_size,ref.remote_download_url
+      catalog.signature AS catalog_sha,b.storage_key,b.metadata,
+      ${
+        historical
+          ? sql`b.sha256 AS archive_sha,b.byte_size AS archive_size,b.mime_type AS archive_mime,b.engine_job_id AS archive_job,
+        b.engine_case_slug AS archive_case,b.result_id IS NOT DISTINCT FROM a.result_id AS same_local_result,`
+          : sql``
+      } mf.storage_key AS manifest_key,mf.sha256 AS manifest_sha,mf.byte_size AS manifest_size,ref.remote_download_url
     FROM owner a FULL JOIN pairs p ON p.result_attempt_id=a.id LEFT JOIN staged s ON s.result_attempt_id=p.result_attempt_id AND s.point_content_signature=p.point_content_signature
     LEFT JOIN progressive_worker_hub_receipts h ON h.sim_job_id=${jobId}::uuid AND h.result_attempt_id=a.id AND h.point_content_signature=s.point_content_signature
     LEFT JOIN progressive_worker_archive_reclaims r ON r.sim_job_id=h.sim_job_id AND r.point_content_signature=h.point_content_signature
     LEFT JOIN progressive_worker_archive_receipts ar ON ar.sim_job_id=r.sim_job_id AND ar.point_content_signature=r.point_content_signature
       AND r.completed_at IS NOT NULL AND a.sim_job_id=ar.sim_job_id AND a.engine_job_id=${jobId}
     LEFT JOIN solver_evidence_artifacts b ON b.result_attempt_id=a.id AND b.kind='engine_bundle'
-    LEFT JOIN solver_evidence_artifacts mf ON mf.result_attempt_id=a.id AND mf.kind='manifest' AND mf.result_id=a.result_id AND mf.engine_job_id=${jobId}
+    LEFT JOIN solver_evidence_artifacts mf ON mf.result_attempt_id=a.id AND mf.kind='manifest' AND ${historical ? sql`mf.result_id IS NOT DISTINCT FROM a.result_id` : sql`mf.result_id=a.result_id`} AND mf.engine_job_id=${jobId}
     LEFT JOIN LATERAL (
       SELECT CASE WHEN bool_and(valid) THEN encode(sha256(convert_to(string_agg(line,chr(10) ORDER BY line COLLATE "C"),'UTF8')),'hex') END AS signature
       FROM (SELECT DISTINCT (artifact.result_id IS NOT DISTINCT FROM a.result_id AND artifact.sha256 ~ '^[a-f0-9]{64}$'
@@ -449,6 +582,93 @@ async function proofs(db: DB, jobId: string, media: KeptImage[] = []) {
       receipt?: ProgressiveEvidenceCustodyReceipt;
       receiptHmac: string;
     } | null;
+    const historic = historical?.get(String(row.point_content_signature));
+    if (historic) {
+      const c = historic,
+        meta = row.metadata as Record<string, unknown> | null;
+      const directory = `cases/${row.engine_case_slug}/${meta?.evidenceBase}`;
+      if (
+        !row.id ||
+        row.same_local_result !== true ||
+        signed?.receipt ||
+        row.hub ||
+        row.brokered_upload_id ||
+        c.source_instance_id !== settings.instance_id ||
+        !meta ||
+        typeof meta.evidenceBase !== "string" ||
+        directory
+          .split("/")
+          .some((s) => !s || s === "." || s === ".." || s.includes("\\")) ||
+        row.archive_job !== jobId ||
+        row.archive_case !== row.engine_case_slug ||
+        row.archive_mime !== "application/zstd" ||
+        row.storage_key !==
+          `jobs/${jobId}/${directory}/engine_evidence.tar.zst` ||
+        row.manifest_key !==
+          `jobs/${jobId}/${directory}/evidence_manifest.json` ||
+        row.archive_sha !== c.stored_sha256 ||
+        Number(row.archive_size) !== c.stored_bytes ||
+        row.manifest_sha !== c.manifest_sha256 ||
+        Number(row.manifest_size) !== c.manifest_bytes ||
+        meta.uncompressedTarSha256 !== c.tar_sha256 ||
+        meta.uncompressedTarByteSize !== c.tar_bytes ||
+        meta.bundledFileCount !== c.bundled_file_count ||
+        meta.zstdLevel !== c.zstd_level ||
+        typeof row.catalog_sha !== "string" ||
+        typeof row.payload_sha !== "string" ||
+        row.remote_download_url
+      )
+        throw Error("Historical local artifact and registered owner differ");
+      const kept = media.filter((m) => m.attemptId === row.id);
+      if (
+        kept.some(
+          (m) =>
+            m.resultId !== row.result_id ||
+            m.evidenceSha256 !== c.manifest_sha256 ||
+            !m.path.startsWith(directory + "/scaled_media/"),
+        )
+      )
+        throw Error("Historical image source differs");
+      return {
+        point: {
+          attemptId: String(row.id),
+          resultId: row.result_id === null ? null : String(row.result_id),
+          canonicalAttemptId: null,
+          canonicalResultId: null,
+          pointSignature: c.point_content_signature,
+          payloadSha256: row.payload_sha,
+          aoa: row.aoa as string | null,
+          cl: row.cl as string | null,
+          cd: row.cd as string | null,
+          cm: row.cm as string | null,
+          status: row.status as string | null,
+          regime: row.regime as string | null,
+        },
+        remote: {
+          bucket: c.bucket,
+          objectKey: c.object_key,
+          generation: c.generation,
+          crc32c: c.crc32c,
+          storedSha256: c.stored_sha256,
+          storedByteSize: c.stored_bytes,
+          tarSha256: c.tar_sha256,
+          tarByteSize: c.tar_bytes,
+          manifestSha256: c.manifest_sha256,
+          manifestByteSize: c.manifest_bytes,
+          zstdLevel: c.zstd_level,
+          bundledFileCount: c.bundled_file_count,
+        },
+        manifest: {
+          directory,
+          catalogSha256: row.catalog_sha,
+          manifestSha256: c.manifest_sha256,
+          manifestByteSize: c.manifest_bytes,
+          generation: c.generation,
+          historicalRaw: c,
+          ...(media.length ? { keepMedia: kept } : {}),
+        },
+      };
+    }
     if (!row.id || !signed?.receipt)
       throw new Error("A job point lacks completed archive custody");
     const receipt = verifyProgressiveEvidenceCustodyReceipt(
@@ -548,6 +768,53 @@ async function proofs(db: DB, jobId: string, media: KeptImage[] = []) {
     media.length
   )
     throw Error("Kept media owner missing from archive set");
+  if (historical) {
+    const used = archives.filter((a) => a.manifest.historicalRaw);
+    if (
+      used.length !== historical.size ||
+      new Set(used.map((a) => a.point.pointSignature)).size !== used.length
+    )
+      throw Error("Incomplete historical source coverage");
+    const [match] =
+      await db.execute(sql`SELECT count(*)::int AS n FROM jsonb_to_recordset(${JSON.stringify([...historical.values()])}::jsonb)
+      c(sim_job_id uuid,sequence bigint,point_content_signature text,report_signature text,assignment_signature text)
+      JOIN progressive_worker_reports r ON (r.sim_job_id,r.sequence,r.content_signature,r.assignment_signature)=(c.sim_job_id,c.sequence,c.report_signature,c.assignment_signature)
+      WHERE r.acknowledged_at IS NOT NULL AND NOT EXISTS(SELECT FROM progressive_worker_report_conflicts x WHERE x.sim_job_id=r.sim_job_id AND x.sequence=r.sequence)
+      AND NOT EXISTS(SELECT FROM progressive_worker_hub_receipts h WHERE h.sim_job_id=c.sim_job_id AND h.point_content_signature=c.point_content_signature)
+      AND EXISTS(SELECT FROM progressive_worker_delivery_failures f
+        JOIN progressive_worker_evidence_attempts a ON (a.sim_job_id,a.sequence,a.result_attempt_id,a.point_content_signature)=(f.sim_job_id,f.sequence,f.result_attempt_id,f.point_content_signature)
+        WHERE f.sim_job_id=c.sim_job_id AND f.point_content_signature=c.point_content_signature AND f.state='conflict'
+          AND f.last_http_status=409 AND f.remote_conflict_ids='[]'::jsonb AND f.last_error IN
+          ('Progressive evidence delivery failed (409): progressive_scope_closed Obsolete or settled progressive CFD execution scope',
+           'Stopped progressive storage delivery failed (409): Stopped storage requires closed ownership and its exact stop acknowledgement'))`);
+    if (match?.n !== historical.size)
+      throw Error("Historical worker report or original disposition changed");
+  }
+  if (historical) {
+    const prefixes = archives
+      .filter((a) => a.manifest.historicalRaw)
+      .map((a) => ({
+        dir: `jobs/${jobId}/${a.manifest.directory}/`,
+        attempt: a.point.attemptId,
+      }));
+    // Source paths can have real artifact rows. Only the exact attempt's catalogue (checked against
+    // the engine result and full manifest) may refer to the numeric files being offloaded.
+    const [guard] =
+      await db.execute(sql`WITH scopes AS MATERIALIZED(SELECT * FROM jsonb_to_recordset(${JSON.stringify(prefixes)}::jsonb) s(dir text,attempt uuid)),
+      referenced AS MATERIALIZED (
+        SELECT storage_key AS key,result_attempt_id AS owner,false AS other FROM solver_evidence_artifacts WHERE storage_key LIKE ${prefix + "%"}
+        UNION ALL SELECT storage_key,NULL::uuid,true FROM result_media WHERE storage_key LIKE ${prefix + "%"}
+        UNION ALL SELECT storage_key,NULL::uuid,true FROM field_render_cache WHERE storage_key LIKE ${prefix + "%"}
+        UNION ALL SELECT local_storage_key,NULL::uuid,true FROM remote_asset_references WHERE local_storage_key LIKE ${prefix + "%"}
+        UNION ALL SELECT cached_storage_key,NULL::uuid,true FROM remote_asset_references WHERE cached_storage_key LIKE ${prefix + "%"})
+      SELECT EXISTS(SELECT FROM scopes s JOIN referenced a ON a.key=s.dir||'engine_evidence.tar.zst'
+        OR starts_with(a.key,s.dir||'openfoam/') OR starts_with(a.key,s.dir||'time_directories/') OR starts_with(a.key,s.dir||'VTK/')
+        WHERE a.other OR a.owner IS DISTINCT FROM s.attempt) AS conflict`);
+    if (guard?.conflict !== false)
+      throw Error(
+        "Historical raw paths have foreign artifact, media, cache or proxy references",
+      );
+  }
   return { archives, base, token: settings.token, media };
 }
 
@@ -584,11 +851,13 @@ async function record(
   scientificSha256: string | null = null,
   allocation: ClosedProgressiveReclaimResponse["allocation"] = null,
   mediaSha256?: string,
+  historical = false,
 ) {
-  await db.execute(sql`UPDATE sim_jobs SET strip_report=jsonb_set(coalesce(strip_report,'{}'::jsonb),'{closedProgressiveFiles}',
+  const field = historical ? "historicalRawFiles" : "closedProgressiveFiles";
+  await db.execute(sql`UPDATE sim_jobs SET strip_report=jsonb_set(coalesce(strip_report,'{}'::jsonb),ARRAY[${field}::text],
     jsonb_build_object('checkedAt',clock_timestamp(),'complete',${complete}::boolean,'retryAfter',CASE WHEN ${complete}::boolean THEN NULL ELSE clock_timestamp()+interval '5 minutes' END,'outcome',${outcome}::text,'bytes',${bytes}::bigint,'files',${files}::int,'planSha256',${planSha256}::text,'verifiedArchives',${verifiedArchives}::int,'scientificSha256',${scientificSha256}::text,'allocation',${JSON.stringify(allocation ?? null)}::jsonb)
     || ${mediaSha256 ? sql`jsonb_build_object('mediaSha256',${mediaSha256}::text)` : sql`'{}'::jsonb`})
-    WHERE id=${id}::uuid AND stripped_at IS NULL AND strip_report#>>'{closedProgressiveFiles,complete}' IS DISTINCT FROM 'true'`);
+    WHERE id=${id}::uuid AND (${historical} OR stripped_at IS NULL) AND (strip_report->${field}::text)->>'complete' IS DISTINCT FROM 'true'`);
 }
 
 export async function closedProgressiveJob(
@@ -603,6 +872,7 @@ export async function closedProgressiveJob(
     verifyCompleted?: boolean;
     expectedScientificSha256?: string;
     keepMedia?: boolean;
+    historicalRaw?: boolean;
     expectedMediaSha256?: string;
     expectedPlan?: string;
     signal?: AbortSignal;
@@ -611,6 +881,9 @@ export async function closedProgressiveJob(
   const { now, ageMs, timeoutMs } = options;
   if (options.verifyCompleted && (!options.inspect || !options.expectedPlan))
     throw new Error("Completed-plan verification must be read-only and exact");
+  const historical = options.historicalRaw
+    ? await historicalCustody(db, id, options.signal)
+    : undefined;
   const source = await db.transaction(async (raw) => {
     const tx = raw as unknown as DB;
     await tx.execute(
@@ -620,13 +893,13 @@ export async function closedProgressiveJob(
       ? await registeredImages(tx, id, false)
       : [];
     const [ready] = await tx.execute(
-      sql`SELECT j.id FROM sim_jobs j WHERE j.id=${id}::uuid AND ${eligible(now, ageMs, options.verifyCompleted ? options.expectedPlan : undefined, media)}`,
+      sql`SELECT j.id FROM sim_jobs j WHERE j.id=${id}::uuid AND ${eligible(now, ageMs, options.verifyCompleted ? options.expectedPlan : undefined, media, options.historicalRaw)}`,
     );
     if (!ready)
       throw new Error(
         "Job has active ownership, a retention refusal, unbound media or an existing completion",
       );
-    return proofs(tx, id, media);
+    return proofs(tx, id, media, historical);
   });
   const manifests = source.archives.map((a) => a.manifest);
   const plan = await engine.reclaimClosedProgressiveFiles(id, manifests);
@@ -648,12 +921,14 @@ export async function closedProgressiveJob(
     throw new Error("Scientific point evidence differs from the pinned proof");
   let mediaSha256: string | undefined;
   if (options.keepMedia) {
-    await assertWorkingPathsUnreferenced(db, id, plan.workingPaths ?? []);
+    if (!historical)
+      await assertWorkingPathsUnreferenced(db, id, plan.workingPaths ?? []);
     mediaSha256 = await readKeptMedia(
       id,
       source.media,
       plan,
       options.signal ?? AbortSignal.timeout(120_000),
+      Boolean(historical),
     );
     if (
       options.expectedMediaSha256 &&
@@ -665,18 +940,107 @@ export async function closedProgressiveJob(
   if (plan.state !== "absent" && plan.files) {
     const signal = options.signal ?? AbortSignal.timeout(20 * 60_000);
     for (const archive of source.archives) {
-      const url = new URL(
-        `/api/sync/v1/evidence-uploads/${archive.manifest.brokeredUploadId}/download`,
-        source.base,
-      );
-      await preflightProgressiveArchive(
-        url.toString(),
-        source.token,
-        archive.remote,
-        signal,
-      );
+      const c = archive.manifest.historicalRaw;
+      let verifiedMember: MediaFile | null = null;
+      if (c) {
+        const target = new URL(
+          "/jobs/" +
+            id +
+            "/files/" +
+            archive.manifest.directory +
+            "/engine_evidence.tar.zst",
+          process.env.ENGINE_URL ?? "http://api:8000",
+        );
+        const headers: Record<string, string> = {
+          accept: "application/zstd",
+          "accept-encoding": "identity",
+        };
+        if (!options.verifyCompleted) {
+          const token = configuredControlPlaneToken();
+          if (!token) throw Error("Local engine authorization unavailable");
+          headers.authorization = "Bearer " + token;
+          headers["x-historical-raw-preflight"] = Buffer.from(
+            JSON.stringify({
+              version: 1,
+              directory: archive.manifest.directory,
+              receipt: c,
+            }),
+          ).toString("base64");
+        }
+        const result = await fetch(target, {
+          redirect: "error",
+          signal,
+          headers,
+        });
+        if (
+          result.headers.get("x-historical-raw-source") !== "registered-hub"
+        ) {
+          await result.body?.cancel();
+          throw Error(
+            "The actual engine file route did not reopen the registered historical generation (" +
+              result.status +
+              ")",
+          );
+        }
+        await verifyProgressiveArchiveResponse(result, archive.remote);
+        if (!plan.historicalSamples || !Object.hasOwn(plan.historicalSamples, c.point_content_signature))
+          throw Error("Native historical member proof is missing");
+        const sample = plan.historicalSamples[c.point_content_signature];
+        if (sample) {
+          if (
+            !/^(openfoam|time_directories|VTK)\//.test(sample.path) ||
+            sample.path
+              .split("/")
+              .some((p) => !p || p === "." || p === ".." || p.includes("\\")) ||
+            !/^[a-f0-9]{64}$/.test(sample.sha256) ||
+            !Number.isSafeInteger(sample.byteSize) ||
+            sample.byteSize < 0
+          )
+            throw Error("Invalid historical member identity");
+          const member = new URL(target);
+          member.pathname =
+            target.pathname.slice(0, target.pathname.lastIndexOf("/") + 1) +
+            sample.path.split("/").map(encodeURIComponent).join("/");
+          const response = await fetch(member, {
+            redirect: "error",
+            signal,
+            headers,
+          });
+          if (
+            response.headers.get("x-historical-raw-source") !== "registered-hub"
+          ) {
+            await response.body?.cancel();
+            throw Error(
+              "Original member route did not restore the pinned source",
+            );
+          }
+          await verifyProgressiveArchiveResponse(
+            response,
+            {
+              storedSha256: sample.sha256,
+              storedByteSize: sample.byteSize,
+              generation: c.generation,
+            },
+            false,
+          );
+          verifiedMember = sample;
+        }
+      } else {
+        const url = new URL(
+          `/api/sync/v1/evidence-uploads/${archive.manifest.brokeredUploadId}/download`,
+          source.base,
+        );
+        await preflightProgressiveArchive(
+          url.toString(),
+          source.token,
+          archive.remote,
+          signal,
+        );
+      }
       readbacks.push({
-        brokeredUploadId: archive.manifest.brokeredUploadId,
+        ...(c
+          ? { historicalPointSignature: c.point_content_signature, verifiedMember }
+          : { brokeredUploadId: archive.manifest.brokeredUploadId }),
         generation: archive.remote.generation,
         storedSha256: archive.remote.storedSha256,
         storedByteSize: archive.remote.storedByteSize,
@@ -706,11 +1070,11 @@ export async function closedProgressiveJob(
     if (!locked) return false;
     const media = options.keepMedia ? await registeredImages(tx, id, true) : [];
     const [ready] = await tx.execute(
-      sql`SELECT j.id FROM sim_jobs j WHERE j.id=${id}::uuid AND ${eligible(now, ageMs, undefined, media)}`,
+      sql`SELECT j.id FROM sim_jobs j WHERE j.id=${id}::uuid AND ${eligible(now, ageMs, undefined, media, options.historicalRaw)}`,
     );
     if (!ready) return false;
-    const fresh = await proofs(tx, id, media);
-    if (options.keepMedia)
+    const fresh = await proofs(tx, id, media, historical);
+    if (options.keepMedia && !historical)
       await assertWorkingPathsUnreferenced(tx, id, plan.workingPaths!);
     options.signal?.throwIfAborted();
     if (
@@ -731,8 +1095,10 @@ export async function closedProgressiveJob(
         options.keepMedia &&
         (canonicalAnalysisJson(done.mediaFiles) !==
           canonicalAnalysisJson(plan.mediaFiles) ||
-          canonicalAnalysisJson(done.workingPaths) !==
-            canonicalAnalysisJson(plan.workingPaths))
+          (historical
+            ? done.historicalPathsSha256 !== plan.historicalPathsSha256
+            : canonicalAnalysisJson(done.workingPaths) !==
+              canonicalAnalysisJson(plan.workingPaths)))
       )
         throw Error("Native keep-set or removed paths changed");
       allocation = done.allocation ?? null;
@@ -750,7 +1116,11 @@ export async function closedProgressiveJob(
       tx,
       id,
       true,
-      plan.state === "absent" ? "absent" : "duplicate-files",
+      plan.state === "absent"
+        ? "absent"
+        : options.historicalRaw
+          ? "historical-raw-files"
+          : "duplicate-files",
       plan.bytes,
       plan.files,
       plan.plan,
@@ -758,6 +1128,7 @@ export async function closedProgressiveJob(
       scientificSha256,
       allocation,
       mediaSha256,
+      options.historicalRaw,
     );
     return true;
   });

@@ -53,11 +53,23 @@ export async function preflightProgressiveArchive(
     headers: { accept: "application/zstd", "x-xfoilfoam-solver-token": token },
     signal,
   });
+  await verifyProgressiveArchiveResponse(response, remote);
+}
+
+export async function verifyProgressiveArchiveResponse(
+  response: Response,
+  remote: Pick<
+    ProgressiveEvidenceCustodyReceipt["remote"],
+    "storedSha256" | "storedByteSize" | "generation"
+  >,
+  archive = true,
+): Promise<void> {
   if (
     !response.ok ||
     !response.body ||
-    response.headers.get("content-type")?.split(";", 1)[0] !==
-      "application/zstd" ||
+    (archive &&
+      response.headers.get("content-type")?.split(";", 1)[0] !==
+        "application/zstd") ||
     Number(response.headers.get("content-length")) !== remote.storedByteSize ||
     response.headers.get("x-content-sha256") !== remote.storedSha256 ||
     response.headers.get("x-gcs-generation") !== remote.generation

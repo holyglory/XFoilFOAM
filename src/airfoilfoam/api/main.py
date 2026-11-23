@@ -22,6 +22,7 @@ from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import FileResponse, PlainTextResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
+from .. import historical_raw_restore
 from .. import __version__, physics
 from ..airfoil import load_airfoil
 from ..archive_reduction import (
@@ -563,6 +564,17 @@ def _render_source(
     cleanup pass from evicting that evidence mid-render.
     """
 
+    if remote_pointer is None and (evidence_dir / historical_raw_restore.MARKER).is_file():
+        try:
+            root = next(p for p in evidence_dir.parents if p.parent == settings.data_dir / "jobs")
+            scope = historical_raw_restore.original_scope(root, evidence_dir / EVIDENCE_ARCHIVE_NAME)
+            if scope is None:
+                raise ValueError("missing historical render owner")
+            with historical_raw_restore.restored(scope, settings, render=True) as restored:
+                yield restored
+            return
+        except (StopIteration, OSError, KeyError, TypeError, ValueError, EvidenceStoreError) as exc:
+            raise HTTPException(status_code=409, detail="Verified historical render source unavailable") from exc
     if remote_pointer is not None:
         if source_mode != "archive":
             raise HTTPException(
@@ -2112,6 +2124,8 @@ def create_app() -> FastAPI:
         expected_generation: int | None = None,
         expected_stored_sha256: str | None = None,
         expected_stored_size: int | None = None,
+        historical_preflight: str | None = Header(default=None, alias="x-historical-raw-preflight"),
+        authorization: str | None = Header(default=None),
     ):
         if not store.exists(job_id):
             raise HTTPException(status_code=404, detail="Job not found")
@@ -2120,6 +2134,31 @@ def create_app() -> FastAPI:
         except ValueError:
             raise HTTPException(status_code=400, detail="Invalid path")
         job_root = safe_job_root(job_id)
+        if historical_preflight is not None:
+            _require_control_plane_bearer(settings.control_plane_token, authorization)
+        if historical_preflight is not None or not target.is_file() or expected_generation is not None:
+            try:
+                historic = historical_raw_restore.original_scope(job_root, target, historical_preflight)
+            except (KeyError, TypeError, OSError, ValueError, EvidenceStoreError) as exc:
+                raise HTTPException(status_code=409, detail="Historical source identity is unavailable") from exc
+            if historical_preflight is not None and historic is None:
+                raise HTTPException(status_code=409, detail="Historical source directory is unavailable")
+            if historic is not None:
+                _, _, historical_manifest, pin, member = historic
+                if member != EVIDENCE_ARCHIVE_NAME and (member.split("/",1)[0] not in PACKAGED_RAW_DIRS or
+                        not any(m.get("path")==member for m in json.loads(historical_manifest)["files"])):
+                    raise HTTPException(status_code=404,detail="Evidence artifact not found")
+                expected = (expected_bucket, expected_object_key, expected_generation, expected_stored_sha256, expected_stored_size)
+                if any(v is not None for v in expected) and expected != (pin.bucket, pin.object_key, pin.generation, pin.stored_sha256, pin.stored_size):
+                    raise HTTPException(status_code=409, detail="Historical source pin differs")
+                response = _stream_remote_evidence(historical_raw_restore.restored(historic, settings),
+                    media_type=ARCHIVE_MIME_TYPE if member == EVIDENCE_ARCHIVE_NAME else (mimetypes.guess_type(target.name)[0] or "application/octet-stream"),
+                    identity=pin if member == EVIDENCE_ARCHIVE_NAME else None)
+                if member != EVIDENCE_ARCHIVE_NAME:
+                    response.headers["x-content-sha256"] = next(m["sha256"] for m in json.loads(historical_manifest)["files"] if m["path"] == member)
+                response.headers["x-historical-raw-source"] = "registered-hub"
+                response.headers["x-gcs-generation"] = str(pin.generation)
+                return response
         evidence_dir = _evidence_dir_for_target(job_root, target)
         expected_pointer: RemoteEvidencePointer | None = None
         if any(
