@@ -843,7 +843,6 @@ export async function exportLegacyReports(input: {
       !savedPending &&
       supervisor?.slots === 2 &&
       pages >= 2 &&
-      maxBytes <= 128 * 1024 ** 2 &&
       next.execution + 1 < input.scope.executions.length;
     if (savedPending?.isDirectory() || useSlots) {
       if (!supervisor || !input.applyVerifiedPage)
