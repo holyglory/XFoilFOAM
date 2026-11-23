@@ -1,6 +1,7 @@
-import { createHash } from "node:crypto";
+import { createHash, type Hash } from "node:crypto";
 import { gzipSync, gunzipSync } from "node:zlib";
 import { isUtf8 } from "node:buffer";
+import { reportTextIdentity } from "./progressive-report-archive";
 import {
   LEGACY_HASH,
   LEGACY_UUID,
@@ -57,7 +58,7 @@ export interface LegacyBackupReceipt {
   memberCount: number;
   rawByteSize: number;
 }
-export function checkLegacyMember(member: LegacyReportMember): void {
+function checkLegacyMemberIdentity(member: LegacyReportMember): void {
   if (
     !LEGACY_UUID.test(member.executionId) ||
     !["report", "conflict"].includes(member.kind) ||
@@ -65,13 +66,20 @@ export function checkLegacyMember(member: LegacyReportMember): void {
     !LEGACY_HASH.test(member.reportSha256) ||
     !LEGACY_HASH.test(member.rowSha256) ||
     typeof member.rowText !== "string" ||
-    typeof member.reportText !== "string" ||
+    typeof member.reportText !== "string"
+  )
+    throw new Error("Exact legacy member proof failed");
+  legacyBound(member.sequence, Number.MAX_SAFE_INTEGER, "member sequence");
+}
+
+export function checkLegacyMember(member: LegacyReportMember): void {
+  checkLegacyMemberIdentity(member);
+  if (
     legacySha256(member.rowText) !== member.rowSha256 ||
     legacySha256(member.reportText) !== member.reportSha256 ||
     Buffer.byteLength(member.reportText) !== member.reportByteSize
   )
     throw new Error("Exact legacy member proof failed");
-  legacyBound(member.sequence, Number.MAX_SAFE_INTEGER, "member sequence");
 }
 
 // Content-defined boundaries align again after changing sequence/status prefixes.
@@ -143,6 +151,110 @@ export function encodeLegacyPage(page: LegacyBackupPage): {
   return { bytes: gzipSync(raw, { level: 9 }), rawByteSize: raw.length };
 }
 
+// Dictionary references identify exact bytes. Keep the UTF-8 text and SHA-256
+// state of the shared leading chunks for this decode only. A chunk boundary
+// inside a code point takes the ordinary whole-string decoding path.
+function commonReportChunks(records: { type: string; reportChunks?: unknown }[]): number {
+  let first: unknown[] | undefined;
+  let count = 0;
+  let members = 0;
+  for (const record of records) {
+    if (record.type !== "member") continue;
+    const chunks = record.reportChunks;
+    members++;
+    if (members > 128) throw new Error("Legacy backup member/chunk count mismatch");
+    if (!Array.isArray(chunks) || chunks.length > 40000)
+      throw new Error("Invalid legacy chunk references");
+    if (first === undefined) {
+      first = chunks;
+      count = chunks.length;
+    } else {
+      const limit = Math.min(count, chunks.length);
+      count = 0;
+      while (count < limit && chunks[count] === first[count]) count++;
+    }
+  }
+  return members > 1 ? count : 0;
+}
+
+interface LegacyTextPrefix {
+  chunkCount: number;
+  byteSize: number;
+  text: string;
+  hash: Hash;
+}
+
+interface LegacyTextProof {
+  readonly reportSha256: string;
+  readonly reportByteSize: number;
+  readonly rowSha256: string;
+  readonly rowByteSize: number;
+}
+
+// Only the dictionary decoder can publish a proof. Keep it with the decoded
+// member's lifetime. The public member and its metadata remain mutable.
+const decodedTexts = new WeakMap<LegacyReportMember, {
+  rowText: string;
+  reportText: string;
+  reportPrefix?: string;
+  reportSuffix: string;
+  proof: LegacyTextProof;
+}>();
+
+/** A caller can snapshot a mutable member before an asynchronous restore.
+ * Reuse authenticated hashes only for the two exact strings in that snapshot. */
+export function legacyMemberTextProof(
+  member: LegacyReportMember,
+  source = member,
+): LegacyTextProof {
+  const decoded = decodedTexts.get(source);
+  if (decoded && decoded.reportText === member.reportText && decoded.rowText === member.rowText)
+    return decoded.proof;
+  // Legacy inline pages, caller-built pages and changed strings still take
+  // the full UTF-8 round trip and exact byte hashes.
+  const report = reportTextIdentity(member.reportText);
+  const row = reportTextIdentity(member.rowText);
+  return {
+    reportSha256: report.sha256, reportByteSize: report.byteSize,
+    rowSha256: row.sha256, rowByteSize: row.byteSize,
+  };
+}
+
+/** Compare the actual decoded strings, including for a caller-supplied page.
+ * Matching section boundaries allow literal equality without flattening two
+ * full reports for every sibling. The independently decoded prefixes may differ. */
+export function sameLegacyMemberText(
+  actual: LegacyReportMember,
+  expected: LegacyReportMember,
+  source = expected,
+): boolean {
+  if (actual.rowText !== expected.rowText) return false;
+  const left = decodedTexts.get(actual);
+  const right = decodedTexts.get(source);
+  if (
+    left?.reportPrefix !== undefined && right?.reportPrefix !== undefined &&
+    left.reportText === actual.reportText && right.reportText === expected.reportText &&
+    left.reportPrefix.length === right.reportPrefix.length
+  ) {
+    return left.reportPrefix === right.reportPrefix && left.reportSuffix === right.reportSuffix;
+  }
+  return actual.reportText === expected.reportText;
+}
+
+function decodeChunkText(chunks: Buffer[], expectedSha: string, prefix?: LegacyTextPrefix) {
+  const bytes = Buffer.concat(prefix ? chunks.slice(prefix.chunkCount) : chunks);
+  if (!isUtf8(bytes)) throw new Error("Invalid legacy UTF-8 bytes");
+  const hash = prefix ? prefix.hash.copy() : createHash("sha256");
+  if (hash.update(bytes).digest("hex") !== expectedSha)
+    throw new Error("Exact legacy member proof failed");
+  const suffix = bytes.toString("utf8");
+  return {
+    text: (prefix?.text ?? "") + suffix,
+    suffix,
+    byteSize: (prefix?.byteSize ?? 0) + bytes.length,
+  };
+}
+
 /** Also reads pre-dictionary canary bundles. No fake GCS receipt for local staging. */
 export function inspectLegacyPage(
   bytes: Buffer,
@@ -198,7 +310,7 @@ export function inspectLegacyPage(
   const resolve = (hashes: unknown) => {
     if (!Array.isArray(hashes) || hashes.length > 40000)
       throw new Error("Invalid legacy chunk references");
-    const values = hashes.map((hash) => {
+    return hashes.map((hash) => {
       const value = chunks.get(hash);
       if (!value) throw new Error("Missing legacy byte chunk");
       used.add(hash);
@@ -207,11 +319,9 @@ export function inspectLegacyPage(
         throw new Error("Legacy decoded page exceeds logical byte bound");
       return value;
     });
-    const value = Buffer.concat(values);
-    if (!isUtf8(value))
-      throw new Error("Invalid legacy UTF-8 bytes");
-    return value.toString("utf8");
   };
+  const prefixLength = encoding ? commonReportChunks(records) : 0;
+  let prefix: LegacyTextPrefix | undefined;
   const members: LegacyReportMember[] = [];
   const seen = new Set<string>();
   for (const record of records) {
@@ -220,16 +330,43 @@ export function inspectLegacyPage(
       throw new Error("Invalid legacy backup record");
     const { type: _memberType, rowChunks, reportChunks, ...member } = record;
     if (encoding) {
-      member.rowText = resolve(rowChunks);
-      member.reportText = resolve(reportChunks);
+      const row = decodeChunkText(resolve(rowChunks), member.rowSha256);
+      member.rowText = row.text;
+      // Resolve and charge every reference even when its bytes are shared.
+      const parts = resolve(reportChunks);
+      if (!members.length && prefixLength) {
+        const shared = Buffer.concat(parts.slice(0, prefixLength));
+        if (isUtf8(shared)) {
+          prefix = {
+            chunkCount: prefixLength,
+            byteSize: shared.length,
+            text: shared.toString("utf8"),
+            hash: createHash("sha256").update(shared),
+          };
+        }
+      }
+      const report = decodeChunkText(parts, member.reportSha256, prefix);
+      member.reportText = report.text;
+      checkLegacyMemberIdentity(member);
+      if (report.byteSize !== member.reportByteSize) throw new Error("Exact legacy member proof failed");
+      decodedTexts.set(member, {
+        rowText: row.text,
+        reportText: report.text,
+        reportPrefix: prefix?.text,
+        reportSuffix: report.suffix,
+        proof: Object.freeze({
+          reportSha256: member.reportSha256, reportByteSize: report.byteSize,
+          rowSha256: member.rowSha256, rowByteSize: row.byteSize,
+        }),
+      });
     } else {
       decodedBytes +=
         Buffer.byteLength(member.rowText) +
         Buffer.byteLength(member.reportText);
       if (decodedBytes > 256 * 1024 ** 2)
         throw new Error("Legacy decoded page exceeds logical byte bound");
+      checkLegacyMember(member);
     }
-    checkLegacyMember(member);
     const key = `${member.kind}:${member.executionId}:${member.sequence}`;
     if (seen.has(key)) throw new Error("Duplicate legacy backup member");
     seen.add(key);

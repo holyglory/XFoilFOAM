@@ -1,10 +1,11 @@
 import type { DB } from "@aerodb/db/client";
 import {
+  legacyMemberTextProof,
   readLegacyPageMembers,
   type LegacyExactPageMemberIdentity,
 } from "@aerodb/db/legacy-report-storage-codec";
 import {
-  parseReportJson, reportValidationValue, ReportJsonNumber, reportTextIdentity,
+  parseReportJson, reportValidationValue, ReportJsonNumber,
   type ReportJson,
 } from "@aerodb/db/progressive-report-archive";
 import { CRC32C } from "@google-cloud/storage";
@@ -182,14 +183,10 @@ async function readPageWithProof(db: DB, value: LegacyWorkerProductReadRequest, 
       ...request, storedSha256: request.object.sha256, storedByteSize: request.object.byteSize,
     });
   } catch { throw new LegacyWorkerProductReadError("member_invalid", "Complete decoded page or exact expected member set differs"); }
-  const members = decoded.map((member) => {
-    const report = reportTextIdentity(member.reportText), row = reportTextIdentity(member.rowText);
-    return {
-      executionId: member.executionId, sequence: member.sequence, kind: member.kind,
-      contentSignature: member.contentSignature, reportSha256: report.sha256, reportByteSize: report.byteSize,
-      rowSha256: row.sha256, rowByteSize: row.byteSize,
-    };
-  });
+  const members = decoded.map((member) => ({
+    executionId: member.executionId, sequence: member.sequence, kind: member.kind,
+    contentSignature: member.contentSignature, ...legacyMemberTextProof(member),
+  }));
   await assertLocalOwner(db, request, signal);
   signal.throwIfAborted();
   const checkedAt = new Date().toISOString();
