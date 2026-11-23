@@ -63,6 +63,7 @@ export function PolarViewer(props: {
   visibleSeries: Record<string, boolean>;
   onToggleSeries: (seriesId: string) => void;
   solvedPointCount: number;
+  hasStoredStageEvidence?: boolean;
   machStr: string;
   hover: HoverState | null;
   onHover: (h: HoverState | null) => void;
@@ -86,6 +87,7 @@ export function PolarViewer(props: {
     visibleSeries,
     onToggleSeries,
     solvedPointCount,
+    hasStoredStageEvidence = false,
     machStr,
     hover,
     onHover,
@@ -547,7 +549,7 @@ export function PolarViewer(props: {
               >
                 {solvedPointCount
                   ? solvedPointLabel
-                  : "waiting for solved points"}
+                  : hasStoredStageEvidence ? "stage evidence available" : "waiting for solved points"}
               </span>
             )}
             <span
@@ -750,7 +752,7 @@ export function PolarViewer(props: {
                         ? "No polar curve available yet."
                         : chartType === "cma" && solvedPointCount > 0
                           ? "Cm is unavailable for these solved points"
-                          : "No solved OpenFOAM polar points yet"}
+                          : hasStoredStageEvidence ? "No polar curve for this condition yet" : "No solved OpenFOAM polar points yet"}
                     </span>
                     {showPoints && (
                       <span
@@ -758,7 +760,9 @@ export function PolarViewer(props: {
                       >
                         {chartType === "cma" && solvedPointCount > 0
                           ? "No moment-coefficient evidence was stored. The other coefficient charts remain available."
-                          : "Queued/running points will appear here only after a completed result row is stored."}
+                          : hasStoredStageEvidence
+                            ? "Open a solver stage under Point results to inspect its stored coefficients."
+                            : "Queued/running points will appear here only after a completed result row is stored."}
                       </span>
                     )}
                   </div>

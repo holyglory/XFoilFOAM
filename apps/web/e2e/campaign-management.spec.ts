@@ -1671,6 +1671,23 @@ test.describe
     expect(overflow.panel).toBeLessThanOrEqual(0);
     expect(overflow.profile).toBeLessThanOrEqual(0);
 
+    // The label rows use different grid tracks on either side of 500px.
+    // Check visible text bounds; the icons themselves have smaller boxes.
+    for (const width of [499, 500, 501, 560, 701]) {
+      await page.setViewportSize({ width, height: 844 });
+      const stages = await handoffRail.locator(".shared-stage strong").evaluateAll((labels) =>
+        labels.map((label) => {
+          const range = document.createRange();
+          range.selectNodeContents(label);
+          const { left, right } = range.getBoundingClientRect();
+          return { left, right };
+        }),
+      );
+      expect(stages).toHaveLength(3);
+      expect(stages[0]!.right + 2).toBeLessThanOrEqual(stages[1]!.left);
+      expect(stages[1]!.right + 2).toBeLessThanOrEqual(stages[2]!.left);
+    }
+    await page.setViewportSize({ width: 390, height: 844 });
     await page.keyboard.press("Escape");
     await expect(panel).toHaveCount(0);
     await expect(trigger).toBeFocused();

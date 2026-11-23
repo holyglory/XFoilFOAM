@@ -743,6 +743,9 @@ export function CellSidePanel({
               )
             }
             solvedPointCount={solvedPointCount}
+            hasStoredStageEvidence={preliminaryOutcomes?.items.some((item) =>
+              !!(item.fastResultId && item.fastResultAttemptId) || !!(item.finalResultId && item.finalResultAttemptId)
+            )}
             machStr={
               condition.mach != null
                 ? condition.mach.toFixed(2)
@@ -801,7 +804,7 @@ export function CellSidePanel({
             style={{ display: "flex", gap: 6, flexWrap: "wrap" }}
           >
             <span style={chip(C.teal, C.tealBorder)}>
-              {fCount(counters.solved)} solved
+              {fCount(counters.solved)} campaign points complete
             </span>
             {counters.derived > 0 && (
               <span style={chip(C.dim, C.stroke)}>

@@ -759,9 +759,12 @@ export function PreliminaryOutcomePanel({
         }
         @media (max-width: 700px) {
           .flow-guide {
-            grid-template-columns: 58px minmax(120px, 1fr) 124px 26px;
+            grid-template-columns: 58px minmax(0, 1fr) max-content;
             gap: 7px;
             padding-inline: 9px;
+          }
+          .shared-rail {
+            grid-template-columns: max-content max-content max-content minmax(12px, 1fr) max-content;
           }
           .shared-stage {
             gap: 4px;
