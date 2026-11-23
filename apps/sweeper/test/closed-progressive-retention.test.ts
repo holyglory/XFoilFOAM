@@ -316,7 +316,7 @@ it("rotates blocked and 409 jobs, authenticates every object before reclaim and 
   });
 }, 30000);
 
-it("keeps path-owned images unbound and checks all image routes, their legend and working-file references", async () => {
+it.each(["rans", "urans"])("keeps %s point-owned images and checks every route, legend and working-file reference", async (regime) => {
   await client.db.transaction(async (transaction) => {
     const db = transaction as unknown as DB;
     for (const def of tableDefinitions)
@@ -337,7 +337,7 @@ it("keeps path-owned images unbound and checks all image routes, their legend an
     );
     const rid = String(owner!.result_id);
     await db.execute(
-      sql`UPDATE result_attempts SET airfoil_id=${foil},regime='rans',status='done' WHERE id=${item!.attempt}`,
+      sql`UPDATE result_attempts SET airfoil_id=${foil},regime=${regime},status='done' WHERE id=${item!.attempt}`,
     );
     await db.execute(
       sql`INSERT INTO results(id,sim_job_id,current_result_attempt_id) VALUES(${rid},${id},${item!.attempt})`,
@@ -345,12 +345,19 @@ it("keeps path-owned images unbound and checks all image routes, their legend an
     await db.execute(sql`INSERT INTO airfoils VALUES(${foil},'real-foil')`);
     const field = "pressure",
       nativePath = "cases/foil/a0/images/pressure.png",
-      scaledPath = "cases/foil/a0/evidence/scaled_media/view/v1/pressure.png";
+      scaledPath = "cases/foil/a0/evidence/scaled_media/default_v1_zoom2/v8/pressure.png";
+    const registered = regime === "urans" ? nativePath : scaledPath;
+    const registeredBytes = regime === "urans" ? "engine" : "scaled";
     const locals = [
       { path: nativePath, sha256: sha("engine"), byteSize: 6 },
       { path: scaledPath, sha256: sha("scaled"), byteSize: 6 },
     ];
+    if (regime === "urans")
+      locals.push({ path: scaledPath.replace("/v8/", "/v7/"), sha256: sha("oldpng"), byteSize: 6 });
     const candidate = "cases/foil/postProcessing/forceCoeffs/0/coefficient.dat";
+    const workingPaths = regime === "urans"
+      ? [...Array.from({ length: 4112 }, (_, i) => `cases/foil/transient_a0/${i + 1}/U`), candidate]
+      : [candidate];
     const legend = {
       mode: "track",
       vmin: -1,
@@ -363,7 +370,7 @@ it("keeps path-owned images unbound and checks all image routes, their legend an
       sql`INSERT INTO field_color_scales VALUES(${scale},-1,1,'linear',1,'active')`,
     );
     await db.execute(sql`INSERT INTO result_media(id,result_id,result_attempt_id,storage_key,kind,role,field,mime_type,sha256,byte_size,evidence_sha256,color_scale_id)
-      VALUES(${media},${rid},${item!.attempt},${`jobs/${id}/${scaledPath}`},'image','instantaneous',${field},'image/png',${sha("scaled")},6,${item!.remote.manifestSha256},${scale})`);
+      VALUES(${media},${rid},${item!.attempt},${`jobs/${id}/${registered}`},'image','instantaneous',${field},'image/png',${sha(registeredBytes)},6,${item!.remote.manifestSha256},${scale})`);
     let applied = 0,
       brokenPath = false,
       wrongLegend = false,
@@ -374,6 +381,7 @@ it("keeps path-owned images unbound and checks all image routes, their legend an
       async reclaimClosedProgressiveFiles(job, manifests, plan, readbacks) {
         expect(job).toBe(id);
         expect(manifests[0]?.keepMedia?.map((row) => row.id)).toEqual([media]);
+        expect(manifests[0]?.regime).toBe(regime === "urans" ? "urans" : undefined);
         if (plan) {
           expect(readbacks?.[0]?.brokeredUploadId).toBe(item!.upload);
           applied++;
@@ -383,10 +391,10 @@ it("keeps path-owned images unbound and checks all image routes, their legend an
           state: plan ? "reclaimed" : "planned",
           replayed: !plan && applied > 0,
           plan: "c".repeat(64),
-          files: 1,
+          files: workingPaths.length,
           bytes: 32,
           mediaFiles: missingOriginal ? locals.slice(1) : locals,
-          workingPaths: [candidate],
+          workingPaths,
           plannedAllocatedBytes: 4096,
         };
       },
@@ -417,7 +425,8 @@ it("keeps path-owned images unbound and checks all image routes, their legend an
               },
             },
           });
-        const value = path.endsWith(nativePath) ? "engine" : "scaled";
+        const value = path === `/api/result-media/${media}` ? registeredBytes :
+          path.endsWith(nativePath) ? "engine" : path.includes("/v7/") ? "oldpng" : "scaled";
         if (brokenPath && path.startsWith("/api/media/"))
           return new Response("broken", {
             headers: { "content-type": "image/png", "content-length": "6" },
@@ -447,6 +456,12 @@ it("keeps path-owned images unbound and checks all image routes, their legend an
         "/api/airfoils/real-foil/sim",
       ])
         expect(routes).toContain(expected);
+      if (regime === "urans") {
+        expect(routes).toContain(`/api/media/jobs/${id}/${scaledPath.replace("/v8/", "/v7/")}`);
+        locals.push({ path: scaledPath.replace("pressure.png", "foreign.png"), sha256: sha("scaled"), byteSize: 6 });
+        await expect(closedProgressiveJob(db, native, id, opts)).rejects.toThrow(/incomplete/);
+        locals.pop();
+      }
       missingOriginal = true;
       await expect(closedProgressiveJob(db, native, id, opts)).rejects.toThrow(
         /inventory is incomplete/,

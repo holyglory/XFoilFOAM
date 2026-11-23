@@ -19,6 +19,7 @@ export interface ClosedProgressiveManifest {
   generation: string;
   receiptHmac: string;
   keepMedia?: KeptImage[];
+  regime?: "urans";
 }
 
 export interface ClosedProgressiveReadback {
@@ -56,6 +57,7 @@ export interface ClosedProgressiveBackend {
 }
 
 type KeptImage = {
+  regime?: "urans";
   id: string;
   resultId: string;
   attemptId: string;
@@ -110,18 +112,23 @@ async function registeredImages(
     encode(sha256(convert_to(to_jsonb(m)::text,'UTF8')),'hex') AS "rowSha256",
     CASE WHEN s.id IS NOT NULL THEN jsonb_build_object('mode','track','vmin',coalesce(m.scale_vmin,s.vmin),'vmax',coalesce(m.scale_vmax,s.vmax),
       'policy',coalesce(m.scale_policy,s.scale_policy),'version',coalesce(m.color_scale_version,s.version),'status',s.status) END AS legend,
-    (a.sim_job_id=${jobId}::uuid AND a.engine_job_id=${jobId} AND a.result_id=m.result_id AND a.regime='rans' AND r.current_result_attempt_id=a.id
+    a.regime AS source_regime,
+    (a.sim_job_id=${jobId}::uuid AND a.engine_job_id=${jobId} AND a.result_id=m.result_id AND a.regime IN ('rans','urans') AND r.current_result_attempt_id=a.id
      AND m.storage_key LIKE ${prefix + "%"} AND m.kind='image' AND m.role='instantaneous' AND m.mime_type='image/png'
      AND m.sha256~'^[a-f0-9]{64}$' AND m.byte_size>0 AND m.evidence_sha256~'^[a-f0-9]{64}$' AND m.field IS NOT NULL AND f.slug IS NOT NULL
      AND NOT EXISTS(SELECT 1 FROM result_media_storage_bindings b WHERE b.result_media_id=m.id)
      AND NOT EXISTS(SELECT 1 FROM result_media_storage_uploads u WHERE u.result_media_id=m.id)) AS ok
     FROM result_media m LEFT JOIN result_attempts a ON a.id=m.result_attempt_id LEFT JOIN results r ON r.id=m.result_id
     LEFT JOIN airfoils f ON f.id=a.airfoil_id LEFT JOIN field_color_scales s ON s.id=m.color_scale_id WHERE ${selected} ORDER BY m.id LIMIT 257`);
-  if (!rows.length || rows.length > 256 || rows.some((r) => r.ok !== true))
+  if (!rows.length) throw Error("The named job has no registered instantaneous PNGs");
+  if (rows.length > 256) throw Error("The named job exceeds 256 registered instantaneous PNGs");
+  if (rows.some((r) => r.ok !== true))
     throw Error(
       "Keep-set requires a bounded inventory of exact current-job instantaneous PNG rows",
     );
-  return rows.map(({ ok, ...r }) => r as unknown as KeptImage);
+  return rows.map(({ ok, source_regime, ...r }) => ({
+    ...r, ...(source_regime === "urans" ? { regime: "urans" } : {}),
+  } as unknown as KeptImage));
 }
 
 async function assertWorkingPathsUnreferenced(
@@ -131,7 +138,6 @@ async function assertWorkingPathsUnreferenced(
 ) {
   if (!paths.length) return;
   if (
-    paths.length > 4096 ||
     paths.some(
       (p) =>
         !p.startsWith("cases/") ||
@@ -139,12 +145,14 @@ async function assertWorkingPathsUnreferenced(
     )
   )
     throw Error("Invalid candidate working paths");
-  const keys = sql`(${sql.join(
-    paths.map((p) => sql`${`jobs/${id}/${p}`}`),
-    sql`,`,
-  )})`;
+  // One snapshot covers the entire signed plan, including a URANS window
+  // with thousands of fields. Bind the path list once instead of expanding
+  // four independent lists of SQL parameters.
+  const keys = sql`(SELECT key FROM planned)`;
   const [row] =
-    await db.execute(sql`SELECT EXISTS (SELECT 1 FROM result_media WHERE storage_key IN ${keys})
+    await db.execute(sql`WITH planned AS MATERIALIZED (
+      SELECT ${"jobs/" + id + "/"}::text || path AS key FROM jsonb_array_elements_text(${JSON.stringify(paths)}::jsonb) AS files(path)
+    ) SELECT EXISTS (SELECT 1 FROM result_media WHERE storage_key IN ${keys})
     OR EXISTS(SELECT 1 FROM solver_evidence_artifacts WHERE storage_key IN ${keys})
     OR EXISTS(SELECT 1 FROM field_render_cache WHERE storage_key IN ${keys})
     OR EXISTS(SELECT 1 FROM remote_asset_references WHERE local_storage_key IN ${keys} OR cached_storage_key IN ${keys}) AS referenced`);
@@ -196,20 +204,26 @@ async function readKeptMedia(
       "Native peer omitted the protected image or working-file inventory",
     );
   const expectedPaths = new Set<string>();
+  const uransFields = new Set<string>();
   for (const row of media) {
     const suffix = "/evidence/scaled_media/";
     const prefixLength = row.path.lastIndexOf(suffix);
-    if (prefixLength < 0)
-      throw Error(
-        "Registered image is outside a signed scaled-media directory",
-      );
+    const nativeSuffix = "/images/" + row.field + ".png";
+    const base = prefixLength >= 0 ? row.path.slice(0, prefixLength) :
+      row.regime === "urans" && row.path.endsWith(nativeSuffix) ? row.path.slice(0, -nativeSuffix.length) : null;
+    if (!base) throw Error("Registered image is outside its signed point media directories");
+    const native = base + nativeSuffix;
+    if (expectedPaths.has(row.path) || expectedPaths.has(native)) throw Error("Overlapping registered point images");
+    expectedPaths.add(native);
     expectedPaths.add(row.path);
-    expectedPaths.add(
-      row.path.slice(0, prefixLength) + "/images/" + row.field + ".png",
-    );
+    if (row.regime === "urans") uransFields.add(base + nativeSuffix);
+  }
+  for (const file of plan.mediaFiles) {
+    const previous = /^(cases\/[^/]+\/[^/]+)\/evidence\/scaled_media\/default_v1_zoom2\/v[0-9]+\/([^/]+\.png)$/.exec(file.path);
+    if (previous && uransFields.has(previous[1] + "/images/" + previous[2]))
+      expectedPaths.add(file.path);
   }
   if (
-    expectedPaths.size !== 2 * media.length ||
     plan.mediaFiles.length !== expectedPaths.size ||
     plan.mediaFiles.some((file) => !expectedPaths.has(file.path)) ||
     new Set(plan.workingPaths).size !== plan.files ||
@@ -484,12 +498,14 @@ async function proofs(db: DB, jobId: string, media: KeptImage[] = []) {
     const kept = media.filter((m) => m.attemptId === row.id);
     if (
       media.length &&
-      (!kept.length ||
+      ((!kept.length && row.regime !== "urans") ||
         kept.some(
           (m) =>
             m.resultId !== row.result_id ||
             m.evidenceSha256 !== receipt.remote.manifestSha256 ||
-            !m.path.startsWith(directory + "/scaled_media/"),
+            !(m.path.startsWith(directory + "/scaled_media/") ||
+              (row.regime === "urans" && directory.endsWith("/evidence") &&
+               m.path === directory.slice(0, -"/evidence".length) + "/images/" + m.field + ".png")),
         ))
     )
       throw Error("Kept images differ from the exact signed point owner");
@@ -514,6 +530,7 @@ async function proofs(db: DB, jobId: string, media: KeptImage[] = []) {
         directory,
         catalogSha256: row.catalog_sha,
         ...(media.length ? { keepMedia: kept } : {}),
+        ...(media.length && row.regime === "urans" ? { regime: "urans" as const } : {}),
         manifestSha256: receipt.remote.manifestSha256,
         manifestByteSize: receipt.remote.manifestByteSize,
         brokeredUploadId: receipt.brokeredUploadId,

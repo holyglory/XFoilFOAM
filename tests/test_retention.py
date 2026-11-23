@@ -1035,8 +1035,10 @@ def test_api_running_guard_and_delete_status_codes():
     assert client.delete("/jobs/retention-api-missing").status_code == 404
 
 
-@pytest.mark.parametrize('keep_media', [False, True])
-def test_closed_progressive_exact_duplicates_require_whole_job_proof(tmp_path, monkeypatch, keep_media):
+@pytest.mark.parametrize("mode", ["no-media", "rans-images", "urans-images", "urans-foreign-method", "urans-foreign-solver"])
+def test_closed_progressive_exact_duplicates_require_whole_job_proof(tmp_path, monkeypatch, mode):
+    keep_media = mode != "no-media"
+    urans = mode.startswith("urans-")
     from datetime import datetime, timezone
     import runpy
     peer = runpy.run_path(str(Path(__file__).resolve().parents[1] / "scripts/deploy/hz-closed-job-engine.py"))
@@ -1058,6 +1060,26 @@ def test_closed_progressive_exact_duplicates_require_whole_job_proof(tmp_path, m
     members.append({"path": "time_directories/1/p", "byteSize": len(mismatch.read_bytes()), "sha256": sha(b"other")})
     members.append({"path": "openfoam/postProcessing/forceCoeffs/0/coefficient.dat", "byteSize": len(archived), "sha256": sha(archived)})
     members.append({"path": "openfoam/mesh_evidence/log.blockMesh", "byteSize": 3, "sha256": sha(b"log")})
+    duplicates = [copies[0], force]
+    protected = {}
+    if urans:
+        for rel, item, deletable in (
+            ("log.pimpleFoam", "openfoam/logs/transient_a0/log.pimpleFoam", True),
+            ("1/uniform/time", "time_directories/1/uniform/time", False),
+            ("1/core.123", "time_directories/1/core.123", False),
+            ("1/excluded", "time_directories/1/excluded", False),
+            ("processor0/1/U", None, False),
+            ("VTK/transient_a0_302766/internal.vtu", None, False),
+        ):
+            source = _write(post / rel, rel.encode())
+            if item:
+                members.append({"path": item, "byteSize": len(rel), "sha256": sha(rel.encode())})
+            if deletable:
+                duplicates.append(source)
+            else:
+                protected[source] = source.read_bytes()
+        link = post / "processor0/1/uniform"
+        link.symlink_to("../../1/uniform", target_is_directory=True)
     proofs, points = [], []
     retained = {}
     for index in (0, 1):
@@ -1066,11 +1088,21 @@ def test_closed_progressive_exact_duplicates_require_whole_job_proof(tmp_path, m
         folder = root / directory
         original = case / f"a{index}/images/pressure.png"
         scaled = folder / "scaled_media/default_v1_zoom2/v8/pressure.png"
-        for picture, data in ((original, b"engine image"), (scaled, b"scaled image")) if keep_media else ():
+        has_images = keep_media and (not urans or index == 0)
+        pictures = [(original, b"engine image"), (scaled, b"scaled image")]
+        if urans:
+            pictures.append((folder / "scaled_media/default_v1_zoom2/v7/pressure.png", b"previous scale"))
+        for picture, data in pictures if has_images else ():
             _write(picture, data + str(index).encode())
             retained[picture] = picture.read_bytes()
-        native_images = {"pressure": f"a{index}/images/pressure.png"} if keep_media else {}
-        mf = _write_json(folder / "evidence_manifest.json", {"casePath": str(case), "postPath": str(post),
+        native_images = {"pressure": f"a{index}/images/pressure.png"} if has_images else {}
+        solver = case / f"transient_a{index}" if urans else post
+        if mode == "urans-foreign-solver" and index == 0:
+            solver = case / "transient_a1"
+        solver.mkdir(exist_ok=True)
+        mf = _write_json(folder / "evidence_manifest.json", {"casePath": str(case), "postPath": str(solver),
+                          "methodKey": "openfoam.urans" if urans and mode != "urans-foreign-method" else "openfoam.rans",
+                          "unsteady": urans and index == 1, "bundleExcludes": ["frames", "time_directories/1/excluded"],
                           "files": members if not index else [], "media": {"instantaneous": native_images}})
         mf_sha = sha(mf.read_bytes())
         upload = f"upload-{index}"
@@ -1093,9 +1125,12 @@ def test_closed_progressive_exact_duplicates_require_whole_job_proof(tmp_path, m
         proof["catalogSha256"] = sha("\n".join(catalog).encode())
         points.append({"case_slug": "foil", "evidence_artifacts": artifacts})
         if keep_media:
-            proof["keepMedia"] = [{"path": scaled.relative_to(root).as_posix(), "sha256": sha(retained[scaled]),
-                                   "byteSize": len(retained[scaled]), "field": "pressure"}]
-            points[-1]["images"] = {"pressure": "/jobs/" + job + "/files/" + original.relative_to(root).as_posix()}
+            if urans:
+                proof["regime"] = "urans"
+            registered = original if urans else scaled
+            proof["keepMedia"] = [{"path": registered.relative_to(root).as_posix(), "sha256": sha(retained[registered]),
+                                   "byteSize": len(retained[registered]), "field": "pressure"}] if has_images else []
+            points[-1]["images"] = {"pressure": "/jobs/" + job + "/files/" + original.relative_to(root).as_posix()} if has_images else {}
         proofs.append(proof)
     _write_json(root / "result.json", {"job_id": job, "state": "completed", "polars": [{"points": points}]})
     status = _write_json(root / "status.json", {"job_id": job, "state": "completed"})
@@ -1119,6 +1154,10 @@ def test_closed_progressive_exact_duplicates_require_whole_job_proof(tmp_path, m
             request(*args, **kwargs)
         return str(caught.value)
 
+    if mode in {"urans-foreign-method", "urans-foreign-solver"}:
+        assert "does not own this transient solver" in refused()
+        assert all(path.exists() for path in duplicates)
+        return
     with pytest.raises(ValueError, match="authentication refused"):
         request(token="wrong")
     with pytest.raises(ValueError, match="execution locks differ"):
@@ -1140,6 +1179,24 @@ def test_closed_progressive_exact_duplicates_require_whole_job_proof(tmp_path, m
         mesh.mkdir(parents=True)
         (case / "constant").mkdir()
         (case / "constant/polyMesh").symlink_to(mesh, target_is_directory=True)
+    if urans:
+        link.unlink()
+        link.symlink_to("../../2", target_is_directory=True)
+        assert "symlink" in refused()
+        link.unlink()
+        link.symlink_to("../../1/uniform", target_is_directory=True)
+        foreign_vtk = post / "VTK/transient_a1_302766"
+        foreign_vtk.mkdir()
+        assert "unarchived case state" in refused()
+        foreign_vtk.rmdir()
+        intruder = _write(case / "a0/evidence/scaled_media/default_v1_zoom2/v7/unknown.png", b"foreign image")
+        assert "unknown scaled-media field" in refused()
+        intruder.unlink()
+        points[1].pop("images")
+        _write_json(root / "result.json", {"job_id": job, "state": "completed", "polars": [{"points": points}]})
+        assert "no instantaneous image inventory" in refused()
+        points[1]["images"] = {}
+        _write_json(root / "result.json", {"job_id": job, "state": "completed", "polars": [{"points": points}]})
     refused(proofs[:1])
     refused([proofs[0], {**proofs[1], "catalogSha256": "0" * 64}])
     stored_result = json.loads((root / "result.json").read_bytes())
@@ -1154,11 +1211,13 @@ def test_closed_progressive_exact_duplicates_require_whole_job_proof(tmp_path, m
     assert "outside authenticated bundle" in declared_frame
     _write_json(root / "result.json", {"job_id": job, "state": "completed", "polars": [{"points": points}]})
     plan = request()
-    assert plan["state"] == "planned" and plan["bytes"] == 2 * len(archived) and plan["files"] == 2
+    assert plan["state"] == "planned" and plan["files"] == len(duplicates)
+    assert plan["bytes"] == sum(p.stat().st_size for p in duplicates)
     assert all(p.is_file() for p in copies)
     if keep_media:
-        assert len(plan["mediaFiles"]) == 4 and len(plan["workingPaths"]) == 2
-        assert plan["plannedAllocatedBytes"] == sum(p.stat().st_blocks * 512 for p in (copies[0],force))
+        assert {f["path"] for f in plan["mediaFiles"]} == {p.relative_to(root).as_posix() for p in retained}
+        assert set(plan["workingPaths"]) == {p.relative_to(root).as_posix() for p in duplicates}
+        assert plan["plannedAllocatedBytes"] == sum(p.stat().st_blocks * 512 for p in duplicates)
         image = next(iter(retained))
         image.write_bytes(b"changed original image")
         refused(plan=plan["plan"])
@@ -1173,6 +1232,8 @@ def test_closed_progressive_exact_duplicates_require_whole_job_proof(tmp_path, m
         refused(plan=plan["plan"])
         assert blocker.is_file() and copies[0].is_file()
         blocker.unlink()
+        if urans and rel.endswith("a1/images/unregistered.png"):
+            blocker.parent.rmdir()
         if rel.endswith("a2/evidence/evidence_manifest.json"):
             blocker.parent.rmdir()
     _write_json(status, {"job_id": job, "state": "running"})
@@ -1212,6 +1273,10 @@ def test_closed_progressive_exact_duplicates_require_whole_job_proof(tmp_path, m
     if keep_media:
         assert all(p.read_bytes()==data for p,data in retained.items())
         assert (case / "constant/polyMesh").is_symlink()
+    if urans:
+        assert not (post / "log.pimpleFoam").exists()
+        assert all(p.read_bytes() == data for p, data in protected.items())
+        assert link.is_symlink() and (link / "time").read_bytes() == b"1/uniform/time"
     _write(copies[0], archived)
     refused(plan=plan["plan"])
     assert copies[0].is_file()
