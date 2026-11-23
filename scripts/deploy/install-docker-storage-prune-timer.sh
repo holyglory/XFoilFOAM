@@ -25,7 +25,7 @@ install -D -m 0644 \
   "$SCRIPT_DIR/airfoils-docker-storage-prune.timer" \
   "$SYSTEMD_DIR/airfoils-docker-storage-prune.timer"
 
-"$SCRIPT_DIR/install-solver-core-maintenance.sh"
+SBIN_DIR="$SBIN_DIR" SYSTEMD_DIR="$SYSTEMD_DIR" bash "$SCRIPT_DIR/install-solver-core-maintenance.sh"
 
 systemd-analyze verify \
   "$SYSTEMD_DIR/airfoils-docker-storage-prune.service" \

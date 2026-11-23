@@ -471,3 +471,37 @@ def test_preexisting_native_reader_holds_the_job_even_for_a_different_file(core_
         assert j in observed(volume,{j},{(row['dev'],row['ino']):j})
         assert process("release",observed)[0]["state"]=="held"
     finally:child.terminate();child.wait(timeout=4)
+
+
+@pytest.mark.parametrize("explicit_lib", [False, True])
+def test_real_top_level_installer_installs_and_validates_the_solver_core_dropin(tmp_path, explicit_lib):
+    from shutil import which
+
+    units=tmp_path/"units";sbin=tmp_path/"prefix"/"sbin"
+    lib=tmp_path/"private library" if explicit_lib else tmp_path/"prefix"/"lib"/"airfoils-pro"/"solver-core"
+    localbin=tmp_path/"commands";localbin.mkdir()
+    # Exercise the actual installer and actual systemd parser without contacting
+    # the host manager. Every install destination is inside this fixture.
+    for cmd,body in {"id":"printf '0\\n'", "systemctl":'printf "%s\\n" "$*" >> "$FIXTURE_CTL_LOG"'}.items():
+        tool=localbin/cmd;tool.write_text("#!/bin/sh\n"+body+"\n");tool.chmod(0o755)
+    units.mkdir()
+    # The real systemd parser must resolve the dependency in the isolated unit load path.
+    (units/"docker.service").write_text("[Service]\nExecStart=/bin/true\n")
+    env=os.environ|{"PATH":str(localbin)+os.pathsep+os.environ["PATH"],"SBIN_DIR":str(sbin),"SYSTEMD_DIR":str(units),
+                    "SYSTEMD_UNIT_PATH":str(units)+":","RUN_INITIAL_CLEANUP":"0","FIXTURE_CTL_LOG":str(tmp_path/"ctl.log")}
+    env.pop("SOLVER_CORE_LIB_DIR",None)
+    if explicit_lib:env["SOLVER_CORE_LIB_DIR"]=str(lib)
+    # The parent service has a production absolute ExecStart. Override only
+    # that path for systemd-analyze on test hosts without the installed binary.
+    drop=units/"airfoils-docker-storage-prune.service.d";drop.mkdir()
+    (drop/"fixture-exec.conf").write_text(f'[Service]\nExecStart=\nExecStart="{sbin}/airfoils-docker-storage-prune"\n')
+    run=subprocess.run(["bash",str(ROOT/"scripts/deploy/install-docker-storage-prune-timer.sh")],
+                       cwd=ROOT,env=env,text=True,capture_output=True)
+    assert run.returncode==0,run.stderr
+    assert (drop/"solver-core-maintenance.conf").read_text()==f'[Service]\nExecStartPost="{lib}/solver_core_maintenance.py" auto\n'
+    helper=lib/"solver_core_maintenance.py"
+    assert os.access(helper,os.X_OK)
+    verify=subprocess.run([which("systemd-analyze"),"verify",str(units/"airfoils-docker-storage-prune.service"),
+                           str(units/"airfoils-docker-storage-prune.timer")],env=env,text=True,capture_output=True)
+    assert verify.returncode==0,verify.stderr
+    assert "enable --now airfoils-docker-storage-prune.timer" in (tmp_path/"ctl.log").read_text()
