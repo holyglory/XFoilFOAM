@@ -52,6 +52,20 @@ export function parseReportJson(
   text: string,
   rootFields?: Map<string, string>,
 ): ReportJson {
+  return parseWithResultSpan(text, rootFields);
+}
+
+// Offsets use UTF-16 code units, as does the immutable on-disk delta format.
+// Only the internal text-only reader can supply a previously validated span.
+interface ResultSpan { start: number; end: number; value: ReportJson }
+interface ResultTracking {
+  envelope?: boolean;
+  reportStart?: number;
+  reused?: ResultSpan;
+  found?: ResultSpan;
+}
+
+function parseWithResultSpan(text: string, rootFields?: Map<string, string>, tracking?: ResultTracking): ReportJson {
   let at = 0;
   const space = () => {
     while (/[\x20\t\r\n]/.test(text[at] ?? "x")) at++;
@@ -68,7 +82,7 @@ export function parseReportJson(
     }
     return fail();
   };
-  const value = (root = false): ReportJson => {
+  const value = (root = false, reportRoot = false): ReportJson => {
     space();
     if (text[at] === '"') return string();
     if (text[at] === "{" || text[at] === "[") {
@@ -90,7 +104,20 @@ export function parseReportJson(
           if (text[at++] !== ":" || Object.hasOwn(entries, key)) fail();
           space();
           const start = at;
-          entries[key] = value();
+          const result = reportRoot && key === "result" && tracking;
+          const reused = result && result.reused;
+          if (reused && reused.start === start) {
+            // The delta copied this complete object/array token unchanged.
+            entries[key] = reused.value;
+            at = reused.end;
+          } else {
+            const report = root && tracking?.envelope === true && key === "report";
+            if (report) tracking.reportStart = start;
+            entries[key] = value(false, report);
+          }
+          const parsed = entries[key];
+          if (result && parsed !== null && typeof parsed === "object" && !(parsed instanceof ReportJsonNumber))
+            result.found = { start, end: at, value: parsed };
           if (root) rootFields?.set(key, text.slice(start, at));
         } else items.push(value());
         space();
@@ -116,7 +143,7 @@ export function parseReportJson(
     at += number[0].length;
     return new ReportJsonNumber(number[0]);
   };
-  const result = value(true);
+  const result = value(true, tracking !== undefined && !tracking.envelope);
   space();
   if (at !== text.length) fail();
   return result;
@@ -269,8 +296,10 @@ class BundleDecoder {
   constructor(
     private readonly requireProof = false,
     private readonly maxReportBytes = Number.MAX_SAFE_INTEGER,
+    private readonly reuseResult = false,
   ) {}
   private previousText: string | null = null;
+  private previousResult?: ResultSpan;
   private readonly keys = new Set<string>();
   private readonly signatures = new Set<string>();
   count = 0;
@@ -281,7 +310,8 @@ class BundleDecoder {
     // Root value spans preserve the text, including legacy rows whose report
     // was not last. Nested fields and quoted delimiters cannot confuse them.
     const fields = new Map<string, string>();
-    const object = reportJsonObject(parseReportJson(line, fields));
+    const outer: ResultTracking | undefined = this.reuseResult ? { envelope: true } : undefined;
+    const object = reportJsonObject(parseWithResultSpan(line, fields, outer));
     if (
       this.requireProof &&
       Object.hasOwn(object, "report") &&
@@ -309,6 +339,7 @@ class BundleDecoder {
     exactInteger(object.sequence, 1);
 
     let reportText: string;
+    let reused: ResultSpan | undefined;
     if (Object.hasOwn(object, "reportDelta")) {
       const delta = reportJsonObject(object.reportDelta!);
       const prefix = exactInteger(delta.prefix, 0);
@@ -326,6 +357,12 @@ class BundleDecoder {
         this.previousText.slice(0, prefix) +
         middle +
         (suffix ? this.previousText.slice(-suffix) : "");
+      const previous = this.previousResult;
+      if (previous && previous.end <= prefix) reused = previous;
+      else if (previous && previous.start >= this.previousText.length - suffix) {
+        const shift = reportText.length - this.previousText.length;
+        reused = { start: previous.start + shift, end: previous.end + shift, value: previous.value };
+      }
     } else {
       reportText = fields.get("report")!;
     }
@@ -333,10 +370,11 @@ class BundleDecoder {
       throw new Error(
         "Progressive report archive member exceeds its decoded report limit",
       );
+    const inner: ResultTracking | undefined = this.reuseResult ? { reused } : undefined;
     const report = reportJsonObject(
       Object.hasOwn(object, "report")
         ? object.report!
-        : parseReportJson(reportText),
+        : parseWithResultSpan(reportText, undefined, inner),
     );
     const proof = reportTextIdentity(reportText);
     const hasProof =
@@ -361,6 +399,10 @@ class BundleDecoder {
     this.keys.add(key);
     this.signatures.add(signature);
     this.previousText = reportText;
+    if (outer?.found && outer.reportStart !== undefined) {
+      const { start, end, value } = outer.found;
+      this.previousResult = { start: start - outer.reportStart, end: end - outer.reportStart, value };
+    } else this.previousResult = inner?.found;
     this.count++;
     this.firstSequence = Math.min(
       this.firstSequence,
@@ -398,6 +440,7 @@ async function consumeBundle(
   ) => void | Promise<void>,
   limits: ProgressiveReportArchiveLimits = {},
   signal?: AbortSignal,
+  reuseResult = false,
 ): Promise<void> {
   try {
     signal?.throwIfAborted();
@@ -415,7 +458,7 @@ async function consumeBundle(
   const hash = createHash("sha256");
   let size = 0;
   let crc = 0xffffffff;
-  const decoder = new BundleDecoder(false, limits.maxReportBytes);
+  const decoder = new BundleDecoder(false, limits.maxReportBytes, reuseResult);
   const utf8 = new TextDecoder("utf-8", { fatal: true });
   // A physical result can occupy one multi-megabyte JSONL line. Inspect each
   // decoded chunk once and join its pieces only when the line is complete.
@@ -583,7 +626,7 @@ export async function readProgressiveReportArchiveText(
         );
       found = entry.reportText;
     }
-  }, {}, signal);
+  }, {}, signal, true);
   if (found === null)
     throw new Error("Progressive report archive member was not found");
   return found;
