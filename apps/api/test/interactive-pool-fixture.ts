@@ -145,8 +145,8 @@ export async function verifyInteractivePool(input: {
             ON c.pid=ANY(pg_blocking_pids(a.pid)) WHERE a.datname=current_database())
           SELECT a.pid,a.application_name FROM pg_stat_activity a JOIN chain USING(pid)
           WHERE a.pid<>pg_backend_pid() AND a.wait_event_type='Lock'
-            AND a.backend_type='client backend' AND a.application_name='xfoilfoam-api-sync'
-            AND a.datname=current_database() AND a.usename=current_user
+            AND a.application_name='xfoilfoam-api-sync'
+            AND a.query ILIKE '%progressive_remote_dispatches%' AND a.query ILIKE '%FOR UPDATE%'
           ORDER BY a.pid`;
       };
       writers = Array.from({ length: reportRequests }, () =>

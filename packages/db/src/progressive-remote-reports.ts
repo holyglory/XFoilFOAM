@@ -23,6 +23,78 @@ interface RemoteReportInput {
   report: unknown;
 }
 
+type RunningPredecessor = {
+  sequence: number;
+  completedCases: number;
+  signature: string;
+  tupleVersion: string;
+};
+
+/** Check a nonfinal predecessor outside the lock. Reading the normalized payload
+ * header is permitted only after the indexed FK lookup. The legacy row form
+ * also works on inline-only storage. Neither path returns any prior samples. */
+export async function prepareRunningReportOrder(
+  db: DB,
+  envelope: ProgressiveRemoteExecutionEnvelope,
+  sequence: number,
+): Promise<RunningPredecessor | null> {
+  if (sequence < 1) return null;
+  const [prior] = await db.execute<RunningPredecessor>(sql`
+    WITH prior AS MATERIALIZED (
+      SELECT r.sequence,r.content_signature AS signature,
+        concat_ws(':',r.tableoid,r.xmin,r.ctid) AS version,to_jsonb(r.*) AS stored
+      FROM progressive_remote_reports r
+      WHERE r.sim_job_id=${envelope.scope.executionId}::uuid AND r.sequence=${sequence}
+    ), candidate AS MATERIALIZED (
+      SELECT sequence,signature,version,stored->>'result_payload_hash' AS hash,stored#>'{report,result}' AS result,
+        CASE WHEN jsonb_typeof(stored#>'{report,status,completed_cases}')='number'
+          THEN (stored#>>'{report,status,completed_cases}')::numeric END AS done
+      FROM prior WHERE stored->>'archived_at' IS NULL AND stored->>'archive_bundle_id' IS NULL
+        AND NOT ((stored->'report') ? 'archivedReport')
+        AND stored->'report' @> jsonb_build_object('version',1,'executionId',${envelope.scope.executionId}::text,
+          'solverId',${envelope.solverId}::text,'promiseId',${envelope.promiseId}::text,
+          'assignmentSignature',${envelope.contentSignature}::text,'sequence',sequence,'stopProof',NULL,
+          'status',jsonb_build_object('job_id',${envelope.scope.executionId}::text,'state','running','total_cases',${envelope.scope.units.length}::integer))
+    )
+    SELECT sequence::double precision,done::double precision AS "completedCases",signature,version AS "tupleVersion"
+    FROM candidate c LEFT JOIN LATERAL (
+      SELECT p.result FROM public.progressive_report_result_payloads p WHERE p.content_hash=c.hash LIMIT 1
+    ) body ON true
+    WHERE done BETWEEN 0 AND ${envelope.scope.units.length}::integer AND done=trunc(done)
+      AND CASE WHEN c.hash IS NULL THEN c.result='null'::jsonb OR c.result @>
+        jsonb_build_object('state','running','job_id',${envelope.scope.executionId}::text,'polars','[]'::jsonb)
+      ELSE c.result='{"state":"running"}'::jsonb AND body.result @>
+        jsonb_build_object('state','running','job_id',${envelope.scope.executionId}::text,'polars','[]'::jsonb) END
+  `);
+  return prior ?? null;
+}
+
+/** Compare the actual latest heap tuple after acquiring dispatch ownership.
+ * An UPDATE (including storage-only compaction) changes the tuple version.
+ * A different row takes the existing signature-pinned full read outside SQL locks. */
+export async function readLatestReportForOrder(
+  db: DB,
+  executionId: string,
+  prepared: RunningPredecessor | null,
+) {
+  const [row] = await db.execute<{
+    sequence: string;
+    running: boolean;
+    content_signature: string | null;
+  }>(sql`
+    WITH latest AS MATERIALIZED (
+      SELECT r.sequence,r.content_signature,${
+        prepared
+          ? sql`
+        r.sequence=${prepared.sequence} AND r.content_signature=${prepared.signature} AND
+        concat_ws(':',r.tableoid,r.xmin,r.ctid)=${prepared.tupleVersion}`
+          : sql`false`
+      } AS running
+      FROM progressive_remote_reports r WHERE r.sim_job_id=${executionId}::uuid ORDER BY r.sequence DESC LIMIT 1
+    ) SELECT sequence,running,CASE WHEN NOT running THEN content_signature END AS content_signature FROM latest`);
+  return row;
+}
+
 export async function storeProgressiveRemoteReport(
   db: DB,
   input: RemoteReportInput,
@@ -37,12 +109,10 @@ export async function storeProgressiveRemoteReport(
     throw new ProgressiveRemoteReportConflict(
       "Remote report sender does not own the immutable dispatch",
     );
+  const envelope = dispatch.envelope as ProgressiveRemoteExecutionEnvelope;
   let publication: ReturnType<typeof prepareProgressiveReportPublication>;
   try {
-    publication = prepareProgressiveReportPublication(
-      input.report,
-      dispatch.envelope as ProgressiveRemoteExecutionEnvelope,
-    );
+    publication = prepareProgressiveReportPublication(input.report, envelope);
   } catch (error) {
     throw new ProgressiveRemoteReportConflict(
       error instanceof Error
@@ -92,6 +162,11 @@ export async function storeProgressiveRemoteReport(
   let previous:
     | { sequence: number; signature: string; full: ProgressiveRemoteReport }
     | undefined;
+  const running = await prepareRunningReportOrder(
+    db,
+    envelope,
+    report.sequence - 1,
+  );
   const encoded = JSON.stringify(report);
   for (;;) {
     const outcome = await db.transaction(async (transaction) => {
@@ -105,23 +180,18 @@ export async function storeProgressiveRemoteReport(
       const duplicate = await replay(connection, true);
       if (duplicate) return { receipt: duplicate };
 
-      const [latest] =
-        await connection.execute(sql`SELECT r.sequence,r.content_signature,
-        r.report @> jsonb_build_object('version',1,'executionId',r.sim_job_id,'sequence',r.sequence,'solverId',${input.solverId}::uuid,
-          'promiseId',${input.promiseId}::uuid,'assignmentSignature',${dispatch.content_signature}::text,'stopProof',NULL) AS open,
-        r.report#>'{status,completed_cases}' AS completed
-        FROM progressive_remote_reports r WHERE r.sim_job_id=${input.executionId}::uuid ORDER BY r.sequence DESC LIMIT 1`);
+      const latest = await readLatestReportForOrder(
+        connection,
+        input.executionId,
+        running,
+      );
       try {
         if (!latest) validateProgressiveRemoteReportOrder(report, null);
-        else if (
-          latest.open === true &&
-          Number.isSafeInteger(latest.completed) &&
-          Number(latest.completed) >= 0
-        )
+        else if (running && latest.running)
           validateProgressiveReportProgress(
             report,
-            Number(latest.sequence),
-            Number(latest.completed),
+            running.sequence,
+            running.completedCases,
           );
         else {
           if (report.sequence !== Number(latest.sequence) + 1)
