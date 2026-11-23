@@ -11,20 +11,47 @@ export async function readRegisteredArchive(
     const response = await fetch(url, {
       redirect: "error",
       signal,
-      headers: { accept, "accept-encoding": "identity", "x-xfoilfoam-solver-token": token },
+      headers: {
+        accept,
+        "accept-encoding": "identity",
+        "x-xfoilfoam-solver-token": token,
+      },
     });
-    if (response.status !== 503 || attempt >= 3 ||
-        response.headers.get("content-type")?.split(";")[0] !== "application/json")
+    if (
+      response.status !== 503 ||
+      attempt >= 3 ||
+      response.headers.get("content-type")?.split(";")[0] !== "application/json"
+    )
       return response;
     const bytes = Number(response.headers.get("content-length"));
     const seconds = Number(response.headers.get("retry-after"));
-    if (!Number.isSafeInteger(bytes) || bytes <= 0 || bytes > 1024 ||
-        !Number.isSafeInteger(seconds) || seconds <= 0 || seconds > 60)
+    if (
+      !Number.isSafeInteger(bytes) ||
+      bytes <= 0 ||
+      bytes > 1024 ||
+      !Number.isSafeInteger(seconds) ||
+      seconds <= 0 ||
+      seconds > 60
+    )
       return response;
-    const busy = await response.clone().json().catch(() => null);
-    if (busy?.code !== "sync_capacity_busy" || busy.retryAfterMs !== seconds * 1000)
+    const retryAfterMs = seconds * 1000;
+    const busy: unknown = await response
+      .clone()
+      .json()
+      .catch(() => null);
+    if (
+      typeof busy !== "object" ||
+      busy === null ||
+      !("code" in busy) ||
+      busy.code !== "sync_capacity_busy" ||
+      !("retryAfterMs" in busy) ||
+      typeof busy.retryAfterMs !== "number" ||
+      busy.retryAfterMs !== retryAfterMs
+    )
       return response;
     await response.body?.cancel();
-    await delay(Math.max(busy.retryAfterMs, 1000 * 2 ** attempt), undefined, { signal });
+    await delay(Math.max(retryAfterMs, 1000 * 2 ** attempt), undefined, {
+      signal,
+    });
   }
 }
