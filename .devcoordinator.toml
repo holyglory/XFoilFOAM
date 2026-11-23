@@ -6028,3 +6028,22 @@ name = "engine-retention"
 tier = "development"
 timeout_seconds = 300
 command = ["/bin/bash", "-c", "export PYTHONPATH=$PWD/src; exec /home/holyglory/XFoilFOAM/.venv/bin/python -m pytest tests/test_retention.py -q"]
+
+[test.hz-cache-parking]
+timeout_seconds = 900
+
+[[test.hz-cache-parking.check]]
+name = "mesh-parking-roundtrip"
+tier = "development"
+command = ["/home/holyglory/.local/bin/uv", "run", "--frozen", "--extra", "dev", "-m", "pytest", "tests/test_cache.py", "-q"]
+
+[test.hz-cache-parking.postgres]
+image = "postgres:16-alpine"
+database = "aerodb"
+user = "aerodb"
+
+[[test.hz-cache-parking.check]]
+name = "postgres-replacement-sizing"
+tier = "development"
+case_command = ["/bin/bash", "-c", "exec psql \"$DATABASE_URL\" -Xq -v ON_ERROR_STOP=1 -f tests/fixtures/hz_cache_index_packing.sql"]
+cases = [{ id = "disposable-index-and-rewrite", args = [], postgres = "default" }]
