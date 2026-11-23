@@ -11,7 +11,7 @@ LOCK_FILE="${LOCK_FILE:-/tmp/airfoils-pro-deploy.lock}"
 operation="${1:-status}"
 case "$operation" in
   status|verify) [[ $# -le 1 ]] || exit 2 ;;
-  backfill) [[ $# -ge 2 && $# -le 3 ]] || { echo "backfill requires the worker instance UUID and accepts one page size." >&2; exit 2; } ;;
+  backfill) [[ $# -ge 2 && $# -le 4 ]] || { echo "backfill requires the worker instance UUID and accepts a page size and bounded page count." >&2; exit 2; } ;;
   start|stop|enable|disable|restore) [[ $# == 2 ]] || { echo "$operation requires the worker instance UUID." >&2; exit 2; } ;;
   retire) [[ $# == 3 && "$3" =~ ^[0-9a-f]{40}$ ]] || { echo "retire requires the worker instance UUID and exact serving commit." >&2; exit 2; } ;;
   *) echo "Expected status, start, backfill, verify, enable, retire, restore, disable or stop." >&2; exit 2 ;;
@@ -53,4 +53,27 @@ if [[ "$operation" == retire ]]; then
     done <<<"$ids"
   done
 fi
-"${compose[@]}" exec -T -w /app sweeper node --import tsx packages/db/src/worker-staging-key-maintenance.ts "$@"
+operator=(-w /app sweeper node --import tsx packages/db/src/worker-staging-key-maintenance.ts)
+if [[ "$operation" == backfill && $# == 4 ]]; then
+  # Closing this pipe asks the in-container operator to finish its current
+  # transaction. This also works when Compose doesn't forward a host signal.
+  stopping=false
+  input_fd=
+  stop_batch() {
+    stopping=true
+    if [[ -n "$input_fd" ]]; then exec {input_fd}>&-; input_fd=; fi
+  }
+  trap stop_batch HUP INT TERM
+  exec 3>&1
+  coproc BATCH { exec "${compose[@]}" exec -T -e STAGING_KEY_PARENT_PIPE=1 "${operator[@]}" "$@" >&3; }
+  batch_pid=$!
+  input_fd="${BATCH[1]:-}"
+  exec 3>&-
+  if [[ "$stopping" == true ]]; then stop_batch; fi
+  while true; do
+    rc=0
+    wait "$batch_pid" || rc=$?
+    if ((rc < 128)) || ! kill -0 "$batch_pid" 2>/dev/null; then exit "$rc"; fi
+  done
+fi
+exec "${compose[@]}" exec -T "${operator[@]}" "$@"
