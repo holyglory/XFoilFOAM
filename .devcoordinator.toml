@@ -6061,6 +6061,14 @@ cases = [{ id = "disposable-index-and-rewrite", args = [], postgres = "default" 
 [test.catalog-web-delivery]
 timeout_seconds = 300
 
+[test.campaign-evidence-delivery]
+timeout_seconds = 160
+[[test.campaign-evidence-delivery.check]]
+name = "handoff"
+tier = "release"
+command = ["node", "scripts/dev/verify-campaign-evidence-delivery.mjs"]
+retained_artifacts = [{name="campaign-selected-evidence",path=".codex-artifacts/campaign-evidence-delivery",max_bytes=16777216}]
+
 [test.campaign-attempt-design-audit]
 timeout_seconds = 100
 
