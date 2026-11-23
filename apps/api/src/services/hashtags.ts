@@ -1,5 +1,5 @@
 import type { HashtagDTO } from "@aerodb/core";
-import { airfoilHashtags, hashtags } from "@aerodb/db";
+import { airfoilHashtags, hashtags, type DB } from "@aerodb/db";
 import { asc, eq, inArray } from "drizzle-orm";
 
 import { db } from "../db";
@@ -46,10 +46,10 @@ export async function syncAirfoilHashtagNames(airfoilId: string, names: string[]
   return rows;
 }
 
-export async function hashtagsByAirfoilIds(ids: string[]): Promise<Map<string, HashtagDTO[]>> {
+export async function hashtagsByAirfoilIds(ids: string[], connection: DB = db): Promise<Map<string, HashtagDTO[]>> {
   const map = new Map<string, HashtagDTO[]>();
   if (ids.length === 0) return map;
-  const rows = await db
+  const rows = await connection
     .select({
       airfoilId: airfoilHashtags.airfoilId,
       id: hashtags.id,
