@@ -1085,8 +1085,10 @@ test.describe
       ),
     );
     await expect
-      .poll(() => page.evaluate(() => document.body.style.position))
-      .toBe("fixed");
+      .poll(() => page.evaluate(() => document.documentElement.style.overflow))
+      .toBe("hidden");
+    await expect.poll(() => page.evaluate(() => window.scrollY)).toBe(originalScrollY);
+    expect(await panel.evaluate((element) => element.matches(":modal"))).toBe(true);
     await expect
       .poll(() =>
         panel.evaluate(
@@ -1580,8 +1582,8 @@ test.describe
         ),
       )
       .toBe(true);
-    expect(await page.evaluate(() => document.body.style.position)).toBe(
-      "fixed",
+    expect(await page.evaluate(() => document.documentElement.style.overflow)).toBe(
+      "hidden",
     );
 
     const simFocusable = simDialog.locator(
@@ -1604,8 +1606,8 @@ test.describe
         panel.evaluate((element) => element.contains(document.activeElement)),
       )
       .toBe(true);
-    expect(await page.evaluate(() => document.body.style.position)).toBe(
-      "fixed",
+    expect(await page.evaluate(() => document.documentElement.style.overflow)).toBe(
+      "hidden",
     );
 
     await page.keyboard.press("Escape");
@@ -1614,7 +1616,7 @@ test.describe
     await expect
       .poll(() => page.evaluate(() => window.scrollY))
       .toBe(originalScrollY);
-    expect(await page.evaluate(() => document.body.style.position)).toBe("");
+    expect(await page.evaluate(() => document.documentElement.style.overflow)).toBe("");
     await page.waitForTimeout(100);
     const requestsAfterClose = solverFlowRequestCount;
     await page.waitForTimeout(2_300);

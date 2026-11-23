@@ -106,6 +106,15 @@ body {
 html {
   scroll-padding-top: 60px;
 }
+.campaign-detail,
+.campaign-evidence-drawer {
+  --aero-dim: var(--aero-muted);
+  --aero-dimmest: var(--aero-muted);
+  --aero-red-text: var(--aero-red);
+}
+[data-theme="light"] .simulation-evidence-dialog {
+  --aero-violet: #6345b3;
+}
 .catalog-page-shell {
   --aero-dim: var(--aero-muted);
   display: grid;

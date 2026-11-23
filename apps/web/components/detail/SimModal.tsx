@@ -2380,6 +2380,7 @@ export function SimModal(props: {
       `}</style>
       <dialog
         ref={dialogRef}
+        className="simulation-evidence-dialog"
         data-testid="sim-modal-dialog"
         role="dialog"
         aria-modal="true"

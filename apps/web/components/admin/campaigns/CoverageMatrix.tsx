@@ -295,7 +295,7 @@ export function CoverageMatrix({
   }, []);
 
   // ---- segmented-bar geometry (mockup grid: name | done | flex bar) ----
-  const nameCol = rootWidth >= 720 ? 220 : 170;
+  const nameCol = rootWidth >= 720 ? 220 : Math.min(170, Math.max(74, Math.floor(rootWidth * 0.29)));
   const barWidth = Math.max(
     0,
     rootWidth - 2 * ROW_PAD_X - nameCol - FRAC_COL - PROG_COL - 3 * COL_GAP,

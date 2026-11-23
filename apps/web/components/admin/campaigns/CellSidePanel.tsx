@@ -50,6 +50,7 @@ import {
   initialSeriesVisibility,
   toggleSeriesVisibility,
 } from "@/lib/polar-series";
+import { createPortal } from "react-dom";
 import { C, MONO } from "@/lib/tokens";
 import { useModalLayer } from "@/lib/use-modal-layer";
 import { AirfoilGlyph } from "../../AirfoilGlyph";
@@ -155,49 +156,30 @@ export function CellSidePanel({
   const [simField, setSimField] = useState<FieldId>("vorticity");
   const [simTrack, setSimTrack] = useState<FieldTrackPoint[]>([]);
   const [playing, setPlaying] = useState(true);
-  const panelRef = useRef<HTMLElement>(null);
+  const panelRef = useRef<HTMLDialogElement>(null);
   const closeButtonRef = useRef<HTMLButtonElement>(null);
   const restoreFocusRef = useRef<HTMLElement | null>(null);
   const simTriggerRef = useRef<HTMLElement | null>(null);
 
-  useModalLayer(true);
+  useModalLayer(true, { fixedBody: false });
 
   useEffect(() => {
     restoreFocusRef.current =
       document.activeElement instanceof HTMLElement
         ? document.activeElement
         : null;
+    const dialog = panelRef.current;
+    if (dialog && !dialog.open) dialog.showModal();
     const frame = requestAnimationFrame(() => {
       closeButtonRef.current?.focus({ preventScroll: true });
     });
     return () => {
       cancelAnimationFrame(frame);
+      if (dialog?.open) dialog.close();
       const trigger = restoreFocusRef.current;
       if (trigger?.isConnected) trigger.focus({ preventScroll: true });
     };
   }, []);
-
-  // A stacked evidence modal owns Escape while it is present. Otherwise this
-  // panel closes before any page-level Escape handler can race it.
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key !== "Escape") return;
-      // An unrelated modal stacked above this panel owns its own Escape.
-      if (
-        Array.from(
-          document.querySelectorAll<HTMLElement>(
-            '[role="dialog"][aria-modal="true"]',
-          ),
-        ).some((dialog) => dialog !== panelRef.current)
-      )
-        return;
-      e.preventDefault();
-      e.stopPropagation();
-      onClose();
-    };
-    document.addEventListener("keydown", onKey, true);
-    return () => document.removeEventListener("keydown", onKey, true);
-  }, [onClose]);
 
   const trapPanelFocus = (event: ReactKeyboardEvent<HTMLElement>) => {
     if (event.key !== "Tab" || simOpen) return;
@@ -587,20 +569,12 @@ export function CellSidePanel({
       (request.state === "pending" || request.state === "running"),
   );
 
-  return (
+  if (typeof document === "undefined") return null;
+  return createPortal(
     <>
-      <div
-        data-testid="cell-side-panel-backdrop"
-        style={{
-          position: "fixed",
-          inset: 0,
-          zIndex: 44,
-          touchAction: "none",
-        }}
-        onClick={onClose}
-        aria-hidden
-      />
-      <aside
+      <style>{".campaign-evidence-drawer::backdrop { background: transparent; touch-action: none; }"}</style>
+      <dialog
+        className="campaign-evidence-drawer"
         ref={panelRef}
         data-testid="cell-side-panel"
         role="dialog"
@@ -609,14 +583,30 @@ export function CellSidePanel({
         aria-hidden={simOpen ? "true" : undefined}
         inert={simOpen}
         tabIndex={-1}
+        onCancel={(event) => {
+          event.preventDefault();
+          onClose();
+        }}
+        onClick={(event) => {
+          if (event.target !== event.currentTarget) return;
+          const bounds = event.currentTarget.getBoundingClientRect();
+          if (event.clientX < bounds.left || event.clientX >= bounds.right ||
+              event.clientY < bounds.top || event.clientY >= bounds.bottom) onClose();
+        }}
         onKeyDown={trapPanelFocus}
         style={{
           position: "fixed",
           top: 0,
           right: 0,
+          left: "auto",
           bottom: 0,
           zIndex: 45,
+          margin: 0,
+          padding: 0,
+          border: 0,
+          color: C.text,
           width: "min(780px, 100vw)",
+          maxWidth: "100vw",
           height: "100dvh",
           maxHeight: "100dvh",
           minHeight: 0,
@@ -1001,7 +991,7 @@ export function CellSidePanel({
             </div>
           )}
         </div>
-      </aside>
+      </dialog>
 
       <SimModal
         open={simOpen}
@@ -1030,6 +1020,7 @@ export function CellSidePanel({
         restoreFocusTo={simTriggerRef.current}
         unavailableMessage={simMessage}
       />
-    </>
+    </>,
+    document.body,
   );
 }
