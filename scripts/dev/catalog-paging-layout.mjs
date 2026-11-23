@@ -32,7 +32,7 @@ export function catalogPagingLayout(origin, repoRoot, reviewInputs) {
         actions: [
           ...start,
           { action: "focus", selector: more },
-          { action: "press", selector: more, key: "Enter" },
+          { action: "press", selector: more, value: "Enter" },
         ],
         waitFor: { selector: row(450) },
         continuation: {
