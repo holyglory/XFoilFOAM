@@ -36,7 +36,7 @@ import { applyProgressiveRemoteProgress } from "../../sweeper/src/progressive-re
 import { archiveProgressiveReportBatch } from "../../sweeper/src/progressive-report-archive-service";
 import { ColdReportWitnesses } from "../../sweeper/src/cold-report-witnesses";
 import { CancelledReportScanCheckpoint } from "../../sweeper/src/cancelled-report-scan-checkpoint";
-import { copyStoppedReportBatch, offerNextStoppedCopyPage, stoppedReportCopyKeys } from "../../sweeper/src/shared-stopped-report-custody";
+import { copyStoppedReportBatch, offerNextStoppedCopyPage, offerStoppedReportCopyWindows, stoppedReportCopyKeys } from "../../sweeper/src/shared-stopped-report-custody";
 import { readSharedReport, SHARED_REPORT_FORMAT } from "../../sweeper/src/shared-report-archive";
 import { memoryReportObjects } from "../../sweeper/test/shared-report-object-fixture";
 import type { importPolarPush } from "../src/sync-routes";
@@ -206,6 +206,18 @@ export async function verifyCancelledReportCopyReplay(
   expect(chronological.after).toEqual((await nextCancelledReportCopies(db,cursor,true)).after);
   expect((await selectCancelledReportCopyPage(db, chronological.after, priority)).preferred?.executionId).toBe(id);
   const exact = new Map(preferred.keys.map(k=>[k.sequence,k.signature]));
+  const firstSourceWindow = await stoppedReportCopyKeys(db, id, 0, 1, true);
+  expect(firstSourceWindow.at(-1)!.sequence).toBeLessThanOrEqual(anchorSequence);
+  const signedWindows = new CancelledReportCopyPriority();
+  await offerStoppedReportCopyWindows(db, id, firstSourceWindow, null, signedWindows);
+  expect(signedWindows.take()).toBeUndefined();
+  await offerStoppedReportCopyWindows(db, id, firstSourceWindow, anchorSequence, signedWindows);
+  const later = await selectCancelledReportCopyPage(db, cursor, signedWindows);
+  expect(later.preferred?.keys).toEqual(ready);
+  expect(later.after).toEqual(cursor);
+  const intervening = await selectCancelledReportCopyPage(db, cursor, signedWindows);
+  expect(intervening.preferred).toBeUndefined();
+  expect(intervening.sequences).toEqual(page.sequences);
   const scanned=new Error("rollback metadata-only discovery window");
   await expect(db.transaction(async tx=>{
     const conn=tx as unknown as DB;

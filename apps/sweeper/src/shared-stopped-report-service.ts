@@ -6,6 +6,7 @@ import type { DB } from "@aerodb/db/client";
 import { cancelledReportOwner, type CancelledReportCopyPriority } from "./cancelled-report-copies";
 import {
   copyStoppedReportBatch,
+  offerStoppedReportCopyWindows,
   stoppedReportCopyKeys,
   type StoppedCopyReceipt,
 } from "./shared-stopped-report-custody";
@@ -33,12 +34,20 @@ async function ownerFrontier(db: DB, id: string) {
     await db.execute(sql`SELECT d.content_signature AS assignment,st.proof_signature AS stop,
     (SELECT max(sequence)::text FROM progressive_remote_reports r WHERE r.sim_job_id=job.id) AS last,
     (SELECT max(sequence)::text FROM progressive_remote_progress_receipts p WHERE p.sim_job_id=job.id) AS applied,
-    (SELECT count(*)::int FROM progressive_remote_evidence_receipts e WHERE e.sim_job_id=job.id) AS scientific,
-    (SELECT count(*)::int FROM progressive_remote_diagnostic_receipts e WHERE e.sim_job_id=job.id) AS diagnostic
+    receipts.scientific,
+    (SELECT count(*)::int FROM progressive_remote_diagnostic_receipts e WHERE e.sim_job_id=job.id) AS diagnostic,
+    receipts.latest
     FROM sim_jobs job JOIN progressive_remote_dispatches d ON d.sim_job_id=job.id JOIN sync_sweep_promises promise ON promise.id=d.promise_id
     JOIN progressive_cfd_execution_stops st ON st.sim_job_id=job.id AND st.engine_job_id=job.engine_job_id
+    CROSS JOIN LATERAL (SELECT count(*)::int AS scientific, max(e.sequence) AS latest
+      FROM progressive_remote_evidence_receipts e WHERE e.sim_job_id=job.id) receipts
     WHERE job.id=${id}::uuid AND ${cancelledReportOwner}`);
-  return o?.last ? sha256(JSON.stringify(o)) : null;
+  if (!o?.last) return null;
+  // The extra seek hint is outside the durable frontier hash used by existing cursors.
+  const { latest, ...facts } = o;
+  const sequence = Number(latest);
+  return { frontier: sha256(JSON.stringify(facts)),
+    latestReceipt: Number.isSafeInteger(sequence) && sequence > 0 && sequence < Number(o.last) ? sequence : null };
 }
 async function preserveReceipt(root: string, receipt: StoppedCopyReceipt) {
   const text = JSON.stringify(receipt),
@@ -61,8 +70,9 @@ export async function advanceSharedReportOwner(
 ) {
   if (!uuid.test(id) || !isAbsolute(dir))
     throw new Error("Invalid stopped report owner or receipt path");
-  const frontier = await ownerFrontier(db, id);
-  if (!frontier) return { complete: true, changed: 0 };
+  const owner = await ownerFrontier(db, id);
+  if (!owner) return { complete: true, changed: 0 };
+  const { frontier } = owner;
   const root = join(dir, id),
     cursorFile = join(root, "cursor.json");
   const prior = await read<Cursor>(cursorFile);
@@ -142,7 +152,7 @@ export async function advanceSharedReportOwner(
   const after = scientific ? (cursor.scientificAfter ?? 0) : cursor.after;
   const keys = await stoppedReportCopyKeys(db, id, after, 32, scientific);
   if (scientific && priority)
-    priority.offer(id, keys.filter((key) => key.mode === "ordinary"));
+    await offerStoppedReportCopyWindows(db, id, keys, owner.latestReceipt, priority);
   if (!keys.length) {
     if (scientific) {
       await write(cursorFile, {

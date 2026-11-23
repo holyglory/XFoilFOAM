@@ -167,6 +167,27 @@ export async function offerNextStoppedCopyPage(
   priority.offer(executionId, keys.filter(k => k.mode === "ordinary"));
 }
 
+/** A cumulative report can grow substantially after later points arrive.
+ * Offer at most one disjoint window after the owner's latest actual scientific
+ * receipt. Neither this seek nor its publication moves the shared scan cursor. */
+export async function offerStoppedReportCopyWindows(
+  db: DB,
+  executionId: string,
+  forward: Awaited<ReturnType<typeof stoppedReportCopyKeys>>,
+  latestReceipt: number | null,
+  priority: CancelledReportCopyPriority,
+) {
+  priority.offer(executionId, forward.filter(key => key.mode === "ordinary"));
+  const last = forward.at(-1);
+  if (!last || latestReceipt === null || latestReceipt < last.sequence) return;
+  try {
+    await offerNextStoppedCopyPage(db, executionId, latestReceipt + 1, priority);
+  } catch (error) {
+    console.warn("[sweeper] later stopped report window", executionId,
+      error instanceof Error ? error.message : String(error));
+  }
+}
+
 export async function copyStoppedReportBatch(
   db: DB,
   objects: ReportObjects,
