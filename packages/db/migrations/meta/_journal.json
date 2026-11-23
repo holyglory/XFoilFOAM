@@ -1576,6 +1576,13 @@
       "when": 1795363913055,
       "tag": "0224_hz_settled_attempt_receipts",
       "breakpoints": true
+    },
+    {
+      "idx": 225,
+      "version": "7",
+      "when": 1795363913056,
+      "tag": "0225_attempt_projection_sealing",
+      "breakpoints": true
     }
   ]
 }

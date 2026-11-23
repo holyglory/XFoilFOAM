@@ -32,6 +32,7 @@ import {
 } from "@aerodb/db/attempt-receipt-source";
 import {
   readApiAttemptEvidenceForApp,
+  readStoredAttemptEvidenceText,
   apiAttemptEvidenceReader,
 } from "../../api/src/attempt-evidence-reader";
 import { env } from "../../api/src/env";
@@ -78,6 +79,7 @@ describe("verified settled attempt history transition", () => {
 
   function dependencies(
     source: Awaited<ReturnType<typeof seedSettledHistory>>,
+    db = fixture.db,
   ) {
     vi.spyOn(apiAttemptEvidenceReader, "read").mockImplementation(
       (identity, signal) => source.store.read(identity, signal),
@@ -85,10 +87,10 @@ describe("verified settled attempt history transition", () => {
     return {
       store: source.store,
       readApp: vi.fn((request) =>
-        readApiAttemptEvidenceForApp(fixture.db, request),
+        readApiAttemptEvidenceForApp(db, request),
       ),
       verifyDependencies: createAttemptServerDependencyVerifier(
-        fixture.db,
+        db,
         source.store,
       ),
     };
@@ -441,6 +443,37 @@ describe("verified settled attempt history transition", () => {
       ),
     ).resolves.toMatchObject({ alreadyRestored: true });
   });
+
+  it("seals a multi-megabyte source in the same transaction and rolls its projection back on a stale proof", async () => {
+    const isolated = await createSettlementFixture(false, true);
+    const { db } = isolated;
+    try {
+      const source = await seedSettledHistory(db, { detailBytes: 4 * 1024 * 1024 });
+      const { attemptId, archive } = source;
+      const deps = dependencies(source, db);
+      await setAttemptEvidenceStoragePolicy(db, { enabled: true, consumerContractVersion: 1 });
+      await db.execute(sql`UPDATE attempt_evidence_storage_policy SET max_source_bytes=8388608 WHERE id=1`);
+      const [before] = await db.execute(sql`SELECT evidence_payload::text AS original FROM result_attempts WHERE id=${attemptId}::uuid`);
+      expect(archive.sourceByteSize).toBeGreaterThan(4 * 1024 * 1024);
+      const stale = { direct: { sourceByteSize: archive.sourceByteSize, verifiedAt: "2000-01-01T00:00:00Z" } } as AttemptEvidenceFreshVerification;
+      await expect(shortenAttemptEvidence(db, attemptId, archive.id, stale)).rejects.toThrow("proofs");
+      const [rolledBack] = await db.execute(sql`SELECT a.evidence_archive_id,a.evidence_payload::text AS original,
+        (SELECT count(*)::int FROM attempt_evidence_history_projections p WHERE p.result_attempt_id=a.id) AS projections,
+        (SELECT count(*)::int FROM attempt_evidence_storage_events e WHERE e.result_attempt_id=a.id) AS events
+        FROM result_attempts a WHERE a.id=${attemptId}::uuid`);
+      expect(rolledBack).toEqual({ evidence_archive_id: null, original: before.original, projections: 0, events: 0 });
+      const result = await settleAttemptEvidenceHistory(db, deps, { attemptId, archiveId: archive.id });
+      expect(result.netValueBytesReclaimed).toBeGreaterThan(1023);
+      const [committed] = await db.execute(sql`SELECT p.created_at < e.created_at AS sealed_first,e.completed,
+        e.app_readback_at IS NOT NULL AS normal_read, length(a.evidence_payload->>'diagnostic_detail') AS retained_detail
+        FROM result_attempts a JOIN attempt_evidence_storage_events e ON e.id=a.evidence_storage_event_id
+        JOIN attempt_evidence_history_projections p ON p.result_attempt_id=a.id AND p.archive_id=e.archive_id WHERE a.id=${attemptId}::uuid`);
+      expect(committed).toEqual({ sealed_first: true, completed: true, normal_read: true, retained_detail: 4 * 1024 * 1024 });
+      expect(await readStoredAttemptEvidenceText(db, attemptId)).toBe(before.original);
+    } finally {
+      await isolated.close();
+    }
+  }, 30_000);
 
   it("shortens at most the requested rows per automatic pass and counts replay only once", async () => {
     const first = await seedSettledHistory(fixture.db, {

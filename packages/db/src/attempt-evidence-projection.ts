@@ -549,6 +549,14 @@ export async function shortenAttemptEvidence(
         FROM attempt_evidence_storage_policy p WHERE p.id=1 FOR SHARE OF p`);
       if (policy?.scope === "verified") requireConfiguredAttemptHubRole();
     }
+    if (verification.direct?.sourceByteSize >= 4 * 1024 * 1024) {
+      // Resolve against the source table's schema during rolling upgrades.
+      const [local] = await tx.execute(sql`SELECT EXISTS (SELECT FROM pg_proc f
+        JOIN pg_class a ON a.oid=to_regclass('result_attempts') AND a.relnamespace=f.pronamespace
+        WHERE f.oid=to_regprocedure('attempt_evidence_seal_projection(uuid,uuid)')) AS ready`);
+      if (local?.ready === true)
+        await tx.execute(sql`SELECT attempt_evidence_seal_projection(${attemptId}::uuid,${archiveId}::uuid)`);
+    }
     const [row] = await tx.execute(
       sql`SELECT attempt_evidence_shorten(${attemptId}::uuid,${archiveId}::uuid,${JSON.stringify(verification)}::jsonb) AS measurement`,
     );

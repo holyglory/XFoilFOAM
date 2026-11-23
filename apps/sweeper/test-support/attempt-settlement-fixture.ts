@@ -152,7 +152,7 @@ const dependencies = [
   "sync_brokered_evidence_uploads",
 ];
 
-export async function createSettlementFixture(workerCustody = false) {
+export async function createSettlementFixture(workerCustody = false, projectionSealing = workerCustody) {
   const client = createClient({ max: 1 });
   const namespace = `attempt_settle_${randomUUID().replaceAll("-", "")}`;
   const db = client.db;
@@ -198,6 +198,7 @@ export async function createSettlementFixture(workerCustody = false) {
             "0224_hz_settled_attempt_receipts.sql",
           ]
         : []),
+      ...(projectionSealing ? ["0225_attempt_projection_sealing.sql"] : []),
     ]) {
       const body = await readFile(
         new URL(`../../../packages/db/migrations/${file}`, import.meta.url),
@@ -323,9 +324,13 @@ export async function seedInlineSettledHistory(
 
 export async function seedSettledHistory(
   db: DB,
-  options: SettledHistoryOptions & { memory?: SettlementGcs } = {},
+  options: SettledHistoryOptions & { memory?: SettlementGcs; detailBytes?: number } = {},
 ) {
   const source = await seedInlineSettledHistory(db, options);
+  if (options.detailBytes) {
+    await db.execute(sql`UPDATE result_attempts SET evidence_payload=evidence_payload||
+      jsonb_build_object('diagnostic_detail',repeat('x',${options.detailBytes}::int)) WHERE id=${source.attemptId}::uuid`);
+  }
   const memory = options.memory ?? new SettlementGcs(),
     store = new AttemptEvidenceStore(memory as unknown as Storage);
   const result = await archiveAttemptEvidence(db, store, {
