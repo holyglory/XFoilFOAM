@@ -1,8 +1,12 @@
 import { readFileSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { afterAll, expect, it } from "vitest";
 import { sql } from "drizzle-orm";
+import { readMigrationFiles } from "drizzle-orm/migrator";
+import { fileURLToPath } from "node:url";
 import { createClient } from "../src/client";
+import { deliveryIndexMigration, installDeliveryIndexFixture } from "../test-support/progressive-worker-delivery-index";
 import { previousProgressiveSettlementJobsSql } from "../test-support/progressive-progress-selection-baseline";
 import { selectProgressiveRemoteProgressJobs } from "../../../apps/sweeper/src/progressive-remote-progress";
 import { progressiveDeliverySelectionSql } from "../../../apps/sweeper/src/progressive-delivery-selection";
@@ -1376,8 +1380,39 @@ it("resumes due archive retries and expired claims before untouched work while p
   });
 });
 
+it("installs the full ordered journal and the real pending-delivery projection on the fresh database", async () => {
+  const expected = readMigrationFiles({
+    migrationsFolder: fileURLToPath(new URL("../migrations/", import.meta.url)),
+  }).map((m) => ({ hash: m.hash, boundary: String(m.folderMillis) }));
+  const rows =
+    await client.sql`SELECT hash,created_at::text AS boundary FROM drizzle.__drizzle_migrations ORDER BY id`;
+  expect(Array.from(rows)).toEqual(expected);
+  expect(rows.slice(229, 231).map((r) => r.boundary)).toEqual([
+    "1795363913060",
+    "1795363913061",
+  ]);
+  expect(
+    await client.sql`SELECT count(*)::int AS n FROM pg_trigger WHERE tgenabled='O'
+    AND (tgrelid,tgname::text) IN (('public.result_attempts'::regclass,'worker_delivery_disposition_written'),
+      ('public.progressive_worker_evidence_attempts'::regclass,'worker_delivery_source_staged'),
+      ('public.progressive_worker_evidence_attempts'::regclass,'worker_delivery_source_removed'),
+      ('public.progressive_worker_evidence_attempts'::regclass,'worker_delivery_sources_truncated'),
+      ('public.progressive_worker_hub_receipts'::regclass,'worker_delivery_receipt_added'),
+      ('public.progressive_worker_hub_receipts'::regclass,'worker_delivery_receipt_removed'),
+      ('public.progressive_worker_hub_receipts'::regclass,'worker_delivery_receipts_truncated'))`,
+  ).toEqual([{ n: 7 }]);
+  console.info(
+    JSON.stringify({
+      component: "fresh-delivery-migration",
+      orderedJournalCount: rows.length,
+      sourceTriggers: 7,
+    }),
+  );
+});
+
 it("preserves exact eligible deliveries, active priority, fallback and cumulative-report ordering", async () => {
   await client.db.transaction(async (transaction) => {
+    await transaction.execute(sql`SET LOCAL statement_timeout='30s'`);
     await transaction.execute(sql`CREATE TEMP TABLE fixture_jobs ON COMMIT DROP AS
       SELECT md5(variant)::uuid AS id,variant FROM unnest(ARRAY['eligible-active','eligible-cancelled','eligible-expired',
         'future-retry','due-retry','conflict','wrong-solver','wrong-upstream','wrong-job-upstream','not-remote',
@@ -1435,6 +1470,17 @@ it("preserves exact eligible deliveries, active priority, fallback and cumulativ
           WHEN variant='due-retry' THEN clock_timestamp()-interval '1 day' END AS retry_after
       FROM progressive_worker_evidence_attempts source JOIN fixture_jobs fixture ON fixture.id=source.sim_job_id
       WHERE variant IN ('future-retry','due-retry','conflict') GROUP BY 1,2,variant`);
+    await transaction.execute(sql`ALTER TABLE sim_jobs ADD PRIMARY KEY(id)`);
+    await transaction.execute(sql`ALTER TABLE sync_sweep_promises ADD PRIMARY KEY(id)`);
+    await transaction.execute(sql`CREATE INDEX fixture_dense_promise_idx ON sync_sweep_promises((id::text))`);
+    await transaction.execute(sql`ALTER TABLE result_attempts ADD PRIMARY KEY(id)`);
+    await transaction.execute(sql`ALTER TABLE progressive_worker_reports ADD PRIMARY KEY(sim_job_id,sequence)`);
+    await transaction.execute(sql`ALTER TABLE progressive_worker_evidence_attempts ADD PRIMARY KEY(sim_job_id,sequence,result_attempt_id)`);
+    await transaction.execute(sql`ALTER TABLE progressive_worker_hub_receipts ADD PRIMARY KEY(sim_job_id,point_content_signature)`);
+    await transaction.execute(sql`ALTER TABLE progressive_worker_delivery_failures ADD PRIMARY KEY(sim_job_id,point_content_signature)`);
+    await transaction.execute(sql`ALTER TABLE progressive_worker_report_conflicts ADD PRIMARY KEY(sim_job_id,sequence)`);
+    await transaction.execute(sql`CREATE INDEX fixture_worker_attempt_idx ON progressive_worker_evidence_attempts(result_attempt_id)`);
+    await installDeliveryIndexFixture(transaction);
     const selected = (active: boolean) =>
       transaction.execute(progressiveDeliverySelectionSql(active));
     const expected = (active: boolean) =>
@@ -1462,8 +1508,7 @@ it("preserves exact eligible deliveries, active priority, fallback and cumulativ
       const rollback = new Error(
         "Rollback isolated complete delivery ordering",
       );
-      await expect(
-        transaction.transaction(async (nested) => {
+      await transaction.transaction(async (nested) => {
           let count = 0;
           while (true) {
             const actual = await nested.execute(
@@ -1480,9 +1525,88 @@ it("preserves exact eligible deliveries, active priority, fallback and cumulativ
           }
           expect(count).toBe(16);
           throw rollback;
-        }),
-      ).rejects.toBe(rollback);
+        }).catch(error => { if (error !== rollback) throw error; });
     }
+    const aliasRollback = new Error("Restore exact signed alias history");
+    await transaction
+      .transaction(async (nested) => {
+        const [binding] =
+          await nested.execute(sql`SELECT a.* FROM progressive_worker_evidence_attempts a
+        JOIN fixture_jobs f ON f.id=a.sim_job_id WHERE f.variant='eligible-active' ORDER BY a.sequence,a.result_attempt_id LIMIT 1`);
+        const job = String(binding.sim_job_id),
+          attempt = String(binding.result_attempt_id),
+          point = String(binding.point_content_signature);
+        await nested.execute(sql`INSERT INTO progressive_worker_hub_receipts SELECT DISTINCT sim_job_id,point_content_signature
+        FROM progressive_worker_evidence_attempts ON CONFLICT DO NOTHING`);
+        expect(
+          await nested.execute(progressiveDeliverySelectionSql(true)),
+        ).toEqual([]);
+        // A late repeated report for an already received point consumes no pending alias slot.
+        // Another point signed for that same attempt is still an independent delivery.
+        await nested.execute(sql`INSERT INTO progressive_worker_reports
+        SELECT ${job}::uuid,n,clock_timestamp(),'{"result":{}}'::jsonb,md5(n::text),
+          CASE WHEN n=41 THEN timestamptz '2018-01-01' ELSE timestamptz '2017-01-01' END
+        FROM unnest(ARRAY[41,42]) n`);
+        const secondSignature = "e".repeat(64);
+        await nested.execute(sql`INSERT INTO progressive_worker_evidence_attempts VALUES
+        (${job}::uuid,41,${attempt}::uuid,${point}),(${job}::uuid,42,${attempt}::uuid,${secondSignature})`);
+        expect(
+          await nested.execute(
+            sql`SELECT sequence::integer AS n FROM progressive_worker_delivery_order`,
+          ),
+        ).toEqual([{ n: 42 }]);
+        expect(
+          await nested.execute(progressiveDeliverySelectionSql(false)),
+        ).toMatchObject([
+          {
+            sequence: 42,
+            point_content_signature: secondSignature,
+            result_attempt_id: attempt,
+          },
+        ]);
+        await nested.execute(
+          sql`INSERT INTO progressive_worker_hub_receipts VALUES(${job}::uuid,${secondSignature})`,
+        );
+        await nested.execute(
+          sql`DELETE FROM progressive_worker_hub_receipts WHERE sim_job_id=${job}::uuid AND point_content_signature=${point}`,
+        );
+        expect(
+          await nested.execute(progressiveDeliverySelectionSql(true)),
+        ).toMatchObject([{ sequence: 41, point_content_signature: point }]);
+        await nested.execute(
+          sql`INSERT INTO progressive_worker_report_conflicts VALUES(${job}::uuid,41)`,
+        );
+        expect(
+          await nested.execute(progressiveDeliverySelectionSql(true)),
+        ).toMatchObject([{ sequence: 1, point_content_signature: point }]);
+        await nested.execute(sql`DELETE FROM progressive_worker_evidence_attempts
+        WHERE sim_job_id=${job}::uuid AND sequence=1 AND result_attempt_id=${attempt}::uuid`);
+        expect(
+          await nested.execute(progressiveDeliverySelectionSql(true)),
+        ).toMatchObject([{ sequence: 2, point_content_signature: point }]);
+        await nested.execute(
+          sql`DELETE FROM progressive_worker_report_conflicts WHERE sim_job_id=${job}::uuid AND sequence=41`,
+        );
+        expect(
+          await nested.execute(progressiveDeliverySelectionSql(false)),
+        ).toMatchObject([{ sequence: 41, point_content_signature: point }]);
+        await nested.execute(sql`TRUNCATE progressive_worker_hub_receipts`);
+        expect(
+          await nested.execute(
+            sql`SELECT count(*)::int n FROM progressive_worker_delivery_points WHERE received`,
+          ),
+        ).toEqual([{ n: 0 }]);
+        expect(
+          await nested.execute(sql`SELECT count(*)::int missing FROM progressive_worker_evidence_attempts s
+        LEFT JOIN progressive_worker_delivery_order o ON (s.sim_job_id,s.sequence,s.result_attempt_id,s.point_content_signature)=
+        (o.sim_job_id,o.sequence,o.result_attempt_id,o.point_content_signature) WHERE o.sequence IS NULL`),
+        ).toEqual([{ missing: 0 }]);
+        throw aliasRollback;
+      })
+      .catch((error) => {
+        if (error !== aliasRollback) throw error;
+      });
+
     const scopeRollback = new Error("Restore closed-scope delivery bindings");
     await expect(transaction.transaction(async nested => {
       const [p] = await nested.execute(sql`SELECT s.* FROM progressive_worker_evidence_attempts s
@@ -1502,11 +1626,17 @@ it("preserves exact eligible deliveries, active priority, fallback and cumulativ
       await nested.execute(sql`INSERT INTO result_attempts
         SELECT md5('alternate-scope-diagnostic')::uuid,sim_job_id,engine_job_id,result_id,aoa_deg,engine_case_slug,
           '{"failure_disposition":"material_domain","converged":false}'::jsonb FROM result_attempts WHERE id=${p.result_attempt_id}::uuid`);
-      await nested.execute(sql`UPDATE progressive_worker_evidence_attempts SET result_attempt_id=md5('alternate-scope-diagnostic')::uuid
+      // Production staging associations are immutable. Replace this fixture association
+      // through the supported delete/insert events so the index observes both sides.
+      await nested.execute(sql`DELETE FROM progressive_worker_evidence_attempts
         WHERE sim_job_id=${p.sim_job_id}::uuid AND point_content_signature=${p.point_content_signature} AND sequence=2`);
+      await nested.execute(sql`INSERT INTO progressive_worker_evidence_attempts
+        VALUES(${p.sim_job_id}::uuid,2,md5('alternate-scope-diagnostic')::uuid,${p.point_content_signature})`);
       const [eligible] = await pick();
       expect(eligible).toMatchObject({sim_job_id:p.sim_job_id,sequence:2,point_content_signature:p.point_content_signature});
       expect(eligible.result_attempt_id).not.toBe(p.result_attempt_id);
+      await nested.execute(sql`DELETE FROM progressive_worker_delivery_diagnostics WHERE result_attempt_id=md5('alternate-scope-diagnostic')::uuid`);
+      expect((await pick())[0]).toEqual(eligible);
       const claimed = await nested.execute(progressiveDeliverySelectionSql(true,"44444444-4444-4444-8444-444444444444"));
       expect(claimed).toEqual([eligible]);
       expect(await pick()).toEqual([]);
@@ -1591,33 +1721,53 @@ it("preserves exact eligible deliveries, active priority, fallback and cumulativ
     }
     // Reproduce the remote-dense shape missed by the HUB-only index fixture:
     // many owned jobs and cumulative reports, with few undelivered points.
-    await transaction.execute(sql`ALTER TABLE sim_jobs ADD PRIMARY KEY(id)`);
-    await transaction.execute(sql`ALTER TABLE sync_sweep_promises ADD PRIMARY KEY(id)`);
-    await transaction.execute(sql`CREATE INDEX fixture_dense_promise_idx ON sync_sweep_promises((id::text))`);
-    await transaction.execute(sql`ALTER TABLE result_attempts ADD PRIMARY KEY(id)`);
-    await transaction.execute(sql`ALTER TABLE progressive_worker_reports ADD PRIMARY KEY(sim_job_id,sequence)`);
-    await transaction.execute(sql`ALTER TABLE progressive_worker_evidence_attempts ADD PRIMARY KEY(sim_job_id,sequence,result_attempt_id)`);
-    await transaction.execute(sql`ALTER TABLE progressive_worker_hub_receipts ADD PRIMARY KEY(sim_job_id,point_content_signature)`);
-    await transaction.execute(sql`ALTER TABLE progressive_worker_delivery_failures ADD PRIMARY KEY(sim_job_id,point_content_signature)`);
-    await transaction.execute(sql`ALTER TABLE progressive_worker_report_conflicts ADD PRIMARY KEY(sim_job_id,sequence)`);
     await transaction.execute(sql`CREATE TEMP TABLE dense_worker_jobs ON COMMIT DROP AS
       SELECT md5('dense-worker-'||ordinal)::uuid id,md5('dense-attempt-'||ordinal)::uuid attempt_id,
         md5('dense-result-'||ordinal)::uuid result_id,md5('dense-point-'||ordinal) point_signature
       FROM generate_series(1,12000) ordinal`);
-    await transaction.execute(sql`INSERT INTO sim_jobs
+    const writeCosts: Record<string, number> = {};
+    let marked = performance.now();
+    const measured = (name: string) => {
+      const now = performance.now();
+      writeCosts[name] = Math.round(now - marked);
+      marked = now;
+    };
+    const bulk = async (name: string, statement: ReturnType<typeof sql>) => {
+      try {
+        await transaction.execute(statement);
+      } catch (error) {
+        const e = error as { code?: string; where?: string };
+        throw Error(name + " " + e.code + " " + (e.where ?? "").slice(-750));
+      }
+    };
+    await bulk("sim_jobs",sql`INSERT INTO sim_jobs
       SELECT id,jsonb_build_object('syncPromiseId',id::text,'remoteSolver',true,'upstreamBaseUrl','https://fixture.invalid')
       FROM dense_worker_jobs`);
-    await transaction.execute(sql`INSERT INTO sync_sweep_promises
+    await bulk("sync_sweep_promises",sql`INSERT INTO sync_sweep_promises
       SELECT id,'active',clock_timestamp()+interval '1 day',md5('solver')::uuid,'https://fixture.invalid' FROM dense_worker_jobs`);
-    await transaction.execute(sql`INSERT INTO result_attempts
+    await bulk("result_attempts",sql`INSERT INTO result_attempts
       SELECT attempt_id,id,id::text,result_id,0,'dense-case','{"retainedFixture":true}'::jsonb FROM dense_worker_jobs`);
-    await transaction.execute(sql`INSERT INTO progressive_worker_reports
+    measured("jobsPromisesAndAttemptsMs");
+    await bulk("progressive_worker_reports",sql`INSERT INTO progressive_worker_reports
       SELECT id,sequence,clock_timestamp(),'{"result":{}}'::jsonb,md5(id::text||sequence::text),
         timestamptz '2025-01-01'+sequence*interval '1 second'
       FROM dense_worker_jobs CROSS JOIN generate_series(1,16) sequence`);
-    await transaction.execute(sql`INSERT INTO progressive_worker_evidence_attempts
+    measured("reportsMs");
+    await bulk("progressive_worker_evidence_attempts",sql`INSERT INTO progressive_worker_evidence_attempts
       SELECT id,sequence,attempt_id,point_signature FROM dense_worker_jobs CROSS JOIN generate_series(1,16) sequence`);
-    await transaction.execute(sql`INSERT INTO progressive_worker_hub_receipts SELECT id,point_signature FROM dense_worker_jobs`);
+    measured("stagingMs");
+    await bulk("progressive_worker_hub_receipts",sql`INSERT INTO progressive_worker_hub_receipts SELECT id,point_signature FROM dense_worker_jobs`);
+    measured("receiptsMs");
+    await transaction.execute(sql`INSERT INTO progressive_worker_reports
+      SELECT id,n,clock_timestamp(),'{"result":{}}'::jsonb,md5(n::text),timestamptz '2030-01-01' + n*interval '1 second'
+      FROM fixture_jobs CROSS JOIN generate_series(101,4196)n WHERE variant='eligible-active'`);
+    await transaction.execute(sql`INSERT INTO progressive_worker_evidence_attempts
+      SELECT b.sim_job_id,n,b.result_attempt_id,b.point_content_signature FROM (
+        SELECT s.* FROM fixture_jobs j JOIN progressive_worker_evidence_attempts s ON s.sim_job_id=j.id
+        WHERE j.variant='eligible-active' AND s.sequence=1 ORDER BY s.result_attempt_id LIMIT 1
+      ) b CROSS JOIN generate_series(101,4196)n`);
+    measured("repeatedPendingAliasesMs");
+    console.info(JSON.stringify({component:"dense-worker-inserts",...writeCosts}));
     await transaction.execute(sql.raw(readFileSync(new URL('../migrations/0195_remote_worker_identity_index.sql', import.meta.url), 'utf8')));
     const repair = readFileSync(new URL('../migrations/0196_restore_remote_worker_identity_index.sql', import.meta.url), 'utf8');
     // Both present-index and already-removed containment states must repair.
@@ -1644,30 +1794,127 @@ it("preserves exact eligible deliveries, active priority, fallback and cumulativ
             for (const child of (node.Plans ?? []) as Array<Record<string, unknown>>) visit(child);
           };
           visit(plan.Plan as Record<string, unknown>);
-          const outstanding = nodes.filter((node) => node['Subplan Name'] === 'CTE outstanding_sources');
-          const jobLookups = nodes.filter((node) => node['Relation Name'] === 'sim_jobs' && Number(node['Actual Loops']) > 0);
-          const enumeratedSources = outstanding.reduce((sum, node) => sum + Number(node['Actual Rows']) * Number(node['Actual Loops']), 0);
-          const lookupLoops = jobLookups.reduce((sum, node) => sum + Number(node['Actual Loops']), 0);
-          const examinedJobs = jobLookups.reduce((sum, node) => sum + Number(node['Actual Loops']) *
-            (Number(node['Actual Rows']) + Number(node['Rows Removed by Filter'] ?? 0) + Number(node['Rows Removed by Index Recheck'] ?? 0)), 0);
+          const scans = (relation: string) =>
+            nodes.filter(
+              (n) =>
+                n["Relation Name"] === relation &&
+                Number(n["Actual Loops"]) > 0,
+            );
+          const examined = (relation: string) =>
+            scans(relation).reduce(
+              (total, n) =>
+                total +
+                Number(n["Actual Loops"]) *
+                  (Number(n["Actual Rows"]) +
+                    Number(n["Rows Removed by Filter"] ?? 0) +
+                    Number(n["Rows Removed by Index Recheck"] ?? 0)),
+              0,
+            );
+          const probes = (relation: string) =>
+            scans(relation).reduce(
+              (sum, n) => sum + Number(n["Actual Loops"]),
+              0,
+            );
+          const pages = (relation: string) =>
+            scans(relation).reduce(
+              (sum, n) =>
+                sum +
+                [
+                  "Local Hit Blocks",
+                  "Local Read Blocks",
+                  "Shared Hit Blocks",
+                  "Shared Read Blocks",
+                ].reduce((count, key) => count + Number(n[key] ?? 0), 0),
+              0,
+            );
+          const costs = Object.fromEntries(
+            [
+              "progressive_worker_evidence_attempts",
+              "progressive_worker_delivery_points",
+              "progressive_worker_delivery_order",
+              "progressive_worker_reports",
+              "sim_jobs",
+            ].map((r) => [r, examined(r)]),
+          );
+          console.info(
+            JSON.stringify({
+              component: "dense-worker-full-claim",
+              active,
+              workerJobs: 12000,
+              historicalReports: 192000,
+              additionalPendingAliases: 4096,
+              executionMs: plan["Execution Time"],
+              rowsExamined: costs,
+              sourceProbes: probes("progressive_worker_evidence_attempts"),
+              sourcePages: pages("progressive_worker_evidence_attempts"),
+            }),
+          );
           if (process.env.DEVCOORDINATOR_DIAGNOSTICS_DIR)
-            writeFileSync(join(process.env.DEVCOORDINATOR_DIAGNOSTICS_DIR, `dense-full-claim-${active}.plan.json`), JSON.stringify(plan, null, 2));
-          console.info(JSON.stringify({ component: 'dense-worker-full-claim', active, workerJobs: 12000,
-            historicalReports: 192000, executionMs: plan['Execution Time'], enumeratedSources, lookupLoops, examinedJobs,
-            outstandingEvaluations: outstanding.map((node) => node['Actual Loops']),
-            jobLookups: jobLookups.map((node) => ({ type: node['Node Type'], index: node['Index Name'],
-              condition: node['Index Cond'], loops: node['Actual Loops'], rows: node['Actual Rows'] })) }));
-          expect(outstanding).toHaveLength(1);
-          const bindings = nodes.filter(node => node['Subplan Name'] === 'CTE eligible_bindings');
-          expect(bindings).toHaveLength(1);
-          expect(Number(bindings[0]['Actual Loops'])).toBe(1);
-          expect(Number(bindings[0]['Actual Rows'])).toBeLessThan(enumeratedSources);
-          expect(outstanding.every((node) => Number(node['Actual Loops']) <= 1)).toBe(true);
+            writeFileSync(
+              join(
+                process.env.DEVCOORDINATOR_DIAGNOSTICS_DIR,
+                `dense-full-claim-${active}.plan.json`,
+              ),
+              JSON.stringify({
+                executionMs: plan["Execution Time"],
+                rowsExamined: costs,
+                scans: nodes
+                  .filter((n) => n["Relation Name"])
+                  .map((n) => ({
+                    relation: n["Relation Name"],
+                    index: n["Index Name"],
+                    type: n["Node Type"],
+                    rows: n["Actual Rows"],
+                    loops: n["Actual Loops"],
+                    filtered: n["Rows Removed by Filter"],
+                  })),
+              }),
+            );
+          const sourceScans = scans("progressive_worker_evidence_attempts");
+          expect(sourceScans.length).toBeGreaterThan(0);
+          expect(
+            sourceScans.every((n) =>
+              ["Index Scan", "Index Only Scan"].includes(
+                String(n["Node Type"]),
+              ),
+            ),
+          ).toBe(true);
+          expect(
+            examined("progressive_worker_evidence_attempts"),
+          ).toBeLessThanOrEqual(1);
+          expect(probes("progressive_worker_evidence_attempts")).toBe(1);
+          expect(pages("progressive_worker_evidence_attempts")).toBeLessThan(
+            20,
+          );
+          expect(probes("progressive_worker_delivery_order")).toBeLessThan(130);
+          expect(probes("progressive_worker_reports")).toBeLessThan(180);
+          expect(probes("sim_jobs")).toBeLessThan(100);
+          for (const cte of ["CTE pending_bindings", "CTE eligible_bindings"]) {
+            expect(
+              nodes
+                .filter((n) => n["Subplan Name"] === cte)
+                .map((n) => n["Actual Loops"]),
+            ).toEqual([1]);
+          }
+          expect(examined("progressive_worker_delivery_points")).toBeLessThan(
+            120,
+          );
+          expect(examined("progressive_worker_delivery_order")).toBeLessThan(
+            180,
+          );
+          expect(examined("progressive_worker_reports")).toBeLessThan(180);
+          const jobLookups = scans("sim_jobs");
           expect(jobLookups.length).toBeGreaterThan(0);
-          expect(jobLookups.every((node) => ['Index Scan', 'Index Only Scan'].includes(String(node['Node Type'])) &&
-            /\bid\s*=\s*\w+\.sim_job_id\b/.test(String(node['Index Cond'])))).toBe(true);
-          expect(lookupLoops).toBeLessThanOrEqual(enumeratedSources);
-          expect(examinedJobs).toBeLessThanOrEqual(enumeratedSources);
+          expect(
+            jobLookups.every(
+              (n) =>
+                ["Index Scan", "Index Only Scan"].includes(
+                  String(n["Node Type"]),
+                ) &&
+                /\bid\s*=\s*\w+\.sim_job_id\b/.test(String(n["Index Cond"])),
+            ),
+          ).toBe(true);
+          expect(examined("sim_jobs")).toBeLessThan(100);
           expect(await nested.execute(sql`SELECT sim_job_id,sequence::integer AS sequence,result_attempt_id,point_content_signature
             FROM progressive_worker_evidence_delivery_claims`)).toEqual(wanted.map((row) => ({
               sim_job_id: row.sim_job_id, sequence: row.sequence, result_attempt_id: row.result_attempt_id,
@@ -1685,3 +1932,134 @@ it("preserves exact eligible deliveries, active priority, fallback and cumulativ
 
   });
 }, 120_000);
+
+it("claims disjoint signed points and reopens every racing late alias across worker connections", async () => {
+  const schema = "delivery_race_" + randomUUID().replaceAll("-", "");
+  await client.sql.unsafe(`CREATE SCHEMA ${schema}`);
+  const peers = createClient({
+    max: 2,
+    connection: { search_path: schema + ",public", statement_timeout: "10s" },
+  });
+  const job = randomUUID(),
+    firstAttempt = randomUUID(),
+    secondAttempt = randomUUID();
+  const first = "a".repeat(64),
+    second = "b".repeat(64),
+    solver = randomUUID();
+  try {
+    await peers.sql.unsafe(`
+      CREATE TABLE sim_jobs(id uuid PRIMARY KEY,request_payload jsonb);
+      CREATE TABLE result_attempts(id uuid PRIMARY KEY,sim_job_id uuid,engine_job_id text,result_id uuid,
+        aoa_deg double precision,engine_case_slug text,evidence_payload jsonb);
+      CREATE TABLE progressive_worker_reports(sim_job_id uuid,sequence bigint,created_at timestamptz,
+        acknowledged_at timestamptz,content_signature text,report jsonb,PRIMARY KEY(sim_job_id,sequence));
+      CREATE TABLE progressive_worker_evidence_attempts(sim_job_id uuid,sequence bigint,result_attempt_id uuid,
+        point_content_signature text,PRIMARY KEY(sim_job_id,sequence,result_attempt_id));
+      CREATE INDEX race_source_attempt_idx ON progressive_worker_evidence_attempts(result_attempt_id);
+      CREATE TABLE progressive_worker_hub_receipts(sim_job_id uuid,sequence bigint,result_attempt_id uuid,
+        point_content_signature text, PRIMARY KEY(sim_job_id,point_content_signature),
+        FOREIGN KEY(sim_job_id,sequence,result_attempt_id) REFERENCES progressive_worker_evidence_attempts ON DELETE CASCADE);
+      CREATE TABLE progressive_worker_report_conflicts(sim_job_id uuid,sequence bigint,PRIMARY KEY(sim_job_id,sequence));
+      CREATE TABLE progressive_worker_evidence_delivery_claims(sim_job_id uuid,sequence bigint,result_attempt_id uuid,
+        point_content_signature text,claim_token uuid,claim_expires_at timestamptz,PRIMARY KEY(sim_job_id,point_content_signature));
+      CREATE TABLE progressive_worker_delivery_failures(sim_job_id uuid,point_content_signature text,state text,last_error text,
+        last_http_status int,remote_conflict_ids jsonb,retry_after timestamptz,PRIMARY KEY(sim_job_id,point_content_signature));
+      CREATE TABLE sync_sweep_promises(id uuid PRIMARY KEY,status text,"expiresAt" timestamptz,registered_solver_id uuid,source_base_url text);
+      CREATE TABLE sync_api_settings(id int,remote_solver_transfer_paused boolean,remote_solver_auth_token text,
+        remote_solver_registered_id uuid,instance_id uuid,instance_name text,upstream_base_url text)
+    `);
+    await peers.sql`INSERT INTO sim_jobs VALUES(${job},jsonb_build_object('remoteSolver',true,'syncPromiseId',${job}::text,'upstreamBaseUrl','fixture'))`;
+    await peers.sql`INSERT INTO sync_api_settings VALUES(1,false,'test-owner',${solver},${randomUUID()},'isolated','fixture')`;
+    await peers.sql`INSERT INTO sync_sweep_promises VALUES(${job},'active',now()+interval '1 day',${solver},'fixture')`;
+    await peers.sql`INSERT INTO result_attempts VALUES(${firstAttempt},${job},${job},${randomUUID()},1,'real-case','{}'),
+      (${secondAttempt},${job},${job},${randomUUID()},2,'real-case','{}')`;
+    await peers.sql`INSERT INTO progressive_worker_reports SELECT ${job},n,timestamptz '2025-01-01'+n*interval '1 second',
+      now(),md5(n::text),'{"result":{}}'::jsonb FROM generate_series(1,4) n`;
+    await peers.sql`INSERT INTO progressive_worker_evidence_attempts VALUES(${job},1,${firstAttempt},${first}),(${job},2,${secondAttempt},${second})`;
+    await peers.sql.begin(async (tx) => {
+      for (const statement of deliveryIndexMigration.split(
+        "--> statement-breakpoint",
+      )) {
+        await tx.unsafe(
+          statement
+            .replaceAll("public.", schema + ".")
+            .replaceAll(
+              "search_path=pg_catalog,public",
+              "search_path=pg_catalog," + schema,
+            ),
+        );
+      }
+    });
+    await peers.db.transaction(async (owner) => {
+      const a = await owner.execute(
+        progressiveDeliverySelectionSql(true, randomUUID()),
+      );
+      expect(a.map((r) => r.point_content_signature)).toEqual([first]);
+      const b = await peers.db.transaction((other) =>
+        other.execute(progressiveDeliverySelectionSql(false, randomUUID())),
+      );
+      expect(b.map((r) => r.point_content_signature)).toEqual([second]);
+    });
+    expect(
+      await peers.db.execute(progressiveDeliverySelectionSql(false)),
+    ).toHaveLength(0);
+    await peers.sql`DELETE FROM progressive_worker_evidence_delivery_claims`;
+
+    for (const [index, isolation] of [
+      "read committed",
+      "repeatable read",
+    ].entries()) {
+      await peers.sql`INSERT INTO progressive_worker_hub_receipts VALUES(${job},1,${firstAttempt},${first})`;
+      const latestSequence = index + 3;
+      let remove: Promise<string | undefined> | undefined;
+      let started!: (pid: number) => void;
+      const receiverPid = new Promise<number>((resolve) => {
+        started = resolve;
+      });
+      try {
+        await peers.sql.begin(async (writer) => {
+          const [session] = await writer`SELECT pg_backend_pid() AS pid`;
+          // These bytes are a genuine later staged alias of the already received point.
+          await writer`INSERT INTO progressive_worker_evidence_attempts VALUES(${job},${latestSequence},${firstAttempt},${first})`;
+          remove = peers.sql
+            .begin("isolation level " + isolation, async (receiver) => {
+              const [peer] = await receiver`SELECT pg_backend_pid() AS pid`;
+              started(peer.pid);
+              await receiver`DELETE FROM progressive_worker_hub_receipts WHERE sim_job_id=${job} AND point_content_signature=${first}`;
+              return undefined;
+            })
+            .catch((e: { code?: string }) => {
+              if (e.code !== "40001") throw e;
+              return e.code;
+            });
+          const pid = await receiverPid;
+          let blocked = false;
+          for (let n = 0; n < 100 && !blocked; n++) {
+            const [r] =
+              await client.sql`SELECT ${session.pid}::int=ANY(pg_blocking_pids(${pid})) AS waiting`;
+            blocked = r.waiting;
+            if (!blocked)
+              await new Promise((resolve) => setTimeout(resolve, 10));
+          }
+          expect(blocked).toBe(true);
+          expect(
+            await writer`SELECT sequence FROM progressive_worker_delivery_order WHERE point_content_signature=${first}`,
+          ).toHaveLength(0);
+        });
+      } finally {
+        const result = await remove;
+        if (isolation === "repeatable read") {
+          expect(result).toBe("40001");
+          await peers.sql`DELETE FROM progressive_worker_hub_receipts WHERE sim_job_id=${job} AND point_content_signature=${first}`;
+        } else expect(result).toBeUndefined();
+      }
+      const sources =
+        await peers.sql`SELECT sequence::int AS n FROM progressive_worker_delivery_order
+        WHERE sim_job_id=${job} AND point_content_signature=${first} ORDER BY sequence`;
+      expect(sources.map((r) => r.n)).toEqual(index === 0 ? [1, 3] : [1, 3, 4]);
+    }
+  } finally {
+    await peers.sql.end({ timeout: 5 });
+    await client.sql.unsafe(`DROP SCHEMA ${schema} CASCADE`);
+  }
+}, 45_000);
