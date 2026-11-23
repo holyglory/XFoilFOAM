@@ -10,6 +10,7 @@ import type {
   SimulationDetail,
 } from "@aerodb/core";
 import type { SolverWorkPayload } from "./solver-work";
+import { airfoilGlyphPath } from "./airfoil-glyph";
 
 const SERVER_BASE = process.env.API_URL ?? "http://localhost:4000";
 const CLIENT_BASE = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:4000";
@@ -89,7 +90,7 @@ export function getAirfoilCompareDetail(slug: string, signal?: AbortSignal) {
   return getAirfoilDetail(slug, null, signal, "compare");
 }
 
-export const INITIAL_BROWSE_ROWS = 150;
+export const INITIAL_BROWSE_ROWS = 40;
 
 export type AirfoilListParams = {
   q?: string;
@@ -133,6 +134,15 @@ type CatalogRequest = AirfoilListParams & {
 };
 
 type AirfoilKey = Pick<AirfoilSummary, "id" | "slug">;
+export type CatalogRow = Omit<AirfoilSummary, "points"> & {
+  glyphPath: string | null;
+};
+
+// The table only displays the projected contour. Its larger preview and the
+// coordinate downloads already use the exact geometry from the detail endpoint.
+function catalogRow({ points, ...metadata }: AirfoilSummary): CatalogRow {
+  return { ...metadata, glyphPath: airfoilGlyphPath(points) };
+}
 
 async function fetchCatalogRows<T>(
   params: CatalogRequest,
@@ -179,9 +189,9 @@ export async function listAirfoilPage(
     page.total >= 0
   )
     return {
-      items: page.items,
+      items: page.items.map(catalogRow),
       total: page.total,
-      retained: page.retained ?? null,
+      retained: page.retained ? catalogRow(page.retained) : null,
       rankingId: page.rankingId,
     };
 
@@ -191,10 +201,13 @@ export async function listAirfoilPage(
     offset === 0 && page.items.length < limit
       ? page.items
       : await listAirfoils(filter, signal);
+  const retained = retainSlug
+    ? all.find((item) => item.slug === retainSlug)
+    : undefined;
   return {
-    items: all.slice(offset, offset + limit),
+    items: all.slice(offset, offset + limit).map(catalogRow),
     total: all.length,
-    retained: all.find((item) => item.slug === retainSlug) ?? null,
+    retained: retained ? catalogRow(retained) : null,
     rankingId: undefined,
   };
 }

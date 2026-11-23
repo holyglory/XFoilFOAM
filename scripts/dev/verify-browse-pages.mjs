@@ -48,13 +48,13 @@ try {
     if (url.pathname === "/api/airfoils")
       requests.push(Object.fromEntries(url.searchParams));
   });
-  const first = await query(page, { limit: "150" });
+  const first = await query(page, { limit: "40" });
   assert.equal(
     (await (await page.request.get(origin + "/api/admin/me")).json()).authed,
     false,
   );
-  const expanded = await query(page, { limit: "450" });
-  assert(first.total > 450 && first.rankingId === expanded.rankingId);
+  const expanded = await query(page, { limit: "340" });
+  assert(first.total > 340 && first.rankingId === expanded.rankingId);
   const document = await page.goto(origin, { waitUntil: "domcontentloaded" });
   assert.equal(document.status(), 200);
   await expect(
@@ -63,7 +63,7 @@ try {
   await waitRows(page, first.items);
   const html = await document.text();
   assert(
-    !html.includes(expanded.items[150].id),
+    !html.includes(expanded.items[40].id),
     "An unloaded profile was serialized into the initial document",
   );
   proof.firstPage = {
@@ -74,21 +74,21 @@ try {
   await page.getByRole("button", { name: "Load more", exact: true }).click();
   await waitRows(page, expanded.items);
   await expect(
-    page.getByText("showing 450 of " + first.total, { exact: true }),
+    page.getByText("showing 340 of " + first.total, { exact: true }),
   ).toBeVisible();
   assert.equal(
     requests.length,
     1,
     "The browser refetched the SSR page or sent overlapping page requests",
   );
-  assert.equal(requests[0].offset, "150");
+  assert.equal(requests[0].offset, "40");
   assert.equal(requests[0].limit, "300");
-  proof.expansion = { rendered: 450, firstOffset: requests[0].offset };
+  proof.expansion = { rendered: 340, firstOffset: requests[0].offset };
 
-  const byName = await query(page, { sort: "name", dir: "asc", limit: "150" });
+  const byName = await query(page, { sort: "name", dir: "asc", limit: "40" });
   const inFirst = new Set(byName.items.map((item) => item.id));
   const retained = expanded.items
-    .slice(150)
+    .slice(40)
     .find((item) => !inFirst.has(item.id));
   assert(
     retained,
@@ -113,7 +113,7 @@ try {
   });
   await page.route("**/api/airfoils?**", async (route) => {
     const url = new URL(route.request().url());
-    if (url.searchParams.get("offset") !== "150") return route.continue();
+    if (url.searchParams.get("offset") !== "40") return route.continue();
     start();
     await allow;
     await route.continue().catch(() => {});
@@ -125,7 +125,7 @@ try {
       sort: "name",
       dir: "asc",
       q: "AG24",
-      limit: "150",
+      limit: "40",
     });
     assert(filtered.items.some((item) => item.slug === "ag24"));
     await page.getByTestId("airfoil-name-filter").fill("AG24");
@@ -145,7 +145,7 @@ try {
       sort: "name",
       dir: "asc",
       metricConditionKey: condition,
-      limit: "150",
+      limit: "40",
     });
     const response = page.waitForResponse(
       (r) =>
@@ -160,7 +160,7 @@ try {
     await expect(page).toHaveURL(new RegExp("condition=" + condition));
     const direct = await query(page, {
       metricConditionKey: condition,
-      limit: "150",
+      limit: "40",
     });
     const selectedDocument = await page.reload({
       waitUntil: "domcontentloaded",
@@ -208,12 +208,12 @@ try {
   await expect(
     page.getByText(first.total + " selected", { exact: true }),
   ).toBeVisible();
-  await expect(rows(page)).toHaveCount(150);
+  await expect(rows(page)).toHaveCount(40);
   await page.getByRole("button", { name: "Select none", exact: true }).click();
   await expect(
     page.getByRole("button", { name: "Select none", exact: true }),
   ).toHaveCount(0);
-  proof.selection = { allMatching: first.total, rendered: 150, cleared: true };
+  proof.selection = { allMatching: first.total, rendered: 40, cleared: true };
   assert.deepEqual(errors, []);
   await mkdir(".codex-artifacts/catalog-page-journey", { recursive: true });
   await writeFile(

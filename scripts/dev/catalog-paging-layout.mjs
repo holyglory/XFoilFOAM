@@ -34,11 +34,11 @@ export function catalogPagingLayout(origin, repoRoot, reviewInputs) {
           { action: "focus", selector: more },
           { action: "press", selector: more, value: "Enter" },
         ],
-        waitFor: { selector: row(450) },
+        waitFor: { selector: row(340) },
         continuation: {
           kind: "in-page",
-          anchor: row(151) + " [data-ui-continuation-anchor]",
-          focusWithin: row(151),
+          anchor: row(41) + " [data-ui-continuation-anchor]",
+          focusWithin: row(41),
           maxScrollDelta: 8,
         },
       },
@@ -113,10 +113,10 @@ export function catalogPagingLayout(origin, repoRoot, reviewInputs) {
       conditionalDom: [
         row(
           state.startsWith("expanded")
-            ? 450
+            ? 340
             : state.startsWith("filtered")
               ? 1
-              : 150,
+              : 40,
         ),
         state.startsWith("filtered")
           ? "[data-testid='airfoil-row-ag24']"
@@ -153,6 +153,8 @@ export function catalogPagingLayout(origin, repoRoot, reviewInputs) {
         reviewInputs: [
           ...reviewInputs,
           { path: "apps/web/lib/api.ts", kind: "ui-code" },
+          { path: "apps/web/lib/airfoil-glyph.ts", kind: "ui-code" },
+          { path: "apps/web/components/AirfoilGlyph.tsx", kind: "ui-code" },
           {
             path: "apps/web/components/browse/CatalogContent.tsx",
             kind: "ui-code",

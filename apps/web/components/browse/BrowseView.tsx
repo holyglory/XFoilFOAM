@@ -2,7 +2,6 @@
 
 import {
   type AirfoilDetailPayload,
-  type AirfoilSummary,
   type CategoryNode,
   type HashtagDTO,
   type PolarMetricCondition,
@@ -36,6 +35,7 @@ import {
   listAirfoilPage,
   listAirfoilPrefix,
   type AirfoilListParams,
+  type CatalogRow,
 } from "@/lib/api";
 import { MetricConditionSelector } from "@/components/MetricConditionSelector";
 import { PolarMiniChart } from "@/components/PolarMiniChart";
@@ -93,7 +93,7 @@ const EMPTY_FILTERS: Filters = {
 const COLS: {
   key: SortKey;
   label: string;
-  fmt: (a: AirfoilSummary) => string;
+  fmt: (a: CatalogRow) => string;
   num: boolean;
 }[] = [
   { key: "name", label: "NAME", fmt: (a) => a.name, num: false },
@@ -169,7 +169,7 @@ export function BrowseView({
   conditions,
   initialConditionKey = "",
 }: {
-  initialItems: AirfoilSummary[];
+  initialItems: CatalogRow[];
   initialTotal: number;
   initialRankingId?: string;
   categories: CategoryNode[];
@@ -199,7 +199,7 @@ export function BrowseView({
   const [filters, setFilters] = useState<Filters>(EMPTY_FILTERS);
   const [filterHashtags, setFilterHashtags] = useState<string[]>([]);
   const [focusedMetric, setFocusedMetric] = useState<MetricKey | null>(null);
-  const [preview, setPreview] = useState<AirfoilSummary | undefined>(
+  const [preview, setPreview] = useState<CatalogRow | undefined>(
     initialItems[0],
   );
   const selected = preview?.slug ?? "";
@@ -1126,7 +1126,7 @@ export function BrowseView({
                   </button>
                   <span className="airfoil-name-cell airfoil-cell airfoil-col-name">
                     <span className="airfoil-glyph">
-                      <AirfoilGlyph points={a.points} />
+                      <AirfoilGlyph outline={a.glyphPath} />
                     </span>
                     <span className="airfoil-name-wrap">
                       <span
@@ -1839,7 +1839,7 @@ function PreviewPane({
   conditionKey,
 }: {
   slug: string;
-  summary?: AirfoilSummary;
+  summary?: CatalogRow;
   conditionKey: string;
 }) {
   const [detail, setDetail] = useState<AirfoilDetailPayload | null>(null);
