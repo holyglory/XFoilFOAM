@@ -112,7 +112,7 @@ describe("per-point solver sequence panel", () => {
 
   it("keeps stage controls accessible without enlarging their visual glyphs and holds disclosure geometry stable", () => {
     expect(source).toMatch(
-      /\.stage-node \{[\s\S]*?width: 44px;[\s\S]*?height: 44px;/,
+      /\.row-track :global\(\.stage-node\) \{[\s\S]*?width: 44px;[\s\S]*?height: 44px;/,
     );
     expect(source).toContain("button.stage-node:hover::before");
     expect(source).toContain("inset: 9px");
