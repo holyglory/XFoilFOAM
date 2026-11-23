@@ -1035,7 +1035,7 @@ def test_api_running_guard_and_delete_status_codes():
     assert client.delete("/jobs/retention-api-missing").status_code == 404
 
 
-@pytest.mark.parametrize("mode", ["no-media", "rans-images", "urans-images", "urans-foreign-method", "urans-foreign-solver"])
+@pytest.mark.parametrize("mode", ["no-media", "rans-images", "urans-images", "urans-empty", "urans-foreign-method", "urans-foreign-solver"])
 def test_closed_progressive_exact_duplicates_require_whole_job_proof(tmp_path, monkeypatch, mode):
     keep_media = mode != "no-media"
     urans = mode.startswith("urans-")
@@ -1080,6 +1080,11 @@ def test_closed_progressive_exact_duplicates_require_whole_job_proof(tmp_path, m
                 protected[source] = source.read_bytes()
         link = post / "processor0/1/uniform"
         link.symlink_to("../../1/uniform", target_is_directory=True)
+        base_time = _write(case / "3180/uniform/time", b"original case time")
+        protected[base_time] = base_time.read_bytes()
+        base_link = case / "processor2/3180/uniform"
+        base_link.parent.mkdir(parents=True)
+        base_link.symlink_to("../../3180/uniform", target_is_directory=True)
     proofs, points = [], []
     retained = {}
     for index in (0, 1):
@@ -1088,7 +1093,7 @@ def test_closed_progressive_exact_duplicates_require_whole_job_proof(tmp_path, m
         folder = root / directory
         original = case / f"a{index}/images/pressure.png"
         scaled = folder / "scaled_media/default_v1_zoom2/v8/pressure.png"
-        has_images = keep_media and (not urans or index == 0)
+        has_images = keep_media and mode != "urans-empty" and (not urans or index == 0)
         pictures = [(original, b"engine image"), (scaled, b"scaled image")]
         if urans:
             pictures.append((folder / "scaled_media/default_v1_zoom2/v7/pressure.png", b"previous scale"))
@@ -1154,6 +1159,22 @@ def test_closed_progressive_exact_duplicates_require_whole_job_proof(tmp_path, m
             request(*args, **kwargs)
         return str(caught.value)
 
+    if mode == "urans-empty":
+        plan = request()
+        assert plan["mediaFiles"] == [] and set(plan["workingPaths"]) == {p.relative_to(root).as_posix() for p in duplicates}
+        unexpected = _write(case / "a0/images/unregistered.png", b"unique unregistered image")
+        refused(plan=plan["plan"])
+        assert all(p.is_file() for p in duplicates)
+        unexpected.unlink()
+        points[1].pop("images")
+        _write_json(root / "result.json", {"job_id": job, "state": "completed", "polars": [{"points": points}]})
+        assert "no instantaneous image inventory" in refused(plan=plan["plan"])
+        points[1]["images"] = {}
+        _write_json(root / "result.json", {"job_id": job, "state": "completed", "polars": [{"points": points}]})
+        done = request(plan=plan["plan"])
+        assert done["state"] == "reclaimed" and not any(p.exists() for p in duplicates)
+        assert request()["replayed"] and all(p.read_bytes() == data for p, data in protected.items())
+        return
     if mode in {"urans-foreign-method", "urans-foreign-solver"}:
         assert "does not own this transient solver" in refused()
         assert all(path.exists() for path in duplicates)
@@ -1189,6 +1210,11 @@ def test_closed_progressive_exact_duplicates_require_whole_job_proof(tmp_path, m
         foreign_vtk.mkdir()
         assert "unarchived case state" in refused()
         foreign_vtk.rmdir()
+        base_link.unlink()
+        base_link.symlink_to(post / "1/uniform", target_is_directory=True)
+        assert "symlink" in refused()
+        base_link.unlink()
+        base_link.symlink_to("../../3180/uniform", target_is_directory=True)
         intruder = _write(case / "a0/evidence/scaled_media/default_v1_zoom2/v7/unknown.png", b"foreign image")
         assert "unknown scaled-media field" in refused()
         intruder.unlink()
@@ -1277,6 +1303,7 @@ def test_closed_progressive_exact_duplicates_require_whole_job_proof(tmp_path, m
         assert not (post / "log.pimpleFoam").exists()
         assert all(p.read_bytes() == data for p, data in protected.items())
         assert link.is_symlink() and (link / "time").read_bytes() == b"1/uniform/time"
+        assert base_link.is_symlink() and (base_link / "time").read_bytes() == b"original case time"
     _write(copies[0], archived)
     refused(plan=plan["plan"])
     assert copies[0].is_file()

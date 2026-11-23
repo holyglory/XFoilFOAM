@@ -155,7 +155,6 @@ async function registeredImages(
      AND NOT EXISTS(SELECT 1 FROM result_media_storage_uploads u WHERE u.result_media_id=m.id)) AS ok
     FROM result_media m LEFT JOIN result_attempts a ON a.id=m.result_attempt_id LEFT JOIN results r ON r.id=m.result_id
     LEFT JOIN airfoils f ON f.id=a.airfoil_id LEFT JOIN field_color_scales s ON s.id=m.color_scale_id WHERE ${selected} ORDER BY m.id LIMIT 257`);
-  if (!rows.length) throw Error("The named job has no registered instantaneous PNGs");
   if (rows.length > 256) throw Error("The named job exceeds 256 registered instantaneous PNGs");
   if (rows.some((r) => r.ok !== true))
     throw Error(
@@ -236,7 +235,7 @@ async function readKeptMedia(
   historical = false,
 ) {
   if (
-    !plan.mediaFiles?.length ||
+    !Array.isArray(plan.mediaFiles) ||
     plan.mediaFiles.length > 512 ||
     (historical
       ? !/^[a-f0-9]{64}$/.test(plan.historicalPathsSha256 ?? "")
@@ -544,6 +543,7 @@ async function proofs(
   jobId: string,
   media: KeptImage[] = [],
   historical?: Map<string, HistoricalReceipt>,
+  inspectImages = false,
 ) {
   const prefix = `jobs/${jobId}/`;
   const [unprotected] = await db.execute(sql`SELECT EXISTS (
@@ -614,6 +614,10 @@ async function proofs(
     new Set(rows.map((r) => r.id)).size !== rows.length
   )
     throw new Error("Incomplete or ambiguous job point inventory");
+  // A deliberately empty set is meaningful only for a named URANS job.
+  // The native peer checks every signed manifest, engine point and physical path.
+  if (inspectImages && !media.length && (historical || rows.some((r) => r.regime !== "urans")))
+    throw Error("The named job has no registered instantaneous PNGs");
   const archives: Archive[] = rows.map((row) => {
     const signed = row.receipt as {
       receipt?: ProgressiveEvidenceCustodyReceipt;
@@ -694,7 +698,7 @@ async function proofs(
           generation: c.generation,
           historicalRaw: c,
           ...(row.regime === "urans" ? { regime: "urans" as const } : {}),
-          ...(media.length ? { keepMedia: kept } : {}),
+          ...(inspectImages ? { keepMedia: kept } : {}),
         },
       };
     }
@@ -765,8 +769,8 @@ async function proofs(
       manifest: {
         directory,
         catalogSha256: row.catalog_sha,
-        ...(media.length ? { keepMedia: kept } : {}),
-        ...(media.length && row.regime === "urans" ? { regime: "urans" as const } : {}),
+        ...(inspectImages ? { keepMedia: kept } : {}),
+        ...(inspectImages && row.regime === "urans" ? { regime: "urans" as const } : {}),
         manifestSha256: receipt.remote.manifestSha256,
         manifestByteSize: receipt.remote.manifestByteSize,
         brokeredUploadId: receipt.brokeredUploadId,
@@ -915,7 +919,7 @@ export async function closedProgressiveJob(
       throw new Error(
         "Job has active ownership, a retention refusal, unbound media or an existing completion",
       );
-    return proofs(tx, id, media, historical);
+    return proofs(tx, id, media, historical, options.keepMedia);
   });
   const manifests = source.archives.map((a) => a.manifest);
   const plan = await engine.reclaimClosedProgressiveFiles(id, manifests);
@@ -1111,7 +1115,7 @@ export async function closedProgressiveJob(
       sql`SELECT j.id FROM sim_jobs j WHERE j.id=${id}::uuid AND ${eligible(now, ageMs, undefined, media, options.historicalRaw)}`,
     );
     if (!ready) return false;
-    const fresh = await proofs(tx, id, media, historical);
+    const fresh = await proofs(tx, id, media, historical, options.keepMedia);
     if (options.keepMedia && !historical)
       await assertWorkingPathsUnreferenced(tx, id, plan.workingPaths!);
     options.signal?.throwIfAborted();
