@@ -1,5 +1,6 @@
 import { readWorkerReportVolume } from "./worker-report-volume";
 import { readLegacyWorkerReportArchiveText } from "./legacy-worker-report-read";
+import { readRegisteredWorkerReportArchiveText } from "./registered-worker-report-read";
 import { CRC32C } from "@google-cloud/storage";
 import { canonicalRemoteHubBaseUrl } from "@aerodb/core";
 import { verifyProgressiveRemoteExecution, type DB } from "@aerodb/db";
@@ -276,6 +277,16 @@ export async function readWorkerReportArchiveText(
   identity: ProgressiveReportArchiveReadIdentity & { signal?: AbortSignal },
   options: { upstreamOnly?: boolean } = {},
 ): Promise<string> {
+  if (
+    identity.sourceKind === "worker" &&
+    identity.archiveFormat === "jsonl" &&
+    typeof identity.objectKey === "string" &&
+    identity.objectKey.endsWith(
+      `/remote/${identity.executionId}/${identity.storedSha256}.jsonl.gz`,
+    )
+  ) {
+    return readRegisteredWorkerReportArchiveText(db, identity, options);
+  }
   assertArchive(identity, identity.executionId);
   if (
     identity.sourceKind !== "worker" ||

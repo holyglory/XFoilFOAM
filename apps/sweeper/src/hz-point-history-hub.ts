@@ -112,7 +112,7 @@ export class PointHistoryHubStorage extends HubWorkloadGcs {
 // A lost media/metadata response can follow a successful create-only upload.
 // Report only explicit fetch/stream transport failures. Validation errors
 // remain held, including a different owner, checksum or immutable generation.
-function historyHubFailure(error: unknown, operation: unknown) {
+export function historyHubFailure(error: unknown, operation: unknown) {
   if (error instanceof HistoryOperationError) {
     return {
       operation: error.operation,
