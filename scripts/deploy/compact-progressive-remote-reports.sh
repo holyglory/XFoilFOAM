@@ -342,10 +342,18 @@ cleanup() {
     printf 'CRITICAL: recovery incomplete (operation exit %s). Inspect the retained prior-state snapshot.\n' "$original_rc" >&2
   fi
   if [[ -n "$RUN_DIR" ]]; then
-    local receipt=result
+    local receipt=result pending_receipt
     if [[ "$restore_only" == true ]]; then receipt=recovery-result; fi
-    printf 'operation_exit=%s\nrecovery_failed=%s\nreadiness_failed=%s\nexit=%s\n' \
-      "$original_rc" "$failed" "$readiness_failed" "$final_rc" >"$RUN_DIR/$receipt.tmp" && mv "$RUN_DIR/$receipt.tmp" "$RUN_DIR/$receipt" || final_rc=18
+    pending_receipt="$RUN_DIR/$receipt.$BASHPID.tmp"
+    if printf 'operation_exit=%s\nrecovery_failed=%s\nreadiness_failed=%s\nexit=%s\n' \
+      "$original_rc" "$failed" "$readiness_failed" "$final_rc" >"$pending_receipt"; then
+      # All restoration checks are complete. Release our deployment lock before
+      # a detached observer can see the receipt and start the next operation.
+      exec 9>&-
+      mv -- "$pending_receipt" "$RUN_DIR/$receipt" || final_rc=18
+    else
+      final_rc=18
+    fi
   fi
   exit "$final_rc"
 }

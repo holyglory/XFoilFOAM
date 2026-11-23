@@ -3817,6 +3817,17 @@ def test_control_plane_deploy_compaction_preserves_existing_lock_and_recovery_co
 def test_control_plane_deploy_report_compaction_server_run_outlives_observer(tmp_path: Path) -> None:
     env = _compaction_harness(tmp_path)
     env["COMPACTION_SQL_WAIT"] = "1"
+    real_mv = shutil.which("mv")
+    assert real_mv
+    env["COMPACTION_REAL_MV"] = real_mv
+    _write_executable(tmp_path / "bin/mv", r'''#!/usr/bin/env python3
+import fcntl, os, sys
+from pathlib import Path
+if Path(sys.argv[-1]).name == 'result':
+    with open(os.environ['LOCK_FILE'], 'a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+os.execv(os.environ['COMPACTION_REAL_MV'], ['mv', *sys.argv[1:]])
+''')
     _write_executable(tmp_path / "bin/systemd-run", r'''#!/usr/bin/env python3
 import json, os, subprocess, sys
 from pathlib import Path
