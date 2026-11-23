@@ -15,6 +15,8 @@ import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { readSharedReport, SHARED_REPORT_FORMAT } from "./shared-report-archive";
+import { HubReportObjects } from "./shared-report-objects";
 
 const SHA256 = /^[a-f0-9]{64}$/;
 const GENERATION = /^[1-9][0-9]{0,19}$/;
@@ -214,7 +216,12 @@ export class ProgressiveReportArchiveStore {
     );
   }
 
-  async read(identity: ProgressiveReportArchiveReadIdentity): Promise<string> {
+  async read(identity: ProgressiveReportArchiveReadIdentity & { signal?: AbortSignal }): Promise<string> {
+    if (identity.archiveFormat === SHARED_REPORT_FORMAT) {
+      if (process.env.AIRFOILFOAM_DEPLOYMENT_ROLE === "remote-solver")
+        throw new Error("Shared report generations require the configured hub");
+      return readSharedReport(new HubReportObjects(this.bucketName, this.prefix, this.storage), identity, identity.signal);
+    }
     assertProgressiveReportArchiveIdentity(identity);
     const file = this.pinnedFile(identity);
     return readProgressiveReportArchiveText(

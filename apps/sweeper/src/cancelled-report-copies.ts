@@ -21,7 +21,7 @@ export const cancelledReportOwner = sql`job.status='cancelled' AND job."ingested
 
 // Every source must have its own physical receipt and bound raw archive. The
 // receipt-owning report stays inline. A single uncovered sibling holds this member.
-export const receiptedReportCopy = sql`EXISTS (
+export const scientificallyReceiptedReportCopy = sql`EXISTS (
   SELECT 1 FROM progressive_remote_report_inventories inventory
   JOIN progressive_remote_progress_receipts applied USING (sim_job_id,sequence)
   WHERE inventory.sim_job_id=r.sim_job_id AND inventory.sequence=r.sequence
@@ -48,6 +48,36 @@ export const receiptedReportCopy = sql`EXISTS (
         AND u.state='bound' AND u.verified_at IS NOT NULL
     )) FROM progressive_remote_report_sources s WHERE s.sim_job_id=r.sim_job_id AND s.sequence=r.sequence)
 ) AND EXISTS (SELECT 1 FROM progressive_remote_reports later WHERE later.sim_job_id=r.sim_job_id AND later.sequence>r.sequence)`;
+
+// The bundle is the immutable transport manifest. Every member is read back
+// from its pinned object before the archive transaction checks this predicate
+// again. Leave the first signed source for each point, actual receipt owners,
+// and the final report available to the outstanding scientific workflow.
+// No scientific or raw custody receipt is derived from this transport proof.
+export const repeatedStoppedSource = sql`EXISTS (
+  SELECT 1 FROM progressive_remote_report_inventories inv
+  JOIN progressive_remote_progress_receipts applied USING (sim_job_id,sequence)
+  WHERE inv.sim_job_id=r.sim_job_id AND inv.sequence=r.sequence
+    AND inv.report_content_signature=r.content_signature AND applied.content_signature=r.content_signature
+    AND inv.source_count>0 AND inv.source_count=(
+      SELECT count(*) FROM progressive_remote_report_sources s
+      WHERE s.sim_job_id=r.sim_job_id AND s.sequence=r.sequence AND EXISTS (
+        SELECT FROM progressive_remote_report_sources earlier
+        JOIN progressive_remote_reports warm USING (sim_job_id,sequence)
+        JOIN progressive_remote_report_inventories origin USING (sim_job_id,sequence)
+        JOIN progressive_remote_progress_receipts acknowledged USING (sim_job_id,sequence)
+        WHERE earlier.sim_job_id=s.sim_job_id AND earlier.point_content_signature=s.point_content_signature
+          AND earlier.sequence<s.sequence AND earlier.aoa_deg=s.aoa_deg
+          AND earlier.case_slug IS NOT DISTINCT FROM s.case_slug
+          AND warm.archived_at IS NULL AND warm.archive_bundle_id IS NULL
+          AND origin.report_content_signature=warm.content_signature AND acknowledged.content_signature=warm.content_signature)))
+  AND NOT EXISTS (SELECT FROM progressive_remote_evidence_receipts e WHERE e.sim_job_id=r.sim_job_id AND e.sequence=r.sequence)
+  AND NOT EXISTS (SELECT FROM progressive_remote_diagnostic_receipts d WHERE d.sim_job_id=r.sim_job_id AND d.sequence=r.sequence)
+  AND EXISTS (SELECT FROM progressive_remote_reports later WHERE later.sim_job_id=r.sim_job_id AND later.sequence>r.sequence)`;
+
+// The original GCS worker retains its original scientific selection. Pending
+// transport copies use the shared-result writer and separate read-through proof.
+export const receiptedReportCopy = scientificallyReceiptedReportCopy;
 
 /** Inspect a bounded page of the warm index. Only one job can own a bundle. */
 export async function nextCancelledReportCopies(
