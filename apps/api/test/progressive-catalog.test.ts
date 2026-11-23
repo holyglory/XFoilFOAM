@@ -733,6 +733,96 @@ async function verifyPublicCatalog(fullScale: boolean) {
             (condition) => condition.key === selected.key,
           ),
         ).toBe(true);
+        if (!fullScale) {
+          const app = Fastify();
+          try {
+            await registerRoutes(app);
+            const call = async (query: string) => {
+              const response = await app.inject({
+                url: `/api/airfoils?q=${prefix}&${query}`,
+              });
+              expect(response.statusCode).toBe(200);
+              return response.json();
+            };
+            const order = "sort=ldmax&dir=desc";
+            const original = await call(order);
+            expect(Object.keys(original)).toEqual(["items"]);
+            expect(
+              original.items.map((item: { id: string }) => item.id),
+            ).toEqual([profiles[1], profiles[0], profiles[2]]);
+            const page = await call(
+              `${order}&limit=1&includeTotal=true&retainSlug=${prefix}A`,
+            );
+            expect(page).toMatchObject({
+              total: 3,
+              items: [original.items[0]],
+              retained: original.items[1],
+            });
+            expect(page.rankingId).toMatch(/^[a-f0-9]{64}$/);
+            const secondPage = await call(
+              `${order}&limit=1&offset=1&includeTotal=true&retainSlug=${prefix}A`,
+            );
+            expect(secondPage).toEqual({
+              items: [original.items[1]],
+              total: 3,
+              rankingId: page.rankingId,
+              retained: null,
+            });
+            const selectedOrder = `${order}&metricConditionKey=${selected.key}&includePoints=false`;
+            const selectedAll = await call(selectedOrder);
+            const retained = await call(
+              `${selectedOrder}&limit=1&offset=20&includeTotal=true&retainSlug=${prefix}A`,
+            );
+            expect(retained).toMatchObject({
+              total: 3,
+              items: [],
+              retained: selectedAll.items[0],
+            });
+            expect(retained.retained).toMatchObject({
+              id: profiles[0],
+              ldmax: 50,
+              points: [],
+              metricCondition: { key: selected.key },
+            });
+            const keys = await call(`${order}&keysOnly=true`);
+            expect(keys).toEqual({
+              total: 3,
+              items: original.items.map(
+                ({ id, slug }: { id: string; slug: string }) => ({ id, slug }),
+              ),
+            });
+            expect(
+              await call(`${order}&keysOnly=true&limit=1&offset=2`),
+            ).toEqual({ total: 3, items: [keys.items[2]] });
+            const tag = randomUUID();
+            await connection.execute(
+              sql`INSERT INTO hashtags(id,slug,name) VALUES(${tag},${prefix},${prefix})`,
+            );
+            await connection.execute(
+              sql`INSERT INTO airfoil_hashtags(airfoil_id,hashtag_id) VALUES(${profiles[2]},${tag})`,
+            );
+            const tagged = await call(
+              `sort=name&limit=1&hashtags=${prefix},${prefix}&includeTotal=true&retainSlug=${prefix}Z`,
+            );
+            expect(tagged).toMatchObject({
+              total: 1,
+              retained: null,
+              items: [
+                { id: profiles[2], ldmax: null, hashtags: [{ id: tag }] },
+              ],
+            });
+            expect(tagged.rankingId).not.toBe(page.rankingId);
+            expect(
+              await call(`sort=name&keysOnly=true&hashtags=${prefix}`),
+            ).toEqual({ total: 1, items: [keys.items[2]] });
+            const none = await call(
+              "includeTotal=true&retainSlug=missing&hashtags=absent-" + prefix,
+            );
+            expect(none).toMatchObject({ items: [], total: 0, retained: null });
+          } finally {
+            await app.close();
+          }
+        }
         const ranked = await listAirfoils({
           q: prefix,
           sort: "ldmax",

@@ -75,7 +75,7 @@ import { makeEngineClient } from "./engine-client";
 import { MediaUpstreamError, mediaStore, resultMediaUrl } from "./media-store";
 import { createAirfoil, createAirfoilsBulk } from "./services/airfoils";
 import { assembleDetail } from "./services/detail";
-import { categoriesTree, listAirfoils } from "./services/catalog";
+import { categoriesTree, listAirfoilPage, listAirfoils } from "./services/catalog";
 import { listHashtags } from "./services/hashtags";
 import {
   mediumViscosityColumns,
@@ -868,6 +868,9 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
     const q = z
       .object({
         category: z.string().optional(),
+        includeTotal: z.enum(["true", "false"]).optional(),
+        keysOnly: z.enum(["true", "false"]).optional(),
+        retainSlug: z.string().optional(),
         includeSubcategories: z
           .enum(["true", "false"])
           .optional()
@@ -919,7 +922,10 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
         camberNegativeMax: numeric,
       })
       .parse(req.query);
-    return { items: await listAirfoils(q) };
+    const { includeTotal, keysOnly, retainSlug, ...opts } = q;
+    if (keysOnly === "true") return listAirfoilPage({ ...opts, keysOnly: true });
+    if (includeTotal === "true") return listAirfoilPage({ ...opts, retainSlug });
+    return { items: await listAirfoils(opts) };
   });
 
   // create one airfoil (NACA params or pasted coordinates)
