@@ -227,6 +227,27 @@ it("rebuilds and historically replays a receipt-bearing fitted history across sh
     const modelId = await storeProgressivePolarFit(db, hot, original, expected);
     expect(read).not.toHaveBeenCalled();
 
+    const rollbackScope = new Error("Restore verified fit after scope admission checks");
+    await expect(db.transaction(async tx => {
+      const scoped = tx as unknown as typeof db;
+      const acquireScoped = () => claimProgressivePolarFit(scoped, {
+        owner: "scoped-fit", leaseSeconds: 120, predictionId, requireCfdEvidence: true, archiveReader: reader,
+      });
+      const evidenceScans = () => tx.execute(sql`SELECT seq_scan,idx_scan FROM pg_stat_xact_user_tables
+        WHERE relid='progressive_cfd_evidence'::regclass`);
+      const before = await evidenceScans();
+      expect(await acquireScoped()).toBeNull();
+      expect(await evidenceScans()).toEqual(before);
+      await tx.execute(sql`UPDATE progressive_polar_fit_work SET model_id=NULL WHERE prediction_id=${predictionId}`);
+      const missingModel = await acquireScoped();
+      expect(missingModel?.source.signature).toBe(hot.source.signature);
+      expect(await acquireScoped()).toBeNull();
+      await tx.execute(sql`UPDATE progressive_polar_fit_work SET lease_until=clock_timestamp()-interval '1 second'
+        WHERE prediction_id=${predictionId}`);
+      expect((await acquireScoped())?.source.signature).toBe(hot.source.signature);
+      throw rollbackScope;
+    })).rejects.toBe(rollbackScope);
+
     vi.spyOn(apiAttemptEvidenceReader, "read").mockImplementation(
       store.read.bind(store),
     );
