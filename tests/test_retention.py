@@ -1015,7 +1015,19 @@ def test_api_strip_preserves_served_media_and_reports_maintenance():
     assert 0 <= disk["used_pct"] <= 100
 
 
-def test_api_running_guard_and_delete_status_codes():
+def test_api_running_guard_and_delete_status_codes(tmp_path):
+    from airfoilfoam.automatic_retention import direct_request, disposable
+    local = tmp_path / "legacy-mirror"
+    _write_json(local / "request.json", {})
+    _write_json(local / "status.json", {"job_id":local.name,"state":"cancelled","completed_cases":0})
+    _write(local / ".execute.lock", b"")
+    record = _write(local / "cases/c0/a0/evidence/historical_raw_custody.database.json", b"registered physical custody")
+    original = _write(record.parent / "engine_evidence.tar.zst", b"original stored bytes")
+    with pytest.raises(JobRetentionRefused):
+        disposable(local, None)
+    with pytest.raises(JobRetentionRefused):
+        strip_job_dir(local, keep_case_state=False, source_guard=direct_request)
+    assert original.read_bytes() == b"original stored bytes" and record.is_file()
     client = TestClient(app)
     running_id = "retention-api-running"
     running_root = _clean_store_job(running_id)
@@ -1086,6 +1098,9 @@ def test_closed_progressive_exact_duplicates_require_whole_job_proof(tmp_path, m
         base_link = case / "processor2/3180/uniform"
         base_link.parent.mkdir(parents=True)
         base_link.symlink_to("../../3180/uniform", target_is_directory=True)
+    cache_bytes = b"local-only cache data"
+    members.append({"path":"openfoam/postProcessing/historical_cache/member.bin","byteSize":len(cache_bytes),
+                    "sha256":sha(cache_bytes)})
     proofs, points = [], []
     retained = {}
     for index in (0, 1):
@@ -1359,6 +1374,14 @@ def test_closed_progressive_exact_duplicates_require_whole_job_proof(tmp_path, m
         assert "no instantaneous image inventory" in refused()
         points[1]["images"] = {}
         _write_json(root / "result.json", {"job_id": job, "state": "completed", "polars": [{"points": points}]})
+    local_archive = _write(case / "a0/evidence/engine_evidence.tar.zst", b"the sole native archive")
+    refused()
+    assert local_archive.read_bytes()==b"the sole native archive" and copies[0].exists()
+    local_archive.unlink()
+    cache_only = _write(post / "postProcessing/historical_cache/member.bin", cache_bytes)
+    assert "cache, raw, forensic or unsupported" in refused()
+    assert cache_only.read_bytes()==cache_bytes and copies[0].exists()
+    cache_only.unlink()
     refused(proofs[:1])
     refused([proofs[0], {**proofs[1], "catalogSha256": "0" * 64}])
     stored_result = json.loads((root / "result.json").read_bytes())

@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { existsSync } from "node:fs";
+import { accessSync, constants, existsSync, statSync } from "node:fs";
 import { isAbsolute, resolve } from "node:path";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
@@ -25,10 +25,24 @@ export class RetentionFiles implements ClosedProgressiveBackend {
     if (!isAbsolute(volume)) throw new Error("An absolute results volume is required");
   }
 
+  private python() {
+    return process.env.AIRFOILFOAM_RETENTION_PYTHON ||
+      (existsSync(installed) ? installed : resolve(sourceRoot, "../.venv/bin/python"));
+  }
+
+  available() {
+    try {
+      accessSync(this.python(), constants.X_OK);
+      accessSync(resolve(sourceRoot, "airfoilfoam/automatic_retention.py"), constants.R_OK);
+      return statSync(resolve(this.volume, "jobs")).isDirectory();
+    } catch {
+      return false;
+    }
+  }
+
   private async run<T>(packet: Packet, body?: ReadableStream<Uint8Array>, signal = this.signal): Promise<T | undefined> {
     signal?.throwIfAborted();
-    const python = process.env.AIRFOILFOAM_RETENTION_PYTHON ||
-      (existsSync(installed) ? installed : resolve(sourceRoot, "../.venv/bin/python"));
+    const python = this.python();
     const child = spawn(python, ["-IB", "-c", main, sourceRoot, this.volume], {
       stdio: ["pipe", "pipe", "ignore"], env: { PATH: process.env.PATH }, signal,
     });
@@ -67,12 +81,12 @@ export class RetentionFiles implements ClosedProgressiveBackend {
   }
 
   async reclaimClosedProgressiveFiles(job: string, manifests: ClosedProgressiveManifest[], plan?: string,
-                                     readbacks?: ClosedProgressiveReadback[]) {
+                                     readbacks?: ClosedProgressiveReadback[], signal?: AbortSignal) {
     const owner = this.owners.get(job);
     if (plan && !owner) throw new Error("Native file removal has no preview identity");
     const result = await this.run<ClosedProgressiveReclaimResponse>({
       action: "progressive", job, manifests, plan, readbacks, owner,
-    });
+    }, undefined, signal ?? this.signal);
     if (!result) throw new FileRetentionHold("native job directory is absent");
     if (!result.nativeOwner) throw new Error("Native peer omitted its worker lock identity");
     this.owners.set(job, result.nativeOwner);

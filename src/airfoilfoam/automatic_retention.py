@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import re
+import signal
 import stat
 import sys
 import tempfile
@@ -156,7 +157,7 @@ def plan_or_apply(root, packet):
 
 
 def direct_request(root):
-    raw, request = regular_json(root / "request.json", 2 * 1024 * 1024)
+    _, request = regular_json(root / "request.json", 2 * 1024 * 1024)
     require(isinstance(request, dict) and request.get("execution_id") is None and
             not any(k in request for k in ("remoteProgressiveExecution", "progressiveExecution", "executionContract")),
             "native request has a stable progressive execution owner")
@@ -164,7 +165,21 @@ def direct_request(root):
     # if an old or incomplete request does not contain the execution marker.
     require(not any(p.name.startswith(("closed_progressive_", "historical_raw_")) for p in root.iterdir()),
             "native job has closed progressive custody records")
-    return raw
+    cases = root / "cases"
+    if cases.exists():
+        require(cases.resolve(strict=True) == cases and cases.is_dir(), "unsafe case directory")
+        for folder in cases.rglob("evidence"):
+            require(folder.resolve(strict=True) == folder, "redirected native evidence")
+            for marker in ("historical_raw_custody.database.json", "incomplete_evidence_quarantine.receipt.json",
+                           "orphan_evidence_quarantine.receipt.json"):
+                require(not (folder / marker).exists(), "another workflow owns this evidence directory")
+            binding = folder / "brokered_hub_binding.database.json"
+            if binding.exists():
+                _, ack = regular_json(binding, 65536)
+                require(ack.get("state") != "hub_progressive_custody" and
+                        ack.get("authorization",{}).get("receipt",{}).get("kind") != "hub-progressive-evidence-custody",
+                        "native point has a registered progressive owner")
+    return request
 
 
 def disposable(root, cutoff):
@@ -180,29 +195,51 @@ def disposable(root, cutoff):
     require(all(p.name in allowed for p in root.iterdir()), "directory contains local scientific files or unowned state")
     direct_request(root)
     with named_owner(root, None, True, allow_create=True):
-        direct_request(root)
+        request = direct_request(root)
+        if cutoff is not None and request:
+            _, never_started = regular_json(root / ".execution-not-started.json", 4096)
+            require(never_started == {"version":1,"job_id":root.name}, "unregistered request has no exact never-started marker")
         _, status = regular_json(root / "status.json", 1024 * 1024)
         require(status.get("job_id") == root.name and status.get("state") in {"failed","cancelled","completed"}
                 and status.get("completed_cases", 0) == 0, "job has a live execution or completed scientific cases")
         require(not any(status.get(k) for k in ("forces", "polars", "results", "evidence_artifacts", "frame_track",
                         "force_history", "steady_history", "solver_budget_progress")), "status contains solver evidence")
+        # A nonempty lockfile or unfamiliar status field can itself contain local-only diagnostics.
+        safe_status = {"job_id","state","phase","total_cases","completed_cases","message","task_id","queued_at","started_at",
+                       "updated_at","phase_started_at","last_progress_at","active_solver","active_case_slug","active_aoa_deg",
+                       "active_pids","cpu_tokens_waiting","cpu_tokens_held","scheduling","requested_engine","engine",
+                       "execution_pool","requested_execution_pool","solver_budget_progress","solver_budget_error",
+                       "mesh_recovery_version","failure_disposition","continuation_failure_kind"}
+        require(not (set(status)-safe_status) and not any(status.get(k) for k in
+                ("active_pids","cpu_tokens_held","failure_disposition","continuation_failure_kind","solver_budget_error")),
+                "unknown status evidence or active physical work remains")
         files = {}
         for path in root.iterdir():
             st = path.lstat()
             require(path.name in allowed and stat.S_ISREG(st.st_mode) and st.st_nlink == 1 and path.resolve() == path,
                     "directory contains local results, scientific files, or unowned state")
+            if path.name in {".execute.lock", ".publication.lock"}:
+                require(st.st_size == 0, "nonempty lock metadata may contain evidence")
+            if path.name == "cancelled":
+                require(st.st_size <= 1024, "unexpected cancellation record")
             files[path] = st
         require(all(os.path.samestat(st,path.lstat()) and st.st_ctime_ns==path.lstat().st_ctime_ns for path,st in files.items()),
                 "disposable file set changed")
         require(set(root.iterdir()) == set(files), "disposable directory contents changed")
         # Keep the locked inode until all other identified metadata is gone.
         for path in sorted(files, key=lambda p: p.name == ".execute.lock"):
+            current = path.lstat()
+            require(os.path.samestat(current, files[path]) and current.st_ctime_ns == files[path].st_ctime_ns,
+                    "disposable metadata changed before removal")
             path.unlink()
         root.rmdir()
         return {"state":"removed","files":len(files),"allocatedBytes":sum(st.st_blocks * 512 for st in files.values())}
 
 
 def main():
+    def interrupted(_signum, _frame):
+        raise SystemExit(143)
+    signal.signal(signal.SIGTERM, interrupted)  # unwind scratch-file contexts on a normal service stop
     stream = sys.stdin.buffer
     try:
         line = stream.readline(8 * 1024**2 + 1)
@@ -228,7 +265,12 @@ def main():
             require(type(packet.get("keepCaseState")) is bool, "invalid legacy strip mode")
             # The caller's DB ownership check and the native request check are
             # independent. The native check and existing strip share the worker lock.
-            result = strip_job_dir(root, packet["keepCaseState"], source_guard=direct_request).to_dict()
+            with named_owner(root, None, False) as scope:
+                def still_direct(directory):
+                    require(inode(directory) == scope["job"] and inode(directory / ".execute.lock") == scope["lock"],
+                            "legacy source or worker lock changed")
+                    direct_request(directory)
+                result = strip_job_dir(root, packet["keepCaseState"], source_guard=still_direct).to_dict()
         else:
             raise JobRetentionRefused("unknown normal retention action")
         print(json.dumps({"result":result}, separators=(",",":")))

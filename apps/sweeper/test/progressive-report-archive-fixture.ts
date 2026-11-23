@@ -51,6 +51,42 @@ export interface ArchiveFixture {
   }[];
 }
 
+/** The role savepoint shares one physical DB and one unique attempt slot for this job/result/AoA.
+ * Only the unselected failed stub created by withArchiveFixture can occupy that slot.
+ * Insert the independent hub ID; keep all constraints and both roles' production readers active. */
+export async function insertHubArchiveFixtureAttempt(
+  hub: DB, executionId: string, workerAttempt: string, hubAttempt: string,
+) {
+  if (process.env.AIRFOILFOAM_DEPLOYMENT_ROLE !== "hub" || workerAttempt === hubAttempt)
+    throw new Error("An independent hub fixture attempt is required");
+  // The hub owns its dispatch; the worker-only fields belong to the outer, rolled-back-to snapshot.
+  await hub.execute(sql`UPDATE sim_jobs SET request_payload=request_payload-'remoteSolver'-'syncPromiseId'-'upstreamBaseUrl'
+    WHERE id=${executionId}::uuid`);
+  const [copy] = await hub.execute(sql`WITH native_fixture AS (
+    DELETE FROM result_attempts a
+    WHERE a.id=${workerAttempt}::uuid AND a.sim_job_id=${executionId}::uuid AND a.engine_job_id=${executionId}
+      AND a.status='failed' AND NOT a.valid_for_polar AND a.error='retained archive regression diagnostic'
+      AND NOT EXISTS(SELECT FROM results r WHERE r.current_result_attempt_id=a.id)
+      AND NOT EXISTS(SELECT FROM progressive_worker_evidence_attempts s WHERE s.result_attempt_id=a.id)
+      AND NOT EXISTS(SELECT FROM progressive_worker_hub_receipts h WHERE h.result_attempt_id=a.id)
+    RETURNING a.*
+  ), canonical_fixture AS (
+    INSERT INTO result_attempts
+    SELECT (jsonb_populate_record(NULL::result_attempts,to_jsonb(n)||jsonb_build_object('id',${hubAttempt}::uuid))).*
+    FROM native_fixture n RETURNING *
+  )
+  SELECT c.id,(to_jsonb(c)-'id')::text=(to_jsonb(n)-'id')::text AS exact FROM canonical_fixture c CROSS JOIN native_fixture n`);
+  if (copy?.id !== hubAttempt || copy.exact !== true)
+    throw new Error("The hub fixture did not retain the exact failed source under its own ID");
+}
+
+export async function archiveFixtureAttemptIdentity(db: DB, workerAttempt: string, hubAttempt: string) {
+  return db.execute(sql`SELECT encode(sha256(convert_to(to_jsonb(a)::text,'UTF8')),'hex') AS attempt_sha,
+    d.material_domain,EXISTS(SELECT FROM result_attempts WHERE id=${hubAttempt}::uuid) AS hub_attempt_present
+    FROM result_attempts a JOIN progressive_worker_delivery_diagnostics d ON d.result_attempt_id=a.id
+    WHERE a.id=${workerAttempt}::uuid`);
+}
+
 /** Reuse the exact setup fixture, with real migrated report tables/triggers.
  * Everything, including singleton normalization and immutable archives, rolls
  * back in the ordinary suite. The named paired-database acceptance explicitly
