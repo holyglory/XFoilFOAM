@@ -52,6 +52,28 @@ async function expectParity() {
   expect(r).toEqual({ missing: 0, extra: 0 });
 }
 
+async function verifyBusyViewSwitch(operation: "enable" | "disable") {
+  const reader = await sql.reserve();
+  const operator = createClient({ url: targetUrl.toString(), max: 1,
+    connection: { lock_timeout: "0", statement_timeout: "2500" } });
+  const state = () => sql`SELECT reads_enabled,parity_checked_at,parity_count FROM progressive_worker_staging_key_backfill`;
+  try {
+    await reader`BEGIN READ ONLY`;
+    await reader`SELECT 1 FROM public.progressive_worker_staging_candidates LIMIT 1`;
+    const before = await state();
+    // A real poll is still using the view. New polls must not queue behind a
+    // view replacement until the operator's outer statement deadline.
+    await expect(maintainWorkerStagingKeys(operator.sql, operation, { instance }))
+      .rejects.toMatchObject({ code: "55P03" });
+    expect(await state()).toEqual(before);
+    expect(await operator.sql`SELECT current_setting('lock_timeout') AS timeout`).toEqual([{ timeout: "0" }]);
+  } finally {
+    await reader`ROLLBACK`;
+    reader.release();
+    await operator.sql.end();
+  }
+}
+
 beforeAll(async () => {
   await admin.sql.unsafe('CREATE DATABASE "' + databaseName + '"');
   await sql`CREATE TABLE progressive_worker_reports (
@@ -242,7 +264,9 @@ it("keeps the original read view until a lossless, restartable bootstrap and han
   const before =
     await sql`SELECT sequence::int seq,created_at::text at,stopped_engine_job_id stop
     FROM progressive_worker_staging_candidates ORDER BY created_at,sim_job_id,sequence`;
+  await verifyBusyViewSwitch("enable");
   await maintainWorkerStagingKeys(sql, "enable", { instance });
+  await verifyBusyViewSwitch("disable");
   const after =
     await sql`SELECT sequence::int seq,created_at::text at,stopped_engine_job_id stop
     FROM progressive_worker_staging_candidates ORDER BY created_at,sim_job_id,sequence`;

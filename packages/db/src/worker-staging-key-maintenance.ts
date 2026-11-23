@@ -241,6 +241,16 @@ export type StagingKeyOperation =
   | "disable"
   | "retire"
   | "restore";
+
+async function switchReads(session: Connection, enabled: boolean) {
+  // CREATE OR REPLACE VIEW needs an exclusive lock. Bound how long new polls
+  // can queue behind it when a previous read is still running. Keep a tighter
+  // operator setting, and let the enclosing transaction restore it on exit.
+  await session`SELECT set_config('lock_timeout','250ms',true) FROM pg_settings
+    WHERE name='lock_timeout' AND (setting::integer=0 OR setting::integer>250)`;
+  await session`SELECT public.set_progressive_worker_staging_key_reads(${enabled})`;
+}
+
 export async function maintainWorkerStagingKeys(
   client: Sql,
   operation: StagingKeyOperation,
@@ -289,13 +299,13 @@ export async function maintainWorkerStagingKeys(
           throw new Error(
             "Restore source staging indexes before disabling key reads",
           );
-      await session`SELECT public.set_progressive_worker_staging_key_reads(false)`;
+      await transaction(session, false, () => switchReads(session, false));
     } else if (operation === "enable") {
       if (!state.reads_enabled)
         await transaction(session, false, async () => {
           const count = await verifyRows(session);
           await session`UPDATE public.progressive_worker_staging_key_backfill SET parity_count=${count},parity_checked_at=clock_timestamp() WHERE singleton`;
-          await session`SELECT public.set_progressive_worker_staging_key_reads(true)`;
+          await switchReads(session, true);
         });
     } else {
       if (!state.reads_enabled || !state.complete)

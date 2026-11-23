@@ -6,7 +6,9 @@ Use this option when worker staging or delivery wake polls repeatedly scan retai
 
 ## Install and backfill
 
-The worker wrapper holds a shared deployment lock from role selection through each metadata command. Ordinary archive readers can continue. A real deployment or exclusive maintenance window returns exit 9 before the operator connects. PostgreSQL serializes state changes with its staging advisory lock and backfill cursor row. The separate index retirement and restoration operations retain their exclusive host fence. Retirement also verifies the exact serving release and both running readers.
+The worker wrapper holds a shared deployment lock from role selection through each non-status metadata command. Ordinary archive readers can continue. A real deployment or exclusive maintenance window returns exit 9 before the operator connects. PostgreSQL serializes state changes with its staging advisory lock and backfill cursor row. The separate index retirement and restoration operations retain their exclusive host fence. Retirement also verifies the exact serving release and both running readers.
+
+When enabling or disabling key reads, the operator limits the view replacement's database lock wait to 250 ms or the session's shorter limit. A busy view returns a lock timeout and rolls back the switch and its parity timestamp together. Run the same action again when the existing reader finishes.
 
 1. Deploy migration `0218_worker_report_staging_keys.sql` before deploying callers that use the new candidate view. The migration installs the source-backed view, an empty key table and two disabled tracking triggers. It creates no checkpoint or keys. A hub-only installation has no tracking writes. The first worker backfill, or an explicit `start INSTANCE_UUID`, enables tracking for that registered instance in a short transaction using a nonwaiting source-table lock. Backfill starts after that transaction commits.
 2. Run `scripts/deploy/worker-report-staging-keys.sh status` on the registered worker. The application may continue writing and using the source-backed view.
