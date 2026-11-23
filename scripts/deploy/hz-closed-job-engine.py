@@ -65,6 +65,9 @@ def run_engine(scope, packet, source, settings):
             (keep_media and not scope.get("historicalRaw") and isinstance(preserved,str) and
              re.fullmatch(r"cases/[A-Za-z0-9_.-]+/transient_a[0-9]+",preserved) and
              not any(p in (".","..") for p in preserved.split("/")))), "signed unreported solver scope differs")
+    linked=scope.get("linkedContinuation")
+    require(req.get("linkedContinuation")==linked and (linked is None or preserved is not None),
+            "signed continuation scope differs")
     historical=scope.get("historicalRaw") is True
     require((req.get("historicalRaw") is True)==historical and any("historicalRaw" in m for m in manifests)==historical,
             "historical proof belongs to another scope")
@@ -106,7 +109,7 @@ def run_engine(scope, packet, source, settings):
         module.__package__ = "airfoilfoam"
         exec(compile(source, "<closed-progressive-retention>", "exec"), module.__dict__)
         result = module.reclaim_closed_progressive_files(root, req["manifests"], plan, req["readbacks"],
-                                                        lock_identity=scope["lockInode"], preserve_solver=preserved)
+                                                        lock_identity=scope["lockInode"], preserve_solver=preserved, linked_continuation=linked)
         require(inode(lock) == scope["lockInode"], "execution lock was replaced")
     finally:
         os.close(descriptor)

@@ -608,7 +608,7 @@ it("binds an explicitly empty URANS image set to its normal per-job proof", asyn
   });
 }, 30000);
 
-it("keeps an unreported solver readable and records only its signed siblings as released", async () => {
+it.each([false,true])("keeps an unreported solver readable and records only its signed siblings as released (linked continuation %s)", async (linked) => {
   await client.db.transaction(async (tx) => {
     const db = tx as unknown as DB;
     for (const definition of tableDefinitions)
@@ -621,9 +621,19 @@ it("keeps an unreported solver readable and records only its signed siblings as 
     const [signed] = await fixture(db, id, 1);
     await db.execute(sql`UPDATE sim_jobs SET status='cancelled' WHERE id=${id}`);
     await db.execute(sql`UPDATE result_attempts SET regime='urans' WHERE id=${signed!.attempt}`);
+    const child = randomUUID(), childCase = "foil_a12", childPromise = randomUUID();
+    if (linked) {
+      const foil = randomUUID(), revision = randomUUID();
+      await db.execute(sql`ALTER TABLE sim_jobs ADD airfoil_id uuid,ADD simulation_preset_revision_id uuid,ADD engine_state text`);
+      await db.execute(sql`UPDATE sim_jobs SET airfoil_id=${foil},simulation_preset_revision_id=${revision},engine_state='cancelled' WHERE id=${id}`);
+      await db.execute(sql`INSERT INTO sync_sweep_promises VALUES(${childPromise},${root},${solver},'expired')`);
+      const req={syncPromiseId:childPromise,upstreamBaseUrl:root,engineRequest:{continue_from:{engine_job_id:id,case_slug:"foil"}}};
+      await db.execute(sql`INSERT INTO sim_jobs(id,status,engine_job_id,engine_state,airfoil_id,simulation_preset_revision_id,request_payload)
+        VALUES(${child},'cancelled',${child},'failed',${foil},${revision},${JSON.stringify(req)}::jsonb)`);
+    }
     const directory = "cases/foil/transient_a1";
     const sample = { path: directory + "/postProcessing/forces/0/coefficient.dat", sha256: sha("0.1 0.03"), byteSize: 8 };
-    const kept = { directory, treeSha256: "a".repeat(64), entries: 6, files: 2, byteSize: 80, allocatedBytes: 8192, sample };
+    const kept = { directory, treeSha256: "a".repeat(64), entries: 6, files: 2, byteSize: 80, allocatedBytes: 8192, sample, ...(linked?{linkedContinuation:{jobId:child,caseSlug:childCase,sharedFiles:2,otherLinks:3,pathSetSha256:"d".repeat(64)}}:{}) };
     const unit = {unitId:randomUUID(),token:randomUUID(),alpha:0,activeBudgetSeconds:900};
     const envelope = sealProgressiveRemoteExecution({solverId:solver,promiseId,scope:{executionContract:"progressive-cfd-v1",
       executionId:id,epochId:randomUUID(),generationId:randomUUID(),targetId:"a".repeat(64),recipeId:"b".repeat(64),stage:2,
@@ -633,8 +643,9 @@ it("keeps an unreported solver readable and records only its signed siblings as 
     await db.execute(sql`UPDATE sim_jobs SET request_payload=request_payload||${JSON.stringify({remoteSolver:true,remoteProgressiveExecution:envelope})}::jsonb WHERE id=${id}`);
     await db.execute(sql`ALTER TABLE progressive_worker_reports ADD sequence bigint,ADD content_signature text,ADD assignment_signature text`);
     await db.execute(sql`UPDATE progressive_worker_reports SET sequence=1,content_signature=${sha("report")},assignment_signature=${envelope.contentSignature}`);
-    let applied = 0, broken = false, overlap = false;
+    let applied = 0, broken = false, overlap = false, childBusyAfterFetch = false;
     let hubState = "active", hubJob = "cancelled", stopped = true, hubSequence = 1, foreign = false, http = 200, resumeOnDownload = false;
+    let changeAfterRead: "report" | "envelope" | null = null, sawDownload = false;
     const originalRole = process.env.AIRFOILFOAM_DEPLOYMENT_ROLE;
     process.env.AIRFOILFOAM_DEPLOYMENT_ROLE = "remote-solver";
     const backend: ClosedProgressiveBackend = {
@@ -656,26 +667,34 @@ it("keeps an unreported solver readable and records only its signed siblings as 
       routes.push(path);
       if (path === `/api/sync/v1/progressive-executions/${id}`) {
         expect(new Headers(init?.headers).get("x-xfoilfoam-solver-token")).toBe(token);
+        if (sawDownload && changeAfterRead === "report")
+          await db.execute(sql`UPDATE progressive_worker_reports SET content_signature=${sha("different stop")}`);
+        if (sawDownload && changeAfterRead === "envelope")
+          await db.execute(sql`UPDATE sim_jobs SET request_payload=jsonb_set(request_payload,
+            '{remoteProgressiveExecution,request,airfoil,name}','"changed after the registered read"') WHERE id=${id}`);
+
         if (http !== 200) return Response.json({error:"unavailable"}, {status:http});
         return Response.json({assignment:{envelope:foreign?{...envelope,promiseId:randomUUID()}:envelope,
           receivedSequence:hubSequence,executionStopped:stopped,job:{status:hubJob,engineState:"cancelled"},promise:{id:promiseId,status:hubState}},
           continuation:{kind:"stop"}});
       }
       if (path.endsWith("/download")) {
+        sawDownload = true;
         if (resumeOnDownload) hubState="active";
+        if (childBusyAfterFetch) await db.execute(sql`UPDATE sim_jobs SET status='ingesting',ingest_lease_token=${randomUUID()},ingest_lease_expires_at=clock_timestamp()+interval '10 minutes' WHERE id=${child}`);
         return new Response(signed!.upload, {headers: {"content-type":"application/zstd","content-length":String(signed!.upload.length),
           "x-content-sha256":signed!.remote.storedSha256,"x-gcs-generation":signed!.remote.generation}});
       }
       expect(path.endsWith(sample.path)).toBe(true);
       return new Response(broken ? "different" : "0.1 0.03", {headers:{"content-length":"8"}});
     });
-    const options = {now:clock,ageMs:1,timeoutMs:3000,keepMedia:true,preserveSolver:directory};
+    const options = {now:clock,ageMs:1,timeoutMs:3000,keepMedia:true,preserveSolver:directory,...(linked?{linkedContinuation:child+"/"+childCase}:{})};
     try {
       const preview = await closedProgressiveJob(db,backend,id,{...options,inspect:true});
       const pinned = {...options, expectedPlan:preview.plan.plan!,expectedMediaSha256:preview.mediaSha256,expectedScientificSha256:preview.scientificSha256};
       expect(routes).toContain(`/jobs/${id}/files/${sample.path}`);
       expect(routes).toContain(`/api/media/jobs/${id}/${sample.path}`);
-      await expect(closedProgressiveJob(db,backend,id,{...options,inspect:true,preserveSolver:undefined})).rejects.toThrow(/Unexpected preserved/);
+      await expect(closedProgressiveJob(db,backend,id,{...options,inspect:true,preserveSolver:undefined,linkedContinuation:undefined})).rejects.toThrow(/Unexpected preserved|continuation links differ/);
       await expect(closedProgressiveJob(db,backend,id,{...options,inspect:true,preserveSolver:"cases/foil/transient_a0"})).rejects.toThrow(/next unreported/);
       await expect(closedProgressiveJob(db,backend,id,options)).rejects.toThrow(/exact plan/);
       overlap = true;
@@ -683,7 +702,7 @@ it("keeps an unreported solver readable and records only its signed siblings as 
       overlap = false;broken = true;
       await expect(closedProgressiveJob(db,backend,id,pinned)).rejects.toThrow();
       broken = false;
-      await db.execute(sql`UPDATE sync_sweep_promises SET status='active'`);
+      await db.execute(sql`UPDATE sync_sweep_promises SET status='active' WHERE id=${promiseId}`);
       await expect(closedProgressiveJob(db,backend,id,pinned)).rejects.toThrow(/active ownership/);
       hubState="cancelled";hubJob="ingesting";
       await expect(closedProgressiveJob(db,backend,id,pinned)).rejects.toThrow(/active ownership/);
@@ -695,20 +714,56 @@ it("keeps an unreported solver readable and records only its signed siblings as 
       await expect(closedProgressiveJob(db,backend,id,pinned)).rejects.toThrow(/HTTP 403/);
       http=200;foreign=true;
       await expect(closedProgressiveJob(db,backend,id,pinned)).rejects.toThrow(/stored assignment/);
-      foreign=false;resumeOnDownload=true;
-      await expect(closedProgressiveJob(db,backend,id,pinned)).rejects.toThrow(/active ownership/);
+      foreign=false;
+      await db.execute(sql`UPDATE sync_api_settings SET remote_solver_transfer_paused=true`);
+      const readsBeforePause=routes.length;
+      await expect(closedProgressiveJob(db,backend,id,pinned)).rejects.toThrow(/paused/);
+      expect(routes).toHaveLength(readsBeforePause);
+      await db.execute(sql`UPDATE sync_api_settings SET remote_solver_transfer_paused=false`);
+      const stalePreview=await closedProgressiveJob(db,backend,id,{...options,inspect:true});
+      expect(stalePreview.registeredTerminalPromiseSha256).toMatch(/^[a-f0-9]{64}$/);
+      const bound={...pinned,expectedRegisteredStopSha256:stalePreview.registeredTerminalPromiseSha256!};
+      await expect(closedProgressiveJob(db,backend,id,pinned)).rejects.toThrow(/pinned read-only proof/);
+      await expect(closedProgressiveJob(db,backend,id,{...bound,expectedRegisteredStopSha256:"0".repeat(64)})).rejects.toThrow(/pinned read-only proof/);
+      resumeOnDownload=true;
+      await expect(closedProgressiveJob(db,backend,id,bound)).rejects.toThrow(/active ownership/);
       resumeOnDownload=false;hubState="cancelled";
+      for (const change of ["report","envelope"] as const) {
+        sawDownload=false;changeAfterRead=change;
+        expect((await closedProgressiveJob(db,backend,id,bound)).settled).toBe(false);
+        await db.execute(sql`UPDATE progressive_worker_reports SET content_signature=${sha("report")}`);
+        await db.execute(sql`UPDATE sim_jobs SET request_payload=jsonb_set(request_payload,'{remoteProgressiveExecution}',${JSON.stringify(envelope)}::jsonb)
+          WHERE id=${id}`);
+      }
+      changeAfterRead=null;
       await db.execute(sql`UPDATE progressive_worker_reports SET acknowledged_at=NULL`);
       await expect(closedProgressiveJob(db,backend,id,pinned)).rejects.toThrow(/acknowledged stop/);
       await db.execute(sql`UPDATE progressive_worker_reports SET acknowledged_at=clock_timestamp()`);
       expect(applied).toBe(0);
-      const settled=await closedProgressiveJob(db,backend,id,pinned);
+      if (linked) {
+        await expect(closedProgressiveJob(db,backend,id,{...bound,linkedContinuation:randomUUID()+"/"+childCase})).rejects.toThrow(/does not own/);
+        await expect(closedProgressiveJob(db,backend,id,{...bound,linkedContinuation:child+"/wrong"})).rejects.toThrow(/links differ/);
+        await db.execute(sql`UPDATE sim_jobs SET request_payload=jsonb_set(request_payload,'{engineRequest,continue_from,engine_job_id}',to_jsonb(${randomUUID()}::text)) WHERE id=${child}`);
+        await expect(closedProgressiveJob(db,backend,id,bound)).rejects.toThrow(/does not own/);
+        await db.execute(sql`UPDATE sim_jobs SET request_payload=jsonb_set(request_payload,'{engineRequest,continue_from,engine_job_id}',to_jsonb(${id}::text)) WHERE id=${child}`);
+        childBusyAfterFetch=true;
+        await expect(closedProgressiveJob(db,backend,id,bound)).rejects.toThrow(/busy/);
+        childBusyAfterFetch=false;
+        await db.execute(sql`UPDATE sim_jobs SET status='cancelled',ingest_lease_token=NULL,ingest_lease_expires_at=NULL WHERE id=${child}`);
+        expect(applied).toBe(0);
+      }
+      const settled=await closedProgressiveJob(db,backend,id,bound);
       expect(settled.settled).toBe(true);
       expect(settled.registeredTerminalPromise).toMatchObject({promiseId,executionId:id,solverId:solver,receivedSequence:1,
         assignmentSignature:envelope.contentSignature,stoppedReportSignature:sha("report"),promiseState:"cancelled"});
       const [unchanged]=await db.execute(sql`SELECT status FROM sync_sweep_promises WHERE id=${promiseId}`);
       expect(unchanged!.status).toBe("active");
-      const after = await closedProgressiveJob(db,backend,id,{...pinned,inspect:true,verifyCompleted:true});
+      await db.execute(sql`UPDATE sync_sweep_promises SET status='cancelled' WHERE id=${promiseId}`);
+      hubSequence=2;
+      await expect(closedProgressiveJob(db,backend,id,{...bound,inspect:true,verifyCompleted:true})).rejects.toThrow(/active ownership/);
+      hubSequence=1;
+      const after = await closedProgressiveJob(db,backend,id,{...bound,inspect:true,verifyCompleted:true});
+      expect(after.registeredTerminalPromiseSha256).toBe(stalePreview.registeredTerminalPromiseSha256);
       expect(after.plan.preservedSolver).toEqual(kept);
       const [job] = await db.execute(sql`SELECT stripped_at,strip_report FROM sim_jobs WHERE id=${id}`);
       expect(job!.stripped_at).toBeNull();

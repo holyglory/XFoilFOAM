@@ -6,6 +6,7 @@ import fcntl
 import base64
 import hashlib
 import io
+import os
 import tarfile
 from pathlib import Path
 
@@ -1035,7 +1036,7 @@ def test_api_running_guard_and_delete_status_codes():
     assert client.delete("/jobs/retention-api-missing").status_code == 404
 
 
-@pytest.mark.parametrize("mode", ["no-media", "rans-images", "urans-images", "urans-empty", "urans-preserve-next", "urans-foreign-method", "urans-foreign-solver"])
+@pytest.mark.parametrize("mode", ["no-media", "rans-images", "urans-images", "urans-empty", "urans-preserve-next", "urans-preserve-linked", "urans-foreign-method", "urans-foreign-solver"])
 def test_closed_progressive_exact_duplicates_require_whole_job_proof(tmp_path, monkeypatch, mode):
     keep_media = mode != "no-media"
     urans = mode.startswith("urans-")
@@ -1144,12 +1145,15 @@ def test_closed_progressive_exact_duplicates_require_whole_job_proof(tmp_path, m
              "jobInode": peer["inode"](root), "lockInode": peer["inode"](lockpath)}
     readbacks = [dict(brokeredUploadId=p["brokeredUploadId"], generation=p["generation"], storedSha256=sha(b"gzip"),
                       storedByteSize=4, verifiedAt=datetime.now(timezone.utc).isoformat()) for p in proofs]
-    preserve_directory = "cases/foil/transient_a2" if mode == "urans-preserve-next" else None
+    preserve_directory = "cases/foil/transient_a2" if mode in {"urans-preserve-next", "urans-preserve-linked"} else None
+    child_id = "adf10a20-1b23-463c-8027-000000000041"
+    linked_owner = child_id + "/foil_a12" if mode == "urans-preserve-linked" else None
     def request(proof_list=proofs, plan=None, objects=readbacks, mode=None, token="fixture-control", peer_scope=None,
-                preserve=preserve_directory):
+                preserve=preserve_directory, continuation=linked_owner):
         mode = mode or ("reclaim" if plan else "proof")
-        ctx = {**scope, "mode": mode, "plan": plan, "preserveSolver": preserve, **(peer_scope or {})}
-        body = json.dumps({"keepMedia":keep_media,"preserveSolver":preserve,"id": job, "step": 2 if plan else 1, "helper": scope["helper"], "mode": mode,
+        linked = continuation if preserve is not None else None
+        ctx = {**scope, "mode": mode, "plan": plan, "preserveSolver": preserve, "linkedContinuation": linked, **(peer_scope or {})}
+        body = json.dumps({"keepMedia":keep_media,"preserveSolver":preserve,"linkedContinuation":linked,"id": job, "step": 2 if plan else 1, "helper": scope["helper"], "mode": mode,
                            "expectedPlan": plan, "manifests": proof_list, "readbacks": objects if plan else []})
         packet = {"body": body, "mac": peer["signature"](token, "request", ctx["nonce"], body)}
         answer = peer["run_engine"](ctx, packet, native, settings)
@@ -1170,6 +1174,42 @@ def test_closed_progressive_exact_duplicates_require_whole_job_proof(tmp_path, m
         faces = _write(mesh / "faces", b"original shared mesh")
         (next_solver / "constant").mkdir()
         (next_solver / "constant/polyMesh").symlink_to(mesh, target_is_directory=True)
+        if linked_owner:
+            child = root.parent / child_id
+            child_case = child / "cases/foil_a12"
+            (child_case / "transient_a2/1").mkdir(parents=True)
+            clone = child_case / "transient_a2/1/U"
+            os.link(unique, clone)
+            mesh_clones = []
+            for location in ("constant", "transient_a2/constant"):
+                copy = child_case / location / "polyMesh/faces"
+                copy.parent.mkdir(parents=True)
+                os.link(faces,copy)
+                mesh_clones.append(copy)
+            _write_json(child / "status.json", {"job_id":child_id,"state":"failed"})
+            _write_json(child / "result.json", {"job_id":child_id,"state":"failed"})
+            child_lock = _write(child / ".execute.lock",b"")
+            assert "shared or redirected" in refused(continuation=None) or "retained mesh changed" in refused(continuation=None)
+            with pytest.raises(ValueError, match="continuation scope differs"):
+                request(peer_scope={"linkedContinuation":child_id+"/another_case"})
+            with child_lock.open("rb") as held:
+                fcntl.flock(held,fcntl.LOCK_EX)
+                assert "active writer" in refused()
+            _write_json(child / "status.json", {"job_id":child_id,"state":"running"})
+            assert "no exact terminal" in refused()
+            _write_json(child / "status.json", {"job_id":child_id,"state":"failed"})
+            foreign = child / "other"
+            os.link(unique,foreign)
+            assert "retained reconstructed time" in refused() or "every other hardlink" in refused()
+            foreign.unlink()
+            clone.rename(clone.with_name("undeclared"))
+            _write(clone,unique.read_bytes())
+            assert "does not account for every other hardlink" in refused()
+            clone.unlink()
+            clone.with_name("undeclared").rename(clone)
+            os.link(faces, foreign)
+            assert "does not account for every other hardlink" in refused()
+            foreign.unlink()
         assert "unarchived case state" in refused(preserve=None)
         assert "next sibling" in refused(preserve="cases/foil/transient_a3")
         with pytest.raises(ValueError, match="scope differs"):
@@ -1179,6 +1219,11 @@ def test_closed_progressive_exact_duplicates_require_whole_job_proof(tmp_path, m
                                                       "sha256": sha(original_bytes), "byteSize": len(original_bytes)}
         assert {p.relative_to(root).as_posix() for p in duplicates} == set(plan["workingPaths"])
         assert plan["preservedSolver"]["files"] == 2
+        if linked_owner:
+            link_proof=plan["preservedSolver"]["linkedContinuation"]
+            assert (link_proof["jobId"],link_proof["caseSlug"],link_proof["sharedFiles"],link_proof["otherLinks"])==(child_id,"foil_a12",2,3)
+            assert not any(path.startswith("cases/foil/transient_a2/") for path in plan["workingPaths"])
+
         assert plan["preservedSolver"]["sharedMeshInventories"][0]["name"] == mesh.relative_to(root).as_posix()
         faces.write_bytes(b"changed shared mesh")
         refused(plan=plan["plan"])
@@ -1211,6 +1256,11 @@ def test_closed_progressive_exact_duplicates_require_whole_job_proof(tmp_path, m
         assert done["preservedSolver"] == plan["preservedSolver"] and done["allocation"]["fileAllocatedBytes"] > 0
         assert request()["replayed"] and not any(p.exists() for p in duplicates)
         assert coefficient.read_bytes() == original_bytes and unique.read_bytes() == b"unreported flow field"
+        if linked_owner:
+            assert clone.read_bytes()==unique.read_bytes() and clone.samefile(unique) and unique.stat().st_nlink==2
+            assert all(p.samefile(faces) and p.read_bytes()==b"original shared mesh" for p in mesh_clones)
+            assert faces.stat().st_nlink==3
+
         assert not (root / "closed_progressive_duplicate_files.complete.json").exists()
         assert "unarchived case state" in refused(preserve=None)
         # A later real source for this third point must still enter the ordinary full-job workflow.
@@ -1393,6 +1443,37 @@ def test_closed_progressive_exact_duplicates_require_whole_job_proof(tmp_path, m
     _write(copies[0], archived)
     refused(plan=plan["plan"])
     assert copies[0].is_file()
+
+
+def test_completed_sibling_replay_binds_both_the_original_stop_and_all_continuation_links():
+    import runpy
+    operator = runpy.run_path(str(Path(__file__).resolve().parents[1] / "scripts/deploy/hz-closed-job-maintenance.py"))
+    solver, promise, job, child = [f"00000000-0000-4000-8000-{n:012d}" for n in range(1, 5)]
+    witness = {"solverId":solver, "promiseId":promise, "baseUrl":"https://hub.example/api/sync/v1",
+               "executionId":job, "assignmentSignature":"a"*64, "localEnvelopeSha256":"b"*64,
+               "stoppedReportSignature":"c"*64, "receivedSequence":1024, "promiseState":"cancelled",
+               "jobState":"cancelled", "engineState":"cancelled"}
+    # canonicalAnalysisJson on the original fixed-shape witness.
+    fingerprint = "c29a034fcacc42a7e6e4f17d31746d88463fe44527b29c5a3e4fb7716df60423"
+    preserved = {"directory":"cases/c1/transient_a2","linkedContinuation":{"jobId":child,"caseSlug":"c1_a12",
+                 "sharedFiles":2,"otherLinks":3,"pathSetSha256":"f"*64}}
+    target = {"job":job,"id":job,"plan":"1"*64,"preserveSolver":preserved["directory"],
+              "linkedContinuation":child+"/c1_a12","keepMedia":True}
+    original = {"registeredTerminalPromise":witness,"preservedSolver":preserved,"scientificSha256":"d"*64,"mediaSha256":"e"*64}
+    assert operator["terminal_stop_digest"](original) == fingerprint
+    effect = {"status":"already-settled","record":original}
+    def restored(check):
+        assert check["terminalStop"] == fingerprint and check["linkedContinuation"] == target["linkedContinuation"]
+        return {"status":"verified","databaseReadOnly":True,"plan":{"preservedSolver":preserved,"replayed":True},
+                "scientificSha256":"d"*64,"mediaSha256":"e"*64,"readbacks":[{}],"points":[{}],
+                "registeredTerminalPromise":dict(witness),"registeredTerminalPromiseSha256":fingerprint}
+    assert operator["confirm_reclaim"]({},target,effect,restored)["status"] == "verified"
+    with pytest.raises(ValueError,match="fingerprint"):
+        operator["confirm_reclaim"]({},target,effect,lambda check: {**restored(check),
+                                    "registeredTerminalPromise":{**witness,"receivedSequence":1023}})
+    with pytest.raises(ValueError,match="unreported working source"):
+        operator["confirm_reclaim"]({},target,effect,lambda check: {**restored(check),
+                                    "plan":{"preservedSolver":{"directory":preserved["directory"]},"replayed":True}})
 
 
 def test_closed_storage_inventory_resumes_one_pinned_job_and_preserves_refusals(tmp_path, monkeypatch):
