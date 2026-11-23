@@ -1171,7 +1171,7 @@ test.describe
       preliminary.getByTestId("cell-preliminary-rans-0"),
     ).toHaveAttribute(
       "title",
-      "RANS: attempt recorded; automatic recovery exhausted before fast URANS",
+      "RANS: evidence recorded; a machine fault exhausted system recovery before FAST URANS",
     );
     await expect(
       preliminary.getByTestId("cell-preliminary-fast-0"),
