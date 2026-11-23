@@ -71,6 +71,7 @@ import { z } from "zod";
 
 import { requireAdmin, sessionEmail } from "./admin-auth";
 import { db } from "./db";
+import { currentRenderManifest, remoteRenderAuthorities } from "./render-target";
 import { selectVisibleEvidenceArtifacts } from "./evidence-artifacts";
 import { env } from "./env";
 import { makeEngineClient } from "./engine-client";
@@ -406,85 +407,14 @@ async function delegateRemoteRender(opts: {
   evidenceSha256: string;
   params: { field: string; role: string } & Record<string, unknown>;
 }) {
-  const refs = await db
-    .select()
-    .from(remoteAssetReferences)
-    .where(
-      and(
-        eq(remoteAssetReferences.resultId, opts.resultId),
-        eq(remoteAssetReferences.resultAttemptId, opts.resultAttemptId),
-        sql`${remoteAssetReferences.remoteResultId} IS NOT NULL`,
-      ),
-    );
-  const artifactRowIds = refs.flatMap((ref) =>
-    ref.localKind === "evidence_artifact" && ref.localRowId
-      ? [ref.localRowId]
-      : [],
-  );
-  const mediaRowIds = refs.flatMap((ref) =>
-    ref.localKind === "result_media" && ref.localRowId ? [ref.localRowId] : [],
-  );
-  const [artifacts, media] = await Promise.all([
-    artifactRowIds.length
-      ? db
-          .select()
-          .from(solverEvidenceArtifacts)
-          .where(inArray(solverEvidenceArtifacts.id, artifactRowIds))
-      : [],
-    mediaRowIds.length
-      ? db
-          .select()
-          .from(resultMedia)
-          .where(inArray(resultMedia.id, mediaRowIds))
-      : [],
-  ]);
-  const artifactsById = new Map(artifacts.map((row) => [row.id, row]));
-  const mediaById = new Map(media.map((row) => [row.id, row]));
-  const exactRefs = refs.filter((ref) => {
-    if (!ref.localRowId || !ref.remoteResultId) return false;
-    if (ref.localKind === "evidence_artifact") {
-      const artifact = artifactsById.get(ref.localRowId);
-      return Boolean(
-        artifact &&
-        artifact.resultId === opts.resultId &&
-        artifact.resultAttemptId === opts.resultAttemptId &&
-        artifact.kind === "manifest" &&
-        artifact.sha256 === opts.evidenceSha256 &&
-        ref.sha256 === artifact.sha256 &&
-        ref.byteSize === artifact.byteSize &&
-        ref.mimeType === artifact.mimeType,
-      );
-    }
-    if (ref.localKind === "result_media") {
-      const item = mediaById.get(ref.localRowId);
-      return Boolean(
-        item &&
-        item.resultId === opts.resultId &&
-        item.resultAttemptId === opts.resultAttemptId &&
-        item.evidenceSha256 === opts.evidenceSha256 &&
-        item.sha256 &&
-        ref.sha256 === item.sha256 &&
-        ref.byteSize === item.byteSize &&
-        ref.mimeType === item.mimeType,
-      );
-    }
-    return false;
-  });
-  const authorities = new Map<string, (typeof exactRefs)[number]>();
-  for (const ref of exactRefs) {
-    const key = `${ref.sourceInstanceId ?? ""}\0${ref.remoteResultId}`;
-    const preferred = authorities.get(key);
-    if (!preferred || ref.localKind === "evidence_artifact") {
-      authorities.set(key, ref);
-    }
-  }
-  if (!authorities.size) return null;
-  if (authorities.size !== 1) {
+  const authorities = await remoteRenderAuthorities(opts);
+  if (!authorities.length) return null;
+  if (authorities.length !== 1) {
     throw new RemoteRenderIntegrityError(
       "current evidence generation has ambiguous remote render authorities",
     );
   }
-  const ref = [...authorities.values()][0];
+  const [ref] = authorities;
   if (!ref.remoteResultId) return null;
   const settings = await syncSettingsForRemoteProxy();
   const renderUrl = ref.remoteRenderUrl
@@ -1414,19 +1344,8 @@ export async function registerRoutes(app: FastifyInstance, publicPoints?: Public
           eq(solverEvidenceArtifacts.kind, "manifest"),
         ),
       );
-    const manifest = manifests.length === 1 ? manifests[0] : null;
-    if (
-      !manifest ||
-      !/^[a-f0-9]{64}$/i.test(manifest.sha256) ||
-      manifest.byteSize <= 0 ||
-      !manifest.storageKey.trim() ||
-      !manifest.mimeType.trim() ||
-      manifest.airfoilId !== result.airfoilId ||
-      manifest.simJobId !== attempt.simJobId ||
-      manifest.engineJobId !== attempt.engineJobId ||
-      manifest.engineCaseSlug !== attempt.engineCaseSlug ||
-      manifest.aoaDeg !== attempt.aoaDeg
-    )
+    const manifest = currentRenderManifest(result, attempt, manifests);
+    if (!manifest)
       return reply
         .code(409)
         .send({ error: "result has no unique current raw evidence manifest" });
