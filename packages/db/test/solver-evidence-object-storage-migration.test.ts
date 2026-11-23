@@ -1,3 +1,6 @@
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import { prepareReportPayloadReferenceIndexes } from "../src/report-payload-reference-indexes";
 import { drizzle } from "drizzle-orm/postgres-js";
 import { sql as drizzleSql } from "drizzle-orm";
 import { migrate } from "drizzle-orm/postgres-js/migrator";
@@ -789,3 +792,134 @@ describe("0067 solver evidence object storage migration", () => {
     ).rejects.toThrow(/linked solver evidence artifacts are immutable/);
   });
 });
+
+it("normal migrate prepares 0223 online, recovers an interrupted build and preserves real FK protection", async () => {
+  const name = dbName + "_payloads",
+    url = new URL(targetUrl);
+  url.pathname = "/" + name;
+  const prior = makeMigrationFolder(222),
+    job = randomUUID();
+  await admin!.unsafe(`CREATE DATABASE "${name}"`);
+  const db = postgres(url.toString(), {
+    max: 5,
+    connection: { application_name: "payload-index-fixture" },
+  });
+  const worker = "progressive_worker_reports_result_payload_hash_idx",
+    remote = "progressive_remote_reports_result_payload_hash_idx";
+  const normal = () =>
+    promisify(execFile)(
+      process.execPath,
+      ["--import", "tsx", resolve(here, "../src/migrate.ts")],
+      {
+        cwd: resolve(here, "../../.."),
+        env: { ...process.env, DATABASE_URL: url.toString() },
+        timeout: 90_000,
+      },
+    );
+  const countJournal = async () =>
+    Number(
+      (await db`SELECT count(*) AS n FROM drizzle.__drizzle_migrations`)[0].n,
+    );
+  try {
+    await migrate(drizzle(db), { migrationsFolder: prior });
+    const n = await countJournal();
+    await db`INSERT INTO categories(id,slug,name,path) VALUES(${IDS.category},'payload-fk-test','Payload FK','payload-fk-test')`;
+    await db`INSERT INTO airfoils(id,slug,name,category_id,source,points) VALUES(${IDS.airfoil},'payload-fk-test','Payload FK',${IDS.category},'test-coordinates','[{"x":1,"y":0},{"x":0,"y":0},{"x":1,"y":0}]')`;
+    await db`INSERT INTO sim_jobs(id,engine_job_id,airfoil_id,bc_ids,job_kind,reference_chord_m,wave,status,total_cases,completed_cases,request_payload)
+      VALUES(${job}::uuid,${job},${IDS.airfoil},'[]','targeted',1,1,'done',0,0,'{}')`;
+    const [{ hash }] =
+      await db`SELECT store_progressive_report_result('{"state":"failed","polars":[]}'::jsonb) AS hash`;
+    await db`INSERT INTO progressive_worker_reports(sim_job_id,sequence,content_signature,report,result_payload_hash)
+      SELECT ${job}::uuid,i,encode(sha256(convert_to(i::text,'UTF8')),'hex'),
+      jsonb_build_object('version',1,'executionId',${job}::text,'sequence',i,'result',CASE WHEN i=1 THEN '{"state":"failed"}'::jsonb ELSE 'null'::jsonb END),
+      CASE WHEN i=1 THEN ${hash}::text END FROM generate_series(1,4096) i`;
+    await db.unsafe("ANALYZE progressive_worker_reports");
+    const identity = async () =>
+      (
+        await db`SELECT content_signature,resolve_progressive_report(report,result_payload_hash)::text AS original
+      FROM progressive_worker_reports WHERE sim_job_id=${job} AND sequence=1`
+      )[0];
+    const before = await identity();
+    await expect(
+      db.unsafe(
+        readFileSync(
+          join(migrations, "0223_report_payload_reference_indexes.sql"),
+          "utf8",
+        ),
+      ),
+    ).rejects.toThrow(/prepare/i);
+    await db.unsafe(
+      `CREATE INDEX ${worker} ON progressive_worker_reports(sequence)`,
+    );
+    await expect(prepareReportPayloadReferenceIndexes(db)).rejects.toThrow(
+      /differs/,
+    );
+    await db.unsafe("DROP INDEX " + worker);
+    const writer = await db.reserve();
+    let building: Promise<unknown> | undefined;
+    try {
+      await writer.unsafe("BEGIN");
+      await writer`UPDATE progressive_worker_reports SET acknowledged_at=clock_timestamp() WHERE sim_job_id=${job} AND sequence=2`;
+      building = db
+        .unsafe(
+          `CREATE INDEX CONCURRENTLY ${worker} ON public.progressive_worker_reports USING btree(result_payload_hash) WHERE result_payload_hash IS NOT NULL`,
+        )
+        .execute()
+        .catch((e) => e);
+      let pid: number | undefined;
+      for (let i = 0; i < 250 && !pid; i++) {
+        const [r] =
+          await db`SELECT p.pid FROM pg_stat_progress_create_index p JOIN pg_index i ON i.indexrelid=p.index_relid
+          WHERE p.datid=(SELECT oid FROM pg_database WHERE datname=current_database()) AND p.index_relid=to_regclass(${"public." + worker}) AND NOT i.indisvalid`;
+        pid = r?.pid;
+        if (!pid) await delay(20);
+      }
+      expect(pid).toBeDefined();
+      await expect(prepareReportPayloadReferenceIndexes(db)).rejects.toThrow(
+        /still active/,
+      );
+      await db.begin(async (tx) => {
+        await tx.unsafe("SET LOCAL lock_timeout='1s'");
+        expect(
+          await tx`UPDATE progressive_worker_reports SET acknowledged_at=clock_timestamp()
+        WHERE sim_job_id=${job} AND sequence=3 RETURNING sequence`,
+        ).toHaveLength(1);
+      });
+      expect((await db`SELECT pg_cancel_backend(${pid!}) AS ok`)[0].ok).toBe(
+        true,
+      );
+    } finally {
+      await writer.unsafe("ROLLBACK");
+      writer.release();
+    }
+    expect(await building).toMatchObject({ code: "57014" });
+    expect(
+      (
+        await db`SELECT indisvalid FROM pg_index WHERE indexrelid=to_regclass(${"public." + worker})`
+      )[0].indisvalid,
+    ).toBe(false);
+    expect(await countJournal()).toBe(n);
+    await normal();
+    expect(await countJournal()).toBe(n + 1);
+    expect((await prepareReportPayloadReferenceIndexes(db)).indexes).toEqual([
+      { name: worker, action: "existing" },
+      { name: remote, action: "existing" },
+    ]);
+    const plan = await db.unsafe(
+      `EXPLAIN(FORMAT JSON) SELECT 1 FROM ONLY public.progressive_worker_reports AS x WHERE $1 OPERATOR(pg_catalog.=) x.result_payload_hash FOR KEY SHARE OF x`,
+      [hash],
+    );
+    expect(JSON.stringify(plan)).toContain(worker);
+    expect(await identity()).toEqual(before);
+    await expect(
+      db`DELETE FROM progressive_report_result_payloads WHERE content_hash=${hash}`,
+    ).rejects.toThrow(/referenced|foreign key/i);
+    expect(await identity()).toEqual(before);
+    await normal();
+    expect(await countJournal()).toBe(n + 1);
+  } finally {
+    await db.end();
+    await admin!.unsafe(`DROP DATABASE "${name}"`);
+    rmSync(prior, { recursive: true, force: true });
+  }
+}, 120_000);
