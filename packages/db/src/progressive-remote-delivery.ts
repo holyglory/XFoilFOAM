@@ -65,15 +65,22 @@ export async function readProgressiveRemoteAssignment(
       job.status AS job_status, job.engine_state,
       airfoil.id AS airfoil_id, airfoil.slug, airfoil.name, airfoil.source, airfoil.point_format, airfoil.points,
       revision.id AS revision_id, revision.signature_hash, revision.snapshot,
-      EXISTS (SELECT 1 FROM progressive_cfd_execution_stops stopped
-        WHERE stopped.sim_job_id = dispatch.sim_job_id AND stopped.engine_job_id = dispatch.sim_job_id::text) AS stopped,
-      (SELECT max(sequence) FROM progressive_remote_reports report
-        WHERE report.sim_job_id = dispatch.sim_job_id) AS received_sequence
+      stopped.proof_signature AS stop_signature,
+      CASE WHEN stopped.proof_signature IS NOT NULL AND promise.status='cancelled' THEN (
+        SELECT encode(sha256(string_agg(sha256(convert_to(d.receipt::text,'UTF8')),''::bytea
+          ORDER BY d.point_content_signature COLLATE "C")),'hex')
+        FROM progressive_remote_diagnostic_receipts d WHERE d.sim_job_id=dispatch.sim_job_id
+      ) END AS diagnostic_receipt_signature,
+      latest.sequence AS received_sequence, latest.content_signature AS received_signature
     FROM progressive_remote_dispatches dispatch
     JOIN registered_remote_solvers solver ON solver.id = dispatch.solver_id AND solver.revoked_at IS NULL
     JOIN sync_sweep_promises promise ON promise.id = dispatch.promise_id
       AND promise.registered_solver_id = dispatch.solver_id
     JOIN sim_jobs job ON job.id = dispatch.sim_job_id
+    LEFT JOIN progressive_cfd_execution_stops stopped ON stopped.sim_job_id=dispatch.sim_job_id
+      AND stopped.engine_job_id=dispatch.sim_job_id::text
+    LEFT JOIN LATERAL (SELECT sequence,content_signature FROM progressive_remote_reports
+      WHERE sim_job_id=dispatch.sim_job_id ORDER BY sequence DESC LIMIT 1) latest ON true
     JOIN airfoils airfoil ON airfoil.id = job.airfoil_id
     JOIN simulation_preset_revisions revision ON revision.id = job.simulation_preset_revision_id
     WHERE dispatch.solver_id = ${input.solverId}::uuid AND dispatch.sim_job_id = ${input.executionId}::uuid
@@ -88,7 +95,21 @@ export async function readProgressiveRemoteAssignment(
   return {
     envelope,
     cpuSlots: Number(row.cpu_slots),
-    executionStopped: Boolean(row.stopped),
+    executionStopped: Boolean(row.stop_signature),
+    terminalReceipt:
+      row.stop_signature && row.received_signature
+        ? {
+            reportSignature: String(row.received_signature),
+            stopProofSignature: String(row.stop_signature),
+            ...(row.diagnostic_receipt_signature
+              ? {
+                  diagnosticReceiptSetSignature: String(
+                    row.diagnostic_receipt_signature,
+                  ),
+                }
+              : {}),
+          }
+        : null,
     receivedSequence: Number(row.received_sequence ?? 0),
     job: { status: String(row.job_status), engineState: row.engine_state },
     promise: {

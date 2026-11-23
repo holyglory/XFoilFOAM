@@ -2,7 +2,9 @@ import { createHash } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
 import { canonicalRemoteHubBaseUrl } from "@aerodb/core";
 import {
+  analysisContentHash,
   progressiveReportedPointSources,
+  validateProgressiveRemoteReport,
   verifyProgressiveRemoteExecution,
   type ProgressiveRemoteExecutionEnvelope,
   type DB,
@@ -10,6 +12,11 @@ import {
 import { sql } from "drizzle-orm";
 import { configuredDeploymentRole } from "./config";
 import { fetchProgressiveRemote } from "./progressive-remote-http";
+import {
+  provenTerminalDiagnostic,
+  readTerminalDiagnostics,
+  type TerminalDiagnostics,
+} from "./progressive-terminal-diagnostic";
 
 type Row = Record<string, unknown>;
 const record = (value: unknown): value is Row =>
@@ -30,22 +37,35 @@ const owner = sql`FROM sync_sweep_promises p
   JOIN LATERAL (SELECT job.* FROM sim_jobs job WHERE job.id=CASE
     WHEN p.request_payload->>'progressiveExecutionId' ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
     THEN (p.request_payload->>'progressiveExecutionId')::uuid END OFFSET 0) j ON true
-  JOIN progressive_worker_submission_intents i ON i.sim_job_id=j.id
-  JOIN LATERAL (SELECT r.sequence,r.content_signature,r.assignment_signature,r.stopped_engine_job_id,r.acknowledged_at,r.report
+  LEFT JOIN progressive_worker_submission_intents i ON i.sim_job_id=j.id
+  JOIN LATERAL (SELECT r.sequence,r.content_signature,r.assignment_signature,r.stopped_engine_job_id,r.acknowledged_at,r.report,
+      r.archive_bundle_id,r.result_payload_hash
     FROM progressive_worker_reports r WHERE r.sim_job_id=j.id ORDER BY r.sequence DESC LIMIT 1) stop ON true`;
+const assignment = sql`j.request_payload#>>'{remoteProgressiveExecution,contentSignature}'`;
+// A namespace cancellation fence can be acknowledged without a physical submission.
+// Its logical job ID in the report identifies that fence.
+const stoppedOwner = sql`(
+  (j.engine_job_id=j.id::text AND i.assignment_signature=${assignment}
+    AND stop.report#>>'{stopProof,ownership_basis}' IS DISTINCT FROM 'never_started_cancellation_fence')
+  OR (j.engine_job_id IS NULL AND j.status='cancelled' AND j.engine_state='cancelled'
+    AND (i.sim_job_id IS NULL OR i.assignment_signature=${assignment})
+    AND stop.report#>>'{stopProof,ownership_basis}'='never_started_cancellation_fence'
+    AND stop.report#>>'{stopProof,fence}'='cancel_marker'
+    AND stop.archive_bundle_id IS NULL AND stop.result_payload_hash IS NULL
+    AND stop.report->'result'='null'::jsonb AND stop.report#>'{status,completed_cases}'='0'::jsonb))`;
 const terminal = sql`p.status='active' AND p.request_payload->>'remoteSolver'='true'
   AND p.request_payload->>'executionContract'='progressive-cfd-v1'
   AND p.request_payload->>'solverId'=solver.id::text AND p.request_payload->>'upstreamBaseUrl'=cfg.upstream_base_url
   AND j.status IN ('done','failed','cancelled') AND j.engine_state IN ('completed','failed','cancelled')
-  AND j.engine_job_id=j.id::text AND j.ingest_lease_token IS NULL
+  AND ${stoppedOwner}
+  AND (j.ingest_lease_token IS NULL OR j.ingest_lease_expires_at<=clock_timestamp())
   AND j.request_payload->>'syncPromiseId'=p.id::text
   AND j.request_payload->>'remoteSolver'='true' AND j.request_payload->>'upstreamBaseUrl'=cfg.upstream_base_url
   AND j.request_payload#>>'{remoteProgressiveExecution,solverId}'=solver.id::text
   AND j.request_payload#>>'{remoteProgressiveExecution,promiseId}'=p.id::text
   AND j.request_payload#>>'{remoteProgressiveExecution,scope,executionId}'=j.id::text
-  AND j.request_payload#>>'{remoteProgressiveExecution,contentSignature}'=i.assignment_signature
   AND j.request_payload->'engineRequest'=j.request_payload#>'{remoteProgressiveExecution,request}'
-  AND stop.assignment_signature=i.assignment_signature AND stop.acknowledged_at IS NOT NULL
+  AND stop.assignment_signature=${assignment} AND stop.acknowledged_at IS NOT NULL
   AND stop.stopped_engine_job_id=j.id::text AND stop.report->>'executionId'=j.id::text
   AND stop.report#>>'{stopProof,job_id}'=j.id::text AND stop.report#>>'{status,job_id}'=j.id::text
   AND stop.report#>>'{stopProof,fence}' IN ('terminal_result','cancel_marker')
@@ -57,16 +77,18 @@ const terminal = sql`p.status='active' AND p.request_payload->>'remoteSolver'='t
   AND NOT EXISTS (SELECT FROM progressive_remote_dispatches d WHERE d.sim_job_id=j.id)
   AND NOT EXISTS (SELECT FROM progressive_cfd_attempts a WHERE a.sim_job_id=j.id)
   AND NOT EXISTS (SELECT FROM sim_jobs sibling WHERE sibling.id<>j.id
-    AND (sibling.request_payload->>'syncPromiseId'=p.id::text OR sibling.engine_job_id=j.engine_job_id))
+    AND (sibling.request_payload->>'syncPromiseId'=p.id::text OR sibling.engine_job_id=j.id::text))
   AND NOT EXISTS (SELECT FROM progressive_worker_submission_intents other
-    WHERE other.assignment_signature=i.assignment_signature AND other.sim_job_id<>j.id)
+    WHERE other.assignment_signature=${assignment} AND other.sim_job_id<>j.id)
   AND NOT EXISTS (WITH live AS MATERIALIZED (SELECT id,request_payload FROM sim_jobs
     WHERE status IN ('pending','submitted','running','ingesting') OR engine_state IN ('cancelling','cancel_pending'))
     SELECT FROM live WHERE live.id<>j.id AND live.request_payload#>>'{remoteProgressiveExecution,promiseId}'=p.id::text)`;
 
 // Ignore only completed/superseded transport. A missing custody receipt is
 // outstanding even if no archive queue row has been allocated yet.
-const settled = sql`NOT EXISTS (SELECT FROM sync_remote_result_deliveries d
+const settled = (
+  diagnostics: TerminalDiagnostics,
+) => sql`NOT EXISTS (SELECT FROM sync_remote_result_deliveries d
     WHERE (d.promise_id=p.id OR d.sim_job_id=j.id) AND d.state NOT IN ('delivered','superseded'))
   AND NOT EXISTS (SELECT FROM sync_remote_promise_cancellations c WHERE c.promise_id=p.id AND c.state<>'delivered')
   AND NOT EXISTS (SELECT FROM results live WHERE live.sim_job_id=j.id AND live.status IN ('pending','stale','queued','running'))
@@ -76,6 +98,13 @@ const settled = sql`NOT EXISTS (SELECT FROM sync_remote_result_deliveries d
   AND NOT EXISTS (SELECT FROM progressive_worker_delivery_failures f WHERE f.sim_job_id=j.id AND f.state='retry')
   AND NOT EXISTS (SELECT FROM progressive_worker_evidence_delivery_claims c WHERE c.sim_job_id=j.id AND c.claim_expires_at>clock_timestamp())
   AND NOT EXISTS (SELECT FROM progressive_worker_archive_deliveries a WHERE a.sim_job_id=j.id)
+  AND (j.engine_job_id IS NOT NULL OR (
+    NOT EXISTS(SELECT FROM result_attempts a WHERE a.sim_job_id=j.id OR a.engine_job_id=j.id::text)
+    AND NOT EXISTS(SELECT FROM results r WHERE r.sim_job_id=j.id OR r.engine_job_id=j.id::text)
+    AND NOT EXISTS(SELECT FROM solver_evidence_artifacts artifact WHERE artifact.engine_job_id=j.id::text)
+    AND NOT EXISTS(SELECT FROM progressive_worker_evidence_attempts a WHERE a.sim_job_id=j.id)
+    AND NOT EXISTS(SELECT FROM progressive_worker_hub_receipts h WHERE h.sim_job_id=j.id)
+    AND NOT EXISTS(SELECT FROM progressive_worker_archive_receipts ar WHERE ar.sim_job_id=j.id)))
   AND NOT EXISTS (SELECT FROM progressive_worker_evidence_attempts a WHERE a.sim_job_id=j.id
     AND NOT EXISTS(SELECT FROM progressive_worker_hub_receipts h JOIN result_attempts attempt ON attempt.id=h.result_attempt_id
       WHERE h.sim_job_id=a.sim_job_id AND h.point_content_signature=a.point_content_signature AND h.result_attempt_id=a.result_attempt_id
@@ -83,7 +112,7 @@ const settled = sql`NOT EXISTS (SELECT FROM sync_remote_result_deliveries d
         AND attempt.simulation_preset_revision_id=j.simulation_preset_revision_id AND j.bc_ids ? attempt.bc_id::text))
   AND NOT EXISTS (SELECT FROM progressive_worker_hub_receipts h WHERE h.sim_job_id=j.id
     AND NOT EXISTS(SELECT FROM progressive_worker_archive_receipts ar WHERE ar.sim_job_id=h.sim_job_id
-      AND ar.point_content_signature=h.point_content_signature))`;
+      AND ar.point_content_signature=h.point_content_signature) AND NOT ${provenTerminalDiagnostic(diagnostics)})`;
 
 interface Mirror {
   id: string;
@@ -94,6 +123,9 @@ interface Mirror {
   signature: string;
   sequence: number;
   finalSignature: string;
+  stopSignature: string;
+  engineJobId: string | null;
+  intentToken: string | null;
   status: string;
   engine: string;
   expiry: string;
@@ -104,7 +136,8 @@ async function candidate(db: DB, promiseId?: string): Promise<Mirror | null> {
   const after = promiseId ? undefined : seen.get(db);
   const [r] =
     await db.execute(sql`SELECT p.id,j.id AS execution,solver.id AS solver,p.source_base_url AS url,
-    cfg.remote_solver_auth_token AS token,i.assignment_signature AS signature,stop.sequence,stop.content_signature AS final,
+    cfg.remote_solver_auth_token AS token,${assignment} AS signature,stop.sequence,stop.content_signature AS final,
+    j.engine_job_id,i.token AS intent_token,stop.report->'stopProof' AS stop_proof,
     j.status,j.engine_state,p."expiresAt"::text AS expiry,j.request_payload->'remoteProgressiveExecution' AS envelope
     ${owner} WHERE ${terminal} ${promiseId ? sql`AND p.id=${promiseId}::uuid` : sql``}
     ORDER BY ${after ? sql`(p."expiresAt",p.id)<=(${after.expiry}::timestamptz,${after.id}::uuid),` : sql``}
@@ -119,6 +152,9 @@ async function candidate(db: DB, promiseId?: string): Promise<Mirror | null> {
     signature: String(r.signature),
     sequence: Number(r.sequence),
     finalSignature: String(r.final),
+    stopSignature: analysisContentHash(r.stop_proof),
+    engineJobId: r.engine_job_id == null ? null : String(r.engine_job_id),
+    intentToken: r.intent_token == null ? null : String(r.intent_token),
     status: String(r.status),
     engine: String(r.engine_state),
     expiry: String(r.expiry),
@@ -134,7 +170,11 @@ async function candidate(db: DB, promiseId?: string): Promise<Mirror | null> {
   return m;
 }
 
-async function cancelledAtHub(m: Mirror, fetcher: typeof fetch) {
+async function cancelledAtHub(
+  m: Mirror,
+  fetcher: typeof fetch,
+  diagnosticReceiptSetSignature?: string | null,
+) {
   const reply = await fetchProgressiveRemote(
     fetcher,
     `${m.url}/progressive-executions/${m.execution}`,
@@ -165,6 +205,12 @@ async function cancelledAtHub(m: Mirror, fetcher: typeof fetch) {
     a.job.status !== m.status ||
     a.job.engineState !== m.engine ||
     a.executionStopped !== true ||
+    !record(a.terminalReceipt) ||
+    a.terminalReceipt.reportSignature !== m.finalSignature ||
+    a.terminalReceipt.stopProofSignature !== m.stopSignature ||
+    (diagnosticReceiptSetSignature != null &&
+      a.terminalReceipt.diagnosticReceiptSetSignature !==
+        diagnosticReceiptSetSignature) ||
     a.receivedSequence !== m.sequence
   )
     return { confirmed: false, httpStatus: reply.status };
@@ -190,11 +236,15 @@ const reportStamp = sql`sha256(pg_catalog.record_send(ROW(r.sequence,r.content_s
 const stagingReceipt = sql`LEFT JOIN progressive_worker_evidence_receipts e ON e.sim_job_id=r.sim_job_id AND e.sequence=r.sequence
   LEFT JOIN LATERAL (SELECT string_agg(a.point_content_signature||':'||a.result_attempt_id::text,',' ORDER BY a.point_content_signature COLLATE "C",a.result_attempt_id) AS points
     FROM progressive_worker_evidence_attempts a WHERE a.sim_job_id=r.sim_job_id AND a.sequence=r.sequence) links ON true`;
-function startScan(m: Mirror) {
+function startScan(m: Mirror, diagnostics: TerminalDiagnostics) {
   return {
     promiseId: m.id,
     final: m.finalSignature,
     signature: m.signature,
+    stopSignature: m.stopSignature,
+    engineJobId: m.engineJobId,
+    intentToken: m.intentToken,
+    diagnostics,
     after: 0,
     anchors: new Map<string, { sequence: number; points: boolean }>(),
     required: new Set<string>(),
@@ -204,8 +254,41 @@ function startScan(m: Mirror) {
 }
 type Scan = ReturnType<typeof startScan>;
 const scans = new WeakMap<DB, Scan>();
+function isUnstartedReport(
+  value: unknown,
+  signature: unknown,
+  sequence: number,
+  m: Mirror,
+) {
+  if (!value) return false;
+  try {
+    const { report, contentSignature } = validateProgressiveRemoteReport(
+      value,
+      m.envelope,
+    );
+    return (
+      contentSignature === signature &&
+      report.sequence === sequence &&
+      report.result === null &&
+      report.status.completed_cases === 0 &&
+      report.status.started_at == null &&
+      !report.status.active_pids?.length &&
+      !report.status.active_solver &&
+      !report.status.solver_budget_progress?.cases.length &&
+      (report.stopProof === null ||
+        report.stopProof.ownership_basis === "never_started_cancellation_fence")
+    );
+  } catch {
+    return false;
+  }
+}
 async function evidenceProof(db: DB, m: Mirror, scan: Scan, pageLimit: number) {
   const { anchors, required, verified, hash } = scan;
+  const unstartedReport =
+    m.engineJobId === null
+      ? sql`CASE WHEN p.archive_bundle_id IS NULL AND p.result_payload_hash IS NULL
+        AND p.report->'result'='null'::jsonb THEN p.report END`
+      : sql`NULL::jsonb`;
   for (let page = 0; scan.after < m.sequence && page < pageLimit; page++) {
     const rows = await db.execute(sql`WITH page AS MATERIALIZED (
       SELECT r.sim_job_id,r.sequence,r.report,r.content_signature,r.assignment_signature,r.archive_bundle_id,r.result_payload_hash,
@@ -215,14 +298,14 @@ async function evidenceProof(db: DB, m: Mirror, scan: Scan, pageLimit: number) {
       ORDER BY r.sequence LIMIT ${pageRows}),
     originals AS MATERIALIZED (
       SELECT p.sequence,p.content_signature,p.assignment_signature,p.staged_signature,p.stamp,p.archive_bundle_id,p.result_payload_hash,
-        p.point_anchor,
+        p.point_anchor,${unstartedReport} AS unstarted_report,
         CASE WHEN p.archive_bundle_id IS NULL AND p.result_payload_hash IS NULL THEN p.report->'result' END AS result FROM page p),
     bytes AS MATERIALIZED (
-      SELECT sequence,content_signature,assignment_signature,staged_signature,stamp,archive_bundle_id,result_payload_hash,point_anchor,
+      SELECT sequence,content_signature,assignment_signature,staged_signature,stamp,archive_bundle_id,result_payload_hash,point_anchor,unstarted_report,
         jsonb_typeof(result) AS kind,
         CASE WHEN jsonb_typeof(result)='object' THEN convert_to(result::text,'UTF8') END AS body
       FROM originals)
-    SELECT b.sequence,b.stamp,b.assignment_signature=${m.signature} AS owned,
+    SELECT b.sequence,b.stamp,b.content_signature,b.unstarted_report,b.assignment_signature=${m.signature} AS owned,
       b.staged_signature=b.content_signature AS staged,b.staged_signature IS NOT NULL AS receipt,
       b.kind,b.point_anchor,b.archive_bundle_id IS NOT NULL AS archived,b.result_payload_hash IS NOT NULL AS shared,
       coalesce(payload.content_hash,encode(sha256(b.body),'hex')) AS sha,
@@ -239,6 +322,16 @@ async function evidenceProof(db: DB, m: Mirror, scan: Scan, pageLimit: number) {
         return null;
       scan.after = Number(r.sequence);
       hash.update(Buffer.from(String(r.stamp), "hex"));
+      if (
+        m.engineJobId === null &&
+        !isUnstartedReport(
+          r.unstarted_report,
+          r.content_signature,
+          scan.after,
+          m,
+        )
+      )
+        return null;
       // A compact cold header alone cannot attest to its original point set.
       if (r.archived === true) return null;
       if (r.kind === "null" && r.shared !== true) continue;
@@ -297,7 +390,9 @@ const binding = (
   m: Mirror,
 ) => sql`p.id=${m.id}::uuid AND j.id=${m.execution}::uuid AND solver.id=${m.solver}::uuid
   AND cfg.upstream_base_url=${m.url} AND cfg.remote_solver_auth_token=${m.token}
-  AND i.assignment_signature=${m.signature} AND stop.sequence=${m.sequence} AND stop.content_signature=${m.finalSignature}
+  AND ${assignment}=${m.signature} AND i.token IS NOT DISTINCT FROM ${m.intentToken}::uuid
+  AND j.engine_job_id IS NOT DISTINCT FROM ${m.engineJobId}::text
+  AND stop.sequence=${m.sequence} AND stop.content_signature=${m.finalSignature}
   AND j.request_payload->'remoteProgressiveExecution'=${JSON.stringify(m.envelope)}::jsonb
   AND j.status=${m.status} AND j.engine_state=${m.engine}`;
 
@@ -327,7 +422,11 @@ export async function reconcileTerminalProgressiveMirror(
   };
   const fetcher = options.fetcher ?? fetch;
   const resume =
-    previous?.final === m.finalSignature && previous.signature === m.signature;
+    previous?.final === m.finalSignature &&
+    previous.signature === m.signature &&
+    previous.stopSignature === m.stopSignature &&
+    previous.engineJobId === m.engineJobId &&
+    previous.intentToken === m.intentToken;
   // An automatic pass probes the owner before starting a historical scan. A
   // specifically named operation always fetches the owner immediately after
   // the proof and before the write, without duplicating the initial GET.
@@ -347,11 +446,15 @@ export async function reconcileTerminalProgressiveMirror(
         httpStatus: remote.httpStatus,
       } as const;
   }
+  const diagnostics = resume
+    ? previous.diagnostics
+    : await readTerminalDiagnostics(db, m.execution, m.envelope);
+  const obligations = settled(diagnostics);
   const [ready] = await db.execute(
-    sql`SELECT 1 ${owner} WHERE ${binding(m)} AND ${terminal} AND ${settled}`,
+    sql`SELECT 1 ${owner} WHERE ${binding(m)} AND ${terminal} AND ${obligations}`,
   );
   if (!ready) return { ...identity, outcome: "unsettled" } as const;
-  const scan = resume ? previous : startScan(m);
+  const scan = resume ? previous : startScan(m, diagnostics);
   const proof = await evidenceProof(
     db,
     m,
@@ -363,7 +466,7 @@ export async function reconcileTerminalProgressiveMirror(
     return { ...identity, outcome: "checking" } as const;
   }
   if (!proof) return { ...identity, outcome: "unsettled-reports" } as const;
-  let remote = await cancelledAtHub(m, fetcher);
+  let remote = await cancelledAtHub(m, fetcher, diagnostics.signature);
   // Under hub admission pressure, retain the in-memory proof during a
   // bounded named operation. Re-read the hub and rebind every local row
   // before writing. Normal transfer passes keep their short polling budget.
@@ -378,7 +481,7 @@ export async function reconcileTerminalProgressiveMirror(
     const wait = Math.max(10_000, remote.retryMs ?? 0);
     if (wait > 30_000) break;
     await delay(wait);
-    remote = await cancelledAtHub(m, fetcher);
+    remote = await cancelledAtHub(m, fetcher, diagnostics.signature);
   }
   if (!remote.confirmed)
     return {
@@ -392,8 +495,14 @@ export async function reconcileTerminalProgressiveMirror(
     distinctResults: scan.required.size,
     provedResults: scan.verified.size,
     reportBinding: proof,
+    ...(diagnostics.signature
+      ? {
+          diagnosticReceipts: diagnostics.pins.length,
+          diagnosticReceiptSetSignature: diagnostics.signature,
+        }
+      : {}),
   };
-  const qualified = sql`SELECT p.id ${owner} WHERE ${binding(m)} AND ${terminal} AND ${settled}
+  const qualified = sql`SELECT p.id ${owner} WHERE ${binding(m)} AND ${terminal} AND ${obligations}
     AND (SELECT encode(sha256(string_agg(${reportStamp},''::bytea ORDER BY r.sequence)),'hex')
       FROM progressive_worker_reports r ${stagingReceipt} WHERE r.sim_job_id=j.id)=${proof}`;
   if (options.preview) {
@@ -419,7 +528,9 @@ export async function reconcileTerminalProgressiveMirror(
       await tx.execute(sql`UPDATE sync_sweep_promises SET status='cancelled',"cancelledAt"=coalesce("cancelledAt",clock_timestamp()),
       "updatedAt"=clock_timestamp(),response_payload=coalesce(response_payload,'{}'::jsonb)||jsonb_build_object(
         'registeredTerminalMirror',jsonb_build_object('executionId',${m.execution}::text,'solverId',${m.solver}::text,
-          'assignmentSignature',${m.signature}::text,'sequence',${m.sequence}::bigint,'reportSignature',${m.finalSignature}::text))
+          'assignmentSignature',${m.signature}::text,'sequence',${m.sequence}::bigint,'reportSignature',${m.finalSignature}::text,
+          'engineJobId',${m.engineJobId}::text,'stopProofSignature',${m.stopSignature}::text,
+          'diagnosticReceiptSetSignature',${diagnostics.signature}::text))
       WHERE id IN (${qualified}) AND status='active' RETURNING id`);
     if (update.length !== 1) return "changed";
     await tx.execute(sql`UPDATE sync_sweep_promise_points SET status='cancelled',"updatedAt"=clock_timestamp()

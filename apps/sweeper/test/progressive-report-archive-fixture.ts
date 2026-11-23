@@ -104,6 +104,7 @@ export async function withArchiveFixture(
     nullPrefix?: number;
     angles?: number[];
     historyRepeats?: number;
+    metadataOnlyDiagnostic?: boolean;
     legacyConflict?: "identical" | "distinct";
     // The dedicated rollout graph needs durable transactions across its
     // baseline, changing read view and independent archive reader.
@@ -284,7 +285,7 @@ export async function withArchiveFixture(
           fixture: executionId,
         }),
       };
-      const provenance = force
+      const provenance = force || options.metadataOnlyDiagnostic
         ? {
             engine: runtime,
             execution_pool: envelope.request.expected_execution_pool,
@@ -303,6 +304,9 @@ export async function withArchiveFixture(
         error: "repeated immutable history λ🌬️".repeat(
           options.historyRepeats ?? 512,
         ),
+        ...(options.metadataOnlyDiagnostic
+          ? { ...provenance, failure_disposition: "infrastructure", solver_active_seconds: 0 }
+          : {}),
         ...(force
           ? {
               ...provenance,
@@ -407,7 +411,7 @@ export async function withArchiveFixture(
             total_cases: units.length,
             completed_cases: sequence <= nullPrefix ? 0 : 1,
             // Unknown diagnostic values must survive archival without JS rounding.
-            diagnosticLargeInteger: force ? 2147483647 : "__LARGE_INTEGER__",
+            diagnosticLargeInteger: force || options.metadataOnlyDiagnostic ? 2147483647 : "__LARGE_INTEGER__",
             diagnosticNull: null,
             message: [
               "archive diagnostic: λ 🌬️",
@@ -435,7 +439,7 @@ export async function withArchiveFixture(
           stopProof:
             sequence === count && options.stopped !== false ? proof : null,
         };
-        const inputText = force
+        const inputText = force || options.metadataOnlyDiagnostic
           ? JSON.stringify(
               validateProgressiveRemoteReport(report, envelope).report,
             )
