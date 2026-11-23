@@ -8,10 +8,11 @@ import { afterAll, expect, it, vi } from "vitest";
 import {
   createClient,
   signProgressiveEvidenceCustodyReceipt,
+  sealProgressiveRemoteExecution,
   type DB,
   type ProgressiveEvidenceCustodyReceipt,
 } from "@aerodb/db";
-import { EngineError } from "@aerodb/engine-client";
+import { EngineError, OPENCFD_2606_ENGINE } from "@aerodb/engine-client";
 import { sql } from "drizzle-orm";
 import {
   type ClosedProgressiveBackend,
@@ -623,7 +624,19 @@ it("keeps an unreported solver readable and records only its signed siblings as 
     const directory = "cases/foil/transient_a1";
     const sample = { path: directory + "/postProcessing/forces/0/coefficient.dat", sha256: sha("0.1 0.03"), byteSize: 8 };
     const kept = { directory, treeSha256: "a".repeat(64), entries: 6, files: 2, byteSize: 80, allocatedBytes: 8192, sample };
+    const unit = {unitId:randomUUID(),token:randomUUID(),alpha:0,activeBudgetSeconds:900};
+    const envelope = sealProgressiveRemoteExecution({solverId:solver,promiseId,scope:{executionContract:"progressive-cfd-v1",
+      executionId:id,epochId:randomUUID(),generationId:randomUUID(),targetId:"a".repeat(64),recipeId:"b".repeat(64),stage:2,
+      units:[unit],tokens:[unit.token]},request:{execution_id:id,expected_engine:{...OPENCFD_2606_ENGINE},expected_execution_pool:"test-pool",
+        expected_solver_budget_version:2,expected_mesh_recovery_version:1,airfoil:{name:"closed-source-fixture"},chord_lengths:[1],speeds:[30],
+        aoa:{angles:[0]},solver:{warm_start:true},resources:{case_concurrency:1,case_solver_budget_seconds:900}}});
+    await db.execute(sql`UPDATE sim_jobs SET request_payload=request_payload||${JSON.stringify({remoteSolver:true,remoteProgressiveExecution:envelope})}::jsonb WHERE id=${id}`);
+    await db.execute(sql`ALTER TABLE progressive_worker_reports ADD sequence bigint,ADD content_signature text,ADD assignment_signature text`);
+    await db.execute(sql`UPDATE progressive_worker_reports SET sequence=1,content_signature=${sha("report")},assignment_signature=${envelope.contentSignature}`);
     let applied = 0, broken = false, overlap = false;
+    let hubState = "active", hubJob = "cancelled", stopped = true, hubSequence = 1, foreign = false, http = 200, resumeOnDownload = false;
+    const originalRole = process.env.AIRFOILFOAM_DEPLOYMENT_ROLE;
+    process.env.AIRFOILFOAM_DEPLOYMENT_ROLE = "remote-solver";
     const backend: ClosedProgressiveBackend = {
       async reclaimClosedProgressiveFiles(job, manifests, expected, objects) {
         expect(manifests).toHaveLength(1);
@@ -638,12 +651,21 @@ it("keeps an unreported solver readable and records only its signed siblings as 
       },
     };
     const routes: string[] = [];
-    const fetcher = vi.spyOn(globalThis, "fetch").mockImplementation(async (url) => {
+    const fetcher = vi.spyOn(globalThis, "fetch").mockImplementation(async (url,init) => {
       const path = new URL(String(url)).pathname;
       routes.push(path);
-      if (path.endsWith("/download"))
+      if (path === `/api/sync/v1/progressive-executions/${id}`) {
+        expect(new Headers(init?.headers).get("x-xfoilfoam-solver-token")).toBe(token);
+        if (http !== 200) return Response.json({error:"unavailable"}, {status:http});
+        return Response.json({assignment:{envelope:foreign?{...envelope,promiseId:randomUUID()}:envelope,
+          receivedSequence:hubSequence,executionStopped:stopped,job:{status:hubJob,engineState:"cancelled"},promise:{id:promiseId,status:hubState}},
+          continuation:{kind:"stop"}});
+      }
+      if (path.endsWith("/download")) {
+        if (resumeOnDownload) hubState="active";
         return new Response(signed!.upload, {headers: {"content-type":"application/zstd","content-length":String(signed!.upload.length),
           "x-content-sha256":signed!.remote.storedSha256,"x-gcs-generation":signed!.remote.generation}});
+      }
       expect(path.endsWith(sample.path)).toBe(true);
       return new Response(broken ? "different" : "0.1 0.03", {headers:{"content-length":"8"}});
     });
@@ -663,9 +685,29 @@ it("keeps an unreported solver readable and records only its signed siblings as 
       broken = false;
       await db.execute(sql`UPDATE sync_sweep_promises SET status='active'`);
       await expect(closedProgressiveJob(db,backend,id,pinned)).rejects.toThrow(/active ownership/);
-      await db.execute(sql`UPDATE sync_sweep_promises SET status='cancelled'`);
+      hubState="cancelled";hubJob="ingesting";
+      await expect(closedProgressiveJob(db,backend,id,pinned)).rejects.toThrow(/active ownership/);
+      hubJob="cancelled";stopped=false;
+      await expect(closedProgressiveJob(db,backend,id,pinned)).rejects.toThrow(/active ownership/);
+      stopped=true;hubSequence=2;
+      await expect(closedProgressiveJob(db,backend,id,pinned)).rejects.toThrow(/active ownership/);
+      hubSequence=1;http=403;
+      await expect(closedProgressiveJob(db,backend,id,pinned)).rejects.toThrow(/HTTP 403/);
+      http=200;foreign=true;
+      await expect(closedProgressiveJob(db,backend,id,pinned)).rejects.toThrow(/stored assignment/);
+      foreign=false;resumeOnDownload=true;
+      await expect(closedProgressiveJob(db,backend,id,pinned)).rejects.toThrow(/active ownership/);
+      resumeOnDownload=false;hubState="cancelled";
+      await db.execute(sql`UPDATE progressive_worker_reports SET acknowledged_at=NULL`);
+      await expect(closedProgressiveJob(db,backend,id,pinned)).rejects.toThrow(/acknowledged stop/);
+      await db.execute(sql`UPDATE progressive_worker_reports SET acknowledged_at=clock_timestamp()`);
       expect(applied).toBe(0);
-      expect((await closedProgressiveJob(db,backend,id,pinned)).settled).toBe(true);
+      const settled=await closedProgressiveJob(db,backend,id,pinned);
+      expect(settled.settled).toBe(true);
+      expect(settled.registeredTerminalPromise).toMatchObject({promiseId,executionId:id,solverId:solver,receivedSequence:1,
+        assignmentSignature:envelope.contentSignature,stoppedReportSignature:sha("report"),promiseState:"cancelled"});
+      const [unchanged]=await db.execute(sql`SELECT status FROM sync_sweep_promises WHERE id=${promiseId}`);
+      expect(unchanged!.status).toBe("active");
       const after = await closedProgressiveJob(db,backend,id,{...pinned,inspect:true,verifyCompleted:true});
       expect(after.plan.preservedSolver).toEqual(kept);
       const [job] = await db.execute(sql`SELECT stripped_at,strip_report FROM sim_jobs WHERE id=${id}`);
@@ -673,7 +715,11 @@ it("keeps an unreported solver readable and records only its signed siblings as 
       expect(job!.strip_report).toMatchObject({closedProgressiveSiblingFiles:{complete:true,outcome:"signed-sibling-working-files",preservedSolver:kept}});
       expect(job!.strip_report).not.toHaveProperty("closedProgressiveFiles");
       expect(applied).toBe(1);
-    } finally { fetcher.mockRestore(); }
+    } finally {
+      fetcher.mockRestore();
+      if (originalRole === undefined) delete process.env.AIRFOILFOAM_DEPLOYMENT_ROLE;
+      else process.env.AIRFOILFOAM_DEPLOYMENT_ROLE = originalRole;
+    }
   });
 },30000);
 
