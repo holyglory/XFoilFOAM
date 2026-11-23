@@ -6213,3 +6213,74 @@ timeout_seconds = 3000
 env = { HZ_REWRITE_COST_DISPOSABLE = "1", PYTHONDONTWRITEBYTECODE = "1" }
 command = ["python3", "-B", "tests/fixtures/hz-rewrite/rehearse_cost.py", "--corpus", ".codex-artifacts/hz-rewrite-cost-corpus", "--output", ".codex-artifacts/hz-toast-rewrite-cost-result/summary.json", "--toast-only", "--copies", "32"]
 retained_artifacts = [{ name = "full-rewrite-cost", path = ".codex-artifacts/hz-toast-rewrite-cost-result", max_bytes = 4194304 }]
+
+# PostgreSQL and immutable object bytes are disposable for this workload.
+[test.worker-staging-key-rollout]
+timeout_seconds = 900
+[test.worker-staging-key-rollout.postgres]
+image = "postgres:16-alpine"
+database = "aerodb"
+user = "aerodb"
+
+[[test.worker-staging-key-rollout.check]]
+name = "workspace"
+tier = "development"
+timeout_seconds = 240
+command = ["/usr/bin/corepack", "pnpm", "install", "--frozen-lockfile", "--ignore-scripts", "--offline"]
+[[test.worker-staging-key-rollout.check]]
+name = "schema"
+tier = "development"
+requires = ["workspace"]
+timeout_seconds = 180
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "migrate"]
+[[test.worker-staging-key-rollout.check]]
+name = "concurrent-backfill"
+tier = "development"
+requires = ["schema"]
+timeout_seconds = 90
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/worker-staging-key-backfill.test.ts", "--reporter=default"]
+[[test.worker-staging-key-rollout.check]]
+name = "source-and-key-selectors"
+tier = "development"
+requires = ["schema"]
+timeout_seconds = 180
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/progressive-staging-selection.test.ts", "test/progressive-stopped-storage.test.ts", "--reporter=default"]
+[[test.worker-staging-key-rollout.check]]
+name = "workload-to-storage"
+tier = "development"
+requires = ["workspace"]
+timeout_seconds = 240
+env = { PROGRESSIVE_REPORT_ARCHIVE_DISPOSABLE_DB="1", WORKER_STAGING_KEYS_ACCEPTANCE="1", NODE_ENV="test" }
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/progressive-report-archive.test.ts", "-t", "one registered worker workload through tracking, storage and rollback", "--reporter=default"]
+retained_artifacts = [{ name = "staging-key-workload", path = ".codex-artifacts/worker-staging-key-workload", max_bytes = 524288 }]
+
+[[test.worker-staging-key-rollout.check]]
+name = "seed-regressions"
+tier = "development"
+requires = ["schema"]
+timeout_seconds = 180
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "seed"]
+[[test.worker-staging-key-rollout.check]]
+name = "retention-and-delivery"
+tier = "development"
+requires = ["seed-regressions"]
+timeout_seconds = 300
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/progressive-report-retention.test.ts", "test/progressive-delivery-selection.test.ts", "--reporter=default"]
+[[test.worker-staging-key-rollout.check]]
+name = "archive-readers"
+tier = "development"
+requires = ["seed-regressions"]
+timeout_seconds = 240
+env = { PROGRESSIVE_REPORT_ARCHIVE_DISPOSABLE_DB="1", NODE_ENV="test" }
+command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/progressive-report-archive.test.ts", "--reporter=default"]
+[[test.worker-staging-key-rollout.check]]
+name = "release-identity"
+tier = "development"
+timeout_seconds = 45
+command = ["/usr/bin/python3", "-B", "tests/test_worker_staging_key_release.py"]
+[[test.worker-staging-key-rollout.check]]
+name = "workspace-types"
+tier = "development"
+requires = ["workspace"]
+timeout_seconds = 300
+command = ["/usr/bin/corepack", "pnpm", "-r", "typecheck"]

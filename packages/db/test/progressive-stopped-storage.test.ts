@@ -1,3 +1,4 @@
+import { fixtureStagingCandidateView, useFixtureStagingKeys } from "../test-support/staging-candidate-view";
 import { afterAll, expect, it } from "vitest";
 import { sql } from "drizzle-orm";
 import { createClient, type DB } from "../src/client";
@@ -32,9 +33,10 @@ it("retries only authenticated stopped inactive-promise refusals once without ch
     await transaction.execute(sql`CREATE TEMP TABLE progressive_worker_submission_intents ON COMMIT DROP AS
       SELECT id AS sim_job_id,'signature'::text AS assignment_signature FROM fixture_jobs`);
     await transaction.execute(sql`CREATE TEMP TABLE progressive_worker_reports ON COMMIT DROP AS
-      SELECT id AS sim_job_id,CASE WHEN variant='wrong-signature' THEN 'foreign' ELSE 'signature' END AS assignment_signature,
+      SELECT 1::bigint AS sequence,timestamptz '2026-01-01' AS created_at,id AS sim_job_id,CASE WHEN variant='wrong-signature' THEN 'foreign' ELSE 'signature' END AS assignment_signature,
       CASE WHEN variant<>'not-stopped' THEN id::text END AS stopped_engine_job_id,
       CASE WHEN variant<>'unacknowledged' THEN clock_timestamp() END AS acknowledged_at,'{"result":{}}'::jsonb AS report FROM fixture_jobs`);
+    await transaction.execute(fixtureStagingCandidateView);
     await transaction.execute(sql`CREATE TEMP TABLE progressive_worker_delivery_failures ON COMMIT DROP AS SELECT id AS sim_job_id,
       md5(variant) AS point_content_signature,'conflict'::text AS state,1::integer AS attempt_count,NULL::timestamptz AS retry_after,
       CASE WHEN variant='other-http' THEN 500 ELSE 409 END AS last_http_status,
@@ -57,6 +59,15 @@ it("retries only authenticated stopped inactive-promise refusals once without ch
       expect(
         await progressiveStoppedStorageEligible(connection, String(row.id)),
       ).toBe(false);
+    const owners = await transaction.execute(sql`SELECT id FROM fixture_jobs ORDER BY id`);
+    const originalEligibility = [];
+    for (const owner of owners)
+      originalEligibility.push(await progressiveStoppedStorageEligible(connection,String(owner.id)));
+    await useFixtureStagingKeys(transaction);
+    const projectedEligibility = [];
+    for (const owner of owners)
+      projectedEligibility.push(await progressiveStoppedStorageEligible(connection,String(owner.id)));
+    expect(projectedEligibility).toEqual(originalEligibility);
     expect(await requeueStoppedProgressiveStorage(connection)).toBe(1);
     expect(await requeueStoppedProgressiveStorage(connection)).toBe(0);
     const retries =

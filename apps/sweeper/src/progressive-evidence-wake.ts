@@ -10,11 +10,10 @@ export function progressiveEvidenceWakeSql(
   const source =
     scope === "staging"
       ? sql`SELECT report.sim_job_id, failure.retry_after, NULL::timestamptz AS claim_until
-        FROM progressive_worker_reports report
+        FROM progressive_worker_staging_candidates report
         LEFT JOIN progressive_worker_staging_failures failure
           ON failure.sim_job_id = report.sim_job_id AND failure.sequence = report.sequence
-        WHERE report.acknowledged_at IS NOT NULL AND jsonb_typeof(report.report->'result') = 'object'
-          AND NOT EXISTS (SELECT 1 FROM public.progressive_worker_closed_staging_copies covered
+        WHERE NOT EXISTS (SELECT 1 FROM public.progressive_worker_closed_staging_copies covered
             WHERE covered.sim_job_id=report.sim_job_id AND covered.sequence=report.sequence)
           AND NOT EXISTS (SELECT 1 FROM progressive_worker_report_conflicts conflict
             WHERE conflict.sim_job_id = report.sim_job_id AND conflict.sequence = report.sequence)
@@ -27,7 +26,7 @@ export function progressiveEvidenceWakeSql(
         FROM progressive_worker_evidence_attempts association
         JOIN progressive_worker_evidence_receipts staged
           ON staged.sim_job_id = association.sim_job_id AND staged.sequence = association.sequence
-        JOIN progressive_worker_reports report
+        JOIN progressive_worker_staging_candidates report
           ON report.sim_job_id = association.sim_job_id AND report.sequence = association.sequence
         JOIN result_attempts attempt ON attempt.id = association.result_attempt_id
           AND attempt.sim_job_id = association.sim_job_id AND attempt.engine_job_id = association.sim_job_id::text
@@ -35,8 +34,7 @@ export function progressiveEvidenceWakeSql(
           ON failure.sim_job_id = association.sim_job_id AND failure.point_content_signature = association.point_content_signature
         LEFT JOIN progressive_worker_evidence_delivery_claims claim
           ON claim.sim_job_id = association.sim_job_id AND claim.point_content_signature = association.point_content_signature
-        WHERE report.acknowledged_at IS NOT NULL AND jsonb_typeof(report.report->'result') = 'object'
-          AND NOT EXISTS (SELECT 1 FROM progressive_worker_report_conflicts conflict
+        WHERE NOT EXISTS (SELECT 1 FROM progressive_worker_report_conflicts conflict
             WHERE conflict.sim_job_id = report.sim_job_id AND conflict.sequence = report.sequence)
           AND attempt.result_id IS NOT NULL
           AND NOT EXISTS (SELECT 1 FROM progressive_worker_hub_receipts delivered

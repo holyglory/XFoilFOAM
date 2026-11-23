@@ -77,10 +77,11 @@ async function claimProgressiveWorkerEvidence(
     const [candidate] = await connection.execute(sql`
       SELECT job.id, report.sequence, report.content_signature, resolve_progressive_report(to_jsonb(report.*)) AS report
       FROM sim_jobs job JOIN sync_api_settings settings ON settings.id = 1
-      JOIN progressive_worker_reports report ON report.sim_job_id = job.id
+      JOIN progressive_worker_staging_candidates eligible ON eligible.sim_job_id = job.id
+      JOIN progressive_worker_reports report ON report.sim_job_id = eligible.sim_job_id AND report.sequence = eligible.sequence
+        AND report.acknowledged_at IS NOT NULL
       WHERE job.id = ${executionId}::uuid AND NOT settings.remote_solver_transfer_paused
         AND (${reportSequence ?? null}::bigint IS NULL OR report.sequence = ${reportSequence ?? null}::bigint)
-        AND report.acknowledged_at IS NOT NULL AND jsonb_typeof(report.report->'result') = 'object'
         AND NOT EXISTS (SELECT 1 FROM progressive_worker_report_conflicts conflict
           WHERE conflict.sim_job_id = report.sim_job_id AND conflict.sequence = report.sequence)
         AND NOT EXISTS (SELECT 1 FROM progressive_worker_evidence_receipts receipt
