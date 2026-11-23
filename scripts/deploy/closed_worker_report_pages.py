@@ -4,6 +4,7 @@ import hashlib
 import json
 import re
 import time
+from pathlib import Path
 
 
 def qualified_width(args, binding, runtime, peer_hash):
@@ -21,12 +22,24 @@ def qualified_width(args, binding, runtime, peer_hash):
         runtime_hash = hashlib.sha256(json.dumps(runtime, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
         if (policy["version"] != 1 or policy["binding"] != binding or policy["runtimeSha256"] != runtime_hash
                 or policy["peerSha256"] != peer_hash or policy["ordinaryMembers"] != 4 or policy["wideMembers"] != 8
-                or not re.fullmatch("[0-9a-f]{64}", policy["qualificationReceiptSha256"])):
+                or type(policy["maxKeysPerInvocation"]) is not int
+                or not 8 <= policy["maxKeysPerInvocation"] <= 128
+                or args.limit * max(1, getattr(args, "reuse_read_passes", 1)) > policy["maxKeysPerInvocation"]):
             return None
-        limits = {k: policy[k] for k in ("maxMemberBytes", "maxPageBytes", "maxPointSources", "minResultShareBps")}
+        with Path(policy["qualificationReceipt"]).open("rb") as file:
+            evidence = file.read(2 * 1024**2 + 1)
+        if len(evidence) > 2 * 1024**2 or hashlib.sha256(evidence).hexdigest() != policy["qualificationReceiptSha256"]:
+            return None
+        receipt = json.loads(evidence)
+        if (receipt["qualifiedSmallEnvelope"] is not True or receipt["scopedSource"] != binding
+                or receipt["comparisonGroupBytes"] < policy["maxPageBytes"]
+                or not receipt["populationPerGeneration"] or set(receipt["populationPerGeneration"]) != {8}):
+            return None
+        limits = {k: policy[k] for k in ("maxMemberBytes", "maxPageBytes", "maxPointSources", "maxResultBytes", "maxEnvelopeBytes")}
         member, page, points = (limits[k] for k in ("maxMemberBytes", "maxPageBytes", "maxPointSources"))
         if (any(type(n) is not int for n in limits.values()) or not 0 < member <= page <= 32 * 1024**2
-                or not 0 < points <= 512 or not 0 < limits["minResultShareBps"] <= 10000):
+                or not 0 < points <= 512 or not 0 < limits["maxResultBytes"] <= member
+                or not 0 < limits["maxEnvelopeBytes"] <= member):
             return None
         return limits
     except (OSError, ValueError, TypeError, KeyError):
@@ -40,14 +53,14 @@ def fits_wide_page(rows, limits, *, prefix=False):
     if not isinstance(first.get("sha256"), str) or not re.fullmatch("[0-9a-f]{64}", first["sha256"]):
         return False
     result_bytes = first.get("byteSize")
-    if type(result_bytes) is not int or result_bytes <= 0:
+    if type(result_bytes) is not int or not 0 < result_bytes <= limits["maxResultBytes"]:
         return False
     total = 0
     for row in rows:
         facts = row["source"]["facts"]
         size = facts["byteSize"]
         if (row["resultMeta"] != first or not 0 < size <= limits["maxMemberBytes"]
-                or result_bytes > size or result_bytes * 10000 < size * limits["minResultShareBps"]
+                or not 0 <= size - result_bytes <= limits["maxEnvelopeBytes"]
                 or not 0 < len(facts["points"]) <= limits["maxPointSources"]):
             return False
         total += size

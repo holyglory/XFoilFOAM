@@ -256,12 +256,14 @@ class ClosedReportOperator(unittest.TestCase):
             binding={"inventory":"one","frozen":"two","solver":"three"}
             runtime={"reader":"a"*64}
             runtime_digest=hashlib.sha256(json.dumps(runtime,sort_keys=True,separators=(",",":")).encode()).hexdigest()
-            limits=dict(maxMemberBytes=20,maxPageBytes=150,maxPointSources=2,minResultShareBps=4000)
+            limits=dict(maxMemberBytes=20,maxPageBytes=150,maxPointSources=2,maxResultBytes=12,maxEnvelopeBytes=8)
             peer="b"*64
-            config=dict(version=1,binding=binding,runtimeSha256=runtime_digest,peerSha256=peer,ordinaryMembers=4,wideMembers=8,
-                        qualificationReceiptSha256="f"*64,**limits)
+            evidence=Path(tmp)/"live-comparison.json"
+            evidence.write_bytes(controller.compact(dict(qualifiedSmallEnvelope=True,scopedSource=binding,comparisonGroupBytes=150,populationPerGeneration=[8,8])))
+            config=dict(maxKeysPerInvocation=16,qualificationReceipt=str(evidence),version=1,binding=binding,runtimeSha256=runtime_digest,peerSha256=peer,ordinaryMembers=4,wideMembers=8,
+                        qualificationReceiptSha256=controller.digest(evidence.read_bytes()),**limits)
             p.write_bytes(controller.compact(config))
-            args=SimpleNamespace(width_qualification=p,width_qualification_sha256=controller.digest(p.read_bytes()),page_members=4)
+            args=SimpleNamespace(width_qualification=p,width_qualification_sha256=controller.digest(p.read_bytes()),page_members=4,limit=16)
             self.assertEqual(qualified_width(args,binding,runtime,peer),limits)
             self.assertIsNone(qualified_width(args,dict(binding,inventory="prospective"),runtime,peer))
             self.assertIsNone(qualified_width(args,binding,{},peer))
@@ -314,8 +316,10 @@ class ClosedReportOperator(unittest.TestCase):
                 return {"rows":[{"storedFieldBytes":5}for _ in items]}
             with patch.object(controller.subprocess,"check_output",return_value=b"runtime"),patch.object(controller,"run_peer",side_effect=rpc):
                 _s,_ranges,binding,runtime,peer=controller.inputs(args)
-                policy=dict(version=1,binding=binding,ordinaryMembers=4,wideMembers=8,maxMemberBytes=20,maxPageBytes=144,
-                      maxPointSources=1,minResultShareBps=7000,qualificationReceiptSha256="c"*64,
+                evidence=root/"qualified.json"
+                evidence.write_bytes(controller.compact(dict(qualifiedSmallEnvelope=True,scopedSource=binding,comparisonGroupBytes=144,populationPerGeneration=[8])))
+                policy=dict(version=1,binding=binding,ordinaryMembers=4,wideMembers=8,maxMemberBytes=20,maxPageBytes=144,maxKeysPerInvocation=16,
+                      maxPointSources=1,maxResultBytes=16,maxEnvelopeBytes=5,qualificationReceipt=str(evidence),qualificationReceiptSha256=controller.digest(evidence.read_bytes()),
                       runtimeSha256=controller.digest(json.dumps(runtime,sort_keys=True,separators=(",",":")).encode()),
                       peerSha256=controller.digest(peer.encode()))
                 args.width_qualification.write_bytes(controller.compact(policy))
