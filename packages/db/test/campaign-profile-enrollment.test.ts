@@ -112,6 +112,7 @@ import {
 } from "../../../apps/sweeper/src/progressive-remote-progress";
 import { storeProgressiveRemoteReport } from "../src/progressive-remote-reports";
 import { settleProgressiveRemoteJob } from "../../../apps/sweeper/src/progressive-remote-settlement";
+import { verifyRepeatedProgress } from "./progressive-repeated-progress-fixture";
 import { verifyProgressiveWorkerReportDelivery } from "./progressive-worker-report-fixture";
 import { verifyProgressiveAcceptedArchiveReplay } from "./progressive-accepted-archive-fixture";
 import { verifyProgressiveRemoteReportInventory } from "./progressive-remote-inventory-fixture";
@@ -6025,6 +6026,7 @@ describe("progressive CPU admission", () => {
             },
           },
         };
+        await verifyRepeatedProgress(db, bound.envelope, running, client.sql);
         await verifyProgressiveAcceptedArchiveReplay(
           db,
           bound.envelope,
