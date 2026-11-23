@@ -14,6 +14,14 @@ existing sweeper container and canonical metadata workload identity. The hub
 does not SSH to the worker; no private key, cloud token, ADC file, or worker
 credential is transferred. No helper installation or service restart is needed.
 
+When a conflict refers to an already archived worker report from this frozen
+scope, the controller reads the original generation through the hub. It keeps
+the conflict's exact row text, including its reason and timestamp, and verifies
+the original worker body, signature and source-row digest. Consecutive aliases
+share one decoded generation index within a bounded output page. The controller
+rechecks the PostgreSQL pointers before sealing the page. A missing origin or
+proof mismatch holds the checkpoint and identifies the execution and sequence.
+
 ## Configure an operation
 
 Run from a checkout with dependencies installed. Supply nonsecret targets and

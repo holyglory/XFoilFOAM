@@ -1,3 +1,8 @@
+import {
+  coldLegacySource,
+  overLegacyBudget,
+  LegacyConflictOrigin,
+} from "./legacy-report-conflict-origin";
 import { randomUUID } from "node:crypto";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
@@ -354,6 +359,7 @@ export async function readLegacyPage(
   maxBytes = 64 * 1024 ** 2,
   checkRead?: (cursor: LegacyCursor) => void,
   endExecution = scope.executions.length,
+  originStore?: Pick<LegacyBackupStore, "read">,
 ): Promise<LegacyBackupPage> {
   assertLegacyScope(scope);
   checkCursor(scope, start);
@@ -365,6 +371,14 @@ export async function readLegacyPage(
   );
   legacyBound(rows, 128, "page rows");
   legacyBound(maxBytes, 256 * 1024 ** 2, "page bytes");
+  const origins = originStore
+    ? new LegacyConflictOrigin(
+        source,
+        originStore,
+        scope,
+        legacyScopeHash(scope),
+      )
+    : undefined;
   const next = { ...start };
   const members: LegacyReportMember[] = [];
   let bytes = 0;
@@ -460,15 +474,27 @@ export async function readLegacyPage(
               (maxBytes - bytes) * 6 + 1024 * 1024,
             );
       if (result.length !== 1) throw new Error("Frozen source member missing");
-      if (result[0].blocked) {
-        if (
-          members.length &&
-          result[0].blocked === "row exceeds remaining byte budget"
-        )
-          return page();
-        throw new Error(`Legacy copy blocked: ${result[0].blocked}`);
+      let row = result[0]!;
+      if (
+        row.blocked === coldLegacySource &&
+        next.kind === "conflict" &&
+        origins
+      ) {
+        row = await origins.read(item.executionId, sequence, maxBytes - bytes);
+        checkRead?.(next);
       }
-      const member = result[0] as unknown as LegacyReportMember;
+      if (row.blocked) {
+        if (members.length && row.blocked === overLegacyBudget) return page();
+        throw new LegacyStorageOperationError({
+          operation: "worker_read",
+          category:
+            row.blocked === overLegacyBudget
+              ? "member_over_budget"
+              : "origin_unavailable",
+          member: { executionId: item.executionId, kind: next.kind, sequence },
+        });
+      }
+      const member = row as unknown as LegacyReportMember;
       checkRead?.(next);
       checkLegacyMember(member);
       if (
@@ -490,7 +516,8 @@ export async function readLegacyPage(
     }
   }
   return page();
-  function page(): LegacyBackupPage {
+  async function page(): Promise<LegacyBackupPage> {
+    await origins?.recheck();
     return {
       version: 1,
       scopeSha256: legacyScopeHash(scope),
@@ -716,6 +743,7 @@ export async function exportLegacyReports(input: {
       maxBytes,
       check,
       endExecution,
+      input.store,
     );
     check?.(page.next);
     return packedPage(page);

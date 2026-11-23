@@ -1735,3 +1735,205 @@ it("retires an unstaged native report through its independent hub generation and
   const { registeredWorkerRoundtrip } = await import("./registered-worker-report-fixture");
   await withArchiveFixture(client, "worker", registeredWorkerRoundtrip, { normalized: false, settled: false, reportCount: 4 });
 });
+
+it("crosses from the final warm report into cold conflict aliases using one verified original generation", async () => {
+  const { readLegacyPage, legacyScopeHash, encodeLegacyPage } =
+    await import("../src/legacy-report-storage");
+  const { LegacyResultTransport } =
+    await import("../src/legacy-report-result-transport");
+  await withArchiveFixture(
+    client,
+    "worker",
+    async (f) => {
+      const { db, executionId: job } = f;
+      await db.execute(sql`INSERT INTO progressive_worker_report_conflicts(sim_job_id,sequence,content_signature,report,reason)
+      SELECT sim_job_id,sequence,content_signature,report,'original conflict '||sequence FROM progressive_worker_reports WHERE sim_job_id=${job}::uuid AND sequence IN (2,3)`);
+      const query = async (q: string, max: number) => {
+        // This fixture owns an outer rollback. Execute the generated read-only SELECT on that same connection.
+        const body = q.match(
+          /SET LOCAL timezone = 'UTC';\n([\s\S]+);\nCOMMIT;\n$/,
+        )?.[1];
+        if (!body || !/^(WITH|SELECT) /.test(body))
+          throw new Error("Unexpected source query");
+        const result = await db.execute(sql.raw(body));
+        const raw = result.map((r) => String(Object.values(r)[0]));
+        if (Buffer.byteLength(raw.join("\n")) > max)
+          throw new Error("Unbounded fixture read");
+        return raw.map((t) => JSON.parse(t) as Record<string, unknown>);
+      };
+      const transport = new LegacyResultTransport({ query });
+      const source = {
+        query,
+        readMember: transport.readMember.bind(transport),
+      };
+      const scope = {
+        version: 1 as const,
+        sourceInstance: randomUUID(),
+        solverId: JSON.parse(f.reports[0]!.text).solverId as string,
+        measuredAt: new Date().toISOString(),
+        executions: [
+          {
+            executionId: job,
+            reports: 4,
+            reportHighWater: 4,
+            conflicts: 2,
+            conflictHighWater: 3,
+          },
+        ],
+      };
+      const hash = legacyScopeHash(scope),
+        original = await readLegacyPage(source, scope, undefined, 3);
+      const bytes = encodeLegacyPage(original).bytes,
+        sha = archiveSha256(bytes),
+        objectKey = `legacy-worker-reports/v1/${scope.sourceInstance}/${scope.solverId}/${hash}/${sha}.jsonl.gz`;
+      const crc = new Storage({
+        projectId: "legacy-conflict-origin",
+      }).crc32cGenerator();
+      crc.update(bytes);
+      const [bundle] =
+        await db.execute(sql`INSERT INTO progressive_report_archive_bundles(source_kind,sim_job_id,bucket,object_key,generation,
+      archive_format,stored_sha256,stored_byte_size,crc32c,member_count,first_sequence,last_sequence,verified_at,
+      legacy_instance_id,legacy_solver_id,legacy_scope_sha256,legacy_page_member_count,legacy_read_mode)
+      VALUES ('worker',${job}::uuid,'origin-test',${objectKey},'1795380355397132222','legacy-jsonl',${sha},${bytes.length},${crc.toString()},3,1,3,now(),
+        ${scope.sourceInstance}::uuid,${scope.solverId}::uuid,${hash},3,'registered-get') RETURNING id`);
+      for (const m of original.members) {
+        await db.execute(sql`INSERT INTO progressive_report_archive_members(bundle_id,source_kind,sim_job_id,sequence,member_kind,content_signature,
+        report_sha256,report_byte_size,legacy_row_sha256,legacy_row_byte_size) VALUES(${bundle!.id}::uuid,'worker',${job}::uuid,${m.sequence},'report',
+        ${m.contentSignature},${m.reportSha256},${m.reportByteSize},${m.rowSha256},${Buffer.byteLength(m.rowText)})`);
+        await db.execute(sql`UPDATE progressive_worker_reports SET archived_at=now(),archive_bundle_id=${bundle!.id}::uuid,report=progressive_report_compact_header(report)
+        WHERE sim_job_id=${job}::uuid AND sequence=${m.sequence}`);
+      }
+      const store = {
+        read: vi.fn(async (o: { generation: string; objectKey: string }) => {
+          expect(o.generation).toBe("1795380355397132222");
+          expect(o.objectKey).toBe(objectKey);
+          return bytes;
+        }),
+      };
+      const start = {
+        execution: 0,
+        kind: "report" as const,
+        after: 3,
+        copied: 3,
+      };
+      const page = await readLegacyPage(
+        source,
+        scope,
+        start,
+        3,
+        256 * 1024 ** 2,
+        undefined,
+        1,
+        store,
+      );
+      expect(store.read).toHaveBeenCalledTimes(1);
+      expect(page.members.map((m) => [m.kind, m.sequence])).toEqual([
+        ["report", 4],
+        ["conflict", 2],
+        ["conflict", 3],
+      ]);
+      expect(page.next).toEqual({
+        execution: 0,
+        kind: "conflict",
+        after: 3,
+        copied: 2,
+      });
+      for (const m of page.members.slice(1)) {
+        const [c] = await db.execute(
+          sql`SELECT to_jsonb(c)::text AS body FROM progressive_worker_report_conflicts c WHERE sim_job_id=${job}::uuid AND sequence=${m.sequence}`,
+        );
+        expect(m.rowText).toBe(c!.body);
+        expect(JSON.parse(m.rowText)).toMatchObject({
+          reason: "original conflict " + m.sequence,
+          body_source_sequence: m.sequence,
+        });
+        expect(m.reportText).toBe(f.reports[m.sequence - 1]!.text);
+        expect(m.reportText).toContain(LARGE_REPORT_INTEGER);
+      }
+      const conflict = {
+        execution: 0,
+        kind: "conflict" as const,
+        after: 0,
+        copied: 0,
+      };
+      const cost =
+        page.members[1]!.reportByteSize +
+        Buffer.byteLength(page.members[1]!.rowText);
+      store.read.mockClear();
+      expect(
+        (
+          await readLegacyPage(
+            source,
+            scope,
+            conflict,
+            2,
+            cost,
+            undefined,
+            1,
+            store,
+          )
+        ).next,
+      ).toEqual({ ...conflict, after: 2, copied: 1 });
+      await expect(
+        readLegacyPage(
+          source,
+          scope,
+          conflict,
+          2,
+          cost - 1,
+          undefined,
+          1,
+          store,
+        ),
+      ).rejects.toMatchObject({
+        details: {
+          category: "member_over_budget",
+          member: { executionId: job, sequence: 2 },
+        },
+      });
+      expect(store.read).toHaveBeenCalledTimes(1);
+      await expect(
+        readLegacyPage(
+          source,
+          scope,
+          conflict,
+          2,
+          4 * 1024 ** 2,
+          undefined,
+          1,
+          { read: async () => Buffer.from("corrupt") },
+        ),
+      ).rejects.toMatchObject({
+        details: { operation: "conflict_origin", category: "origin_mismatch" },
+        retryable: false,
+      });
+      const changed = {
+        ...source,
+        query: async (q: string, b: number) => {
+          const rows = await query(q, b);
+          return q.includes("'job',job,'sequence',sequence,'snapshot'")
+            ? []
+            : rows;
+        },
+      };
+      await expect(
+        readLegacyPage(
+          changed,
+          scope,
+          conflict,
+          2,
+          4 * 1024 ** 2,
+          undefined,
+          1,
+          store,
+        ),
+      ).rejects.toMatchObject({
+        details: {
+          category: "origin_mismatch",
+          member: { executionId: job, sequence: 2 },
+        },
+      });
+    },
+    { reportCount: 4, normalized: false },
+  );
+});

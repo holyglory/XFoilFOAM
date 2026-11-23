@@ -1,3 +1,4 @@
+import { canonicalLegacyResultSlot as resultSlot } from "./legacy-report-signature";
 import { createHash, type Hash } from "node:crypto";
 import { sql } from "drizzle-orm";
 import type { DB } from "./client";
@@ -156,16 +157,6 @@ function postgresEnvelope(fields: Map<string, string>, result: string): string {
 function appendScientificReport(group: ScientificResultGroup, member: LegacyReportMember, fields: Map<string, string>) {
   group.reports.push({ sequence: member.sequence, contentSignature: member.contentSignature,
     envelopeText: postgresEnvelope(fields, "null") });
-}
-
-/** Split only an unambiguous top-level canonical result slot. All varying
- * envelope tokens still use the production lossless canonical serializer. */
-function resultSlot(envelope: ReturnType<typeof reportJsonObject>) {
-  const canonical = canonicalReportJson({ ...envelope, result: null });
-  const slot = '"result":null';
-  const at = canonical.indexOf(slot);
-  if (at < 0 || at !== canonical.lastIndexOf(slot)) return undefined;
-  return { prefix: canonical.slice(0, at + slot.length - 4), suffix: canonical.slice(at + slot.length) };
 }
 
 function matchesOriginalReport(fields: ReadonlyMap<string, string>, result: string, text: string) {
