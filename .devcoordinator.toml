@@ -5856,8 +5856,10 @@ diagnostic_sources = [{ format = "junit", path = "report.xml" }]
 name = "report-protocol"
 tier = "development"
 timeout_seconds = 600
-requires = ["schema"]
-command = ["/bin/bash", "scripts/dev/run-vitest-with-diagnostics.sh", "@aerodb/db", "test/progressive-report-retention.test.ts", "test/progressive-remote-report.test.ts"]
+requires = ["workspace"]
+# Parallel archive fixtures update the same public normalization-policy row.
+case_command = ["/bin/bash", "-c", "/usr/bin/corepack pnpm --filter @aerodb/db migrate && exec /bin/bash scripts/dev/run-vitest-with-diagnostics.sh @aerodb/db test/progressive-report-retention.test.ts test/progressive-remote-report.test.ts"]
+cases = [{ id = "isolated-retention", args = [], postgres = "default" }]
 diagnostic_sources = [{ format = "junit", path = "report.xml" }]
 
 [[test.progressive-report-archive.check]]
@@ -6347,9 +6349,10 @@ command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "seed"]
 [[test.worker-staging-key-rollout.check]]
 name = "retention-and-delivery"
 tier = "development"
-requires = ["seed-regressions"]
+requires = ["workspace"]
 timeout_seconds = 300
-command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/progressive-report-retention.test.ts", "test/progressive-delivery-selection.test.ts", "--reporter=default"]
+case_command = ["/bin/bash", "-c", "/usr/bin/corepack pnpm --filter @aerodb/db migrate && /usr/bin/corepack pnpm --filter @aerodb/db seed && exec /usr/bin/corepack pnpm --filter @aerodb/db exec vitest run test/progressive-report-retention.test.ts test/progressive-delivery-selection.test.ts --reporter=default"]
+cases = [{ id = "isolated-retention", args = [], postgres = "default" }]
 [[test.worker-staging-key-rollout.check]]
 name = "archive-readers"
 tier = "development"
