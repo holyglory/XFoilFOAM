@@ -23,6 +23,25 @@ ADMIN_PASSWORD="$(cat -- "$fixture_dir/password")"
 ADMIN_SESSION_SECRET="$(cat -- "$fixture_dir/session")"
 export ADMIN_PASSWORD ADMIN_SESSION_SECRET
 corepack pnpm --filter @aerodb/db migrate
-corepack pnpm --filter @aerodb/db exec node --import tsx src/seed-progressive-preview.ts
+# The ordinary preview enrolls every new profile in its campaign. On subsequent
+# starts the full catalog is present, but this fixture only needs the two
+# measured examples. Reuse them when all six conditions per example can be read.
+examples_ready="$(corepack pnpm --filter @aerodb/db exec node --import tsx --input-type=module - <<'JS'
+import { createClient } from './src/client.ts';
+import { publicProgressiveCatalog } from './src/progressive-catalog.ts';
+const { db, sql } = createClient({ max: 1 });
+try {
+  const rows = await sql`SELECT id FROM airfoils WHERE slug IN ('ag24', 'ag25') AND "deletedAt" IS NULL AND "archivedAt" IS NULL`;
+  const examples = await publicProgressiveCatalog(db, rows.map((row) => row.id));
+  console.log(rows.length === 2 && examples.conditions.length === 6 &&
+    rows.every((row) => examples.metrics.get(row.id)?.polarCount === 6));
+} finally {
+  await sql.end();
+}
+JS
+)"
+if [[ "$examples_ready" != true ]]; then
+  corepack pnpm --filter @aerodb/db exec node --import tsx src/seed-progressive-preview.ts
+fi
 corepack pnpm --filter @aerodb/db seed
 exec corepack pnpm --filter @aerodb/api start

@@ -16,7 +16,7 @@ async function query(page, values) {
   assert.equal(result.status(), 200);
   return result.json();
 }
-const rows = (page) => page.locator(".airfoil-row");
+const rows = (page) => page.locator('[data-testid^="airfoil-row-"]');
 async function waitRows(page, expected) {
   await expect(rows(page)).toHaveCount(expected.length);
   assert.deepEqual(await rows(page).evaluateAll((nodes) => nodes.map((node) => node.dataset.testid)),
