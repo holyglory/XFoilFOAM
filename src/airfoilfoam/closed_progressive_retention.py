@@ -11,7 +11,7 @@ from contextlib import nullcontext
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 
-from .evidence_runtime import EvidenceCleanupError, _atomic_create_json, _broker_reclaim_path_inventory
+from .evidence_runtime import EvidenceCleanupError, _atomic_create_json
 from .evidence_store import MAX_EVIDENCE_MANIFEST_BYTES, _size_and_sha256
 from .retention import JobRetentionRefused, _job_retention_guard
 
@@ -320,6 +320,29 @@ def _checked_job_tree(root, protected, authenticated, urans_solvers, historical_
         yield folder, relative, dirs, names
 
 
+def _preserved_mesh_inventory(root, mesh):
+    digest = hashlib.sha256()
+    size = count = 0
+    for path in sorted(mesh.rglob("*"), key=lambda p: p.as_posix()):
+        relative = path.relative_to(mesh)
+        if any(re.fullmatch(r"core\.[0-9]+", part) for part in relative.parts):
+            continue
+        count += 1
+        _require(count <= 100_000 and not path.is_symlink(), "unbounded or linked retained mesh")
+        name = relative.as_posix()
+        st = path.lstat()
+        if stat.S_ISDIR(st.st_mode):
+            digest.update(f"dir\0{name}\n".encode())
+        else:
+            _require(stat.S_ISREG(st.st_mode), "special file in retained mesh")
+            length, sha = _size_and_sha256(path)
+            _require(length == st.st_size and _same_file(path, st), "retained mesh changed during inventory")
+            size += length
+            digest.update(f"file\0{name}\0{length}\0{sha}\n".encode())
+    return {"name": mesh.relative_to(root).as_posix(), "kind": "directory", "byteSize": size,
+            "entryCount": count, "treeSha256": digest.hexdigest()}
+
+
 def _preserved_solver_tree(root, directory):
     """Pin every original entry in one unreported solver; it has no cloud disposition."""
     tree = root / directory
@@ -363,7 +386,7 @@ def _preserved_solver_tree(root, directory):
                              "preserved solver links into another working source")
                     mesh = target.relative_to(root).as_posix()
                     if mesh not in meshes:
-                        meshes[mesh] = _broker_reclaim_path_inventory(target, mesh)
+                        meshes[mesh] = _preserved_mesh_inventory(root, target)
                 identity.extend([os.readlink(path), target.relative_to(root).as_posix()])
             else:
                 _require(stat.S_ISDIR(st.st_mode), "special file in preserved solver")
