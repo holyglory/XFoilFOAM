@@ -207,7 +207,14 @@ try {
       assert.equal(actual.resultAttemptId, input.publicAttemptId);
       assert.equal(actual.history.t.length, input.sampleCount);
       await expect(live.getByTestId("sim-modal-dialog")).toBeVisible();
-      await expect(live.getByTestId("sim-accent-stats")).toBeVisible();
+      const coefficients = live.getByTestId(
+        actual.observation ? "sim-attempt-evidence" : "sim-accent-stats",
+      );
+      await expect(coefficients).toBeVisible();
+      if (actual.observation) {
+        await expect(coefficients).toContainText(actual.cl.toFixed(4));
+        await expect(coefficients).toContainText(actual.cd.toFixed(5));
+      }
       await live.screenshot({
         path: join(directory, "live-selected-solver-result.png"),
         animations: "disabled",
