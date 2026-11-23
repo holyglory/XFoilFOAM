@@ -947,6 +947,181 @@ describe.sequential("worker-only legacy backup and 0198 representation", () => {
       vi.unstubAllEnvs();
     }
   });
+  it("charges the same front and peer work in serial and concurrent controls and preserves both receipt chains", async () => {
+    const a = await fixture(false),
+      b = await fixture(false, a.solverId);
+    const scope = {
+      ...a,
+      executions: [...a.executions, ...b.executions].sort((x, y) =>
+        x.executionId.localeCompare(y.executionId),
+      ),
+    };
+    const [front, peer] = scope.executions;
+    const results = [];
+    for (const order of ["serial", "concurrent"] as const) {
+      const path = await directory(),
+        store = new MemoryBackup(),
+        peerStarted = signal(),
+        frontStarted = signal();
+      let active = 0,
+        peak = 0,
+        frontApplied = false;
+      const peerSource = {
+        ...source,
+        async query(q: string, bytes: number) {
+          if (order === "serial") {
+            expect(frontApplied).toBe(true);
+            const frontStage = join(
+              path,
+              "pending.jsonl.gz",
+              "page-0-report-0-0",
+            );
+            expect(
+              JSON.parse(await readFile(join(frontStage, "ready.json"), "utf8"))
+                .receipt,
+            ).toMatch(/receipt\.json$/);
+            await expect(
+              readFile(join(frontStage, "transfer.gz")),
+            ).rejects.toMatchObject({ code: "ENOENT" });
+          }
+          return source.query(q, bytes);
+        },
+      };
+      const result = await exportLegacyReports({
+        scope,
+        source,
+        store,
+        directory: path,
+        rows: 2,
+        pages: 2,
+        maxBytes: 256 * 1024 ** 2,
+        sourceBinding: "same-target",
+        executionSupervisor: {
+          slots: 2,
+          pairOrder: order,
+          targetBinding: "same-worker",
+          peerSource,
+          openBudget: async () => ({
+            admit: true,
+            finish: async () => ({
+              permitted: true,
+              peakWorkerRssMiB: 100,
+              peakControllerRssMiB: 100,
+              minAvailableMiB: 12000,
+            }),
+          }),
+        },
+        applyVerifiedPage: async (page, receipt) => {
+          active++;
+          peak = Math.max(peak, active);
+          try {
+            const owner = page.members[0].executionId;
+            if (order === "concurrent") {
+              if (owner === front.executionId) {
+                frontStarted.release();
+                await peerStarted.reached;
+              } else {
+                peerStarted.release();
+                await frontStarted.reached;
+              }
+            }
+            expect(
+              decodeLegacyPage(await store.read(receipt.object), receipt)
+                .members,
+            ).toEqual(page.members);
+            if (owner === peer.executionId) peerStarted.release();
+            if (owner === front.executionId) frontApplied = true;
+          } finally {
+            active--;
+          }
+        },
+      });
+      expect(peak).toBe(order === "serial" ? 1 : 2);
+      expect(result.executionSupervisor?.maxActive).toBe(peak);
+      expect(result.executionSupervisor?.pairOrder).toBe(order);
+      expect(result.executionSupervisor?.pairedExecutions).toEqual([
+        [front.executionId, peer.executionId],
+      ]);
+      const costs = result.executionSupervisor!.pageWork;
+      expect(costs).toHaveLength(2);
+      expect(
+        costs.every(
+          (x) => x.elapsedMs >= 0 && x.members === 2 && x.packedBytes > 0,
+        ),
+      ).toBe(true);
+      results.push({
+        next: result.next,
+        receipts: result.receipts,
+        peerReceipts: result.executionSupervisor!.peerReceipts,
+        peerNext: result.executionSupervisor!.peerNext,
+      });
+    }
+    expect(results[0]).toEqual(results[1]);
+  }, 30000);
+
+  it("stops serial-control admissions before a peer when the front reply is lost", async () => {
+    const a = await fixture(false),
+      b = await fixture(false, a.solverId);
+    const scope = {
+      ...a,
+      executions: [...a.executions, ...b.executions].sort((x, y) =>
+        x.executionId.localeCompare(y.executionId),
+      ),
+    };
+    const path = await directory(),
+      store = new MemoryBackup();
+    const peer = vi.fn(source.query);
+    const base = {
+      scope,
+      source,
+      store,
+      directory: path,
+      rows: 2,
+      pages: 2,
+      maxBytes: 256 * 1024 ** 2,
+      sourceBinding: "serial-failure",
+      executionSupervisor: {
+        slots: 2 as const,
+        pairOrder: "serial" as const,
+        targetBinding: "same-worker",
+        peerSource: { query: peer },
+        openBudget: async () => ({
+          admit: true,
+          finish: async () => ({
+            permitted: true,
+            peakWorkerRssMiB: 100,
+            peakControllerRssMiB: 100,
+            minAvailableMiB: 10000,
+          }),
+        }),
+      },
+    };
+    await expect(
+      exportLegacyReports({
+        ...base,
+        applyVerifiedPage: async () => {
+          throw Error("lost front reply");
+        },
+      }),
+    ).rejects.toThrow(/lost front reply/);
+    expect(peer).not.toHaveBeenCalled();
+    expect(
+      JSON.parse(await readFile(join(path, "checkpoint.json"), "utf8"))
+        .lastReceipt,
+    ).toBeNull();
+    const resumed = await exportLegacyReports({
+      ...base,
+      applyVerifiedPage: async () => undefined,
+    });
+    expect(resumed.executionSupervisor).toMatchObject({
+      pairOrder: "serial",
+      maxActive: 1,
+      appliedAhead: 1,
+      published: 1,
+    });
+    expect(resumed.next.copied).toBe(2);
+  });
+
   it("persists custody proof for a real 64.64.generation receipt without exceeding NAME_MAX", async () => {
     const scope = await fixture(false),
       path = await directory();

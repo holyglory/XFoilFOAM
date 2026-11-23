@@ -181,6 +181,24 @@ to the ordinary window still bound admission. A cache-heavy PostgreSQL can
 therefore coexist with a second worker while measured resource margins hold.
 
 
+To measure whether overlapping the two *actual* heads helps, `--pair-order=serial`
+runs the admitted front page to durable completion before starting the peer.
+`--pair-order=concurrent` overlaps the same two bounded operations. Both use
+the same scope, budgets, immutable objects, working reader, receipt files and
+ordered checkpoint. A held or failed front never starts a new serial peer.
+Admission can still select an ordinary 256 MiB head when the pair cannot run.
+The pass reports each stage's execution, generation, member count, packed bytes
+and elapsed time. The working-volume proof reports CPU and peak RSS for its
+own worker process. PostgreSQL and solver cgroup counters cover the full window.
+
+For a crossover, use a four-page block of serial then concurrent waves, and a
+second four-page block in reversed order. Run each wave with `--pages=2` in the
+same owning unit. Compare decoded native bytes, near-prefix bytes and elapsed
+time as well as rows. Count only receipts joined to the public prefix as ordered
+progress. Record the outcome separately if capacity, representation or release
+eligibility differs between arms. Restore ordinary single-slot operation after
+each block.
+
 During a pair, `pending.jsonl.gz` is a directory with a transfer file per
 active slot, exact archive receipts, and a short publication record. The
 supervisor removes transfer bytes after durable application evidence. It

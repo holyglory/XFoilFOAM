@@ -39,7 +39,7 @@ import {
 } from "./legacy-report-storage";
 
 const usage = `legacy-report-storage-cli COMMAND [--name=value] [--apply] [--readers-ready]
-  migrate (copy options) [--execution-slots=1|2 --slot-min-available-mib=N --slot-max-rss-mib=N --slot-pair-reserve-mib=N] [--until-complete --max-passes=N --max-seconds=N --yield-ms=N] --readers-ready [--adopt-copy] [--worker-sweeper-container=HZ_SWEEPER] [--registered-get=denied|unproven]
+  migrate (copy options) [--execution-slots=1|2 --pair-order=serial|concurrent --slot-min-available-mib=N --slot-max-rss-mib=N --slot-pair-reserve-mib=N] [--until-complete --max-passes=N --max-seconds=N --yield-ms=N] --readers-ready [--adopt-copy] [--worker-sweeper-container=HZ_SWEEPER] [--registered-get=denied|unproven]
   migrate-receipts --scope=scope.json --directory=RECEIPTS --ssh-host=HZ --container=POSTGRES
                    (hub options) [--pages=32] [--apply --readers-ready]
   inventory-sql --side=worker|hub [--after=UUID] [--rows=256]
@@ -149,6 +149,7 @@ export async function legacyReportStorageCli(args: string[]): Promise<void> {
     "readers-ready",
     "adopt-copy",
     "execution-slots",
+    "pair-order",
     "slot-min-available-mib",
     "slot-max-rss-mib",
     "slot-pair-reserve-mib",
@@ -338,6 +339,14 @@ export async function legacyReportStorageCli(args: string[]): Promise<void> {
     const rows = number("rows", 16, 128);
     const maxBytes = number("max-bytes", 64 * 1024 ** 2, 256 * 1024 ** 2);
     const slots = number("execution-slots", 1, 2) as 1 | 2;
+    const pairOrder = options.get("pair-order") ?? "concurrent";
+    if (
+      (pairOrder !== "serial" && pairOrder !== "concurrent") ||
+      (options.has("pair-order") && slots !== 2)
+    )
+      throw new Error(
+        "--pair-order requires two execution slots and serial or concurrent ordering",
+      );
     const minAvailable = number("slot-min-available-mib", 8192, 1048576);
     const maxRss = number("slot-max-rss-mib", 4096, 1048576);
     const pairReserve = number("slot-pair-reserve-mib", 3072, 1048576);
@@ -387,6 +396,7 @@ export async function legacyReportStorageCli(args: string[]): Promise<void> {
             pages,
             executionSlots: slots,
             ...(slots === 2 && {
+              pairOrder,
               pairedPageMaxBytes: 128 * 1024 ** 2,
               combinedPageMaxBytes: 256 * 1024 ** 2,
               minAvailableMiB: minAvailable,
@@ -499,6 +509,7 @@ export async function legacyReportStorageCli(args: string[]): Promise<void> {
           ? {
               slots,
               peerSource: peer,
+              pairOrder,
               applicationMarker: (receipt) =>
                 legacyAppliedReceiptFile(receipt, normalizer),
               targetBinding:
