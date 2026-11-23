@@ -11,6 +11,7 @@ import { runSolverHistoryStorageService } from "./solver-history-service";
 import { runResultHistoryStorageService } from "./result-history-service";
 import { runWorkerVolumeCleanup } from "./worker-report-volume-cleanup";
 import { runSharedStoppedReportStorage } from "./shared-stopped-report-service";
+import { CancelledReportCopyPriority } from "./cancelled-report-copies";
 import { runAttemptEvidenceStorageService } from "./attempt-evidence-service";
 import { runConfiguredAttemptEvidenceSettlementService } from "./attempt-evidence-settlement";
 
@@ -37,13 +38,14 @@ const attemptSettlement = createClient({
 for (const event of ["SIGTERM", "SIGINT", "disconnect"] as const)
   process.once(event, () => stop.abort());
 try {
-  const work = [runProgressiveReportArchiveService(client.db, stop.signal)];
+  const priority = configuredDeploymentRole() === "hub" ? new CancelledReportCopyPriority() : undefined;
+  const work = [runProgressiveReportArchiveService(client.db, stop.signal, priority)];
   if (configuredDeploymentRole() === "remote-solver") {
     work.push(runDuplicateReportCleanup(client.db, stop.signal));
     work.push(runNativeWorkerReportSharing(client.db, stop.signal));
     work.push(runWorkerVolumeCleanup(client.db, stop.signal));
   } else {
-    work.push(runSharedStoppedReportStorage(client.db, stop.signal));
+    work.push(runSharedStoppedReportStorage(client.db, stop.signal, priority));
     work.push(runSolverHistoryStorageService(client.db, stop.signal));
     work.push(runResultHistoryStorageService(client.db, stop.signal));
     work.push(

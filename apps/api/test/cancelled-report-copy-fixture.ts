@@ -29,7 +29,7 @@ import {
   recheckRemoteReportMember, verifiedProgressiveReportMember,
   readProgressiveReport,
 } from "@aerodb/db/progressive-report-reader";
-import { nextCancelledReportCopies } from "../../sweeper/src/cancelled-report-copies";
+import { CancelledReportCopyPriority, nextCancelledReportCopies, selectCancelledReportCopyPage } from "../../sweeper/src/cancelled-report-copies";
 import { applyProgressiveRemoteProgress } from "../../sweeper/src/progressive-remote-progress";
 import { archiveProgressiveReportBatch } from "../../sweeper/src/progressive-report-archive-service";
 import { copyStoppedReportBatch, stoppedReportCopyKeys } from "../../sweeper/src/shared-stopped-report-custody";
@@ -183,6 +183,24 @@ export async function verifyCancelledReportCopyReplay(
   const page = await nextCancelledReportCopies(db, cursor);
   expect(page.executionId).toBe(id);
   expect(page.sequences).toEqual([copy.sequence,dependent.sequence]);
+  const ready = (await stoppedReportCopyKeys(db, id, cursor.sequence, 32, true)).filter(k=>k.mode==="ordinary");
+  expect(ready.map(k=>k.sequence)).toEqual(page.sequences);
+  const priority = new CancelledReportCopyPriority();
+  priority.offer(id,ready.slice(0,1));
+  priority.offer(id,ready);
+  priority.offer(id,ready.slice(1));
+  const offered = await selectCancelledReportCopyPage(db, cursor, priority);
+  const preferred = offered.preferred!;
+  expect(offered.after).toEqual(cursor);
+  expect(offered.sequences).toEqual(page.sequences);
+  expect(preferred.bytes).toBe(ready.reduce((n,k)=>n+k.storedBytes,0));
+  expect(preferred.keys).toEqual(ready);
+  priority.offer(id,ready);
+  const chronological = await selectCancelledReportCopyPage(db, cursor, priority);
+  expect(chronological.preferred).toBeUndefined();
+  expect(chronological.after).toEqual(page.after);
+  expect((await selectCancelledReportCopyPage(db, chronological.after, priority)).preferred?.executionId).toBe(id);
+  const exact = new Map(preferred.keys.map(k=>[k.sequence,k.signature]));
   const scanned=new Error("rollback metadata-only discovery window");
   await expect(db.transaction(async tx=>{
     const conn=tx as unknown as DB;
@@ -247,6 +265,8 @@ export async function verifyCancelledReportCopyReplay(
     await verifyProgressiveReportArchive(Readable.from([bytes]), identity);
     return identity;
   };
+  const refused = new Map(preferred.keys.map(k=>[k.sequence,"0".repeat(64)]));
+  expect(await archiveProgressiveReportBatch(db,"remote",id,async()=>{throw Error("Stale source reached storage")},page.sequences,refused)).toBe(0);
   expect(
     await archiveProgressiveReportBatch(
       db,
@@ -259,6 +279,7 @@ export async function verifyCancelledReportCopyReplay(
         return stored;
       },
       page.sequences,
+      exact,
     ),
   ).toBe(0);
   await db.execute(
@@ -499,7 +520,7 @@ export async function verifyCancelledReportCopyReplay(
       const [heldDependent]=await db.execute(sql`SELECT archive_bundle_id FROM progressive_remote_reports WHERE sim_job_id=${id}::uuid AND sequence=${dependent.sequence} AND content_signature=${dependentReceipt.contentSignature}`);
       expect(heldDependent.archive_bundle_id).toBeNull();
       files.set(retired.object.key,anchorObject);
-      expect(await archiveProgressiveReportBatch(db,"remote",id,put,[dependent.sequence])).toBe(1);
+      expect(await archiveProgressiveReportBatch(db,"remote",id,put,[dependent.sequence],exact)).toBe(1);
 
       expect(await state()).toEqual(before);
     }

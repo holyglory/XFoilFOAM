@@ -139,7 +139,7 @@ export async function stoppedReportCopyKeys(
     ORDER BY s.sim_job_id,s.sequence LIMIT ${rows}`
     : sql`SELECT sim_job_id,sequence FROM progressive_remote_reports WHERE sim_job_id=${job}::uuid AND sequence>${after} ORDER BY sequence LIMIT ${rows}`;
   const page = await db.execute(sql`WITH keys AS MATERIALIZED (${keys})
-    SELECT r.sequence::int seq,r.content_signature sig,CASE WHEN r.archived_at IS NOT NULL THEN 'cold'
+    SELECT r.sequence::int seq,r.content_signature sig,${scientific ? sql`pg_column_size(r.report)` : sql`0`} AS stored,CASE WHEN r.archived_at IS NOT NULL THEN 'cold'
     WHEN i.report_content_signature IS DISTINCT FROM r.content_signature OR applied.content_signature IS DISTINCT FROM r.content_signature THEN 'missing'
     WHEN ${scientificallyReceiptedReportCopy} THEN 'ordinary' WHEN ${release} THEN 'release' ELSE 'preserve' END AS mode
     FROM keys JOIN progressive_remote_reports r USING(sim_job_id,sequence)
@@ -149,6 +149,7 @@ export async function stoppedReportCopyKeys(
     sequence: Number(r.seq),
     signature: String(r.sig),
     mode: String(r.mode),
+    storedBytes: Number(r.stored),
   }));
 }
 

@@ -4,7 +4,7 @@ import { dirname, isAbsolute, join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
 import type { DB } from "@aerodb/db/client";
-import { cancelledReportOwner } from "./cancelled-report-copies";
+import { cancelledReportOwner, type CancelledReportCopyPriority } from "./cancelled-report-copies";
 import {
   copyStoppedReportBatch,
   stoppedReportCopyKeys,
@@ -91,6 +91,7 @@ export async function advanceSharedReportOwner(
   dir: string,
   id: string,
   eligibleAnchors = false,
+  priority?: CancelledReportCopyPriority,
 ) {
   if (!uuid.test(id) || !isAbsolute(dir))
     throw new Error("Invalid stopped report owner or receipt path");
@@ -174,6 +175,8 @@ export async function advanceSharedReportOwner(
   const scientific = !cursor.scientificComplete && !cursor.ordinaryNext;
   const after = scientific ? (cursor.scientificAfter ?? 0) : cursor.after;
   const keys = await stoppedReportCopyKeys(db, id, after, 32, scientific);
+  if (scientific && priority)
+    priority.offer(id, keys.filter((key) => key.mode === "ordinary"));
   if (!keys.length) {
     if (scientific) {
       await write(cursorFile, {
@@ -309,6 +312,7 @@ export async function advanceSharedReportOwner(
 export async function runSharedStoppedReportStorage(
   db: DB,
   signal: AbortSignal,
+  priority?: CancelledReportCopyPriority,
 ) {
   const scope =
     process.env.AIRFOILFOAM_STOPPED_SHARED_REPORT_SCOPE?.trim() || "all";
@@ -411,6 +415,7 @@ export async function runSharedStoppedReportStorage(
           directory,
           id,
           anchorReader && (anchorScope === "all" || anchorScope === id),
+          priority,
         );
         queue.shift();
         if (!result.complete) worked = true;

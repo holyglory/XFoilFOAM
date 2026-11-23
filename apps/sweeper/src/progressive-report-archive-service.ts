@@ -13,9 +13,10 @@ import { setTimeout as delay } from "node:timers/promises";
 import { configuredDeploymentRole } from "./config";
 import {
   cancelledReportOwner,
-  nextCancelledReportCopies,
+  selectCancelledReportCopyPage,
   verifyColdReceiptSources,
   receiptedReportCopy,
+  type CancelledReportCopyPriority,
   type ReportCopyCursor,
 } from "./cancelled-report-copies";
 import {
@@ -162,7 +163,7 @@ async function* archiveLines(
   db: DB,
   source: Source,
   executionId: string,
-  keys: { sequence: unknown; kind: unknown; inventorySignature?: string }[],
+  keys: { sequence: unknown; kind: unknown; inventorySignature?: string; sourceSignature?: string }[],
   members: Member[],
 ) {
   let logicalBytes = 0;
@@ -190,6 +191,8 @@ async function* archiveLines(
     const bytes = Buffer.byteLength(raw);
     const sha256 = createHash("sha256").update(raw).digest("hex");
     const signature = String(row.content_signature);
+    if (key.sourceSignature !== undefined && key.sourceSignature !== signature)
+      throw new Error("Cancelled report identity changed during preparation");
     let sourceList: string | undefined;
     if (key.inventorySignature !== undefined) {
       // Bound an individual member for the full product reader. Verify the
@@ -234,7 +237,10 @@ export async function archiveProgressiveReportBatch(
   executionId: string,
   putFile: PutFile,
   cancelledSequences?: readonly number[],
+  expectedSignatures?: ReadonlyMap<number,string>,
 ): Promise<number> {
+  if (expectedSignatures && (!cancelledSequences || expectedSignatures.size > maxMembers))
+    throw new Error("Signed copy hints require a bounded cancelled report page");
   if (
     cancelledSequences &&
     (source !== "remote" ||
@@ -253,14 +259,16 @@ export async function archiveProgressiveReportBatch(
         sequence: string;
         kind: string;
         inventorySignature: string;
+        sourceSignature: string;
       }>(sql`
-        SELECT r.sequence,'report' AS kind,inventory.inventory_signature AS "inventorySignature"
+        SELECT r.sequence,'report' AS kind,r.content_signature AS "sourceSignature",inventory.inventory_signature AS "inventorySignature"
         FROM progressive_remote_reports r JOIN progressive_remote_report_inventories inventory USING (sim_job_id,sequence)
         WHERE r.sim_job_id=${executionId}::uuid AND r.archived_at IS NULL AND r.sequence IN (
           ${sql.join(
             cancelledSequences.map((n) => sql`${n}::bigint`),
             sql`,`,
           )})
+          ${expectedSignatures ? sql`AND r.content_signature=(${JSON.stringify(Object.fromEntries(expectedSignatures))}::jsonb ->> r.sequence::text)` : sql``}
           AND ${receiptedReportCopy} ORDER BY r.sequence`)
     : (await db.execute(memberKeys(source, executionId))).map(
         ({ sequence, kind }) => ({ sequence, kind }),
@@ -421,6 +429,7 @@ export async function nextProgressiveReportArchiveJob(
 export async function runProgressiveReportArchiveService(
   db: DB,
   signal: AbortSignal,
+  priority?: CancelledReportCopyPriority,
 ): Promise<void> {
   const source: Source =
     configuredDeploymentRole() === "remote-solver" ? "worker" : "remote";
@@ -508,10 +517,12 @@ export async function runProgressiveReportArchiveService(
     do {
       if (store && !signal.aborted && Date.now() >= nextCopyScan) {
         try {
-          const page = await nextCancelledReportCopies(db, copyCursor);
+          const page: Awaited<ReturnType<typeof selectCancelledReportCopyPage>> =
+            await selectCancelledReportCopyPage(db, copyCursor, priority);
+          const preferred = page.preferred;
           // Advance past refused or concurrently changed copies on this pass.
-          copyCursor = page.after;
-          nextCopyScan = Date.now() + (copyCursor ? 500 : 30_000);
+          if (!preferred) copyCursor = page.after;
+          nextCopyScan = Date.now() + (copyCursor || preferred ? 500 : 30_000);
           if (page.executionId) {
             const members = await archiveProgressiveReportBatch(
               db,
@@ -519,16 +530,21 @@ export async function runProgressiveReportArchiveService(
               page.executionId,
               upload,
               page.sequences,
+              preferred ? new Map(preferred.keys.map(k => [k.sequence,k.signature])) : undefined,
             );
             if (members) {
-              if (members < page.sequences.length)
-                copyCursor = {
+              if (members < page.sequences.length) {
+                if (preferred) priority?.offer(preferred.executionId,preferred.keys);
+                else copyCursor = {
                   executionId: page.executionId,
                   sequence: page.sequences[members - 1]!,
                 };
+              }
               console.info(
                 JSON.stringify({
                   component: "cancelled-report-copies",
+                  selection: preferred ? "signed-source-window" : "chronological",
+                  executionId: page.executionId,
                   members,
                 }),
               );
