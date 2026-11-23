@@ -227,8 +227,13 @@ def _local_manifest(root, folder, proof, reported, readbacks, declared=None):
     _require(_case_path(root.name, manifest["casePath"], case) == case, "unowned manifest case")
     post = _case_path(root.name, manifest["postPath"], case)
     if proof.get("regime") == "urans":
-        _require(manifest.get("unsteady") is True and post.parent == case and
-                 re.fullmatch(r"transient(?:_a[0-9]+)?", post.name), "URANS manifest does not own this transient solver")
+        # The engine records the observed flow in "unsteady". A URANS run
+        # can settle to a steady solution. Its signed method and point path
+        # identify the solver that wrote these files.
+        point = rel.parent.name
+        _require(manifest.get("methodKey") == "openfoam.urans" and isinstance(manifest.get("unsteady"), bool) and
+                 post.parent == case and re.fullmatch(r"a[0-9]+", point) and post.name == "transient_" + point,
+                 "URANS manifest does not own this transient solver")
     return case, post, [m for m in manifest["files"] if not any(_relative(m["path"]).is_relative_to(d) for d in excluded)]
 
 

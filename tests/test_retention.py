@@ -1035,10 +1035,10 @@ def test_api_running_guard_and_delete_status_codes():
     assert client.delete("/jobs/retention-api-missing").status_code == 404
 
 
-@pytest.mark.parametrize("mode", ["no-media", "rans-images", "urans-images"])
+@pytest.mark.parametrize("mode", ["no-media", "rans-images", "urans-images", "urans-foreign-method", "urans-foreign-solver"])
 def test_closed_progressive_exact_duplicates_require_whole_job_proof(tmp_path, monkeypatch, mode):
     keep_media = mode != "no-media"
-    urans = mode == "urans-images"
+    urans = mode.startswith("urans-")
     from datetime import datetime, timezone
     import runpy
     peer = runpy.run_path(str(Path(__file__).resolve().parents[1] / "scripts/deploy/hz-closed-job-engine.py"))
@@ -1096,9 +1096,12 @@ def test_closed_progressive_exact_duplicates_require_whole_job_proof(tmp_path, m
             retained[picture] = picture.read_bytes()
         native_images = {"pressure": f"a{index}/images/pressure.png"} if has_images else {}
         solver = case / f"transient_a{index}" if urans else post
+        if mode == "urans-foreign-solver" and index == 0:
+            solver = case / "transient_a1"
         solver.mkdir(exist_ok=True)
         mf = _write_json(folder / "evidence_manifest.json", {"casePath": str(case), "postPath": str(solver),
-                          "unsteady": urans, "bundleExcludes": ["frames", "time_directories/1/excluded"],
+                          "methodKey": "openfoam.urans" if urans and mode != "urans-foreign-method" else "openfoam.rans",
+                          "unsteady": urans and index == 1, "bundleExcludes": ["frames", "time_directories/1/excluded"],
                           "files": members if not index else [], "media": {"instantaneous": native_images}})
         mf_sha = sha(mf.read_bytes())
         upload = f"upload-{index}"
@@ -1150,6 +1153,10 @@ def test_closed_progressive_exact_duplicates_require_whole_job_proof(tmp_path, m
             request(*args, **kwargs)
         return str(caught.value)
 
+    if mode in {"urans-foreign-method", "urans-foreign-solver"}:
+        assert "does not own this transient solver" in refused()
+        assert all(path.exists() for path in duplicates)
+        return
     with pytest.raises(ValueError, match="authentication refused"):
         request(token="wrong")
     with pytest.raises(ValueError, match="execution locks differ"):
