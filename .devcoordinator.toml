@@ -6026,20 +6026,20 @@ name = "types"
 tier = "development"
 requires = ["workspace"]
 timeout_seconds = 600
-command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "--filter", "@aerodb/engine-client", "typecheck"]
+command = ["scripts/dev/check-closed-retention.sh", "types"]
 
 [[test.closed-progressive-retention.check]]
 name = "retention"
 tier = "development"
 requires = ["seed"]
 timeout_seconds = 600
-command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "--no-file-parallelism", "test/retention.test.ts", "test/closed-progressive-retention.test.ts"]
+command = ["scripts/dev/check-closed-retention.sh", "node"]
 
 [[test.closed-progressive-retention.check]]
 name = "engine-retention"
 tier = "development"
 timeout_seconds = 300
-command = ["/bin/bash", "-c", "export PYTHONPATH=$PWD/src; exec /home/holyglory/XFoilFOAM/.venv/bin/python -m pytest tests/test_retention.py -q"]
+command = ["scripts/dev/check-closed-retention.sh", "engine"]
 
 [test.hz-cache-parking]
 timeout_seconds = 900
