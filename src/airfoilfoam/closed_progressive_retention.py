@@ -11,7 +11,7 @@ from contextlib import nullcontext
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 
-from .evidence_runtime import EvidenceCleanupError, _atomic_create_json
+from .evidence_runtime import EvidenceCleanupError, _atomic_create_json, _broker_reclaim_path_inventory
 from .evidence_store import MAX_EVIDENCE_MANIFEST_BYTES, _size_and_sha256
 from .retention import JobRetentionRefused, _job_retention_guard
 
@@ -328,6 +328,7 @@ def _preserved_solver_tree(root, directory):
     root_stat = tree.lstat()
     digest.update(json.dumps([".", root_stat.st_mode, root_stat.st_dev, root_stat.st_ino]).encode() + b"\n")
     samples = []
+    meshes = {}
     entries = files = logical = allocated = 0
     def walk_error(exc):
         raise exc
@@ -356,15 +357,22 @@ def _preserved_solver_tree(root, directory):
                     samples.append({"path": path.relative_to(root).as_posix(), "sha256": sha, "byteSize": size})
             elif stat.S_ISLNK(st.st_mode):
                 target = path.resolve(strict=True)
-                _require(target.is_relative_to(tree) or (name == "polyMesh" and target.is_relative_to(root / "meshes")),
-                         "preserved solver links into another working source")
+                if not target.is_relative_to(tree):
+                    _require(name == "polyMesh" and path.parent.name == "constant" and
+                             target.is_relative_to(root / "meshes") and target.parts[-2:] == ("constant", "polyMesh"),
+                             "preserved solver links into another working source")
+                    mesh = target.relative_to(root).as_posix()
+                    if mesh not in meshes:
+                        meshes[mesh] = _broker_reclaim_path_inventory(target, mesh)
                 identity.extend([os.readlink(path), target.relative_to(root).as_posix()])
             else:
                 _require(stat.S_ISDIR(st.st_mode), "special file in preserved solver")
             digest.update(json.dumps(identity, separators=(",", ":")).encode() + b"\n")
     _require(samples, "unreported solver has no readable original coefficient history")
+    digest.update(json.dumps(meshes, sort_keys=True, separators=(",", ":")).encode())
     return {"directory": directory.as_posix(), "treeSha256": digest.hexdigest(), "entries": entries,
             "files": files, "byteSize": logical, "allocatedBytes": allocated,
+            "sharedMeshInventories": list(meshes.values()),
             "sample": min(samples, key=lambda f: ("/steady_initialization/" in f["path"], f["byteSize"], f["path"]))}
 
 

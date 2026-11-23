@@ -1166,6 +1166,10 @@ def test_closed_progressive_exact_duplicates_require_whole_job_proof(tmp_path, m
         coefficient = _write(next_solver / "postProcessing/forceCoeffs/0/coefficient.dat", b"0.1 0.2 0.015 0.001\\n")
         original_bytes = coefficient.read_bytes()
         unique = _write(next_solver / "1/U", b"unreported flow field")
+        mesh = root / "meshes/recipe/constant/polyMesh"
+        faces = _write(mesh / "faces", b"original shared mesh")
+        (next_solver / "constant").mkdir()
+        (next_solver / "constant/polyMesh").symlink_to(mesh, target_is_directory=True)
         assert "unarchived case state" in refused(preserve=None)
         assert "next sibling" in refused(preserve="cases/foil/transient_a3")
         with pytest.raises(ValueError, match="scope differs"):
@@ -1175,6 +1179,10 @@ def test_closed_progressive_exact_duplicates_require_whole_job_proof(tmp_path, m
                                                       "sha256": sha(original_bytes), "byteSize": len(original_bytes)}
         assert {p.relative_to(root).as_posix() for p in duplicates} == set(plan["workingPaths"])
         assert plan["preservedSolver"]["files"] == 2
+        assert plan["preservedSolver"]["sharedMeshInventories"][0]["name"] == mesh.relative_to(root).as_posix()
+        faces.write_bytes(b"changed shared mesh")
+        refused(plan=plan["plan"])
+        faces.write_bytes(b"original shared mesh")
         coefficient.write_bytes(b"changed original")
         refused(plan=plan["plan"])
         assert all(p.exists() for p in duplicates)
