@@ -18,7 +18,7 @@ import { sql, type SQL } from "drizzle-orm";
 import { expect } from "vitest";
 import { createSettlementFixture } from "./attempt-settlement-fixture";
 import { HzAttemptHubStore } from "../src/hz-attempt-hub";
-import { attemptWorkerOperation } from "../src/hz-attempt-custody-cli";
+import { attemptHubOperation, attemptWorkerOperation } from "../src/hz-attempt-custody-cli";
 import { hzAttemptApiProbe } from "../../api/src/hz-attempt-custody-cli";
 import { readStoredAttemptEvidenceText } from "../../api/src/attempt-evidence-reader";
 import {
@@ -102,6 +102,8 @@ function objectStore(originalCopy = false) {
   };
   return {
     objects,
+    account,
+    request,
     store: new HzAttemptHubStore(bucket, account, request, originalCopy),
   };
 }
@@ -156,7 +158,7 @@ export async function verifyHzAttemptTransition(
       sql`SELECT instance_id::text AS instance FROM sync_api_settings`,
     );
     const instance = String(r.instance);
-    const { store, objects } = objectStore();
+    const { store, objects, account, request } = objectStore();
     async function checkNativeReplay(request: Record<string, unknown>) {
       // The production report reader names its public catalog explicitly.
       // Use the exact fixture catalog there only inside this rollback.
@@ -627,6 +629,27 @@ export async function verifyHzAttemptTransition(
       await readOriginalAttemptForProjection(db, id, String(cold.archive)),
     ).toBe(original);
     const catalog = await getAttemptEvidenceArchive(db, String(cold.archive));
+    const hubRead = {operation:"read", identity:catalog, bucket:catalog.bucket, account};
+    await expect(attemptHubOperation(hubRead)).rejects.toThrow("Unexpected hub role or bucket");
+    const priorRole = process.env.AIRFOILFOAM_DEPLOYMENT_ROLE;
+    const priorBucket = process.env.AIRFOILFOAM_EVIDENCE_BUCKET;
+    const previousFetch = globalThis.fetch;
+    try {
+      process.env.AIRFOILFOAM_DEPLOYMENT_ROLE = "hub";
+      process.env.AIRFOILFOAM_EVIDENCE_BUCKET = catalog.bucket;
+      globalThis.fetch = request;
+      const restored = await attemptHubOperation(hubRead);
+      const exact = await store.read(catalog);
+      expect(restored.identity.generation).toBe(catalog.generation);
+      expect(restored.packed).toBe(exact.packed);
+      await expect(attemptHubOperation({...hubRead,identity:{...catalog,generation:"8"}})).rejects.toThrow();
+    } finally {
+      globalThis.fetch = previousFetch;
+      if (priorRole === undefined) delete process.env.AIRFOILFOAM_DEPLOYMENT_ROLE;
+      else process.env.AIRFOILFOAM_DEPLOYMENT_ROLE = priorRole;
+      if (priorBucket === undefined) delete process.env.AIRFOILFOAM_EVIDENCE_BUCKET;
+      else process.env.AIRFOILFOAM_EVIDENCE_BUCKET = priorBucket;
+    }
     await expect(
       readHzAttemptWorkingCopy({ ...catalog, generation: "8" }),
     ).rejects.toThrow("unavailable");

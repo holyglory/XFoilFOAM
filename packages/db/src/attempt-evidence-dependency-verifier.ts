@@ -1,4 +1,4 @@
-import { buildPolarFit, classifyPolarEvidence } from "@aerodb/core";
+import { buildPolarFit, classifyPolarEvidence } from "@aerodb/core/polar-fit";
 import { sql } from "drizzle-orm";
 import type { DB } from "./client";
 import { analysisContentHash, canonicalAnalysisJson } from "./analysis-target";
