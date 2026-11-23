@@ -907,6 +907,8 @@ it("normal migrate prepares 0223 online, recovers an interrupted build and prese
     expect(await countJournal()).toBe(n);
     await normal();
     const installedJournal = await readJournal();
+    expect(installedJournal.length).toBeGreaterThan(n);
+    expect(installedJournal.filter(row => row.created_at === "1795363913054")).toHaveLength(1);
     expect(installedJournal.map(({ hash, created_at }) => ({ hash, created_at }))).toEqual(expectedJournal);
     const [workerPolicy] = await db`SELECT hz_settled_receipts_enabled AS enabled,
       to_regprocedure('public.attempt_evidence_hz_settled_scope(uuid,uuid)') IS NOT NULL AS ready

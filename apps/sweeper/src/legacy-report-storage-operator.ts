@@ -47,6 +47,8 @@ export function legacyOperatorWriteFailure(
         category: failure.category,
         sqlState: failure.sqlState,
         workerPhase: failure.workerPhase,
+        transactionRolledBack: failure.transactionRolledBack,
+        registrationElapsedMs: failure.registrationElapsedMs,
         exitCode: 1,
         signal: (error as { signal?: unknown }).signal,
       });

@@ -1,5 +1,15 @@
+import { Storage } from "@google-cloud/storage";
+import { installProgressiveReportArchiveReader } from "@aerodb/db/progressive-report-reader";
 import { createHash, randomUUID } from "node:crypto";
-import { afterAll, expect, it } from "vitest";
+import {
+  afterAll,
+  afterEach,
+  beforeAll,
+  describe,
+  expect,
+  it,
+  vi,
+} from "vitest";
 import { sql } from "drizzle-orm";
 import { createClient, type DB } from "@aerodb/db/client";
 import {
@@ -15,7 +25,11 @@ import {
   legacyReportCustodySql,
   verifyLegacyReportCustodyPage,
 } from "@aerodb/db/legacy-report-custody";
-import { withArchiveFixture } from "./progressive-report-archive-fixture";
+import {
+  withArchiveFixture,
+  archiveSha256,
+  LARGE_REPORT_INTEGER,
+} from "./progressive-report-archive-fixture";
 import { legacyNormalizationTelemetry } from "../src/legacy-report-storage-migration";
 import {
   applyLegacyCustodyWorkerTransaction,
@@ -302,3 +316,354 @@ it.each([false, true])(
   },
   120000,
 );
+
+// Both round trips hold the normalization singleton for the rollback fixture.
+// This case owns a migrated database apart from the parallel sync and reader suites.
+describe.sequential(
+  "native report custody, durable storage and normal readers",
+  { timeout: 60_000 },
+  () => {
+    beforeAll(() =>
+      expect(process.env.PROGRESSIVE_REPORT_ARCHIVE_DISPOSABLE_DB).toBe("1"),
+    );
+    afterEach(() => {
+      vi.restoreAllMocks();
+      vi.unstubAllGlobals();
+      vi.unstubAllEnvs();
+      installProgressiveReportArchiveReader(null);
+    });
+    it("retires an unstaged native report through its independent hub generation and both registered volume readers", async () => {
+      const { registeredWorkerRoundtrip } =
+        await import("./registered-worker-report-fixture");
+      await withArchiveFixture(client, "worker", registeredWorkerRoundtrip, {
+        normalized: false,
+        settled: false,
+        reportCount: 7,
+      });
+    });
+
+    it("crosses from the final warm report into cold conflict aliases using one verified original generation", async () => {
+      const { readLegacyPage, legacyScopeHash, encodeLegacyPage } =
+        await import("../src/legacy-report-storage");
+      const { LegacyResultTransport } =
+        await import("../src/legacy-report-result-transport");
+      await withArchiveFixture(
+        client,
+        "worker",
+        async (f) => {
+          const { db, executionId: job } = f;
+          await db.execute(sql`INSERT INTO progressive_worker_report_conflicts(sim_job_id,sequence,content_signature,report,reason)
+      SELECT sim_job_id,sequence,content_signature,report,'original conflict '||sequence FROM progressive_worker_reports WHERE sim_job_id=${job}::uuid AND sequence IN (2,3)`);
+          const query = async (q: string, max: number) => {
+            // This fixture owns an outer rollback. Execute the generated read-only SELECT on that same connection.
+            const body = q.match(
+              /SET LOCAL timezone = 'UTC';\n([\s\S]+);\nCOMMIT;\n$/,
+            )?.[1];
+            if (!body || !/^(WITH|SELECT) /.test(body))
+              throw new Error("Unexpected source query");
+            const result = await db.execute(sql.raw(body));
+            const raw = result.map((r) => String(Object.values(r)[0]));
+            if (Buffer.byteLength(raw.join("\n")) > max)
+              throw new Error("Unbounded fixture read");
+            return raw.map((t) => JSON.parse(t) as Record<string, unknown>);
+          };
+          const transport = new LegacyResultTransport({ query });
+          const source = {
+            query,
+            readMember: transport.readMember.bind(transport),
+          };
+          const scope = {
+            version: 1 as const,
+            sourceInstance: randomUUID(),
+            solverId: JSON.parse(f.reports[0]!.text).solverId as string,
+            measuredAt: new Date().toISOString(),
+            executions: [
+              {
+                executionId: job,
+                reports: 4,
+                reportHighWater: 4,
+                conflicts: 2,
+                conflictHighWater: 3,
+              },
+            ],
+          };
+          const hash = legacyScopeHash(scope),
+            original = await readLegacyPage(source, scope, undefined, 3);
+          const bytes = encodeLegacyPage(original).bytes,
+            sha = archiveSha256(bytes),
+            objectKey = `legacy-worker-reports/v1/${scope.sourceInstance}/${scope.solverId}/${hash}/${sha}.jsonl.gz`;
+          const crc = new Storage({
+            projectId: "legacy-conflict-origin",
+          }).crc32cGenerator();
+          crc.update(bytes);
+          const [bundle] =
+            await db.execute(sql`INSERT INTO progressive_report_archive_bundles(source_kind,sim_job_id,bucket,object_key,generation,
+      archive_format,stored_sha256,stored_byte_size,crc32c,member_count,first_sequence,last_sequence,verified_at,
+      legacy_instance_id,legacy_solver_id,legacy_scope_sha256,legacy_page_member_count,legacy_read_mode)
+      VALUES ('worker',${job}::uuid,'origin-test',${objectKey},'1795380355397132222','legacy-jsonl',${sha},${bytes.length},${crc.toString()},3,1,3,now(),
+        ${scope.sourceInstance}::uuid,${scope.solverId}::uuid,${hash},3,'registered-get') RETURNING id`);
+          for (const m of original.members) {
+            await db.execute(sql`INSERT INTO progressive_report_archive_members(bundle_id,source_kind,sim_job_id,sequence,member_kind,content_signature,
+        report_sha256,report_byte_size,legacy_row_sha256,legacy_row_byte_size) VALUES(${bundle!.id}::uuid,'worker',${job}::uuid,${m.sequence},'report',
+        ${m.contentSignature},${m.reportSha256},${m.reportByteSize},${m.rowSha256},${Buffer.byteLength(m.rowText)})`);
+            await db.execute(sql`UPDATE progressive_worker_reports SET archived_at=now(),archive_bundle_id=${bundle!.id}::uuid,report=progressive_report_compact_header(report)
+        WHERE sim_job_id=${job}::uuid AND sequence=${m.sequence}`);
+          }
+          const store = {
+            read: vi.fn(
+              async (o: { generation: string; objectKey: string }) => {
+                expect(o.generation).toBe("1795380355397132222");
+                expect(o.objectKey).toBe(objectKey);
+                return bytes;
+              },
+            ),
+          };
+          const start = {
+            execution: 0,
+            kind: "report" as const,
+            after: 3,
+            copied: 3,
+          };
+          const page = await readLegacyPage(
+            source,
+            scope,
+            start,
+            3,
+            256 * 1024 ** 2,
+            undefined,
+            1,
+            store,
+          );
+          expect(store.read).toHaveBeenCalledTimes(1);
+          expect(page.members.map((m) => [m.kind, m.sequence])).toEqual([
+            ["report", 4],
+            ["conflict", 2],
+            ["conflict", 3],
+          ]);
+          expect(page.next).toEqual({
+            execution: 0,
+            kind: "conflict",
+            after: 3,
+            copied: 2,
+          });
+          for (const m of page.members.slice(1)) {
+            const [c] = await db.execute(
+              sql`SELECT to_jsonb(c)::text AS body FROM progressive_worker_report_conflicts c WHERE sim_job_id=${job}::uuid AND sequence=${m.sequence}`,
+            );
+            expect(m.rowText).toBe(c!.body);
+            expect(JSON.parse(m.rowText)).toMatchObject({
+              reason: "original conflict " + m.sequence,
+              body_source_sequence: m.sequence,
+            });
+            expect(m.reportText).toBe(f.reports[m.sequence - 1]!.text);
+            expect(m.reportText).toContain(LARGE_REPORT_INTEGER);
+          }
+          const conflict = {
+            execution: 0,
+            kind: "conflict" as const,
+            after: 0,
+            copied: 0,
+          };
+          const cost =
+            page.members[1]!.reportByteSize +
+            Buffer.byteLength(page.members[1]!.rowText);
+          store.read.mockClear();
+          expect(
+            (
+              await readLegacyPage(
+                source,
+                scope,
+                conflict,
+                2,
+                cost,
+                undefined,
+                1,
+                store,
+              )
+            ).next,
+          ).toEqual({ ...conflict, after: 2, copied: 1 });
+          await expect(
+            readLegacyPage(
+              source,
+              scope,
+              conflict,
+              2,
+              cost - 1,
+              undefined,
+              1,
+              store,
+            ),
+          ).rejects.toMatchObject({
+            details: {
+              category: "member_over_budget",
+              member: { executionId: job, sequence: 2 },
+            },
+          });
+          expect(store.read).toHaveBeenCalledTimes(1);
+          await expect(
+            readLegacyPage(
+              source,
+              scope,
+              conflict,
+              2,
+              4 * 1024 ** 2,
+              undefined,
+              1,
+              { read: async () => Buffer.from("corrupt") },
+            ),
+          ).rejects.toMatchObject({
+            details: {
+              operation: "conflict_origin",
+              category: "origin_mismatch",
+            },
+            retryable: false,
+          });
+          const changed = {
+            ...source,
+            query: async (q: string, b: number) => {
+              const rows = await query(q, b);
+              return q.includes("'job',job,'sequence',sequence,'snapshot'")
+                ? []
+                : rows;
+            },
+          };
+          await expect(
+            readLegacyPage(
+              changed,
+              scope,
+              conflict,
+              2,
+              4 * 1024 ** 2,
+              undefined,
+              1,
+              store,
+            ),
+          ).rejects.toMatchObject({
+            details: {
+              category: "origin_mismatch",
+              member: { executionId: job, sequence: 2 },
+            },
+          });
+        },
+        { reportCount: 4, normalized: false },
+      );
+    });
+  },
+);
+
+it("retries one confirmed registration timeout at the same pin and holds a real administrative cancel", async () => {
+  const { withLegacyCustodyRollback, measureLegacyCustodyRegistration } =
+    await import("../src/legacy-report-storage-custody-worker");
+  const { applyPinnedCustodyWithRetry } =
+    await import("../src/legacy-report-storage-custody");
+  const receipt = {
+    object: {
+      bucket: "test-archive",
+      objectKey: "test",
+      generation: "1795452221132176",
+      sha256: "a".repeat(64),
+      crc32c: "AAAAAA==",
+      byteSize: 1,
+      verifiedAt: new Date().toISOString(),
+    },
+  };
+  await retryClient.sql`CREATE TEMP TABLE custody_cancel_journal (id integer PRIMARY KEY)`;
+  const [backend] = await retryClient.sql`SELECT pg_backend_pid() AS pid`;
+  try {
+    for (const mode of ["once", "twice", "admin"] as const) {
+      let attempts = 0;
+      const applied = applyPinnedCustodyWithRetry(receipt, async () => {
+        expect(
+          (await retryClient.sql`SELECT FROM custody_cancel_journal`).length,
+        ).toBe(0);
+        attempts++;
+        try {
+          await withLegacyCustodyRollback<void>(
+            (fn) =>
+              retryClient.sql.begin((tx) =>
+                fn(tx as unknown as LegacyWorkerSqlTransaction),
+              ),
+            async (tx) => {
+              await tx.unsafe("INSERT INTO custody_cancel_journal VALUES(1)");
+              if (mode === "once" && attempts === 2) return;
+              await tx.unsafe(
+                mode === "admin"
+                  ? "SET LOCAL statement_timeout='5s'"
+                  : "SET LOCAL statement_timeout='60ms'",
+              );
+              await measureLegacyCustodyRegistration(() =>
+                tx
+                  .unsafe("SELECT pg_sleep(8) /* custody_cancel_fixture */")
+                  .simple(),
+              );
+            },
+          );
+        } catch (error) {
+          const diagnostic = legacyCustodyWorkerFailure(error);
+          expect(diagnostic).toMatchObject({
+            sqlState: "57014",
+            workerPhase: "custody_registration",
+            transactionRolledBack: true,
+            category:
+              mode === "admin"
+                ? "database_user_cancelled"
+                : "database_statement_timeout",
+            cancellation:
+              mode === "admin" ? "user_request" : "statement_timeout",
+          });
+          expect(diagnostic.registrationElapsedMs).toBeGreaterThan(0);
+          expect(JSON.stringify(diagnostic)).not.toContain("pg_sleep");
+          throw legacyOperatorWriteFailure(
+            { code: 1 },
+            "LEGACY_CUSTODY_FAILURE " + JSON.stringify(diagnostic),
+            "worker_custody",
+            true,
+          );
+        }
+        return { verifiedReports: 1, normalizedReports: 0, rowProofs: [] };
+      });
+      const observed = applied.catch((e) => e);
+      if (mode === "admin") {
+        let waiting = false;
+        for (let i = 0; i < 100 && !waiting; i++) {
+          const [row] =
+            await blockerClient.sql`SELECT wait_event FROM pg_stat_activity WHERE pid=${backend.pid}`;
+          waiting = row?.wait_event === "PgSleep";
+          if (!waiting) await new Promise((r) => setTimeout(r, 10));
+        }
+        expect(waiting).toBe(true);
+        expect(
+          (
+            await blockerClient.sql`SELECT pg_cancel_backend(${backend.pid}) AS stopped`
+          )[0].stopped,
+        ).toBe(true);
+      }
+      const result = await observed;
+      if (mode === "once")
+        expect(result).toMatchObject({
+          custody: {
+            registrationTimeoutRetries: 1,
+            retriedGeneration: receipt.object.generation,
+          },
+        });
+      else
+        expect(result).toMatchObject({
+          retryable: false,
+          details: {
+            category:
+              mode === "admin"
+                ? "database_user_cancelled"
+                : "database_statement_timeout",
+            transactionRolledBack: true,
+          },
+        });
+      expect(attempts).toBe(mode === "admin" ? 1 : 2);
+      expect(
+        await retryClient.sql`SELECT FROM custody_cancel_journal`,
+      ).toHaveLength(mode === "once" ? 1 : 0);
+      await retryClient.sql`DELETE FROM custody_cancel_journal`;
+    }
+  } finally {
+    await retryClient.sql`DROP TABLE custody_cancel_journal`;
+  }
+});

@@ -34,7 +34,13 @@ export interface LegacyCustodyFailure {
   version: 1;
   workerPhase: WorkerPhase;
   sqlState: string | null;
+  cancellation?: "statement_timeout" | "user_request" | "unclassified";
+  transactionRolledBack?: boolean;
+  registrationElapsedMs?: number;
   category:
+    | "database_statement_timeout"
+    | "database_user_cancelled"
+    | "database_query_cancelled"
     | "database_lock_timeout"
     | "database_deadlock"
     | "database_serialization_failure"
@@ -51,46 +57,85 @@ export function legacyCustodyWorkerFailure(
 ): LegacyCustodyFailure {
   const value =
     error && typeof error === "object"
-      ? (error as { code?: unknown; workerPhase?: unknown })
+      ? (error as {
+          code?: unknown;
+          workerPhase?: unknown;
+          message?: unknown;
+          cause?: { message?: unknown };
+          transactionRolledBack?: unknown;
+          registrationElapsedMs?: unknown;
+        })
       : {};
   const code = typeof value.code === "string" ? value.code : "";
   const sqlState = /^[0-9A-Z]{5}$/.test(code) ? code : null;
   const workerPhase = workerPhases.includes(value.workerPhase as WorkerPhase)
     ? (value.workerPhase as WorkerPhase)
     : "worker";
+  // 57014 also covers pg_cancel_backend. PostgreSQL supplies the reason in
+  // the primary message. Recognize only its exact built-in messages; never
+  // transport the message or infer a timeout from elapsed time alone.
+  const message = value.cause?.message ?? value.message;
+  const cancellation =
+    message === "canceling statement due to statement timeout"
+      ? "statement_timeout"
+      : message === "canceling statement due to user request"
+        ? "user_request"
+        : "unclassified";
   const category =
-    sqlState === "55P03"
-      ? "database_lock_timeout"
-      : sqlState === "40P01"
-        ? "database_deadlock"
-        : sqlState === "40001"
-          ? "database_serialization_failure"
-          : [
-                "57P01",
-                "57P02",
-                "57P03",
-                "08000",
-                "08001",
-                "08003",
-                "08006",
-              ].includes(code) ||
-              [
-                "CONNECTION_CLOSED",
-                "CONNECTION_DESTROYED",
-                "CONNECTION_ENDED",
-                "CONNECT_TIMEOUT",
-                "ECONNRESET",
-                "ECONNREFUSED",
-                "EPIPE",
-                "ETIMEDOUT",
-              ].includes(code)
-            ? "database_unavailable"
-            : ["42501", "28000", "28P01"].includes(code)
-              ? "credentials_denied"
-              : code === "P0001" || code.startsWith("23") || !code
-                ? "integrity"
-                : "operation_failed";
-  return { version: 1, workerPhase, sqlState, category };
+    sqlState === "57014"
+      ? cancellation === "statement_timeout"
+        ? "database_statement_timeout"
+        : cancellation === "user_request"
+          ? "database_user_cancelled"
+          : "database_query_cancelled"
+      : sqlState === "55P03"
+        ? "database_lock_timeout"
+        : sqlState === "40P01"
+          ? "database_deadlock"
+          : sqlState === "40001"
+            ? "database_serialization_failure"
+            : [
+                  "57P01",
+                  "57P02",
+                  "57P03",
+                  "08000",
+                  "08001",
+                  "08003",
+                  "08006",
+                ].includes(code) ||
+                [
+                  "CONNECTION_CLOSED",
+                  "CONNECTION_DESTROYED",
+                  "CONNECTION_ENDED",
+                  "CONNECT_TIMEOUT",
+                  "ECONNRESET",
+                  "ECONNREFUSED",
+                  "EPIPE",
+                  "ETIMEDOUT",
+                ].includes(code)
+              ? "database_unavailable"
+              : ["42501", "28000", "28P01"].includes(code)
+                ? "credentials_denied"
+                : code === "P0001" || code.startsWith("23") || !code
+                  ? "integrity"
+                  : "operation_failed";
+  return {
+    version: 1,
+    workerPhase,
+    sqlState,
+    category,
+    ...(sqlState === "57014"
+      ? {
+          cancellation,
+          transactionRolledBack: value.transactionRolledBack === true,
+        }
+      : {}),
+    ...(workerPhase === "custody_registration" &&
+    Number.isSafeInteger(value.registrationElapsedMs) &&
+    Number(value.registrationElapsedMs) >= 0
+      ? { registrationElapsedMs: Number(value.registrationElapsedMs) }
+      : {}),
+  };
 }
 
 export function parseLegacyCustodyWorkerFailure(
@@ -114,6 +159,9 @@ export function parseLegacyCustodyWorkerFailure(
       return null;
     if (
       ![
+        "database_statement_timeout",
+        "database_user_cancelled",
+        "database_query_cancelled",
         "database_lock_timeout",
         "database_deadlock",
         "database_serialization_failure",
@@ -124,15 +172,65 @@ export function parseLegacyCustodyWorkerFailure(
       ].includes(value.category)
     )
       return null;
+    if (
+      value.sqlState === "57014" &&
+      (!["statement_timeout", "user_request", "unclassified"].includes(
+        value.cancellation,
+      ) ||
+        typeof value.transactionRolledBack !== "boolean")
+    )
+      return null;
+    if (
+      value.sqlState !== "57014" &&
+      (value.cancellation !== undefined ||
+        value.transactionRolledBack !== undefined)
+    )
+      return null;
     const expected = legacyCustodyWorkerFailure({
       code:
         value.sqlState ??
         (value.category === "database_unavailable" ? "CONNECTION_CLOSED" : ""),
       workerPhase: value.workerPhase,
+      transactionRolledBack: value.transactionRolledBack,
+      registrationElapsedMs: value.registrationElapsedMs,
+      message:
+        value.cancellation === "statement_timeout"
+          ? "canceling statement due to statement timeout"
+          : value.cancellation === "user_request"
+            ? "canceling statement due to user request"
+            : undefined,
     });
     return expected.category === value.category ? expected : null;
   } catch {
     return null;
+  }
+}
+
+/** postgres-js awaits ROLLBACK before rethrowing the original callback
+ * error. A lost connection or failed rollback is a different error. */
+export async function withLegacyCustodyRollback<T>(
+  begin: (fn: (tx: LegacyWorkerSqlTransaction) => Promise<T>) => Promise<T>,
+  work: (tx: LegacyWorkerSqlTransaction) => Promise<T>,
+): Promise<T> {
+  let callbackError: unknown;
+  try {
+    return await begin(async (tx) => {
+      try {
+        return await work(tx);
+      } catch (e) {
+        callbackError = e;
+        throw e;
+      }
+    });
+  } catch (e) {
+    if (
+      e &&
+      typeof e === "object" &&
+      e === callbackError &&
+      (e as { code?: unknown }).code === "57014"
+    )
+      Object.assign(e, { transactionRolledBack: true });
+    throw e;
   }
 }
 
@@ -150,6 +248,22 @@ function workerFailure(error: unknown, workerPhase: WorkerPhase): Error {
   });
 }
 
+export async function measureLegacyCustodyRegistration<T>(
+  work: () => Promise<T>,
+) {
+  const start = performance.now();
+  try {
+    const value = await work();
+    return {
+      value,
+      registrationElapsedMs: Math.round(performance.now() - start),
+    };
+  } catch (error) {
+    throw Object.assign(workerFailure(error, "custody_registration"), {
+      registrationElapsedMs: Math.round(performance.now() - start),
+    });
+  }
+}
 /** Same authority/ownership lock order as 0205, without waiting behind a busy
  * ingester while holding the singleton settings row needed by heartbeats. */
 export async function lockLegacyCustodyWorkerScope(
@@ -349,17 +463,21 @@ export async function runLegacyCustodyWorker(
         verifiedMembers: verifiedMembers.length,
       };
     }
-    const result = await sql.begin((tx) =>
-      applyLegacyCustodyWorkerTransaction(tx, {
-        page,
-        object,
-        proof,
-        custody,
-        normalization,
-        codec,
-        productBytes,
-        verifiedMembers,
-      }),
+    const result = await withLegacyCustodyRollback<
+      Awaited<ReturnType<typeof applyLegacyCustodyWorkerTransaction>>
+    >(
+      (fn) => sql.begin(fn),
+      (tx) =>
+        applyLegacyCustodyWorkerTransaction(tx, {
+          page,
+          object,
+          proof,
+          custody,
+          normalization,
+          codec,
+          productBytes,
+          verifiedMembers,
+        }),
     );
     return {
       mode: "custody" as const,
@@ -475,18 +593,17 @@ export async function applyLegacyCustodyWorkerTransaction(
     phase = "catalog_read";
     const before = await catalog();
     phase = "custody_registration";
-    const registered = rows(
-      await tx
-        .unsafe(
-          legacyTransactionBody(
-            custody.legacyReportCustodySql(proof, {
-              apply: true,
-              readersReady: true,
-            }),
-          ),
-        )
-        .simple(),
+    const statement = legacyTransactionBody(
+      custody.legacyReportCustodySql(proof, {
+        apply: true,
+        readersReady: true,
+      }),
     );
+    const { value, registrationElapsedMs } =
+      await measureLegacyCustodyRegistration(() =>
+        tx.unsafe(statement).simple(),
+      );
+    const registered = rows(value);
     const values = registered
       .flatMap((row) => Object.values(row))
       .filter((value): value is string => typeof value === "string");
@@ -590,6 +707,7 @@ export async function applyLegacyCustodyWorkerTransaction(
         Number(after.bundles) > Number(before.bundles) ||
         Number(after.members) > Number(before.members),
       archiveMembersReleased: released,
+      registrationElapsedMs,
       replayMembersVerified: replay.length,
       remainingWarmReports: remaining.length,
       normalizedReports: Number(normalized.n),
