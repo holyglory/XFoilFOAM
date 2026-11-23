@@ -62,7 +62,8 @@ const pair = JSON.parse(
     "utf8",
   ),
 );
-const route = origin + "/admin?campaign=" + pair.campaignId;
+const entryRoute = origin + "/admin";
+const campaignPath = "/admin?campaign=" + pair.campaignId;
 const api = await request.newContext({ baseURL: origin });
 const socket = await mkdtemp("/tmp/airfoils-campaign-handoff-");
 const target = "campaign-selected-evidence";
@@ -103,13 +104,16 @@ try {
         storageState: await api.storageState(),
         viewport: { width: 1206, height: 954 },
       });
-      const document = await preview.goto(route, {
+      const document = await preview.goto(entryRoute, {
         waitUntil: "domcontentloaded",
       });
       assert.equal(document.status(), 200);
       assert.equal(document.headers()["x-ui-source-revision"], local.webBuild);
       const html = await document.body();
       await writeFile(join(directory, "campaign.html"), html);
+      await preview.getByRole("button", { name: "All", exact: true }).click();
+      await preview.locator(`a[href="${campaignPath}"]`).click();
+      await expect(preview).toHaveURL(origin + campaignPath);
       const cell = preview.getByTestId(
         `matrix-cell-${pair.airfoilSlug}-${pair.conditionOrd}`,
       );
@@ -275,7 +279,7 @@ try {
         file: "campaign.html",
         observed_sha256: sha(html),
         checked_at_ms: Date.now(),
-        access: route,
+        access: entryRoute,
         observation: "web_route_passed",
         deployment: {
           deployment_id: before.data.deployment_id,
