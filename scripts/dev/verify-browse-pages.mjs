@@ -31,6 +31,7 @@ try {
     if (url.pathname === "/api/airfoils") requests.push(Object.fromEntries(url.searchParams));
   });
   const first = await query(page, { limit: "150" });
+  assert.equal((await (await page.request.get(origin + "/api/admin/me")).json()).authed, false);
   const expanded = await query(page, { limit: "450" });
   assert(first.total > 450 && first.rankingId === expanded.rankingId);
   const document = await page.goto(origin, { waitUntil: "domcontentloaded" });
@@ -90,7 +91,9 @@ try {
   } finally { unblock(); }
 
   const password = await readFile(root + "/.codex-artifacts/catalog-page-auth/" + deployment.data.current_generation + "/password", "utf8");
-  const login = await page.request.post(origin + "/api/admin/login", { data: { password } });
+  const login = await page.request.post(origin + "/api/admin/login", {
+    data: { email: "catalog-qa@example.invalid", password },
+  });
   assert.equal(login.status(), 200);
   assert.equal((await (await page.request.get(origin + "/api/admin/me")).json()).authed, true);
   await page.goto(origin, { waitUntil: "domcontentloaded" });

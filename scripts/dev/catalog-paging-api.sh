@@ -4,6 +4,7 @@ cd "$(dirname -- "$0")/../.."
 [[ "${DC2_COMPONENT:?}" == api && -n "${DC2_POSTGRES_DB_URL:?}" && "${DATABASE_URL:?}" == "$DC2_POSTGRES_DB_URL" ]]
 export API_HOST=127.0.0.1 API_PORT="${PORT:?}" ENGINE_URL=http://127.0.0.1:1
 export AIRFOILFOAM_EVIDENCE_BUCKET= ENGINE_CONTROL_PLANE_TOKEN=
+export ADMIN_AUTH_REQUIRED=true ADMIN_AUTH_DISABLED=false ADMIN_EMAIL=catalog-qa@example.invalid
 umask 077
 fixture_dir=".codex-artifacts/catalog-page-auth/${DC2_GENERATION:?}"
 mkdir -p -- "$fixture_dir"
