@@ -1,7 +1,53 @@
 """One atomic, bounded archive page on the original controller and inventory cursor."""
 import concurrent.futures
+import hashlib
+import re
 import json
 import time
+
+
+def qualified_width(args, binding, runtime, peer_hash):
+    """Return optional packing limits. A missing/stale tuning receipt leaves ordinary custody available."""
+    path = getattr(args, "width_qualification", None)
+    expected = getattr(args, "width_qualification_sha256", None)
+    if not path or not expected or getattr(args, "page_members", 1) != 4:
+        return None
+    try:
+        with path.open("rb") as file:
+            data = file.read(65537)
+        if len(data) > 65536 or hashlib.sha256(data).hexdigest() != expected:
+            return None
+        policy = json.loads(data)
+        runtime_hash = hashlib.sha256(json.dumps(runtime, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        if (policy["version"] != 1 or policy["binding"] != binding or policy["runtimeSha256"] != runtime_hash
+                or policy["peerSha256"] != peer_hash or policy["ordinaryMembers"] != 4 or policy["wideMembers"] != 8
+                or not re.fullmatch("[0-9a-f]{64}", policy["qualificationReceiptSha256"])):
+            return None
+        limits = {k: policy[k] for k in ("maxMemberBytes", "maxPageBytes", "maxPointSources")}
+        member, page, points = (limits[k] for k in ("maxMemberBytes", "maxPageBytes", "maxPointSources"))
+        if (any(type(n) is not int for n in (member, page, points)) or not 0 < member <= page <= 32 * 1024**2
+                or not 0 < points <= 512):
+            return None
+        return limits
+    except (OSError, ValueError, TypeError, KeyError):
+        return None
+
+
+def fits_wide_page(rows, limits):
+    if len(rows) != 8:
+        return False
+    first = rows[0]["resultMeta"]
+    if not isinstance(first.get("sha256"), str) or not re.fullmatch("[0-9a-f]{64}", first["sha256"]):
+        return False
+    total = 0
+    for row in rows:
+        facts = row["source"]["facts"]
+        size = facts["byteSize"]
+        if (row["resultMeta"] != first or not 0 < size <= limits["maxMemberBytes"]
+                or not 0 < len(facts["points"]) <= limits["maxPointSources"]):
+            return False
+        total += size
+    return total <= limits["maxPageBytes"]
 
 
 def adjacent(stream, limit, validate, allow_gaps=False):
@@ -27,11 +73,14 @@ def adjacent(stream, limit, validate, allow_gaps=False):
 
 
 def process_page(args, stream, limit, progress, path, bind, runtime, peer_digest,
-                 scope_for, ask, durable, require):
+                 scope_for, ask, durable, require, width_limits=None):
     pending = progress.get("group")
     # On resume the saved exact member list owns the page, even if the preferred width or grouping changed.
     entries = adjacent(stream, len(pending["items"]) if pending else limit, scope_for,
                        allow_gaps=bool(pending) or getattr(args,"same_execution_pages",False))
+    trial = width_limits if width_limits and not pending and len(entries) == 8 else None
+    if width_limits and not pending and not trial:
+        entries = entries[:4]
     if len(entries) < 2:
         require(not pending, "Pending page is absent from inventory")
         return 0
@@ -43,7 +92,10 @@ def process_page(args, stream, limit, progress, path, bind, runtime, peer_digest
         items = pending["items"]
     else:
         items=[{"key":k} for k,_ in entries]
-        originals=rpc("worker","source",items)["rows"]
+        hint = {"widthLimits": trial} if trial else {}
+        originals = rpc("worker", "source", items, **hint)["rows"]
+        if trial and not fits_wide_page(originals, trial):
+            originals = originals[:4]
         if len(originals)<2:
             return 0
         items=[dict(key=i["key"],source=v["source"]) for i,v in zip(items,originals)]
@@ -60,11 +112,15 @@ def process_page(args, stream, limit, progress, path, bind, runtime, peer_digest
         elif len(hubs["rows"])<2:
             return 0
         hubs=hubs["rows"]
+        if trial and len(hubs) < 8:
+            hubs = hubs[:4]
         items=items[:len(hubs)]
         entries=entries[:len(hubs)]
         count=len(items)
         if not pending:
             pending=dict(items=items,initials=originals[:count],end=entries[-1][1],publication=None)
+            if trial and count == 8:
+                pending["widthQualificationSha256"] = args.width_qualification_sha256
             progress["group"]=pending
             durable(path,progress)
         require(pending["end"]==entries[-1][1],"Pending byte boundary changed")
@@ -106,6 +162,8 @@ def process_page(args, stream, limit, progress, path, bind, runtime, peer_digest
         require(sizes==[r["storedFieldBytes"] for r in after["sweeper"]],"Committed SQL field sizes differ")
         saved=dict(binding=bind,keys=[i["key"] for i in batch],initials=pending["initials"],publication=publication,settled=pending["settled"],
                    runtimeRevision=args.runtime_revision,installed=runtime,peerSha256=peer_digest,committedStoredFieldBytes=sizes,before=before,after=after)
+        if "widthQualificationSha256" in pending:
+            saved["widthQualificationSha256"] = pending["widthQualificationSha256"]
         durable(receipt,saved,immutable=True)
     end=entries[-1][1]
     progress.setdefault("archived",progress["completed"]-progress.get("held",0))

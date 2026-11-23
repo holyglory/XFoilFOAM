@@ -8994,6 +8994,38 @@ export const progressiveWorkerEvidenceAttempts = pgTable(
   }),
 );
 
+// Scheduling keys only. The picker rechecks the original signed association, report, and live ownership.
+export const progressiveWorkerDeliveryPoints = pgTable("progressive_worker_delivery_points", {
+  simJobId: uuid("sim_job_id").notNull().references(() => simJobs.id, { onDelete: "cascade" }),
+  pointContentSignature: text("point_content_signature").notNull(),
+  attemptIds: uuid("attempt_ids").array().notNull(),
+  received: boolean("received").notNull(),
+}, (t) => ({
+  primary: primaryKey({ name: "progressive_worker_delivery_points_pkey", columns: [t.simJobId, t.pointContentSignature] }),
+  pending: index("progressive_worker_delivery_pending_point_idx").on(t.simJobId, t.pointContentSignature)
+    .where(sql`NOT ${t.received} AND cardinality(${t.attemptIds})>0`),
+}));
+
+export const progressiveWorkerDeliveryOrder = pgTable("progressive_worker_delivery_order", {
+  simJobId: uuid("sim_job_id").notNull(),
+  sequence: bigint("sequence", { mode: "number" }).notNull(),
+  resultAttemptId: uuid("result_attempt_id").notNull(),
+  pointContentSignature: text("point_content_signature").notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull(),
+}, (t) => ({
+  primary: primaryKey({ name: "progressive_worker_delivery_order_pkey", columns: [t.simJobId, t.sequence, t.resultAttemptId] }),
+  source: foreignKey({ name: "worker_delivery_order_source_fk", columns: [t.simJobId,t.sequence,t.resultAttemptId],
+    foreignColumns: [progressiveWorkerEvidenceAttempts.simJobId,progressiveWorkerEvidenceAttempts.sequence,progressiveWorkerEvidenceAttempts.resultAttemptId],
+  }).onDelete("cascade"),
+  byBinding: index("progressive_worker_delivery_binding_order_idx")
+    .on(t.simJobId, t.pointContentSignature, t.resultAttemptId, t.createdAt, t.sequence),
+}));
+
+export const progressiveWorkerDeliveryDiagnostics = pgTable("progressive_worker_delivery_diagnostics", {
+  resultAttemptId: uuid("result_attempt_id").primaryKey().references(() => resultAttempts.id, { onDelete: "cascade" }),
+  materialDomain: boolean("material_domain").notNull(),
+});
+
 export const progressiveWorkerEvidenceDeliveryClaims = pgTable(
   "progressive_worker_evidence_delivery_claims",
   {

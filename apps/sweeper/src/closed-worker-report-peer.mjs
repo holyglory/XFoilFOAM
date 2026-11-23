@@ -808,6 +808,22 @@ async function runClosedPage(db, m, readBasis) {
   if (op === "source" || op === "hub") {
     const rows = [];
     let bytes = 0;
+    const wider = op === "source" ? m.widthLimits : null;
+    if (wider) {
+      assert.ok(
+        items.length === 8 &&
+          Number.isSafeInteger(wider.maxMemberBytes) &&
+          wider.maxMemberBytes > 0 &&
+          Number.isSafeInteger(wider.maxPageBytes) &&
+          wider.maxMemberBytes <= wider.maxPageBytes &&
+          wider.maxPageBytes <= byteLimit &&
+          Number.isSafeInteger(wider.maxPointSources) &&
+          wider.maxPointSources > 0 &&
+          wider.maxPointSources <= 512,
+        "Invalid source-specific page limits",
+      );
+    }
+    let fits = true;
     for (const item of items) {
       try {
         const next = await runClosedReportPeer(db, { op, scope, ...item });
@@ -817,6 +833,18 @@ async function runClosedPage(db, m, readBasis) {
         )
           break;
         rows.push(next);
+        if (wider) {
+          fits =
+            fits &&
+            next.source.facts.byteSize <= wider.maxMemberBytes &&
+            bytes <= wider.maxPageBytes &&
+            next.source.facts.points.length <= wider.maxPointSources &&
+            next.resultMeta.sha256 === rows[0].resultMeta.sha256 &&
+            next.resultMeta.byteSize === rows[0].resultMeta.byteSize;
+          // Large or distinct originals still get the four-member path. Avoid
+          // resolving the unused second half once the first half disqualifies it.
+          if (!fits && rows.length >= 4) return { rows: rows.slice(0, 4) };
+        }
       } catch (e) {
         if (e.name !== "ClosedReportHeld") throw e;
         return { rows, held: e.message };

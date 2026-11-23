@@ -1611,6 +1611,13 @@
       "when": 1795363913060,
       "tag": "0229_closed_progressive_retention_cursor",
       "breakpoints": true
+    },
+    {
+      "idx": 230,
+      "version": "7",
+      "when": 1795363913061,
+      "tag": "0230_pending_worker_delivery_sources",
+      "breakpoints": true
     }
   ]
 }

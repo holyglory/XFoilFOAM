@@ -1,4 +1,5 @@
-import { nextCancelledReportCopies } from "../src/cancelled-report-copies";
+import { CancelledReportCopyPriority, nextCancelledReportCopies, selectCancelledReportCopyPage } from "../src/cancelled-report-copies";
+import { archiveProgressiveReportBatch } from "../src/progressive-report-archive-service";
 import { randomUUID } from "node:crypto";
 import { fork } from "node:child_process";
 import { once } from "node:events";
@@ -191,6 +192,28 @@ it("runs the stock recurring hub storage worker and serves both archive formats 
     expect(ordinaryWindow.after).not.toBeNull();
     expect(ordinaryWindow.after!.executionId !== originals[1].executionId ||
       ordinaryWindow.after!.sequence >= originals[1].reports.at(-1)!.sequence).toBe(true);
+    // Both pages carry real stored scientific identities. A scheduling hint
+    // alone cannot retire a pending row or supply its missing raw receipt.
+    const waiting = originals[0].executionId, continuing = originals[1].executionId;
+    const waitingKeys = (await stoppedReportCopyKeys(db.db, waiting, 0, 32, true)).slice(0, 2);
+    const continuingKeys = await stoppedReportCopyKeys(db.db, continuing, 0, 32, true);
+    const signedOffers = new CancelledReportCopyPriority();
+    signedOffers.offer(continuing, continuingKeys);
+    expect(signedOffers.take()?.executionId).toBe(continuing);
+    signedOffers.offer(waiting, waitingKeys);
+    signedOffers.offer(continuing, continuingKeys);
+    const cursor = {executionId: continuing, sequence: 0};
+    const chronological = await selectCancelledReportCopyPage(db.db, cursor, signedOffers);
+    expect(chronological.preferred).toBeUndefined();
+    const selected = await selectCancelledReportCopyPage(db.db, chronological.after, signedOffers);
+    expect(selected.preferred?.executionId).toBe(waiting);
+    expect(selected.after).toEqual(chronological.after);
+    expect(selected.sequences).toEqual(waitingKeys.map(k => k.sequence));
+    expect(await archiveProgressiveReportBatch(db.db, "remote", waiting, async () => {
+      throw new Error("An unreceipted priority hint reached the cloud writer");
+    }, selected.sequences, new Map(waitingKeys.map(k => [k.sequence,k.signature])))).toBe(0);
+    expect(signedOffers.take()).toBeUndefined();
+    expect(signedOffers.take()?.executionId).toBe(continuing);
     const physicalRead = (f: ArchiveFixture) => {
       const first = f.reports.findIndex((r) => r.payloadHash !== null);
       return f.reports[first + 1];

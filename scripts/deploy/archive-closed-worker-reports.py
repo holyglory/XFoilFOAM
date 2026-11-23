@@ -16,7 +16,7 @@ import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from closed_worker_report_pages import process_page
+from closed_worker_report_pages import process_page, qualified_width
 from closed_worker_report_sessions import ReportReadSessions, ROLE_READS
 from closed_worker_report_discovery import discovery_step, revisit_held, revisit_prefix
 
@@ -222,13 +222,18 @@ def run(args):
             return dict(sourceInstance=s["sourceInstance"],solverId=s["solverId"],sha256=args.frozen_sha256,range=entry)
         def ask(role, message):
             return run_peer(args,role,{**message,"runtime":runtime},peer)
+        # The invocation budget and mutation owner do not change when two normal
+        # four-member windows share one authenticated generation.
+        peer_hash = digest(peer.encode())
+        limits = qualified_width(args, bind, runtime, peer_hash)
+        max_members = 8 if limits else getattr(args, "page_members", 1)
         left = args.limit
         while left>0:
             if getattr(args,"pause_file",None) and args.pause_file.exists():
                 return
             if args.apply and not progress.get("pending") and (progress.get("group") or min(getattr(args,"page_members",1),left)>1):
-                used=process_page(args, keys, min(getattr(args,"page_members",1),left), progress, path, bind, runtime, digest(peer.encode()),
-                                  scope_for, ask, durable, require)
+                used=process_page(args, keys, min(max_members,left), progress, path, bind, runtime, peer_hash,
+                                  scope_for, ask, durable, require, limits)
                 if used:
                     left-=used
                     continue
@@ -357,6 +362,8 @@ if __name__ == "__main__":
     parser.add_argument("--discovery-interval",type=int,default=900)
     parser.add_argument("--reuse-read-passes",type=int,default=0)
     parser.add_argument("--pause-file",type=Path)
+    parser.add_argument("--width-qualification", type=Path, help="Optional measured eight-member budget for the exact ordinary four-member scope")
+    parser.add_argument("--width-qualification-sha256", help="SHA-256 of that local qualification")
     parser.add_argument("--same-execution-pages",action="store_true",help="Pack consecutive inventory keys from one execution across sequence gaps")
     parser.add_argument("--page-members",type=int,default=1)
     parser.add_argument("--hub-account-file",type=Path,help="Confirmed workload identity for independent grouped GCS reads on the hub")

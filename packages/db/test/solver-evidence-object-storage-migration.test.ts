@@ -924,6 +924,15 @@ it("normal migrate prepares 0223 online, recovers an interrupted build and prese
     expect(installedJournal.length).toBeGreaterThan(n);
     expect(installedJournal.filter(row => row.created_at === "1795363913054")).toHaveLength(1);
     expect(installedJournal.map(({ hash, created_at }) => ({ hash, created_at }))).toEqual(expectedJournal);
+    const cursorMigration = installedJournal.findIndex(row => row.created_at === "1795363913060");
+    expect(cursorMigration).toBeGreaterThan(0);
+    expect(installedJournal[cursorMigration + 1]?.created_at).toBe("1795363913061");
+    const [deliveryIndex] = await db`SELECT EXISTS(SELECT FROM pg_attribute WHERE attrelid='sweeper_state'::regclass
+      AND attname='closed_progressive_retention_after_id' AND NOT attisdropped) AS retention_cursor,
+      to_regclass('public.progressive_worker_delivery_pending_point_idx') IS NOT NULL AS pending,
+      to_regclass('public.progressive_worker_delivery_binding_order_idx') IS NOT NULL AS aliases,
+      to_regclass('public.progressive_worker_delivery_diagnostics') IS NOT NULL AS dispositions`;
+    expect(deliveryIndex).toEqual({retention_cursor:true,pending:true,aliases:true,dispositions:true});
     const [workerPolicy] = await db`SELECT hz_settled_receipts_enabled AS enabled,
       to_regprocedure('public.attempt_evidence_hz_settled_scope(uuid,uuid)') IS NOT NULL AS ready
       FROM attempt_evidence_storage_policy WHERE id=1`;
@@ -944,6 +953,8 @@ it("normal migrate prepares 0223 online, recovers an interrupted build and prese
     expect(await identity()).toEqual(before);
     await normal();
     expect(await readJournal()).toEqual(installedJournal);
+    console.info(JSON.stringify({ component:"normal-migration-repeat", count:installedJournal.length,
+      retentionIndex:cursorMigration,deliveryIndex:cursorMigration+1,fullOrderedHashesAndTimestampsUnchanged:true }));
   } finally {
     await db.end();
     await admin!.unsafe(`DROP DATABASE "${name}"`);

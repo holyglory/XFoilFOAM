@@ -248,5 +248,36 @@ class ClosedReportOperator(unittest.TestCase):
         self.assertEqual([k for k,_ in adjacent(stream,4,lambda k:None,allow_gaps=True)],keys[:3])
         self.assertEqual(stream.tell(),0)
 
+    def test_wider_page_needs_the_pinned_scope_runtime_and_matching_sources(self):
+        import hashlib
+        from closed_worker_report_pages import qualified_width, fits_wide_page
+        with tempfile.TemporaryDirectory() as tmp:
+            p=Path(tmp)/"limits.json"
+            binding={"inventory":"one","frozen":"two","solver":"three"}
+            runtime={"reader":"a"*64}
+            runtime_digest=hashlib.sha256(json.dumps(runtime,sort_keys=True,separators=(",",":")).encode()).hexdigest()
+            limits=dict(maxMemberBytes=20,maxPageBytes=150,maxPointSources=2)
+            peer="b"*64
+            config=dict(version=1,binding=binding,runtimeSha256=runtime_digest,peerSha256=peer,ordinaryMembers=4,wideMembers=8,
+                        qualificationReceiptSha256="f"*64,**limits)
+            p.write_bytes(controller.compact(config))
+            args=SimpleNamespace(width_qualification=p,width_qualification_sha256=controller.digest(p.read_bytes()),page_members=4)
+            self.assertEqual(qualified_width(args,binding,runtime,peer),limits)
+            self.assertIsNone(qualified_width(args,dict(binding,inventory="prospective"),runtime,peer))
+            self.assertIsNone(qualified_width(args,binding,{},peer))
+            self.assertIsNone(qualified_width(args,binding,runtime,"d"*64))
+            p.write_bytes(b"{}")
+            self.assertIsNone(qualified_width(args,binding,runtime,peer))
+            p.unlink()
+            self.assertIsNone(qualified_width(args,binding,runtime,peer))
+            def item(size=16, result="e", points=1):
+                return dict(resultMeta={"sha256":result*64,"byteSize":8},source={"facts":{"points":[None]*points,"byteSize":size}})
+            rows=[item() for _ in range(8)]
+            self.assertTrue(fits_wide_page(rows,limits))
+            self.assertFalse(fits_wide_page(rows[:7],limits))
+            for changed in (item(size=21),item(result="f"),item(points=3)):
+                self.assertFalse(fits_wide_page([*rows[:-1],changed],limits))
+            self.assertFalse(fits_wide_page([item(size=20)for _ in range(8)],limits))
+
 if __name__ == "__main__":
     unittest.main()

@@ -1,3 +1,4 @@
+import { installDeliveryIndexFixture } from "../../../packages/db/test-support/progressive-worker-delivery-index";
 import { periodicPoint } from "../../../packages/db/test-support/periodic-urans-point";
 import {verifyHzAttemptTransition} from "../test-support/hz-attempt-transition";
 import {
@@ -470,6 +471,8 @@ async function withFixture(
             409,'Progressive evidence delivery failed (409): progressive_scope_closed Original ingestion scope is closed','[]'::jsonb)`);
       }
     }
+    await connection.execute(sql`ALTER TABLE result_attempts ADD PRIMARY KEY(id)`);
+    await installDeliveryIndexFixture(connection, true);
     try {
       await run({
         connection,
