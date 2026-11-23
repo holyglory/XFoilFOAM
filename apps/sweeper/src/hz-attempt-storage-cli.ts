@@ -269,6 +269,7 @@ export async function hzAttemptStorage(
       eligible: 0,
       verified: 0,
       limited: 0,
+      deferredReadbacks: 0,
       reportSizeHeld: 0,
       sourceStoredBytes: 0,
       excluded: 0,
@@ -293,8 +294,49 @@ export async function hzAttemptStorage(
       }
       await atomicJson(file, state);
     }
+    // An already committed event survives disconnects. Job-row contention
+    // during its post-read must not monopolize the sole worker. Explicit
+    // migrations, transfer fences and source-integrity failures retain their
+    // normal retry/restore semantics.
+    let nextPendingCheck = 0;
+    let afterEvent = ZERO_ID;
+    let previousPending: string | null = null;
+    async function transfer(id: string, observed?: { id: string; event?: string }) {
+      return retry(async () => {
+        try {
+          return await migrateHzAttempt(relay, id, instance);
+        } catch (error) {
+          if (!watching || !(error instanceof HistoryOperationError) || error.category !== "database_busy" || !error.retryable) throw error;
+          const durable = observed ??
+            (await relay.worker({ operation: "pending", attemptId: id })).find((r: { id: string }) => r.id === id);
+          if (!durable) throw error;
+          report({ pendingReadback: id, event: durable.event, operation: error.operation });
+          nextPendingCheck = Date.now() + 60_000;
+          return { pendingReadback: true as const };
+        }
+      });
+    }
+    async function revisitPending() {
+      if (!watching || Date.now() < nextPendingCheck) return;
+      const cursorSupported = bound.pending_cursor_protocol === 1;
+      const rows = await retry(() => relay.worker({
+        operation: "pending", ...(cursorSupported ? { afterEvent } : {}),
+      }));
+      nextPendingCheck = Date.now() + 60_000;
+      if (!rows.length) {
+        afterEvent = ZERO_ID;
+        previousPending = null;
+        return;
+      }
+      const pos = cursorSupported ? 0 : (rows.findIndex((r: { id: string }) => r.id === previousPending) + 1) % rows.length;
+      const row = rows[pos];
+      previousPending = exactId(row.id);
+      if (cursorSupported) afterEvent = exactId(row.event);
+      const recovered = await transfer(previousPending, {id:previousPending,event:row.event});
+      if (!("pendingReadback" in recovered)) nextPendingCheck = 0;
+    }
     for (;;) {
-      if (write) {
+      if (write && !watching) {
         // Audit pending commits even if a previous scan reached its high water.
         for (;;) {
           const pending = await retry(() =>
@@ -307,6 +349,7 @@ export async function hzAttemptStorage(
             );
         }
       }
+      if (watching) await revisitPending();
       for (
         let pass = 0;
         !state.complete && (continuous || pass < pages);
@@ -331,12 +374,17 @@ export async function hzAttemptStorage(
           const key = exactId(row.id);
           if (key <= state.after || key > state.high)
             throw Error("Invalid keyset progress");
+          if (watching) await revisitPending();
+          // Older peers return only their first eight pending entries. Their
+          // ordinary forward page still identifies any later unconfirmed row.
+          if (watching && bound.pending_cursor_protocol !== 1 && row.archive && row.pending && key !== previousPending)
+            await transfer(key, {id:key});
           if (!row.archive && row.limiter === null) {
             if (write) {
-              const r = await retry(() =>
-                migrateHzAttempt(relay, key, instance),
-              );
-              if (r.limited) {
+              const r = await transfer(key);
+              if ("pendingReadback" in r) {
+                state.deferredReadbacks = (state.deferredReadbacks ?? 0) + 1;
+              } else if (r.limited) {
                 state.limited++;
                 if (r.limited === SETTLED_REPORT_SIZE_LIMIT) state.reportSizeHeld = (state.reportSizeHeld ?? 0) + 1;
               }
@@ -377,7 +425,7 @@ export async function hzAttemptStorage(
             : {}),
         });
       if (!watching) break;
-      const nextScan = Date.now() + poll * 1000;
+      const nextScan = Date.now() + (previousPending ? Math.min(60_000, poll * 1000) : poll * 1000);
       if (originals)
         await (io.originalCycle ?? runOriginalCycle)(
           originals,
@@ -399,6 +447,7 @@ export async function hzAttemptStorage(
         eligible: 0,
         verified: 0,
         limited: 0,
+        deferredReadbacks: 0,
         reportSizeHeld: 0,
         sourceStoredBytes: 0,
         excluded: 0,

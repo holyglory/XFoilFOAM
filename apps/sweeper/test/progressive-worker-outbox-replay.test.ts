@@ -1274,7 +1274,7 @@ it("runs CLI help and refuses ambiguous flags before connecting to a database", 
   });
 }, 30000);
 
-it.each(["steady", "periodic"])(
+it.each(["steady", "periodic", "contended"])(
   "reads and migrates the %s attempt through its actual worker report and rejects stale custody",
   async (kind) => {
     const periodic = kind === "periodic";
@@ -1342,6 +1342,14 @@ it.each(["steady", "periodic"])(
             root,
           );
           expect(await read()).toBe(source);
+          if (kind === "contended") {
+            const other = input.points.find(v => v.resultAttemptId !== id)!;
+            await db.execute(sql`UPDATE result_attempts SET regime='rans' WHERE id=${other.resultAttemptId}::uuid`);
+            await db.execute(sql`INSERT INTO progressive_worker_hub_receipts VALUES(${input.executionId}::uuid,${other.sequence},
+              ${other.resultAttemptId}::uuid,${other.pointContentSignature},${JSON.stringify({ ...receipt(other), storageOnly: true })}::jsonb)`);
+            await verifyHzAttemptTransition(db, id, input, source, root, full, false, other.resultAttemptId);
+            return;
+          }
           if (periodic) {
             expect(JSON.parse(source).force_history.t).toHaveLength(6 * 80);
             expect(JSON.parse(source).frame_track.frames).toHaveLength(6 * 24);
@@ -1375,7 +1383,7 @@ it.each(["steady", "periodic"])(
         },
         {
           includeHistory: true,
-          pendingCount: 1,
+          pendingCount: kind === "contended" ? 2 : 1,
           periodicHistory: periodic,
           failedPoints: periodic,
         },

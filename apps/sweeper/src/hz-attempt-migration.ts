@@ -1,4 +1,5 @@
 import { Readable } from "node:stream";
+import { setTimeout as delay } from "node:timers/promises";
 import type { AttemptEvidenceArchiveIdentity } from "@aerodb/db/attempt-evidence-catalog";
 import type { AttemptEvidenceFreshVerification } from "@aerodb/db/attempt-evidence-projection";
 import { readAttemptEvidenceCopy } from "./attempt-evidence-archive";
@@ -162,7 +163,19 @@ async function transferHzAttempt(relay: AttemptRelay, id: string, instance: stri
     });
     checkApp(app, id, archiveId, identity, false);
     await relay.worker({ operation: "replay", ...owner }, true);
-    await relay.worker({ operation: "confirm", ...owner, eventId, app }, true);
+    // A failed row lock rolled back only this confirmation. Reuse the
+    // genuine post-read and exact event for a short retry; the native confirm
+    // rechecks ownership, source bytes, selection and job decisions each time.
+    for (let attempt = 1; ; attempt++) {
+      try {
+        await relay.worker({ operation: "confirm", ...owner, eventId, app }, true);
+        break;
+      } catch (error) {
+        if (attempt >= 3 || !(error instanceof HistoryOperationError) ||
+            error.category !== "database_busy" || !error.retryable) throw error;
+        await delay(250 * attempt);
+      }
+    }
   } catch (error) {
     // A deploy pause or disconnected confirmation may already have committed.
     // Re-enter through the durable event. Other failures restore pending rows.

@@ -1,4 +1,4 @@
-import { checkHzTransferFence } from "../src/hz-attempt-transfer-fence";
+import { checkHzTransferFence, hzAttemptRpcFailure } from "../src/hz-attempt-transfer-fence";
 import { analysisContentHash, type ProgressiveRemoteReport } from "@aerodb/db";
 import { replayProgressiveWorkerOutbox, ProgressiveWorkerReplayNeedsFinalReport } from "../src/progressive-worker-outbox-replay";
 import { verifyOriginalCopyJourney } from "./hz-attempt-originals-fixture";
@@ -13,7 +13,7 @@ import {
   loadAttemptSourcePins,
   prepareAttemptSources,
 } from "@aerodb/db/attempt-receipt-source";
-import type { DB } from "@aerodb/db/client";
+import { createClient, type DB } from "@aerodb/db/client";
 import { sql, type SQL } from "drizzle-orm";
 import { expect } from "vitest";
 import { createSettlementFixture } from "./attempt-settlement-fixture";
@@ -114,6 +114,7 @@ export async function verifyHzAttemptTransition(
   root: string,
   fullReport: string,
   periodic = false,
+  independentAttempt?: string,
 ) {
   const fixture = await createSettlementFixture(true),
     db = fixture.db;
@@ -232,6 +233,84 @@ export async function verifyHzAttemptTransition(
       relay,
       report: (value: unknown) => reports.push(value as Record<string, any>),
     };
+    if (independentAttempt) {
+      const siblingSource = await readStoredAttemptEvidenceText(db, independentAttempt);
+      const interrupted: AttemptRelay = {...relay, async api(request) {
+        const checked = await relay.api(request);
+        if (request.forceArchive === false) throw new HistoryOperationError("deploy", "deployment_busy", true);
+        return checked;
+      }};
+      await expect(hzAttemptStorage(["migrate", ...config, "--include-retained", "--id", id],
+        { ...io, relay: interrupted })).rejects.toMatchObject({ category: "deployment_busy" });
+      const [pending] = await relay.worker({operation:"pending",attemptId:id});
+      expect(pending.id).toBe(id);
+      const firstPage = await relay.worker({ operation:"page",retained:true,
+        after:"00000000-0000-0000-0000-000000000000",high:"ffffffff-ffff-ffff-ffff-ffffffffffff",limit:64 });
+      const readyIds: string[] = firstPage.filter((r: {archive:string|null;limiter:string|null}) =>
+        r.archive === null && r.limiter === null).map((r:{id:string}) => r.id);
+      expect(readyIds).toContain(independentAttempt);
+      expect(readyIds).not.toContain(id);
+      const otherClient = createClient({max:1});
+      let takeLock!: () => void, locked!: () => void, release!: () => void;
+      const requested = new Promise<void>(resolve => { takeLock = resolve; });
+      const acquired = new Promise<void>(resolve => { locked = resolve; });
+      const keepLock = new Promise<void>(resolve => { release = resolve; });
+      const hold = requested.then(() => otherClient.db.transaction(async tx => {
+        await tx.execute(sql`SELECT id FROM ${sql.identifier(fixture.namespace)}.result_attempts WHERE id=${id}::uuid FOR SHARE`);
+        locked();
+        await keepLock;
+      }));
+      const controller = new AbortController();
+      const messages: Array<Record<string, any>> = [];
+      let busy = 0;
+      const contended: AttemptRelay = {...relay, async worker(request,write) {
+        try {
+          if (request.operation === "confirm" && request.attemptId === id) {
+            takeLock();
+            await Promise.race([acquired,hold]);
+          }
+          return await relay.worker(request,write);
+        } catch(error) {
+          const wire = hzAttemptRpcFailure("attempt_"+request.operation,error);
+          if (request.operation === "confirm" && request.attemptId === id && wire.operation === "attempt_confirm_lock_timeout" && wire.retryable) {
+            busy++;
+            throw new HistoryOperationError(wire.operation,"database_busy",true);
+          }
+          if (wire.retryable) throw new Error("Unexpected contention in fixture at "+wire.operation, {cause:error});
+          throw error;
+        }
+      }};
+      try {
+        await hzAttemptStorage(["watch",...config,"--include-retained","--directory",checkpoint,"--limit","2"], {
+          relay:contended,signal:controller.signal,report(value) {
+            const message = value as Record<string, any>;
+            messages.push(message);
+            if (message.complete && message.activeCustody) controller.abort();
+          },
+        });
+        expect(busy).toBe(3);
+        expect(messages.some(m=>m.pendingReadback===id && m.event===pending.event)).toBe(true);
+        expect(messages.at(-1)).toMatchObject({complete:true,activeCustody:{pending:1,confirmed:readyIds.length}});
+        const confirmed = await db.execute(sql`SELECT result_attempt_id FROM attempt_evidence_storage_events
+          WHERE completed AND app_readback_at IS NOT NULL AND action='shorten' ORDER BY result_attempt_id`);
+        expect(confirmed.map(r=>r.result_attempt_id)).toEqual([...readyIds].sort());
+        const [sibling] = await db.execute(sql`SELECT e.app_readback_at FROM result_attempts a JOIN attempt_evidence_storage_events e
+          ON e.id=a.evidence_storage_event_id AND e.archive_id=a.evidence_archive_id WHERE a.id=${independentAttempt}::uuid`);
+        expect(sibling.app_readback_at).toBeTruthy();
+        expect(await readStoredAttemptEvidenceText(db, independentAttempt)).toBe(siblingSource);
+        expect(await readStoredAttemptEvidenceText(db, id)).toBe(original);
+      } finally {
+        takeLock();
+        release();
+        await hold;
+        await otherClient.sql.end({timeout:1});
+      }
+      await hzAttemptStorage(["migrate",...config,"--include-retained","--directory",checkpoint,"--until-complete"],io);
+      expect(reports.at(-1)?.activeCustody).toMatchObject({pending:0,confirmed:readyIds.length+1});
+      const [same] = await db.execute(sql`SELECT evidence_storage_event_id event FROM result_attempts WHERE id=${id}::uuid`);
+      expect(same.event).toBe(pending.event);
+      return;
+    }
     async function verifySettledPoint() {
       // A normal running report delivered the point. Its assignment stopped at
       // a later sequence. Both signed reports are still inline on this worker.
