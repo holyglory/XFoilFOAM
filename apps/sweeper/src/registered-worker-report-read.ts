@@ -10,6 +10,8 @@ import {
 } from "@aerodb/db/progressive-report-archive";
 import { retainedReportInventory } from "@aerodb/db/retained-solver-reports";
 import { sql } from "drizzle-orm";
+import { AsyncLocalStorage } from "node:async_hooks";
+import { isDeepStrictEqual } from "node:util";
 import { Readable } from "node:stream";
 import { configuredDeploymentRole } from "./config";
 import { registeredWorkerArchiveOwner } from "./report-archive-broker-client";
@@ -117,18 +119,50 @@ export async function nativeReportOwner(
     upstream: baseUrl,
   };
 }
-async function exactHubMember(
+export const maxRegisteredPageMembers = 8;
+export const maxRegisteredPageBytes = 32 * 1024 ** 2;
+function objectIdentity(p: ReportPin) {
+  const { sequence, signature, reportSha256, reportByteSize, ...object } = p;
+  return object;
+}
+export function assertRegisteredPage(links: readonly HubReportLink[]) {
+  requireReportProof(
+    Array.isArray(links) &&
+      links.length > 0 &&
+      links.length <= maxRegisteredPageMembers,
+    "Invalid registered report page",
+  );
+  const first = links[0]!;
+  let total = 0;
+  for (const [index, l] of links.entries()) {
+    assertReportPin(l.pin);
+    total += l.pin.reportByteSize;
+    requireReportProof(
+      l.owner.executionId === l.pin.executionId &&
+        isDeepStrictEqual(l.owner, first.owner) &&
+        l.hubBundle === first.hubBundle &&
+        l.hubInstance === first.hubInstance &&
+        isDeepStrictEqual(objectIdentity(l.pin), objectIdentity(first.pin)) &&
+        (!index || links[index - 1]!.pin.sequence < l.pin.sequence) &&
+        total <= maxRegisteredPageBytes,
+      "Registered report page crossed owner, object, order or byte limit",
+    );
+  }
+}
+type PageMember = { pin: ReportPin; text: string };
+async function exactHubMembers(
   source: Readable,
-  p: ReportPin,
+  pins: readonly ReportPin[],
   owner: ReportOwner,
   signal?: AbortSignal,
 ) {
-  let found: string | undefined,
-    expanded = 0;
+  const wanted = new Map(pins.map((p) => [p.sequence, p]));
+  const rows = new Map<number, PageMember>();
+  let expanded = 0;
   await visitVerifiedSignedReportArchive(
     "remote",
     source,
-    p,
+    pins[0]!,
     owner,
     (entry) => {
       expanded += Buffer.byteLength(entry.reportText);
@@ -136,29 +170,31 @@ async function exactHubMember(
         entry.kind === "report" && expanded <= 256 * 1024 ** 2,
         "Invalid registered report record set",
       );
-      if (entry.sequence !== p.sequence) return;
+      const pin = wanted.get(entry.sequence);
+      if (!pin) return;
       const original = reportTextIdentity(entry.reportText);
       requireReportProof(
-        entry.contentSignature === p.signature &&
-          original.sha256 === p.reportSha256 &&
-          original.byteSize === p.reportByteSize,
+        entry.contentSignature === pin.signature &&
+          original.sha256 === pin.reportSha256 &&
+          original.byteSize === pin.reportByteSize,
         "Signed native report bytes differ",
       );
-      found = entry.reportText;
+      rows.set(pin.sequence, {
+        pin: Object.freeze({ ...pin }),
+        text: entry.reportText,
+      });
     },
     limits,
     signal,
   );
   requireReportProof(
-    found !== undefined,
+    rows.size === pins.length,
     "Native report missing from original hub generation",
   );
-  return found;
+  return rows;
 }
-export async function inspectHubReport(bytes: Buffer, link: HubReportLink) {
-  const { pin: p, owner } = link;
-  assertReportPin(p);
-  const text = await exactHubMember(Readable.from([bytes]), p, owner);
+function verifyInventory(link: HubReportLink, text: string) {
+  const p = link.pin;
   const inv = retainedReportInventory(
     reportJsonObject(parseReportJson(text)),
     p.signature,
@@ -178,6 +214,54 @@ export async function inspectHubReport(bytes: Buffer, link: HubReportLink) {
       }),
     "Archived scientific source inventory differs",
   );
+}
+export async function inspectHubReportPage(
+  source: Readable,
+  links: readonly HubReportLink[],
+) {
+  assertRegisteredPage(links);
+  const members = await exactHubMembers(
+    source,
+    links.map((l) => l.pin),
+    links[0]!.owner,
+  );
+  for (const l of links) verifyInventory(l, members.get(l.pin.sequence)!.text);
+}
+export async function inspectHubReport(bytes: Buffer, link: HubReportLink) {
+  return inspectHubReportPage(Readable.from([bytes]), [link]);
+}
+// Only the product adapter can consume a verified page. Each normal call still
+// rechecks its own live binding. There is no cross-request or process cache.
+const localPage = new AsyncLocalStorage<{
+  db: DB;
+  owner: ReportOwner;
+  members: Map<number, PageMember>;
+}>();
+export async function withRegisteredWorkingPage<T>(
+  db: DB,
+  links: readonly HubReportLink[],
+  work: () => Promise<T>,
+) {
+  assertRegisteredPage(links);
+  const p = links[0]!.pin;
+  const owner = await nativeReportOwner(db, p.executionId);
+  requireReportProof(
+    isDeepStrictEqual(owner, links[0]!.owner),
+    "Registered working page owner differs",
+  );
+  const file = await readWorkerReportVolume(p);
+  requireReportProof(file, "Registered hub report working copy unavailable");
+  const members = await exactHubMembers(
+    file,
+    links.map((l) => l.pin),
+    owner,
+    AbortSignal.timeout(15000),
+  );
+  try {
+    return await localPage.run({ db, owner, members }, work);
+  } finally {
+    members.clear();
+  }
 }
 export async function readRegisteredWorkerReportArchiveText(
   db: DB,
@@ -200,7 +284,21 @@ export async function readRegisteredWorkerReportArchiveText(
     AND l.promise_id=${owner.promiseId}::uuid AND l.assignment_signature=${owner.assignmentSignature} AND l.upstream_base_url=${owner.upstream}
     AND r.assignment_signature=l.assignment_signature AND r.content_signature=${pin.signature} AND r.acknowledged_at IS NOT NULL`);
   requireReportProof(binding, "No exact registered local report binding");
+  const page = localPage.getStore();
+  if (page) {
+    const row = page.members.get(pin.sequence);
+    requireReportProof(
+      page.db === db &&
+        isDeepStrictEqual(owner, page.owner) &&
+        row &&
+        isDeepStrictEqual(row.pin, pin),
+      "Product reader differs from registered working page",
+    );
+    signal?.throwIfAborted();
+    return row.text;
+  }
   const file = await readWorkerReportVolume(pin);
   requireReportProof(file, "Registered hub report working copy unavailable");
-  return exactHubMember(file, pin, owner, signal);
+  return (await exactHubMembers(file, [pin], owner, signal)).get(pin.sequence)!
+    .text;
 }

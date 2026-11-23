@@ -98,13 +98,15 @@ export async function registeredWorkerRoundtrip(f: ArchiveFixture) {
       ',"report":' +
       r.text +
       "}";
-    const packed = gzipSync([line(anchor), line(target)].join("\n") + "\n"),
+    const physical = f.reports.slice(1, 6);
+    const packed = gzipSync(physical.map((r) => line(r)).join("\n") + "\n"),
       sha = archiveSha256(packed),
       crc = new CRC32C();
     crc.update(packed);
     const objectKey = `progressive-reports/v1/remote/${id}/${sha}.jsonl.gz`;
     vi.stubEnv("AIRFOILFOAM_EVIDENCE_BUCKET", bucket);
     let link!: HubReportLink, restored!: Buffer;
+    const more: HubReportLink[] = [];
     const rollback = new Error("finish independent hub snapshot");
     await expect(
       db.transaction(async (t) => {
@@ -120,7 +122,7 @@ export async function registeredWorkerRoundtrip(f: ArchiveFixture) {
         SELECT id,${f.promiseId}::uuid,${owner.solverId}::uuid,1,${owner.assignmentSignature},request_payload->'remoteProgressiveExecution' FROM sim_jobs WHERE id=${id}::uuid`);
         await hub.execute(sql`INSERT INTO progressive_remote_reports(sim_job_id,sequence,content_signature,report) SELECT sim_job_id,sequence,content_signature,report
         FROM progressive_worker_reports WHERE sim_job_id=${id}::uuid`);
-        for (const r of [anchor, target]) {
+        for (const r of physical) {
           const inventory = retainedReportInventory(
             reportJsonObject(parseReportJson(r.text)),
             r.contentSignature,
@@ -138,14 +140,23 @@ export async function registeredWorkerRoundtrip(f: ArchiveFixture) {
         const [b] =
           await hub.execute(sql`INSERT INTO progressive_report_archive_bundles(source_kind,sim_job_id,bucket,object_key,generation,stored_sha256,
         stored_byte_size,crc32c,member_count,first_sequence,last_sequence,verified_at)
-        VALUES('remote',${id}::uuid,${bucket},${objectKey},${generation},${sha},${packed.length},${crc.toString()},2,2,3,clock_timestamp()) RETURNING id`);
-        for (const r of [anchor, target]) {
+        VALUES('remote',${id}::uuid,${bucket},${objectKey},${generation},${sha},${packed.length},${crc.toString()},5,2,6,clock_timestamp()) RETURNING id`);
+        for (const r of physical) {
           await hub.execute(sql`INSERT INTO progressive_report_archive_members(bundle_id,source_kind,sim_job_id,sequence,member_kind,content_signature,report_sha256,report_byte_size)
           VALUES(${b!.id}::uuid,'remote',${id}::uuid,${r.sequence},'report',${r.contentSignature},${reportTextIdentity(r.text).sha256},${Buffer.byteLength(r.text)})`);
           await hub.execute(sql`UPDATE progressive_remote_reports SET archive_bundle_id=${b!.id}::uuid,archived_at=now(),
           report=progressive_report_compact_header(report) WHERE sim_job_id=${id}::uuid AND sequence=${r.sequence}`);
         }
         link = (await hubReportLink(hub, owner, key))!;
+        for (const r of physical.slice(2)) {
+          const next = await hubReportLink(hub, owner, {
+            executionId: id,
+            sequence: r.sequence,
+            signature: r.contentSignature,
+          });
+          expect(next).not.toBeNull();
+          more.push(next!);
+        }
         expect(link.hubBundle).toBe(b!.id);
         expect(link.anchors[0]?.hubAttempt).not.toBe(nativeAttempt);
         await expect(
@@ -189,6 +200,23 @@ export async function registeredWorkerRoundtrip(f: ArchiveFixture) {
           cloud,
         ).restore(link);
         expect(restored).toEqual(packed);
+        cloud.mockClear();
+        expect(
+          await new ExistingHubReportStore(bucket, account, cloud).restorePage(
+            more,
+          ),
+        ).toEqual(packed);
+        expect(
+          cloud.mock.calls.filter(([url]) =>
+            String(url).startsWith("https://storage.googleapis.com"),
+          ),
+        ).toHaveLength(2);
+        await expect(
+          new ExistingHubReportStore(bucket, account, cloud).restorePage([
+            more[0]!,
+            { ...more[1]!, pin: { ...more[1]!.pin, generation: "2" } },
+          ]),
+        ).rejects.toThrow();
         const denied = new ExistingHubReportStore(
           bucket,
           account,
@@ -417,6 +445,176 @@ export async function registeredWorkerRoundtrip(f: ArchiveFixture) {
     ).toBe(false);
     const file = join(volume, sha.slice(0, 2), sha + ".jsonl.gz");
     expect(await readFile(file)).toEqual(packed);
+    // A failed reply after the first member commit leaves the old ordered cursor
+    // behind the whole page. Reopen the exact generation even if configuration
+    // reverts to scalar admission on restart.
+    await rm(file);
+    const keysFile = join(volume, "exact-keys.json");
+    const keys = more.map((l) => ({
+      executionId: id,
+      sequence: l.pin.sequence,
+      signature: l.pin.signature,
+    }));
+    await writeFile(keysFile, JSON.stringify(keys));
+    const selected = [
+      "selected",
+      ...shared,
+      "--keys-file=" + keysFile,
+      "--apply",
+      "--bundle-members=3",
+    ];
+    let drop = true,
+      wrong = false,
+      packedTransfers = 0;
+    const calls: string[] = [];
+    let partialStage = true;
+    const groupConnect: ReportConnector = (host, container, write) => ({
+      close: async () => {},
+      ask: async (msg) => {
+        const m = msg as Record<string, any>;
+        calls.push(
+          m.operation + (m.reader ? "/" + m.reader + "/" + m.committed : ""),
+        );
+        if (m.operation === "hello")
+          return {
+            role: host === "hub" ? "hub" : "remote-solver",
+            instance: host === "hub" ? hubInstance : workerInstance,
+            solver: ownerSolver,
+            build: m.build,
+          };
+        if (host === "hub") {
+          expect(write).toBeFalsy();
+          if (m.operation === "describe")
+            return more.find((l) => l.pin.sequence === m.key.sequence);
+          expect(m.operation).toBe("restore_page");
+          expect(m.links).toEqual(more);
+          if (wrong)
+            throw new Error("Pending hub member or scientific source changed");
+          if (m.needBytes) packedTransfers++;
+          return {
+            sha,
+            packed: m.needBytes ? packed.toString("base64") : null,
+            at: new Date().toISOString(),
+          };
+        }
+        expect(!!write).toBe(
+          ["stage_page", "retire_page"].includes(m.operation),
+        );
+        if (m.operation === "read_page")
+          expect(container).toBe(m.reader === "api" ? "node-api" : "sweeper");
+        if (m.operation === "stage_page" && partialStage) {
+          partialStage = false;
+          return registeredReportRequest(db, {
+            ...m,
+            links: m.links.slice(0, 1),
+          });
+        }
+        if (m.operation === "retire_page" && drop) {
+          drop = false;
+          // Even genuine recent reader confirmations cannot release a row
+          // if the locally accessible compressed file is lost or corrupt.
+          const corrupt = Buffer.from(packed);
+          corrupt[corrupt.length - 1]! ^= 1;
+          await writeFile(file, corrupt);
+          try {
+            await expect(registeredReportRequest(db, m)).rejects.toThrow(
+              "Working file changed",
+            );
+          } finally {
+            await writeFile(file, packed);
+          }
+          // Other native staging wins for the tail after the page's read proofs.
+          const tail = more[2]!.pin;
+          await db.execute(sql`INSERT INTO progressive_worker_evidence_receipts(sim_job_id,sequence,content_signature)
+            VALUES(${id}::uuid,${tail.sequence},${tail.signature})`);
+          expect(
+            await registeredReportRequest(db, {
+              ...m,
+              links: m.links.slice(0, 1),
+              api: m.api.slice(0, 1),
+              sweeper: m.sweeper.slice(0, 1),
+            }),
+          ).toEqual(["retired"]);
+          throw new HistoryOperationError("ssh", "transport", true);
+        }
+        return registeredReportRequest(db, m);
+      },
+    });
+    const oldCursor = (await checkpoint()).after;
+    await expect(
+      runRegisteredReportCli(selected, groupConnect),
+    ).rejects.toMatchObject({ retryable: true });
+    const held = await checkpoint();
+    expect(held.version).toBe(2);
+    expect(held.after).toEqual(oldCursor);
+    expect(held.group.links).toEqual(more);
+    expect(
+      await db.execute(
+        sql`SELECT FROM progressive_worker_reports WHERE sim_job_id=${id}::uuid AND sequence IN (4,5) AND archived_at IS NOT NULL`,
+      ),
+    ).toHaveLength(1);
+    const checkpointFile = join(directory, "registered-report-progress.json"),
+      saved = await readFile(checkpointFile);
+    await writeFile(
+      checkpointFile,
+      JSON.stringify({
+        ...held,
+        group: { ...held.group, checksum: "0".repeat(64) },
+      }),
+    );
+    await expect(
+      runRegisteredReportCli(selected, groupConnect),
+    ).rejects.toThrow("page checksum differs");
+    await writeFile(checkpointFile, saved);
+    wrong = true;
+    await expect(
+      runRegisteredReportCli(selected, groupConnect),
+    ).rejects.toThrow("Pending hub member");
+    expect((await checkpoint()).group).toEqual(held.group);
+    wrong = false;
+    calls.length = 0;
+    await runRegisteredReportCli(
+      selected.map((v) =>
+        v === "--bundle-members=3" ? "--bundle-members=1" : v,
+      ),
+      groupConnect,
+    );
+    expect(calls.filter((s) => s === "restore_page")).toHaveLength(1);
+    expect(calls.filter((s) => s === "stage_page")).toHaveLength(1);
+    expect(calls.filter((s) => s === "retire_page")).toHaveLength(1);
+    for (const who of ["api", "sweeper"])
+      for (const how of [true, false])
+        expect(
+          calls.filter((s) => s === `read_page/${who}/${how}`),
+        ).toHaveLength(1);
+    expect(packedTransfers).toBe(1);
+    expect((await checkpoint()).version).toBe(1);
+    expect((await checkpoint()).after).toEqual(oldCursor);
+    for (const l of more.slice(0, 2)) {
+      const receipt = JSON.parse(
+        await readFile(
+          join(directory, id + "." + l.pin.sequence + ".json"),
+          "utf8",
+        ),
+      );
+      expect(receipt.api.sha256).toBe(l.pin.reportSha256);
+      expect(receipt.sweeper.sha256).toBe(l.pin.reportSha256);
+    }
+    expect(
+      await db.execute(
+        sql`SELECT FROM progressive_worker_reports WHERE sim_job_id=${id}::uuid AND sequence=6 AND archived_at IS NULL`,
+      ),
+    ).toHaveLength(1);
+    const { withRegisteredWorkingPage } =
+      await import("../src/registered-worker-report-read");
+    await withRegisteredWorkingPage(db, more.slice(0, 2), async () => {
+      await expect(readWorkerReportArchiveText(db, link.pin)).rejects.toThrow(
+        "working page",
+      );
+      await expect(
+        readWorkerReportArchiveText(db, more[0]!.pin, { upstreamOnly: true }),
+      ).rejects.toThrow("volume");
+    });
     const corrupted = Buffer.from(packed);
     corrupted[corrupted.length - 1]! ^= 1;
     await writeFile(file, corrupted);
@@ -434,7 +632,7 @@ export async function registeredWorkerRoundtrip(f: ArchiveFixture) {
       await db.execute(
         sql`SELECT FROM progressive_worker_reports WHERE sim_job_id=${id}::uuid AND archived_at IS NOT NULL`,
       ),
-    ).toHaveLength(1);
+    ).toHaveLength(3);
     expect(
       await db.execute(
         sql`SELECT FROM progressive_worker_evidence_receipts WHERE sim_job_id=${id}::uuid AND sequence=3`,

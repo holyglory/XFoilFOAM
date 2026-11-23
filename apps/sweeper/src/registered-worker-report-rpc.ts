@@ -1,3 +1,4 @@
+import { readWorkerReportVolume } from "./worker-report-volume";
 import { isDeepStrictEqual } from "node:util";
 import {
   HistoryMessages,
@@ -17,6 +18,10 @@ import {
   originalState,
   proveRegisteredReader,
   retireRegisteredReport,
+  stageRegisteredPage,
+  readRegisteredPage,
+  retireRegisteredPage,
+  RegisteredMemberFailure,
   stageRegisteredReport,
   verifyNativeBytes,
 } from "./registered-worker-report-custody";
@@ -27,6 +32,9 @@ import {
   type SourceKey,
 } from "./registered-worker-report-hub";
 import {
+  assertRegisteredPage,
+  type HubReportLink,
+  nativeReportOwner,
   reportUuid,
   requireReportProof,
 } from "./registered-worker-report-read";
@@ -42,6 +50,7 @@ export async function registeredReaderBuild() {
     "registered-worker-report-read.ts",
     "registered-worker-report-hub.ts",
     "registered-worker-report-custody.ts",
+    "registered-worker-report-page.ts",
     "report-archive-broker-client.ts",
     "worker-report-volume.ts",
     "hz-attempt-transfer-fence.ts",
@@ -113,6 +122,34 @@ export async function registeredReportRequest(db: DB, m: Message) {
         : null,
     };
   }
+  if (m.operation === "restore_page") {
+    requireReportProof(
+      role === "hub",
+      "Expected authoritative registered report hub",
+    );
+    const links = m.links as HubReportLink[];
+    assertRegisteredPage(links);
+    for (const l of links) {
+      const actual = await hubReportLink(db, l.owner, {
+        executionId: l.pin.executionId,
+        sequence: l.pin.sequence,
+        signature: l.pin.signature,
+      });
+      requireReportProof(
+        isDeepStrictEqual(actual, l),
+        "Pending hub member or scientific source changed",
+      );
+    }
+    const bytes = await new ExistingHubReportStore(
+      String(process.env.AIRFOILFOAM_EVIDENCE_BUCKET ?? ""),
+      m.account,
+    ).restorePage(links);
+    return {
+      packed: m.needBytes === true ? bytes.toString("base64") : null,
+      at: new Date().toISOString(),
+      sha: links[0]!.pin.storedSha256,
+    };
+  }
   if (m.operation === "describe" || m.operation === "restore") {
     requireReportProof(
       role === "hub",
@@ -170,11 +207,38 @@ export async function registeredReportRequest(db: DB, m: Message) {
       { isolationLevel: "repeatable read", accessMode: "read only" },
     );
   }
+  if (m.operation === "volume_present") {
+    assertRegisteredPage(m.links);
+    const l = m.links[0] as HubReportLink;
+    requireReportProof(
+      isDeepStrictEqual(
+        await nativeReportOwner(db, l.pin.executionId),
+        l.owner,
+      ),
+      "Foreign volume hint",
+    );
+    await checkHzTransferFence(db, {
+      instance: l.owner.workerInstance,
+      solver: l.owner.solverId,
+    });
+    const stream = await readWorkerReportVolume(l.pin);
+    stream?.destroy();
+    return Boolean(stream);
+  }
+  if (m.operation === "stage_page")
+    return stageRegisteredPage(
+      db,
+      m.links,
+      m.bytes === null ? null : boundedPacked(m.bytes),
+      m.cloudAt,
+    );
+  if (m.operation === "retire_page")
+    return retireRegisteredPage(db, m.links, m.cloudAt, m.api, m.sweeper);
   if (m.operation === "stage")
     return stageRegisteredReport(db, m.link, boundedPacked(m.bytes), m.cloudAt);
   if (m.operation === "retire")
     return retireRegisteredReport(db, m.link, m.cloudAt, m.api);
-  if (m.operation === "read") {
+  if (m.operation === "read" || m.operation === "read_page") {
     if (m.reader === "api") {
       const { installApiReportArchiveReader } =
         await import("../../api/src/progressive-report-archive-reader");
@@ -185,6 +249,8 @@ export async function registeredReportRequest(db: DB, m: Message) {
         read: (i, conn) => readStoredWorkerArchiveText(conn, i),
       });
     }
+    if (m.operation === "read_page")
+      return readRegisteredPage(db, m.links, m.committed === true);
     return proveRegisteredReader(db, m.link, m.committed === true);
   }
   throw new HistoryOperationError("registered_report_rpc", "input");
@@ -193,6 +259,7 @@ export async function registeredReportRequest(db: DB, m: Message) {
 async function serve() {
   const wire = new HistoryMessages(process.stdin, process.stdout);
   const build = await registeredReaderBuild();
+  let firstRequest = true;
   for (;;) {
     let m: Message;
     try {
@@ -203,12 +270,14 @@ async function serve() {
     }
     const operation =
       typeof m.operation === "string" &&
-      /^(?:hello|scan|describe|restore|filter|key|state|stage|retire|read)$/.test(
+      /^(?:hello|scan|describe|restore|restore_page|filter|key|state|volume_present|stage|stage_page|retire|retire_page|read|read_page)$/.test(
         m.operation,
       )
         ? m.operation
         : "invalid";
-    const write = operation === "stage" || operation === "retire";
+    const write = ["stage", "retire", "stage_page", "retire_page"].includes(
+      operation,
+    );
     const c = createClient({
       max: 1,
       connection: {
@@ -224,15 +293,32 @@ async function serve() {
         m.build === build,
         "Installed registered report helper differs",
       );
+      const began = performance.now(),
+        cpu = process.cpuUsage();
       const result = await registeredReportRequest(c.db, m);
-      await wire.send({ id: m.id, result });
+      const used = process.cpuUsage(cpu);
+      const timing = {
+        ms: performance.now() - began,
+        cpuUs: used.user + used.system,
+        startupCpuUs: firstRequest ? cpu.user + cpu.system : 0,
+        peakRssKiB: process.resourceUsage().maxRSS,
+      };
+      firstRequest = false;
+      await wire.send({
+        id: m.id,
+        result: m.timing === true ? { value: result, timing } : result,
+      });
     } catch (error) {
+      const member = error instanceof RegisteredMemberFailure ? error : null;
       const failure = hzAttemptRpcFailure(
         "registered_report_" + operation,
-        error,
+        member ? member.cause : error,
       );
+      if (member && !failure.retryable)
+        failure.operation += "_seq_" + member.sequence;
       const wireFailure =
-        operation === "restore" && historyHubFailure(error, "read").retryable;
+        (operation === "restore" || operation === "restore_page") &&
+        historyHubFailure(error, "read").retryable;
       await wire.send({
         id: m.id,
         error: wireFailure

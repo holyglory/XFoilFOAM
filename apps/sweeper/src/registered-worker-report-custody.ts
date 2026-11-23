@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+import { HistoryOperationError } from "@aerodb/core/point-history-protocol";
 import type { DB } from "@aerodb/db/client";
 import {
   reportTextIdentity,
@@ -13,10 +15,16 @@ import {
   checkHzTransferFence,
 } from "./hz-attempt-transfer-fence";
 import { readStoredWorkerArchiveText } from "./report-archive-broker-client";
-import { storeWorkerReportVolume } from "./worker-report-volume";
+import {
+  readWorkerReportVolume,
+  storeWorkerReportVolume,
+} from "./worker-report-volume";
 import {
   assertReportPin,
   inspectHubReport,
+  inspectHubReportPage,
+  assertRegisteredPage,
+  withRegisteredWorkingPage,
   nativeReportOwner,
   reportUuid,
   reportHash,
@@ -198,6 +206,16 @@ export async function stageRegisteredReport(
   if (before !== "ready" && before !== "already_retired") return before;
   await inspectHubReport(packed, l);
   await storeWorkerReportVolume(Readable.from([packed]), p);
+  return registerStagedMember(db, l, cloudReadAt);
+}
+async function registerStagedMember(
+  db: DB,
+  l: HubReportLink,
+  cloudReadAt: string,
+) {
+  fresh(cloudReadAt);
+  const { pin: p, owner: o } = l;
+  const fence = { instance: o.workerInstance, solver: o.solverId };
   return withActiveHzTransfer(db, fence, async (tx) => {
     const status = await originalState(tx, l, true);
     if (status === "already_retired") {
@@ -270,6 +288,15 @@ export async function retireRegisteredReport(
     "API reader proof differs",
   );
   await proveRegisteredReader(db, l, false);
+  return commitRegisteredMember(db, l, cloudReadAt, api.at);
+}
+async function commitRegisteredMember(
+  db: DB,
+  l: HubReportLink,
+  cloudReadAt: string,
+  apiAt: string,
+) {
+  const { pin: p, owner: o } = l;
   return withActiveHzTransfer(
     db,
     { instance: o.workerInstance, solver: o.solverId },
@@ -277,7 +304,7 @@ export async function retireRegisteredReport(
       const status = await originalState(tx, l, true);
       if (status !== "ready") return status;
       fresh(cloudReadAt);
-      fresh(api.at);
+      fresh(apiAt);
       await assertBinding(tx, l);
       await tx.execute(sql`INSERT INTO progressive_report_archive_bundles(source_kind,sim_job_id,bucket,object_key,generation,mime_type,compression,
       archive_format,stored_sha256,stored_byte_size,crc32c,member_count,first_sequence,last_sequence,verified_at)
@@ -304,4 +331,160 @@ export async function retireRegisteredReport(
       return "retired" as const;
     },
   );
+}
+
+type ReaderProof = Awaited<ReturnType<typeof proveRegisteredReader>>;
+
+// Each member commits under the ordinary native owner/lease gates. Return a
+// prefix if the host's shared deployment lock needs to be released between
+// members. A subsequent call must reacquire it and recheck the same receipts.
+export class RegisteredMemberFailure extends Error {
+  constructor(
+    readonly sequence: number,
+    cause: unknown,
+  ) {
+    super("Registered member verification failed", { cause });
+  }
+}
+async function writePrefix<T>(
+  links: readonly HubReportLink[],
+  started: number,
+  write: (l: HubReportLink, index: number) => Promise<T>,
+) {
+  const statuses: T[] = [];
+  for (const [i, l] of links.entries()) {
+    if (i && performance.now() - started >= 5000) break;
+    try {
+      statuses.push(await write(l, i));
+    } catch (error) {
+      throw new RegisteredMemberFailure(l.pin.sequence, error);
+    }
+  }
+  return statuses;
+}
+export async function stageRegisteredPage(
+  db: DB,
+  links: HubReportLink[],
+  bytes: Buffer | null,
+  cloudAt: string,
+) {
+  const started = performance.now();
+  assertRegisteredPage(links);
+  links.forEach(checkLink);
+  fresh(cloudAt);
+  const first = links[0]!,
+    p = first.pin;
+  await checkHzTransferFence(db, {
+    instance: first.owner.workerInstance,
+    solver: first.owner.solverId,
+  });
+  if (bytes !== null)
+    requireReportProof(
+      bytes.byteLength === p.storedByteSize &&
+        createHash("sha256").update(bytes).digest("hex") === p.storedSha256,
+      "Registered transfer bytes differ",
+    );
+  const before = await writePrefix(links, started, (l) => originalState(db, l));
+  const admitted = links.slice(0, before.length);
+  if (
+    before.every((status) => status !== "ready" && status !== "already_retired")
+  )
+    return before;
+  const local = await readWorkerReportVolume(p);
+  if (local) {
+    await inspectHubReportPage(local, admitted);
+  } else {
+    if (bytes === null)
+      throw new HistoryOperationError(
+        "registered_volume_missing",
+        "transport",
+        true,
+      );
+    await inspectHubReportPage(Readable.from([bytes]), admitted);
+    await storeWorkerReportVolume(Readable.from([bytes]), p);
+  }
+  return writePrefix(admitted, started, (l, i) =>
+    before[i] === "ready" || before[i] === "already_retired"
+      ? registerStagedMember(db, l, cloudAt)
+      : Promise.resolve(before[i]!),
+  );
+}
+export async function readRegisteredPage(
+  db: DB,
+  links: HubReportLink[],
+  committed: boolean,
+) {
+  return withRegisteredWorkingPage(db, links, async () => {
+    const results: ReaderProof[] = [];
+    for (const l of links) {
+      try {
+        results.push(await proveRegisteredReader(db, l, committed));
+      } catch (error) {
+        throw new RegisteredMemberFailure(l.pin.sequence, error);
+      }
+    }
+    return results;
+  });
+}
+export async function retireRegisteredPage(
+  db: DB,
+  links: HubReportLink[],
+  cloudAt: string,
+  api: ReaderProof[],
+  sweeper: ReaderProof[],
+) {
+  const started = performance.now();
+  assertRegisteredPage(links);
+  links.forEach(checkLink);
+  fresh(cloudAt);
+  requireReportProof(
+    api.length === links.length && sweeper.length === links.length,
+    "Incomplete registered reader set",
+  );
+  // Reopen the physical working file inside the host write fence. Its bytes
+  // must still be the generation decoded independently by both product readers.
+  const pin = links[0]!.pin;
+  const file = await readWorkerReportVolume(pin);
+  requireReportProof(
+    file,
+    "Registered working copy disappeared before retirement",
+  );
+  let size = 0;
+  const hash = createHash("sha256");
+  try {
+    for await (const part of file) {
+      size += part.length;
+      requireReportProof(
+        size <= pin.storedByteSize,
+        "Working file exceeds pin",
+      );
+      hash.update(part);
+    }
+  } finally {
+    file.destroy();
+  }
+  requireReportProof(
+    size === pin.storedByteSize && hash.digest("hex") === pin.storedSha256,
+    "Working file changed before retirement",
+  );
+  return writePrefix(links, started, async (l, i) => {
+    for (const r of [api[i]!, sweeper[i]!]) {
+      fresh(r.at);
+      requireReportProof(
+        r.signature === l.pin.signature &&
+          r.sha256 === l.pin.reportSha256 &&
+          r.byteSize === l.pin.reportByteSize &&
+          r.generation === l.pin.generation,
+        "Registered member reader proof differs",
+      );
+    }
+    return commitRegisteredMember(
+      db,
+      l,
+      cloudAt,
+      new Date(
+        Math.min(Date.parse(api[i]!.at), Date.parse(sweeper[i]!.at)),
+      ).toISOString(),
+    );
+  });
 }
