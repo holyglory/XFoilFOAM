@@ -1,3 +1,4 @@
+import { DEFAULT_PROGRESSIVE_REPORT_READ_TIMEOUT_MS } from "@aerodb/db/progressive-report-reader";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { gzipSync, gunzipSync } from "node:zlib";
 import { createHash } from "node:crypto";
@@ -280,6 +281,31 @@ export async function readSharedReport(
   store: ReportObjects,
   id: ProgressiveReportArchiveReadIdentity,
   signal?: AbortSignal,
+) {
+  const deadline = AbortSignal.timeout(
+    DEFAULT_PROGRESSIVE_REPORT_READ_TIMEOUT_MS,
+  );
+  const bounded = signal ? AbortSignal.any([signal, deadline]) : deadline;
+  bounded.throwIfAborted();
+  let onAbort: () => void = () => {};
+  try {
+    const aborted = new Promise<never>((_, reject) => {
+      onAbort = () => reject(bounded.reason);
+      bounded.addEventListener("abort", onAbort, { once: true });
+    });
+    return await Promise.race([
+      readPinnedSharedReport(store, id, bounded),
+      aborted,
+    ]);
+  } finally {
+    bounded.removeEventListener("abort", onAbort);
+  }
+}
+
+async function readPinnedSharedReport(
+  store: ReportObjects,
+  id: ProgressiveReportArchiveReadIdentity,
+  signal: AbortSignal,
 ) {
   if (
     id.archiveFormat !== SHARED_REPORT_FORMAT ||

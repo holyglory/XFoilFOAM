@@ -407,6 +407,12 @@ export async function verifyCancelledReportCopyReplay(
         WHERE sim_job_id=${id}::uuid AND sequence=${key.sequence}`);
       expect(warmRepeat.archived_at).toBeNull();
       expect(warmRepeat.result_payload_hash).toBe(referenceHash.hash);
+      await expect(copyStoppedReportBatch(db,store,id,[key],"release",{...adapters,beforeCommit:async()=>{throw new Error("interrupted durable receipt");}}))
+        .rejects.toThrow("interrupted durable receipt");
+      const [afterAbort]=await db.execute(sql`SELECT archive_bundle_id,result_payload_hash FROM progressive_remote_reports
+        WHERE sim_job_id=${id}::uuid AND sequence=${key.sequence}`);
+      expect(afterAbort.archive_bundle_id).toBeNull();
+      expect(afterAbort.result_payload_hash).toBe(referenceHash.hash);
       const first = await copyStoppedReportBatch(db,store,id,[key],"release",adapters);
       expect(await protectedCount()).toBe(1);
       const other = await copyStoppedReportBatch(db,store,id,[second],"release",adapters);
