@@ -12,6 +12,7 @@ import {
 } from "@aerodb/db/progressive-report-archive";
 import {
   cancelledReportOwner,
+  type CancelledReportCopyPriority,
   repeatedStoppedSource,
   scientificallyReceiptedReportCopy,
 } from "./cancelled-report-copies";
@@ -151,6 +152,19 @@ export async function stoppedReportCopyKeys(
     mode: String(r.mode),
     storedBytes: Number(r.stored),
   }));
+}
+
+/** Continue from a page the ordinary writer actually committed. Starting at
+ * its first key also finds a still-warm suffix when the byte budget split it.
+ * This read never advances either of the durable source cursors. */
+export async function offerNextStoppedCopyPage(
+  db: DB,
+  executionId: string,
+  firstSequence: number,
+  priority: CancelledReportCopyPriority,
+) {
+  const keys = await stoppedReportCopyKeys(db, executionId, firstSequence - 1, 32, true);
+  priority.offer(executionId, keys.filter(k => k.mode === "ordinary"));
 }
 
 export async function copyStoppedReportBatch(
