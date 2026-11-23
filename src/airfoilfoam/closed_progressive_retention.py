@@ -276,7 +276,12 @@ def _inventory(root, proofs, readbacks, kept=None):
         if len(relative.parts) == 2 and relative.parts[0] == "cases":
             cases.add(relative)
         if folder.name == "transient" or folder.name.startswith("transient_a"):
-            solvers.add(relative)
+            # foamToVTK names time exports after the solver and time index.
+            # Only this exact layout below the authenticated solver is an export.
+            vtk_time = (solver in urans_solvers and relative.parent == solver / "VTK" and
+                        re.fullmatch(re.escape(solver.name) + r"_[0-9]+", folder.name))
+            if not vtk_time:
+                solvers.add(relative)
         for name in dirs:
             path = folder / name
             if path.is_symlink():

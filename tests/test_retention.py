@@ -1069,6 +1069,7 @@ def test_closed_progressive_exact_duplicates_require_whole_job_proof(tmp_path, m
             ("1/core.123", "time_directories/1/core.123", False),
             ("1/excluded", "time_directories/1/excluded", False),
             ("processor0/1/U", None, False),
+            ("VTK/transient_a0_302766/internal.vtu", None, False),
         ):
             source = _write(post / rel, rel.encode())
             if item:
@@ -1184,6 +1185,10 @@ def test_closed_progressive_exact_duplicates_require_whole_job_proof(tmp_path, m
         assert "symlink" in refused()
         link.unlink()
         link.symlink_to("../../1/uniform", target_is_directory=True)
+        foreign_vtk = post / "VTK/transient_a1_302766"
+        foreign_vtk.mkdir()
+        assert "unarchived case state" in refused()
+        foreign_vtk.rmdir()
         intruder = _write(case / "a0/evidence/scaled_media/default_v1_zoom2/v7/unknown.png", b"foreign image")
         assert "unknown scaled-media field" in refused()
         intruder.unlink()
