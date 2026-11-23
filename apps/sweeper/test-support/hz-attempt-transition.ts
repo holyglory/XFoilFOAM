@@ -1,3 +1,4 @@
+import { checkHzTransferFence } from "../src/hz-attempt-transfer-fence";
 import { verifyOriginalCopyJourney } from "./hz-attempt-originals-fixture";
 import { getAttemptEvidenceArchive } from "@aerodb/db/attempt-evidence-catalog";
 import { readHzAttemptWorkingCopy } from "../src/hz-attempt-volume";
@@ -329,20 +330,91 @@ export async function verifyHzAttemptTransition(
       );
     const initialInterpretation = await interpretations();
 
-    let interrupted = true;
+    const paused = {
+      operation: "worker_transfer_paused",
+      category: "transfer_paused",
+      retryable: true,
+    };
+    const setPaused = (value: boolean) =>
+      db.execute(
+        sql`UPDATE sync_api_settings SET remote_solver_transfer_paused=${value} WHERE id=1`,
+      );
+    await setPaused(true);
+    try {
+      await expect(
+        relay.worker({ operation: "replay", attemptId: id }),
+      ).rejects.toMatchObject(paused);
+      const [row] = await db.execute(
+        sql`SELECT evidence_archive_id,evidence_storage_event_id,evidence_payload::text AS original FROM result_attempts WHERE id=${id}::uuid`,
+      );
+      expect(row).toMatchObject({
+        evidence_archive_id: null,
+        evidence_storage_event_id: null,
+        original,
+      });
+    } finally {
+      await setPaused(false);
+    }
+    // A pre-fence worker reports the same sanitized replay error for two
+    // different causes. Only a current flag on the pinned worker permits a wait.
+    let fenceOnReplay = true;
+    const oldWorker: AttemptRelay = {
+      ...relay,
+      worker: async (r, write) => {
+        if (r.operation === "bound")
+          return {
+            ...(await relay.worker(r)),
+            transfer_fence_protocol: undefined,
+          };
+        if (r.operation === "replay") {
+          if (fenceOnReplay) await setPaused(true);
+          throw new HistoryOperationError("attempt_replay", "integrity");
+        }
+        return relay.worker(r, write);
+      },
+    };
+    const legacyIo = {
+      ...io,
+      relay: oldWorker,
+      checkLegacyFence: (
+        _host: string,
+        _container: string,
+        expected: { instance: string; solver: string },
+      ) => checkHzTransferFence(db, expected),
+    };
+    try {
+      await expect(
+        hzAttemptStorage(["migrate", ...config, "--id", id], legacyIo),
+      ).rejects.toMatchObject(paused);
+    } finally {
+      await setPaused(false);
+    }
+    fenceOnReplay = false;
+    await expect(
+      hzAttemptStorage(["migrate", ...config, "--id", id], legacyIo),
+    ).rejects.toMatchObject({
+      operation: "attempt_replay",
+      category: "integrity",
+      retryable: false,
+    });
+    expect(await relay.worker({ operation: "pending" })).toHaveLength(0);
+    expect(await readStoredAttemptEvidenceText(db, id)).toBe(original);
+    // A real transfer fence after SQL COMMIT must leave the same readback event pending.
     const interruptedRelay = {
       ...relay,
       api: async (r: Record<string, unknown>) => {
-        if (r.forceArchive === false && interrupted) {
-          interrupted = false;
-          throw new HistoryOperationError("deploy", "deployment_busy", true);
-        }
-        return relay.api(r);
+        const result = await relay.api(r);
+        if (r.forceArchive === false) await setPaused(true);
+        return result;
       },
     };
-    await expect(
-      migrateHzAttempt(interruptedRelay, id, instance),
-    ).rejects.toThrow("deployment_busy");
+    try {
+      await expect(
+        migrateHzAttempt(interruptedRelay, id, instance),
+      ).rejects.toMatchObject(paused);
+    } finally {
+      await setPaused(false);
+    }
     const [cold] =
       await db.execute(sql`SELECT a.evidence_archive_id::text AS archive,a.evidence_payload#>'{steady_history,cl}' AS online,ar.source_instance,ar.object_key,e.net_value_bytes_saved AS net,e.app_readback_at FROM result_attempts a
     JOIN attempt_evidence_archives ar ON ar.id=a.evidence_archive_id AND ar.result_attempt_id=a.id JOIN attempt_evidence_storage_events e ON e.id=a.evidence_storage_event_id WHERE a.id=${id}::uuid`);
@@ -371,6 +443,8 @@ export async function verifyHzAttemptTransition(
     const again = await migrateHzAttempt(relay, id, instance);
     expect(again.alreadyShortened).toBe(true);
     expect(again.netValueBytesReclaimed).toBe(0);
+    expect(again.archiveId).toBe(cold.archive);
+    expect(objects.size).toBe(1);
     expect(await relay.worker({ operation: "pending" })).toHaveLength(0);
     expect(await readStoredAttemptEvidenceText(db, id)).toBe(original);
     expect(

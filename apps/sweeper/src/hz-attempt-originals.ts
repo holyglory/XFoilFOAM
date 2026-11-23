@@ -1,3 +1,4 @@
+import { requireActiveHzTransfer } from "./hz-attempt-transfer-fence";
 import { Readable } from "node:stream";
 import { sql, type SQL } from "drizzle-orm";
 import { verifyProgressiveRemoteExecution } from "@aerodb/db/progressive-remote-execution";
@@ -54,6 +55,7 @@ export interface SourceBinding {
   instance: string;
   solver: string;
   high: string;
+  transfer_fence_protocol?: number;
 }
 export interface PriorityMatch {
   id: string;
@@ -130,6 +132,7 @@ export async function originalBinding(db: DB): Promise<SourceBinding> {
     instance: exactId(r.instance),
     solver: exactId(r.solver),
     high: exactId(r.high ?? ZERO_ID),
+    transfer_fence_protocol: 1,
   };
 }
 /** HZ proves the producing job, worker registration and immutable submission.
@@ -153,7 +156,7 @@ function workerOwners(
      AND j.simulation_preset_revision_id=a.simulation_preset_revision_id AND j.bc_ids ? a.bc_id::text
    WHERE a.result_id IS NULL OR EXISTS(SELECT FROM results r WHERE r.id=a.result_id AND r.airfoil_id=a.airfoil_id
      AND r.aoa_deg=a.aoa_deg AND r.simulation_preset_revision_id=a.simulation_preset_revision_id))
- SELECT n.id,n.job,pr.id AS promise,intent.assignment_signature AS signature
+ SELECT n.id,n.job,pr.id AS promise,intent.assignment_signature AS signature,cfg.remote_solver_transfer_paused AS paused
    ${full ? sql`,n.envelope` : sql``}
  FROM native n JOIN sync_api_settings cfg ON cfg.id=1 AND cfg.instance_id::text=${b.instance}
    AND cfg.remote_solver_registered_id=${b.solver}::uuid AND n.upstream=cfg.upstream_base_url
@@ -186,6 +189,7 @@ async function checkWorkerOwner(
     executionId: String(owner.job),
     contentSignature: String(owner.signature),
   });
+  requireActiveHzTransfer(owner.paused);
 }
 
 export async function inspectOriginals(

@@ -113,8 +113,8 @@ class Relay:
             raise RelayError("integrity")
         if "error" in reply:
             err=reply["error"]
-            raise RelayError(err["category"] if err.get("category") in {"transport","deployment_busy","integrity","input","denied","local_io"} else "integrity",
-                             err.get("retryable") is True and err.get("category") in {"transport","deployment_busy"})
+            raise RelayError(err["category"] if err.get("category") in {"transport","deployment_busy","transfer_paused","database_busy","integrity","input","denied","local_io"} else "integrity",
+                             err.get("retryable") is True and err.get("category") in {"transport","deployment_busy","transfer_paused","database_busy"})
         return reply["result"]
 
 def summary(db):
@@ -274,7 +274,21 @@ def main(argv=None,relay_factory=Relay):
     with state(args.directory) as db:
         relay=relay_factory(args)
         try:
-            b=relay.send("bound");sig=digest_file(db,args.scope) if args.scope else None
+            backoff=1
+            while not stopping:
+                try:
+                    b=relay.send("bound")
+                    break
+                except RelayError as e:
+                    if not e.retryable or not args.until_complete:raise
+                    if backoff==1:print(json_text({"waiting":True,"operation":"bound","category":e.category}),file=sys.stderr,flush=True)
+                    relay.close()
+                    for _ in range(backoff*4):
+                        if stopping:return
+                        time.sleep(0.25)
+                    backoff=min(30,backoff*2)
+            else:return
+            sig=digest_file(db,args.scope) if args.scope else None
             bind(db,args,b,sig)
             # A fixed file never admits a new identity. An unscoped watch
             # revisits random UUIDs behind its high-water mark after its drain.
@@ -303,6 +317,7 @@ def main(argv=None,relay_factory=Relay):
                     if not more and (args.mode!="cycle" or not scan):break
                 except RelayError as e:
                     if not e.retryable or not args.until_complete:raise
+                    if backoff==1:print(json_text({"waiting":True,"operation":"original_page","category":e.category}),file=sys.stderr,flush=True)
                     relay.close()
                     for _ in range(backoff*4):
                         if stopping or (deadline and time.monotonic()>=deadline):break

@@ -1,3 +1,10 @@
+import { HistoryOperationError } from "@aerodb/core/point-history-protocol";
+import {
+  checkHzTransferFence,
+  withActiveHzTransfer,
+  type HzWorkerOwner,
+} from "./hz-attempt-transfer-fence";
+import { ProgressiveWorkerTransferPaused } from "./progressive-worker-outbox-replay";
 import { replayProgressiveWorkerOutbox } from "./progressive-worker-outbox-replay";
 import {
   loadAttemptSourcePins,
@@ -188,6 +195,8 @@ export async function stageHzEnvelope(
   db: DB,
   identity: AttemptEvidenceArchiveIdentity,
   bytes: Buffer,
+  expected?: HzWorkerOwner,
+  enable?: { retained: boolean },
 ) {
   const original = await retainHzAttemptVolume(db, identity, bytes);
   const stored = await getAttemptEvidenceStorage(db, identity.attemptId);
@@ -198,13 +207,13 @@ export async function stageHzEnvelope(
   }
   if (stored.inlinePayloadText !== original.payloadText)
     throw Error("Fresh GCS generation differs from HZ SQL");
-  const result = await registerAttemptEvidenceArchive(
-    db,
-    identity,
-    prepareAttemptEvidenceCopy(original),
-  );
-  sameArchive(result.archive, identity);
-  return result.archive;
+  const plan = prepareAttemptEvidenceCopy(original);
+  return withActiveHzTransfer(db, expected, async (tx) => {
+    const result = await registerAttemptEvidenceArchive(tx, identity, plan);
+    sameArchive(result.archive, identity);
+    if (enable) await enableHzCustody(tx, enable.retained);
+    return result.archive;
+  });
 }
 export async function hzScience(db: DB, id: string, archiveId: string) {
   const archive = await getAttemptEvidenceArchive(db, archiveId);
@@ -270,7 +279,15 @@ export async function verifyHzOutboxReplay(db: DB, id: string) {
       ],
     },
     { apply: false },
-  );
+  ).catch((error) => {
+    if (error instanceof ProgressiveWorkerTransferPaused)
+      throw new HistoryOperationError(
+        "worker_transfer_paused",
+        "transfer_paused",
+        true,
+      );
+    throw error;
+  });
   if (
     preview.points.length !== 1 ||
     preview.points[0]?.outcome !== "already_delivered"
@@ -283,6 +300,7 @@ export async function confirmHzAttempt(
   id: string,
   eventId: string,
   app: Omit<AttemptEvidenceAppReadback, "payloadText">,
+  expected?: HzWorkerOwner,
 ) {
   const stored = await getAttemptEvidenceStorage(db, id);
   if (
@@ -342,6 +360,7 @@ export async function confirmHzAttempt(
       await tx.execute(sql`SET TRANSACTION ISOLATION LEVEL REPEATABLE READ`);
       await tx.execute(sql`SET LOCAL statement_timeout='8s'`);
       await tx.execute(sql`SET LOCAL lock_timeout='1s'`);
+      await checkHzTransferFence(tx, expected, true);
       await tx.execute(sql`SELECT attempt_evidence_lock_source(${id}::uuid)`);
       const [selection] = await tx.execute(
         sql`SELECT attempt_evidence_hz_selection_sha256(${id}::uuid) AS sha`,
@@ -363,10 +382,12 @@ export async function confirmHzAttempt(
     });
     return;
   }
-  await confirmAttemptEvidenceReadback(db, eventId, {
-    ...app,
-    payloadText: text,
-  });
+  await withActiveHzTransfer(db, expected, (tx) =>
+    confirmAttemptEvidenceReadback(tx, eventId, {
+      ...app,
+      payloadText: text,
+    }),
+  );
 }
 export async function restoreHzAttempt(
   db: DB,

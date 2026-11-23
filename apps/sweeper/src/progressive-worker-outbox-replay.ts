@@ -22,6 +22,7 @@ const SCOPE_CLOSED =
   /^(?:Progressive evidence|Stopped progressive storage) delivery failed \(409\): progressive_scope_closed(?: |$)/;
 
 export class ProgressiveWorkerOutboxReplayRefused extends Error {}
+export class ProgressiveWorkerTransferPaused extends ProgressiveWorkerOutboxReplayRefused {}
 
 export interface ProgressiveWorkerOutboxReplayPoint {
   pointContentSignature: string;
@@ -160,7 +161,7 @@ export async function replayProgressiveWorkerOutbox(
     await connection.execute(sql`SET LOCAL lock_timeout = '2s'`);
     await connection.execute(sql`SET LOCAL statement_timeout = '10s'`);
     const [owner] = await connection.execute(sql`
-      SELECT settings.remote_solver_registered_id, settings.upstream_base_url,
+      SELECT settings.remote_solver_registered_id, settings.upstream_base_url, settings.remote_solver_transfer_paused AS paused,
         job.request_payload, job.airfoil_id, job.bc_ids, job.simulation_preset_revision_id,
         job.engine_job_id, promise.id AS promise_id, intent.assignment_signature,
         intent.authorization,
@@ -177,7 +178,6 @@ export async function replayProgressiveWorkerOutbox(
         AND promise.simulation_preset_revision_id = job.simulation_preset_revision_id
       JOIN progressive_worker_submission_intents intent ON intent.sim_job_id = job.id
       WHERE settings.id = 1 AND settings.remote_solver_enabled
-        AND NOT settings.remote_solver_transfer_paused
         AND btrim(settings.remote_solver_auth_token) <> ''
         AND job.request_payload->>'remoteSolver' = 'true'
         AND job.request_payload->>'upstreamBaseUrl' = settings.upstream_base_url
@@ -233,6 +233,11 @@ export async function replayProgressiveWorkerOutbox(
       throw new ProgressiveWorkerOutboxReplayRefused(
         "Replay request differs from its immutable submission authorization",
       );
+
+    if (owner.paused === true)
+      throw new ProgressiveWorkerTransferPaused("Worker transfers are paused");
+    if (owner.paused !== false)
+      throw new ProgressiveWorkerOutboxReplayRefused("Worker transfer state unavailable");
 
     const points: (ProgressiveWorkerOutboxReplayPoint & {
       outcome: "would_requeue" | "requeued" | "already_delivered";

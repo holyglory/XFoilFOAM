@@ -9,6 +9,7 @@ export class HistoryOperationError extends Error {
       | "transport"
       | "denied"
       | "integrity"
+      | "transfer_paused"
       | "deployment_busy"
       | "database_busy"
       | "input"

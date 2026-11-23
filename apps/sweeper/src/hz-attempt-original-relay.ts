@@ -1,3 +1,4 @@
+import { checkLegacyHzFence } from "./hz-attempt-controller-fence";
 import { pathToFileURL } from "node:url";
 import { readFile } from "node:fs/promises";
 import {
@@ -193,6 +194,7 @@ async function main() {
       );
     },
   };
+  let binding: SourceBinding | undefined;
   try {
     for (;;) {
       let req;
@@ -204,8 +206,23 @@ async function main() {
       }
       try {
         let result;
+        if (
+          (req.operation === "upload" || req.operation === "register") &&
+          cfg.apply &&
+          req.binding
+        ) {
+          binding ??= await relay.worker({ operation: "bound" });
+          if (
+            !binding ||
+            binding.instance !== req.binding.instance ||
+            binding.solver !== req.binding.solver
+          )
+            throw new HistoryOperationError("worker_registration", "denied");
+          if (binding.transfer_fence_protocol !== 1)
+            await checkLegacyHzFence(cfg.hzHost, cfg.hzContainer, binding);
+        }
         if (req.operation === "bound")
-          result = await relay.worker({ operation: "bound" });
+          result = binding = await relay.worker({ operation: "bound" });
         else if (req.operation === "inventory")
           result = await inventoryOriginalPage(
             relay,
