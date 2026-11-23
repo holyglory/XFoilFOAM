@@ -143,7 +143,7 @@ const SERIES: Readonly<Record<string, readonly string[]>> = {
  * This also works when the audit runs before installation of the 0207 catalog. */
 export function attemptHistorySizesSql(payload: SQL): SQL {
   const paths = Object.entries(SERIES).flatMap(([parent, children]) =>
-    children.map(child => sql`(ARRAY[${parent}, ${child}]::text[])`),
+    children.map((child) => sql`(ARRAY[${parent}, ${child}]::text[])`),
   );
   return sql`SELECT coalesce(sum(octet_length(channel.value::text)),0)::bigint AS history_bytes,
     coalesce(bool_or(jsonb_array_length(channel.value)>0),false) AS has_samples
@@ -226,6 +226,62 @@ export function prepareAttemptEvidenceCopy(
     historySeries,
     inlineRequired: ATTEMPT_EVIDENCE_INLINE_REQUIRED,
   };
+}
+
+export interface HubAttemptVersionPin {
+  attemptId: string;
+  resultId: string;
+  simJobId: string;
+  engineJobId: string;
+  sourceSha256: string;
+  sourceByteSize: number;
+}
+
+/** Upstream dispatches and imported receipt owners belong to the registered worker path. */
+export function withoutRemoteAttemptOwner(attemptId: SQL, jobId: SQL) {
+  return sql`NOT EXISTS(SELECT FROM progressive_remote_dispatches d WHERE d.sim_job_id=${jobId})
+    AND NOT EXISTS(SELECT FROM progressive_remote_evidence_receipts r WHERE r.result_attempt_id=${attemptId})`;
+}
+
+/** A copy of a produced point version may outlive its job's next enrichment.
+ * This path has no catalog registration, working pointer or settlement authority. */
+export async function readHubAttemptVersion(db: DB, pin: HubAttemptVersionPin) {
+  if (
+    ![pin.attemptId, pin.resultId, pin.simJobId].every((id) => UUID.test(id)) ||
+    !pin.engineJobId ||
+    !/^[a-f0-9]{64}$/.test(pin.sourceSha256) ||
+    !Number.isSafeInteger(pin.sourceByteSize) ||
+    pin.sourceByteSize < 1 ||
+    pin.sourceByteSize > MAX_ATTEMPT_EVIDENCE_BYTES
+  )
+    throw new Error("Invalid hub attempt version identity");
+  const source = await db.transaction(async (tx) => {
+    await tx.execute(sql`SET TRANSACTION READ ONLY`);
+    await tx.execute(sql`SET LOCAL statement_timeout='5s'`);
+    await tx.execute(sql`SET LOCAL lock_timeout='500ms'`);
+    const [row] =
+      await tx.execute(sql`SELECT a.id AS "attemptId",a.result_id AS "resultId",a.sim_job_id AS "simJobId",
+      CASE WHEN octet_length(a.evidence_payload::text)=${pin.sourceByteSize} THEN a.evidence_payload::text END AS "payloadText"
+      FROM result_attempts a JOIN sim_jobs job ON job.id=a.sim_job_id
+      WHERE a.id=${pin.attemptId}::uuid AND a.result_id=${pin.resultId}::uuid AND a.sim_job_id=${pin.simJobId}::uuid
+      AND a.evidence_archive_id IS NULL AND jsonb_typeof(a.evidence_payload)='object'
+      AND pg_column_size(a.evidence_payload)<=${MAX_ATTEMPT_EVIDENCE_BYTES} AND a.status IN ('done','failed')
+      AND a.engine_job_id=${pin.engineJobId} AND job.engine_job_id=a.engine_job_id
+      AND ${withoutRemoteAttemptOwner(sql`a.id`, sql`a.sim_job_id`)}`);
+    if (!row || typeof row.payloadText !== "string") return;
+    return {
+      attemptId: pin.attemptId,
+      resultId: pin.resultId,
+      simJobId: pin.simJobId,
+      payloadText: row.payloadText,
+    };
+  });
+  if (
+    !source ||
+    reportTextIdentity(source.payloadText).sha256 !== pin.sourceSha256
+  )
+    throw new Error("Hub attempt version or producer changed before capture");
+  return source;
 }
 
 /** Read-only preparation for a future copy. Active/missing owners and oversized

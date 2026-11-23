@@ -4,6 +4,8 @@ import {
   MAX_ATTEMPT_EVIDENCE_BYTES,
   attemptHistorySizesSql,
   hasAttemptEvidenceStoragePointer,
+  type HubAttemptVersionPin,
+  withoutRemoteAttemptOwner,
   type AttemptEvidenceCopyPlan,
   type AttemptEvidenceCopySource,
 } from "./attempt-evidence-storage";
@@ -161,6 +163,7 @@ export function attemptEvidenceArchiveCandidatesSql(
   after: string | null = null,
   sourceInstance?: string,
   readThroughReady = false,
+  includeHubVersions = false,
 ): SQL {
   if (after !== null && !UUID.test(after))
     throw new Error("Invalid attempt evidence archive cursor");
@@ -169,6 +172,12 @@ export function attemptEvidenceArchiveCandidatesSql(
     ${readThroughReady ? sql`AND evidence_archive_id IS NULL` : sql``} ORDER BY id LIMIT 32),
     sources AS MATERIALIZED (
       SELECT a.id,a.result_id,a.sim_job_id,
+        ${
+          includeHubVersions
+            ? sql`CASE WHEN a.status IN ('done','failed') AND a.result_id IS NOT NULL AND a.engine_job_id=job.engine_job_id
+          THEN nullif(a.engine_job_id,'') END AS local_engine,`
+            : sql``
+        }
         (a.status IN ('done','failed') AND (a.sim_job_id IS NULL OR (job.id IS NOT NULL AND job.status IN ('done','failed','cancelled')
           AND job."ingestedAt" IS NOT NULL AND (job.ingest_lease_token IS NULL OR coalesce(job.ingest_lease_expires_at<=clock_timestamp(),false))))) AS settled,
         CASE WHEN pg_column_size(a.evidence_payload)<=${MAX_ATTEMPT_EVIDENCE_BYTES} THEN a.evidence_payload END AS payload
@@ -182,6 +191,15 @@ export function attemptEvidenceArchiveCandidatesSql(
           ${sourceInstance ? sql`AND archive.source_instance=${sourceInstance}` : sql``}
           AND archive.source_sha256=encode(sha256(convert_to(payload::text,'UTF8')),'hex') AND archive.source_byte_size=byte_size
           AND archive.result_id IS NOT DISTINCT FROM measured.result_id AND archive.sim_job_id IS NOT DISTINCT FROM measured.sim_job_id)) AS eligible
+      ${
+        includeHubVersions
+          ? sql`,CASE WHEN NOT settled AND local_engine IS NOT NULL AND has_samples AND byte_size BETWEEN 1 AND ${MAX_ATTEMPT_EVIDENCE_BYTES}
+          AND ${withoutRemoteAttemptOwner(sql`measured.id`, sql`measured.sim_job_id`)}
+          THEN jsonb_build_object('attemptId',id,'resultId',result_id,'simJobId',sim_job_id,'engineJobId',local_engine,
+            'sourceSha256',encode(sha256(convert_to(payload::text,'UTF8')),'hex'),'sourceByteSize',byte_size)
+          END AS source_version`
+          : sql``
+      }
     FROM measured ORDER BY id`;
 }
 
@@ -189,6 +207,7 @@ export async function attemptEvidenceArchiveCandidates(
   db: DB,
   after: string | null,
   sourceInstance: string,
+  includeHubVersions = false,
 ) {
   return db.transaction(async (tx) => {
     await tx.execute(sql`SET TRANSACTION READ ONLY`);
@@ -198,13 +217,19 @@ export async function attemptEvidenceArchiveCandidates(
       tx as unknown as DB,
     );
     return tx.execute(
-      attemptEvidenceArchiveCandidatesSql(after, sourceInstance, hasPointer),
+      attemptEvidenceArchiveCandidatesSql(
+        after,
+        sourceInstance,
+        hasPointer,
+        includeHubVersions && hasPointer,
+      ),
     ) as unknown as Promise<
       Array<{
         id: string;
         byte_size: number | null;
         history_bytes: string;
         eligible: boolean | null;
+        source_version?: HubAttemptVersionPin | null;
       }>
     >;
   });

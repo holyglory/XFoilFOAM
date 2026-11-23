@@ -152,6 +152,23 @@ Inspect failures and the use audit to determine remaining copies; scan exhaustio
 alone does not establish complete custody. Existing archives and source rows are
 never deleted by these commands.
 
+## Completed local points in an open hub job
+
+The ordinary hub archive service also saves an immutable source version when a
+local engine has produced a completed or failed point and the job is still
+open. The attempt and job must name the same engine execution. Remote dispatches
+and imported point receipts stay with their registered worker. The service uses
+the same bounded scan, exact PostgreSQL text, content-addressed object and
+generation-pinned verification as a settled copy.
+
+Each entry in the service's `versions` output records the attempt, result, job,
+source hash and verified GCS generation. An enrichment can produce another
+version. Both originals remain recoverable. The live evidence stays inline and
+the normal application continues reading it. On settlement the existing
+registration path checks the current owner and exact bytes again and can adopt
+the same object. Settlement alone decides whether an online history can be
+shortened.
+
 ## Verification
 
 The focused suites are `test/attempt-evidence-archive.test.ts` and

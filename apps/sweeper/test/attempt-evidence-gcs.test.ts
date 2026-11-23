@@ -27,15 +27,17 @@ class MemoryGcs {
   objects = new Map<string, { bytes: Buffer; metadata: Record<string, any> }>();
   requests: Array<{ kind: string; generation: unknown }> = [];
   uploads = 0;
+  uploadAttempts: string[] = [];
   failRead = false;
   lateError = false;
-  afterUpload: (() => Promise<void>) | undefined;
+  afterUpload: ((key: string) => Promise<void>) | undefined;
   bucket(bucket: string) {
     return {
       upload: async (path: string, options: Record<string, any>) => {
         expect(options.preconditionOpts).toEqual({ ifGenerationMatch: 0 });
         expect(options.validation).toBe("crc32c");
         const key = `${bucket}/${options.destination}`;
+        this.uploadAttempts.push(key);
         if (this.objects.has(key))
           throw Object.assign(new Error("exists"), { code: 412 });
         const bytes = await readFile(path),
@@ -51,7 +53,7 @@ class MemoryGcs {
             crc32c: crc.toString(),
           },
         });
-        if (this.afterUpload) await this.afterUpload();
+        if (this.afterUpload) await this.afterUpload(key);
       },
       file: (key: string, options?: { generation: string }) => {
         const interceptors: File["interceptors"] = [];
@@ -434,17 +436,157 @@ describe("settled attempt GCS retention and immutable SQL receipts", () => {
     expect(memory.uploads).toBe(1);
     let after = result.next;
     while (after !== null) {
-      const page = await runAttemptEvidenceArchivePass(db, memoryStore(memory), {
-        bucket: "fixture", sourceInstance: "hub", after, maxRows: 2,
-      });
+      const page = await runAttemptEvidenceArchivePass(
+        db,
+        memoryStore(memory),
+        {
+          bucket: "fixture",
+          sourceInstance: "hub",
+          after,
+          maxRows: 2,
+        },
+      );
       expect(page.failures).toEqual([]);
       after = page.next;
     }
-    const records = await db.execute(sql`SELECT id,result_attempt_id FROM attempt_evidence_archives
+    const records =
+      await db.execute(sql`SELECT id,result_attempt_id FROM attempt_evidence_archives
       WHERE result_attempt_id IN (${small.attemptId}::uuid,${empty.attemptId}::uuid,${active.attemptId}::uuid)`);
-    expect(records.map(row => row.result_attempt_id)).toEqual([small.attemptId]);
-    const restored = await memoryStore(memory).read(await getAttemptEvidenceArchive(db, String(records[0]!.id)));
+    expect(records.map((row) => row.result_attempt_id)).toEqual([
+      small.attemptId,
+    ]);
+    const restored = await memoryStore(memory).read(
+      await getAttemptEvidenceArchive(db, String(records[0]!.id)),
+    );
     expect(restored.payloadText).toBe(before.text);
     expect(await onlinePoint(small.attemptId)).toEqual(before);
+  });
+  it("captures exact local point versions while the job runs and adopts the unchanged generation on settlement", async () => {
+    // Keep the 0207-only checks above on their original schema. The live
+    // version path also requires the actual storage-pointer column.
+    await db.execute(
+      sql`ALTER TABLE result_attempts ADD COLUMN evidence_archive_id uuid, ADD COLUMN engine_job_id text`,
+    );
+    await db.execute(sql`ALTER TABLE sim_jobs ADD COLUMN engine_job_id text`);
+    await db.execute(
+      sql`CREATE TABLE progressive_remote_dispatches (sim_job_id uuid PRIMARY KEY)`,
+    );
+    await db.execute(
+      sql`CREATE TABLE progressive_remote_evidence_receipts (result_attempt_id uuid UNIQUE)`,
+    );
+    const ids = await seed({ active: true, sampleCount: 2 });
+    const dispatched = await seed({ active: true, sampleCount: 2 });
+    const imported = await seed({ active: true, sampleCount: 2 });
+    const differentEngine = await seed({ active: true, sampleCount: 2 });
+    for (const owner of [ids, dispatched, imported, differentEngine]) {
+      await db.execute(
+        sql`UPDATE sim_jobs SET engine_job_id=${owner.simJobId} WHERE id=${owner.simJobId}::uuid`,
+      );
+      await db.execute(
+        sql`UPDATE result_attempts SET status='failed',engine_job_id=${owner.simJobId} WHERE id=${owner.attemptId}::uuid`,
+      );
+    }
+    await db.execute(
+      sql`UPDATE result_attempts SET engine_job_id=${randomUUID()} WHERE id=${differentEngine.attemptId}::uuid`,
+    );
+    await db.execute(
+      sql`INSERT INTO progressive_remote_dispatches VALUES(${dispatched.simJobId}::uuid)`,
+    );
+    await db.execute(
+      sql`INSERT INTO progressive_remote_evidence_receipts VALUES(${imported.attemptId}::uuid)`,
+    );
+    const state = async () => {
+      const [row] =
+        await db.execute(sql`SELECT a.evidence_payload::text AS original,a.status,a.evidence_archive_id pointer,
+        r.current_result_attempt_id selected,(SELECT count(*)::int FROM attempt_evidence_archives ar WHERE ar.result_attempt_id=a.id) registered
+        FROM result_attempts a JOIN results r ON r.id=a.result_id WHERE a.id=${ids.attemptId}::uuid`);
+      return row!;
+    };
+    const memory = new MemoryGcs(),
+      store = memoryStore(memory);
+    const scan = async (verifiedVersions: Map<string, string>) => {
+      let after: string | null = null;
+      const versions = [];
+      do {
+        const pass = await runAttemptEvidenceArchivePass(db, store, {
+          bucket: "fixture",
+          sourceInstance: "hub",
+          after,
+          maxRows: 2,
+          verifiedVersions,
+        });
+        expect(pass.failures).toEqual([]);
+        expect(pass.onlineBytesRemoved).toBe(0);
+        versions.push(...pass.versions);
+        after = pass.next;
+      } while (after !== null);
+      return versions;
+    };
+    const before = await state();
+    expect(before).toMatchObject({
+      status: "failed",
+      pointer: null,
+      selected: null,
+      registered: 0,
+    });
+    const cache = new Map<string, string>();
+    const [first, ...others] = await scan(cache);
+    expect(others).toEqual([]);
+    expect(first!.attemptId).toBe(ids.attemptId);
+    expect((await store.read(first!)).payloadText).toBe(before.original);
+    expect(await state()).toEqual(before);
+    await expect(
+      loadSettledAttemptEvidenceCopy(db, ids.attemptId),
+    ).rejects.toThrow("active");
+    expect(await scan(cache)).toEqual([]);
+    const forOwner = () =>
+      memory.uploadAttempts.filter((k) =>
+        k.includes("/" + ids.attemptId + "/"),
+      );
+    expect(forOwner()).toHaveLength(1);
+    const replay = await scan(new Map());
+    expect(replay[0]).toMatchObject({
+      attemptId: ids.attemptId,
+      generation: first!.generation,
+      storedSha256: first!.storedSha256,
+    });
+    expect(forOwner()).toHaveLength(1);
+    await db.execute(
+      sql`UPDATE result_attempts SET evidence_payload=jsonb_set(evidence_payload,'{force_history,t}','[0,0.3,0.5]'::jsonb) WHERE id=${ids.attemptId}::uuid`,
+    );
+    const changed = await state();
+    memory.afterUpload = async (key) => {
+      if (key.includes("/" + ids.attemptId + "/"))
+        await db.execute(
+          sql`UPDATE result_attempts SET evidence_payload=jsonb_set(evidence_payload,'{force_history,t}','[0,0.3,0.5,1]'::jsonb) WHERE id=${ids.attemptId}::uuid`,
+        );
+    };
+    const [second] = await scan(cache);
+    expect((await store.read(second!)).payloadText).toBe(changed.original);
+    memory.afterUpload = undefined;
+    const final = await state();
+    const [third] = await scan(cache);
+    expect((await store.read(third!)).payloadText).toBe(final.original);
+    expect(
+      new Set([first!.objectKey, second!.objectKey, third!.objectKey]).size,
+    ).toBe(3);
+    expect(forOwner()).toHaveLength(3);
+    await db.execute(
+      sql`UPDATE sim_jobs SET status='failed',"ingestedAt"=now() WHERE id=${ids.simJobId}::uuid`,
+    );
+    await scan(new Map());
+    expect(forOwner()).toHaveLength(3);
+    const [registered] = await db.execute(
+      sql`SELECT id FROM attempt_evidence_archives WHERE result_attempt_id=${ids.attemptId}::uuid`,
+    );
+    const sealed = await getAttemptEvidenceArchive(db, String(registered!.id));
+    expect(sealed).toMatchObject({
+      generation: third!.generation,
+      objectKey: third!.objectKey,
+      sourceSha256: third!.sourceSha256,
+    });
+    expect((await store.read(sealed)).payloadText).toBe(final.original);
+    expect(await state()).toEqual({ ...final, registered: 1 });
+    expect((await store.read(first!)).payloadText).toBe(before.original);
   });
 });

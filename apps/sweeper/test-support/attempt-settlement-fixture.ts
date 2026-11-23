@@ -75,7 +75,7 @@ export class SettlementGcs {
             !entry ||
             (options && request.qs.generation !== entry.metadata.generation)
           )
-            throw new Error("Archive fixture exact generation is missing");
+            throw Object.assign(new Error("Archive fixture exact generation is missing"), { code: 404 });
           if (options) this.pinned.push(String(request.qs.generation));
           return entry;
         };

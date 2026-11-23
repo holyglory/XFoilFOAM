@@ -51,34 +51,43 @@ export class AttemptEvidenceStore implements AttemptEvidenceArchiveStore {
       );
     const objectKey = `attempt-evidence/v1/${options.sourceInstance}/${proof.attemptId}/${proof.sourceSha256}/${proof.storedSha256}.json.gz`;
     const bucket = this.storage.bucket(options.bucket);
+    const file = bucket.file(objectKey);
+    // An open-job snapshot or a lost registration response can leave this exact
+    // immutable object available before a settled SQL receipt exists.
+    let metadata;
     try {
-      await bucket.upload(path, {
-        destination: objectKey,
-        resumable: true,
-        validation: "crc32c",
-        preconditionOpts: { ifGenerationMatch: 0 },
-        metadata: {
-          contentType: "application/gzip",
-          cacheControl: "private, max-age=31536000, immutable",
-          metadata: {
-            format: "attempt-evidence-copy-v1",
-            sha256: proof.storedSha256,
-            byteSize: String(proof.storedByteSize),
-            sourceInstance: options.sourceInstance,
-            attemptId: proof.attemptId,
-            resultId: proof.resultId ?? "",
-            simJobId: proof.simJobId ?? "",
-            sourceSha256: proof.sourceSha256,
-            sourceByteSize: String(proof.sourceByteSize),
-            envelopeSha256: proof.envelopeSha256,
-            envelopeByteSize: String(proof.envelopeByteSize),
-          },
-        },
-      });
+      [metadata] = await file.getMetadata();
     } catch (error) {
-      if (Number((error as { code?: unknown })?.code) !== 412) throw error;
+      if (Number((error as { code?: unknown }).code) !== 404) throw error;
+      try {
+        await bucket.upload(path, {
+          destination: objectKey,
+          resumable: true,
+          validation: "crc32c",
+          preconditionOpts: { ifGenerationMatch: 0 },
+          metadata: {
+            contentType: "application/gzip",
+            cacheControl: "private, max-age=31536000, immutable",
+            metadata: {
+              format: "attempt-evidence-copy-v1",
+              sha256: proof.storedSha256,
+              byteSize: String(proof.storedByteSize),
+              sourceInstance: options.sourceInstance,
+              attemptId: proof.attemptId,
+              resultId: proof.resultId ?? "",
+              simJobId: proof.simJobId ?? "",
+              sourceSha256: proof.sourceSha256,
+              sourceByteSize: String(proof.sourceByteSize),
+              envelopeSha256: proof.envelopeSha256,
+              envelopeByteSize: String(proof.envelopeByteSize),
+            },
+          },
+        });
+      } catch (error) {
+        if (Number((error as { code?: unknown })?.code) !== 412) throw error;
+      }
+      [metadata] = await file.getMetadata();
     }
-    const [metadata] = await bucket.file(objectKey).getMetadata();
     const identity: AttemptEvidenceArchiveIdentity = {
       ...proof,
       bucket: options.bucket,
