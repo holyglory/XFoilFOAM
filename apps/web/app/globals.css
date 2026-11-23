@@ -736,7 +736,10 @@ button.campaign-instrument-exception-action:focus-visible {
 
   .campaign-progress-gauge {
     width: min(390px, 100%);
-    min-height: 222px;
+    max-width: 100%;
+    min-width: 0;
+    height: 222px;
+    aspect-ratio: auto;
   }
 
   .campaign-instrument-stage-rail {

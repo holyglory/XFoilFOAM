@@ -14,8 +14,17 @@ try {
   const campaign = `/api/admin/campaigns/${pair.campaignId}`;
   const exact = `/api/admin/point-history/${pair.resultId}/sim?resultAttemptId=`;
   assert.equal((await api.get(exact + pair.fastAttemptId)).status(), 401);
+  const url = `/admin?campaign=${pair.campaignId}`;
+  const anonShell = await api.get(url, { headers: { accept: "text/html" } });
+  assert.equal(anonShell.status(), 200);
+  const html = await anonShell.text();
+  assert(!html.includes(pair.fastAttemptId) && !html.includes("catalog-qa@example.invalid"));
   const password = await readFile(`.codex-artifacts/catalog-page-auth/${generation}/password`, "utf8");
   assert.equal((await api.post("/api/admin/login", { data: { email: "catalog-qa@example.invalid", password } })).status(), 200);
+  const authenticatedShell = await api.get(url, { headers: { accept: "text/html" } });
+  assert.equal(authenticatedShell.status(), 200);
+  assert.equal(await authenticatedShell.text(), html);
+  assert.match(authenticatedShell.headers()["cache-control"], /no-store/);
   async function get(route) {
     const res = await api.get(route);
     assert.equal(res.status(), 200, route);

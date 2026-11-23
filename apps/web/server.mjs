@@ -24,6 +24,25 @@ if (!/^[a-f0-9]{64}$/.test(buildId))
   throw new Error("Missing the compiled web source identity.");
 const handle = app.getRequestHandler();
 const compress = promisify(gzip);
+const dist = process.env.NEXT_DIST_DIR ?? ".next";
+const campaignRoute = "/admin-page/campaign";
+// Only the compiled, identity-free document can use this path. Its client
+// fetches the current admin and campaign through the usual protected API.
+// If the route ever becomes dynamic, let Next render the request normally.
+let campaignDocument;
+try {
+  const manifest = JSON.parse(
+    readFileSync(join(dist, "prerender-manifest.json"), "utf8"),
+  );
+  if (manifest.routes?.[campaignRoute]?.initialRevalidateSeconds === false) {
+    const body = readFileSync(
+      join(dist, "server", "app", "admin-page", "campaign.html"),
+    );
+    campaignDocument = { body, gzip: await compress(body) };
+  }
+} catch (error) {
+  if (error.code !== "ENOENT") throw error;
+}
 const refreshId = randomUUID();
 const freshMs = 5_000;
 const maxAgeMs = 60_000;
@@ -128,12 +147,9 @@ function acceptedEncoding(value = "") {
 async function serve(req, res) {
   res.setHeader("x-ui-source-revision", buildId);
   const h = req.headers;
-  const ordinary =
-    req.url === "/" &&
+  const documentRequest =
     (req.method === "GET" || req.method === "HEAD") &&
     h["x-airfoils-page-refresh"] !== refreshId &&
-    !h.cookie &&
-    !h.authorization &&
     !h.range &&
     !h["next-action"] &&
     !h["x-nextjs-data"] &&
@@ -143,8 +159,31 @@ async function serve(req, res) {
     !h["if-modified-since"] &&
     !vary.slice(1).some((key) => key in h) &&
     (!h.accept || /text\/html|\*\/\*/i.test(h.accept));
-  const encoding = ordinary && acceptedEncoding(h["accept-encoding"]);
-  if (encoding) {
+  const encoding = documentRequest && acceptedEncoding(h["accept-encoding"]);
+  if (
+    encoding &&
+    campaignDocument &&
+    req.url?.startsWith("/admin?") &&
+    !h["if-none-match"]
+  ) {
+    const url = new URL(req.url, "http://localhost");
+    const campaign = url.searchParams.get("campaign");
+    if (
+      url.pathname === "/admin" &&
+      url.searchParams.size === 1 &&
+      /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(campaign ?? "")
+    ) {
+      const body =
+        encoding === "gzip" ? campaignDocument.gzip : campaignDocument.body;
+      res.setHeader("content-type", "text/html; charset=utf-8");
+      res.setHeader("cache-control", "private, no-store");
+      res.setHeader("vary", vary.join(", "));
+      res.setHeader("content-length", body.length);
+      if (encoding === "gzip") res.setHeader("content-encoding", "gzip");
+      return res.end(req.method === "HEAD" ? undefined : body);
+    }
+  }
+  if (encoding && req.url === "/" && !h.cookie && !h.authorization) {
     if (!cached || Date.now() - cached.at > maxAgeMs) await refreshOnce();
     const entry = cached;
     if (entry && Date.now() - entry.at <= maxAgeMs) {
