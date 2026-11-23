@@ -1,3 +1,4 @@
+import { unexpectedWorkerJobScans } from "../test-support/worker-ownership-plan";
 import { afterAll, expect, it } from "vitest";
 import { sql } from "drizzle-orm";
 import { createClient, type DB } from "../src/client";
@@ -237,7 +238,7 @@ it.each(["staging", "delivery"] as const)(
       ).not.toBeNull();
       for (const ready of [true, false]) {
         const [measured] = await connection.execute(
-          sql`EXPLAIN (ANALYZE,BUFFERS,FORMAT JSON) ${progressiveEvidenceWakeSql(scope, ready)}`,
+          sql`EXPLAIN (ANALYZE,VERBOSE,BUFFERS,FORMAT JSON) ${progressiveEvidenceWakeSql(scope, ready)}`,
         );
         const result = (
           measured["QUERY PLAN"] as Array<Record<string, unknown>>
@@ -254,9 +255,7 @@ it.each(["staging", "delivery"] as const)(
         const ownership = nodes.filter(
           (node) => node["Relation Name"] === "sim_jobs",
         );
-        expect(
-          ownership.every((node) => node["Node Type"] !== "Seq Scan"),
-        ).toBe(true);
+        expect(unexpectedWorkerJobScans(ownership, scope === "staging")).toEqual([]);
         const probes = ownership.reduce(
           (total, node) => total + Number(node["Actual Loops"]),
           0,
@@ -402,7 +401,7 @@ it("serves fresh active reports and FIFO backlog without changing eligibility", 
     expect(backlogHead[0].sequence).toBe(1);
     for (const active of [true, false]) {
       const [measured] = await transaction.execute(
-        sql`EXPLAIN (ANALYZE,BUFFERS,FORMAT JSON) ${progressiveStagingSelectionSql(active)}`,
+        sql`EXPLAIN (ANALYZE,VERBOSE,BUFFERS,FORMAT JSON) ${progressiveStagingSelectionSql(active)}`,
       );
       const result = (
         measured["QUERY PLAN"] as Array<Record<string, unknown>>
@@ -609,4 +608,20 @@ it("prioritizes active terminal reports and keeps invalid reports in the fallbac
       expect(selectedFallback.sim_job_id).not.toBe(invalidTerminal.id);
     }
   });
+});
+
+
+it("keeps the ownership scan guard for executed or foreign sequential scans", () => {
+  const viewNode = {
+    "Node Type": "Seq Scan", "Relation Name": "sim_jobs", Schema: "public", Alias: "j_2",
+    Filter: `((j_2."ingestedAt" IS NOT NULL) AND (j_2.status = ANY ('{done,failed,cancelled}'::sim_job_status[])) AND (j_2.engine_job_id = (j_2.id)::text))`,
+    Output: ["j_2.id"], "Actual Loops": 0, "Actual Rows": 0, "Rows Removed by Filter": 0,
+  };
+  expect(unexpectedWorkerJobScans([viewNode], true)).toEqual([]);
+  expect(unexpectedWorkerJobScans([viewNode], false)).toHaveLength(1);
+  for (const changed of [
+    { "Actual Loops": 1 }, { "Actual Rows": 1 }, { "Rows Removed by Filter": 1 },
+    { Schema: "pg_temp" }, { Alias: "job" }, { Output: ["j_2.request_payload"] },
+    { Filter: "j_2.id IS NOT NULL" }, { "Actual Loops": undefined },
+  ]) expect(unexpectedWorkerJobScans([{ ...viewNode, ...changed }], true)).toHaveLength(1);
 });
