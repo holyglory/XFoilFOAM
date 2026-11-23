@@ -37,6 +37,7 @@ import {
   parseLegacyCustodyWorkerFailure,
 } from "../src/legacy-report-storage-custody-worker";
 import { LegacyHubSshStore } from "../src/legacy-report-storage-hub";
+import { LegacyPeerOccupied } from "../src/legacy-report-peer-memory";
 import { runLegacyUntilComplete } from "../src/legacy-report-storage-loop";
 import {
   LegacyOperatorPaused,
@@ -979,6 +980,7 @@ describe.sequential("worker-only legacy backup and 0198 representation", () => {
             category: "gcs_server_error",
             httpStatus: 503,
           });
+        if (attempt === 4) throw new LegacyPeerOccupied();
         return { complete: true, next: 1 };
       },
       {
@@ -991,9 +993,10 @@ describe.sequential("worker-only legacy backup and 0198 representation", () => {
     expect(result).toMatchObject({
       complete: true,
       deployPauses: 1,
+      peerWorkerPauses: 1,
       transientRetries: 2,
     });
-    expect(waits).toEqual([5000, 1000, 2000]);
+    expect(waits).toEqual([5000, 1000, 2000, 5000]);
     for (const stderr of [
       "Permission denied (publickey)",
       "Host key verification failed",

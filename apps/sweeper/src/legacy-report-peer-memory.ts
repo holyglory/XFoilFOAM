@@ -21,6 +21,7 @@ const { availableMiB: controllerAvailable } = createRequire(import.meta.url)(
 export class LegacyPeerOccupied extends Error {
   readonly retryable = true;
   readonly code = "custody_worker_active";
+  readonly exitCode = 75;
   constructor() {
     super("A physical custody worker is still active on the selected target");
   }

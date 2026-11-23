@@ -2,7 +2,10 @@ import {
   LegacyStorageOperationError,
   legacyLocalStorageError,
 } from "./legacy-report-storage-gcs";
-import { openLegacyPeerBudget } from "./legacy-report-peer-memory";
+import {
+  LegacyPeerOccupied,
+  openLegacyPeerBudget,
+} from "./legacy-report-peer-memory";
 import { runLegacyUntilComplete } from "./legacy-report-storage-loop";
 import { LegacyWorkingVolumeNormalizer } from "./legacy-report-storage-custody";
 import { LegacyOperatorPaused } from "./legacy-report-storage-operator";
@@ -706,7 +709,10 @@ export async function legacyReportStorageCli(args: string[]): Promise<void> {
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href)
   legacyReportStorageCli(process.argv.slice(2)).catch((error: Error) => {
-    if (error instanceof LegacyOperatorPaused) {
+    if (
+      error instanceof LegacyOperatorPaused ||
+      error instanceof LegacyPeerOccupied
+    ) {
       console.log(
         JSON.stringify({
           paused: true,

@@ -46,6 +46,7 @@ export async function runLegacyUntilComplete<
   let attempted = 0,
     completed = 0,
     pauses = 0,
+    peerPauses = 0,
     transientRetries = 0,
     last: T | undefined,
     previous: string | undefined,
@@ -84,7 +85,8 @@ export async function runLegacyUntilComplete<
         error instanceof LegacyOperatorPaused ||
         error instanceof LegacyPeerOccupied
       ) {
-        pauses++;
+        if (error instanceof LegacyPeerOccupied) peerPauses++;
+        else pauses++;
         backoff = Math.max(yieldMs, 5000);
         emit({
           event: "paused",
@@ -158,6 +160,7 @@ export async function runLegacyUntilComplete<
       passesAttempted: attempted,
       passesCompleted: completed,
       deployPauses: pauses,
+      peerWorkerPauses: peerPauses,
       transientRetries,
       elapsedSeconds: (now() - started) / 1000,
       next: last?.next ?? null,
