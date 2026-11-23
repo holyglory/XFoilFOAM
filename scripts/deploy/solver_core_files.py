@@ -194,36 +194,52 @@ def _metadata_names(name):
 
 
 def manifests(rootfd, casesfd, case_names):
-    """Read declared sources, skipping raw payloads and solver time directories."""
+    """Inspect native declarations, including cases/<condition>/<angle>/evidence.
+
+    Directory discovery never follows symlinks or crosses a mount. Raw data
+    and field files are never opened. Keep only paths that can name a core.
+    """
     documents=[]
-    def visit(fd,relative,case,deep):
-        for name in os.listdir(fd):
-            if name in {".retain-solver-core-dumps",".forensic-hold"} or "incomplete_evidence_quarantine" in name or "orphan_quarantine" in name:
-                raise Held("explicit diagnostic or forensic hold: "+str(relative/name))
-            if _metadata_names(name):
-                st=os.stat(name,dir_fd=fd,follow_symlinks=False)
-                require(stat.S_ISREG(st.st_mode), "metadata source is not a regular file: "+str(relative/name))
-                with os.fdopen(os.open(name,FILE,dir_fd=fd),"rb") as f:
-                    require(same_inode(st,os.fstat(f.fileno())), "metadata identity changed")
+    def visit(fd, relative, case):
+        with os.scandir(fd) as entries:
+            for entry in entries:
+                name=entry.name
+                if name in {".retain-solver-core-dumps",".forensic-hold"} or "incomplete_evidence_quarantine" in name or "orphan_quarantine" in name:
+                    raise Held("explicit diagnostic or forensic hold: "+str(relative/name))
+                if _metadata_names(name):
+                    st=entry.stat(follow_symlinks=False)
+                    require(stat.S_ISREG(st.st_mode), "nonregular source metadata: "+str(relative/name))
+                    with os.fdopen(os.open(name,FILE,dir_fd=fd),"rb") as f:
+                        require(same_inode(st,os.fstat(f.fileno())), "metadata identity changed")
+                        try:
+                            values=(json.loads(line)for line in f if line.strip()) if name.endswith(".jsonl") else (json.load(f),)
+                            paths=set()
+                            for obj in values:
+                                for value in _strings(obj):
+                                    if ("core" in value or "%" in value) and CORE.fullmatch(unquote(value.split("?",1)[0].split("#",1)[0]).split("/")[-1]):
+                                        paths.add(value)
+                        except (ValueError,RecursionError) as exc:
+                            raise Held("invalid source metadata: "+str(relative/name)) from exc
+                        require(file_id(st)==file_id(os.fstat(f.fileno())) and same_inode(st,os.stat(name,dir_fd=fd,follow_symlinks=False)),
+                                "source declaration changed during read")
+                    if paths:documents.append((relative,case,sorted(paths)))
+                elif relative==PurePosixPath(".") and name=="cases":
+                    continue
+                elif entry.is_symlink():
+                    require(name not in {"evidence","mesh-evidence","continuation-metadata"},"symlink in declared evidence namespace")
+                elif entry.is_dir(follow_symlinks=False):
+                    st=entry.stat(follow_symlinks=False);child=os.open(name,DIR,dir_fd=fd)
                     try:
-                        document=[json.loads(line) for line in f if line.strip()] if name.endswith(".jsonl") else json.load(f)
-                    except (ValueError,RecursionError) as exc:
-                        raise Held("invalid source metadata: "+str(relative/name)) from exc
-                documents.append((relative,case,document))
-            elif name in ("cases","polyMesh","raw","VTK","constant","system","postProcessing","frames","images") or name.startswith("processor") or re.fullmatch(r"[0-9.eE+-]+",name):
-                continue
-            elif name in ("evidence","mesh-evidence","continuation-metadata","pressure_initialization") or deep:
-                st=os.stat(name,dir_fd=fd,follow_symlinks=False)
-                require(not stat.S_ISLNK(st.st_mode), "symlink in metadata namespace: "+str(relative/name))
-                if stat.S_ISDIR(st.st_mode):
-                    child=os.open(name,DIR,dir_fd=fd)
-                    try:visit(child,relative/name,case,True)
+                        require(same_inode(st,os.fstat(child)) and _mount_id(child)==_mount_id(fd),"metadata directory moved or mounted")
+                        visit(child,relative/name,case)
                     finally:os.close(child)
-    visit(rootfd,PurePosixPath("."),None,False)
+    visit(rootfd,PurePosixPath("."),None)
     for case in case_names:
-        c=os.open(case,DIR,dir_fd=casesfd)
-        try:visit(c,PurePosixPath("cases",case),case,False)
-        finally:os.close(c)
+        fd=os.open(case,DIR,dir_fd=casesfd)
+        try:
+            require(_mount_id(fd)==_mount_id(casesfd),"unexpected native case mount")
+            visit(fd,PurePosixPath("cases",case),case)
+        finally:os.close(fd)
     return documents
 
 
