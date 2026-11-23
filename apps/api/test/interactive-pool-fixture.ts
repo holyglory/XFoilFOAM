@@ -144,7 +144,9 @@ export async function verifyInteractivePool(input: {
           SELECT pg_backend_pid() UNION SELECT a.pid FROM chain c JOIN pg_stat_activity a
             ON c.pid=ANY(pg_blocking_pids(a.pid)) WHERE a.datname=current_database())
           SELECT a.pid,a.application_name FROM pg_stat_activity a JOIN chain USING(pid)
-          WHERE a.pid<>pg_backend_pid() AND a.wait_event_type='Lock' AND a.query LIKE '%FOR UPDATE OF dispatch%'
+          WHERE a.pid<>pg_backend_pid() AND a.wait_event_type='Lock'
+            AND a.backend_type='client backend' AND a.application_name='xfoilfoam-api-sync'
+            AND a.datname=current_database() AND a.usename=current_user
           ORDER BY a.pid`;
       };
       writers = Array.from({ length: reportRequests }, () =>
