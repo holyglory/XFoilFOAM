@@ -561,6 +561,10 @@ export interface SimulationDetail {
    *  previous frame visible until a newly selected AoA has actually loaded. */
   resultId?: string;
   resultAttemptId?: string;
+  /** Solver convergence recorded on the exact attempt. Null means unrecorded. */
+  numericalConvergence?: boolean | null;
+  /** Measured flow outcome on the exact URANS attempt, independent of polar acceptance. */
+  uransFlowOutcome?: "periodic" | "no_shedding" | null;
   observation?: {
     method: "RANS" | "URANS";
     classification: string | null;

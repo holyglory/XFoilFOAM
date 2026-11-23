@@ -274,10 +274,11 @@ export async function verifyPublicAttemptFieldSources(
     ).toEqual(originalSteady.fields);
     expect(read.mock.lastCall![0].sourceKind).toBe("steady_history");
 
-    // Histories with only force arrays removed have all five public keys available locally.
+    // Force-only offload keeps every selected detail field in the pinned compact value.
     const forcePoint = {
       ...periodicPoint(0, 24, false),
       frame_track: null,
+      no_shedding_certificate: null,
       fidelity: "urans_precalc" as const,
     };
     const forceOnly = await seedInlineSettledHistory(db, {
@@ -323,6 +324,8 @@ export async function verifyPublicAttemptFieldSources(
       { read },
     );
     expect(intact.get(forceOnly.attemptId)).toEqual(forceInline.fields);
+    expect(intact.get(forceOnly.attemptId)).toHaveProperty("no_shedding_certificate", null);
+    expect(intact.get(forceOnly.attemptId)).not.toHaveProperty("noSheddingCertificate");
     expect(read).not.toHaveBeenCalled();
 
     const rollback = new Error("rollback field proof control");

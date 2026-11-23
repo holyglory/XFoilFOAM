@@ -1,6 +1,8 @@
 import { pointStage } from "../public-point-timing";
 import {
   canonicalAoa,
+  FRAME_TRACK_PERIOD_EPSILON,
+  parseNoSheddingCertificate,
   type FieldId,
   type FieldMedia,
   type FrameTrackDetail,
@@ -127,21 +129,24 @@ const selectedDetailColumns = {
   },
   attempt: {
     ...attemptDetailColumns,
-    detailPayload: sql`CASE WHEN ${resultAttempts.evidenceArchiveId} IS NULL THEN jsonb_build_object(
-      'frame_track', ${evidencePayload}->'frame_track',
-      'frameTrack', ${evidencePayload}->'frameTrack',
-      'steady_history', ${evidencePayload}->'steady_history',
-      'steadyHistory', ${evidencePayload}->'steadyHistory',
-      'fidelity', ${evidencePayload}->'fidelity') END`.mapWith(evidencePayload),
+    detailPayload: sql`CASE WHEN ${resultAttempts.evidenceArchiveId} IS NULL THEN (
+      WITH doc AS MATERIALIZED (SELECT ${evidencePayload} || '{}'::jsonb AS value)
+      SELECT jsonb_build_object(
+        'frame_track',value->'frame_track', 'frameTrack',value->'frameTrack',
+        'steady_history',value->'steady_history', 'steadyHistory',value->'steadyHistory', 'fidelity',value->'fidelity',
+        'no_shedding_certificate',value->'no_shedding_certificate', 'noSheddingCertificate',value->'noSheddingCertificate')
+      FROM doc) END`.mapWith(evidencePayload),
   },
 };
+
+type SelectedDetailResult = Result & { noSheddingCertificate: unknown };
 
 /** The result owns the physical cell. The public or admin selector chooses
  * the attempt that supplies the solver outputs and provenance. */
 async function selectedResultProjection(
   result: Result,
   attempt: DetailAttempt,
-): Promise<Result> {
+): Promise<SelectedDetailResult> {
   const payload = await pointStage("attemptFields", readSelectedAttemptDetailFields(db, attempt));
   return {
     ...result,
@@ -170,6 +175,7 @@ async function selectedResultProjection(
     error: attempt.error,
     qualityWarnings: attempt.qualityWarnings,
     frameTrack: payload.frame_track ?? payload.frameTrack ?? null,
+    noSheddingCertificate: payload.no_shedding_certificate ?? payload.noSheddingCertificate,
     fidelity: typeof payload.fidelity === "string" ? payload.fidelity : null,
     steadyHistory: payload.steady_history ?? payload.steadyHistory ?? null,
     simJobId: attempt.simJobId,
@@ -283,10 +289,34 @@ async function uransVerifyDetailOf(
   return item ?? null;
 }
 
+function hasPeriodLockedFrames(track: FrameTrackDetail | null): boolean {
+  if (!track || track.periodS === null || track.periodS <= 0 || track.frames.length < 2) return false;
+  const { tStart, tEnd } = track.window;
+  // The engine reports fractional periods available, but the statistics window
+  // covers their whole-period floor. Frames may cover just the last few periods.
+  const cycles = Math.floor(track.periodsRetained + FRAME_TRACK_PERIOD_EPSILON);
+  const windowCycles = (tEnd - tStart) / track.periodS;
+  if (cycles < 1 || Math.abs(windowCycles - cycles) > FRAME_TRACK_PERIOD_EPSILON * cycles) return false;
+  const tolerance = FRAME_TRACK_PERIOD_EPSILON * Math.max(1, Math.abs(tStart), Math.abs(tEnd));
+  return track.frames.every((frame, index, frames) => frame.t >= tStart - tolerance && frame.t <= tEnd + tolerance &&
+    (index === 0 || (frame.t > frames[index - 1]!.t && frame.i > frames[index - 1]!.i)));
+}
+
+function recordedUransFlowOutcome(
+  r: SelectedDetailResult, track: FrameTrackDetail | null,
+): SimulationDetail["uransFlowOutcome"] {
+  if (r.fidelity !== "urans_precalc" && r.fidelity !== "urans_full" &&
+      !(r.fidelity === null && r.regime === "urans")) return null;
+  const periodic = hasPeriodLockedFrames(track);
+  if (r.noSheddingCertificate != null)
+    return !periodic && parseNoSheddingCertificate(r.noSheddingCertificate).ok ? "no_shedding" : null;
+  return periodic ? "periodic" : null;
+}
+
 async function solvedDetail(
   name: string,
   re: number,
-  r: Result,
+  r: SelectedDetailResult,
   observation?: SimulationDetail["observation"],
 ): Promise<SimulationDetailWithReview | null> {
   if (!r.currentResultAttemptId) return null;
@@ -513,8 +543,11 @@ async function solvedDetail(
           mesh: snapshotMesh,
         }
       : null;
+  const frameTrack = frameTrackDetailOf(r, frameArtifacts);
   return {
     resultId: r.id,
+    numericalConvergence: r.converged ?? null,
+    uransFlowOutcome: recordedUransFlowOutcome(r, frameTrack),
     status: observation ? "evidence" : "solved",
     ...(observation
       ? { observation, resultAttemptId: r.currentResultAttemptId }
@@ -546,7 +579,7 @@ async function solvedDetail(
       metadata: row.metadata ?? {},
     })),
     history: hist ? { t: hist.t, cl: hist.cl, cd: hist.cd } : null,
-    frameTrack: frameTrackDetailOf(r, frameArtifacts),
+    frameTrack,
     fidelity: parsePointFidelity(r.fidelity),
     steadyHistory: steadyHistoryDetailOf(r),
     uransVerify: await uransVerifyDetailOf(r),

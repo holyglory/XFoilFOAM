@@ -1,3 +1,4 @@
+import { noSheddingCertificate } from "./no-shedding-fixture";
 // Fidelity-ladder classifier gates (POLAR_CLASSIFIER_VERSION fidelity-ladder-v7):
 //   1. FIDELITY-AWARE frame-track period bar — urans_precalc accepts at >= 3
 //      retained periods, urans_full / legacy keeps the strict >= 5 bar.
@@ -53,31 +54,6 @@ const uransRow: PolarEvidencePoint = {
   hasVideo: true,
   frameTrack: contractFrameTrack,
 };
-
-const noSheddingCertificate = {
-  reducer_version: "no-shedding-v1",
-  certified: true,
-  required_observation_s: 0.2,
-  observation_start_time: 1,
-  observation_end_time: 1.25,
-  observed_observation_s: 0.25,
-  source_sample_count: 120,
-  transport_sample_count: 100,
-  relative_tolerance: 0.01,
-  absolute_floor: 0.001,
-  cl_mean: 0.4,
-  cd_mean: 0.02,
-  cm_mean: -0.03,
-  cl_rms: 0.001,
-  cd_rms: 0.0001,
-  cm_rms: 0.0001,
-  transport_cl_mean: 0.4,
-  transport_cd_mean: 0.02,
-  transport_cm_mean: -0.03,
-  transport_cl_rms: 0.001,
-  transport_cd_rms: 0.0001,
-  transport_cm_rms: 0.0001,
-} as const;
 
 const steadyHistory = {
   iterations: [1000, 1500, 2000],
