@@ -18,6 +18,7 @@ import {
 import { syncSql } from "../src/db";
 import { COOKIE_NAME, signSession } from "../src/admin-auth";
 import { createProgressiveReportFixture } from "./progressive-report-fixture";
+import { verifyPublicPointDuringArchive } from "./public-point-archive-fixture";
 
 /** Hold actual report import transactions at their dispatch lock. The observer
  * owns a separate connection so measuring contention cannot consume an API slot. */
@@ -200,6 +201,14 @@ export async function verifyInteractivePool(input: {
     });
     const live = sibling;
     const base = await app.listen({ port: 0, host: "127.0.0.1" });
+    await verifyPublicPointDuringArchive(
+      db,
+      base,
+      token,
+      report.report,
+      input.slug,
+      input.resultId,
+    );
     const post = (
       target: typeof report,
       promise: string,

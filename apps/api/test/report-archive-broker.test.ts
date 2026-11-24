@@ -8,11 +8,16 @@ import { PgDialect } from "drizzle-orm/pg-core";
 import type { SQL } from "drizzle-orm";
 import Fastify from "fastify";
 import { createHash, randomUUID } from "node:crypto";
-import { readFile } from "node:fs/promises";
+import { access, mkdtemp, readFile, readdir, rm } from "node:fs/promises";
+import { once } from "node:events";
+import { request } from "node:http";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { Readable } from "node:stream";
-import { setImmediate as nextTurn } from "node:timers/promises";
 import { gzipSync, gunzipSync } from "node:zlib";
 import { afterEach, expect, it, vi } from "vitest";
+import { gatedArchiveVerifier } from "./gated-archive-verifier";
+import type { ReportArchiveVerifier } from "../src/report-archive-verifier";
 import {
   putBrokeredWorkerReportBundle,
   registerReportArchiveBrokerRoutes,
@@ -36,7 +41,7 @@ function checksum(bytes: Buffer) {
   return crc.toString();
 }
 
-async function fixture(instanceId = "isolated-worker") {
+async function fixture(instanceId = "isolated-worker", verifier?: ReportArchiveVerifier) {
   const solver = { id: randomUUID(), instanceId };
   const executionId = randomUUID();
   const promiseId = randomUUID();
@@ -129,6 +134,7 @@ async function fixture(instanceId = "isolated-worker") {
   const app = Fastify();
   await registerReportArchiveBrokerRoutes(app, {
     db: { execute } as unknown as DB,
+    verifier,
     authenticate: async (req, reply) => {
       if (state.revoked || req.headers["x-xfoilfoam-solver-token"] !== token) {
         reply
@@ -261,43 +267,45 @@ it("pins every metadata and media request to the exact uint64 generation string"
   }
 });
 
-it("serves a pinned read between delta members and refuses a forged final member", async () => {
-  const f = await fixture();
-  const visit = archiveCodec.visitVerifiedWorkerReportArchive;
-  const observer = vi.spyOn(archiveCodec, "visitVerifiedWorkerReportArchive");
+it("admits a pinned restore during verification of a delta page and refuses a forged final member", async () => {
+  const gate = gatedArchiveVerifier();
+  const f = await fixture(undefined, gate.verifier);
   try {
+    gate.release();
     const source = f.bundle();
-    const upload = (page: typeof source) =>
-      f.app.inject({ method: "POST", url: page.url, headers: f.headers, payload: page.bytes });
+    const upload = async (page: typeof source) =>
+      f.app.inject({
+        method: "POST",
+        url: page.url,
+        headers: f.headers,
+        payload: page.bytes,
+      });
     const saved = await upload(source);
     expect(saved.statusCode).toBe(200);
     const { generation, crc32c } = saved.json();
-    const read = () => f.app.inject({
-      url: `${source.url}&generation=${generation}&crc32c=${encodeURIComponent(crc32c)}`, headers: f.headers,
-    });
+    await gate.verifier.closeIdle();
+    gate.holdNextWorker();
     const reports = Array.from({ length: 12 }, (_, i) => f.report(30 + i));
     const page = f.bundle(reports);
-    let visited = 0;
-    let atReadStart: number | undefined;
-    let pending: Promise<Awaited<ReturnType<typeof read>>> | undefined;
-    observer.mockImplementation((stream, identity, owner, visitor, limits, signal) =>
-      visit(stream, identity, owner, async (...args) => {
-        if (identity.storedSha256 === page.sha256 && ++visited === 1) {
-          // A socket callback made runnable during the first member must get
-          // a turn before the rest of this single decompressor chunk finishes.
-          pending = nextTurn().then(() => {
-            atReadStart = visited;
-            return read();
-          });
-        }
-        await visitor(...args);
-      }, limits, signal));
-    expect((await upload(page)).statusCode).toBe(200);
-    const restored = await pending;
-    expect(visited).toBe(reports.length);
-    expect(atReadStart).toBe(1);
-    expect(restored?.statusCode).toBe(200);
-    expect(restored?.rawPayload).toEqual(source.bytes);
+    const pageStaged = gate.staged();
+    const saving = upload(page);
+    await pageStaged;
+    const restoreStaged = gate.staged();
+    const reading = f.app
+      .inject({
+        url: `${source.url}&generation=${generation}&crc32c=${encodeURIComponent(crc32c)}`,
+        headers: f.headers,
+      })
+      .then((result) => result);
+    // The listener has authorized the other request and read its exact GCS
+    // generation to EOF while the upload still owns the only CPU verifier.
+    await restoreStaged;
+    expect(f.upload).toHaveBeenCalledTimes(1);
+    gate.release();
+    const [written, restored] = await Promise.all([saving, reading]);
+    expect(written.statusCode).toBe(200);
+    expect(restored.statusCode).toBe(200);
+    expect(restored.rawPayload).toEqual(source.bytes);
 
     const forged = f.bundle(reports, (entry, i) => {
       if (i === reports.length - 1) entry.contentSignature = "0".repeat(64);
@@ -305,7 +313,7 @@ it("serves a pinned read between delta members and refuses a forged final member
     expect((await upload(forged)).statusCode).toBe(409);
     expect(f.upload).toHaveBeenCalledTimes(2);
   } finally {
-    observer.mockRestore();
+    gate.release();
     await f.app.close();
   }
 });
@@ -684,3 +692,235 @@ it("authenticates a worker envelope and its original generation through the same
     expect((await get()).rawPayload).toEqual(packed);
   } finally { await f.app.close(); }
 });
+
+it("keeps one signed verifier, fails the interrupted transfer closed, and serves its waiting peer", async () => {
+  const gate = gatedArchiveVerifier();
+  const f = await fixture(undefined, gate.verifier);
+  const page = f.bundle();
+  const send = async () =>
+    f.app.inject({
+      method: "POST",
+      url: page.url,
+      headers: f.headers,
+      payload: page.bytes,
+    });
+  try {
+    const activePath = gate.staged();
+    const first = send();
+    const active = await activePath;
+    const waitingPath = gate.staged();
+    const second = send();
+    const waiting = await waitingPath;
+    const overflow = await send();
+    expect(overflow.statusCode).toBe(503);
+    expect(gate.workers).toHaveLength(1);
+    expect(f.upload).not.toHaveBeenCalled();
+    // An unexpected exit (including exit before the first worker reply)
+    // cannot become a receipt or implicitly retry the failed caller.
+    await gate.workers[0].terminate();
+    const failed = await first;
+    expect(failed.statusCode).toBe(503);
+    expect(failed.json()).not.toHaveProperty("verifiedAt");
+    await expect(access(active)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(f.upload).not.toHaveBeenCalled();
+    expect(gate.workers).toHaveLength(2);
+    gate.release();
+    const saved = await second;
+    expect(saved.statusCode).toBe(200);
+    const receipt = saved.json();
+    expect(receipt).toMatchObject({
+      generation: f.generation,
+      storedSha256: page.sha256,
+    });
+    await expect(access(waiting)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(f.upload).toHaveBeenCalledTimes(1);
+    const restored = await f.app.inject({
+      url:
+        page.url +
+        "&generation=" +
+        f.generation +
+        "&crc32c=" +
+        encodeURIComponent(receipt.crc32c),
+      headers: f.headers,
+    });
+    expect(restored.statusCode).toBe(200);
+    expect(restored.rawPayload).toEqual(page.bytes);
+    expect(gate.workers).toHaveLength(2);
+  } finally {
+    gate.release();
+    await f.app.close();
+  }
+});
+
+it("cleans interrupted request bytes, drops a disconnected waiter, and stops active verification before upload", async () => {
+  const gate = gatedArchiveVerifier();
+  const f = await fixture(undefined, gate.verifier);
+  const root = await mkdtemp(join(tmpdir(), "archive-disconnect-"));
+  vi.stubEnv("TMPDIR", root);
+  const page = f.bundle();
+  const opts = {
+    method: "POST",
+    headers: f.headers,
+    body: new Uint8Array(page.bytes),
+  };
+  const scratch = async () =>
+    (await readdir(root)).filter((n) => n.startsWith("worker-report-broker-"));
+  const gone = (path: string) =>
+    vi.waitFor(
+      async () => {
+        await expect(access(path)).rejects.toMatchObject({ code: "ENOENT" });
+      },
+      { timeout: 5000 },
+    );
+  try {
+    const base = await f.app.listen({ host: "127.0.0.1", port: 0 });
+    const partial = request(base + page.url, {
+      method: "POST",
+      headers: { ...f.headers, "content-length": String(page.bytes.length) },
+    });
+    partial.on("error", () => {});
+    const disconnected = once(partial, "close").catch(() => {});
+    try {
+      partial.write(page.bytes.subarray(0, 10));
+      await vi.waitFor(async () => expect(await scratch()).toHaveLength(1), {
+        timeout: 5000,
+      });
+    } finally {
+      partial.destroy();
+    }
+    await disconnected;
+    await vi.waitFor(async () => expect(await scratch()).toHaveLength(0), {
+      timeout: 5000,
+    });
+    expect(gate.workers).toHaveLength(0);
+
+    const start = async () => {
+      const controller = new AbortController();
+      const staged = gate.staged();
+      const response = fetch(base + page.url, {
+        ...opts,
+        signal: controller.signal,
+      });
+      const path = await staged;
+      return { controller, response, path };
+    };
+    const active = await start();
+    const queued = await start();
+    queued.controller.abort();
+    await expect(queued.response).rejects.toThrow();
+    await gone(queued.path);
+    expect(gate.workers).toHaveLength(1);
+    const exited = once(gate.workers[0], "exit");
+    active.controller.abort();
+    await expect(active.response).rejects.toThrow();
+    await exited;
+    await gone(active.path);
+    expect(f.upload).not.toHaveBeenCalled();
+    expect(f.objects.size).toBe(0);
+
+    gate.release();
+    const resumed = await fetch(base + page.url, opts);
+    expect(resumed.status).toBe(200);
+    expect(await resumed.json()).toMatchObject({
+      storedSha256: page.sha256,
+      generation: f.generation,
+    });
+    expect(f.state.readbacks).toBe(1);
+  } finally {
+    gate.release();
+    f.app.server.closeAllConnections();
+    await f.app.close();
+    vi.unstubAllEnvs();
+    await rm(root, { recursive: true, force: true });
+  }
+}, 20_000);
+
+it("recovers a completed object after disconnect without acknowledging it before a pinned readback", async () => {
+  const f = await fixture();
+  const controller = new AbortController();
+  const page = f.bundle();
+  try {
+    const store = f.upload.getMockImplementation()!;
+    f.upload.mockImplementationOnce(async (path, options) => {
+      await store(path, options);
+      controller.abort();
+    });
+    await expect(
+      putBrokeredWorkerReportBundle(
+        { execute: f.execute } as unknown as DB,
+        f.solver,
+        f.executionId,
+        { sha256: page.sha256, byteSize: page.bytes.length },
+        Readable.from([page.bytes]),
+        "jsonl",
+        { signal: controller.signal },
+      ),
+    ).rejects.toThrow(/abort/i);
+    expect(f.objects.size).toBe(1);
+    expect(f.state.readbacks).toBe(0);
+    const retry = await f.app.inject({
+      method: "POST",
+      url: page.url,
+      headers: f.headers,
+      payload: page.bytes,
+    });
+    expect(retry.statusCode).toBe(200);
+    expect(retry.json()).toMatchObject({
+      generation: f.generation,
+      storedSha256: page.sha256,
+    });
+    expect(f.objects.size).toBe(1);
+    expect(f.state.readbacks).toBe(1);
+  } finally {
+    await f.app.close();
+  }
+});
+
+it("enforces the original member limit in the verifier before object creation", async () => {
+  const f = await fixture();
+  try {
+    const reports = Array.from({ length: 256 }, (_, i) => f.report(i + 1));
+    const put = async (page: ReturnType<typeof f.bundle>) =>
+      f.app.inject({
+        method: "POST",
+        url: page.url,
+        headers: f.headers,
+        payload: page.bytes,
+      });
+    const complete = f.bundle(reports);
+    expect((await put(complete)).statusCode).toBe(200);
+    const excess = f.bundle([...reports, f.report(257)]);
+    expect((await put(excess)).statusCode).toBe(409);
+    expect(f.upload).toHaveBeenCalledTimes(1);
+    expect(f.state.readbacks).toBe(1);
+  } finally {
+    await f.app.close();
+  }
+});
+
+it("closes the verifier with its server and releases every admitted staged path", async () => {
+  const gate = gatedArchiveVerifier();
+  const f = await fixture(undefined, gate.verifier);
+  const page = f.bundle();
+  const put = () => f.app.inject({ method: "POST", url: page.url, headers: f.headers, payload: page.bytes }).then(response => response);
+  try {
+    const firstPath = gate.staged();
+    const first = put();
+    const active = await firstPath;
+    const nextPath = gate.staged();
+    const second = put();
+    const queued = await nextPath;
+    const exit = once(gate.workers[0], "exit");
+    const shuttingDown = f.app.close();
+    const [a, b] = await Promise.all([first, second, exit, shuttingDown]);
+    expect(a.statusCode).toBeGreaterThanOrEqual(400);
+    expect(b.statusCode).toBeGreaterThanOrEqual(400);
+    await expect(access(active)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(access(queued)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(gate.workers).toHaveLength(1);
+    expect(f.upload).not.toHaveBeenCalled();
+  } finally {
+    gate.release();
+    await f.app.close();
+  }
+}, 12_000);

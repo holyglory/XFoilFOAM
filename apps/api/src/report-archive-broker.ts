@@ -17,6 +17,11 @@ import { setImmediate as yieldToRequests } from "node:timers/promises";
 import { z } from "zod";
 import { visitWorkerReportGeneration, WorkerResultReadCache, WORKER_RESULT_REF } from "../../sweeper/src/worker-result-archive";
 import { env } from "./env";
+import {
+  ArchiveVerifierUnavailable,
+  ReportArchiveVerifier,
+} from "./report-archive-verifier";
+import { syncRequestSignal } from "./sync-admission";
 
 // A page may contain reports and their conflict copies. No whole-execution
 // uniqueness or active scheduling lease is required for historical custody.
@@ -116,6 +121,16 @@ async function ownedDispatch(
 }
 
 const brokerResults = new WorkerResultReadCache();
+const signedPages = new ReportArchiveVerifier();
+const verificationLimits = {
+  maxMembers: MAX_MEMBERS,
+  maxDecodedBytes: MAX_JSON_BYTES,
+  maxReportBytes: MAX_LINE_BYTES,
+};
+interface VerificationContext {
+  verifier?: ReportArchiveVerifier;
+  signal?: AbortSignal;
+}
 
 async function inspectBundle(
   path: string,
@@ -123,30 +138,55 @@ async function inspectBundle(
   solver: Solver,
   executionId: string,
   dispatch: Dispatch,
+  { verifier = signedPages, signal }: VerificationContext,
 ) {
+  const owner = {
+    executionId,
+    solverId: solver.id,
+    workerInstance: solver.instanceId,
+    ...dispatch,
+  };
   try {
+    signal?.throwIfAborted();
+    if (identity.archiveFormat === "jsonl") {
+      await verifier.verify(
+        { path, identity, owner, limits: verificationLimits },
+        signal,
+      );
+      return;
+    }
+    // A result-reference page also needs a second authorized GCS generation.
     await visitWorkerReportGeneration(
       createReadStream(path),
       identity,
-      { executionId, solverId: solver.id, workerInstance: solver.instanceId, ...dispatch },
-      // Small deltas may expand into many envelopes within a single zlib chunk.
+      owner,
       () => yieldToRequests(),
-      {
-        maxMembers: MAX_MEMBERS,
-        maxDecodedBytes: MAX_JSON_BYTES,
-        maxReportBytes: MAX_LINE_BYTES,
+      verificationLimits,
+      async (anchor) => {
+        signal?.throwIfAborted();
+        const { file } = await exactFile(
+          solver,
+          executionId,
+          { sha256: anchor.storedSha256, byteSize: anchor.storedByteSize },
+          anchor.generation,
+          anchor.crc32c,
+          "jsonl",
+        );
+        signal?.throwIfAborted();
+        return file.createReadStream({
+          validation: "crc32c",
+          decompress: false,
+        });
       },
-      async anchor => {
-        const { file } = await exactFile(solver, executionId,
-          { sha256: anchor.storedSha256, byteSize: anchor.storedByteSize }, anchor.generation, anchor.crc32c, "jsonl");
-        return file.createReadStream({ validation: "crc32c", decompress: false });
-      }, undefined, brokerResults,
+      signal,
+      brokerResults,
     );
   } catch (error) {
     if (error instanceof WorkerReportMemberMismatch)
       reject(
         "Worker report archive member changed the exact dispatch scope or content",
       );
+    if (error instanceof ArchiveVerifierUnavailable) reject(error.message, 503);
     throw error;
   }
 }
@@ -156,8 +196,18 @@ export async function stageBrokerArchive(
   identity: LocalIdentity,
   expectedCrc?: string,
   maxBytes = MAX_STORED_BYTES,
+  signal?: AbortSignal,
 ) {
-  const directory = await mkdtemp(join(tmpdir(), "worker-report-broker-"));
+  if (signal?.aborted) {
+    source.destroy();
+    signal.throwIfAborted();
+  }
+  const directory = await mkdtemp(
+    join(tmpdir(), "worker-report-broker-"),
+  ).catch((error) => {
+    source.destroy();
+    throw error;
+  });
   const path = join(directory, "archive");
   const remove = () => rm(directory, { recursive: true, force: true });
   const hash = createHash("sha256");
@@ -182,6 +232,7 @@ export async function stageBrokerArchive(
         },
       }),
       createWriteStream(path, { flags: "wx", mode: 0o600 }),
+      { signal },
     );
     if (
       size !== identity.byteSize ||
@@ -280,11 +331,12 @@ export async function putBrokeredWorkerReportBundle(
   identity: LocalIdentity,
   body: Readable,
   format: WorkerReportArchiveIdentity["archiveFormat"] = "jsonl",
+  context: VerificationContext = {},
 ): Promise<WorkerReportArchiveIdentity> {
   assertLocalIdentity(executionId, identity);
   const dispatch = await ownedDispatch(db, solver, executionId);
   const scope = objectScope(executionId, identity.sha256);
-  const local = await stageBrokerArchive(body, identity);
+  const local = await stageBrokerArchive(body, identity, undefined, MAX_STORED_BYTES, context.signal);
   try {
     await inspectBundle(
       local.path,
@@ -302,7 +354,9 @@ export async function putBrokeredWorkerReportBundle(
       solver,
       executionId,
       dispatch,
+      context,
     );
+    context.signal?.throwIfAborted();
     try {
       await brokerArchiveStorage()
         .bucket(scope.bucket)
@@ -328,6 +382,9 @@ export async function putBrokeredWorkerReportBundle(
     } catch (error) {
       if (Number((error as { code?: unknown })?.code) !== 412) throw error;
     }
+    // A disconnected upload may already have created the immutable object.
+    // Its normal retry must still reopen and check the generation to EOF.
+    context.signal?.throwIfAborted();
     const remote = await exactFile(
       solver,
       executionId,
@@ -336,13 +393,17 @@ export async function putBrokeredWorkerReportBundle(
       local.crc32c,
       format,
     );
+    context.signal?.throwIfAborted();
     const proof = await stageBrokerArchive(
       remote.file.createReadStream({ validation: "crc32c", decompress: false }),
       identity,
       remote.identity.crc32c,
+      MAX_STORED_BYTES,
+      context.signal,
     );
     await proof.remove();
     await ownedDispatch(db, solver, executionId);
+    context.signal?.throwIfAborted();
     return { ...remote.identity, verifiedAt: new Date() };
   } finally {
     await local.remove();
@@ -356,6 +417,7 @@ export async function restoreBrokeredWorkerReportBundle(
   identity: LocalIdentity,
   generation: string,
   crc32c: string,
+  context: VerificationContext = {},
 ) {
   assertLocalIdentity(executionId, identity);
   if (
@@ -365,6 +427,7 @@ export async function restoreBrokeredWorkerReportBundle(
   )
     reject("Invalid worker report archive generation or CRC32C", 400);
   const dispatch = await ownedDispatch(db, solver, executionId);
+  context.signal?.throwIfAborted();
   const remote = await exactFile(
     solver,
     executionId,
@@ -372,10 +435,13 @@ export async function restoreBrokeredWorkerReportBundle(
     generation,
     crc32c,
   );
+  context.signal?.throwIfAborted();
   const restored = await stageBrokerArchive(
     remote.file.createReadStream({ validation: "crc32c", decompress: false }),
     identity,
     crc32c,
+    MAX_STORED_BYTES,
+    context.signal,
   );
   try {
     await inspectBundle(
@@ -384,8 +450,10 @@ export async function restoreBrokeredWorkerReportBundle(
       solver,
       executionId,
       dispatch,
+      context,
     );
     await ownedDispatch(db, solver, executionId);
+    context.signal?.throwIfAborted();
     return { ...restored, identity: remote.identity };
   } catch (error) {
     await restored.remove();
@@ -397,6 +465,7 @@ export async function registerReportArchiveBrokerRoutes(
   app: FastifyInstance,
   options: {
     db: DB;
+    verifier?: ReportArchiveVerifier;
     authenticate: (
       req: FastifyRequest,
       reply: FastifyReply,
@@ -405,6 +474,33 @@ export async function registerReportArchiveBrokerRoutes(
   },
 ): Promise<void> {
   await app.register(async (routes) => {
+    const verifier = options.verifier ?? signedPages;
+    const shutdown = new AbortController();
+    routes.addHook("preClose", async () => { shutdown.abort(); });
+    routes.addHook("onClose", async () => verifier.closeIdle());
+
+    async function withClient<T>(
+      req: FastifyRequest,
+      reply: FastifyReply,
+      run: (context: VerificationContext) => Promise<T>,
+    ): Promise<T> {
+      const client = new AbortController();
+      const abort = () => client.abort();
+      req.raw.once("aborted", abort);
+      reply.raw.once("close", abort);
+      try {
+        if (req.raw.aborted || reply.raw.destroyed) abort();
+        const ticket = syncRequestSignal();
+        const signals = [shutdown.signal, client.signal];
+        if (ticket) signals.push(ticket);
+        const signal = AbortSignal.any(signals);
+        signal.throwIfAborted();
+        return await run({ verifier, signal });
+      } finally {
+        req.raw.removeListener("aborted", abort);
+        reply.raw.removeListener("close", abort);
+      }
+    }
     routes.addContentTypeParser("application/gzip", (_req, stream, done) =>
       done(null, stream),
     );
@@ -457,13 +553,17 @@ export async function registerReportArchiveBrokerRoutes(
             .code(400)
             .send({ error: "Invalid bounded worker report archive upload" });
         try {
-          return await putBrokeredWorkerReportBundle(
-            options.db,
-            solver,
-            params.data.executionId,
-            { sha256: params.data.sha256, byteSize: query.data.byteSize },
-            req.body,
-            query.data.format,
+          const body = req.body;
+          return await withClient(req, reply, (context) =>
+            putBrokeredWorkerReportBundle(
+              options.db,
+              solver,
+              params.data.executionId,
+              { sha256: params.data.sha256, byteSize: query.data.byteSize },
+              body,
+              query.data.format,
+              context,
+            ),
           );
         } catch (error) {
           return failure(reply, error);
@@ -487,13 +587,16 @@ export async function registerReportArchiveBrokerRoutes(
           .code(400)
           .send({ error: "Invalid exact worker report archive restore" });
       try {
-        const restored = await restoreBrokeredWorkerReportBundle(
-          options.db,
-          solver,
-          params.data.executionId,
-          { sha256: params.data.sha256, byteSize: query.data.byteSize },
-          query.data.generation,
-          query.data.crc32c,
+        const restored = await withClient(req, reply, (context) =>
+          restoreBrokeredWorkerReportBundle(
+            options.db,
+            solver,
+            params.data.executionId,
+            { sha256: params.data.sha256, byteSize: query.data.byteSize },
+            query.data.generation,
+            query.data.crc32c,
+            context,
+          ),
         );
         const body = createReadStream(restored.path);
         const disconnected = () => body.destroy();

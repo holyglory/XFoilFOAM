@@ -1,5 +1,7 @@
 import { setTimeout as delay } from "node:timers/promises";
 
+export const WORKER_REPORT_TRANSFER_TIMEOUT_MS = 10 * 60_000;
+
 /** Recognize only the hub's bounded, internally consistent admission response. */
 export async function registeredArchiveAdmissionDelay(response: Response): Promise<number | null> {
   if (response.status !== 503 || response.headers.get("content-type")?.split(";")[0] !== "application/json")

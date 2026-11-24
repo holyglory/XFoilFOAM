@@ -11,6 +11,7 @@ export const SYNC_DATA_CONNECTIONS = 4;
 export const SYNC_CONTROL_CONNECTIONS = 2;
 type Traffic = "control" | "report" | "polar" | "transfer";
 export const SYNC_REPORT_LIMIT = 2;
+export const SYNC_NON_REPORT_LIMIT = 2;
 const heavyLimit = 3;
 const controlLimit = 8;
 
@@ -243,7 +244,7 @@ export function installSyncAdmission(app: FastifyInstance): void {
           : active.report + nonReport >= heavyLimit ||
             (kind === "report"
               ? active.report >= SYNC_REPORT_LIMIT || reports.has(key!)
-              : nonReport >= 2);
+              : nonReport >= SYNC_NON_REPORT_LIMIT);
       if (busy) {
         observed[kind].busy++;
         const seconds = 2 + Math.floor(Math.random() * 3);

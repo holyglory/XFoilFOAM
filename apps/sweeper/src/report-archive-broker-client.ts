@@ -1,3 +1,4 @@
+import { WORKER_REPORT_TRANSFER_TIMEOUT_MS } from "@aerodb/core/registered-archive-read";
 import { readWorkerReportVolume } from "./worker-report-volume";
 import { readLegacyWorkerReportArchiveText } from "./legacy-worker-report-read";
 import { readRegisteredWorkerReportArchiveText } from "./registered-worker-report-read";
@@ -34,7 +35,6 @@ const MAX_STORED_BYTES = 256 * 1024 ** 2;
 const MAX_JSON_BYTES = 512 * 1024 ** 2;
 const MAX_LINE_BYTES = 64 * 1024 ** 2;
 const MAX_MEMBERS = 256;
-const TRANSFER_TIMEOUT_MS = 10 * 60_000;
 
 function assertLocalIdentity(
   executionId: string,
@@ -81,7 +81,6 @@ function assertArchive(
       "Worker report archive receipt changed its immutable scope",
     );
 }
-
 
 function archiveUrl(baseUrl: string, executionId: string, sha256: string) {
   return `${baseUrl}/progressive-executions/${executionId}/report-archives/${sha256}`;
@@ -148,7 +147,7 @@ export async function putWorkerReportBundle<F extends "jsonl" | typeof WORKER_RE
       {
         method: "POST",
         redirect: "error",
-        signal: AbortSignal.timeout(TRANSFER_TIMEOUT_MS),
+        signal: AbortSignal.timeout(WORKER_REPORT_TRANSFER_TIMEOUT_MS),
         headers: {
           "content-type": "application/gzip",
           "content-length": String(identity.byteSize),
@@ -331,9 +330,9 @@ async function openWorkerGeneration(
         signal: identity.signal
           ? AbortSignal.any([
               identity.signal,
-              AbortSignal.timeout(TRANSFER_TIMEOUT_MS),
+              AbortSignal.timeout(WORKER_REPORT_TRANSFER_TIMEOUT_MS),
             ])
-          : AbortSignal.timeout(TRANSFER_TIMEOUT_MS),
+          : AbortSignal.timeout(WORKER_REPORT_TRANSFER_TIMEOUT_MS),
         headers: { "x-xfoilfoam-solver-token": owned.authToken },
       },
     );
