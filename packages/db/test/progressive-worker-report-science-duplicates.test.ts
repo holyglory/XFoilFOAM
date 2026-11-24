@@ -129,6 +129,7 @@ async function prepare(base: ArchiveFixture, inline = false) {
       nullResult?: boolean;
       headerState?: "running" | "cancelled";
       mutate?: (report: ProgressiveRemoteReport) => void;
+      sourceText?: (report: ProgressiveRemoteReport) => string;
     } = {},
   ) => {
     const report = structuredClone(scientific);
@@ -158,8 +159,13 @@ async function prepare(base: ArchiveFixture, inline = false) {
       report.stopProof = terminal.proof as ProgressiveRemoteReport["stopProof"];
     input.mutate?.(report);
     const signature = analysisContentHash(report);
+    const text = input.sourceText
+      ? input.sourceText(report)
+      : JSON.stringify(report);
+    if (input.sourceText)
+      expect(analysisContentHash(JSON.parse(text))).toBe(signature);
     await db.execute(sql`INSERT INTO progressive_worker_reports(sim_job_id,sequence,content_signature,report,acknowledged_at)
-      VALUES (${executionId}::uuid,${sequence},${signature},${JSON.stringify(report)}::jsonb,clock_timestamp())`);
+      VALUES (${executionId}::uuid,${sequence},${signature},${text}::jsonb,clock_timestamp())`);
     return { report, signature };
   };
   if (inline)
@@ -786,6 +792,162 @@ it("checks each signed envelope and preserves a one-sample history change on rep
       reportByteSize: Buffer.byteLength(member.reportText),
     });
     await expect(whole.verify()).rejects.toThrow("canonical signature");
+  });
+});
+
+it("authenticates each reconstructed result across consecutive and changing payloads, then replays exact originals", async () => {
+  await fixture(async (f) => {
+    const diagnosticKey = 'quote"\\line\n翼';
+    // PostgreSQL preserves trailing numeric scale while the transport signature
+    // uses the parsed number. Both representations must survive a normal read.
+    const textWithScale = (report: ProgressiveRemoteReport) =>
+      JSON.stringify(report).replaceAll(
+        '"numericScale":1.23',
+        '"numericScale":1.2300',
+      );
+    const first = 3510,
+      second = 3513,
+      held = 3515,
+      last = 3517;
+    for (const sequence of range(first, last)) {
+      await f.append(sequence, {
+        mutate(report) {
+          Object.assign(report.status, {
+            [diagnosticKey]: { numericScale: 1.23, notes: ["λ", null] },
+          });
+          Object.assign(report.result!, {
+            numericScale: 1.23,
+            label:
+              sequence === held
+                ? "different"
+                : sequence === second || sequence === second + 1
+                  ? "B"
+                  : "A",
+          });
+        },
+        sourceText: textWithScale,
+      });
+    }
+    await f.append(last + 1, { headerState: "cancelled" });
+    for (const sequence of [first, second]) {
+      expect(
+        await stageProgressiveWorkerEvidence(f.db, noEngine, f.executionId, {
+          reportSequence: sequence,
+        }),
+      ).toMatchObject({ kind: "staged" });
+    }
+    const before = await protectedState(f);
+    const original = await pageFor(f, range(first, last));
+    const input = original.page.members;
+    const hashes = input.map(
+      (m) => JSON.parse(m.rowText).result_payload_hash as string,
+    );
+    expect(new Set(hashes).size).toBe(3);
+    expect(hashes).toEqual([
+      hashes[0],
+      hashes[0],
+      hashes[0],
+      hashes[3],
+      hashes[3],
+      hashes[5],
+      hashes[0],
+      hashes[0],
+    ]);
+    for (const m of input) {
+      expect(m.reportText).toContain('"numericScale": 1.2300');
+      expect(m.reportText).toContain(JSON.stringify(diagnosticKey));
+    }
+    const missing = "0".repeat(64);
+    await expect(
+      f.db.transaction((tx) =>
+        tx.execute(sql`
+      SELECT resolve_progressive_report(report,${missing}) FROM progressive_worker_reports
+      WHERE sim_job_id=${f.executionId}::uuid AND sequence=${first}`),
+      ),
+    ).rejects.toThrow(
+      "Missing or inconsistent progressive report result payload",
+    );
+    await expect(
+      f.db.transaction((tx) =>
+        tx.execute(sql`
+      DELETE FROM progressive_report_result_payloads WHERE content_hash=${hashes[0]}`),
+      ),
+    ).rejects.toThrow("Progressive report result payload is still referenced");
+    await expect(
+      f.db.transaction((tx) =>
+        tx.execute(sql`UPDATE progressive_report_result_payloads
+          SET result=jsonb_set(result,'{numericScale}','1.24'::jsonb)
+          WHERE content_hash=${hashes[0]}`),
+      ),
+    ).rejects.toThrow("Progressive report result payload is immutable");
+    // The final duplicate has a real witness. A different claimed body must
+    // roll back the earlier row updates, even after switching payload groups.
+    const [decoded] = await f.db.execute(
+      sql`SELECT ${boundPageLiteral(original.proof)} AS page`,
+    );
+    const changed = decoded.page as {
+      members: { sequence: number; reportSha256: string }[];
+    };
+    changed.members.find((m) => m.sequence === last)!.reportSha256 = missing;
+    await expect(
+      f.db.transaction((tx) =>
+        tx.execute(
+          sql`SELECT register_legacy_report_archive_custody(${JSON.stringify(changed)}::jsonb)`,
+        ),
+      ),
+    ).rejects.toThrow("Legacy source differs from registered restore");
+    const [unchanged] = await f.db
+      .execute(sql`SELECT count(*)::int AS n FROM progressive_worker_reports
+      WHERE sim_job_id=${f.executionId}::uuid AND sequence BETWEEN ${first} AND ${last} AND archived_at IS NULL`);
+    expect(unchanged.n).toBe(input.length);
+
+    const skipped = [
+      expect.objectContaining({ sequence: held, reason: "report_not_staged" }),
+    ];
+    expect(await apply(f, original)).toMatchObject({
+      receipt: {
+        registeredMembers: 7,
+        compactedReports: 7,
+        duplicateReports: 5,
+        skipped,
+      },
+    });
+    const hold = input.find((m) => m.sequence === held)!;
+    // A direct UPDATE with a catalog entry carrying a different digest must
+    // still fail at the independent 0202 trigger. The savepoint reverts the entry.
+    await expect(
+      f.db.transaction(async (tx) => {
+        const [row] =
+          await tx.execute(sql`SELECT archive_bundle_id AS bundle FROM progressive_worker_reports
+        WHERE sim_job_id=${f.executionId}::uuid AND sequence=${first}`);
+        await tx.execute(sql`INSERT INTO progressive_report_archive_members
+        (bundle_id,source_kind,sim_job_id,sequence,member_kind,content_signature,report_sha256,report_byte_size,legacy_row_sha256,legacy_row_byte_size)
+        VALUES (${row.bundle}::uuid,'worker',${f.executionId}::uuid,${held},'report',${hold.contentSignature},${missing},
+          ${hold.reportByteSize},${hold.rowSha256},${Buffer.byteLength(hold.rowText)})`);
+        await tx.execute(sql`UPDATE progressive_worker_reports SET report=progressive_report_compact_header(report),result_payload_hash=NULL,
+          archive_bundle_id=${row.bundle}::uuid,archived_at=clock_timestamp()
+        WHERE sim_job_id=${f.executionId}::uuid AND sequence=${held}`);
+      }),
+    ).rejects.toThrow("Exact report bytes differ from verified archive member");
+    expect(await apply(f, original)).toMatchObject({
+      receipt: {
+        registeredMembers: 0,
+        compactedReports: 0,
+        replayedMembers: 7,
+        skipped,
+      },
+    });
+    const restored = await pageFor(f, range(first, last));
+    expect(
+      restored.page.members.map((m) => [
+        m.contentSignature,
+        m.reportText,
+        m.reportSha256,
+      ]),
+    ).toEqual(
+      input.map((m) => [m.contentSignature, m.reportText, m.reportSha256]),
+    );
+    expect(await protectedState(f)).toEqual(before);
   });
 });
 
