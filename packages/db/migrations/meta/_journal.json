@@ -1625,6 +1625,13 @@
       "when": 1795363913062,
       "tag": "0231_reuse_verified_worker_report_result_text",
       "breakpoints": true
+    },
+    {
+      "idx": 232,
+      "version": "7",
+      "when": 1795363913063,
+      "tag": "0232_registered_short_work_windows",
+      "breakpoints": true
     }
   ]
 }

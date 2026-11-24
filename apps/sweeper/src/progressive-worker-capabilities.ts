@@ -12,7 +12,7 @@ import {
 import {
   parseProgressiveRemoteCapabilities,
   type ProgressiveRemoteCapabilities,
-} from "./progressive-remote-admission";
+} from "./progressive-remote-capabilities";
 
 interface Observation {
   checkedAt: number;

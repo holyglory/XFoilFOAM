@@ -1,3 +1,10 @@
+import {
+  chooseShortWork,
+  matchesShortWork,
+  recordShortWorkOffer,
+  shortWorkStillOwnsWholeGroup,
+  RetryOrdinaryDispatch,
+} from "./short-work-window";
 import { progressiveAdmissionReportPressureSql } from "./progressive-progress-selection";
 import { randomUUID } from "node:crypto";
 import { sql } from "drizzle-orm";
@@ -14,7 +21,11 @@ import {
   type ProgressiveCfdLease,
   type ProgressiveRemoteExecutionEnvelope,
 } from "@aerodb/db";
-import { isEngineIdentity, type EngineIdentity } from "@aerodb/engine-client";
+import { observedProgressiveRemoteCapabilities } from "./progressive-remote-capabilities";
+export {
+  parseProgressiveRemoteCapabilities,
+  type ProgressiveRemoteCapabilities,
+} from "./progressive-remote-capabilities";
 import { composeProgressiveCfdJob } from "./progressive-cfd-jobs";
 import {
   deferProgressiveClaim,
@@ -25,57 +36,6 @@ import { retireSettledProgressivePromise } from "./progressive-remote-lease-reti
 
 const PROGRESSIVE_REPORT_BACKPRESSURE_LIMIT = 2_000;
 const NO_UNRESERVED_CPU_SLOTS = "The worker has no unreserved CPU slots";
-
-export interface ProgressiveRemoteCapabilities {
-  localTimeStepVersion?: number | null;
-  version: 1;
-  solverBudgetVersion: 2;
-  meshRecoveryVersion: number;
-  uransRecoveryVersion: number | null;
-  engine: EngineIdentity;
-  executionPools: string[];
-}
-
-export function parseProgressiveRemoteCapabilities(
-  value: unknown,
-): ProgressiveRemoteCapabilities | null {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
-  const raw = value as Record<string, unknown>;
-  if (
-    raw.version !== 1 ||
-    raw.solverBudgetVersion !== 2 ||
-    (raw.localTimeStepVersion != null &&
-      (!Number.isSafeInteger(raw.localTimeStepVersion) ||
-        Number(raw.localTimeStepVersion) < 0)) ||
-    !Number.isSafeInteger(raw.meshRecoveryVersion) ||
-    Number(raw.meshRecoveryVersion) < 0 ||
-    !(
-      raw.uransRecoveryVersion === null ||
-      (Number.isSafeInteger(raw.uransRecoveryVersion) &&
-        Number(raw.uransRecoveryVersion) >= 0)
-    ) ||
-    !isEngineIdentity(raw.engine) ||
-    !Array.isArray(raw.executionPools) ||
-    raw.executionPools.length < 1 ||
-    raw.executionPools.length > 16 ||
-    raw.executionPools.some(
-      (pool) => typeof pool !== "string" || !pool.trim() || pool.length > 128,
-    ) ||
-    new Set(raw.executionPools).size !== raw.executionPools.length
-  )
-    return null;
-  return {
-    version: 1,
-    solverBudgetVersion: 2,
-    ...(raw.localTimeStepVersion != null
-      ? { localTimeStepVersion: Number(raw.localTimeStepVersion) }
-      : {}),
-    meshRecoveryVersion: Number(raw.meshRecoveryVersion),
-    uransRecoveryVersion: raw.uransRecoveryVersion as number | null,
-    engine: { ...raw.engine },
-    executionPools: [...raw.executionPools] as string[],
-  };
-}
 
 class RemoteProgressiveAdmissionWait extends Error {}
 
@@ -145,13 +105,29 @@ async function findAdmissionCellConflicts(
   `);
 }
 
+type RemoteDispatchOutcome =
+  | { kind: "prepared"; envelope: ProgressiveRemoteExecutionEnvelope }
+  | { kind: "waiting"; reason: string; deferredUnits?: number };
+
 export async function prepareProgressiveRemoteDispatch(
   db: DB,
   solverId: string,
-): Promise<
-  | { kind: "prepared"; envelope: ProgressiveRemoteExecutionEnvelope }
-  | { kind: "waiting"; reason: string; deferredUnits?: number }
-> {
+): Promise<RemoteDispatchOutcome> {
+  try {
+    return await prepareRemoteDispatch(db, solverId);
+  } catch (error) {
+    if (!(error instanceof RetryOrdinaryDispatch)) throw error;
+    // The preferred transaction rolled back every unit, job and promise.
+    // Resume ordinary selection once with fresh capacity and authority checks.
+    return prepareRemoteDispatch(db, solverId, error.windowId);
+  }
+}
+
+async function prepareRemoteDispatch(
+  db: DB,
+  solverId: string,
+  skipWindowId?: string,
+): Promise<RemoteDispatchOutcome> {
   if (
     !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(
       solverId,
@@ -162,6 +138,7 @@ export async function prepareProgressiveRemoteDispatch(
     );
   let admissionPhase = "start";
   let claimedLeases: ProgressiveCfdLease[] = [];
+  let attemptedWindow: string | undefined;
   try {
     return await db.transaction(async (transaction) => {
       const connection = transaction as unknown as DB;
@@ -198,7 +175,9 @@ export async function prepareProgressiveRemoteDispatch(
           "Hub campaign dispatch is paused or unavailable",
         );
       const [solver] = await connection.execute(sql`
-        SELECT id, instance_id, instance_name, public_endpoint, cpu_capacity, cpu_budget, max_active_polar_promises, metadata, clock_timestamp() AS checked_at
+        SELECT id, instance_id, instance_name, public_endpoint, cpu_capacity, cpu_budget, max_active_polar_promises, metadata, clock_timestamp() AS checked_at,
+          (SELECT w.id FROM registered_short_work_windows w WHERE w.solver_id=registered_remote_solvers.id
+            AND w.ended_at IS NULL AND w.expires_at>clock_timestamp()) AS short_window_id
         FROM registered_remote_solvers WHERE id = ${solverId}::uuid AND revoked_at IS NULL
           AND auth_token_hash IS NOT NULL AND credential_version > 0
           AND last_heartbeat_at > clock_timestamp() - interval '2 minutes'
@@ -207,23 +186,11 @@ export async function prepareProgressiveRemoteDispatch(
         throw new RemoteProgressiveAdmissionWait(
           "The registered worker has no recent authenticated heartbeat",
         );
-      const capabilities = parseProgressiveRemoteCapabilities(
-        (solver.metadata as Record<string, unknown> | null)
-          ?.progressiveExecution,
+      const capabilities = observedProgressiveRemoteCapabilities(
+        solver.metadata,
+        new Date(String(solver.checked_at)),
       );
-      const observedAt = (solver.metadata as Record<string, unknown> | null)
-        ?.progressiveExecutionObservedAt;
-      const observationAge =
-        typeof observedAt === "string"
-          ? new Date(String(solver.checked_at)).getTime() -
-            Date.parse(observedAt)
-          : NaN;
-      if (
-        !capabilities ||
-        !Number.isFinite(observationAge) ||
-        observationAge < -30000 ||
-        observationAge >= 60000
-      )
+      if (!capabilities)
         throw new RemoteProgressiveAdmissionWait(
           "The worker has not advertised the exact progressive execution contract",
         );
@@ -243,9 +210,7 @@ export async function prepareProgressiveRemoteDispatch(
         capacity -
         (await progressiveRemoteAdmissionReservedSlots(connection, solverId));
       if (!Number.isSafeInteger(available) || available < 1)
-        throw new RemoteProgressiveAdmissionWait(
-          NO_UNRESERVED_CPU_SLOTS,
-        );
+        throw new RemoteProgressiveAdmissionWait(NO_UNRESERVED_CPU_SLOTS);
       const [admissionGate] = await connection.execute(sql`
         SELECT pg_try_advisory_xact_lock(
           hashtextextended('progressive-cfd-admission', 0)
@@ -256,7 +221,24 @@ export async function prepareProgressiveRemoteDispatch(
           "Progressive admission is busy with another campaign maintenance pass",
         );
       admissionPhase = "claim";
+      const choice = solver.short_window_id
+        ? await chooseShortWork(
+            connection,
+            solverId,
+            String(solver.short_window_id),
+            available,
+            solver.metadata,
+            new Date(String(solver.checked_at)),
+            skipWindowId,
+          )
+        : ({ kind: "normal" } as const);
+      if (choice.kind === "wait")
+        throw new RemoteProgressiveAdmissionWait(choice.reason);
+      if (choice.kind === "prefer") attemptedWindow = choice.windowId;
       const claimInput = {
+        ...(choice.kind === "prefer"
+          ? { preferredWorkId: choice.plan.workId }
+          : {}),
         owner: `remote-progressive-${solverId}`,
         remoteSolverId: solverId,
         leaseSeconds: PROGRESSIVE_REMOTE_START_LEASE_SECONDS,
@@ -269,6 +251,16 @@ export async function prepareProgressiveRemoteDispatch(
         campaignLockMode: "skip",
       } as const;
       let leases = await claimProgressiveCfdBatch(connection, claimInput);
+      if (
+        choice.kind === "prefer" &&
+        (!matchesShortWork(choice.plan, leases) ||
+          !(await shortWorkStillOwnsWholeGroup(
+            connection,
+            choice.plan,
+            leases,
+          )))
+      )
+        throw new RetryOrdinaryDispatch(choice.windowId);
       if (!leases.length) {
         // Keep the transaction's 10s lock bound: normal scoped settlement can
         // hold the campaign mutex longer than a subsecond fallback would allow.
@@ -301,8 +293,27 @@ export async function prepareProgressiveRemoteDispatch(
           "The worker does not execute this exact engine and numerical pool",
         );
       const [job] = await connection.execute(sql`
-        SELECT airfoil_id, simulation_preset_revision_id FROM sim_jobs WHERE id = ${composed.jobId}::uuid
+        SELECT airfoil_id, simulation_preset_revision_id, admission_cpu_slots FROM sim_jobs WHERE id = ${composed.jobId}::uuid
       `);
+      if (
+        "headroom" in choice &&
+        choice.headroom != null &&
+        Number(job.admission_cpu_slots) > choice.headroom
+      )
+        throw new RemoteProgressiveAdmissionWait(
+          "The complete request exceeds the registered worker's observed free slots",
+        );
+      if (
+        choice.kind === "prefer" &&
+        (job.simulation_preset_revision_id !== choice.plan.revisionId ||
+          Number(job.admission_cpu_slots) !== choice.plan.slots ||
+          (composed.request.resources?.solver_processes ?? null) !==
+            choice.plan.solverProcesses ||
+          composed.request.resources?.case_concurrency !== 1 ||
+          composed.request.solver?.warm_start !== true ||
+          composed.request.expected_execution_pool !== choice.plan.pool)
+      )
+        throw new RetryOrdinaryDispatch(choice.windowId);
       await retireSettledAdmissionOwners(connection, {
         airfoilId: String(job.airfoil_id),
         simulationPresetRevisionId: String(job.simulation_preset_revision_id),
@@ -343,9 +354,17 @@ export async function prepareProgressiveRemoteDispatch(
         promiseId,
         solverId,
       });
+      if (choice.kind === "prefer")
+        await recordShortWorkOffer(connection, choice.windowId, composed.jobId);
       return { kind: "prepared" as const, envelope: bound.envelope };
     });
   } catch (error) {
+    if (
+      attemptedWindow &&
+      (error instanceof ProgressiveEvidenceCellOwned ||
+        isActivePromisePointConflict(error))
+    )
+      throw new RetryOrdinaryDispatch(attemptedWindow);
     if (error instanceof ProgressiveEvidenceCellOwned)
       return {
         kind: "waiting" as const,
@@ -356,8 +375,7 @@ export async function prepareProgressiveRemoteDispatch(
     if (isActivePromisePointConflict(error) && claimedLeases.length)
       return {
         kind: "waiting" as const,
-        reason:
-          "Exact result cells became owned during remote promise binding",
+        reason: "Exact result cells became owned during remote promise binding",
         deferredUnits: await deferProgressiveClaim(
           db,
           new ProgressiveEvidenceCellOwned(claimedLeases),
@@ -366,7 +384,9 @@ export async function prepareProgressiveRemoteDispatch(
     if (error instanceof RemoteProgressiveAdmissionWait)
       return { kind: "waiting", reason: error.message };
     if (
-      ["40P01", "55P03", "57014"].includes(String((error as { code?: unknown }).code)) ||
+      ["40P01", "55P03", "57014"].includes(
+        String((error as { code?: unknown }).code),
+      ) ||
       (error instanceof Error && /lock timeout/i.test(error.message))
     )
       return {
@@ -422,9 +442,15 @@ async function prepareProgressiveRemoteFleetRun(db: DB) {
   };
   // A fleet with no free slots cannot admit work in this pass. Only scan
   // report history when at least one registered worker could actually claim.
-  const hasCapacity = solvers.some((solver) => Number(solver.capacity) > Number(solver.reserved));
+  const hasCapacity = solvers.some(
+    (solver) => Number(solver.capacity) > Number(solver.reserved),
+  );
   const [pressure] = hasCapacity
-    ? await db.execute(progressiveAdmissionReportPressureSql(PROGRESSIVE_REPORT_BACKPRESSURE_LIMIT))
+    ? await db.execute(
+        progressiveAdmissionReportPressureSql(
+          PROGRESSIVE_REPORT_BACKPRESSURE_LIMIT,
+        ),
+      )
     : [];
   if (pressure?.throttled === true) {
     for (const solver of solvers) {
@@ -444,7 +470,10 @@ async function prepareProgressiveRemoteFleetRun(db: DB) {
     if (!Number.isSafeInteger(capacity) || capacity < 1) continue;
     if (Number(solver.reserved) >= capacity) {
       receipt.waiting += 1;
-      receipt.waitingReasons.push({ solverId, reason: NO_UNRESERVED_CPU_SLOTS });
+      receipt.waitingReasons.push({
+        solverId,
+        reason: NO_UNRESERVED_CPU_SLOTS,
+      });
       continue;
     }
     for (

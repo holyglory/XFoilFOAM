@@ -117,6 +117,7 @@ import { verifyProgressiveWorkerReportDelivery } from "./progressive-worker-repo
 import { verifyProgressiveAcceptedArchiveReplay } from "./progressive-accepted-archive-fixture";
 import { verifyProgressiveRemoteReportInventory } from "./progressive-remote-inventory-fixture";
 import { verifyProgressiveRemoteStart } from "./progressive-remote-start-fixture";
+import { verifyRegisteredShortWork } from "./registered-short-work-window-fixture";
 import { verifyProgressiveWorkerJobMirror } from "./progressive-worker-job-fixture";
 import {
   progressiveRemoteEvidenceResult,
@@ -6395,6 +6396,17 @@ describe("progressive CPU admission", () => {
       }
     });
   });
+
+  it("prefers one complete registered short-work group at a vacancy and expires back to ordinary admission", async () => {
+    await ready((scope) =>
+      verifyRegisteredShortWork(
+        db,
+        scope.generationId,
+        scope.poolId,
+        targetUrl.toString(),
+      ),
+    );
+  }, 90_000);
 
   it("progressive remote dispatch composes only after authenticated capabilities and rolls back incompatible work", async () => {
     await ready(async ({ generationId, poolId }) => {

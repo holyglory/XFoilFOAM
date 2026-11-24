@@ -18,6 +18,7 @@
     "precalc-final-owner-backfill": "tsx src/precalc-final-owner-backfill.ts",
     "canary-evidence-cleanup": "tsx src/canary-evidence-cleanup-cli.ts",
     "canary-evidence-ownership": "tsx src/canary-evidence-ownership-cli.ts",
+    "short-work-window": "node --import tsx src/short-work-window-cli.ts",
     "successor:admit-once": "tsx src/successor-continuation-once-cli.ts",
     "urans-canary:admit-once": "tsx src/three-stage-urans-canary-once-cli.ts",
     "precalc-failures:export": "tsx src/precalc-failure-evaluation-export.ts",

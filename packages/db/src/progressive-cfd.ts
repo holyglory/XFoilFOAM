@@ -216,6 +216,13 @@ export async function initializeProgressiveCfdWork(
   });
 }
 
+/** The exact effective numerical recipe used by the ordinary claimant. */
+export function progressiveCfdUnitRecipeSql(localStepPolicy = currentLocalStepPolicySql()) {
+  return sql`coalesce((SELECT ${normalizeProgressiveMaterialDomainRecoveryRecipeSql(sql`recovery.recipe`)}
+      FROM progressive_cfd_recovery_plans recovery WHERE recovery.unit_id = unit.id ORDER BY recovery.ordinal DESC LIMIT 1),
+      (SELECT ${localStepRecipeSql(sql`unit.recipe`, sql`policy.smoothing`)} FROM campaign_local_step_policies policy WHERE policy.id=(${localStepPolicy})), unit.recipe)`;
+}
+
 export async function claimProgressiveCfdUnit(
   db: DB,
   input: {
@@ -228,6 +235,7 @@ export async function claimProgressiveCfdUnit(
     localTimeStepVersion?: number | null;
     remoteSolverId?: string;
     campaignLockMode?: "skip" | "wait";
+    preferredWorkId?: string;
     sameTarget?: {
       generationId: string;
       targetId: string;
@@ -267,6 +275,11 @@ export async function claimProgressiveCfdUnit(
     throw new Error(
       "Recovery ownership requires an exact registered worker identity",
     );
+  if (
+    input.preferredWorkId !== undefined &&
+    !/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(input.preferredWorkId)
+  )
+    throw new Error("Preferred CFD admission requires an exact work id");
   return db.transaction(async (transaction) => {
     const connection = transaction as unknown as DB;
     const [epoch] = await connection.execute(
@@ -274,9 +287,7 @@ export async function claimProgressiveCfdUnit(
     );
     if (!epoch) throw new Error("Calculation epoch is missing");
     const localStepPolicy = currentLocalStepPolicySql();
-    const effectiveRecipe = sql`coalesce((SELECT ${normalizeProgressiveMaterialDomainRecoveryRecipeSql(sql`recovery.recipe`)}
-      FROM progressive_cfd_recovery_plans recovery WHERE recovery.unit_id = unit.id ORDER BY recovery.ordinal DESC LIMIT 1),
-      (SELECT ${localStepRecipeSql(sql`unit.recipe`, sql`policy.smoothing`)} FROM campaign_local_step_policies policy WHERE policy.id=(${localStepPolicy})), unit.recipe)`;
+    const effectiveRecipe = progressiveCfdUnitRecipeSql(localStepPolicy);
     const effectiveBudget = progressiveCfdEffectiveBudgetSql(sql`unit`);
     const pendingBudgetExtension = progressiveCfdBudgetExtensionPendingSql(
       sql`unit`,
@@ -398,6 +409,11 @@ export async function claimProgressiveCfdUnit(
       ORDER BY campaign.priority DESC, campaign."createdAt", campaign.id LIMIT 1 FOR UPDATE ${input.campaignLockMode === "wait" ? sql`` : sql`SKIP LOCKED`}
     `);
     if (!campaign) return null;
+    // Choose the winning campaign with the ordinary policy first. A preference
+    // within that campaign cannot advance a lower-priority campaign or stage.
+    const preferredWork = input.preferredWorkId
+      ? sql`AND work.id = ${input.preferredWorkId}::uuid AND target.mach > 0 AND target.mach < 1`
+      : sql``;
     const cohortReadiness = campaign.all_stage3
       ? sql``
       : sql`, ${progressiveCohortReadinessSql(
@@ -432,6 +448,7 @@ export async function claimProgressiveCfdUnit(
             AND ${preciseTargetReady}
             AND ${progressiveCfdAdmissionSql("generation", sql`work.target_id`, true)}
             AND (${machPredicate})
+            ${preferredWork}
             AND ${targetFilter}
             AND ${familyFilter}
             AND ${recoveryOwner}
@@ -466,6 +483,7 @@ export async function claimProgressiveCfdUnit(
       JOIN progressive_generations generation ON generation.id = work.generation_id
       JOIN polar_analysis_targets target ON target.id = work.target_id`;
       const candidateGuard = sql`generation.campaign_id = ${campaign.id} AND generation.epoch_id = ${epoch.id}
+        ${preferredWork}
         AND (work.stage = 3 OR ${cohortInitialized})
         AND ${targetFilter}
         AND ${familyFilter}
@@ -495,7 +513,7 @@ export async function claimProgressiveCfdUnit(
         LIMIT 1 FOR UPDATE OF generation, work, unit SKIP LOCKED
       `;
       selected = sql`selected AS MATERIALIZED (${candidateQuery()})`;
-      if (!input.sameTarget) {
+      if (!input.preferredWorkId && !input.sameTarget) {
         // These cheap heads are an ordered superset, never an eligibility test.
         // Ineligible or locked heads cannot hide work beyond the prefix: the
         // complete selector below is executed separately on every prefix miss.
@@ -672,6 +690,7 @@ export async function claimProgressiveCfdBatch(
     localTimeStepVersion?: number | null;
     remoteSolverId?: string;
     campaignLockMode?: "skip" | "wait";
+    preferredWorkId?: string;
   },
 ): Promise<ProgressiveCfdLease[]> {
   return db.transaction(async (transaction) => {

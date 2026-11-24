@@ -225,3 +225,26 @@ scripts/deploy/rebuild-remote-solver-engine.sh --historical-raw-gateway recover 
 Recovery can cancel a prepared drain while jobs are still running. A failed image switch restores the original gateway only after the same live-work checks pass. Its rollback image has a stopped, networkless Docker reference until restoration. If the API is unavailable, the original worker runs the installed queue inspector against the live broker. A previously verified gateway completes the writer restoration without a second switch. The operator refuses a downgrade if any database completion or local file retirement already depends on the new gateway.
 
 A drain prepared by the original gateway workflow can be resumed with the same `prepare` command after the updated workflow ships. While the drain is in its captured phase, the operator authenticates the earlier service identities, installed gateway sources, registered numerical worker, still-closed pools, and original writer and transfer states. It binds the effective running configuration and the canonical gateway Compose hash. It publishes the exact original journal, sealed replacement, and their transition receipt before atomically replacing the current capture. A retry authenticates that same receipt. A replaced service, unrecognized source, changed Compose specification or later image phase refuses adoption.
+
+### Preferring one short existing batch at a vacancy
+
+Run the scheduling command on the hub sweeper. Select the registered solver, its advertised pool, and the stable work ID of a complete subsonic target. The preview reads the existing execution revision and reports the ordinary admission weight, solver-process setting, remaining angles, active-solver seconds and attempt counts. A null solver-process setting uses the installed engine default. Those seconds exclude meshing, packaging and delivery.
+
+```sh
+pnpm --filter @aerodb/sweeper short-work-window preview \
+  --solver "$solver_id" --work "$work_id" --pool "$pool_key" \
+  --max-active-seconds "$batch_seconds"
+
+pnpm --filter @aerodb/sweeper short-work-window enable \
+  --solver "$solver_id" --work "$work_id" --pool "$pool_key" --slots "$slots" \
+  --max-active-seconds "$batch_seconds" --expect-sha256 "$plan_sha256" --until "$utc_deadline"
+```
+
+Pass `--slots` to require a particular ordinary admission weight. Use the digest returned by the preview and an absolute UTC deadline within one hour. The hub checks the original campaign and worker gates at a real vacancy. It can offer one whole serially marched batch with the pinned numerical revision, angles and per-angle budgets. A changed group falls back to ordinary selection. While the window is active, an outstanding live assignment gets its opportunity to start before another offer is prepared. The worker obtains its usual signed start permit and CPU reservation.
+
+```sh
+pnpm --filter @aerodb/sweeper short-work-window status --solver "$solver_id"
+pnpm --filter @aerodb/sweeper short-work-window end --solver "$solver_id" --window "$window_id"
+```
+
+Status includes the absolute expiry and the issued job ID. Expiry or an explicit end returns selection to ordinary scheduling. Any job already issued follows its original contract. Use the complete-state gateway procedure above for a separately timed installation.

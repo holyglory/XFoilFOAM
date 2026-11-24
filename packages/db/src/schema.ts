@@ -8601,6 +8601,31 @@ export const progressiveWorkerSubmissionIntents = pgTable(
   }),
 );
 
+/** A hub scheduling preference. Assignment and scientific authority remain
+ * with the ordinary progressive dispatch, its promise and signed request. */
+export const registeredShortWorkWindows = pgTable(
+  "registered_short_work_windows",
+  {
+    id: uuid("id").primaryKey(),
+    solverId: uuid("solver_id").notNull().references(() => registeredRemoteSolvers.id, {onDelete:"cascade"}),
+    workId: uuid("work_id").notNull().references(() => progressiveWork.id, {onDelete:"cascade"}),
+    plan: jsonb("plan").notNull().$type<Record<string, unknown>>(),
+    planSha256: text("plan_sha256").notNull(),
+    openedAt: timestamp("opened_at", {withTimezone:true}).notNull().default(sql`clock_timestamp()`),
+    expiresAt: timestamp("expires_at", {withTimezone:true}).notNull(),
+    endedAt: timestamp("ended_at", {withTimezone:true}),
+    issuedJobId: uuid("issued_job_id"),
+    issuedAt: timestamp("issued_at", {withTimezone:true}),
+  },
+  (w) => ({
+    openSolver: uniqueIndex("registered_short_work_windows_open_solver_uq").on(w.solverId).where(sql`${w.endedAt} IS NULL`),
+    validPlan: check("registered_short_work_windows_plan_check", sql`jsonb_typeof(${w.plan})='object'`),
+    digest: check("registered_short_work_windows_plan_sha256_check", sql`${w.planSha256} ~ '^[0-9a-f]{64}$'`),
+    deadline: check("registered_short_work_windows_deadline_check", sql`${w.expiresAt}>${w.openedAt} AND ${w.expiresAt}<=${w.openedAt}+interval '1 hour'`),
+    issued: check("registered_short_work_windows_issued_check", sql`(${w.issuedJobId} IS NULL)=(${w.issuedAt} IS NULL)`),
+  }),
+);
+
 export const progressiveWorkerReports = pgTable(
   "progressive_worker_reports",
   {
