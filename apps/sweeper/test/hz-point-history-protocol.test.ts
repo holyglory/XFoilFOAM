@@ -212,3 +212,33 @@ it("acknowledges the real hub handshake before any upload, keeps exact generatio
   await client.send({ operation: "close" });
   await session;
 });
+
+it("keeps reads serial, rotates a full channel, and falls back to one-shot old peers", async () => {
+  const { AttemptReadSession, MAX_ATTEMPT_READ_MESSAGES } = await import("../src/hz-attempt-read-session");
+  for (const supports of [true, false]) {
+    let opens = 0, closes = 0, active = 0;
+    const seen: unknown[] = [];
+    const session = new AttemptReadSession("worker", () => {
+      opens++;
+      return {
+        continuesAttemptReadSession: supports,
+        async ask(request) {
+          expect(++active).toBe(1);
+          seen.push(request.attemptReadSession);
+          await Promise.resolve();
+          active--;
+          return request.index;
+        },
+        async close() { closes++; },
+      };
+    });
+    const total = MAX_ATTEMPT_READ_MESSAGES + 1;
+    const values = Array.from({ length: total }, (_, index) => index);
+    expect(await Promise.all(values.map(index => session.ask({operation:"one",index})))).toEqual(values);
+    expect(() => session.ask({operation:"commit"})).toThrow(/read operation/);
+    await session.close();
+    expect(opens).toBe(supports ? 2 : total);
+    expect(closes).toBe(opens);
+    expect(seen.filter(value => value === "worker")).toHaveLength(supports ? total : 1);
+  }
+});

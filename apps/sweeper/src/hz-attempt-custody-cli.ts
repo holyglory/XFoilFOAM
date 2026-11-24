@@ -14,8 +14,8 @@ export { attemptRpc } from "./hz-attempt-wire";
 export async function attemptWorkerOperation(db: DB, r: Record<string, any>) {
   if (process.env.AIRFOILFOAM_DEPLOYMENT_ROLE !== "remote-solver")
     throw Error("Unexpected worker role");
-  // A custody RPC starts a fresh process. Load the scientific consumers
-  // only when this process handles a worker operation.
+  // Load the scientific consumers only on the worker. Each request receives
+  // its own database client, including reads on a reused SSH process.
   const {
     attemptPage,
     workerAttemptLimiter,
@@ -33,7 +33,7 @@ export async function attemptWorkerOperation(db: DB, r: Record<string, any>) {
   };
   if (
     r.requireTransfers === true &&
-    ["pending", "prepare", "page", "stage", "canonical-candidates", "canonical-bind"].includes(r.operation)
+    ["pending", "prepare", "page", "stage", "canonical-candidates", "canonical-bind", "registered-state"].includes(r.operation)
   )
     await checkHzTransferFence(db, owner);
   switch (r.operation) {
@@ -41,7 +41,7 @@ export async function attemptWorkerOperation(db: DB, r: Record<string, any>) {
       const [row] =
         await db.execute(sql`SELECT s.instance_id::text AS instance,s.remote_solver_registered_id::text AS solver,1 AS transfer_fence_protocol,
     to_regprocedure('attempt_evidence_hz_retained_limiter(uuid,uuid)') IS NOT NULL AS retained_contract,
-    1 AS pending_cursor_protocol,
+    1 AS pending_cursor_protocol, 1 AS registered_roster_protocol,
     EXISTS(SELECT FROM pg_attribute WHERE attrelid=to_regclass('attempt_evidence_storage_policy') AND attname='canonical_history_subtrees_enabled' AND NOT attisdropped)
       AS canonical_subtrees,
     to_regprocedure('attempt_evidence_hz_settled_limiter(uuid,uuid)') IS NOT NULL AS settled_receipt_contract,
@@ -49,6 +49,11 @@ export async function attemptWorkerOperation(db: DB, r: Record<string, any>) {
     WHERE s.id=1 AND s.remote_solver_registered_id IS NOT NULL AND s.upstream_base_url IS NOT NULL AND to_regprocedure('attempt_evidence_hz_limiter(uuid,uuid)') IS NOT NULL`);
       if (!row) throw Error("Worker contract unavailable");
       return row;
+    }
+    case "registered-state": {
+      if (!owner || !r.requireTransfers || !r.settled) throw new HistoryOperationError("registered_scope","denied");
+      const { registeredAttemptStates } = await import("./hz-attempt-registered-roster");
+      return registeredAttemptStates(db, r.pins, owner.instance);
     }
     case "one": {
       const [row] = await db.execute(
@@ -171,7 +176,7 @@ export async function attemptHubOperation(r: Record<string, any>) {
   const { HzAttemptHubStore } = await import("./hz-attempt-hub");
   const canonicalRead = r.operation === "read-canonical-source";
   const store = new HzAttemptHubStore(r.bucket, r.account,fetch,canonicalRead);
-  if (r.operation === "put" || canonicalRead) {
+  if (r.operation === "put" || canonicalRead || r.attemptReadSession === "hub") {
     const instance = exactId(r.instance),
       solver = exactId(r.solver);
     const { createClient } = await import("@aerodb/db/client");
@@ -191,7 +196,7 @@ export async function attemptHubOperation(r: Record<string, any>) {
     } finally {
       await c.sql.end({ timeout: 1 });
     }
-    if (!canonicalRead) return store.put(instance, r.proof, packedBytes(r.packed));
+    if (r.operation === "put") return store.put(instance, r.proof, packedBytes(r.packed));
     if (r.identity?.sourceInstance!==instance) throw new HistoryOperationError("canonical_original_owner","denied");
   }
   if (r.operation === "read" || canonicalRead)
@@ -235,5 +240,5 @@ if (
     } finally {
       await client.sql.end({ timeout: 1 });
     }
-  });
+  }, process.env.AIRFOILFOAM_DEPLOYMENT_ROLE === "remote-solver" ? "worker" : "hub");
 }

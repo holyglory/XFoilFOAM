@@ -42,7 +42,9 @@ import { readWorkerReportVolume } from "../src/worker-report-volume";
 import { readProgressiveReportArchiveText } from "@aerodb/db/progressive-report-archive";
 import { hzAttemptStorage } from "../src/hz-attempt-storage-cli";
 import { join } from "node:path";
-import { writeFile } from "node:fs/promises";
+import { readFile, readdir, writeFile } from "node:fs/promises";
+import { gzipSync } from "node:zlib";
+import { createHash } from "node:crypto";
 import { HistoryOperationError, SETTLED_REPORT_SIZE_LIMIT } from "@aerodb/core/point-history-protocol";
 
 function objectStore(originalCopy = false) {
@@ -397,7 +399,42 @@ export async function verifyHzAttemptTransition(
         if (request.operation==="commit") issued=request.proof as AttemptEvidenceFreshVerification;
         return relay.worker(request,write);
       }};
-      await hzAttemptStorage(["migrate",...config,"--id",id,"--include-settled-receipts"],{...io,relay:recorded});
+      if (tinyDelivery === "received") {
+        const pin = {
+          attempt:id, result:fresh.identity.resultId, job:fresh.identity.simJobId, archive:staged.id,
+          generation:fresh.identity.generation, source_sha256:fresh.identity.sourceSha256, source_byte_size:fresh.identity.sourceByteSize,
+          stored_sha256:fresh.identity.storedSha256, stored_byte_size:fresh.identity.storedByteSize,
+        };
+        const other = { ...pin, attempt:"00000001-0000-4000-8000-000000000001" };
+        const entries = [pin,other].sort((l,r)=>l.attempt.localeCompare(r.attempt));
+        const content = entries.map(r=>JSON.stringify(r)).join("\n")+"\n";
+        const checksum=createHash("sha256").update(content).digest("hex");
+        const roster=join(root,"registered.jsonl.gz"), directory=join(root,"registered-watch");
+        await writeFile(roster,gzipSync(content));
+        const args=["watch",...config,"--include-settled-receipts","--directory",directory,"--registered-roster",roster,"--registered-roster-sha256",checksum];
+        await expect(hzAttemptStorage([...args.slice(0,-1),"0".repeat(64)],io)).rejects.toThrow(/checksum|content changed/);
+        const noUpload: AttemptRelay = { ...recorded, hub(request) {
+          if (request.operation==="put") throw Error("Existing registered original must only be read");
+          return recorded.hub(request);
+        }};
+        const finish=new AbortController();
+        await hzAttemptStorage(args,{...io,relay:noUpload,signal:finish.signal,report(value) {
+          if ((value as {registeredRoster?:unknown}).registeredRoster) finish.abort();
+        }});
+        const folder=(await readdir(directory)).find(n=>n.startsWith("registered-"))!;
+        const page=JSON.parse(await readFile(join(directory,folder,"members-0.json"),"utf8"));
+        expect(page.receipts.find((v:typeof pin)=>v.attempt===id)).toMatchObject({...pin,event:expect.any(String),appReadback:expect.any(String)});
+        expect(page.receipts.find((v:typeof pin)=>v.attempt===other.attempt)).toMatchObject({held:"registered-original-owner-changed"});
+        const restarted=new AbortController();
+        await hzAttemptStorage(args,{...io,relay:{...noUpload,worker(request,write){
+          if(request.operation==="registered-state" || request.operation==="commit")throw Error("Completed roster replayed work");
+          if(request.operation==="page")restarted.abort();
+          return noUpload.worker(request,write);
+        }},signal:restarted.signal});
+        expect(restarted.signal.aborted).toBe(true);
+      } else {
+        await hzAttemptStorage(["migrate",...config,"--id",id,"--include-settled-receipts"],{...io,relay:recorded});
+      }
       expect(issued).toBeDefined();
       const proof=await assertShortProof(db,id,staged.id,issued,true);
       expect(proof.generation).toBe(fresh.identity.generation);

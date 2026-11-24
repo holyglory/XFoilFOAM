@@ -276,3 +276,25 @@ the same controller to verify. Ordinary publication of a replacement clears
 the prior field reference. The source receipt retains the original stored
 value size; field and reference storage are accounted separately from attempt
 compaction.
+
+## Catch up registered worker originals
+
+The existing registered-worker watch accepts `--registered-roster FILE.jsonl.gz`
+and `--registered-roster-sha256 SHA256` together with `--include-settled-receipts`.
+Use the SHA-256 of the uncompressed JSON lines. Rows must have distinct
+`attempt` UUIDs in ascending order and supply `result`, `job`, `archive`,
+the exact decimal `generation`, `source_sha256`, `source_byte_size`,
+`stored_sha256` and `stored_byte_size`. The native selection, signed worker
+report, complete generation read and application checks decide eligibility.
+
+The same locked watch processes up to eight roster owners alongside each fair
+page. It records the confirmed event, application readback and signed storage
+cost, or the reason for retaining the owner, under its existing progress
+directory. Restarting rechecks the current event for an unfinished page.
+After the finite pass, normal discovery continues for changed and new work.
+
+Read-only requests can share a role-specific SSH process for up to 64
+messages or two minutes. An idle process closes after 30 seconds. Each
+request opens fresh database work and validates its own scope. Older peers
+continue with single-message reads. Storage writes, replay locks, transfer
+fences and readback confirmations use their original short-lived operations.

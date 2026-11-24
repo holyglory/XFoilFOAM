@@ -1,4 +1,4 @@
-import { execFile } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { expect, vi } from "vitest";
@@ -36,6 +36,20 @@ async function verifyCanonicalApiProcess(db: DB, namespace: string, proof: Canon
   url.searchParams.set("options", `-c search_path=${namespace},public`);
   const entry = fileURLToPath(new URL("../../api/src/hz-attempt-custody-cli.ts", import.meta.url));
   const request = { id: 1, operation: "canonical-read", resultId: proof.resultId, kind: proof.kind, reference: proof.reference };
+  const batch = [
+    { ...request, id: 1, attemptReadSession: "api" },
+    { ...request, id: 2, attemptReadSession: "api" },
+    { ...request, id: 3, operation: "canonical-confirm", attemptReadSession: "api" },
+  ];
+  const sessionReplies = execFileSync(process.execPath, ["--import", "tsx", entry], {
+    env: { ...process.env, DATABASE_URL: url.toString() },
+    input: batch.map(r => JSON.stringify(r)).join("\n") + "\n", encoding: "utf8", timeout: 20000,
+  }).trim().split("\n").map(line => JSON.parse(line));
+  expect(sessionReplies).toEqual([
+    { id: 1, result: proof, attemptReadSession: "api" },
+    { id: 2, result: proof, attemptReadSession: "api" },
+    { id: 3, error: { operation: "attempt_read_scope", category: "denied", retryable: false } },
+  ]);
   for (const expectTimeout of [false, true]) {
     let pid: number | undefined;
     let reply!: Promise<string>;

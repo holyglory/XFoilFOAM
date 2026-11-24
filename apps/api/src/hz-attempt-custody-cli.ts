@@ -67,4 +67,4 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href)
     } finally {
       await c.sql.end({ timeout: 1 });
     }
-  });
+  }, "api");

@@ -1,3 +1,4 @@
+import { AttemptReadSession, isAttemptRead, type AttemptReadRole } from "./hz-attempt-read-session";
 import { checkLegacyHzFence } from "./hz-attempt-controller-fence";
 import type { HzWorkerOwner } from "./hz-attempt-transfer-fence";
 import { runOriginalCycle } from "./hz-attempt-original-cycle";
@@ -26,7 +27,7 @@ export async function hzAttemptStorage(
   const report = io.report ?? ((value) => console.log(JSON.stringify(value)));
   if (args.length === 1 && args[0] === "--help") {
     console.log(
-      "hz-attempt-storage-cli.ts plan [--id UUID | --until-complete] | status | migrate --apply (--id UUID | --directory DIR [--until-complete]) | watch --apply --directory DIR [--poll-seconds N] | restore --apply --id UUID. Writes require --bucket BUCKET --hub-account-file FILE. Worker scopes: --include-retained or --include-settled-receipts. Select --canonical-fields with a single settled-receipt migration to verify its canonical result fields. Add --originals-directory DIR [--originals-scope FILE] to the same watch for archive-only discovery and copies.",
+      "hz-attempt-storage-cli.ts plan [--id UUID | --until-complete] | status | migrate --apply (--id UUID | --directory DIR [--until-complete]) | watch --apply --directory DIR [--poll-seconds N] | restore --apply --id UUID. Writes require --bucket BUCKET --hub-account-file FILE. Worker scopes: --include-retained or --include-settled-receipts. A settled watch can pair --registered-roster FILE.jsonl.gz with --registered-roster-sha256 UNCOMPRESSED_SHA256. Select --canonical-fields with a single settled-receipt migration to verify its canonical result fields. Add --originals-directory DIR [--originals-scope FILE] to the same watch for archive-only discovery and copies.",
     );
     return;
   }
@@ -38,6 +39,8 @@ export async function hzAttemptStorage(
       "include-retained": { type: "boolean" },
       "include-settled-receipts": { type: "boolean" },
       "canonical-fields": { type: "boolean" },
+      "registered-roster": { type: "string" },
+      "registered-roster-sha256": { type: "string" },
       "originals-directory": { type: "string" },
       "originals-scope": { type: "string" },
       id: { type: "string" },
@@ -72,6 +75,8 @@ export async function hzAttemptStorage(
     (v.id && (continuous || mode === "status")) ||
     (v["canonical-fields"] && !(settled && mode==="migrate" && v.id)) ||
     (v["originals-directory"] && mode !== "watch") ||
+    (Boolean(v["registered-roster"]) !== Boolean(v["registered-roster-sha256"])) ||
+    (v["registered-roster"] && !(watching && write && settled && v.directory)) ||
     (v["originals-scope"] && !v["originals-directory"])
   )
     throw Error("Invalid command");
@@ -91,13 +96,24 @@ export async function hzAttemptStorage(
     ? null
     : (await readFile(v["hub-account-file"]!, "utf8")).trim();
   if (write && (!v.bucket || !account)) throw Error("Missing hub pin");
+  const sessions = new Map<AttemptReadRole, AttemptReadSession>();
+  let owner: HzWorkerOwner | undefined;
   const endpoint = async (
     host: string,
     box: string,
     entry: string,
     request: Record<string, unknown>,
+    role: AttemptReadRole,
     write = false,
   ) => {
+    if (!write && isAttemptRead(role, request.operation)) {
+      let session = sessions.get(role);
+      if (!session) {
+        session = new AttemptReadSession(role, () => new HistorySshEndpoint(host, box, entry));
+        sessions.set(role, session);
+      }
+      return session.ask(request);
+    }
     const ssh = new HistorySshEndpoint(host, box, entry, write);
     try {
       return await ssh.ask(request);
@@ -108,20 +124,22 @@ export async function hzAttemptStorage(
   const helper = "/app/apps/sweeper/src/hz-attempt-custody-cli.ts";
   const transport: AttemptRelay = io.relay ?? {
     worker: (r, write) =>
-      endpoint(v["hz-host"], v["hz-sweeper"], helper, r, write),
+      endpoint(v["hz-host"], v["hz-sweeper"], helper, r, "worker", write),
     api: (r) =>
       endpoint(
         v["hz-host"],
         v["hz-api"],
         "/app/apps/api/src/hz-attempt-custody-cli.ts",
         r,
+        "api",
       ),
     hub: (r) =>
       endpoint(v["hub-host"], v["hub-sweeper"], helper, {
         ...r,
         bucket: v.bucket,
         account,
-      }),
+        ...(r.operation === "read" && owner ? { instance:owner.instance, solver:owner.solver } : {}),
+      }, "hub"),
   };
   const control = new AbortController(),
     stop = () => control.abort();
@@ -150,7 +168,6 @@ export async function hzAttemptStorage(
       }
     }
   }
-  let owner: HzWorkerOwner | undefined;
   let nativeFence = false;
   const checkLegacy = () =>
     (io.checkLegacyFence ?? checkLegacyHzFence)(
@@ -302,6 +319,22 @@ export async function hzAttemptStorage(
       }
       await atomicJson(file, state);
     }
+    if (v["registered-roster"] && bound.registered_roster_protocol !== 1)
+      throw new HistoryOperationError("registered_roster_contract","input");
+    const roster = v["registered-roster"] ? await (await import("./hz-attempt-registered-roster")).openRegisteredAttemptRoster(
+      v["registered-roster"],v["registered-roster-sha256"]!,dir!,binding,
+    ) : undefined;
+    async function visitRegisteredPage() {
+      if (!roster || roster.complete) return;
+      const result = await retry(() => roster.advance(
+        pins => relay.worker({operation:"registered-state",pins}),
+        async pin => {
+          const value=await migrateHzAttempt(relay,pin.attempt,instance,false,pin);
+          return {limited:value.limited};
+        },control.signal,
+      ));
+      if (result) report({registeredRoster:result});
+    }
     // An already committed event survives disconnects. Job-row contention
     // during its post-read must not monopolize the sole worker. Explicit
     // migrations, transfer fences and source-integrity failures retain their
@@ -358,11 +391,13 @@ export async function hzAttemptStorage(
         }
       }
       if (watching) await revisitPending();
+      if (state.complete) await visitRegisteredPage();
       for (
         let pass = 0;
         !state.complete && (continuous || pass < pages);
         pass++
       ) {
+        await visitRegisteredPage();
         if (originals)
           await (io.originalCycle ?? runOriginalCycle)(
             originals,
@@ -448,7 +483,7 @@ export async function hzAttemptStorage(
             : {}),
         });
       if (!watching) break;
-      const nextScan = Date.now() + (previousPending ? Math.min(60_000, poll * 1000) : poll * 1000);
+      const nextScan = Date.now() + (roster && !roster.complete ? 250 : previousPending ? Math.min(60_000, poll * 1000) : poll * 1000);
       if (originals)
         await (io.originalCycle ?? runOriginalCycle)(
           originals,
@@ -486,7 +521,7 @@ export async function hzAttemptStorage(
     io.signal?.removeEventListener("abort", stop);
     process.off("SIGTERM", stop);
     process.off("SIGINT", stop);
-    await unlock?.();
+    try { await Promise.all([...sessions.values()].map(session => session.close())); } finally { await unlock?.(); }
   }
 }
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href)

@@ -1,3 +1,4 @@
+import type { RegisteredAttemptPin } from "./hz-attempt-registered-roster";
 import { Readable } from "node:stream";
 import { setTimeout as delay } from "node:timers/promises";
 import type { AttemptEvidenceArchiveIdentity } from "@aerodb/db/attempt-evidence-catalog";
@@ -10,6 +11,15 @@ export interface AttemptRelay {
   api: (request: Record<string, unknown>) => Promise<any>;
   hub: (request: Record<string, unknown>) => Promise<any>;
 }
+function matchesRegisteredPin(pin: RegisteredAttemptPin, ar: {
+  id?: string; attemptId: string; resultId: string | null; simJobId: string | null;
+  generation: string; sourceSha256: string; sourceByteSize: number; storedSha256: string; storedByteSize: number;
+}) {
+  return ar.id === pin.archive && ar.attemptId === pin.attempt && ar.resultId === pin.result && ar.simJobId === pin.job &&
+    ar.generation === pin.generation && ar.sourceSha256 === pin.source_sha256 && ar.sourceByteSize === pin.source_byte_size &&
+    ar.storedSha256 === pin.stored_sha256 && ar.storedByteSize === pin.stored_byte_size;
+}
+
 function checkApp(
   value: Record<string, any>,
   id: string,
@@ -34,9 +44,10 @@ export async function migrateHzAttempt(
   id: string,
   instance: string,
   restore = false,
+  registered?: RegisteredAttemptPin,
 ) {
   try {
-    return await transferHzAttempt(relay, id, instance, restore);
+    return await transferHzAttempt(relay, id, instance, restore, registered);
   } catch (error) {
     // A report can change representation after selection. The transition
     // restores a committed row before propagating a failed post-read.
@@ -47,9 +58,11 @@ export async function migrateHzAttempt(
   }
 }
 
-async function transferHzAttempt(relay: AttemptRelay, id: string, instance: string, restore: boolean) {
+async function transferHzAttempt(relay: AttemptRelay, id: string, instance: string, restore: boolean, registered?: RegisteredAttemptPin) {
   const prep = await relay.worker({ operation: "prepare", attemptId: id });
   if (prep.limited) return { limited: prep.limited };
+  if (registered && (!prep.archive || prep.archive.sourceInstance !== instance || !matchesRegisteredPin(registered, prep.archive)))
+    return { limited: "registered-original-no-longer-matches" };
   if (restore && !prep.cold) return { alreadyInline: true };
   const fresh = await relay.hub(
     prep.archive

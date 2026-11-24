@@ -67,6 +67,7 @@ export class HistorySshEndpoint {
   private child: ChildProcessWithoutNullStreams;
   private wire: HistoryMessages;
   private stderr = "";
+  continuesAttemptReadSession = false;
   private ended: Promise<unknown>;
   constructor(
     host: string,
@@ -141,6 +142,8 @@ export class HistorySshEndpoint {
       const response = await this.wire.read(timeout);
       if (response.id !== id)
         throw new HistoryOperationError("response", "integrity");
+      this.continuesAttemptReadSession = typeof request.attemptReadSession === "string" &&
+        response.attemptReadSession === request.attemptReadSession;
       if (response.error) {
         const category = response.error.category;
         const operation = String(response.error.operation ?? "worker");
