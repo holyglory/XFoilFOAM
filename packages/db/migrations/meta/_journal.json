@@ -1632,6 +1632,13 @@
       "when": 1795363913063,
       "tag": "0232_registered_short_work_windows",
       "breakpoints": true
+    },
+    {
+      "idx": 233,
+      "version": "7",
+      "when": 1795363913064,
+      "tag": "0233_compact_signed_attempt_proofs",
+      "breakpoints": true
     }
   ]
 }

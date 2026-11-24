@@ -1,3 +1,4 @@
+import { readAttemptEventDependencies, readAttemptWorkerReplayScope } from "@aerodb/db/attempt-evidence-proof-reader";
 import { exactId } from "./hz-attempt-wire";
 export { exactId, ZERO_ID, packedBytes } from "./hz-attempt-wire";
 import { limitSettledReportCandidates } from "./hz-settled-report-bounds";
@@ -259,12 +260,7 @@ export async function commitHzAttempt(
   return shortenAttemptEvidence(db, id, archiveId, proof);
 }
 export async function verifyHzOutboxReplay(db: DB, id: string) {
-  const [owner] =
-    await db.execute(sql`SELECT CASE WHEN a.evidence_archive_id IS NULL THEN attempt_evidence_hz_scope(a.id)
-      ELSE e.verification#>'{dependencies,workerScope}' END AS scope
-    FROM result_attempts a LEFT JOIN attempt_evidence_storage_events e ON e.id=a.evidence_storage_event_id AND e.archive_id=a.evidence_archive_id
-    WHERE a.id=${id}::uuid`);
-  const scope = owner?.scope as {
+  const scope = await readAttemptWorkerReplayScope(db,id) as {
     contract?: string;
     stopSequence?: number;
     job: string;
@@ -360,10 +356,7 @@ export async function confirmHzAttempt(
     ${publicationHistoryJoin(sql`a`, docs)} WHERE a.id=${id}::uuid`);
   if (published?.original !== text)
     throw Error("Canonical repair projection differs");
-  const [event] = await db.execute(
-    sql`SELECT e.verification->'dependencies' AS deps FROM attempt_evidence_storage_events e WHERE e.id=${eventId}::uuid AND e.result_attempt_id=${id}::uuid AND e.archive_id=${app.archiveId}::uuid`,
-  );
-  const deps = event?.deps as
+  const deps = await readAttemptEventDependencies(db,eventId,id,app.archiveId) as
     | {
         verifier?: string;
         jobDecisionsSha256?: string;

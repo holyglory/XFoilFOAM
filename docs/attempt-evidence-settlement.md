@@ -192,3 +192,26 @@ restores the original inline source against the same event ID. Generation,
 scientific, scope and usable-read failures before shortening retain the full
 inline point. Receipts identify representation changes independently of scientific
 changes, so a storage transition preserves the existing fit and classification.
+
+## Short signed histories
+
+Migration 0233 adds a smaller storage format for a settled signed attempt whose
+ordinary transition reaches the SQL value-byte floor. The retry uses the same
+pinned generation, current source locks, application readback, scientific and
+replay proofs. SQL reconstructs each full projection and verification document
+and compares its exact PostgreSQL text before storing the smaller form. The
+original attempt, result and job remain bound to their own archive.
+
+After the compatible API and sweeper readers are deployed on both roles, use
+the existing storage CLI with `enable-short-proofs --id ATTEMPT_UUID` for a
+scoped canary. `enable-short-proofs` enables future qualifying owners on that
+role. `disable-short-proofs` stops new short-proof writes while preserving
+reads, retries and exact restoration for earlier events. Other history cohorts
+continue under their existing policies.
+
+Use `attempt_evidence_read_projections` and `attempt_evidence_read_events` for
+the expanded documents, including legacy rows. The event's source, remaining,
+projection and verification byte fields come from the stored PostgreSQL values.
+The same per-owner floor applies to the retry. A row below that floor retains
+its original arrays online. Heap, index and filesystem measurements have their
+own accounting.

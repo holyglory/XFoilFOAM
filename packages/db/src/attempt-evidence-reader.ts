@@ -1,3 +1,4 @@
+import { readAttemptProjections } from "./attempt-evidence-proof-reader";
 import { sql } from "drizzle-orm";
 import type { DB } from "./client";
 import {
@@ -256,15 +257,7 @@ async function attachProjections(db: DB, current: CurrentRow[]): Promise<void> {
       }
     }
   }
-  const rows =
-    await db.execute(sql`SELECT result_attempt_id,archive_id,projection
-    FROM attempt_evidence_history_projections WHERE result_attempt_id IN (${ids(cold.map((row) => row.id))})`);
-  const projections = new Map(
-    rows.map((row) => [
-      `${row.result_attempt_id}:${row.archive_id}`,
-      row.projection as AttemptEvidenceProjection,
-    ]),
-  );
+  const projections = await readAttemptProjections(db, cold.map(row => ({ attemptId: row.id, archiveId: row.archiveId! })));
   for (const row of cold) {
     const p = projections.get(`${row.id}:${row.archiveId}`);
     if (

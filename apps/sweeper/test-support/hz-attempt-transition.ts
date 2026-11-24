@@ -1,3 +1,7 @@
+import { databaseUrl } from "@aerodb/db/env";
+import { attemptEvidenceStorageMain } from "../src/attempt-evidence-storage-cli";
+import { assertShortProof, measuredFixtureFloor } from "./short-attempt-proof";
+import type { AttemptEvidenceFreshVerification } from "@aerodb/db/attempt-evidence-projection";
 import { checkHzTransferFence, hzAttemptRpcFailure } from "../src/hz-attempt-transfer-fence";
 import { analysisContentHash, type ProgressiveRemoteReport } from "@aerodb/db";
 import { replayProgressiveWorkerOutbox, ProgressiveWorkerReplayNeedsFinalReport } from "../src/progressive-worker-outbox-replay";
@@ -15,7 +19,7 @@ import {
 } from "@aerodb/db/attempt-receipt-source";
 import { createClient, type DB } from "@aerodb/db/client";
 import { sql, type SQL } from "drizzle-orm";
-import { expect } from "vitest";
+import { expect, vi } from "vitest";
 import { createSettlementFixture } from "./attempt-settlement-fixture";
 import { HzAttemptHubStore } from "../src/hz-attempt-hub";
 import { attemptHubOperation, attemptWorkerOperation } from "../src/hz-attempt-custody-cli";
@@ -117,6 +121,7 @@ export async function verifyHzAttemptTransition(
   fullReport: string,
   periodic = false,
   independentAttempt?: string,
+  shortProofJourney = false,
 ) {
   const fixture = await createSettlementFixture(true),
     db = fixture.db;
@@ -313,6 +318,23 @@ export async function verifyHzAttemptTransition(
       expect(same.event).toBe(pending.event);
       return;
     }
+    async function shortProofPolicy(enable: boolean) {
+      const uri = new URL(databaseUrl());
+      uri.searchParams.set("options", `-c search_path=${fixture.namespace},public`);
+      const previous = process.env.DATABASE_URL;
+      const printed = vi.spyOn(process.stdout,"write").mockReturnValue(true);
+      try {
+        process.env.DATABASE_URL = uri.toString();
+        await attemptEvidenceStorageMain(enable ? ["enable-short-proofs","--id",id] : ["disable-short-proofs"]);
+        expect(JSON.parse(String(printed.mock.calls.at(-1)?.[0]))).toMatchObject({
+          hzWorkerOnly:true,shortProofsEnabled:enable,shortProofCanaryAttemptId:enable ? id : null,
+        });
+      } finally {
+        printed.mockRestore();
+        if (previous === undefined) delete process.env.DATABASE_URL;
+        else process.env.DATABASE_URL = previous;
+      }
+    }
     async function verifySettledPoint() {
       // A normal running report delivered the point. Its assignment stopped at
       // a later sequence. Both signed reports are still inline on this worker.
@@ -336,7 +358,7 @@ export async function verifyHzAttemptTransition(
       if (!periodic) await db.execute(sql`UPDATE results SET current_result_attempt_id=${id}::uuid WHERE id=(SELECT result_id FROM result_attempts WHERE id=${id}::uuid)`);
       expect((await relay.worker({ operation: "one", retained: true, attemptId: id })).limiter).not.toBeNull();
       const candidate = () => relay.worker({ operation: "one", settled: true, retained: true, attemptId: id });
-      if (periodic) {
+      if (periodic && !shortProofJourney) {
         const message = "x".repeat(32 * 1024 * 1024);
         const large = { ...final, result: { ...final.result!, message } };
         const largeSignature = analysisContentHash(large);
@@ -386,10 +408,31 @@ export async function verifyHzAttemptTransition(
       expect((await candidate()).limiter).not.toBeNull();
       await db.execute(sql`UPDATE progressive_worker_hub_receipts SET receipt=jsonb_set(receipt,'{remoteResultAttemptId}',to_jsonb(result_attempt_id)) WHERE result_attempt_id=${id}::uuid`);
       await expect(replayProgressiveWorkerOutbox(db, input)).rejects.toBeInstanceOf(ProgressiveWorkerReplayNeedsFinalReport);
-      await hzAttemptStorage(["migrate", ...config, "--id", id, "--include-settled-receipts"], io);
+      let exactProof: AttemptEvidenceFreshVerification | undefined;
+      const measuredRelay: AttemptRelay = { ...relay, async worker(request, write) {
+        if (request.operation === "commit" && !exactProof) {
+          exactProof = request.proof as AttemptEvidenceFreshVerification;
+          const archiveId = String(request.archiveId);
+          const floor = await measuredFixtureFloor(db,id,archiveId,exactProof);
+          await db.execute(sql`UPDATE attempt_evidence_storage_policy SET min_net_value_bytes=${floor} WHERE id=1`);
+          expect(await relay.worker(request,write)).toMatchObject({limited:"insufficient-net-savings"});
+          await shortProofPolicy(true);
+        }
+        return relay.worker(request,write);
+      }};
+      await hzAttemptStorage(["migrate", ...config, "--id", id, "--include-settled-receipts"],
+        shortProofJourney ? { ...io,relay:measuredRelay } : io);
+      if (shortProofJourney) {
+        expect(exactProof).toBeDefined();
+        await assertShortProof(db,id,exactProof!.direct.archiveId,exactProof);
+        await shortProofPolicy(false);
+        // Disabling future writes must leave a stable read and replay available.
+        await hzAttemptStorage(["migrate", ...config, "--id", id, "--include-settled-receipts"],io);
+        expect(reports.at(-1)).toMatchObject({alreadyShortened:true,netValueBytesReclaimed:0});
+      }
       const [confirmed] = await db.execute(sql`SELECT r.current_result_attempt_id,a.status,a.source,
         e.app_readback_at,e.verification->'dependencies' AS deps FROM result_attempts a JOIN results r ON r.id=a.result_id
-        JOIN attempt_evidence_storage_events e ON e.id=a.evidence_storage_event_id AND e.archive_id=a.evidence_archive_id WHERE a.id=${id}::uuid`);
+        JOIN ${shortProofJourney ? sql`attempt_evidence_read_events` : sql`attempt_evidence_storage_events`} e ON e.id=a.evidence_storage_event_id AND e.archive_id=a.evidence_archive_id WHERE a.id=${id}::uuid`);
       expect(confirmed).toMatchObject({ current_result_attempt_id: periodic ? null : id, status: periodic ? "failed" : "done", source: periodic ? "queued" : "solved",
         deps: { verifier: "server-consumers/hz-settled-receipt-v3",
           workerScope: { sequence: earlier.sequence, stopSequence: final.sequence, report: firstSha, stopReport: analysisContentHash(final) } } });
@@ -415,6 +458,19 @@ export async function verifyHzAttemptTransition(
       await db.execute(
         sql`UPDATE progressive_worker_hub_receipts SET receipt=receipt||'{"storageOnly":false}'::jsonb WHERE result_attempt_id=${id}::uuid`,
       );
+      if (shortProofJourney) {
+        // A later signed stop needs the actual worker original in the 0207
+        // catalog. Stage it through the custody relay while the row is warm.
+        const binding = await relay.worker({operation:"bound"});
+        const owner = {instance:binding.instance,solver:binding.solver};
+        const prepared = await relay.worker({operation:"prepare",attemptId:id,retained:true,requireTransfers:true,owner});
+        const fresh = prepared.archive
+          ? await relay.hub({operation:"read",identity:prepared.archive})
+          : await relay.hub({operation:"put",instance:prepared.instance,solver:prepared.solver,proof:prepared.proof,packed:prepared.packed});
+        await relay.worker({operation:"stage",...fresh,enable:true,retained:true,requireTransfers:true,owner},true);
+        await verifySettledPoint();
+        return;
+      }
       expect(
         (await relay.worker({ operation: "one", attemptId: id })).limiter,
       ).not.toBeNull();

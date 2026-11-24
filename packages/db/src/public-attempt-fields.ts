@@ -72,7 +72,8 @@ async function readFields(
   db: DB,
   owners: PublicAttemptFieldOwner[],
   fields: readonly PublicAttemptField[],
-) {
+  expandShortProofs = false,
+): Promise<FieldRow[]> {
   const values = sql.join(
     owners.map(
       (r) => sql`(${r.id}::uuid,${r.resultId}::uuid,${r.simJobId}::uuid,
@@ -84,7 +85,19 @@ async function readFields(
     fields.map((f) => sql`(${f}::text)`),
     sql`, `,
   );
-  return db.execute<FieldRow>(sql`WITH requested(id,result_id,job_id,archive_id,event_id) AS (VALUES ${values}),
+  // Preserve the original one-query path for existing public points. For a
+  // short proof, expand at most one document per requested owner before the
+  // field, receipt and fingerprint comparisons reuse it.
+  const proofRows = expandShortProofs ? sql`,
+    expanded_events AS MATERIALIZED (
+      SELECT e.* FROM requested q JOIN attempt_evidence_read_events e
+        ON e.id=q.event_id AND e.result_attempt_id=q.id AND e.archive_id=q.archive_id),
+    expanded_projections AS MATERIALIZED (
+      SELECT p.* FROM requested q JOIN attempt_evidence_read_projections p
+        ON p.result_attempt_id=q.id AND p.archive_id=q.archive_id)` : sql``;
+  const events = expandShortProofs ? sql`expanded_events` : sql`attempt_evidence_storage_events`;
+  const projections = expandShortProofs ? sql`expanded_projections` : sql`attempt_evidence_history_projections`;
+  const rows = await db.execute<FieldRow>(sql`WITH requested(id,result_id,job_id,archive_id,event_id) AS (VALUES ${values}) ${proofRows},
     owned AS MATERIALIZED (
       SELECT a.id,a.result_id,ar.source_instance,proj.projection,a.evidence_payload || '{}'::jsonb AS compact,
         jsonb_build_array(ar.id,e.id,ar.sim_job_id,ar.source_instance,ar.generation,ar.source_sha256,ar.source_byte_size,
@@ -93,9 +106,9 @@ async function readFields(
         AND a.sim_job_id IS NOT DISTINCT FROM q.job_id AND a.evidence_archive_id=q.archive_id AND a.evidence_storage_event_id=q.event_id
       JOIN attempt_evidence_archives ar ON ar.id=q.archive_id AND ar.result_attempt_id=a.id AND ar.result_id=a.result_id
         AND (a.sim_job_id IS NULL OR ar.sim_job_id=a.sim_job_id)
-      JOIN attempt_evidence_storage_events e ON e.id=q.event_id AND e.result_attempt_id=a.id AND e.archive_id=ar.id
+      JOIN ${events} e ON e.id=q.event_id AND e.result_attempt_id=a.id AND e.archive_id=ar.id
         AND e.action='shorten' AND e.completed
-      JOIN attempt_evidence_history_projections proj ON proj.result_attempt_id=a.id AND proj.archive_id=ar.id
+      JOIN ${projections} proj ON proj.result_attempt_id=a.id AND proj.archive_id=ar.id
       LEFT JOIN progressive_cfd_evidence cf ON cf.result_attempt_id=a.id
       WHERE proj.projection @> jsonb_build_object('version',1,'attemptId',a.id,'archiveId',ar.id,
               'sourceSha256',ar.source_sha256,'sourceByteSize',ar.source_byte_size)
@@ -136,6 +149,20 @@ async function readFields(
       EXISTS(SELECT FROM jsonb_array_elements(projection->'removedPaths') p(path) WHERE path->>0=field) AS removed,
       (compact->field)::text AS field_text
     FROM pinned CROSS JOIN (VALUES ${keys}) AS wanted(field)`);
+  if (expandShortProofs || rows.length === owners.length * fields.length) return rows;
+  const seen = new Set(rows.map(row => row.id));
+  const missing = owners.filter(owner => !seen.has(owner.id));
+  if (!missing.length) return rows;
+  const ids = sql.join(missing.map(owner =>
+    sql`(${owner.id}::uuid,${owner.evidenceArchiveId}::uuid,${owner.evidenceStorageEventId}::uuid)`),sql`,`);
+  const packed = await db.execute<{id:string}>(sql`SELECT q.id FROM (VALUES ${ids}) q(id,archive_id,event_id)
+    JOIN attempt_evidence_history_projections p ON p.result_attempt_id=q.id AND p.archive_id=q.archive_id
+    JOIN attempt_evidence_storage_events e ON e.id=q.event_id AND e.result_attempt_id=q.id AND e.archive_id=q.archive_id
+    WHERE p.projection?'shortFacts' OR e.verification?'shortReceipt'`);
+  if (!packed.length) return rows;
+  const eligible = new Set(packed.map(row => row.id));
+  return [...rows, ...await readFields(db,missing.filter(owner => eligible.has(owner.id)),fields,true)];
+
 }
 
 type MissingField = FieldRow & {

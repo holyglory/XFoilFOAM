@@ -1,3 +1,5 @@
+import { measuredFixtureFloor, verifiedHubFixtureProof, assertShortProof } from "../../../apps/sweeper/test-support/short-attempt-proof";
+import { setShortAttemptProofPolicy } from "../src/attempt-evidence-projection";
 import { selectedDetailBaseline, verifySelectedDetailField } from "../../../apps/api/test/selected-attempt-detail-fixture";
 import { randomUUID } from "node:crypto";
 import { sql } from "drizzle-orm";
@@ -271,10 +273,29 @@ export async function verifyReceiptBearingHistory(
       }),
     ).rejects.toThrow(/proof/i);
     const publicInline = await selectedDetailBaseline(db, id!);
+    const floors = [];
+    for (const [i, pointId] of ids.entries()) {
+      const verified = await verifiedHubFixtureProof(db,deps,pointId,ar[i]!.id);
+      floors.push(await measuredFixtureFloor(db,pointId,ar[i]!.id,verified));
+    }
+    const floor = Math.max(...floors);
+    await db.execute(sql`UPDATE attempt_evidence_storage_policy SET min_net_value_bytes=${floor} WHERE id=1`);
+    await expect(settleAttemptEvidenceHistory(db,deps,{attemptId:id!,archiveId:ar[0]!.id})).rejects.toThrow(/insufficient net/);
+    await setShortAttemptProofPolicy(db,true,ids[1]!);
+    await expect(settleAttemptEvidenceHistory(db,deps,{attemptId:id!,archiveId:ar[0]!.id})).rejects.toThrow(/insufficient net/);
+    await setShortAttemptProofPolicy(db,true);
     const pass = await runAttemptEvidenceSettlementPass(db, deps, {
       maxRows: 2,
     });
     expect(pass).toMatchObject({ shortened: 2, failures: [] });
+    for (const [i, pointId] of ids.entries()) {
+      const stored = await assertShortProof(db,pointId,ar[i]!.id);
+      expect(Number(stored.saved)).toBeGreaterThanOrEqual(floor);
+      expect(stored.generation).toBe(ar[i]!.generation);
+    }
+    await setShortAttemptProofPolicy(db,false);
+    await db.execute(sql`UPDATE attempt_evidence_storage_policy SET min_net_value_bytes=1024 WHERE id=1`);
+
     await verifySelectedDetailField(db, publicInline, "steady_history");
     expect(await settleProgressiveCfdExecution(db, job)).toEqual(inlineSettlement);
     expect(
@@ -283,6 +304,19 @@ export async function verifyReceiptBearingHistory(
     expect(await modelSnapshot()).toEqual(before);
     const cold = await loadAttemptSourcePins(db, ids);
     const fetched = await prepareAttemptSources(db, store, [...cold.values()]);
+    memory.failReads = true;
+    try {
+      await expect(prepareAttemptSources(db,store,[...cold.values()])).rejects.toThrow();
+    } finally {
+      memory.failReads = false;
+    }
+    await expect(db.execute(sql`SELECT attempt_evidence_expand_projection(p.projection,foreign_source)
+      FROM attempt_evidence_history_projections p JOIN attempt_evidence_archives foreign_source ON foreign_source.id=${ar[1]!.id}::uuid
+      WHERE p.result_attempt_id=${ids[0]}::uuid AND p.archive_id=${ar[0]!.id}::uuid`)).rejects.toThrow(/another original/);
+    await expect(db.execute(sql`SELECT attempt_evidence_expand_receipt(e.verification,foreign_source)
+      FROM attempt_evidence_storage_events e JOIN attempt_evidence_archives foreign_source ON foreign_source.id=${ar[1]!.id}::uuid
+      WHERE e.result_attempt_id=${ids[0]}::uuid AND e.archive_id=${ar[0]!.id}::uuid AND e.action='shorten'`)).rejects.toThrow(/another original/);
+
     await db.transaction((tx) =>
       assertAttemptSourcePins(
         tx as unknown as DB,

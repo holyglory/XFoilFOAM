@@ -1,3 +1,4 @@
+import { readAttemptProjections } from "./attempt-evidence-proof-reader";
 import { hasConfiguredAttemptHubRole, requireConfiguredAttemptHubRole, verifiedAttemptCandidatesSql } from "./attempt-evidence-verified-policy";
 import { sql, type SQL } from "drizzle-orm";
 import type { DB } from "./client";
@@ -164,12 +165,8 @@ export async function getAttemptEvidenceStorage(
     };
   }
   const archiveId = String(row.archive_id);
-  const [projected] =
-    await db.execute(sql`SELECT projection FROM attempt_evidence_history_projections
-    WHERE result_attempt_id=${attemptId}::uuid AND archive_id=${archiveId}::uuid`);
-  const projection = projected?.projection as
-    | AttemptEvidenceProjection
-    | undefined;
+  const projections = await readAttemptProjections(db, [{ attemptId, archiveId }]);
+  const projection = projections.get(`${attemptId}:${archiveId}`);
   const archive = await getAttemptEvidenceArchive(db, archiveId);
   if (
     !projection ||
@@ -331,6 +328,8 @@ export function attemptEvidenceValueMatchesSql(
 
 export interface AttemptEvidenceStoragePolicy {
   hzWorkerOnly: boolean;
+  shortProofsEnabled?: boolean;
+  shortProofCanaryAttemptId?: string | null;
   shorteningEnabled: boolean;
   stoppedProgressiveEnabled: boolean;
   progressiveSourceScope: "legacy" | "stopped-only" | "receipt-bearing" | "receipt-urans" | "verified";
@@ -378,9 +377,23 @@ export async function getAttemptEvidenceStoragePolicy(
     coalesce((to_jsonb(policy)->>'stopped_progressive_enabled')::boolean,false) AS "stoppedProgressiveEnabled",
     coalesce(to_jsonb(policy)->>'progressive_source_scope','legacy') AS "progressiveSourceScope",
     coalesce((to_jsonb(policy)->>'hz_worker_only')::boolean,false) AS "hzWorkerOnly",
+    coalesce((to_jsonb(policy)->>'short_proofs_enabled')::boolean,false) AS "shortProofsEnabled",
+    to_jsonb(policy)->>'short_proof_canary_attempt_id' AS "shortProofCanaryAttemptId",
     (to_jsonb(policy)->>'urans_max_source_bytes')::integer AS "uransMaxSourceBytes"
     FROM attempt_evidence_storage_policy policy WHERE id=1`);
   return row as unknown as AttemptEvidenceStoragePolicy;
+}
+
+/** Change only the signed, measured-floor fallback. Other cohort policies keep
+ * running during a scoped canary. Disabling writing preserves every old reader. */
+export async function setShortAttemptProofPolicy(db: DB, enabled: boolean, canaryAttemptId?: string) {
+  if (canaryAttemptId) assertId(canaryAttemptId);
+  if (!enabled && canaryAttemptId) throw new Error("A short-proof canary requires enablement");
+  const result = await db.execute(sql`UPDATE attempt_evidence_storage_policy SET short_proofs_enabled=${enabled},
+    short_proof_canary_attempt_id=${canaryAttemptId ?? null}::uuid
+    WHERE id=1 AND (${!enabled} OR (shortening_enabled AND consumer_contract_version=1)) RETURNING id`);
+  if (!result.length) throw new Error("Short proofs require the active native attempt consumer contract");
+  return getAttemptEvidenceStoragePolicy(db);
 }
 
 export async function setAttemptEvidenceStoragePolicy(
@@ -539,7 +552,7 @@ export async function shortenAttemptEvidence(
 > {
   assertId(attemptId);
   assertId(archiveId);
-  return db.transaction(async (tx) => {
+  const attempt = async (short: boolean) => db.transaction(async (tx) => {
     await tx.execute(sql`SET LOCAL statement_timeout='5s'`);
     await tx.execute(sql`SET LOCAL lock_timeout='500ms'`);
     if (!hasConfiguredAttemptHubRole()) {
@@ -548,6 +561,16 @@ export async function shortenAttemptEvidence(
       const [policy] = await tx.execute(sql`SELECT to_jsonb(p)->>'progressive_source_scope' AS scope
         FROM attempt_evidence_storage_policy p WHERE p.id=1 FOR SHARE OF p`);
       if (policy?.scope === "verified") requireConfiguredAttemptHubRole();
+    }
+    if (short) {
+      // A pre-0233 fixture may share a search path with a newer public schema.
+      const [schema] = await tx.execute(sql`SELECT EXISTS(SELECT FROM pg_proc f
+        JOIN pg_class a ON a.oid=to_regclass('result_attempts') AND a.relnamespace=f.pronamespace
+        WHERE f.oid=to_regprocedure('attempt_evidence_begin_short_proof(uuid,uuid,jsonb)')) AS ready`);
+      if (schema?.ready !== true) return null;
+      const [format] = await tx.execute(sql`SELECT attempt_evidence_begin_short_proof(${attemptId}::uuid,${archiveId}::uuid,
+        ${JSON.stringify(verification)}::jsonb) AS enabled`);
+      if (format?.enabled !== true) return null;
     }
     if (verification.direct?.sourceByteSize >= 4 * 1024 * 1024) {
       // Resolve against the source table's schema during rolling upgrades.
@@ -564,6 +587,19 @@ export async function shortenAttemptEvidence(
       | AttemptEvidenceSettlementMeasurement
       | AttemptEvidenceSettlementReplay;
   });
+  try {
+    return (await attempt(false))!;
+  } catch (error) {
+    // Roll back the original attempt (including its projection seal) before
+    // reusing the same genuine readbacks and the same native safety gates.
+    if (!(error instanceof Error)) throw error;
+    const outer = error as { code?: string; message?: string; cause?: { code?: string; message?: string } };
+    const pg = outer.cause?.code ? outer.cause : outer;
+    if (pg.code !== "P0002" || pg.message !== "Attempt shortening has insufficient net online value-byte savings") throw error;
+    const compact = await attempt(true);
+    if (!compact) throw error;
+    return compact;
+  }
 }
 
 export async function restoreAttemptEvidence(

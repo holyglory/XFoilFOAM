@@ -1354,6 +1354,7 @@ it.each(["steady", "periodic", "contended"])(
             expect(JSON.parse(source).force_history.t).toHaveLength(6 * 80);
             expect(JSON.parse(source).frame_track.frames).toHaveLength(6 * 24);
             await verifyHzAttemptTransition(db, id, input, source, root, full, true);
+            await verifyHzAttemptTransition(db, id, input, source, root, full, true, undefined, true);
             return;
           }
           expect(JSON.parse(source).steady_history.iterations).toHaveLength(

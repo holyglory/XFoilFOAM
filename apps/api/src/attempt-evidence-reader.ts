@@ -1,3 +1,4 @@
+import { readAttemptWorkerReplayScope } from "@aerodb/db/attempt-evidence-proof-reader";
 import { Storage } from "@google-cloud/storage";
 import type { DB } from "@aerodb/db/client";
 import { sql } from "drizzle-orm";
@@ -95,12 +96,8 @@ export async function readStoredAttemptEvidenceText(
       );
     if (process.env.AIRFOILFOAM_DEPLOYMENT_ROLE === "remote-solver") {
       const [installed] = await db.execute(sql`SELECT to_regprocedure('attempt_evidence_hz_settled_scope(uuid,uuid)') IS NOT NULL AS ready`);
-      const [stored] = installed?.ready === true ? await db.execute(sql`SELECT CASE WHEN a.evidence_archive_id IS NULL
-        THEN attempt_evidence_hz_scope(a.id) ELSE e.verification#>'{dependencies,workerScope}' END AS scope
-        FROM result_attempts a LEFT JOIN attempt_evidence_storage_events e ON e.id=a.evidence_storage_event_id
-          AND e.result_attempt_id=a.id AND e.archive_id=a.evidence_archive_id
-        WHERE a.id=${attemptId}::uuid`) : [];
-      const scope = stored?.scope as HzSettledReceiptScope | undefined;
+      const scope = installed?.ready === true
+        ? (await readAttemptWorkerReplayScope(db, attemptId)) as HzSettledReceiptScope | undefined : undefined;
       if (scope?.contract === "settled-receipt-v3") {
         const { readSettledWorkerPoint } = await import("../../sweeper/src/hz-settled-attempt-receipt");
         return (await readSettledWorkerPoint(db, scope, bounded(options).signal)).payloadText;

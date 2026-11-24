@@ -1,3 +1,5 @@
+import { assertShortProof, measuredFixtureFloor, verifiedHubFixtureProof } from "../../../apps/sweeper/test-support/short-attempt-proof";
+import { setShortAttemptProofPolicy } from "../src/attempt-evidence-projection";
 import { selectedDetailBaseline, verifySelectedDetailField, verifyCompactDetail } from "../../../apps/api/test/selected-attempt-detail-fixture";
 import { periodicPoint } from "../test-support/periodic-urans-point";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
@@ -447,12 +449,26 @@ export async function verifyUransAttemptPublication(
         ).rejects.toThrow(/proof/i);
         expect(await readStoredAttemptEvidenceText(db, p.id)).toBe(original);
       }
+      const short = p === chosen && fidelity === "urans_full";
+      if (short) {
+        const proof = await verifiedHubFixtureProof(db,deps,p.id,archive.id);
+        const measured = await measuredFixtureFloor(db,p.id,archive.id,proof);
+        await db.execute(sql`UPDATE attempt_evidence_storage_policy SET min_net_value_bytes=${measured} WHERE id=1`);
+        await expect(settleAttemptEvidenceHistory(db,deps,{attemptId:p.id,archiveId:archive.id})).rejects.toThrow(/insufficient net/);
+        await setShortAttemptProofPolicy(db,true,p.id);
+      }
       const out = await settleAttemptEvidenceHistory(db, deps, {
         attemptId: p.id,
         archiveId: archive.id,
       });
       expect(out.netValueBytesReclaimed).toBeGreaterThan(0);
       expect(await readStoredAttemptEvidenceText(db, p.id)).toBe(original);
+      if (short) {
+        const packed = await assertShortProof(db,p.id,archive.id);
+        expect(packed.generation).toBe(archive.generation);
+        await setShortAttemptProofPolicy(db,false);
+        await db.execute(sql`UPDATE attempt_evidence_storage_policy SET min_net_value_bytes=1024 WHERE id=1`);
+      }
       rows.push({ id: p.id, arc: archive.id, original });
     }
     expect(await scientific()).toEqual(before);
