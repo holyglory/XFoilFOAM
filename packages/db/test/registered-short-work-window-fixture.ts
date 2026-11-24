@@ -242,7 +242,30 @@ export async function verifyRegisteredShortWork(
       "--max-active-seconds",
       "3600",
     ];
+    const [clock] = await db.execute(
+      sql`SELECT clock_timestamp() + interval '8 seconds' AS expires_at`,
+    );
+    const firstDeadline = new Date(clock.expires_at as Date | string);
+    const first = await enableShortWork(db, selection, digest, firstDeadline);
     expect((await cli(["preview", ...args])).planSha256).toEqual(digest);
+    await db.execute(
+      sql`SELECT pg_sleep_until(${firstDeadline.toISOString()}::timestamptz)`,
+    );
+    expect(await shortWorkStatus(db, solverId)).toMatchObject({
+      id: first.id,
+      current: false,
+      issued_job_id: null,
+      ended_at: null,
+    });
+    const firstWindowHistory = async () => {
+      const [row] =
+        await db.execute(sql`SELECT to_jsonb(w) - 'ended_at' AS original,
+        coalesce(ended_at >= expires_at, false) AS closed_after_expiry
+        FROM registered_short_work_windows w WHERE id=${first.id}::uuid`);
+      return row;
+    };
+    const expired = await firstWindowHistory();
+    expect(expired.closed_after_expiry).toBe(false);
     const [window, concurrentReplay] = await Promise.all([
       cli([
         "enable",
@@ -255,6 +278,10 @@ export async function verifyRegisteredShortWork(
       enableShortWork(otherClient.db, selection, digest, until),
     ]);
     expect(window.id).toBe(concurrentReplay.id);
+    expect(window.id).not.toBe(first.id);
+    await expect(
+      enableShortWork(otherClient.db, selection, digest, firstDeadline),
+    ).rejects.toThrow("already has an active short-work window");
     expect((await enableShortWork(db, selection, digest, until)).id).toBe(
       window.id,
     );
@@ -384,6 +411,10 @@ export async function verifyRegisteredShortWork(
       execution_id: reference.request.execution_id,
     }).toEqual(reference.request);
     const execution = preferred.envelope.scope.executionId;
+    expect(await firstWindowHistory()).toEqual({
+      ...expired,
+      closed_after_expiry: true,
+    });
     expect(
       (await shortWorkStatus(otherClient.db, solverId))?.issued_job_id,
     ).toBe(execution);
