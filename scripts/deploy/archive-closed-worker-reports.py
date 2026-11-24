@@ -176,6 +176,7 @@ def inputs(args):
     require(0 <= minimum <= 32 * 1024**2, "Measured repeat size must be within the existing native page bound")
     if getattr(args,"page_members",1)>1 or getattr(args,"share_results",False) or minimum:
         require(args.hub_account_file and args.hub_account_file.is_file(),"Expected existing hub workload account file")
+    require(getattr(args, "discover_every_seed_members", 0) >= 0, "Invalid discovery cadence")
     require(1 <= args.limit <= 128, "Expected 1 to 128 bounded operations")
     s = json.loads(args.frozen_scope.read_bytes())
     require(s["version"] == 1 and digest(compact(s)) == args.frozen_sha256 and s["executions"], "Frozen scope changed")
@@ -205,6 +206,8 @@ def run(args):
         if expected:
             require(saved is not None and digest(saved) == expected, "Committed report retry checkpoint changed")
         progress = json.loads(saved) if saved is not None else dict(binding=bind, after=0, completed=0, pending=None)
+        if saved is None and getattr(args, "discovery_result_hint", None):
+            progress["lastVerifiedResult"] = dict(args.discovery_result_hint, through=0)
         keys = ordered_inventory(args, keys, progress, bind, path, durable, lambda key: check_key(key, ranges))
         index = getattr(args,"recheck_held_index",None)
         if index is not None and args.apply and not progress.get("pending") and not progress.get("group"):
@@ -215,11 +218,22 @@ def run(args):
         if through is not None and args.apply and not progress.get("pending") and not progress.get("group"):
             if revisit_prefix(args,through,progress,bind,run,durable,compact,require):
                 return
-        if (getattr(args,"discover_after_seed",False) and args.apply and progress["after"]==os.fstat(keys.fileno()).st_size
-                and not progress.get("pending") and not progress.get("group")):
-            require(1<=args.scan_rows<=1024 and args.discovery_interval>=1,"Invalid bounded discovery parameters")
-            return discovery_step(args,run,shared,
-                lambda role,msg:run_peer(args,role,{**msg,"runtime":runtime},peer),durable,compact,require)
+        cadence = getattr(args, "discover_every_seed_members", 0)
+        at_end = progress["after"] == os.fstat(keys.fileno()).st_size
+        early = cadence > 0 and not at_end and progress["completed"] - progress.get("lastDiscoverySeedOrdinal", 0) >= cadence
+        if args.apply and not progress.get("pending") and not progress.get("group") and (
+                early or at_end and (cadence or getattr(args, "discover_after_seed", False))):
+            require(1 <= args.scan_rows <= 1024 and args.discovery_interval >= 1, "Invalid bounded discovery parameters")
+            runner = run_with_read_retry if getattr(args, "read_sessions", None) else run
+            worked = discovery_step(args, runner, shared,
+                lambda role, msg: run_peer(args, role, {**msg, "runtime": runtime}, peer),
+                durable, compact, require, before_seed_end=early)
+            if at_end:
+                return
+            progress["lastDiscoverySeedOrdinal"] = progress["completed"]
+            durable(path, progress)
+            if worked:
+                return True
         keys.seek(progress["after"])
         def advance(receipt, done):
             outcome = done["settled"]["outcome"]
@@ -399,6 +413,26 @@ def wait_for_read_peer(pause_file, delay):
     return False
 
 
+def run_with_read_retry(args):
+    current, delay = args, 10
+    while True:
+        try:
+            return run(current) is True or current is not args
+        except ReadPeerStopped as error:
+            args.read_sessions.close()
+            retry = committed_read_retry(current, error)
+            if retry is None:
+                raise
+            previous = getattr(current, "retry_checkpoint_sha256", None)
+            require(not previous or previous == retry.retry_checkpoint_sha256,
+                    "Committed report retry checkpoint changed")
+            print(json.dumps({"waitingForReadPeer": error.role, "settledMembers": retry.limit,
+                              "retrySeconds": delay}), flush=True)
+            if not wait_for_read_peer(args.pause_file, delay):
+                return True
+            current, delay = retry, min(60, delay * 2)
+
+
 def run_invocations(args):
     passes = args.reuse_read_passes
     require(0 <= passes <= 4, "Expected zero to four bounded read-session passes")
@@ -412,26 +446,7 @@ def run_invocations(args):
         for _ in range(passes):
             if args.pause_file.exists():
                 break
-            current, delay = args, 10
-            while True:
-                try:
-                    if run(current) is True:
-                        return
-                    break
-                except ReadPeerStopped as error:
-                    args.read_sessions.close()
-                    retry = committed_read_retry(current, error)
-                    if retry is None:
-                        raise
-                    previous = getattr(current, "retry_checkpoint_sha256", None)
-                    require(not previous or previous == retry.retry_checkpoint_sha256,
-                            "Committed report retry checkpoint changed")
-                    print(json.dumps({"waitingForReadPeer": error.role, "settledMembers": retry.limit,
-                                      "retrySeconds": delay}), flush=True)
-                    if not wait_for_read_peer(args.pause_file, delay):
-                        return
-                    current, delay = retry, min(60, delay * 2)
-            if current is not args:
+            if run_with_read_retry(args):
                 return
             if not args.apply:
                 break
@@ -448,6 +463,8 @@ if __name__ == "__main__":
     parser.add_argument("--recheck-held-through",type=int,help="Automatically revisit all historical held keys before this verified cursor")
     parser.add_argument("--recheck-held-index",type=int,help="Recheck one immutable held receipt under the original writer lock")
     parser.add_argument("--discover-after-seed",action="store_true")
+    parser.add_argument("--discover-every-seed-members", type=int, default=0,
+                        help="Scan one disjoint page after this many primary members and continue scans after EOF")
     parser.add_argument("--priority-turn", type=Path, help="Optional finite signed-key range in the existing inventory")
     parser.add_argument("--priority-turn-sha256", help="Exact digest of the private priority hint")
     parser.add_argument("--scan-rows",type=int,default=512)

@@ -60,6 +60,23 @@ and stores at most 1 MiB of uncompressed envelopes together. Removing the
 flag resumes full JSONL for new work. Any pending publication keeps its saved
 format, and existing references continue to need both generations.
 
+For automatic selection, set `--repeat-result-min-bytes BYTES` to a threshold
+supported by a measured restore and storage comparison. The same writer can
+share a result after two successive, fully verified generations from one
+owner have the same exact result token. Each envelope still requires the
+original SQL text, a registered full generation, and the independent cloud,
+API and sweeper reads. A different token uses full JSONL until it qualifies
+in turn. Zero disables automatic selection.
+
+The initial signed inventory has its own fair order. To discover newly closed
+executions while it drains, use `--discover-every-seed-members N`.
+After at least N primary members, the writer advances one bounded worker
+scan or resumes one saved discovery page. The hub checks the eligible signed
+keys that fall outside both frozen ranges and the entire primary inventory.
+The same controller lock covers both operations. After the primary inventory
+ends, discovery continues at the configured scan interval. The default of zero
+leaves the existing `--discover-after-seed` schedule available.
+
 ## Measure the report table
 
 Run the read-only audit from the operator host. It uses the existing SSH aliases

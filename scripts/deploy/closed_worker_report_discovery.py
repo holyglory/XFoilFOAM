@@ -1,5 +1,6 @@
 """Discover and drain future closed report keys using the same scope owner as the sealed input."""
 import copy
+from bisect import bisect_right
 import hashlib
 import json
 import os
@@ -33,7 +34,54 @@ def snapshot(file, keys, compact):
     return hashlib.sha256(data).hexdigest()
 
 
-def discovery_step(args, seed_runner, shared, ask, durable, compact, require):
+def outside_seed(args, candidates, directory, cursor, durable, require):
+    """Exclude exact primary source keys during an interleaved scan, including holes and old holds."""
+    if not candidates:
+        return candidates
+    path = directory / "seed-membership.json"
+    expected = cursor.get("seedMembershipSha256")
+    raw = path.read_bytes() if expected and path.is_file() else None
+    if raw is not None and hashlib.sha256(raw).hexdigest() == expected:
+        index = json.loads(raw)
+    else:
+        # A derived index of inclusive integer ranges, with no work or progress
+        # ownership. Rebuild even if an installation lost its local copy.
+        owners = {}
+        digest = hashlib.sha256()
+        with args.keys.open("rb") as seed:
+            for line in seed:
+                digest.update(line)
+                key = json.loads(line)
+                runs = owners.setdefault(key["executionId"], [])
+                seq = key["sequence"]
+                if runs and runs[-1][1] + 1 == seq:
+                    runs[-1][1] = seq
+                else:
+                    runs.append([seq, seq])
+        require(digest.hexdigest() == args.keys_sha256, "Discovery seed membership differs from the signed inventory")
+        for job, runs in owners.items():
+            ordered = []
+            for lo, hi in sorted(runs):
+                if ordered and lo <= ordered[-1][1] + 1:
+                    ordered[-1][1] = max(ordered[-1][1], hi)
+                else:
+                    ordered.append([lo, hi])
+            owners[job] = ordered
+        index = {"inventory": args.keys_sha256, "owners": owners}
+        durable(path, index)
+        cursor["seedMembershipSha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+    require(index["inventory"] == args.keys_sha256, "Discovery seed index has a different owner")
+    fresh = []
+    for key in candidates:
+        runs = index["owners"].get(key["executionId"], [])
+        seq = key["sequence"]
+        at = bisect_right(runs, seq, key=lambda bounds: bounds[0]) - 1
+        if at < 0 or seq > runs[at][1]:
+            fresh.append(key)
+    return fresh
+
+
+def discovery_step(args, seed_runner, shared, ask, durable, compact, require, *, before_seed_end=False):
     # Caller holds the original controller.lock throughout discovery and its subordinate page.
     frozen, ranges, bind, _runtime, _program = shared
     directory=args.state/"discovery"
@@ -68,6 +116,8 @@ def discovery_step(args, seed_runner, shared, ask, durable, compact, require):
             f=ranges.get(k["executionId"])
             if not f or not f.get("reportAfter",0)<k["sequence"]<=f["reportHighWater"]:
                 candidates.append(k)
+        if before_seed_end:
+            candidates = outside_seed(args, candidates, directory, cursor, durable, require)
         ready=ask("hub",dict(op="discover-hub",scope=scope,keys=candidates))["keys"] if candidates else []
         approved={tuple((k[n] for n in ("executionId","sequence","signature"))) for k in candidates}
         require(ready==sorted(ready,key=loc) and len(set(map(loc,ready)))==len(ready)
@@ -88,14 +138,27 @@ def discovery_step(args, seed_runner, shared, ask, durable, compact, require):
     sub=copy.copy(args)
     sub.priority_turn=None
     sub.keys=folder/"keys.jsonl";sub.state=folder/"state";sub.keys_sha256=page["sha256"];sub.discover_after_seed=False;sub.recheck_held_index=None;sub.recheck_held_through=None
+    sub.discover_every_seed_members = 0
+    if getattr(args, "discover_every_seed_members", 0):
+        # The primary turn's explicit owner-range selection covers only its seed.
+        sub.share_results = False
+    sub.discovery_result_hint = cursor.get("lastVerifiedResult")
     seed_runner(sub)
-    done=json.loads((sub.state/"progress.json").read_bytes())
+    child_progress = sub.state / "progress.json"
+    if not child_progress.exists() and getattr(args, "pause_file", None) and args.pause_file.exists():
+        return True
+    done=json.loads(child_progress.read_bytes())
     if done["after"]!=sub.keys.stat().st_size or done.get("pending") or done.get("group"):
-        return
+        return True
     require(done["completed"]==page["count"],"Discovered page count differs")
     cursor.update(after=page["through"],page=None,scanned=cursor["scanned"]+page["scanned"],
                   archived=cursor["archived"]+done.get("archived",0),held=cursor["held"]+done.get("held",0))
+    if done.get("lastVerifiedResult"):
+        cursor["lastVerifiedResult"] = done["lastVerifiedResult"]
+    else:
+        cursor.pop("lastVerifiedResult", None)
     durable(path,cursor)
+    return True
 
 def revisit_held(args, index, bind, run, durable, compact, require):
     # Revisit an old scientific hold under the original writer lock. Its first receipt stays immutable.
@@ -114,6 +177,7 @@ def revisit_held(args, index, bind, run, durable, compact, require):
         return False
     sub=copy.copy(args);sub.keys=directory/"keys.jsonl";sub.state=directory/"state"
     sub.priority_turn=None
+    sub.discover_every_seed_members = 0
     sub.keys_sha256=snapshot(sub.keys,[prior["key"]],compact)
     sub.recheck_held_index=None;sub.recheck_held_through=None;sub.discover_after_seed=False;sub.limit=1
     run(sub)
@@ -172,6 +236,7 @@ def revisit_prefix(args, through, progress, bind, run, durable, compact, require
     segment=folder/page["folder"]
     sub=copy.copy(args);sub.keys=segment/"keys.jsonl";sub.state=segment/"state";sub.keys_sha256=page["sha256"]
     sub.priority_turn=None
+    sub.discover_every_seed_members = 0
     sub.recheck_held_index=None;sub.recheck_held_through=None;sub.discover_after_seed=False
     run(sub)
     subprogress=json.loads((sub.state/"progress.json").read_bytes())

@@ -277,6 +277,53 @@ class ClosedReportOperator(unittest.TestCase):
                 self.assertEqual((final["pass"],final["held"],final["archived"],final["page"]),(2,2,0,None))
                 self.assertTrue((args.state/"discovery/pass-000001.json").is_file())
 
+    def test_discovery_interleaves_disjoint_keys_with_unfinished_seed_after_restart(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            job = "11111111-1111-4111-8111-111111111111"
+            key = lambda seq: {"executionId":job,"sequence":seq,"signature":controller.digest(str(seq).encode())}
+            scope = root / "scope.json"
+            scope.write_bytes(controller.compact({"version":1,"sourceInstance":job,"solverId":job,
+                              "executions":[{"executionId":job,"reportHighWater":2}]}))
+            source = root / "signed.jsonl"
+            source.write_bytes(b"".join(controller.compact(key(n)) + b"\n" for n in (5,7,9,12,14)))
+            args = SimpleNamespace(runtime_revision="a"*40,hz_host="hz",hub_host="hub",hz_api="api",
+                hz_sweeper="sweeper",hub_sweeper="sweeper",apply=True,limit=1,frozen_scope=scope,
+                frozen_sha256=controller.digest(scope.read_bytes()),keys=source,keys_sha256=controller.digest(source.read_bytes()),
+                state=root/"state",scan_rows=4,discovery_interval=900,discover_every_seed_members=1)
+            visited, hub, scans = [], [], []
+            def rpc(_args, _role, m, _program):
+                if m["op"] == "source":
+                    visited.append(m["key"]["sequence"])
+                    return {"held":"original retained"}
+                if m["op"] == "discover-worker":
+                    after = m["after"]["sequence"]
+                    scans.append(after)
+                    rows = {0:(5,6,7,8), 8:(9,10,11,12)}.get(after, ())
+                    return {"scanned":len(rows),"keys":[key(n) for n in rows],
+                            "last":{"executionId":job,"sequence":rows[-1]} if rows else None}
+                if m["op"] == "discover-hub":
+                    hub.extend(k["sequence"] for k in m["keys"])
+                    return {"keys":[k for k in m["keys"] if k["sequence"] != 10]}
+                self.fail(f"unexpected mutation {m['op']}")
+            with patch.object(controller,"run_peer",side_effect=rpc), patch.object(controller.subprocess,"check_output",return_value=b"runtime"):
+                controller.run(args)
+                controller.run(args)
+                cursor = args.state/"discovery/cursor.json"
+                pending = json.loads(cursor.read_bytes())
+                self.assertEqual(pending["page"]["count"], 2)
+                self.assertEqual((pending["scanned"],pending["held"]), (0,0))
+                # A missing derived index is rebuilt from the same signed roster.
+                (args.state/"discovery/seed-membership.json").unlink()
+                for _ in range(8):
+                    controller.run(args)
+            self.assertEqual(scans, [0,8,12])
+            self.assertEqual(hub, [6,8,10,11])
+            self.assertEqual(visited, [5,6,7,8,9,11,12,14])
+            final = json.loads(cursor.read_bytes())
+            self.assertEqual((final["page"],final["pass"],final["held"]), (None,2,3))
+            self.assertEqual(json.loads((args.state/"progress.json").read_bytes())["completed"], 5)
+
     def test_group_resumes_committed_generation_before_visiting_next_key(self):
         with tempfile.TemporaryDirectory() as temp:
             root=Path(temp);job="11111111-1111-4111-8111-111111111111"
@@ -506,7 +553,9 @@ class ClosedReportOperator(unittest.TestCase):
                 def row(k):
                     sequence = k["sequence"]
                     digest = "a"*64 if sequence < 2+width*3 else "b"*64
-                    return {"source":{"owner":owner,"facts":{"sha256":k["signature"],"byteSize":1030}},
+                    if sequence >= 100 + width*3:
+                        digest = "c"*64
+                    return {"source":{"owner":dict(owner,executionId=k["executionId"]),"facts":{"sha256":k["signature"],"byteSize":1030}},
                             "resultMeta":{"sha256":digest,"byteSize":1000},"archivedBundle":None,"stored":700}
                 def rpc(_args, role, m, _source):
                     group = "items" in m
@@ -563,6 +612,28 @@ class ClosedReportOperator(unittest.TestCase):
                 self.assertEqual(retired,[k["sequence"] for k in keys])
                 final=json.loads((args.state/"progress.json").read_bytes())
                 self.assertEqual((final["completed"],final["archived"],final["after"]),(len(keys),len(keys),source.stat().st_size))
+
+                # A later closed execution is discovered in independent signed pages.
+                # Carry only a verified result hint across them, even after the seed ends.
+                later = "22222222-2222-4222-8222-222222222222"
+                args.discover_every_seed_members = 16
+                args.scan_rows, args.discovery_interval = width, 900
+                def prospective_rpc(_args, role, m, program):
+                    if m["op"] == "discover-worker":
+                        seq = max(100, m["after"]["sequence"] + 1)
+                        source_keys = [dict(executionId=later,sequence=n,signature=controller.digest(str(n).encode()))
+                                       for n in range(seq,min(seq+width,100+4*width))]
+                        return {"keys":source_keys,"scanned":len(source_keys),
+                                "last":source_keys[-1] if source_keys else None}
+                    if m["op"] == "discover-hub":
+                        return {"keys":m["keys"]}
+                    return rpc(_args,role,m,program)
+                with patch.object(controller,"run_peer",side_effect=prospective_rpc), patch.object(controller.subprocess,"check_output",return_value=b"runtime"):
+                    for _ in range(5):
+                        controller.run(args)
+                self.assertEqual(modes[6:], [(100,False),(100+width,False),(100+width*2,True),(100+width*3,False)])
+                self.assertEqual(json.loads((args.state/"discovery/cursor.json").read_bytes())["archived"], 4*width)
+
 
     def test_existing_result_keeps_its_ordinary_order_across_changed_neighbors(self):
         from closed_worker_report_pages import dictionary_prefix
