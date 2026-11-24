@@ -42,12 +42,20 @@ export async function authorizeProgressiveRemoteStart(
         kind: "stop",
         reason: "The worker does not own this assignment",
       };
-    const initialEnvelope = verifyProgressiveRemoteExecution(dispatch.envelope, {
-      ...input,
-      promiseId: String(dispatch.promise_id),
-    });
+    const initialEnvelope = verifyProgressiveRemoteExecution(
+      dispatch.envelope,
+      {
+        ...input,
+        promiseId: String(dispatch.promise_id),
+      },
+    );
+    const assignedStage = effectiveProgressiveStageSql(
+      "generation",
+      sql`${initialEnvelope.scope.targetId}`,
+      sql`${initialEnvelope.scope.stage}::smallint`,
+    );
     const [generation] = await connection.execute(sql`
-      SELECT generation.status, ${effectiveProgressiveStageSql("generation", sql`${initialEnvelope.scope.targetId}`, null)} AS stage, campaign.status AS campaign_status,
+      SELECT generation.status, ${assignedStage} AS stage, campaign.status AS campaign_status,
         generation.plan_revision_id = campaign.current_plan_revision_id AS current_plan
       FROM progressive_generations generation JOIN sim_campaigns campaign ON campaign.id = generation.campaign_id
       WHERE generation.id = ${initialEnvelope.scope.generationId}::uuid AND generation.epoch_id = ${initialEnvelope.scope.epochId}::uuid

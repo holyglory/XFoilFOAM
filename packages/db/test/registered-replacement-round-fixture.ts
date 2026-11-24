@@ -5,6 +5,11 @@ import type { DB } from "../src/client";
 import type { EngineClient, PolarRequest } from "../../engine-client/src";
 import { analysisContentHash } from "../src/analysis-target";
 import { readProgressiveRemoteAssignment } from "../src/progressive-remote-delivery";
+import { initializeProgressiveCfdWork } from "../src/progressive-cfd";
+import {
+  initializeProgressiveGenerationCohorts,
+  SUBSONIC_THROUGH_PRECISE_POLICY,
+} from "../src/progressive-execution-policy";
 import {
   sealProgressiveRemoteExecution,
   type ProgressiveRemoteExecutionEnvelope,
@@ -49,6 +54,35 @@ export async function verifyRegisteredReplacementRound(
       const [replacement, other] = documents;
       if (!replacement || !other)
         throw Error("Two registered campaign assignments are required");
+      // The same target can already have a precise grid when a leased FAST
+      // group still belongs to its stage-2 cohort. Materialize the ordinary
+      // precise recipe in the independent hub fixture.
+      const scope = other.envelope.scope;
+      expect(scope.stage).toBe(2);
+      const [generation] =
+        await hub.sql`SELECT campaign_id FROM progressive_generations WHERE id=${scope.generationId}`;
+      await hub.sql`INSERT INTO campaign_progressive_execution_policies (campaign_id, policy)
+        VALUES (${generation.campaign_id}, ${SUBSONIC_THROUGH_PRECISE_POLICY}) ON CONFLICT DO NOTHING`;
+      await initializeProgressiveGenerationCohorts(hub.db, scope.generationId);
+      const [member] =
+        await hub.sql`SELECT cohort FROM progressive_generation_cohort_targets
+        WHERE generation_id=${scope.generationId} AND target_id=${scope.targetId}`;
+      expect(member.cohort).toBe("low");
+      const setCohortStage = (
+        stage: 2 | 3,
+      ) => hub.sql`UPDATE progressive_generation_cohorts SET stage=${stage}
+        WHERE generation_id=${scope.generationId} AND cohort=${member.cohort}`;
+      await setCohortStage(3);
+      await hub.sql`INSERT INTO progressive_work (generation_id,target_id,stage)
+        VALUES (${scope.generationId},${scope.targetId},3) ON CONFLICT DO NOTHING`;
+      await initializeProgressiveCfdWork(hub.db, generation.campaign_id);
+      const preciseGrid =
+        () => hub.sql`SELECT u.id,u.aoa_deg,u.recipe,u.active_budget_seconds,u.state
+        FROM progressive_cfd_units u JOIN progressive_work w ON w.id=u.work_id
+        WHERE w.generation_id=${scope.generationId} AND w.target_id=${scope.targetId} AND w.stage=3 ORDER BY u.ordinal`;
+      const originalPrecise = await preciseGrid();
+      expect(originalPrecise.length).toBeGreaterThan(0);
+      await setCohortStage(2);
       const oldJob = randomUUID(),
         oldPromise = randomUUID();
       const oldUnits = replacement.envelope.scope.units.map((u) => ({
@@ -428,6 +462,39 @@ export async function verifyRegisteredReplacementRound(
         });
         expect(retryPage.existing).toBeGreaterThanOrEqual(1);
         expect(await oldSource()).toEqual(priorOwner);
+        const url = `${base}/progressive-executions/${scope.executionId}`;
+        const headers = { "x-xfoilfoam-solver-token": token };
+        const continuation = async () => {
+          const response = await fetch(`${url}/control`, { headers });
+          expect(response.status).toBe(200);
+          return response.json();
+        };
+        expect(await continuation()).toMatchObject({
+          continuation: { kind: "continue" },
+        });
+        await setCohortStage(3);
+        expect(await continuation()).toMatchObject({
+          continuation: {
+            kind: "stop",
+            reason: expect.stringContaining("stage"),
+          },
+        });
+        const staleStart = await fetch(`${url}/start`, {
+          method: "POST",
+          headers: { ...headers, "content-type": "application/json" },
+          body: JSON.stringify({
+            contentSignature: other.envelope.contentSignature,
+          }),
+        });
+        expect(staleStart.status).toBe(409);
+        expect(await staleStart.json()).toMatchObject({
+          decision: { kind: "stop", reason: expect.stringContaining("stage") },
+        });
+        const [retained] =
+          await hub.sql`SELECT request_payload->'remoteStartAuthorization' AS proof
+          FROM sim_jobs WHERE id=${scope.executionId}`;
+        expect(retained.proof).toEqual(authority.proof);
+        expect(await preciseGrid()).toEqual(originalPrecise);
         console.log(
           JSON.stringify({
             registeredReplacementRound: true,

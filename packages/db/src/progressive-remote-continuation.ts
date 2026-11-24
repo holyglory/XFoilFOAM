@@ -29,8 +29,13 @@ export async function readProgressiveRemoteContinuation(
         ...input,
         promiseId: String(dispatch.promise_id),
       });
+      const assignedStage = effectiveProgressiveStageSql(
+        "generation",
+        sql`${envelope.scope.targetId}`,
+        sql`${envelope.scope.stage}::smallint`,
+      );
       const [generation] = await connection.execute(sql`
-      SELECT generation.status, ${effectiveProgressiveStageSql("generation", sql`${envelope.scope.targetId}`, null)} AS stage, generation.plan_revision_id, campaign.current_plan_revision_id,
+      SELECT generation.status, ${assignedStage} AS stage, generation.plan_revision_id, campaign.current_plan_revision_id,
         campaign.status AS campaign_status
       FROM progressive_generations generation JOIN sim_campaigns campaign ON campaign.id = generation.campaign_id
       WHERE generation.id = ${envelope.scope.generationId}::uuid AND generation.epoch_id = ${envelope.scope.epochId}::uuid
