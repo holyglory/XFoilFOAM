@@ -92,6 +92,7 @@ async function withFixture(
   {
     pendingCount = 2,
     failedPoints = false,
+    includeManifest = false,
     includeHistory = false,
     periodicHistory = false,
     tinyHistory = false,
@@ -100,6 +101,7 @@ async function withFixture(
   }: {
     pendingCount?: number;
     failedPoints?: boolean;
+    includeManifest?: boolean;
     includeHistory?: boolean;
     periodicHistory?: boolean;
     tinyHistory?: boolean;
@@ -365,7 +367,7 @@ async function withFixture(
                   sha256: "d".repeat(64),
                   byte_size: 24,
                 },
-                ...(failedPoints && alpha >= 7
+                ...(includeManifest || (failedPoints && alpha >= 7)
                   ? [
                       {
                         kind: "manifest" as const,
@@ -986,6 +988,43 @@ it("leaves another scope-closed rejection terminal after one explicit replay", a
     ).toBe(false);
     expect(fetcher).toHaveBeenCalledOnce();
   });
+});
+
+it.each([true, false])("requires an exact storage-only receipt for a measured point of an expired stopped dispatch (storageOnly=%s)", async (storageOnly) => {
+  await withFixture(async ({connection,input,receipt}) => {
+    const point=input.points[0]!;
+    input.points=[point];input.expectedCount=1;
+    // A still-active promise never qualifies for the expired-source route.
+    await connection.execute(sql`UPDATE sync_sweep_promises SET status='active'`);
+    expect(await progressiveStoppedStorageEligible(connection,input.executionId,point,"expired-measured")).toBe(false);
+    await connection.execute(sql`UPDATE sync_sweep_promises SET status='expired'`);
+    expect(await progressiveStoppedStorageEligible(connection,input.executionId)).toBe(false);
+    expect(await progressiveStoppedStorageEligible(connection,input.executionId,point,"failed")).toBe(false);
+    expect(await progressiveStoppedStorageEligible(connection,input.executionId,point,"expired-measured")).toBe(true);
+    expect(await progressiveStoppedStorageEligible(connection,input.executionId,{...point,pointContentSignature:"0".repeat(64)},"expired-measured")).toBe(false);
+    const [originalAttempt]=await connection.execute(sql`SELECT evidence_payload::text original FROM result_attempts WHERE id=${point.resultAttemptId}::uuid`);
+    await connection.execute(sql`UPDATE result_attempts SET evidence_payload=evidence_payload-'evidence_artifacts' WHERE id=${point.resultAttemptId}::uuid`);
+    expect(await progressiveStoppedStorageEligible(connection,input.executionId,point,"expired-measured")).toBe(false);
+    await connection.execute(sql`UPDATE result_attempts SET evidence_payload=${originalAttempt.original}::jsonb WHERE id=${point.resultAttemptId}::uuid`);
+    const original=await snapshot(connection,["sync_sweep_promises","sim_jobs","results","result_attempts"]);
+    await replayProgressiveWorkerOutbox(connection,input,{apply:true});
+    const calls:string[]=[];
+    const fetcher: typeof fetch = async (url,opts) => {
+      calls.push(String(url));
+      const request=JSON.parse(String(opts?.body));
+      expect(request.results[0].progressiveEvidence.pointContentSignature).toBe(point.pointContentSignature);
+      return String(url).endsWith("/polars")
+        ? Response.json({code:"progressive_scope_closed",error:"Obsolete or settled progressive CFD execution scope"},{status:409})
+        : Response.json({progressiveEvidenceReceipts:[{...receipt(point),storageOnly}]});
+    };
+    if (storageOnly) expect(await deliverNextProgressiveWorkerEvidence(connection,fetcher)).toBe(true);
+    else await expect(deliverNextProgressiveWorkerEvidence(connection,fetcher)).rejects.toThrow(/storage-only receipt/);
+    expect(calls.map(x=>x.split("/").at(-1))).toEqual(["polars","retained-progressive-evidence"]);
+    expect(await snapshot(connection,["sync_sweep_promises","sim_jobs","results","result_attempts"])).toEqual(original);
+    const [saved]=await connection.execute(sql`SELECT receipt FROM progressive_worker_hub_receipts WHERE result_attempt_id=${point.resultAttemptId}::uuid`);
+    if (storageOnly) expect(saved.receipt).toMatchObject({storageOnly:true,pointContentSignature:point.pointContentSignature});
+    else expect(saved).toBeUndefined();
+  },{includeManifest:true,periodicHistory:true});
 });
 
 it("keeps a failed attempt eligible for stopped storage beneath an accepted canonical cell", async () => {

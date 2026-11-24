@@ -24,20 +24,28 @@ const stoppedOwner = sql`
 export async function progressiveStoppedStorageEligible(
   db: DB,
   executionId: string,
-  failedSource?: { resultAttemptId: string; pointContentSignature: string; sequence: number },
+  point?: { resultAttemptId: string; pointContentSignature: string; sequence: number },
+  mode: "failed" | "expired-measured" = "failed",
 ): Promise<boolean> {
-  if (failedSource) {
+  if (mode === "expired-measured" && !point) return false;
+  if (point) {
+    // An expired lease cannot publish or select a point. The retention route
+    // may store a genuinely measured, signed point after the immutable stop.
+    const disposition = mode === "expired-measured"
+      ? sql`promise.status='expired' AND attempt.status='done' AND attempt.valid_for_polar
+          AND attempt.converged AND attempt.cl IS NOT NULL AND attempt.cd IS NOT NULL AND attempt.cm IS NOT NULL`
+      : sql`attempt.status='failed' AND NOT attempt.valid_for_polar AND NOT attempt.converged
+          AND attempt.evidence_payload->>'failure_disposition' IN('material_domain','infrastructure','hard_solver')`;
     const rows = await db.execute(sql`SELECT job.id FROM sim_jobs job
       JOIN sync_sweep_promises promise ON promise.id::text=job.request_payload->>'syncPromiseId'
       JOIN sync_api_settings settings ON settings.id=1
       JOIN progressive_worker_evidence_attempts source ON source.sim_job_id=job.id
-        AND source.sequence=${failedSource.sequence} AND source.result_attempt_id=${failedSource.resultAttemptId}::uuid
-        AND source.point_content_signature=${failedSource.pointContentSignature}
+        AND source.sequence=${point.sequence} AND source.result_attempt_id=${point.resultAttemptId}::uuid
+        AND source.point_content_signature=${point.pointContentSignature}
       JOIN progressive_worker_reports report ON report.sim_job_id=source.sim_job_id AND report.sequence=source.sequence
         AND report.acknowledged_at IS NOT NULL
       JOIN result_attempts attempt ON attempt.id=source.result_attempt_id AND attempt.sim_job_id=job.id
-        AND attempt.engine_job_id=job.id::text AND attempt.status='failed' AND NOT attempt.valid_for_polar
-        AND NOT attempt.converged
+        AND attempt.engine_job_id=job.id::text
       WHERE job.id=${executionId}::uuid AND job.engine_job_id=job.id::text
         AND job.status IN('done','failed','cancelled') AND job.request_payload->>'remoteSolver'='true'
         AND job.request_payload ? 'remoteProgressiveExecution'
@@ -46,13 +54,17 @@ export async function progressiveStoppedStorageEligible(
         AND promise.source_base_url=settings.upstream_base_url
         AND job.request_payload->>'upstreamBaseUrl'=settings.upstream_base_url
         AND NOT settings.remote_solver_transfer_paused AND settings.remote_solver_auth_token<>''
-        AND attempt.evidence_payload->>'failure_disposition' IN('material_domain','infrastructure','hard_solver')
+        AND ${disposition}
         AND EXISTS(SELECT 1 FROM jsonb_array_elements(attempt.evidence_payload->'evidence_artifacts') artifact
           WHERE artifact->>'kind'='manifest' AND artifact->>'sha256' ~ '^[a-fA-F0-9]{64}$'
             AND (artifact->>'byte_size')::bigint>0)
         AND EXISTS(SELECT 1 FROM progressive_worker_reports stopped
           JOIN progressive_worker_submission_intents intent ON intent.sim_job_id=stopped.sim_job_id
             AND intent.assignment_signature=stopped.assignment_signature
+          ${mode === "expired-measured" ? sql`AND intent.authorization->>'kind'='authorized'
+            AND intent.authorization->>'executionId'=job.id::text
+            AND intent.authorization->>'contentSignature'=report.assignment_signature
+            AND report.assignment_signature=job.request_payload#>>'{remoteProgressiveExecution,contentSignature}'` : sql``}
           WHERE stopped.sim_job_id=job.id AND stopped.assignment_signature=report.assignment_signature
             AND stopped.sequence>=source.sequence AND stopped.stopped_engine_job_id=job.id::text
             AND stopped.acknowledged_at IS NOT NULL

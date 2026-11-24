@@ -238,6 +238,7 @@ export async function deliverNextProgressiveWorkerEvidence(
   let responseStatus: number | null = null;
   let importConflictIds: string[] = [];
   let stoppedStorage = false;
+  let expiredMeasuredStorage = false;
   let retryStoppedStorage = false;
   let rejected: { code?: unknown; error?: unknown } | null = null;
   try {
@@ -346,10 +347,12 @@ export async function deliverNextProgressiveWorkerEvidence(
           db,
           executionId,
         );
-        if (!stoppedStorage && projection.status === "failed")
+        if (!stoppedStorage) {
           stoppedStorage = await progressiveStoppedStorageEligible(db, executionId, {
             resultAttemptId: String(pending.result_attempt_id), pointContentSignature: source.contentSignature, sequence,
-          });
+          }, projection.status === "failed" ? "failed" : "expired-measured");
+          expiredMeasuredStorage = stoppedStorage && projection.status !== "failed";
+        }
         if (stoppedStorage) {
           response = await post("retained-progressive-evidence");
           responseStatus = response.status;
@@ -415,6 +418,8 @@ export async function deliverNextProgressiveWorkerEvidence(
     const receipts = responseBody?.progressiveEvidenceReceipts;
     const retainedAttempt = Array.isArray(receipts) && receipts.length === 1
       ? (receipts[0] as Record<string, unknown> | null) : null;
+    if (expiredMeasuredStorage && retainedAttempt?.storageOnly !== true)
+      throw new Error("Expired measured source requires an exact storage-only receipt");
     const receipt = diagnostic ? responseBody?.diagnosticReceipt ?? retainedAttempt : retainedAttempt;
     if (diagnostic && (responseBody?.received !== true || responseBody.receipt?.executionId !== executionId ||
       responseBody.receipt.sequence !== sequence || responseBody.receipt.contentSignature !== pending.report_signature ||
