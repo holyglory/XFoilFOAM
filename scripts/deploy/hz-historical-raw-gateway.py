@@ -19,7 +19,11 @@ from pathlib import Path
 HEX = re.compile(r"[0-9a-f]{64}")
 IMAGE = re.compile(r"sha256:[0-9a-f]{64}")
 BASE_MAIN = "7b43345c58f22d4a2901eae8a0a3425ed3e79619fc7d2e07c02f4b261e4073d1"
-FILES = ("src/airfoilfoam/api/main.py", "src/airfoilfoam/historical_raw_restore.py")
+FILES = ("src/airfoilfoam/api/main.py", "src/airfoilfoam/historical_raw_restore.py", "src/airfoilfoam/working_file_restore.py")
+# The W23–W39 journal for the original, never-selected historical reader.
+HISTORICAL_TARGET = {FILES[0]: "36eff9406d199fc292fabbe135656b94f4dd9dba96287841bc7c44186dcd3dfb",
+                     FILES[1]: "a908d6dd9574de621ddb6cce6675738115e614c6228c0993ea65f98b88872f1f"}
+PREVIOUS_CONTROL = "a65d0fc32b88b770c8b250a99fff438fa4275556dc17108fcfb78b0a48da3c7b"
 FORMAT = (
     "{{.Id}}|{{.Image}}|{{.Config.Image}}|{{.State.Running}}|{{.State.StartedAt}}|"
     '{{index .Config.Labels "com.docker.compose.project"}}|{{index .Config.Labels "com.docker.compose.service"}}'
@@ -32,7 +36,7 @@ from pathlib import Path
 from airfoilfoam.provenance import application_source_files, application_source_sha256, installed_application_source_sha256
 from airfoilfoam.config import get_settings
 root=Path("/app")
-names=("src/airfoilfoam/api/main.py","src/airfoilfoam/historical_raw_restore.py")
+names=("src/airfoilfoam/api/main.py","src/airfoilfoam/historical_raw_restore.py","src/airfoilfoam/working_file_restore.py")
 digest=lambda p: hashlib.sha256(p.read_bytes()).hexdigest() if p.is_file() else None
 sources={n:digest(root/n) for n in names}
 package=Path(importlib.util.find_spec("airfoilfoam").origin).parent
@@ -49,6 +53,8 @@ for path in sorted(package.rglob("*")):
  if "src/airfoilfoam/"+name not in names:
   installed.update(name.encode()+b"\0"+path.read_bytes()+b"\0")
 assert sources==loaded and installed_application_source_sha256()==application_source_sha256(root)
+# Keep the exact original proof representation on the previously captured gateway.
+if sources[names[2]] is None: del sources[names[2]]
 print(json.dumps({"modules":sources,"otherSources":other.hexdigest(),"otherInstalled":installed.hexdigest(),
                   "application":installed_application_source_sha256()}))
 """
@@ -379,6 +385,61 @@ def bind_legacy_capture(a, original, existing, wanted, control, worker):
     return updated
 
 
+def check_reader_predecessor(journal, current):
+    previous_sha = current["previousReaderCaptureSha256"]
+    require(HEX.fullmatch(previous_sha), "invalid prior file-reader capture")
+    archive = capture_directory(journal, previous_sha)
+    st = archive.lstat()
+    require(stat.S_ISDIR(st.st_mode) and st.st_uid == os.geteuid() and not st.st_mode & 0o077
+            and {p.name for p in archive.iterdir()} == {"original.json", "sealed.json", "transition.json"},
+            "invalid working-file capture predecessor directory")
+    prior_bytes = private_bytes(archive / "original.json")
+    sealed = private_bytes(archive / "sealed.json")
+    record = private_json(archive / "transition.json")
+    old, new = json.loads(prior_bytes), json.loads(sealed)
+    require(hashlib.sha256(prior_bytes).hexdigest() == previous_sha and record == {
+        "kind": "working-file-reader", "previousSha256": previous_sha, "newSha256": hashlib.sha256(sealed).hexdigest()
+    } and old["phase"] == new["phase"] == "captured" and old["wanted"] == HISTORICAL_TARGET
+        and set(new) == LEGACY_CAPTURE_FIELDS | {"previousReaderCaptureSha256"}
+        and new["previousReaderCaptureSha256"] == previous_sha
+        and all(new[k] == old[k] for k in LEGACY_CAPTURE_FIELDS - {"wanted", "candidateRef", "control"})
+        and all(current.get(k) == new[k] for k in new if k != "phase"),
+        "captured working-file reader predecessor differs")
+    if "originalCaptureSha256" in old:
+        check_transition(journal, old)
+    return sealed
+
+
+def advance_unselected_reader(a, raw, old, wanted, control, worker):
+    # The shell enters capture before opening its own drain. Never retarget a live
+    # or previously selected image, an issued canary, or another operator's phase.
+    valid_fields = (LEGACY_CAPTURE_FIELDS, LEGACY_CAPTURE_FIELDS | {"originalCaptureSha256", "captureBindingSha256"})
+    require(a.action == "capture" and old["phase"] == "captured"
+            and set(old) in valid_fields and old["wanted"] == HISTORICAL_TARGET and old["version"] == 1
+            and old["project"] == a.project and old["build"] == a.build and old["worker"] == worker
+            and old["base"]["configHash"] == a.config_hash
+            and old["before"]["modules"] == {FILES[0]: BASE_MAIN, FILES[1]: None}
+            and (hashlib.sha256(json_bytes(old["control"]).rstrip(b"\n")).hexdigest() == PREVIOUS_CONTROL
+                 or old["control"] == control), "unrecognized or active original reader candidate")
+    gw = service(a.project + "-api-1", a.project)
+    checked_tag(old["base"]["imageRef"], old["base"]["image"])
+    require(gw == old["base"] and exec_python(gw["id"], PROBE) == old["before"] and
+            require_worker(gw, worker, old["workerNumerical"]["application_source_sha256"], a.build) == old["workerNumerical"],
+            "capture no longer describes the serving gateway and numerical worker")
+    previous_sha = hashlib.sha256(raw).hexdigest()
+    updated = {k:old[k] for k in LEGACY_CAPTURE_FIELDS}
+    updated.update(previousReaderCaptureSha256=previous_sha, control=control, wanted=wanted,
+                   candidateRef=a.project + "-raw-reader:" + hashlib.sha256(json.dumps([gw["image"], wanted], sort_keys=True).encode()).hexdigest())
+    sealed = json_bytes(updated)
+    publish_transition(capture_directory(a.state, previous_sha), raw, sealed,
+                       {"kind":"working-file-reader","previousSha256":previous_sha,"newSha256":hashlib.sha256(sealed).hexdigest()})
+    require(check_reader_predecessor(a.state, updated) == sealed and private_bytes(a.state) == raw
+            and service(a.project + "-api-1", a.project) == gw and service(a.project + "-worker-1", a.project) == worker,
+            "file reader changed before sealing its next target")
+    replace_bytes(a.state, sealed)
+    return updated
+
+
 def runtime_contract(container):
     # Hash effective settings on the deployment host. Values, including server
     # credentials, are never written to a receipt or diagnostic.
@@ -481,7 +542,7 @@ def compare_candidate(base, candidate, wanted):
         and candidate["otherSources"] == base["otherSources"]
         and candidate["otherInstalled"] == base["otherInstalled"]
         and candidate["application"] != base["application"],
-        "gateway image changed outside the two reviewed modules",
+        "gateway image changed outside the reviewed file-reader modules",
     )
 
 
@@ -552,7 +613,48 @@ def require_worker(gateway, worker, expected_hash, build):
     return verify(exec_python(gateway["id"], QUEUE), build, actual, 1)
 
 
+def working_canary(value):
+    w = value.get("workingFile")
+    require(isinstance(w, dict) and set(w) == {"job", "path", "byteSize", "sha256", "generation", "planSha256"}
+            and re.fullmatch(r"[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}", w["job"])
+            and re.fullmatch(r"cases/[A-Za-z0-9][A-Za-z0-9_.+-]*(?:/[A-Za-z0-9][A-Za-z0-9_.+-]*){2,}", w["path"])
+            and w["job"] != (value.get("receipt") or {}).get("sim_job_id") and HEX.fullmatch(w["planSha256"])
+            and not any(q.lower() in {"evidence","frames","images","polymesh","meshes"} or q.startswith(("processor","core."))
+                        for q in w["path"].split("/")[2:])
+            and type(w["byteSize"]) is int and 0 < w["byteSize"] <= 128 * 1024**2
+            and HEX.fullmatch(w["sha256"]) and re.fullmatch(r"[1-9][0-9]{0,19}", w["generation"])
+            and int(w["generation"]) < 2**64, "invalid original working-file canary")
+    return w
+
+
+WORKING_READ = r"""
+import hashlib,json,sys,urllib.request,urllib.parse
+from pathlib import Path
+v=json.load(sys.stdin)
+job=v['job'];path=v['path'];target=Path('/data/airfoilfoam/jobs')/job/path
+assert not target.exists() and not target.is_symlink()
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+ def redirect_request(self,*_):return None
+q='/'.join(urllib.parse.quote(s,safe='')for s in path.split('/'))
+rows=[]
+for origin,url in [('engine','http://127.0.0.1:8000/jobs/'+job+'/files/'+q),('node-api','http://node-api:4000/api/media/jobs/'+job+'/'+q)]:
+ with urllib.request.build_opener(urllib.request.ProxyHandler({}),NoRedirect()).open(url,timeout=300)as s:
+  assert s.status==200 and int(s.headers['content-length'])==v['byteSize']
+  if origin=='engine':assert s.headers['x-gcs-generation']==v['generation'] and s.headers['x-content-sha256']==v['sha256'] and s.headers['x-working-file-plan']==v['planSha256']
+  h=hashlib.sha256();n=0
+  while part:=s.read(1024*1024):
+   n+=len(part);assert n<=v['byteSize'];h.update(part)
+  assert n==v['byteSize'] and h.hexdigest()==v['sha256'];rows.append({'route':origin,'bytes':n,'sha256':h.hexdigest()})
+assert not target.exists();print(json.dumps({'generation':v['generation'],'routes':rows}))
+"""
+
+
 def operate(a):
+    if a.action == "check-working-canary":
+        value = private_json(a.canary)
+        working_canary(value)
+        require("receipt" in value and "member" in value, "original historical canary is also required")
+        return
     state_file, app = a.state, a.app
     digest = lambda p: hashlib.sha256(p.read_bytes()).hexdigest()
     wanted = {name: digest(app / name) for name in FILES}
@@ -582,9 +684,20 @@ def operate(a):
     if existing and (
         set(existing["base"]) == LEGACY_SERVICE_FIELDS or set(existing["worker"]) == LEGACY_SERVICE_FIELDS
     ):
-        existing = bind_legacy_capture(a, original, existing, wanted, control, worker)
+        verified_target = HISTORICAL_TARGET if existing.get("wanted") == HISTORICAL_TARGET else wanted
+        existing = bind_legacy_capture(a, original, existing, verified_target, control, worker)
     if existing and "originalCaptureSha256" in existing:
         check_transition(state_file, existing)
+    if existing and existing.get("wanted") == HISTORICAL_TARGET and existing["phase"] == "captured":
+        if a.action == "capture":
+            existing = advance_unselected_reader(a, private_bytes(state_file), existing, wanted, control, worker)
+        elif a.action in ("phase", "bind-original", "original"):
+            # An old capture can still establish its original identity or recover. No image selection.
+            wanted = HISTORICAL_TARGET
+            if hashlib.sha256(json_bytes(existing["control"]).rstrip(b"\n")).hexdigest() == PREVIOUS_CONTROL:
+                control = existing["control"]
+    if existing and "previousReaderCaptureSha256" in existing:
+        check_reader_predecessor(state_file, existing)
     if a.action == "capture" and existing and existing["phase"] == "restored":
         # Preserve the first attempt and its exact recovery before taking a new baseline.
         recovered = existing["restoredGateway"]
@@ -708,6 +821,8 @@ def operate(a):
         canary = private_json(a.canary)
         c = canary["receipt"]
         member = canary["member"]
+        if getattr(a, "new_working_reader", False) or "workingFile" in canary:
+            working_canary(canary)
         require(
             isinstance(c, dict)
             and HEX.fullmatch(c["stored_sha256"])
@@ -784,6 +899,8 @@ def operate(a):
         require_worker(current, worker, existing["workerNumerical"]["application_source_sha256"], a.build)
         if a.action == "verify":
             readback = exec_python(current["id"], READ, json.dumps(canary), timeout=750)
+            if "workingFile" in canary:
+                readback["workingFile"] = exec_python(current["id"], WORKING_READ, json.dumps(working_canary(canary)), timeout=750)
             require(len(readback) == 2, "incomplete registered archive readback")
             existing.update(phase="verified", gateway=current, readback=readback)
         elif a.action == "attest":
@@ -833,6 +950,7 @@ if __name__ == "__main__":
             "capture",
             "bind-original",
             "bind-canary",
+            "check-working-canary",
             "build",
             "original",
             "select",
@@ -850,6 +968,7 @@ if __name__ == "__main__":
     parser.add_argument("--config-hash", required=True)
     parser.add_argument("--build", required=True)
     parser.add_argument("--canary", type=Path)
+    parser.add_argument("--new-working-reader", action="store_true")
     parser.add_argument("--drain-env", type=Path)
     parser.add_argument("--pool-state")
     parser.add_argument("--transfer-state")

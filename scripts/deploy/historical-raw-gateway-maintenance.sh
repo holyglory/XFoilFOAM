@@ -6,7 +6,8 @@ gateway_image() {
   hash="${BASH_REMATCH[1]}"
   local -a args=("$DEPLOY_SCRIPT_DIR/hz-historical-raw-gateway.py" "$1" --app "$APP_DIR"
     --state "$AIRFOILS_PRO_STATE_DIR/historical-raw-gateway.json" --project "$COMPOSE_PROJECT_NAME" --build "$ACTION" --config-hash "$hash")
-  if [[ "$1" == verify || "$1" == bind-canary ]]; then args+=(--canary "$GATEWAY_CANARY"); fi
+  if [[ "$GATEWAY_ACTION" == try-install ]]; then args+=(--new-working-reader); fi
+  if [[ "$1" == verify || "$1" == bind-canary || "$1" == check-working-canary ]]; then args+=(--canary "$GATEWAY_CANARY"); fi
   if [[ "$1" == bind-original ]]; then
     local pools transfer sweeper media
     pools="$(opencfd_pool_state)" || return 12
@@ -113,6 +114,19 @@ historical_gateway_recover() {
   historical_gateway_restore_controls
 }
 
+# Observe before acquiring a drain. All existing closed-admission and worker guards
+# still run after preparation; a vacancy lost between the two checks is recoverable.
+historical_gateway_vacant_now() {
+  local probe observed
+  for probe in openfoam_processes queue_activity maintenance_database_activity redis_queue_activity remote_solver_drain_transfer_activity; do
+    observed="$("$probe")" || return 12
+    if [[ -n "$observed" ]]; then
+      echo "File gateway deferred before admission changes: $probe reports existing work." >&2
+      return 3
+    fi
+  done
+}
+
 historical_gateway_operation() {
   local pending phase activity
   [[ "$(read_env_var AIRFOILFOAM_BUILD_ID)" == "$ACTION" &&
@@ -120,8 +134,19 @@ historical_gateway_operation() {
     echo "The gateway refresh must retain the original engine build." >&2; return 14;
   }
   pending="$(read_env_var REMOTE_SOLVER2606_DRAIN_PENDING)"
+  if [[ "$GATEWAY_ACTION" == try-install ]]; then
+    [[ "$pending" != 1 ]] || { echo "An existing drain has its own recovery owner." >&2; return 14; }
+    [[ -f "$GATEWAY_CANARY" && ! -L "$GATEWAY_CANARY" ]] || { echo "Missing combined historical and working-file canary." >&2; return 14; }
+    local vacant=0
+    historical_gateway_vacant_now || vacant=$?
+    if [[ "$vacant" == 3 ]]; then return 0; fi
+    [[ "$vacant" == 0 ]] || return "$vacant"
+    # A bad canary or an existing historical retirement must refuse before intake changes.
+    gateway_image check-working-canary || return 14
+    historical_gateway_no_retirements || return 14
+  fi
   if [[ "$pending" != 1 ]]; then
-    if [[ "$GATEWAY_ACTION" != prepare ]]; then
+    if [[ "$GATEWAY_ACTION" != prepare && "$GATEWAY_ACTION" != try-install ]]; then
       if [[ "$GATEWAY_ACTION" == install && "$(gateway_image phase)" == verified ]]; then
         gateway_image verify
         return
@@ -129,7 +154,7 @@ historical_gateway_operation() {
       echo "No prepared historical gateway drain." >&2; return 14
     fi
     if [[ -f "$AIRFOILS_PRO_STATE_DIR/historical-raw-gateway.json" && "$(gateway_image phase)" == verified ]]; then
-      gateway_image attest
+      if [[ "$GATEWAY_ACTION" == try-install ]]; then gateway_image verify; else gateway_image attest; fi
       return
     fi
     numerics2_preflight
@@ -166,6 +191,7 @@ historical_gateway_operation() {
       activity="$(remote_solver_drain_activity)" || return 12
       if [[ -n "$activity" ]]; then
         echo "Historical file gateway deferred; existing jobs and transfers continue: $activity"
+        if [[ "$GATEWAY_ACTION" == try-install ]]; then historical_gateway_recover || return 14; fi
         return
       fi
       if [[ "$sample" == 1 ]]; then sleep "$REMOTE_SOLVER_DRAIN_POLL_SECONDS"; fi

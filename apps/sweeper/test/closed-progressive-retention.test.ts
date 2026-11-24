@@ -349,6 +349,7 @@ it("runs the default sweeper past eight held jobs, restores every member, and re
   const open = () => createClient({max:1,connection:{search_path:schema+",public",application_name:"automatic-retention-fixture"}});
   let connection = open();
   const owned = (i: number) => "00000000-0000-4000-a000-"+String(i).padStart(12,"0");
+  let readFault: "wrong-generation" | "bad-bytes" | "busy" | "historical-owner" | null = null;
   const original = new Map<string, { path: string; remote: ProgressiveEvidenceCustodyReceipt["remote"]; hits: number; failPost: boolean }>();
   const historicalOwner=owned(9), bad=owned(10), good=owned(11), transferred=owned(12), oldHub=owned(13);
   const assignments=new Map<string,string>(), protectedJobs=new Set([historicalOwner]), ownerProbes=new Map<string,number>();
@@ -359,7 +360,7 @@ it("runs the default sweeper past eight held jobs, restores every member, and re
       ownerProbes.set(owner,(ownerProbes.get(owner)??0)+1);
       if (owner===oldHub) { res.writeHead(404).end();return; }
       res.writeHead(200,{"content-type":"application/json"}).end(JSON.stringify({version:1,executionId:owner,solverId:solver,promiseId,
-        assignmentSignature:assignments.get(owner),historicalRaw:protectedJobs.has(owner)}));
+        assignmentSignature:assignments.get(owner),historicalRaw:protectedJobs.has(owner) || readFault==="historical-owner"}));
       return;
     }
     const source = original.get(req.url?.split("/").at(-2) ?? "");
@@ -367,9 +368,11 @@ it("runs the default sweeper past eight held jobs, restores every member, and re
     source.hits++;
     if (source.path.endsWith(transferred+".tar.zst")) protectedJobs.add(transferred);
     if (source.failPost && source.hits===2) {res.writeHead(503).end("unavailable");return;}
+    if (readFault==="busy") {res.writeHead(503).end("unavailable");return;}
     const bytes=await readFile(source.path);
+    if (readFault==="bad-bytes") bytes[0]^=1;
     res.writeHead(200,{"content-type":"application/zstd","content-length":bytes.length,
-      "x-content-sha256":source.remote.storedSha256,"x-gcs-generation":source.remote.generation}).end(bytes);
+      "x-content-sha256":source.remote.storedSha256,"x-gcs-generation":readFault==="wrong-generation"?"123":source.remote.generation}).end(bytes);
   });
   server.listen(0,"127.0.0.1");await once(server,"listening");
   const address=server.address();
@@ -393,6 +396,7 @@ it("runs the default sweeper past eight held jobs, restores every member, and re
   try {
     await client.db.execute(sql.raw("CREATE SCHEMA "+schema));
     for (const def of tableDefinitions) await connection.db.execute(sql.raw("CREATE TABLE "+def));
+    await connection.db.execute(sql`CREATE TABLE progressive_historical_raw_archives(sim_job_id uuid)`);
     // Keep the fixture's positional columns while supplying other real columns
     // consulted by generic retention on the very same normal tick.
     for (const def of tableDefinitions) {
@@ -414,7 +418,7 @@ it("runs the default sweeper past eight held jobs, restores every member, and re
       const remote=generate(id,id===bad?"bad-member":"good") as ProgressiveEvidenceCustodyReceipt["remote"];
       const [point]=await fixture(connection.db,id,1,{remote,base:upstream});assignments.set(id,point!.assignment!.contentSignature);
       if (id!==historicalOwner) generate(id,"bind",point!.signed);
-      await connection.db.execute(sql`UPDATE result_attempts SET regime='urans',status='failed',valid_for_polar=false,
+      await connection.db.execute(sql`UPDATE result_attempts SET regime='urans',status='failed',valid_for_polar=false,aoa_deg=0,
         converged=false,cl=0.43,cd=0.018,cm=-0.03,evidence_payload='{"force_history":{"t":[0.01,0.02],"cl":[0.42,0.43],"cd":[0.02,0.018]}}'::jsonb WHERE id=${point!.attempt}`);
       original.set(point!.upload,{path:join(volume,id+".tar.zst"),remote,hits:0,failPost:id===good});
     }
@@ -471,6 +475,11 @@ it("runs the default sweeper past eight held jobs, restores every member, and re
     expect(await readFile(join(jobs,good,"cases/foil/transient_a0/0.5/U"),"utf8")).toBe("unarchived original field");
     expect(await readFile(join(jobs,good,"cases/foil/transient_a0/1/p"),"utf8")).toBe("latest pressure");
     expect([...original.values()].map(x=>x.hits)).toEqual([0,1,3,1,0]);
+    const { verifyClosedWorkingFileRead } = await import("../../api/test/closed-working-file-read-fixture");
+    await connection.db.execute(sql`UPDATE sync_sweep_promises SET status='cancelled' WHERE id=${promiseId}::uuid`);
+    await connection.db.execute(sql`UPDATE progressive_worker_reports SET sequence=1,content_signature=${sha("r")},
+      assignment_signature=${assignments.get(good)!} WHERE sim_job_id=${good}::uuid`);
+    await verifyClosedWorkingFileRead(connection.db,good,rootPath,volume,python,assignments.get(good)!,mode=>{readFault=mode;});
     // A future closed execution can sort before the current durable cursor.
     const future=owned(0), remote=generate(future,"good") as ProgressiveEvidenceCustodyReceipt["remote"];
     const [late]=await fixture(connection.db,future,1,{remote,base:upstream});

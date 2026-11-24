@@ -248,3 +248,17 @@ pnpm --filter @aerodb/sweeper short-work-window end --solver "$solver_id" --wind
 ```
 
 Status includes the absolute expiry and the issued job ID. Expiry or an explicit end returns selection to ordinary scheduling. Any job already issued follows its original contract. Use the complete-state gateway procedure above for a separately timed installation.
+
+### Bounded activation of the original working-file reader
+
+Deploy the Node control plane with its registered file adapter and verify the read registration for an exact completed HZ job. The current file gateway must still serve its local originals throughout preparation. A control-plane-only promotion leaves the running native gateway and numerical workers in place.
+
+Use one private canary file with the existing historical `directory`, `receipt` and `member` fields. Add a `workingFile` object for a separate ordinary execution containing `job`, `path`, `planSha256`, `generation` as a decimal string, `byteSize` and `sha256`. Select a known missing native path with an independently verified archive member. Protect the canary file with mode 0600.
+
+```sh
+scripts/deploy/rebuild-remote-solver-engine.sh --historical-raw-gateway try-install "$original_build" "$private_canary"
+```
+
+This entry point checks the foreground worker, queue, database ownership, Redis and transfers while admission is open. It returns promptly when work is present. A vacancy that disappears during the subsequent guarded checks restores the prior controls. Installation uses the historical gateway's existing deployment lock, exact original worker and image identities, rollback holder and canonical API-only switch. A previously captured, unselected historical target is eligible for an atomic source transition only when its original gateway, worker and configuration still match. The predecessor journal and its binding evidence are retained. A separate active drain keeps its own recovery owner.
+
+The post-switch canary checks both historical coverage and the working member through the original native file and Node media URLs. The native response must have the expected generation and completed plan, with no local file at that path. Gateway startup or readback failure enters the existing guarded recovery. After interruption use the same operator's `recover` action with its recorded build ID and check the original pool, transfer and service states. Keep every additional candidate file until its own source proof and both normal URL checks have completed under the actual serving version.

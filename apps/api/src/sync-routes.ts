@@ -160,6 +160,7 @@ import {
   revokeSolverEvidenceUploads,
   verifyBrokeredEvidenceUpload,
 } from "./remote-evidence-broker";
+import { registerClosedWorkingFileSource } from "./closed-working-file-source";
 import { registerHistoricalRawArchiveRoutes } from "./historical-raw-archive";
 import { registerReportArchiveBrokerRoutes } from "./report-archive-broker";
 import { registerLegacyWorkerReportReadRoutes } from "./legacy-worker-report-read";
@@ -7174,6 +7175,7 @@ export async function registerSyncRoutes(app: FastifyInstance): Promise<void> {
   };
   await registerReportArchiveBrokerRoutes(app, archiveAccess);
   await registerHistoricalRawArchiveRoutes(app, archiveAccess);
+  registerClosedWorkingFileSource(app, db);
   app.get("/api/sync/v1/progressive-executions", async (req, reply) => {
     const solver = await requireRegisteredRemoteSolver(req, reply);
     if (!solver) return;

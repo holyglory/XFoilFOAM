@@ -179,3 +179,18 @@ python3 "$operator" reclaim "$job" "$plan" --historical-raw --proof-receipt "$pr
 ```
 
 The read-only proof bypasses the local copy at the original file URL and verifies the complete registered archive plus a manifest member when available. The worker's sync admission limit also applies to these reads. Under the job lock, the operator checks each candidate against the authenticated archive, creates the per-directory restore markers, and records the exact file plan before removal. The manifest, work directories, continuation inputs, retained media and core files keep their original paths. After removal the operator reopens the original file URLs and the HZ media download, and compares the scientific fingerprint and generation. The receipt reports net attributed allocated bytes separately from filesystem free-space changes caused by other work.
+
+### Reading a retired working file at its original URL
+
+The HZ engine file route checks the live volume first. For a missing time field, postprocessing file, or solver log in a completed ordinary closed-file plan, the file gateway can reopen the exact member from its bound archive. The Node media route uses its existing engine fallback. The source job, file path, byte size and SHA-256 must all match the retired native inventory. The archived member is verified before the response starts. Native byte ranges use the same verified file.
+
+A successful full after-read on the normal automatic sweep records a small `closedWorkingFileRead` entry alongside `closedProgressiveFiles`. It contains the verified file-list digest and immutable source identities. An older native peer that cannot supply the digest leaves read registration unavailable. For an existing completed ordinary plan, use the installed sweeper's explicit registration command under the shared deployment lock. Run one job at a time. Substitute the actual deployed sweeper container and the stored job ID and plan SHA-256.
+
+```sh
+flock --shared --nonblock /tmp/airfoils-pro-deploy.lock docker exec -w /app/apps/sweeper "$sweeper" node --import tsx src/closed-working-file-read-cli.ts --preview "$job" "$plan"
+flock --shared --nonblock /tmp/airfoils-pro-deploy.lock docker exec -w /app/apps/sweeper "$sweeper" node --import tsx src/closed-working-file-read-cli.ts "$job" "$plan"
+```
+
+Preview uses a read-only database connection. Registration replays the actual completed native plan and restores every bound original through the ordinary registered worker. It compares the prior database receipt before recording the sibling entry. The old receipt and native files retain their identities. Registration can be retried after a capacity deferral.
+
+One cold download at a time is admitted per gateway process. It verifies the compressed size, SHA-256 and CRC32C, the original tar identity, the entire signed manifest and the selected member. An unavailable generation, changed receipt or ambiguous source fails closed. Missing worker state stays visible until a registered source can serve it. Earlier out-of-window fields and processor partitions require independent exact custody before they can be retired. The historical raw-file gateway retains its separate ownership of original evidence paths.

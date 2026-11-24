@@ -22,7 +22,7 @@ from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import FileResponse, PlainTextResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
-from .. import historical_raw_restore
+from .. import historical_raw_restore, working_file_restore
 from .. import __version__, physics
 from ..airfoil import load_airfoil
 from ..archive_reduction import (
@@ -2197,6 +2197,10 @@ def create_app() -> FastAPI:
         # against that exact case-evidence directory; never rediscover an
         # archive by rounded solver values or a different job.
         if evidence_dir is None:
+            if job_root.name == job_id and store.job_dir(job_id) == job_root:
+                restored_file = working_file_restore.original_file(job_root, path, target, settings)
+                if restored_file is not None:
+                    return restored_file
             raise HTTPException(status_code=404, detail="File not found")
 
         try:

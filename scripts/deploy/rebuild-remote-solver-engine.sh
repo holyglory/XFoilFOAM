@@ -21,8 +21,8 @@ if [[ "$ACTION" == "--historical-raw-gateway" ]]; then
   DRAIN_MODE=true
   DRAIN_KIND=historical-raw-gateway
   case "$GATEWAY_ACTION:$#" in
-    prepare:3|recover:3|install:4) ;;
-    *) echo "Usage: $0 --historical-raw-gateway {prepare|recover} <current-build> | --historical-raw-gateway install <current-build> <private-canary.json>" >&2; exit 2 ;;
+    prepare:3|recover:3|install:4|try-install:4) ;;
+    *) echo "Usage: $0 --historical-raw-gateway {prepare|recover} <current-build> | --historical-raw-gateway {install|try-install} <current-build> <private-canary.json>" >&2; exit 2 ;;
   esac
 elif [[ "$ACTION" == "--drain" ]]; then
   DRAIN_MODE=true
@@ -1264,6 +1264,12 @@ fail_safe() {
     trap - EXIT
     echo "Remote-solver cutover preparation failed before its durable pending marker; restoring the prior writer state." >&2
     restore_writers "$PREPARE_SWEEPER_WAS_RUNNING" "$PREPARE_MEDIA_WAS_RUNNING" || true
+    exit "$rc"
+  fi
+  if [[ "${GATEWAY_ACTION:-}" == try-install && $rc -ne 0 && "${DRAIN_STATE_ACTIVE:-false}" == true &&
+        "$(read_env_var REMOTE_SOLVER2606_DRAIN_PENDING)" == 1 ]]; then
+    trap - EXIT
+    historical_gateway_recover || echo "The captured gateway needs its supported recover action." >&2
     exit "$rc"
   fi
   if [[ "$MAINTENANCE_QUIESCE_ARMED" == "true" && $rc -ne 0 ]]; then

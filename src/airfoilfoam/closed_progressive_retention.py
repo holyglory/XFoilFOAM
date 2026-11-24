@@ -762,6 +762,11 @@ def reclaim_closed_progressive_files(job_root: Path, proofs: list[dict], expecte
                 extra = {"workingPaths": [name for name, _, _ in rows],
                          "plannedAllocatedBytes": sum(st.st_blocks * 512 for _, st in files.values()) if stored is None else
                                                   stored["allocationBaseline"]["fileAllocatedBytes"]}
+            if include_working_paths and stored is not None and done_file.is_file() and not historic and preserve_solver is None:
+                # This exact list is part of the plan fingerprint checked below on replay.
+                extra["workingFilesSha256"] = hashlib.sha256(
+                    json.dumps(rows, separators=(",", ":")).encode()
+                ).hexdigest()
             if historic:
                 extra.pop("workingPaths",None)
                 extra["historicalSamples"]=samples.copy()

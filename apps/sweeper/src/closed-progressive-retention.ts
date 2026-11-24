@@ -87,6 +87,7 @@ export interface ClosedProgressiveReclaimResponse {
   replayed?: boolean;
   mediaFiles?: MediaFile[];
   workingPaths?: string[];
+  workingFilesSha256?: string;
   historicalPathsSha256?: string;
   historicalSamples?: Record<string, MediaFile | null>;
   plannedAllocatedBytes?: number;
@@ -731,7 +732,7 @@ async function proofs(
     throw new Error("Job has unbound path-owned media or forensic custody");
   const [settings] =
     await db.execute(sql`SELECT s.remote_solver_registered_id AS solver,s.remote_solver_auth_token AS token,
-    s.upstream_base_url AS base,p.id AS promise ${historical ? sql`,s.instance_id` : sql``} FROM sync_api_settings s JOIN sim_jobs j ON j.id=${jobId}::uuid
+    s.upstream_base_url AS base,p.id AS promise,s.instance_id FROM sync_api_settings s JOIN sim_jobs j ON j.id=${jobId}::uuid
     JOIN sync_sweep_promises p ON p.id::text=j.request_payload->>'syncPromiseId'
     WHERE s.id=1 AND p.source_base_url=s.upstream_base_url AND p.registered_solver_id=s.remote_solver_registered_id
       AND j.request_payload->>'upstreamBaseUrl'=s.upstream_base_url`);
@@ -1010,7 +1011,7 @@ async function proofs(
         "Historical raw paths have foreign artifact, media, cache or proxy references",
       );
   }
-  return { archives, base, token: settings.token, media };
+  return { archives, base, token: settings.token, media, instance: String(settings.instance_id) };
 }
 
 function checkReceipt(
@@ -1072,6 +1073,7 @@ export async function closedProgressiveJob(
     timeoutMs: number;
     inspect?: boolean;
     verifyCompleted?: boolean;
+    registerCompletedRead?: boolean;
     expectedScientificSha256?: string;
     automatic?: boolean;
     expectedNativeOwner?: ClosedProgressiveNativeOwner;
@@ -1087,7 +1089,10 @@ export async function closedProgressiveJob(
   },
 ) {
   const { now, ageMs, timeoutMs } = options;
-  if (options.automatic && (!engine.restoreArchive || options.preserveSolver || options.historicalRaw))
+  if (options.registerCompletedRead && (!options.inspect || !options.verifyCompleted || !options.expectedPlan))
+    throw Error("Working-file registration requires an exact completed read-only replay");
+  const verifyNative = options.automatic || options.registerCompletedRead;
+  if (verifyNative && (!engine.restoreArchive || options.preserveSolver || options.historicalRaw))
     throw Error("Automatic retention requires its verified native archive reader");
   const inspectMedia = options.keepMedia || options.automatic;
   if (options.preserveSolver !== undefined &&
@@ -1130,12 +1135,12 @@ export async function closedProgressiveJob(
     return proofs(tx, id, media, historical, options.keepMedia, options.automatic);
   });
   const restoreSignal = options.signal ?? AbortSignal.timeout(20 * 60_000);
-  const ordinaryAssignment = options.automatic ? await assertOrdinaryRegisteredCustody(db,id,restoreSignal) : undefined;
+  const ordinaryAssignment = verifyNative ? await assertOrdinaryRegisteredCustody(db,id,restoreSignal) : undefined;
   const manifests = source.archives.map((a) => a.manifest);
   const plan = await engine.reclaimClosedProgressiveFiles(id, manifests, undefined, undefined, options.signal);
   checkReceipt(plan, id, "planned");
   const keptImages = manifests.some(m => m.keepMedia !== undefined);
-  if (options.automatic) {
+  if (verifyNative) {
     if (!plan.plan || !plan.files || !plan.bytes) throw Error("No positive verified working file copies");
     if (!plan.nativeOwner || !Array.isArray(plan.workingPaths) || plan.workingPaths.length !== plan.files ||
         new Set(plan.workingPaths).size !== plan.files)
@@ -1177,7 +1182,7 @@ export async function closedProgressiveJob(
   )
     throw new Error("Scientific point evidence differs from the pinned proof");
   let mediaSha256: string | undefined;
-  if (!historical && (keptImages || options.automatic))
+  if (!historical && (keptImages || verifyNative))
     await assertWorkingPathsUnreferenced(db, id, plan.workingPaths ?? []);
   if (keptImages) {
     mediaSha256 = await readKeptMedia(
@@ -1310,7 +1315,7 @@ export async function closedProgressiveJob(
           `/api/sync/v1/evidence-uploads/${archive.manifest.brokeredUploadId}/download`,
           source.base,
         );
-        if (options.automatic) {
+        if (verifyNative) {
           const body = await openProgressiveArchive(url.toString(), source.token, archive.remote, signal);
           try {
             restored = await engine.restoreArchive!(id, archive.manifest, archive.remote, body, signal);
@@ -1341,16 +1346,36 @@ export async function closedProgressiveJob(
   } : undefined;
   if (options.expectedRestoreSha256 && automatic?.restoreSha256 !== options.expectedRestoreSha256)
     throw Error("Post-removal archive membership or sample changed");
-  if (options.inspect)
+  if (options.inspect) {
+    // Only an exact completed native replay with every original restored can bind
+    // the file-list digest. Older native peers continue to verify without a read index.
+    const workingRead = verifyNative && options.verifyCompleted && plan.replayed &&
+      !historical && !options.preserveSolver && typeof plan.workingFilesSha256 === "string" &&
+      /^[a-f0-9]{64}$/.test(plan.workingFilesSha256) &&
+      readbacks.length === source.archives.length && readbacks.every(r => r.restored)
+      ? {
+          version: 1, plan: plan.plan!, filesSha256: plan.workingFilesSha256,
+          workerInstance: source.instance, assignment: ordinaryAssignment,
+          files: plan.files, bytes: plan.bytes,
+          sources: source.archives.map(a => ({
+            upload: a.manifest.brokeredUploadId!, directory: a.manifest.directory,
+            generation: a.remote.generation, manifest: a.manifest.manifestSha256,
+          })),
+        }
+      : undefined;
+    if (workingRead && await assertOrdinaryRegisteredCustody(db, id, restoreSignal) !== ordinaryAssignment)
+      throw Error("Registered file owner changed during completed-plan verification");
     return {
       plan,
       readbacks,
       points,
+      workingRead,
       scientificSha256,
       ...(mediaSha256 ? { mediaSha256, keptMediaRows: source.media } : {}),
       ...(hubStop ? { registeredTerminalPromise: hubStop, registeredTerminalPromiseSha256: stopSha256! } : {}),
       settled: false,
     };
+  }
   let allocation: ClosedProgressiveReclaimResponse["allocation"] = null;
   options.signal?.throwIfAborted();
   // All authenticated network reads finish before the write transaction starts.
@@ -1521,13 +1546,51 @@ async function confirmAutomaticFiles(db: DB, engine: ClosedProgressiveBackend, i
     expectedMediaSha256:saved.mediaSha256,expectedNativeOwner:proof.owner,expectedRestoreSha256:proof.restoreSha256});
   if (!after.plan.replayed || !after.readbacks.length || (after.mediaSha256 ?? null)!==(saved.mediaSha256 ?? null))
     throw Error("Post-removal source, media or native completion is missing");
+  const workingRead = "workingRead" in after ? after.workingRead : undefined;
   const rows = await db.execute(sql`UPDATE sim_jobs SET strip_report=jsonb_set(strip_report-'closedProgressiveScan',
     '{closedProgressiveFiles}', (strip_report->'closedProgressiveFiles') || jsonb_build_object(
       'complete',true,'automaticVerification', (strip_report#>'{closedProgressiveFiles,automaticVerification}') ||
       jsonb_build_object('state','verified','verifiedAt',clock_timestamp())))
+    || ${workingRead ? sql`jsonb_build_object('closedWorkingFileRead',${JSON.stringify(workingRead)}::jsonb)` : sql`'{}'::jsonb`}
     WHERE id=${id}::uuid AND stripped_at IS NULL AND strip_report->'closedProgressiveFiles'=${JSON.stringify(saved)}::jsonb
+      ${workingRead ? sql`AND (NOT strip_report ? 'closedWorkingFileRead'
+        OR strip_report->'closedWorkingFileRead'=${JSON.stringify(workingRead)}::jsonb)` : sql``}
     RETURNING id`);
   return rows.length === 1;
+}
+
+/** Register a previously completed ordinary plan using the same full after-read as the stock sweeper. */
+export async function registerClosedWorkingFileRead(
+  db: DB, engine: ClosedProgressiveBackend, job: string, expectedPlan: string,
+  signal: AbortSignal, preview = false, timeoutMs = 4500,
+) {
+  if (!/^[a-f0-9]{64}$/.test(expectedPlan)) throw Error("Invalid completed working-file plan");
+  const [row] = await db.execute(sql`SELECT strip_report->'closedProgressiveFiles' AS saved
+    FROM sim_jobs WHERE id=${job}::uuid AND stripped_at IS NULL
+      AND strip_report#>>'{closedProgressiveFiles,outcome}'='duplicate-files'
+      AND strip_report#>>'{closedProgressiveFiles,complete}'='true'
+      AND strip_report#>>'{closedProgressiveFiles,planSha256}'=${expectedPlan}`);
+  if (!row) throw Error("No matching completed ordinary working-file receipt");
+  const saved = row.saved as AppliedFileReceipt;
+  const native = saved.automaticVerification;
+  const verified = await closedProgressiveJob(db, engine, job, {
+    now: new Date(), ageMs: 0, timeoutMs, signal, inspect: true, verifyCompleted: true, registerCompletedRead: true,
+    automatic: Boolean(native), keepMedia: Boolean(saved.mediaSha256),
+    expectedPlan, expectedScientificSha256: saved.scientificSha256, expectedMediaSha256: saved.mediaSha256,
+    expectedRestoreSha256: native?.restoreSha256, expectedNativeOwner: native?.owner,
+  });
+  if (!("workingRead" in verified) || !verified.workingRead || !verified.plan.replayed || verified.workingRead.sources.length === 0)
+    throw Error("Native peer did not verify the completed working-file inventory");
+  if (preview) return verified.workingRead;
+  const body = JSON.stringify(verified.workingRead);
+  // Compare-and-swap only the new read metadata. The original file receipt remains intact.
+  const changed = await db.execute(sql`UPDATE sim_jobs SET strip_report =
+      strip_report || jsonb_build_object('closedWorkingFileRead',${body}::jsonb)
+    WHERE id=${job}::uuid AND stripped_at IS NULL AND strip_report->'closedProgressiveFiles'=${JSON.stringify(saved)}::jsonb
+      AND (NOT strip_report ? 'closedWorkingFileRead' OR strip_report->'closedWorkingFileRead'=${body}::jsonb)
+    RETURNING id`);
+  if (changed.length !== 1) throw Error("Completed working-file authority changed during verification");
+  return verified.workingRead;
 }
 
 function holdReason(error: unknown) {

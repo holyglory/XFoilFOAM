@@ -1090,7 +1090,7 @@ def test_remote_maintenance_pause_is_a_real_transfer_admission_gate() -> None:
     assert "wait_remote_transfer_quiescence()" in deploy
 
 
-@pytest.mark.parametrize("fault", ["none", "build", "readback", "late-work", "lost-response"])
+@pytest.mark.parametrize("fault", ["none", "build", "readback", "late-work", "lost-response", "vacancy-race"])
 def test_historical_gateway_drain_preserves_worker_and_recovers_exact_controls(tmp_path, fault):
     """Run the versioned gateway workflow across independent operator processes and an interrupted switch."""
     trace = tmp_path / "trace"
@@ -1134,9 +1134,17 @@ read_env_var() {
 }
 load_drain_state() { DRAIN_PHASE="$(get phase)"; }
 persist_drain_state() { DRAIN_PHASE="$1"; setv phase "$1"; }
-begin_remote_solver_drain() { setv pending 1; setv pool false; persist_drain_state draining; note prepared; }
+begin_remote_solver_drain() {
+  setv pending 1; setv pool false; persist_drain_state draining; note prepared
+  if [[ "$(get fault)" == vacancy-race ]]; then setv physical running; fi
+}
 clear_drain_state() { setv pending 0; setv phase ""; }
 require_drain_admission_closed() { [[ "$(get pool)" == false ]]; }
+openfoam_processes() { if [[ "$(get physical)" != idle ]]; then echo foreground-pimpleFoam; fi; }
+queue_activity() { :; }
+maintenance_database_activity() { :; }
+redis_queue_activity() { :; }
+remote_solver_drain_transfer_activity() { :; }
 remote_solver_drain_activity() { if [[ "$(get physical)" != idle ]]; then echo "live scientist-owned job"; fi; }
 set_remote_transfer_paused() { setv transfer "$1"; note transfer "$1"; }
 remote_transfer_paused() { get transfer; }
@@ -1171,7 +1179,7 @@ gateway_image() {
   case "$1" in
     capture) setv image-state captured;;
     original|bind-original) [[ "$(get image)" == old && ! -e "$ROOT/gateway-replaced" ]];;
-    release-holder|bind-canary) :;;
+    release-holder|bind-canary|check-working-canary) :;;
     phase) get image-state;;
     build) [[ "$(get fault)" != build ]] || return 23; setv image-state built;;
     select) setv image-state switching; setv image new;;
@@ -1202,6 +1210,20 @@ historical_gateway_operation
             timeout=8,
         )
 
+    # Live foreground work must leave admission, transfers and the captured image intact.
+    deferred_immediately = act("try-install")
+    assert deferred_immediately.returncode == 0, deferred_immediately.stderr
+    assert "before admission changes" in deferred_immediately.stderr
+    assert (tmp_path / "pool").read_text() == "true" and (tmp_path / "pending").read_text() == "0"
+    assert not trace.exists() or not trace.read_text().strip()
+    if fault == "vacancy-race":
+        (tmp_path / "physical").write_text("idle")
+        contention = act("try-install")
+        assert contention.returncode == 0, contention.stderr
+        assert {k: (tmp_path / k).read_text() for k in ("pending","pool","transfer","physical","image")} == {
+            "pending":"0","pool":"true","transfer":"false","physical":"running","image":"old"}
+        assert "resume-intake" in trace.read_text() and "stop" not in trace.read_text().splitlines()
+        return
     prepared = act("prepare")
     assert prepared.returncode == 0, prepared.stderr
     assert (tmp_path / "transfer").read_text() == "false" and (tmp_path / "sweeper").read_text() == "1"
@@ -1337,6 +1359,7 @@ def test_historical_gateway_image_keeps_immutable_source_and_worker(tmp_path, mo
                 "Dockerfile",
                 "historical_raw_restore.py",
                 "main.py",
+                "working_file_restore.py",
             ]
             tags[cmd[cmd.index("-t") + 1]] = image("2")
             return ""
@@ -1373,7 +1396,7 @@ def test_historical_gateway_image_keeps_immutable_source_and_worker(tmp_path, mo
         act("bind-canary")
     args.canary.write_text(json.dumps(canary))
     act("build")
-    with pytest.raises(ValueError, match="outside the two"):
+    with pytest.raises(ValueError, match="outside the reviewed"):
         module.compare_candidate(before, {**new, "otherInstalled": "changed"}, wanted)
     args.config_hash = "e" * 64
     with pytest.raises(ValueError, match="Compose gateway configuration"):
@@ -1620,6 +1643,42 @@ def test_previous_gateway_capture_refuses_drift_without_rewriting_original(
     with pytest.raises(ValueError):
         m.operate(a)
     assert a.state.read_bytes() == original and f.env.read_bytes() == env
+
+
+def test_private_working_file_canary_must_name_a_separate_original_path_and_exact_uint64():
+    m = _module("working_file_gateway_canary", "hz-historical-raw-gateway.py")
+    working = {"job":str(uuid4()),"path":"cases/foil/transient_a0/0.125/p","byteSize":4096,
+               "sha256":"a"*64,"planSha256":"b"*64,"generation":"18446744073709551615"}
+    raw = {"receipt":{"sim_job_id":str(uuid4())},"workingFile":working}
+    assert m.working_canary(raw) == working
+    for incorrect in [{"job":raw["receipt"]["sim_job_id"]},{"path":"cases/foil/a0/evidence/engine_evidence.tar.zst"},
+                      {"generation":"18446744073709551616"},{"path":"cases/foil/../member"},{"byteSize":0}]:
+        with pytest.raises(ValueError,match="canary"):
+            m.working_canary({**raw,"workingFile":{**working,**incorrect}})
+
+
+def test_combined_reader_preserves_old_gateway_capture_and_its_sealed_predecessor(previous_gateway_drain):
+    f = previous_gateway_drain
+    m, a = f.m, f.a
+    m.operate(a)
+    sealed_original = a.state.read_bytes()
+    prior = json.loads(sealed_original)
+    a.action = "capture"
+    a.new_working_reader = True
+    m.operate(a)
+    current = json.loads(a.state.read_bytes())
+    assert current["base"] == prior["base"] and current["worker"] == prior["worker"]
+    assert current["workerNumerical"] == prior["workerNumerical"]
+    assert set(current["wanted"]) == set(m.FILES)
+    assert current["wanted"][m.FILES[2]] == hashlib.sha256((ROOT / m.FILES[2]).read_bytes()).hexdigest()
+    assert current["candidateRef"] != prior["candidateRef"] and current["phase"] == "captured"
+    predecessor = m.capture_directory(a.state, hashlib.sha256(sealed_original).hexdigest())
+    assert (predecessor / "original.json").read_bytes() == sealed_original
+    a.action = "phase"
+    m.operate(a)
+    (predecessor / "original.json").write_bytes(b'{}')
+    with pytest.raises(ValueError, match="predecessor"):
+        m.operate(a)
 
 
 def test_sealed_gateway_predecessor_remains_required(previous_gateway_drain):

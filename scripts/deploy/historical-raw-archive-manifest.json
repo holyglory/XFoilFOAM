@@ -37,13 +37,15 @@
     ],
     "workerNodeApi": [
       "apps/api/src/historical-worker-restore.ts",
+      "apps/api/src/closed-working-file-source.ts",
       "packages/db/src/registered-worker-archive-owner.ts",
       "packages/core/src/registered-archive-read.ts",
       "apps/api/src/media-store.ts"
     ],
     "workerFileServingApi": [
       "src/airfoilfoam/api/main.py",
-      "src/airfoilfoam/historical_raw_restore.py"
+      "src/airfoilfoam/historical_raw_restore.py",
+      "src/airfoilfoam/working_file_restore.py"
     ],
     "workerSweeper": [
       "apps/sweeper/src/closed-progressive-retention.ts",
