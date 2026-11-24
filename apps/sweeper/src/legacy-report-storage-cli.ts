@@ -494,7 +494,7 @@ export async function legacyReportStorageCli(args: string[]): Promise<void> {
       stopSignal = "SIGINT";
       stopping.abort();
     };
-    const pass = async () => {
+    const pass = async (onCheckpointAdvance?: () => void) => {
       const result = await exportLegacyReports({
         scope,
         source,
@@ -504,6 +504,7 @@ export async function legacyReportStorageCli(args: string[]): Promise<void> {
         maxBytes,
         pages,
         keepLocal: options.has("keep-local"),
+        onCheckpointAdvance,
         prepareNextPage: slots === 1,
         executionSupervisor: normalizer
           ? {

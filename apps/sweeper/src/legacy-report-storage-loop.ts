@@ -6,7 +6,7 @@ import { LegacyOperatorPaused } from "./legacy-report-storage-operator";
 export async function runLegacyUntilComplete<
   T extends { complete: boolean; next?: unknown },
 >(
-  pass: () => Promise<T>,
+  pass: (onCheckpointAdvance: () => void) => Promise<T>,
   input: {
     maxPasses?: number;
     maxSeconds?: number;
@@ -52,11 +52,16 @@ export async function runLegacyUntilComplete<
     previous: string | undefined,
     stagnant = 0,
     failures = 0;
+  // A bounded pass may sync several pages before its next page hits a lock.
+  // The next page starts with the initial delay after that durable advance.
+  const checkpointAdvanced = () => {
+    failures = 0;
+  };
   for (; attempted < maxPasses && now() < deadline; ) {
     if (input.signal?.aborted) return finish(false, "signal");
     attempted++;
     try {
-      last = await pass();
+      last = await pass(checkpointAdvanced);
       completed++;
       failures = 0;
       emit({
@@ -118,6 +123,7 @@ export async function runLegacyUntilComplete<
           pass: attempted,
           ...error.details,
           retryable: true,
+          consecutiveFailures: failures,
           backoffMs: backoff,
           pendingPageRetry: true,
         });

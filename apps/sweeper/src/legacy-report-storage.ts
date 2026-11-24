@@ -699,6 +699,8 @@ export async function exportLegacyReports(input: {
   executionSupervisor?: LegacySlotOptions<LegacySqlReader>;
   shouldStop?: () => boolean;
   onVerifiedHistory?: () => void;
+  /** Called after the ordered checkpoint and its directory have been synced. */
+  onCheckpointAdvance?: () => void;
   applyVerifiedPage?: (
     page: LegacyBackupPage,
     receipt: LegacyBackupReceipt,
@@ -951,9 +953,7 @@ export async function exportLegacyReports(input: {
         },
         apply: commitPacked,
         publish: async (cursor, receipt) => {
-          next = cursor;
-          lastReceipt = receipt;
-          await saveState();
+          await publishCheckpoint(cursor, receipt);
           receipts.push(receipt);
         },
         store: input.store,
@@ -1072,9 +1072,7 @@ export async function exportLegacyReports(input: {
             ? await findPendingReceipt(input.directory, page.bytes)
             : undefined,
         );
-        next = page.next;
-        lastReceipt = receiptFile;
-        await saveState();
+        await publishCheckpoint(page.next, receiptFile);
         await unlink(pendingPath);
         await syncDirectory(input.directory);
         receipts.push(receiptFile);
@@ -1173,6 +1171,13 @@ export async function exportLegacyReports(input: {
           throw error;
         }
       return receiptFile;
+    }
+    async function publishCheckpoint(cursor: LegacyCursor, receipt: string) {
+      const advanced = !sameCursor(next, cursor);
+      next = cursor;
+      lastReceipt = receipt;
+      await saveState();
+      if (advanced) input.onCheckpointAdvance?.();
     }
     async function saveState() {
       await durableWrite(

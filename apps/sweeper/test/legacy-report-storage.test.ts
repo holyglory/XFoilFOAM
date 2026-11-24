@@ -635,12 +635,14 @@ describe.sequential("worker-only legacy backup and 0198 representation", { timeo
         }),
       }),
     };
+    const checkpointAdvanced = vi.fn();
     const base = {
       scope,
       source,
       store,
       directory: path,
       sourceBinding: "corrupt-peer",
+      onCheckpointAdvance: checkpointAdvanced,
       rows: 2,
       pages: 2,
       executionSupervisor: options,
@@ -648,6 +650,8 @@ describe.sequential("worker-only legacy backup and 0198 representation", { timeo
     };
     const first = await exportLegacyReports(base);
     expect(first.executionSupervisor?.appliedAhead).toBe(1);
+    expect(first.receipts).toHaveLength(1);
+    expect(checkpointAdvanced).toHaveBeenCalledTimes(1);
     const stage = join(path, "pending.jsonl.gz", "page-1-report-0-0");
     const ready = JSON.parse(await readFile(join(stage, "ready.json"), "utf8")),
       f = join(stage, ready.receipt);
@@ -1532,6 +1536,100 @@ describe.sequential("worker-only legacy backup and 0198 representation", { timeo
         legacyOperatorWriteFailure({ code: 1 }, stderr, "worker_custody", true),
       ).toMatchObject({ retryable: false });
     }
+  });
+
+  it("backs off on one pending page and restarts its delay after an ordered checkpoint within the same pass", async () => {
+    const scope = await fixture(false);
+    const path = await directory();
+    const store = new MemoryBackup();
+    const failures = new Map([
+      [1, 1],
+      [3, 4],
+      [8, 1],
+      [9, 1],
+      [10, 1],
+    ]);
+    const receipts = new Map<number, string>();
+    const committed: number[] = [];
+    const retryStreaks: unknown[] = [];
+    const waits: number[] = [];
+    const failure = legacyCustodyWorkerFailure({
+      code: "55P03",
+      workerPhase: "job_lock",
+    });
+    const lock = legacyOperatorWriteFailure(
+      { code: 1 },
+      "LEGACY_CUSTODY_FAILURE " + JSON.stringify(failure),
+      "worker_custody",
+      true,
+    );
+    let advances = 0;
+    let emptyScopeClosures = 0;
+    const result = await runLegacyUntilComplete(
+      (checkpointAdvanced) =>
+        exportLegacyReports({
+          scope,
+          source,
+          store,
+          directory: path,
+          sourceBinding: "ordered-page-lock-recovery",
+          rows: 1,
+          pages: 16,
+          onCheckpointAdvance() {
+            advances++;
+            checkpointAdvanced();
+          },
+          async applyVerifiedPage(page, receipt, filename) {
+            expect(
+              JSON.parse(await readFile(join(path, filename), "utf8")).object,
+            ).toEqual(receipt.object);
+            expect(
+              JSON.parse(await readFile(join(path, "checkpoint.json"), "utf8"))
+                .next,
+            ).toEqual(page.start);
+            expect(advances).toBe(committed.length);
+            if (page.members.length === 0) {
+              expect(page.next.execution).toBe(scope.executions.length);
+              emptyScopeClosures++;
+              return;
+            }
+            const [member] = page.members;
+            expect(page.members).toHaveLength(1);
+            const previous = receipts.get(member.sequence);
+            if (previous) expect(filename).toBe(previous);
+            else receipts.set(member.sequence, filename);
+            const left = failures.get(member.sequence)!;
+            if (left > 0) {
+              failures.set(member.sequence, left - 1);
+              throw lock;
+            }
+            committed.push(member.sequence);
+          },
+        }),
+      {
+        maxPasses: 10,
+        random: () => 0.5,
+        emit: (event) => {
+          if (event.event === "retry")
+            retryStreaks.push(event.consecutiveFailures);
+        },
+        sleep: async (ms) => {
+          waits.push(ms);
+        },
+      },
+    );
+    expect(result).toMatchObject({
+      complete: true,
+      passesAttempted: 9,
+      passesCompleted: 1,
+      transientRetries: 8,
+    });
+    expect(committed).toEqual([1, 3, 8, 9, 10]);
+    expect(emptyScopeClosures).toBe(1);
+    expect(advances).toBe(6);
+    expect(store.objects.size).toBe(6);
+    expect(retryStreaks).toEqual([1, 1, 2, 3, 4, 1, 1, 1]);
+    expect(waits).toEqual([1250, 1250, 2500, 5000, 10000, 1250, 1250, 1250]);
   });
 
   it("caps repeated database backoff within the existing invocation budget", async () => {
