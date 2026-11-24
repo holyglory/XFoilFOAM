@@ -32,6 +32,7 @@ import {
   progressiveCfdCompletionRetryAvailableSql,
   progressiveCfdMaterialDomainRecoveryAvailableSql,
   progressiveCfdMaterialPlanAllowsAttemptSql,
+  progressiveAvailableMaterialUnitIds,
   progressiveCfdPreciseVerificationAvailableSql,
 } from "./progressive-attempt-budget";
 import {
@@ -87,6 +88,8 @@ export const MAX_PRECISE_CFD_BATCH_UNITS = 8;
 
 // A query-cost bound only; a prefix miss always runs the unrestricted selector.
 export const PROGRESSIVE_CFD_CANDIDATE_PREFIX_SIZE = 64;
+export class ProgressiveCfdAdmissionBusy extends Error {}
+const emptyRegisteredBatch = Symbol("empty registered campaign claim");
 
 export function preciseProgressiveSolverSelection(
   selection: Record<string, unknown>,
@@ -236,6 +239,7 @@ export async function claimProgressiveCfdUnit(
     localTimeStepVersion?: number | null;
     remoteSolverId?: string;
     campaignLockMode?: "skip" | "wait";
+    acquireAdmissionAfterCampaign?: boolean;
     preferredWorkId?: string;
     sameTarget?: {
       generationId: string;
@@ -411,6 +415,11 @@ export async function claimProgressiveCfdUnit(
       ORDER BY campaign.priority DESC, campaign."createdAt", campaign.id LIMIT 1 FOR UPDATE ${input.campaignLockMode === "wait" ? sql`` : sql`SKIP LOCKED`}
     `);
     if (!campaign) return null;
+    // A registered claimant can queue fairly for the campaign without blocking
+    // other campaigns' admission or maintenance. Never wait for the advisory
+    // mutex in this lock order. A busy mutex unwinds the campaign lock.
+    if (input.acquireAdmissionAfterCampaign && !(await tryProgressiveAdmissionLock(connection)))
+      throw new ProgressiveCfdAdmissionBusy("Progressive admission is busy with another campaign maintenance pass");
     // Choose the winning campaign with the ordinary policy first. A preference
     // within that campaign cannot advance a lower-priority campaign or stage.
     const preferredWork = input.preferredWorkId
@@ -501,10 +510,17 @@ export async function claimProgressiveCfdUnit(
         AND unit.state = 'pending' AND ${attemptAvailable} AND unit.active_seconds < ${effectiveBudget}
         AND (unit.retry_after IS NULL OR unit.retry_after <= clock_timestamp())
         AND (unit.purpose <> 'adaptive' OR ${initialCoverageComplete})`;
-      const candidateOrder = sql`CASE WHEN ${progressiveCfdMaterialDomainRecoveryAvailableSql("unit")} THEN 0 ELSE 1 END,
+      // A global ranking can hash the small priority sets once. A single
+      // target or pinned work uses the existing indexed per-unit checks.
+      const globalRank = !input.preferredWorkId && !input.sameTarget;
+      const materialPriority = globalRank ? sql`unit.id IN (${progressiveAvailableMaterialUnitIds()})`
+        : progressiveCfdMaterialDomainRecoveryAvailableSql("unit");
+      const extensionPriority = globalRank ? sql`unit.id IN (SELECT extension.unit_id FROM progressive_cfd_budget_extensions extension
+        WHERE extension.state='pending')` : pendingBudgetExtension;
+      const candidateOrder = sql`CASE WHEN ${materialPriority} THEN 0 ELSE 1 END,
         CASE WHEN target.mach < 1.0 THEN 0 WHEN target.mach >= 1.0 THEN 1 ELSE 2 END,
         CASE WHEN target.mach >= 1.0 THEN target.mach END ASC NULLS LAST,
-        CASE WHEN ${pendingBudgetExtension} THEN 0 ELSE 1 END,
+        CASE WHEN ${extensionPriority} THEN 0 ELSE 1 END,
         generation.created_at, generation.id,
         CASE WHEN work.stage = 2 AND unit.purpose = 'initial' AND unit.attempts = 0 THEN 0 ELSE 1 END,
         CASE WHEN work.stage = 3 THEN 0 ELSE 1 END,
@@ -517,7 +533,7 @@ export async function claimProgressiveCfdUnit(
         LIMIT 1 FOR UPDATE OF generation, work, unit SKIP LOCKED
       `;
       selected = sql`selected AS MATERIALIZED (${candidateQuery()})`;
-      if (!input.preferredWorkId && !input.sameTarget) {
+      if (globalRank) {
         // These cheap heads are an ordered superset, never an eligibility test.
         // Ineligible or locked heads cannot hide work beyond the prefix: the
         // complete selector below is executed separately on every prefix miss.
@@ -533,6 +549,14 @@ export async function claimProgressiveCfdUnit(
             AND generation.plan_revision_id = (SELECT current_plan_revision_id FROM sim_campaigns WHERE id = ${campaign.id})
             AND generation.status = 'active' AND work.stage IN (2, 3) AND work.state = 'pending'
             AND unit.state = 'pending'
+            AND (work.stage <> 3 OR (work.generation_id, work.target_id) IN (
+              SELECT fast.generation_id, fast.target_id
+              FROM progressive_work fast JOIN progressive_generations fg ON fg.id=fast.generation_id
+              JOIN progressive_cfd_units fast_unit ON fast_unit.work_id=fast.id
+              WHERE fg.campaign_id=${campaign.id} AND fg.epoch_id=${epoch.id} AND fg.status='active' AND fast.stage=2
+              GROUP BY fast.generation_id, fast.target_id
+              HAVING bool_and(fast_unit.state IN ('complete','gap'))
+            ))
           ORDER BY ${candidateOrder} LIMIT ${PROGRESSIVE_CFD_CANDIDATE_PREFIX_SIZE}
           )) WITH ORDINALITY AS head(id, head_order)
         )`;
@@ -694,14 +718,20 @@ export async function claimProgressiveCfdBatch(
     localTimeStepVersion?: number | null;
     remoteSolverId?: string;
     campaignLockMode?: "skip" | "wait";
+    acquireAdmissionAfterCampaign?: boolean;
     preferredWorkId?: string;
   },
 ): Promise<ProgressiveCfdLease[]> {
   return db.transaction(async (transaction) => {
     const connection = transaction as unknown as DB;
-    if (!(await tryProgressiveAdmissionLock(connection))) return [];
+    if (!input.acquireAdmissionAfterCampaign && !(await tryProgressiveAdmissionLock(connection))) return [];
     const first = await claimProgressiveCfdUnit(connection, input);
-    if (!first) return [];
+    if (!first) {
+      // Release any campaign/advisory locks from the empty first pass before
+      // its caller retries using the normal waiting campaign selector.
+      if (input.acquireAdmissionAfterCampaign) throw emptyRegisteredBatch;
+      return [];
+    }
     const maximum =
       input.maximumUnits ?? progressiveCfdBatchMaximum(first.stage);
     if (!Number.isInteger(maximum) || maximum < 1 || maximum > 512)
@@ -711,6 +741,7 @@ export async function claimProgressiveCfdBatch(
     while (batch.length < maximum) {
       const next = await claimProgressiveCfdUnit(connection, {
         ...input,
+        acquireAdmissionAfterCampaign: false,
         sameTarget: {
           generationId: first.generationId,
           targetId: first.targetId,
@@ -724,6 +755,9 @@ export async function claimProgressiveCfdBatch(
       if (next.budgetExtension) break;
     }
     return batch.sort((left, right) => left.alpha - right.alpha);
+  }).catch((error: unknown) => {
+    if (error === emptyRegisteredBatch) return [];
+    throw error;
   });
 }
 

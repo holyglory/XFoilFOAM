@@ -7,6 +7,7 @@ import {
 } from "./short-work-window";
 import { progressiveAdmissionReportPressureSql } from "./progressive-progress-selection";
 import { randomUUID } from "node:crypto";
+import { setTimeout as delay } from "node:timers/promises";
 import { sql } from "drizzle-orm";
 import {
   bindProgressiveRemoteDispatch,
@@ -17,6 +18,7 @@ import {
   progressiveRemoteAdmissionReservedSlotsSql,
   progressiveRemoteActivePromiseCount,
   PROGRESSIVE_REMOTE_START_LEASE_SECONDS,
+  ProgressiveCfdAdmissionBusy,
   type DB,
   type ProgressiveCfdLease,
   type ProgressiveRemoteExecutionEnvelope,
@@ -38,6 +40,36 @@ const PROGRESSIVE_REPORT_BACKPRESSURE_LIMIT = 2_000;
 const NO_UNRESERVED_CPU_SLOTS = "The worker has no unreserved CPU slots";
 
 class RemoteProgressiveAdmissionWait extends Error {}
+
+function admissionDatabaseFailure(error: unknown) {
+  let cause = error;
+  for (let depth = 0; depth < 4 && cause && typeof cause === "object"; depth++) {
+    const detail = cause as { code?: unknown; message?: unknown; cause?: unknown };
+    const message = typeof detail.message === "string" ? detail.message : "";
+    switch (detail.code) {
+      case "55P03":
+        return { sqlstate: detail.code, reason: /lock timeout/i.test(message) ? "lock_timeout" : "lock_not_available" } as const;
+      case "40P01":
+        return { sqlstate: detail.code, reason: "deadlock" } as const;
+      case "57014":
+        if (/due to statement timeout/i.test(message)) return { sqlstate: detail.code, reason: "statement_timeout" } as const;
+        if (/due to user request/i.test(message)) return { sqlstate: detail.code, reason: "user_cancellation" } as const;
+        return { sqlstate: detail.code, reason: "query_cancellation" } as const;
+    }
+    if (!detail.cause && !detail.code && /lock timeout/i.test(message))
+      return { sqlstate: null, reason: "lock_timeout" } as const;
+    cause = detail.cause;
+  }
+}
+
+const admissionDatabaseMessages = {
+  lock_timeout: "timed out waiting for a database lock",
+  lock_not_available: "could not acquire a database lock",
+  deadlock: "was rolled back by PostgreSQL after a deadlock",
+  statement_timeout: "reached its SQL statement deadline",
+  user_cancellation: "was cancelled by request",
+  query_cancellation: "was cancelled by PostgreSQL",
+} as const;
 
 function isActivePromisePointConflict(error: unknown): boolean {
   if (!error || typeof error !== "object") return false;
@@ -107,7 +139,7 @@ async function findAdmissionCellConflicts(
 
 type RemoteDispatchOutcome =
   | { kind: "prepared"; envelope: ProgressiveRemoteExecutionEnvelope }
-  | { kind: "waiting"; reason: string; deferredUnits?: number };
+  | { kind: "waiting"; reason: string; deferredUnits?: number; retryableContention?: true };
 
 export async function prepareProgressiveRemoteDispatch(
   db: DB,
@@ -137,6 +169,9 @@ async function prepareRemoteDispatch(
       "Remote admission requires an exact registered solver identity",
     );
   let admissionPhase = "start";
+  let lockMode: "skip" | "wait" | undefined;
+  let backendPid: number | undefined;
+  const started = performance.now();
   let claimedLeases: ProgressiveCfdLease[] = [];
   let attemptedWindow: string | undefined;
   try {
@@ -144,11 +179,12 @@ async function prepareRemoteDispatch(
       const connection = transaction as unknown as DB;
       admissionPhase = "transaction setup";
       await connection.execute(
-        sql`SET LOCAL lock_timeout = '10s'; SET LOCAL statement_timeout = '15s'`,
+        sql`SET LOCAL lock_timeout = '10s'; SET LOCAL statement_timeout = '15s'; SET LOCAL jit = off`,
       );
       const [epoch] = await connection.execute(
-        sql`SELECT id FROM calculation_epochs WHERE current FOR SHARE`,
+        sql`SELECT id, pg_backend_pid() AS backend_pid FROM calculation_epochs WHERE current FOR SHARE`,
       );
+      if (epoch && typeof epoch.backend_pid === "number") backendPid = epoch.backend_pid;
       if (!epoch)
         throw new RemoteProgressiveAdmissionWait(
           "No current campaign calculation epoch",
@@ -211,15 +247,15 @@ async function prepareRemoteDispatch(
         (await progressiveRemoteAdmissionReservedSlots(connection, solverId));
       if (!Number.isSafeInteger(available) || available < 1)
         throw new RemoteProgressiveAdmissionWait(NO_UNRESERVED_CPU_SLOTS);
-      const [admissionGate] = await connection.execute(sql`
-        SELECT pg_try_advisory_xact_lock(
+      if (solver.short_window_id) {
+        // A scoped offer still serializes its selection with ordinary admission.
+        const [admissionGate] = await connection.execute(sql`SELECT pg_try_advisory_xact_lock(
           hashtextextended('progressive-cfd-admission', 0)
-        ) AS acquired
-      `);
-      if (!admissionGate?.acquired)
-        throw new RemoteProgressiveAdmissionWait(
+        ) AS acquired`);
+        if (!admissionGate?.acquired) throw new ProgressiveCfdAdmissionBusy(
           "Progressive admission is busy with another campaign maintenance pass",
         );
+      }
       admissionPhase = "claim";
       const choice = solver.short_window_id
         ? await chooseShortWork(
@@ -249,11 +285,14 @@ async function prepareRemoteDispatch(
           capabilities.uransRecoveryVersion ===
           REQUIRED_PRECALC_EVIDENCE_RECOVERY_VERSION,
         campaignLockMode: "skip",
+        acquireAdmissionAfterCampaign: !solver.short_window_id,
       } as const;
+      lockMode = "skip";
       let leases = await claimProgressiveCfdBatch(connection, claimInput);
       if (!leases.length) {
         // Keep the transaction's 10s lock bound: normal scoped settlement can
         // hold the campaign mutex longer than a subsecond fallback would allow.
+        lockMode = "wait";
         leases = await claimProgressiveCfdBatch(connection, {
           ...claimInput,
           campaignLockMode: "wait",
@@ -384,18 +423,26 @@ async function prepareRemoteDispatch(
           new ProgressiveEvidenceCellOwned(claimedLeases),
         ),
       };
+    if (error instanceof ProgressiveCfdAdmissionBusy)
+      return { kind: "waiting", reason: error.message, retryableContention: true };
     if (error instanceof RemoteProgressiveAdmissionWait)
       return { kind: "waiting", reason: error.message };
-    if (
-      ["40P01", "55P03", "57014"].includes(
-        String((error as { code?: unknown }).code),
-      ) ||
-      (error instanceof Error && /lock timeout/i.test(error.message))
-    )
+    const failure = admissionDatabaseFailure(error);
+    if (failure) {
+      // Only enumerated causes leave this boundary. Driver messages can contain
+      // SQL, bound values or credentials and must never go into a fleet event.
+      console.warn(JSON.stringify({
+        component: "progressive-remote-admission-database-wait", solverId,
+        phase: admissionPhase, claimLockMode: lockMode, postgresBackendPid: backendPid,
+        elapsedMs: Math.round(performance.now() - started), ...failure,
+      }));
       return {
         kind: "waiting",
-        reason: `Campaign admission is waiting for a short-lived database lock during ${admissionPhase}`,
+        reason: `Campaign admission ${admissionDatabaseMessages[failure.reason]} during ${admissionPhase}`,
+        ...(["lock_timeout", "lock_not_available", "deadlock"].includes(failure.reason)
+          ? { retryableContention: true as const } : {}),
       };
+    }
     throw error;
   }
 }
@@ -479,13 +526,24 @@ async function prepareProgressiveRemoteFleetRun(db: DB) {
       });
       continue;
     }
+    let retriedContention = false;
     for (
       let admitted = 0;
       admitted < Math.min(capacity, maxAdmissionsPerTick);
       admitted += 1
     ) {
       try {
-        const result = await prepareProgressiveRemoteDispatch(db, solverId);
+        let result = await prepareProgressiveRemoteDispatch(db, solverId);
+        if (result.kind === "waiting" && result.retryableContention && !retriedContention) {
+          // One fresh attempt per solver per existing fleet pass. The failed
+          // transaction has released its locks, and every control and capacity
+          // check runs again. Cancellation and statement timeouts do not retry.
+          retriedContention = true;
+          console.info(JSON.stringify({ component: "progressive-remote-admission-contention-retry",
+            solverId, reason: result.reason, delayMs: 250 }));
+          await delay(250);
+          result = await prepareProgressiveRemoteDispatch(db, solverId);
+        }
         if (result.kind === "waiting" && result.deferredUnits !== undefined) {
           receipt.deferred += result.deferredUnits;
           if (!result.deferredUnits) {

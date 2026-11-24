@@ -14182,6 +14182,27 @@ describe("durable progressive CFD units", () => {
           if (error !== rollback) throw error;
         }
       }
+      // An unfinished FAST target can already have PRECISE units. A whole
+      // higher-ranked prefix of these must not force unrestricted discovery.
+      const unready = new Error("restore mixed FAST readiness");
+      try {
+        await db.transaction(async transaction => {
+          const connection = transaction as unknown as DB;
+          await connection.execute(sql`UPDATE progressive_cfd_units SET state='blocked' WHERE id IN (${headIds})`);
+          const added = await connection.execute(sql`INSERT INTO progressive_cfd_units
+            (work_id,aoa_deg,ordinal,purpose,recipe,reason,active_budget_seconds,policy_version)
+            SELECT precise.id,fast_unit.aoa_deg,fast_unit.ordinal,'precise',fast_unit.recipe,'pending precise sibling',
+              fast_unit.active_budget_seconds,fast_unit.policy_version
+            FROM progressive_cfd_units fast_unit JOIN progressive_work fast ON fast.id=fast_unit.work_id
+            JOIN progressive_work precise ON precise.generation_id=fast.generation_id AND precise.target_id=fast.target_id AND precise.stage=3
+            WHERE fast_unit.id IN (${headIds}) RETURNING id`);
+          expect(added).toHaveLength(PROGRESSIVE_CFD_CANDIDATE_PREFIX_SIZE);
+          await compare(connection, String(tail.id), true);
+          throw unready;
+        });
+      } catch (error) {
+        if (error !== unready) throw error;
+      }
       const release = signal();
       const locked = signal();
       const holding = observer.db.transaction(async (transaction) => {
@@ -14349,6 +14370,13 @@ describe("durable progressive CFD units", () => {
         throw outcome.error ?? new Error("Admission exited before backend observation");
       })]);
       await waitForFixtureBlock(actorPid, ownerPid);
+      // An independent maintenance pass can still take global admission while
+      // the registered claimant waits fairly for this campaign row.
+      await db.transaction(async tx => {
+        const [gate] = await tx.execute(sql`SELECT pg_try_advisory_xact_lock(
+          hashtextextended('progressive-cfd-admission',0)) AS acquired`);
+        expect(gate.acquired).toBe(true);
+      });
       // The barrier owns release. Time only keeps real, observed contention
       // beyond the former 750ms cutoff; it never stands in for lock evidence.
       await new Promise((resolve) => setTimeout(resolve, 1500));
@@ -14379,6 +14407,34 @@ describe("durable progressive CFD units", () => {
           expect(performance.now() - began).toBeGreaterThanOrEqual(9000);
           release.resolve();
           expect((await holding).error).toBeNull();
+          // An unrelated maintenance owner legitimately holds admission. The
+          // ordinary fleet retries from a fresh transaction after it releases.
+          await db.execute(sql`UPDATE registered_remote_solvers SET max_active_polar_promises=1 WHERE id=${solverId}::uuid`);
+          const noticed = signal();
+          const info = vi.spyOn(console, "info").mockImplementation((event: unknown) => {
+            if (typeof event === "string") {
+              const record = JSON.parse(event);
+              if (record.component === "progressive-remote-admission-contention-retry" && record.solverId === solverId)
+                noticed.resolve();
+            }
+          });
+          let refill: ReturnType<typeof prepareProgressiveRemoteFleet> | undefined;
+          try {
+            await locker.db.transaction(async tx => {
+              await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtextextended('progressive-cfd-admission',0))`);
+              refill = prepareProgressiveRemoteFleet(actor.db);
+              await Promise.race([noticed.promise, refill.then(() => { throw new Error("Fleet did not retry the held admission"); })]);
+              expect(await createdWork()).toEqual(empty);
+            });
+            const receipt = await refill!;
+            expect(receipt.prepared).toBe(1);
+            const [created] = await createdWork();
+            expect(created).toMatchObject({ jobs: 1, dispatches: 1, promises: 1 });
+            expect(created.attempts).toBeGreaterThan(0);
+          } finally {
+            info.mockRestore();
+            await refill;
+          }
         } else {
           expect(await prepareProgressiveRemoteDispatch(db, solverId)).toMatchObject({ kind: "waiting" });
           expect(await createdWork()).toEqual(empty);

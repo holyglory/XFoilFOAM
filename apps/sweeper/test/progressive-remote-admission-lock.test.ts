@@ -31,6 +31,30 @@ import { prepareProgressiveRemoteDispatch } from "../src/progressive-remote-admi
 
 afterEach(() => vi.resetAllMocks());
 
+it.each([
+  ["55P03", "canceling statement due to lock timeout", "lock_timeout", true],
+  ["55P03", "could not obtain lock on row", "lock_not_available", true],
+  ["40P01", "deadlock detected", "deadlock", true],
+  ["57014", "canceling statement due to statement timeout", "statement_timeout", false],
+  ["57014", "canceling statement due to user request", "user_cancellation", false],
+  ["57014", "sensitive driver detail", "query_cancellation", false],
+] as const)("retains the safe PostgreSQL cause for %s %s", async (sqlstate, message, reason, retry) => {
+  const pg = Object.assign(new Error(message), { code: sqlstate });
+  const execute = vi.fn().mockResolvedValueOnce([]).mockResolvedValueOnce([{ id: "epoch", backend_pid: 731 }])
+    .mockRejectedValueOnce(new Error("sensitive bound SQL", { cause: pg }));
+  const connection = { transaction: (run: (db: DB) => Promise<unknown>) => run({ execute } as unknown as DB) } as unknown as DB;
+  const log = vi.spyOn(console, "warn").mockImplementation(() => {});
+  try {
+    const outcome = await prepareProgressiveRemoteDispatch(connection, "11111111-1111-4111-8111-111111111111");
+    expect(outcome.kind).toBe("waiting");
+    expect(outcome.kind === "waiting" && outcome.retryableContention === true).toBe(retry);
+    expect(JSON.parse(log.mock.calls[0][0])).toMatchObject({ sqlstate, reason, phase: "transaction setup", postgresBackendPid: 731 });
+    expect(JSON.stringify([log.mock.calls, outcome])).not.toContain("sensitive");
+  } finally {
+    log.mockRestore();
+  }
+});
+
 it("does not hold the solver row lock while a candidate claim is running", async () => {
   const solverId = "11111111-1111-4111-8111-111111111111";
   const epochId = "22222222-2222-4222-8222-222222222222";
@@ -75,7 +99,6 @@ it("does not hold the solver row lock while a candidate claim is running", async
         checked_at: new Date(observedAt),
       },
     ])
-    .mockResolvedValueOnce([{ acquired: true }])
     .mockResolvedValueOnce([
       { airfoil_id: airfoilId, simulation_preset_revision_id: revisionId },
     ])
@@ -163,7 +186,6 @@ it("keeps the transaction bounds when a nonblocking campaign claim skips a busy 
         checked_at: new Date(observedAt),
       },
     ])
-    .mockResolvedValueOnce([{ acquired: true }])
     .mockResolvedValueOnce([{ airfoil_id: airfoilId, simulation_preset_revision_id: revisionId }])
     .mockResolvedValue([]);
   const db = {
@@ -201,7 +223,7 @@ it("keeps the transaction bounds when a nonblocking campaign claim skips a busy 
   );
   const timeouts = execute.mock.calls.map(([statement]) => new PgDialect().sqlToQuery(statement).sql)
     .filter((statement) => /lock_timeout|statement_timeout/.test(statement));
-  expect(timeouts).toEqual(["SET LOCAL lock_timeout = '10s'; SET LOCAL statement_timeout = '15s'"]);
+  expect(timeouts).toEqual(["SET LOCAL lock_timeout = '10s'; SET LOCAL statement_timeout = '15s'; SET LOCAL jit = off"]);
 });
 
 it("defers exact cells owned by another active promise before inserting a successor", async () => {
@@ -244,7 +266,6 @@ it("defers exact cells owned by another active promise before inserting a succes
         checked_at: new Date(observedAt),
       },
     ])
-    .mockResolvedValueOnce([{ acquired: true }])
     .mockResolvedValueOnce([
       { airfoil_id: airfoilId, simulation_preset_revision_id: revisionId },
     ])

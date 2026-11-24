@@ -1,4 +1,4 @@
-import { sql } from "drizzle-orm";
+import { sql, type SQL } from "drizzle-orm";
 
 const PROGRESSIVE_BOUNDED_NO_EVIDENCE_RECOVERY_REASONS = [
   "terminal execution has no measured case evidence",
@@ -164,12 +164,15 @@ export function progressiveCfdMaterialDomainRecoveryAvailableSql(
   alias = "unit",
   settlingAttemptAlias?: string,
 ) {
-  const unit = sql.identifier(alias);
-  return sql`EXISTS (
-    SELECT 1 FROM progressive_cfd_recovery_plans recovery
-    WHERE recovery.unit_id = ${unit}.id AND recovery.ordinal = 1 AND recovery.reason = 'material_domain'
+  return sql`EXISTS (${progressiveAvailableMaterialUnitIds(sql`${sql.identifier(alias)}.id`, settlingAttemptAlias)})`;
+}
+
+export function progressiveAvailableMaterialUnitIds(unitId?: SQL, settlingAttemptAlias?: string) {
+  return sql`SELECT recovery.unit_id FROM progressive_cfd_recovery_plans recovery
+    WHERE recovery.ordinal = 1 AND recovery.reason = 'material_domain'
+      ${unitId ? sql`AND recovery.unit_id = ${unitId}` : sql``}
       AND NOT ${recoveryClaimConsumedSql(settlingAttemptAlias)}
-  )`;
+  `;
 }
 
 // A general retry cannot start the same material fallback again. A pending
