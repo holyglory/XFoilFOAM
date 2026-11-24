@@ -319,8 +319,13 @@ export async function runSharedStoppedReportStorage(
     process.env.AIRFOILFOAM_STOPPED_REPORT_ANCHOR_SCOPE?.trim() || "all";
   let worked = false,
     verifiedUntil = 0;
+  // Only an owner that reached advancement can defer its own next turn.
+  // A global capability or discovery failure keeps the queued owner in place.
+  const retryAfter = new Map<string, number>();
+  let nextOwnerRetry = Infinity;
   while (!signal.aborted) {
     let wait = 500;
+    let owner: string | undefined;
     try {
       if (Date.now() >= verifiedUntil) {
         const [ready] =
@@ -372,26 +377,37 @@ export async function runSharedStoppedReportStorage(
             FROM candidates c JOIN sim_jobs job ON job.id=c.id LEFT JOIN progressive_remote_dispatches d ON d.sim_job_id=c.id
             LEFT JOIN sync_sweep_promises promise ON promise.id=d.promise_id ORDER BY c.id`);
           after = page.length ? String(page.at(-1)!.key) : null;
-          queue = page
-            .filter((r) => r.ready === true)
-            .map((r) => String(r.key));
+          const now = Date.now();
+          for (const row of page) {
+            if (!row.ready) continue;
+            const retry = retryAfter.get(row.key);
+            if (retry !== undefined && retry > now) {
+              nextOwnerRetry = Math.min(nextOwnerRetry, retry);
+            } else {
+              queue.push(row.key);
+            }
+          }
           if (!after) {
-            wait = worked ? 250 : 600_000;
+            wait = Math.min(worked ? 250 : 600_000, Math.max(250, nextOwnerRetry - now));
             worked = false;
+            nextOwnerRetry = Infinity;
+            for (const [id, retry] of retryAfter) {
+              if (retry <= now) retryAfter.delete(id);
+            }
           }
         } else queue = [scope];
       }
-      const id = queue[0];
-      if (id) {
+      owner = queue.shift();
+      if (owner) {
         const result = await advanceSharedReportOwner(
           db,
           store,
           directory,
-          id,
-          anchorReader && (anchorScope === "all" || anchorScope === id),
+          owner,
+          anchorReader && (anchorScope === "all" || anchorScope === owner),
           priority,
         );
-        queue.shift();
+        retryAfter.delete(owner);
         if (!result.complete) worked = true;
         if (scope !== "all" && result.complete) wait = 600_000;
         else if (result.changed) wait = 250;
@@ -399,11 +415,16 @@ export async function runSharedStoppedReportStorage(
     } catch (e) {
       console.error(
         "[stopped-report-cloud-copy]",
-        queue[0],
+        owner ?? "reader availability or owner discovery",
         e instanceof Error ? e.message : String(e),
       );
-      queue.shift();
-      wait = 30_000;
+      if (owner && scope === "all") {
+        const retry = Date.now() + 30_000;
+        retryAfter.set(owner, retry);
+        nextOwnerRetry = Math.min(nextOwnerRetry, retry);
+      } else {
+        wait = 30_000;
+      }
     }
     try {
       await delay(wait, undefined, { signal });

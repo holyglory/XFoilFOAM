@@ -3,7 +3,7 @@ import { archiveProgressiveReportBatch } from "../src/progressive-report-archive
 import { randomUUID } from "node:crypto";
 import { fork } from "node:child_process";
 import { once } from "node:events";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -263,6 +263,29 @@ it("runs the stock recurring hub storage worker and serves both archive formats 
     // An interrupted optional seek hint must leave the ordinary stock writer
     // and readers operating on their normal catalogue and source checks.
     await writeFile(join(dir, "ordinary-chronological.json"), "{");
+    const [failedOwner, healthyOwner] = originals.slice(0, 2)
+      .map((f) => f.executionId)
+      .sort();
+    const ownerCursor = join(dir, failedOwner, "cursor.json");
+    await mkdir(join(dir, failedOwner), { recursive: true });
+    await writeFile(ownerCursor, "{");
+    const errorPrefix = "[stopped-report-cloud-copy] " + failedOwner;
+    const sharedMembers = (id: string) => db.sql`SELECT count(*)::int n
+      FROM progressive_report_archive_members m JOIN progressive_report_archive_bundles b ON b.id=m.bundle_id
+      WHERE m.sim_job_id=${id}::uuid AND b.archive_format='shared-result-v1'`;
+    start(false);
+    await until(async () => errors.includes(errorPrefix));
+    const failureObserved = Date.now();
+    await until(async () => Number((await sharedMembers(healthyOwner))[0].n) > 0, 20_000);
+    const healthyPublicationWaitMs = Date.now() - failureObserved;
+    expect(healthyPublicationWaitMs).toBeLessThan(30_000);
+    console.info("Healthy owner published during another owner's retry interval", healthyPublicationWaitMs);
+    expect(Number((await sharedMembers(failedOwner))[0].n)).toBe(0);
+    expect(errors.split(errorPrefix).length - 1).toBe(1);
+    expect(await readFile(ownerCursor, "utf8")).toBe("{");
+    await stop();
+    await rm(ownerCursor);
+    logs = "";
     start(false);
     await until(async () => {
       const rows =
