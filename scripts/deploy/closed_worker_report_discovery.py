@@ -8,6 +8,8 @@ import tempfile
 import time
 from pathlib import Path
 
+from closed_worker_report_sessions import DiscoveryQueryCancelled
+
 ZERO = {"executionId":"00000000-0000-0000-0000-000000000000","sequence":0}
 
 
@@ -96,12 +98,32 @@ def discovery_step(args, seed_runner, shared, ask, durable, compact, require, *,
     page=cursor["page"]
     if not page:
         scope={"sourceInstance":frozen["sourceInstance"],"solverId":frozen["solverId"],"sha256":args.frozen_sha256}
-        result=ask("worker",dict(op="discover-worker",scope=scope,after=cursor["after"],limit=args.scan_rows))
+        budget = cursor.get("scanBudget", {})
+        width = args.scan_rows
+        if (budget.get("release"), budget.get("configured")) == (args.runtime_revision, width):
+            width = min(width, budget["width"])
+        require(1 <= width <= args.scan_rows, "Invalid saved discovery read budget")
+
+        def retry_scan(role):
+            # These two queries only select candidate keys. Keep the scan boundary
+            # and all saved receipts, and give the primary inventory its next turn.
+            cursor["scanBudget"] = dict(release=args.runtime_revision, configured=args.scan_rows,
+                                        width=max(1, width // 2), cancelledRole=role, sqlstate="57014")
+            if width == 1:
+                cursor["notBefore"] = time.time() + args.discovery_interval
+            durable(path, cursor)
+
+        try:
+            result=ask("worker",dict(op="discover-worker",scope=scope,after=cursor["after"],limit=width))
+        except DiscoveryQueryCancelled:
+            retry_scan("worker")
+            return
         scanned=result["scanned"]
-        require(0<=scanned<=args.scan_rows and len(result["keys"])<=scanned,"Invalid bounded worker scan")
+        require(0<=scanned<=width and len(result["keys"])<=scanned,"Invalid bounded worker scan")
         if not scanned:
             require(not result["keys"] and result["last"] is None,"Missing discovery boundary")
             durable(directory/f"pass-{cursor['pass']:06d}.json",cursor,immutable=True)
+            cursor.pop("scanBudget", None)
             cursor.update(after=ZERO,scanned=0,**{"pass":cursor["pass"]+1,"notBefore":time.time()+args.discovery_interval})
             durable(path,cursor)
             return
@@ -118,7 +140,11 @@ def discovery_step(args, seed_runner, shared, ask, durable, compact, require, *,
                 candidates.append(k)
         if before_seed_end:
             candidates = outside_seed(args, candidates, directory, cursor, durable, require)
-        ready=ask("hub",dict(op="discover-hub",scope=scope,keys=candidates))["keys"] if candidates else []
+        try:
+            ready=ask("hub",dict(op="discover-hub",scope=scope,keys=candidates))["keys"] if candidates else []
+        except DiscoveryQueryCancelled:
+            retry_scan("hub")
+            return
         approved={tuple((k[n] for n in ("executionId","sequence","signature"))) for k in candidates}
         require(ready==sorted(ready,key=loc) and len(set(map(loc,ready)))==len(ready)
                 and all((k["executionId"],k["sequence"],k["signature"]) in approved for k in ready),"Hub selected another source")

@@ -324,6 +324,40 @@ class ClosedReportOperator(unittest.TestCase):
             self.assertEqual((final["page"],final["pass"],final["held"]), (None,2,3))
             self.assertEqual(json.loads((args.state/"progress.json").read_bytes())["completed"], 5)
 
+            # Both catalogue reads can hit their PG deadline without owning a
+            # publication. Preserve their scan key; a genuine refusal still stops.
+            args.state = root/"cancelled"
+            limits, admissions = [], []
+            def cancelled(_args, role, m, _program):
+                if m["op"] == "source":
+                    admissions.append(m["key"]["sequence"])
+                    return {"held":"original retained"}
+                if m["op"] == "discover-worker":
+                    self.assertEqual(m["after"]["sequence"], 0)
+                    limits.append(m["limit"])
+                    if len(limits) == 1:
+                        raise controller.DiscoveryQueryCancelled(role)
+                    return {"keys":[key(6)],"scanned":1,"last":key(6)}
+                if m["op"] == "discover-hub":
+                    if len(limits) == 2:
+                        raise controller.DiscoveryQueryCancelled(role)
+                    if len(limits) == 3:
+                        raise ValueError("wrong signed scope")
+                    return {"keys":m["keys"]}
+                self.fail(m["op"])
+            with patch.object(controller,"run_peer",side_effect=cancelled), patch.object(controller.subprocess,"check_output",return_value=b"runtime"):
+                for _ in range(3):
+                    controller.run(args)
+                checkpoint = json.loads((args.state/"discovery/cursor.json").read_bytes())
+                self.assertEqual((checkpoint["after"]["sequence"],checkpoint["scanBudget"]["width"]), (0,1))
+                self.assertEqual(admissions, [5,7,9])
+                with self.assertRaisesRegex(ValueError, "wrong signed scope"):
+                    controller.run(args)
+                controller.run(args)
+            self.assertEqual(limits, [4,2,1,1])
+            self.assertEqual(admissions, [5,7,9,6])
+
+
     def test_group_resumes_committed_generation_before_visiting_next_key(self):
         with tempfile.TemporaryDirectory() as temp:
             root=Path(temp);job="11111111-1111-4111-8111-111111111111"

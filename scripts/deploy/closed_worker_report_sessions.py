@@ -18,6 +18,10 @@ class ReadPeerStopped(RuntimeError):
         self.keys = []
 
 
+class DiscoveryQueryCancelled(RuntimeError):
+    """The database cancelled a read-only prospective eligibility query (SQLSTATE 57014)."""
+
+
 class ReadTransportLost(RuntimeError):
     """A read-only pipe closed without delivering the response."""
 
@@ -71,6 +75,9 @@ class ReportReadSession:
             if code in (74,255):
                 raise ReadTransportLost(f"{role} reader pipe closed ({code})")
             raise RuntimeError(f"{role} reader refused ({code})")
+        if (response.get("n") == self.count and response.get("error") == "57014"
+                and msg["op"] in ("discover-worker", "discover-hub")):
+            raise DiscoveryQueryCancelled(role)
         if response.get("n")!=self.count or response.get("error"):
             raise RuntimeError(f"{role} read refused: {response.get('error','wrong sequence')}")
         response.pop("n")

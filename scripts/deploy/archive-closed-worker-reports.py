@@ -17,7 +17,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from closed_worker_report_pages import process_page, qualified_width, previous_result_matches, remember_verified_result
-from closed_worker_report_sessions import ReadPeerStopped, ReportReadSessions, ROLE_READS
+from closed_worker_report_sessions import DiscoveryQueryCancelled, ReadPeerStopped, ReportReadSessions, ROLE_READS
 from closed_worker_report_discovery import discovery_step, revisit_held, revisit_prefix
 from closed_worker_report_order import OrderedInventory, ordered_inventory, remember_member_size
 
@@ -104,6 +104,8 @@ def run_peer(args, role, message, source):
     else:
         record = single_request(args,role,message,source)
     value = record.pop("value")
+    if message["op"] in ("discover-worker", "discover-hub") and value == {"discoverySqlstate": "57014"}:
+        raise DiscoveryQueryCancelled(role)
     if args.measure_rpc:
         items=message.get("items") or []
         observed=message.get("pin") or (items[0].get("pin") if items else None) or value.get("pin") or (value.get("pins") or [value])[0]
@@ -150,6 +152,8 @@ catch (e) {
   const status = /^Worker report archive upload failed [(](429|502|503|504)[)]$/.exec(e.message);
   if (["source","hub"].includes(request.op) && e.name === "ClosedReportHeld") {
     send({held:e.message});
+  } else if (["discover-worker", "discover-hub"].includes(request.op) && (e.cause?.code ?? e.code) === "57014") {
+    send({discoverySqlstate:"57014"});
   } else if (request.op === "publish" && status) {
     send({retryableBrokerStatus:Number(status[1])});
   } else {

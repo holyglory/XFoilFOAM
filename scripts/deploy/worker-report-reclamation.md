@@ -74,7 +74,10 @@ After at least N primary members, the writer advances one bounded worker
 scan or resumes one saved discovery page. The hub checks the eligible signed
 keys that fall outside both frozen ranges and the entire primary inventory.
 The same controller lock covers both operations. After the primary inventory
-ends, discovery continues at the configured scan interval. The default of zero
+ends, discovery continues at the configured scan interval. If PostgreSQL
+cancels a discovery query, the next scan retries its saved position with a
+smaller row budget. A single-key cancellation waits for the scan interval.
+The default of zero
 leaves the existing `--discover-after-seed` schedule available.
 
 ## Measure the report table
