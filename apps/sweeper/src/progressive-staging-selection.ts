@@ -61,6 +61,15 @@ export async function hasRegisteredWorkerJob(db: DB): Promise<boolean> {
   return rows.length > 0;
 }
 
+// Probe the ordinary receipt first. Keep the protected closed-copy lookup
+// correlated to the same job and sequence in both selection and wake queries.
+export const workerReportWithoutStagingProof = sql`NOT EXISTS (
+  SELECT 1 FROM progressive_worker_evidence_receipts receipt
+    WHERE receipt.sim_job_id = report.sim_job_id AND receipt.sequence = report.sequence
+  UNION ALL
+  SELECT 1 FROM public.progressive_worker_closed_staging_copies covered
+    WHERE covered.sim_job_id = report.sim_job_id AND covered.sequence = report.sequence)`;
+
 export function progressiveStagingSelectionSql(preferActive: boolean) {
   const settings = sql`SELECT upstream_base_url, remote_solver_registered_id,
       remote_solver_transfer_paused, remote_solver_auth_token
@@ -68,12 +77,7 @@ export function progressiveStagingSelectionSql(preferActive: boolean) {
   const enabled = sql`NOT settings.remote_solver_transfer_paused
         AND settings.remote_solver_auth_token <> ''
         AND settings.upstream_base_url IS NOT NULL`;
-  const outstanding = sql`NOT EXISTS (
-          SELECT 1 FROM progressive_worker_evidence_receipts receipt
-            WHERE receipt.sim_job_id=report.sim_job_id AND receipt.sequence=report.sequence
-          UNION ALL
-          SELECT 1 FROM public.progressive_worker_closed_staging_copies covered
-          WHERE covered.sim_job_id=report.sim_job_id AND covered.sequence=report.sequence)
+  const outstanding = sql`${workerReportWithoutStagingProof}
         AND NOT EXISTS (SELECT 1 FROM progressive_worker_report_conflicts conflict
           WHERE conflict.sim_job_id = report.sim_job_id AND conflict.sequence = report.sequence)
         AND (failure.sim_job_id IS NULL OR failure.retry_after <= clock_timestamp())`;

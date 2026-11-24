@@ -294,6 +294,16 @@ it.each(wakeSources)(
           expect(nodes.some(n => n["Relation Name"] === "fixture_staging_keys")).toBe(true);
           expect(JSON.stringify(nodes)).not.toContain("jsonb_typeof");
         }
+        if (scope === "staging") {
+          const copyProbes = nodes.filter(n => n.Schema === "public" &&
+            n["Relation Name"] === "progressive_worker_staging_copies" && Number(n["Actual Loops"]) > 0);
+          for (const probe of copyProbes) {
+            const condition = String(probe["Index Cond"] ?? probe["Recheck Cond"] ?? probe.Filter ?? "");
+            expect(condition).toContain(".sim_job_id =");
+            expect(condition).toContain(".sequence =");
+          }
+          expect(copyProbes.reduce((sum, n) => sum + Number(n["Actual Loops"]), 0)).toBeLessThanOrEqual(32);
+        }
         const ownership = nodes.filter(
           (node) => node["Relation Name"] === "sim_jobs",
         );
@@ -734,6 +744,12 @@ it("keeps the ownership scan guard for executed or foreign sequential scans", ()
   };
   expect(unexpectedWorkerJobScans([viewNode], true)).toEqual([]);
   expect(unexpectedWorkerJobScans([viewNode], false)).toHaveLength(1);
+  const keyed = { ...viewNode, Filter: viewNode.Filter.replace(" AND (j_2.status",
+    " AND (j_2.id = progressive_worker_reports.sim_job_id) AND (j_2.status") };
+  expect(unexpectedWorkerJobScans([keyed], true)).toEqual([]);
+  expect(unexpectedWorkerJobScans([{ ...keyed, "Actual Loops": 1 }], true)).toHaveLength(1);
+  expect(unexpectedWorkerJobScans([{ ...keyed, Filter: keyed.Filter.replace(
+    "progressive_worker_reports.sim_job_id", "foreign_owner.sim_job_id") }], true)).toHaveLength(1);
   for (const changed of [
     { "Actual Loops": 1 }, { "Actual Rows": 1 }, { "Rows Removed by Filter": 1 },
     { Schema: "pg_temp" }, { Alias: "job" }, { Output: ["j_2.request_payload"] },

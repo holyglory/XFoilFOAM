@@ -1,4 +1,5 @@
 import { sql } from "drizzle-orm";
+import { workerReportWithoutStagingProof } from "./progressive-staging-selection";
 import { progressiveDiagnosticRetrySql } from "./progressive-delivery-selection";
 
 export type ProgressiveEvidenceWakeScope = "staging" | "delivery";
@@ -20,12 +21,9 @@ function stagingWakeSource(ready: boolean) {
     FROM ${reports} report
     LEFT JOIN progressive_worker_staging_failures failure
       ON failure.sim_job_id=report.sim_job_id AND failure.sequence=report.sequence
-    WHERE NOT EXISTS (SELECT 1 FROM public.progressive_worker_closed_staging_copies covered
-        WHERE covered.sim_job_id=report.sim_job_id AND covered.sequence=report.sequence)
+    WHERE ${workerReportWithoutStagingProof}
       AND NOT EXISTS (SELECT 1 FROM progressive_worker_report_conflicts conflict
         WHERE conflict.sim_job_id=report.sim_job_id AND conflict.sequence=report.sequence)
-      AND NOT EXISTS (SELECT 1 FROM progressive_worker_evidence_receipts staged
-        WHERE staged.sim_job_id=report.sim_job_id AND staged.sequence=report.sequence)
       ${ready ? sql`AND (failure.sim_job_id IS NULL OR failure.retry_after<=clock_timestamp())` : sql``}
     OFFSET 0`;
 }
