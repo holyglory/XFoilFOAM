@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { sql } from "drizzle-orm";
-import { expect } from "vitest";
+import { expect, vi } from "vitest";
 import { createClient, type DB } from "../src/client";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
@@ -320,6 +320,50 @@ export async function verifyRegisteredShortWork(
         sql`SELECT count(*)::int AS n FROM progressive_cfd_attempts a JOIN progressive_cfd_units u ON u.id=a.unit_id WHERE u.work_id=${workId}::uuid`,
       );
       expect(history.n).toBe(0);
+    });
+    // Real campaign ownership can outlast the initial SKIP LOCKED lookup.
+    // The normal blocking retry must still carry this approved whole group.
+    let checked: Promise<{ units: string[]; marked: boolean }> | undefined;
+    await db.transaction(async (holder) => {
+      const [locked] =
+        await holder.execute(sql`SELECT pg_backend_pid() AS pid FROM sim_campaigns campaign
+        JOIN progressive_generations g ON g.campaign_id=campaign.id
+        WHERE g.id=${generationId}::uuid FOR UPDATE OF campaign`);
+      let publishPid!: (pid: number) => void;
+      const actorPid = new Promise<number>((resolve) => {
+        publishPid = resolve;
+      });
+      checked = rollback(otherClient.db, async (connection) => {
+        const [actor] = await connection.execute(
+          sql`SELECT pg_backend_pid() AS pid`,
+        );
+        publishPid(Number(actor.pid));
+        const outcome = await prepareProgressiveRemoteDispatch(
+          connection,
+          solverId,
+        );
+        if (outcome.kind !== "prepared") throw new Error(outcome.reason);
+        const status = await shortWorkStatus(connection, solverId);
+        return {
+          units: outcome.envelope.scope.units.map((u) => u.unitId),
+          marked: status?.issued_job_id === outcome.envelope.scope.executionId,
+        };
+      });
+      void checked.catch(() => {});
+      const pid = await actorPid;
+      await vi.waitFor(
+        async () => {
+          const [row] = await db.execute(
+            sql`SELECT ${Number(locked.pid)}::int=ANY(pg_blocking_pids(${pid}::int)) AS held`,
+          );
+          expect(row.held).toBe(true);
+        },
+        { timeout: 8000, interval: 25 },
+      );
+    });
+    expect(await checked).toEqual({
+      units: preview.units.map((u) => u.id),
+      marked: true,
     });
     const competition = await Promise.all([
       prepareProgressiveRemoteDispatch(db, solverId),

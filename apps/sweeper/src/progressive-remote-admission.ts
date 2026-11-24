@@ -251,6 +251,17 @@ async function prepareRemoteDispatch(
         campaignLockMode: "skip",
       } as const;
       let leases = await claimProgressiveCfdBatch(connection, claimInput);
+      if (!leases.length) {
+        // Keep the transaction's 10s lock bound: normal scoped settlement can
+        // hold the campaign mutex longer than a subsecond fallback would allow.
+        leases = await claimProgressiveCfdBatch(connection, {
+          ...claimInput,
+          campaignLockMode: "wait",
+        });
+      }
+      // An empty SKIP LOCKED read may only mean the winning campaign is
+      // settling another job. Give this same preference the ordinary bounded
+      // campaign-lock wait before deciding that the complete group changed.
       if (
         choice.kind === "prefer" &&
         (!matchesShortWork(choice.plan, leases) ||
@@ -261,14 +272,6 @@ async function prepareRemoteDispatch(
           )))
       )
         throw new RetryOrdinaryDispatch(choice.windowId);
-      if (!leases.length) {
-        // Keep the transaction's 10s lock bound: normal scoped settlement can
-        // hold the campaign mutex longer than a subsecond fallback would allow.
-        leases = await claimProgressiveCfdBatch(connection, {
-          ...claimInput,
-          campaignLockMode: "wait",
-        });
-      }
       if (!leases.length)
         throw new RemoteProgressiveAdmissionWait(
           "No eligible campaign cases are ready",
