@@ -2047,6 +2047,7 @@ function fittingRequest(
 function pythonFixtureEnvironment() {
   return {
     ...process.env,
+    PATH: [resolve(ROOT, ".venv", "bin"), process.env.PATH].filter(Boolean).join(delimiter),
     PYTHONPATH: [resolve(ROOT, "src"), process.env.PYTHONPATH]
       .filter(Boolean)
       .join(delimiter),
@@ -2989,7 +2990,7 @@ describe("progressive durable stage transitions", () => {
     await db.execute(sql`
       UPDATE progressive_cfd_units
       SET state = 'gap', lease_token = NULL, lease_owner = NULL, lease_until = NULL,
-        attempts = CASE WHEN id = ${leases[1].id}::uuid THEN 2 ELSE 1 END,
+        attempts = CASE WHEN id = ${leases[1].id}::uuid THEN 3 ELSE 2 END,
         active_seconds = 1,
         error = 'Inactive remote delivery has unresolved evidence'
       WHERE id IN (${leases[0].id}::uuid, ${leases[1].id}::uuid)
@@ -3005,12 +3006,12 @@ describe("progressive durable stage transitions", () => {
     const exhausted = rows.find((row) => row.id === leases[1].id)!;
     expect(recovered).toMatchObject({
       state: "pending",
-      attempts: 1,
+      attempts: 2,
       error: "Retrying after inactive remote delivery",
     });
     expect(exhausted).toMatchObject({
       state: "gap",
-      attempts: 2,
+      attempts: 3,
       error: "Inactive remote delivery has unresolved evidence",
     });
   });
