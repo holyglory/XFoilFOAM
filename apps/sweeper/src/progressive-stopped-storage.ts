@@ -82,19 +82,22 @@ export async function requeueStoppedProgressiveStorage(
   db: DB,
   options: { retryStoppedStorage?: boolean } = {},
 ): Promise<number> {
+  const retryableFailure = sql`failure.state='conflict' AND failure.last_http_status=409
+    AND (failure.last_error='Progressive evidence delivery failed (409)' OR (
+      ${options.retryStoppedStorage === true}
+      AND failure.last_error='Stopped progressive storage delivery failed (409)'
+      AND failure.attempt_count < 5
+    ))
+    AND failure.remote_conflict_ids='[]'::jsonb`;
+  // Separate statement so an empty poll never plans the staging/owner join.
+  // A positive probe grants no authority; the locked update repeats the predicate.
+  const [candidate] = await db.execute(sql`SELECT 1 FROM progressive_worker_delivery_failures failure
+    WHERE ${retryableFailure} LIMIT 1`);
+  if (!candidate) return 0;
   const rows = await db.execute(sql`
     WITH candidates AS (
       SELECT failure.sim_job_id,failure.point_content_signature FROM progressive_worker_delivery_failures failure
-      WHERE failure.state='conflict' AND failure.last_http_status=409
-        AND (
-          failure.last_error='Progressive evidence delivery failed (409)'
-          OR (
-            ${options.retryStoppedStorage === true}
-            AND failure.last_error='Stopped progressive storage delivery failed (409)'
-            AND failure.attempt_count < 5
-          )
-        )
-        AND failure.remote_conflict_ids='[]'::jsonb
+      WHERE ${retryableFailure}
         AND EXISTS (SELECT 1 ${stoppedOwner} AND job.id=failure.sim_job_id
           AND promise.response_payload->>'authoritativeLeaseLoss'='true')
       ORDER BY failure.updated_at,failure.sim_job_id,failure.point_content_signature LIMIT 16
