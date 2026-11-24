@@ -17,6 +17,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from closed_worker_report_pages import process_page, qualified_width, previous_result_matches, remember_verified_result
+from closed_worker_report_write_session import NativeWriteSession, WriterTransportInterrupted
 from closed_worker_report_sessions import DiscoveryQueryCancelled, ReadPeerStopped, ReportReadSessions, ROLE_READS
 from closed_worker_report_discovery import discovery_step, revisit_held, revisit_prefix
 from closed_worker_report_order import OrderedInventory, ordered_inventory, remember_member_size
@@ -94,7 +95,12 @@ def check_key(key, ranges):
 def run_peer(args, role, message, source):
     started = time.monotonic()
     sessions = getattr(args,"read_sessions",None)
-    if sessions and message["op"] in ROLE_READS[role]:
+    writer = getattr(args, "write_session", None)
+    if writer and role == "worker" and message["op"] in ("publish", "settle"):
+        record = writer.ask(args, message, source)
+        if record is None:
+            record = single_request(args, role, message, source)
+    elif sessions and message["op"] in ROLE_READS[role]:
         try:
             record = sessions.ask(args,role,message,source)
         except ReadPeerStopped as error:
@@ -139,6 +145,10 @@ def single_request(args, role, message, source):
     if message["op"] in ("publish", "settle"):
         require(args.apply and role == "worker", "Mutation requires the original native writer")
         argv = ["flock", "-s", "-w", "15", "-E", "75", "/tmp/airfoils-pro-deploy.lock", *argv]
+        # A previous transport may have lost its reply while its actual
+        # Docker exec is still settling. Both native paths respect that lease.
+        argv = ["flock", "-x", "-w", "15", "-E", "76",
+                "/opt/airfoils-pro/app/scripts/deploy/archive-closed-worker-reports.py", *argv]
     wire = base64.b64encode(compact(message)).decode()
     # The program travels through stdin. No file or service in the running image is replaced.
     program = source + "\nconst request=JSON.parse(Buffer.from('" + wire + "','base64'));\n" + """
@@ -164,6 +174,8 @@ catch (e) {
     cmd = ["ssh", "-T", "-C", "-oBatchMode=yes", "-oForwardAgent=no", "-oClearAllForwardings=yes",
            "-oStrictHostKeyChecking=yes", "-oConnectTimeout=10", host, shlex.join(argv)]
     process = subprocess.run(cmd, input=program, text=True, capture_output=True, timeout=170)
+    if process.returncode == 76 and role == "worker" and message["op"] in ("publish", "settle"):
+        raise WriterTransportInterrupted(message)
     if process.returncode:
         raise RuntimeError(f"{role} {message['op']} refused ({process.returncode}): {process.stderr[-340:]}")
     require(len(process.stdout) < 2 * 1024**2, "Oversized peer response")
@@ -435,6 +447,42 @@ def committed_read_retry(args, error):
     return argparse.Namespace(**(vars(args) | {"limit": len(keys), "retry_checkpoint_sha256": digest(saved)}))
 
 
+def pending_writer_retry(args, error):
+    """Re-enter the ordinary proof workflow at precisely the interrupted saved intent."""
+    if not args.apply or not getattr(args, "pause_file", None):
+        return None
+    path = args.state / "progress.json"
+    if not path.is_file():
+        return None
+    saved = path.read_bytes()
+    state = json.loads(saved)
+    group, single = state.get("group"), state.get("pending")
+    if group and not single:
+        keys = [item["key"] for item in group["items"]]
+        sources = [item["source"] for item in group["items"]]
+        pins = (group.get("publication") or {}).get("pins")
+        share = group.get("shareResults", False)
+        settled = group.get("settled")
+    elif single and not group:
+        keys, sources = [single["key"]], [single["initial"]["source"]]
+        pins = [single["pin"]] if single.get("pin") else None
+        share, settled = single.get("shareResults", False), single.get("settled")
+        if error.operation == "publish" and not single.get("publishing"):
+            return None
+    else:
+        return None
+    if (keys != error.keys or sources != error.sources or share != error.share_results or settled
+            or error.operation not in ("publish", "settle")):
+        return None
+    if error.operation == "settle":
+        if not pins or pins != error.pins:
+            return None
+    elif pins:
+        return None
+    return argparse.Namespace(**(vars(args) | {"limit":len(keys), "retry_checkpoint_sha256":digest(saved),
+                                               "recovering_writer":True}))
+
+
 def wait_for_read_peer(pause_file, delay):
     deadline = time.monotonic() + delay
     while not pause_file.exists():
@@ -450,26 +498,44 @@ def run_with_read_retry(args):
     while True:
         try:
             return run(current) is True or current is not args
-        except ReadPeerStopped as error:
-            args.read_sessions.close()
-            retry = committed_read_retry(current, error)
+        except (ReadPeerStopped, WriterTransportInterrupted) as error:
+            if getattr(args, "read_sessions", None):
+                args.read_sessions.close()
+            if isinstance(error, WriterTransportInterrupted):
+                retry = pending_writer_retry(current, error)
+            else:
+                retry = committed_read_retry(current, error)
             if retry is None:
                 raise
             previous = getattr(current, "retry_checkpoint_sha256", None)
-            require(not previous or previous == retry.retry_checkpoint_sha256,
-                    "Committed report retry checkpoint changed")
-            print(json.dumps({"waitingForReadPeer": error.role, "settledMembers": retry.limit,
-                              "retrySeconds": delay}), flush=True)
+            if not getattr(current, "recovering_writer", False):
+                require(not previous or previous == retry.retry_checkpoint_sha256,
+                        "Committed report retry checkpoint changed")
+            waiting = ({"waitingForWriter":error.operation,"savedMembers":retry.limit}
+                       if isinstance(error, WriterTransportInterrupted) else
+                       {"waitingForReadPeer":error.role,"settledMembers":retry.limit})
+            print(json.dumps(dict(waiting, retrySeconds=delay)), flush=True)
             if not wait_for_read_peer(args.pause_file, delay):
                 return True
             current, delay = retry, min(60, delay * 2)
 
 
 def run_invocations(args):
+    if not getattr(args, "reuse_native_writer", False) or not args.apply:
+        return run_passes(args)
+    require(args.pause_file and args.pause_file.is_absolute(), "A resident native writer needs its controller pause path")
+    args.write_session = NativeWriteSession()
+    try:
+        return run_passes(args)
+    finally:
+        args.write_session.close()
+
+
+def run_passes(args):
     passes = args.reuse_read_passes
     require(0 <= passes <= 4, "Expected zero to four bounded read-session passes")
     if not passes:
-        return run(args)
+        return run_with_read_retry(args) if getattr(args, "pause_file", None) else run(args)
     # Release role sockets and DB handles after a finite number of original-size chunks.
     # Pause markers are also checked after every durable member/page and before each new pass.
     require(args.pause_file and args.pause_file.is_absolute(), "Read reuse needs the existing controller pause path")
@@ -480,6 +546,8 @@ def run_invocations(args):
                 break
             if run_with_read_retry(args):
                 return
+            if getattr(args, "write_session", None):
+                args.write_session.close()
             if not args.apply:
                 break
     finally:
@@ -502,6 +570,8 @@ if __name__ == "__main__":
     parser.add_argument("--scan-rows",type=int,default=512)
     parser.add_argument("--discovery-interval",type=int,default=900)
     parser.add_argument("--reuse-read-passes",type=int,default=0)
+    parser.add_argument("--reuse-native-writer", action="store_true",
+                        help="Reuse one source-checked native executable within a bounded owner pass")
     parser.add_argument("--pause-file",type=Path)
     parser.add_argument("--width-qualification", type=Path, help="Optional measured eight-member budget for the exact ordinary four-member scope")
     parser.add_argument("--width-qualification-sha256", help="SHA-256 of that local qualification")

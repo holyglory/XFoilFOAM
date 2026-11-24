@@ -88,6 +88,22 @@ settlement. The byte count is the sum of the original member sizes. Other
 pages continue through their ordinary reads. Both paths keep the same signed
 input, independent cloud proof, size limits and recovery cursor.
 
+On the trusted closed-worker operator, `--reuse-native-writer` keeps one Node
+executable for the current execution and bounded pass. Each publication opens
+a read-only SQL client and each settlement opens its usual transactional
+client. Both finish before returning a response. The host takes the shared
+deployment lock for each request and releases it while the pipe is idle. A
+separate exclusive lock on the existing controller source inode prevents two
+native writers from acting while a lost acknowledgement is being reconciled.
+No service port is opened.
+
+The original pause file and cursor still control the run. A broken pipe may
+leave a publication or settlement complete on the remote worker. The
+controller checks the persisted signed keys, original identities, format and
+known pins before retrying at that exact checkpoint with fresh proof. A
+source or custody refusal stays visible. Leave the option omitted to use the
+one-command worker for each mutation.
+
 ## Measure the report table
 
 Run the read-only audit from the operator host. It uses the existing SSH aliases

@@ -476,6 +476,112 @@ class ClosedReportOperator(unittest.TestCase):
                 self.assertEqual(sessions.return_value.ask.call_count,2)
                 sessions.return_value.close.assert_called_once()
 
+    def test_resident_writer_reconciles_only_its_exact_saved_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            args = SimpleNamespace(state=root, apply=True, pause_file=root/"pause", limit=16)
+            path = root/"progress.json"
+            keys = [dict(executionId="1"*36, sequence=i, signature=str(i)*64) for i in (1,2)]
+            sources = [{"facts":{"sha256":k["signature"]}} for k in keys]
+            items = [dict(key=k,source=s) for k,s in zip(keys,sources)]
+            pins = [dict(**k,generation="123",storedSha256="b"*64) for k in keys]
+            saved = dict(items=items, shareResults=True, publication=None)
+            controller.durable(path, dict(group=saved, completed=9, after=1500))
+            lost = controller.WriterTransportInterrupted(dict(op="publish", items=items, shareResults=True))
+            retry = controller.pending_writer_retry(args,lost)
+            self.assertEqual((retry.limit,retry.retry_checkpoint_sha256),
+                             (2,controller.digest(path.read_bytes())))
+            self.assertIsNone(controller.pending_writer_retry(args,controller.WriterTransportInterrupted(
+                dict(op="publish",items=list(reversed(items)),shareResults=True))))
+            self.assertIsNone(controller.pending_writer_retry(args,controller.WriterTransportInterrupted(
+                dict(op="publish",items=items,shareResults=False))))
+            saved["publication"]={"pins":pins}
+            controller.durable(path,dict(group=saved,completed=9,after=1500))
+            self.assertIsNone(controller.pending_writer_retry(args,lost))
+            fields = [dict(item,pin=pin) for item,pin in zip(items,pins)]
+            interrupted = controller.WriterTransportInterrupted(dict(op="settle",items=fields,shareResults=True))
+            self.assertEqual(controller.pending_writer_retry(args,interrupted).limit,2)
+            altered = [fields[0],dict(fields[1],pin=dict(pins[1],generation="124"))]
+            self.assertIsNone(controller.pending_writer_retry(args,controller.WriterTransportInterrupted(
+                dict(op="settle",items=altered,shareResults=True))))
+            saved["settled"]=[{"outcome":"retired"} for _ in keys]
+            controller.durable(path,dict(group=saved,completed=9,after=1500))
+            self.assertIsNone(controller.pending_writer_retry(args,interrupted))
+            single=dict(key=keys[0],initial={"source":sources[0]},publishing=True,pin=None,shareResults=False)
+            controller.durable(path,dict(group=None,pending=single,completed=9,after=1500))
+            one=controller.WriterTransportInterrupted(dict(op="publish",**items[0]))
+            self.assertEqual(controller.pending_writer_retry(args,one).limit,1)
+            single["publishing"]=False
+            controller.durable(path,dict(group=None,pending=single,completed=9,after=1500))
+            self.assertIsNone(controller.pending_writer_retry(args,one))
+
+    def test_writer_locks_survive_supervisor_loss_only_through_the_real_active_request(self):
+        import fcntl
+        import subprocess
+        import sys
+        import time
+        from closed_worker_report_host import receive, send
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            peer=root/"apps/sweeper/src/closed-worker-report-peer.mjs"
+            owner=root/"scripts/deploy/archive-closed-worker-reports.py"
+            deploy=root/"deploy.lock"
+            for p in (peer,owner,deploy):
+                p.parent.mkdir(exist_ok=True,parents=True)
+                p.write_text("fixture")
+            stub=root/"container.py"
+            stub.write_text(
+                "import json,sys,time\nfrom pathlib import Path\n"
+                "d=Path(sys.argv[1]); print(json.dumps({'ready':'writer','bootMs':1}),flush=True)\n"
+                "for line in sys.stdin:\n"
+                " m=json.loads(line); (d/'entered').touch()\n"
+                " for _ in range(500):\n"
+                "  if (d/'release').exists():break\n"
+                "  time.sleep(.01)\n"
+                " else:raise SystemExit(1)\n"
+                " (d/'settled').write_text(str(m['n']));print(json.dumps({'n':m['n'],'value':{'rows':[]}}),flush=True)\n")
+            bootstrap=(
+                "from pathlib import Path;import sys;"
+                "sys.path.insert(0,sys.argv[1]);import closed_worker_report_write_session as w;"
+                "p=Path(sys.argv[2]);w.DEPLOYED=p;w.DEPLOY_LOCK=p/'deploy.lock';"
+                "w.current_container=lambda *a:['a'*64,'started'];"
+                "original=w.keep_writer;"
+                "w.keep_writer=lambda cmd,d,o:original([sys.executable,'-IB',str(p/'container.py'),str(p)],d,o);"
+                "w.host_writer('a'*40,'sweeper','b'*64,'1'*36,sys.argv[3],sys.argv[4])")
+            proc=subprocess.Popen([sys.executable,"-IB","-c",bootstrap,str(ROOT/"scripts/deploy"),
+                                   str(root),controller.digest(peer.read_bytes()),controller.digest(b"{}")],
+                                  stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL)
+            def available(file):
+                with file.open("rb") as fd:
+                    try:fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
+                    except BlockingIOError:return False
+                return True
+            try:
+                self.assertEqual(receive(proc.stdout,65536,5)["ready"],"writer")
+                self.assertTrue(available(deploy))
+                self.assertFalse(available(owner))
+                send(proc.stdin,{"n":1,"request":{"op":"settle","runtime":{},"scope":{"sha256":"b"*64},
+                                                  "key":{"executionId":"1"*36}}})
+                for _ in range(300):
+                    if (root/"entered").is_file():break
+                    time.sleep(.01)
+                self.assertTrue((root/"entered").is_file())
+                self.assertFalse(available(deploy))
+                proc.kill();proc.wait(timeout=3)
+                self.assertFalse(available(deploy))
+                self.assertFalse(available(owner))
+                (root/"release").touch()
+                for _ in range(300):
+                    if available(deploy) and available(owner):break
+                    time.sleep(.01)
+                self.assertTrue(available(deploy) and available(owner))
+                self.assertEqual((root/"settled").read_text(),"1")
+            finally:
+                (root/"release").touch()
+                proc.stdin.close();proc.stdout.close()
+                if proc.poll() is None:proc.terminate()
+                proc.wait(timeout=4)
+
     def test_expired_read_session_reopens_once_and_keeps_source_refusals(self):
         import closed_worker_report_sessions as sessions
         from unittest.mock import Mock
