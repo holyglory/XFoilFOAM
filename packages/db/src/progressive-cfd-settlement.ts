@@ -14,6 +14,7 @@ import {
   progressiveCfdNeverStartedAttemptCountSql,
   progressiveCfdOrdinaryAttemptCountSql,
   progressiveCfdMaterialDomainRecoveryAvailableSql,
+  progressiveCfdMaterialPlanAllowsAttemptSql,
   progressiveCfdPreciseVerificationAvailableSql,
 } from "./progressive-attempt-budget";
 import {
@@ -707,6 +708,7 @@ export async function settleProgressiveCfdExecution(
         (unit.policy_version = ${PROGRESSIVE_COMPUTE_POLICY.version}
           AND ${progressiveCfdPreciseVerificationAvailableSql("unit", "attempt")}) AS unused_precise_verification,
         ${progressiveCfdMaterialDomainRecoveryAvailableSql("unit", "attempt")} AS unused_material_recovery,
+        ${progressiveCfdMaterialPlanAllowsAttemptSql("unit", "attempt")} AS material_plan_allows_attempt,
         ${historicalEvidence} AS historical_recovery,
         EXISTS (SELECT 1 FROM progressive_cfd_evidence receipt,
           jsonb_array_elements(coalesce(fitted.response->'estimate'->'contributors', '[]'::jsonb)) contributor
@@ -856,12 +858,14 @@ export async function settleProgressiveCfdExecution(
       const budgetExtensionRetry =
         !complete &&
         budgetExtensionPending &&
+        (budgetExtensionAdmitted || unit.material_plan_allows_attempt === true) &&
         (unit.stage === 2 || unit.stage === 3) &&
         ordinaryAttempts === 2 &&
         Number(unit.active_seconds) < effectiveBudget;
       const retry =
         budgetExtensionRetry ||
         (!complete &&
+        unit.material_plan_allows_attempt === true &&
         !exhausted &&
         (!neverStarted ||
           (Number(unit.never_started_attempts) < 1 &&

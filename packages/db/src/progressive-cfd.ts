@@ -31,6 +31,7 @@ import {
   progressiveCfdOrdinaryAttemptCountSql,
   progressiveCfdCompletionRetryAvailableSql,
   progressiveCfdMaterialDomainRecoveryAvailableSql,
+  progressiveCfdMaterialPlanAllowsAttemptSql,
   progressiveCfdPreciseVerificationAvailableSql,
 } from "./progressive-attempt-budget";
 import {
@@ -314,7 +315,8 @@ export async function claimProgressiveCfdUnit(
     const ordinaryAttempts = progressiveCfdOrdinaryAttemptCountSql();
     // Ordinary attempts subtract only nonnegative corrections. Below two raw
     // attempts the ordinary limit is therefore satisfied without history scans.
-    const attemptAvailable = sql`CASE WHEN unit.attempts < 2 THEN true ELSE (
+    const attemptAvailable = sql`(${progressiveCfdMaterialPlanAllowsAttemptSql()}
+      AND CASE WHEN unit.attempts < 2 THEN true ELSE (
       unit.attempts < 4 AND (${ordinaryAttempts} < 2 OR ${progressiveCfdBoundedNoEvidenceRecoveryAvailableSql()} OR ${progressiveCfdCompletionRetryAvailableSql()} OR ${publicationRecovery} OR ${progressiveCfdMaterialDomainRecoveryAvailableSql("unit")} OR (${ordinaryAttempts} = 2
       AND work.stage = 3 AND unit.policy_version = ${PROGRESSIVE_COMPUTE_POLICY.version}
       AND ${progressiveCfdPreciseVerificationAvailableSql()}) OR (${ordinaryAttempts} = 2
@@ -323,7 +325,7 @@ export async function claimProgressiveCfdUnit(
       AND ${pendingBudgetExtension}))
       OR (work.stage = 3 AND unit.purpose = 'precise' AND unit.attempts < 5
         AND ${pendingBudgetExtension})
-    ) END`;
+    ) END)`;
     const targetFilter = input.sameTarget
       ? sql`generation.id = ${input.sameTarget.generationId} AND work.target_id = ${input.sameTarget.targetId}
           AND ${effectiveRecipe} = ${JSON.stringify(input.sameTarget.recipe)}::jsonb

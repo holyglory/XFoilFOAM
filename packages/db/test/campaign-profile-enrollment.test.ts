@@ -9898,6 +9898,8 @@ describe("bounded progressive numerical recovery", () => {
   it.each([
     { stage: 2, second: false, gate: null },
     { stage: 2, second: true, gate: null },
+    { stage: 3, second: false, gate: null },
+    { stage: 3, second: false, gate: "saved checkpoint" },
     { stage: 3, second: true, gate: null },
     { stage: 3, second: true, gate: "attempt cap" },
     { stage: 3, second: true, gate: "budget" },
@@ -9974,7 +9976,7 @@ describe("bounded progressive numerical recovery", () => {
     const immutable = await readImmutable();
     const history = await db.execute(sql`SELECT * FROM progressive_cfd_attempts
       WHERE unit_id = ${fixture.leases[0].id}::uuid AND token <> ${fixture.leases[0].token}::uuid ORDER BY token`);
-    if (gate) {
+    if (gate === "attempt cap" || gate === "budget") {
       await db.execute(sql`UPDATE progressive_cfd_units
         SET ${gate === "attempt cap" ? sql`attempts = 4` : sql`active_seconds = active_budget_seconds`}
         WHERE id = ${fixture.leases[0].id}::uuid`);
@@ -10017,6 +10019,56 @@ describe("bounded progressive numerical recovery", () => {
     expect(await db.execute(sql`SELECT * FROM progressive_cfd_attempts
       WHERE unit_id = ${fixture.leases[0].id}::uuid AND token NOT IN (
         ${fixture.leases[0].token}::uuid, ${replacement.token}::uuid) ORDER BY token`)).toEqual(history);
+    const fallback = await cfdEvidenceFixture(166, stage, [], [0], false, {
+      campaignId: fixture.campaignId, leases: [replacement],
+    });
+    if (gate === "saved checkpoint") {
+      const source = await fallback.save(replacement.remainingActiveSeconds, "urans", 0, {
+        fidelity: "urans_full",
+        force_history: { t: [0, 1], cl: [0, 0], cd: [0.02, 0.02], cm: [0, 0] },
+      });
+      await db.update(resultAttempts).set({
+        engineCaseSlug: "c1_u166/a0",
+        error: "URANS integration stopped by the wall-clock budget guard",
+        qualityWarnings: ["stopped by the wall-clock budget guard"],
+      }).where(eq(resultAttempts.id, source));
+      await fallback.record([source]);
+      await stopped(fallback);
+      await expect(settleProgressiveCfdExecution(db, fallback.composed.jobId))
+        .resolves.toMatchObject({ retry: 1, complete: 0, gaps: 0 });
+      const [continued] = await claimProgressiveCfdBatch(db, {
+        owner: "material-checkpoint-continuation", leaseSeconds: 120,
+        solverBudgetVersion: 2, allowedSolverFamilies: ["rhoPimpleFoam"],
+        preferredWorkId: replacement.workId,
+      });
+      expect(continued).toMatchObject({
+        id: replacement.id,
+        recoveryPlanId: replacement.recoveryPlanId,
+        budgetExtension: { sourceResultAttemptId: source, engineJobId: fallback.engineJobId, engineCaseSlug: "c1_u166/a0" },
+      });
+      expect(await readImmutable()).toEqual(immutable);
+      return;
+    }
+    await heartbeatProgressiveCfdUnit(db, replacement, { attemptActiveSeconds: 60, leaseSeconds: 120 });
+    await stopped(fallback);
+    await expect(settleProgressiveCfdExecution(db, fallback.composed.jobId))
+      .resolves.toMatchObject({ retry: 0, gaps: 1 });
+    // A material fallback which physically ran can stop before producing
+    // a result row. Generic no-evidence recovery must not run it from scratch.
+    expect(await recoverTerminalProgressiveNoEvidenceGaps(db)).toBe(0);
+    const historicalPending = new Error("roll back historical pending fixture");
+    await expect(db.transaction(async tx => {
+      const c = tx as unknown as DB;
+      await c.execute(sql`UPDATE progressive_work SET state='pending' WHERE id=${replacement.workId}::uuid`);
+      await c.execute(sql`UPDATE progressive_cfd_units SET state='pending' WHERE id=${replacement.id}::uuid`);
+      expect(await claimProgressiveCfdBatch(c, {
+        owner: "material-original-consumed", leaseSeconds: 120,
+        solverBudgetVersion: 2, allowedSolverFamilies: ["rhoPimpleFoam"],
+        preferredWorkId: replacement.workId,
+      })).toEqual([]);
+      throw historicalPending;
+    })).rejects.toBe(historicalPending);
+    expect(await readImmutable()).toEqual(immutable);
   }, 120_000);
 
   it("reopens an evidence-bearing material-domain gap for its existing precise recovery plan", async () => {

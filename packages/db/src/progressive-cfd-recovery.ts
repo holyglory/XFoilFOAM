@@ -10,6 +10,7 @@ import {
   progressiveCfdNoAcceptedHistoryAndSettledSql,
   progressiveCfdOrdinaryAttemptCountSql,
   progressiveCfdCompletionRetryAvailableSql,
+  progressiveCfdMaterialPlanAllowsAttemptSql,
   progressiveCfdPreciseVerificationAvailableSql,
 } from "./progressive-attempt-budget";
 import { progressiveCfdMaterialGapRecoveryAvailableSql, verifyProgressiveCfdMaterialGap } from "./progressive-cfd-material-gap";
@@ -65,7 +66,8 @@ export async function recoverUnboundProgressiveCfdLeases(
     if (!campaign) return receipt;
     const units = await connection.execute(sql`
       SELECT unit.id, unit.lease_token, unit.attempts, unit.active_seconds, unit.active_budget_seconds,
-        ${progressiveCfdOrdinaryAttemptCountSql()} AS ordinary_attempts
+        ${progressiveCfdOrdinaryAttemptCountSql()} AS ordinary_attempts,
+        ${progressiveCfdMaterialPlanAllowsAttemptSql()} AS material_plan_allows_attempt
       FROM progressive_cfd_units unit JOIN progressive_work work ON work.id = unit.work_id
       JOIN progressive_generations generation ON generation.id = work.generation_id
       JOIN progressive_cfd_attempts attempt ON attempt.token = unit.lease_token AND attempt.unit_id = unit.id
@@ -78,6 +80,7 @@ export async function recoverUnboundProgressiveCfdLeases(
     `);
     for (const unit of units) {
       const retry =
+        unit.material_plan_allows_attempt === true &&
         Number(unit.ordinary_attempts) < 2 &&
         Number(unit.active_seconds) < Number(unit.active_budget_seconds);
       const reason = retry
@@ -122,6 +125,7 @@ export async function recoverInactiveProgressiveRemoteGaps(
         AND campaign.status IN ('active', 'attention', 'paused')
         AND unit.state = 'gap'
         AND unit.error = 'Inactive remote delivery has unresolved evidence'
+        AND ${progressiveCfdMaterialPlanAllowsAttemptSql()}
         AND unit.attempts < 3
         AND unit.active_seconds < unit.active_budget_seconds
       ORDER BY unit.id
@@ -318,9 +322,10 @@ export async function recoverTerminalProgressiveNoEvidenceGaps(
         AND ${pendingBudgetExtension}
       )
     )`;
-    const requeueEligible = sql`unit.active_seconds < ${progressiveCfdEffectiveBudgetSql(sql`unit`)}
+    const materialPlanAllowsAttempt = progressiveCfdMaterialPlanAllowsAttemptSql();
+    const requeueEligible = sql`${materialPlanAllowsAttempt} AND unit.active_seconds < ${progressiveCfdEffectiveBudgetSql(sql`unit`)}
       AND (unit.attempts = 3 OR ${attemptAvailable})`;
-    const claimEligible = sql`${attemptAvailable}
+    const claimEligible = sql`${materialPlanAllowsAttempt} AND ${attemptAvailable}
       AND unit.active_seconds < ${progressiveCfdEffectiveBudgetSql(sql`unit`)}`;
     const units = await connection.execute(sql`
       SELECT unit.id, unit.work_id, attempt.token,
