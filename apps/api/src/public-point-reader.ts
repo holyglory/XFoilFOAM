@@ -12,6 +12,8 @@ export interface PointTiming {
   queueMs: number;
   assemblyMs: number;
   handoffMs: number;
+  dispatchMs: number;
+  resultDeliveryMs: number;
   stagesMs: PointReply["trace"]["stagesMs"];
   storage: PointReply["trace"]["storage"];
 }
@@ -20,6 +22,7 @@ interface PendingRead {
   args: PointArguments;
   queuedAt: number;
   sentAt: number;
+  sentNs: bigint;
   releaseQueueWait?: () => void;
   resolve: (v: { detail: Detail; timing: PointTiming }) => void;
   reject: (e: Error) => void;
@@ -61,6 +64,7 @@ export class PublicPointReader {
         this.dispatch();
         return;
       }
+      const receivedNs = process.hrtime.bigint();
       const task = this.current;
       if (!task || task.id !== message.id) {
         this.failed(worker);
@@ -82,6 +86,12 @@ export class PublicPointReader {
             ...message.trace,
             queueMs: Math.round(task.sentAt - task.queuedAt),
             assemblyMs: message.assemblyMs,
+            dispatchMs: Math.round(
+              Number(message.receivedNs - task.sentNs) / 1e6,
+            ),
+            resultDeliveryMs: Math.round(
+              Number(receivedNs - message.returnedNs) / 1e6,
+            ),
             handoffMs: Math.max(0, Math.round(elapsed - message.assemblyMs)),
           },
         });
@@ -104,6 +114,7 @@ export class PublicPointReader {
           args,
           queuedAt: performance.now(),
           sentAt: 0,
+          sentNs: 0n,
           resolve,
           reject,
         };
@@ -138,6 +149,7 @@ export class PublicPointReader {
     this.timer = setTimeout(() => this.failed(worker), 120_000);
     this.timer.unref();
     try {
+      task.sentNs = process.hrtime.bigint();
       worker.postMessage({ id: task.id, args: task.args });
     } catch {
       this.failed(worker);

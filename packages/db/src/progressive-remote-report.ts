@@ -13,6 +13,7 @@ import {
   solverBudgetCaseKey,
 } from "../../engine-client/src/solver-budget";
 import { analysisContentHash, canonicalAnalysisJson } from "./analysis-target";
+import { hashSignedReportValue } from "./progressive-signed-read";
 import { validateProgressiveExecutionStopProof } from "./progressive-cfd-settlement";
 import {
   verifyProgressiveRemoteExecution,
@@ -54,20 +55,32 @@ export function normalizeProgressiveRemoteReportJson<T>(value: T): T {
   return normalize(value, "$") as T;
 }
 
+type ReportPolar = JobResult["polars"][number];
+type ReportPoint = ReportPolar["points"][number];
+function pointIdentity(
+  result: JobResult,
+  polar: ReportPolar,
+  point: ReportPoint,
+) {
+  return {
+    kind: "progressive-reported-point-v1",
+    executionId: result.job_id,
+    chord: polar.chord,
+    speed: polar.speed,
+    reynolds: polar.reynolds,
+    mach: polar.mach ?? null,
+    point,
+  };
+}
+
 export function progressiveReportedPointSources(result: JobResult) {
   const candidates = result.polars.flatMap((polar) =>
     [...polar.points, ...(polar.attempts ?? [])].map((point) => ({
       point,
       polar,
-      contentSignature: analysisContentHash({
-        kind: "progressive-reported-point-v1",
-        executionId: result.job_id,
-        chord: polar.chord,
-        speed: polar.speed,
-        reynolds: polar.reynolds,
-        mach: polar.mach ?? null,
-        point,
-      }),
+      contentSignature: analysisContentHash(
+        pointIdentity(result, polar, point),
+      ),
     })),
   );
   return [
@@ -77,28 +90,40 @@ export function progressiveReportedPointSources(result: JobResult) {
   ];
 }
 
-export function resolveProgressiveReportedPoint(
-  result: JobResult,
-  input: {
-    alpha: number;
-    speed: number;
-    chord: number;
-    caseSlug: string | null;
-  },
-) {
+type PointSelector = {
+  alpha: number;
+  speed: number;
+  chord: number;
+  caseSlug: string | null;
+};
+
+function assertPointSelector(input: PointSelector) {
   if (
     ![input.alpha, input.speed, input.chord].every(Number.isFinite) ||
     input.chord <= 0 ||
     input.speed < 0
   )
     throw new Error("Reported point requires an exact finite physical cell");
-  const candidates = progressiveReportedPointSources(result).filter(
-    ({ polar, point }) =>
-      polar.chord === input.chord &&
-      polar.speed === input.speed &&
-      point.aoa_deg === input.alpha &&
-      (point.case_slug ?? null) === input.caseSlug,
+}
+
+function matchesPoint(
+  polar: ReportPolar,
+  point: ReportPoint,
+  input: PointSelector,
+) {
+  return (
+    polar.chord === input.chord &&
+    polar.speed === input.speed &&
+    point.aoa_deg === input.alpha &&
+    (point.case_slug ?? null) === input.caseSlug
   );
+}
+
+type ReportedSource = ReturnType<
+  typeof progressiveReportedPointSources
+>[number];
+
+function selectUniquePoint(candidates: ReportedSource[]) {
   const unique = new Map(
     candidates.map((candidate) => [candidate.contentSignature, candidate]),
   );
@@ -107,6 +132,39 @@ export function resolveProgressiveReportedPoint(
       "Reported point is missing or has competing source generations",
     );
   return [...unique.values()][0];
+}
+
+export function resolveProgressiveReportedPoint(
+  result: JobResult,
+  input: PointSelector,
+) {
+  assertPointSelector(input);
+  return selectUniquePoint(
+    progressiveReportedPointSources(result).filter(({ polar, point }) =>
+      matchesPoint(polar, point, input),
+    ),
+  );
+}
+
+/** The entire report has already been authenticated. Only matching members
+ * can compete for this physical cell, including entries in attempts. */
+export async function resolveValidatedProgressivePoint(
+  result: JobResult,
+  input: PointSelector,
+) {
+  assertPointSelector(input);
+  const candidates: ReportedSource[] = [];
+  for (const polar of result.polars) {
+    for (const point of [...polar.points, ...(polar.attempts ?? [])]) {
+      if (matchesPoint(polar, point, input)) {
+        const contentSignature = await hashSignedReportValue(
+          pointIdentity(result, polar, point),
+        );
+        candidates.push({ point, polar, contentSignature });
+      }
+    }
+  }
+  return selectUniquePoint(candidates);
 }
 
 export function isFinalProgressiveRemoteReport(
@@ -209,10 +267,7 @@ function hasNoSolverProgress(value: unknown): boolean {
   );
 }
 
-export function validateProgressiveRemoteReport(
-  value: unknown,
-  assignment: ProgressiveRemoteExecutionEnvelope,
-): { report: ProgressiveRemoteReport; contentSignature: string } {
+function assertReportFields(value: unknown, assignment: ProgressiveRemoteExecutionEnvelope) {
   const envelope = verifyProgressiveRemoteExecution(assignment, {
     solverId: assignment.solverId,
     promiseId: assignment.promiseId,
@@ -486,6 +541,24 @@ export function validateProgressiveRemoteReport(
         "A never-started remote execution cannot contain calculated evidence",
       );
   }
+}
+
+export async function validateStoredProgressiveReport(
+  value: unknown,
+  assignment: ProgressiveRemoteExecutionEnvelope,
+) {
+  const fragments: string[] = [];
+  const contentSignature = await hashSignedReportValue(value, fragments);
+  const report = JSON.parse(fragments.join("")) as ProgressiveRemoteReport;
+  assertReportFields(report, assignment);
+  return { report, contentSignature };
+}
+
+export function validateProgressiveRemoteReport(
+  value: unknown,
+  assignment: ProgressiveRemoteExecutionEnvelope,
+): { report: ProgressiveRemoteReport; contentSignature: string } {
+  assertReportFields(value, assignment);
   const report = JSON.parse(
     canonicalAnalysisJson(value),
   ) as ProgressiveRemoteReport;

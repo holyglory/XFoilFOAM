@@ -509,6 +509,11 @@ describe("public exact-generation reads", () => {
       const completed = await isolated;
       expect(completed.detail?.resultId).toBe(resultId);
       expect(completed.timing.handoffMs).toBeGreaterThan(150);
+      const { dispatchMs, resultDeliveryMs, handoffMs } = completed.timing;
+      expect(dispatchMs).toBeGreaterThanOrEqual(0);
+      expect(resultDeliveryMs).toBeGreaterThanOrEqual(0);
+      expect(dispatchMs + resultDeliveryMs).toBeGreaterThan(150);
+      expect(dispatchMs + resultDeliveryMs).toBeLessThanOrEqual(handoffMs + 2);
     } finally {
       serving.server.closeAllConnections();
       await serving.close();

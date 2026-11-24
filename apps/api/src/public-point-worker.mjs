@@ -18,10 +18,14 @@ if (session?.readonly !== "on")
   throw new Error("Public point reader requires its read-only connection");
 observePointStorage();
 parentPort.on("message", async ({ id, args }) => {
+  const receivedNs = process.hrtime.bigint();
   try {
+    const report = await timePointRead(() => assembleSim(...args));
     parentPort.postMessage({
       id,
-      ...(await timePointRead(() => assembleSim(...args))),
+      ...report,
+      receivedNs,
+      returnedNs: process.hrtime.bigint(),
     });
   } catch (error) {
     const status = error?.statusCode;

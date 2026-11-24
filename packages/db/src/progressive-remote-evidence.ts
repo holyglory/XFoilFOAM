@@ -9,7 +9,8 @@ import type { DB } from "./client";
 import { verifyProgressiveRemoteExecution } from "./progressive-remote-execution";
 import {
   resolveProgressiveReportedPoint,
-  validateProgressiveRemoteReport,
+  resolveValidatedProgressivePoint,
+  validateStoredProgressiveReport,
   type ProgressiveRemoteReport,
 } from "./progressive-remote-report";
 
@@ -39,13 +40,29 @@ type PointSource = ReturnType<typeof resolveProgressiveReportedPoint> & {
 type VerifiedMember = NonNullable<
   ReturnType<typeof verifiedProgressiveReportMember>
 >;
+interface PreparedSource {
+  source: PointSource;
+  signature: string;
+  storage: { member: VerifiedMember } | { version: string };
+}
 const preparedReports = new WeakMap<
   ProgressiveRemoteEvidenceReference,
-  {
-    report: ProgressiveRemoteReport;
-    member?: { proof: VerifiedMember; source: PointSource };
-  }
+  PreparedSource
 >();
+
+// Replacements of a warm report (including normalization or archival) must
+// prepare again. A normalized result is itself immutable and content-addressed.
+const rowVersion = sql`concat(tableoid::text, '/', xmin::text, '/', ctid::text)`;
+
+async function stillStored(db: DB, prepared: PreparedSource) {
+  if ("member" in prepared.storage)
+    return recheckRemoteReportMember(db, prepared.storage.member);
+  const report = prepared.source.report;
+  const [row] = await db.execute(sql`SELECT 1 FROM progressive_remote_reports
+    WHERE sim_job_id=${report.executionId}::uuid AND sequence=${report.sequence}
+      AND content_signature=${prepared.signature} AND ${rowVersion}=${prepared.storage.version}`);
+  return Boolean(row);
+}
 
 export function prepareProgressiveRemoteEvidence(db: DB, input: EvidenceInput) {
   if (input.progressiveEvidence)
@@ -106,19 +123,19 @@ async function resolveEvidence(
     contentSignature: String(assigned.content_signature),
   });
   const prepared = preparedReports.get(reference);
-  if (prepared?.member) {
-    const { proof, source } = prepared.member;
+  if (prepared) {
+    const { source } = prepared;
     if (
       source.report.assignmentSignature !== envelope.contentSignature ||
       source.report.solverId !== input.solverId ||
       source.report.promiseId !== input.promiseId ||
-      proof.identity.executionId !== input.engineJobId ||
-      proof.identity.sequence !== reference.sequence ||
-      proof.identity.signature !== reference.reportContentSignature ||
+      source.report.executionId !== input.engineJobId ||
+      source.report.sequence !== reference.sequence ||
+      prepared.signature !== reference.reportContentSignature ||
       source.contentSignature !== reference.pointContentSignature ||
       source.point.aoa_deg !== input.aoaDeg ||
       (source.point.case_slug ?? null) !== input.engineCaseSlug ||
-      !(await recheckRemoteReportMember(db, proof))
+      !(await stillStored(db, prepared))
     )
       throw new ProgressiveRemoteEvidenceConflict(
         "Prepared point owner or exact signed report source changed",
@@ -126,23 +143,29 @@ async function resolveEvidence(
     return { ...source, envelope };
   }
   const [stored] =
-    await db.execute(sql`SELECT ${prepared ? sql`NULL::jsonb` : sql`resolve_progressive_report(to_jsonb(progressive_remote_reports.*))`} AS report, content_signature FROM progressive_remote_reports
+    await db.execute(sql`SELECT resolve_progressive_report(to_jsonb(progressive_remote_reports.*)) AS report,
+    content_signature, ${rowVersion} AS source_version FROM progressive_remote_reports
     WHERE sim_job_id = ${input.engineJobId}::uuid AND sequence = ${reference.sequence}`);
   if (!stored)
     throw new ProgressiveRemoteEvidenceConflict(
       "Progressive evidence report has not reached the hub",
     );
-  const report =
-    prepared?.report ??
-    (await resolveStoredProgressiveReport(
-      db,
-      "remote",
-      stored,
-      input.engineJobId,
-      prepare ? { solverId: envelope.solverId, promiseId: envelope.promiseId, assignmentSignature: envelope.contentSignature } : undefined,
-    ));
-  const validated = validateProgressiveRemoteReport(report, envelope);
+  const report = await resolveStoredProgressiveReport(
+    db,
+    "remote",
+    stored,
+    input.engineJobId,
+    prepare
+      ? {
+          solverId: envelope.solverId,
+          promiseId: envelope.promiseId,
+          assignmentSignature: envelope.contentSignature,
+        }
+      : undefined,
+  );
+  const validated = await validateStoredProgressiveReport(report, envelope);
   if (
+    validated.report.sequence !== reference.sequence ||
     validated.contentSignature !== stored.content_signature ||
     validated.contentSignature !== reference.reportContentSignature ||
     !validated.report.result
@@ -152,7 +175,7 @@ async function resolveEvidence(
     );
   let source: ReturnType<typeof resolveProgressiveReportedPoint>;
   try {
-    source = resolveProgressiveReportedPoint(validated.report.result, {
+    source = await resolveValidatedProgressivePoint(validated.report.result, {
       alpha: input.aoaDeg,
       caseSlug: input.engineCaseSlug,
       speed: envelope.request.speeds![0],
@@ -169,22 +192,18 @@ async function resolveEvidence(
     );
   const selected = { ...source, envelope, report: validated.report };
   if (prepare) {
-    const proof = verifiedProgressiveReportMember(report);
-    if (proof) {
-      if (!(await recheckRemoteReportMember(db, proof)))
-        throw new ProgressiveRemoteEvidenceConflict(
-          "Archived signed report changed during preparation",
-        );
-      // Consumers retain the same point and polar objects as the verified report.
-      // Freeze before sharing them across checks inside this one import.
-      freezeProgressiveReport(validated.report);
-      preparedReports.set(reference, {
-        report: validated.report,
-        member: { proof, source: { ...selected } },
-      });
-    } else {
-      preparedReports.set(reference, { report: validated.report });
-    }
+    const member = verifiedProgressiveReportMember(report);
+    const candidate: PreparedSource = {
+      source: { ...selected },
+      signature: validated.contentSignature,
+      storage: member ? { member } : { version: String(stored.source_version) },
+    };
+    if (!(await stillStored(db, candidate)))
+      throw new ProgressiveRemoteEvidenceConflict(
+        "Signed report changed during preparation",
+      );
+    freezeProgressiveReport(validated.report);
+    preparedReports.set(reference, candidate);
   }
   return selected;
 }

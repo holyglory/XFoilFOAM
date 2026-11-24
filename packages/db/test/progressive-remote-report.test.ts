@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { setImmediate } from "node:timers/promises";
 import { describe, expect, it } from "vitest";
 import { OPENCFD_2606_ENGINE } from "../../engine-client/src/engine-identity";
 import type { ProgressiveExecutionScope } from "../../engine-client/src/progressive-execution";
@@ -12,6 +13,9 @@ import {
 import { analysisContentHash } from "../src/analysis-target";
 import {
   isFinalProgressiveRemoteReport,
+  resolveProgressiveReportedPoint,
+  resolveValidatedProgressivePoint,
+  validateStoredProgressiveReport,
   normalizeProgressiveRemoteReportJson,
   validateProgressiveRemoteReportOrder,
   validateProgressiveRemoteReport,
@@ -501,6 +505,62 @@ describe("remote progressive incremental report validation", () => {
     );
     report.result!.polars[0].attempts![0].cl = 999;
     expect(validated.report.result!.polars[0].attempts![0].cl).toBe(0.4);
+  });
+
+  it("authenticates a retained manifest while queued callbacks run and rejects competing point generations", async () => {
+    const { assignment, report } = fixture();
+    const result = report.result!;
+    const polar = result.polars[0];
+    const point = polar.attempts![0];
+    point.evidence_artifacts = Array.from({ length: 1024 }, (_, index) => ({
+      kind: "log",
+      path: `case/log.${index}`,
+      mime_type: "text/plain",
+      sha256: "a".repeat(64),
+      byte_size: index,
+      metadata: {
+        "10": false,
+        "2": null,
+        é: "\u0000",
+        "e\u0301": ["\ud800", -0, 0.0000001, "🌀"],
+      },
+    }));
+    const expected = validateProgressiveRemoteReport(report, assignment);
+    let serviced = false;
+    const waiting = setImmediate().then(() => {
+      serviced = true;
+    });
+    const actual = await validateStoredProgressiveReport(report, assignment);
+    expect(serviced).toBe(true);
+    await waiting;
+    expect(actual).toEqual(expected);
+    const selector = {
+      chord: polar.chord,
+      speed: polar.speed,
+      alpha: point.aoa_deg,
+      caseSlug: point.case_slug ?? null,
+    };
+    expect(await resolveValidatedProgressivePoint(result, selector)).toEqual(
+      resolveProgressiveReportedPoint(result, selector),
+    );
+    polar.points.push(structuredClone(point));
+    expect(
+      (await resolveValidatedProgressivePoint(result, selector)).point,
+    ).toBe(point);
+    polar.points[0].cl = 0.9;
+    await expect(
+      resolveValidatedProgressivePoint(result, selector),
+    ).rejects.toThrow("competing source generations");
+    await expect(
+      resolveValidatedProgressivePoint(result, {
+        ...selector,
+        alpha: selector.alpha + 0.25,
+      }),
+    ).rejects.toThrow("missing");
+    point.cl = Number.NaN;
+    await expect(
+      validateStoredProgressiveReport(report, assignment),
+    ).rejects.toThrow();
   });
 
   it("allows overrun measurements but never increases the granted allocation", () => {

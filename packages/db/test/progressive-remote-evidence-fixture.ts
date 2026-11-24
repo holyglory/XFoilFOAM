@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { sql } from "drizzle-orm";
 import { verifyProgressiveRemoteEvidenceReceipt } from "./progressive-remote-evidence-receipt-fixture";
 import { verifyProgressivePolarImport } from "../../../apps/api/test/progressive-polar-import-fixture";
 import { expect } from "vitest";
@@ -11,6 +12,7 @@ import {
 import type { ProgressiveRemoteExecutionEnvelope } from "../src/progressive-remote-execution";
 import {
   assertProgressiveReportedManifest,
+  prepareProgressiveRemoteEvidence,
   resolveProgressiveRemoteEvidence,
 } from "../src/progressive-remote-evidence";
 import {
@@ -96,6 +98,52 @@ export async function verifyProgressiveRemoteEvidenceSource(
   const resolved = await resolveProgressiveRemoteEvidence(db, input);
   expect(resolved?.point).toEqual(source.point);
   expect(resolved?.report).toEqual(report);
+  const preparing = { ...input, progressiveEvidence: { ...input.progressiveEvidence } };
+  const prepared = await prepareProgressiveRemoteEvidence(db, preparing);
+  expect(prepared?.point).toEqual(source.point);
+  expect(Object.isFrozen(prepared!.point)).toBe(true);
+  expect((await resolveProgressiveRemoteEvidence(db, preparing))?.point).toBe(
+    prepared!.point,
+  );
+  await expect(
+    resolveProgressiveRemoteEvidence(db, {
+      ...preparing,
+      engineCaseSlug: "another-case",
+    }),
+  ).rejects.toThrow();
+  await expect(
+    resolveProgressiveRemoteEvidence(db, { ...preparing, solverId: randomUUID() }),
+  ).rejects.toThrow();
+  await db.transaction(async (tx) => {
+    const connection = tx as unknown as DB;
+    // A copy with the same identifiers and a changed body must invalidate
+    // the prepared proof even when its signature column has not changed.
+    await tx.execute(sql`CREATE TEMP TABLE progressive_remote_reports ON COMMIT DROP AS
+      SELECT * FROM public.progressive_remote_reports WHERE sim_job_id=${input.engineJobId}::uuid AND sequence=${report.sequence}`);
+    await expect(
+      resolveProgressiveRemoteEvidence(connection, preparing),
+    ).rejects.toThrow("source changed");
+    const local = {
+      ...input,
+      progressiveEvidence: { ...input.progressiveEvidence },
+    };
+    expect(
+      (await prepareProgressiveRemoteEvidence(connection, local))?.point,
+    ).toEqual(source.point);
+    await tx.execute(
+      sql`UPDATE progressive_remote_reports SET report=jsonb_set(report, '{status,detail}', '"changed"'::jsonb)`,
+    );
+    await expect(
+      resolveProgressiveRemoteEvidence(connection, local),
+    ).rejects.toThrow("source changed");
+    await expect(
+      prepareProgressiveRemoteEvidence(connection, local),
+    ).rejects.toThrow("stored report");
+    await tx.execute(sql`DELETE FROM progressive_remote_reports`);
+    await expect(
+      prepareProgressiveRemoteEvidence(connection, local),
+    ).rejects.toThrow("has not reached the hub");
+  });
   expect(() =>
     assertProgressiveReportedManifest(resolved!, {
       manifestSha256: progressiveArchiveManifestSha256,

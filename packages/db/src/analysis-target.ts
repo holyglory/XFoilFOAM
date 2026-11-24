@@ -19,6 +19,12 @@ export interface TransitionAssumptions {
   lower: number;
 }
 
+export function canonicalAnalysisEntries(value: object) {
+  return Object.entries(value).sort(([left], [right]) =>
+    left.localeCompare(right, "en"),
+  );
+}
+
 export function canonicalAnalysisJson(value: unknown): string {
   if (value === null || typeof value === "boolean" || typeof value === "string")
     return JSON.stringify(value);
@@ -27,8 +33,7 @@ export function canonicalAnalysisJson(value: unknown): string {
   if (Array.isArray(value))
     return `[${value.map(canonicalAnalysisJson).join(",")}]`;
   if (typeof value === "object" && value !== null)
-    return `{${Object.entries(value)
-      .sort(([left], [right]) => left.localeCompare(right, "en"))
+    return `{${canonicalAnalysisEntries(value)
       .map(
         ([key, item]) =>
           `${JSON.stringify(key)}:${canonicalAnalysisJson(item)}`,
