@@ -36,6 +36,7 @@ import { env } from "../../../apps/api/src/env";
 import {
   restoreAttemptEvidence,
   setAttemptEvidenceStoragePolicy,
+  setShortAttemptProofPolicy,
 } from "../src/attempt-evidence-projection";
 import { archiveAttemptEvidence } from "../../../apps/sweeper/src/attempt-evidence-service";
 import {
@@ -235,6 +236,7 @@ export async function bindReceiptBearingSignedArchive(
 export async function verifyReceiptBearingSignedTransition(
   db: DB,
   delivery: ProgressiveRemoteEvidenceDelivery & { resultAttemptId: string },
+  shortReceipt = false,
 ) {
   const id = delivery.resultAttemptId;
   const [raw] =
@@ -265,6 +267,7 @@ export async function verifyReceiptBearingSignedTransition(
       canaryAttemptId: id,
       consumerContractVersion: 1,
     });
+    if (shortReceipt) await setShortAttemptProofPolicy(db, true, id, "tiny-history");
     const before = await readProgressiveRemoteRetention(
       db,
       delivery.engineJobId,
@@ -275,6 +278,14 @@ export async function verifyReceiptBearingSignedTransition(
       { ...(await configuredAttemptEvidenceSettlementDependencies(db)), store },
       { attemptId: id, archiveId: archive.id },
     );
+    const [event] = await db.execute(sql`SELECT e.verification?'shortReceipt' AS packed,
+      e.verification#>'{dependencies,progressiveScope,remote}' IS NOT NULL AS inline_remote,
+      v.verification#>>'{dependencies,progressiveScope,remote,pointContentSignature}' AS point
+      FROM result_attempts a JOIN attempt_evidence_storage_events e ON e.id=a.evidence_storage_event_id
+        AND e.archive_id=a.evidence_archive_id AND e.result_attempt_id=a.id
+      JOIN attempt_evidence_read_events v ON v.id=e.id WHERE a.id=${id}::uuid`);
+    expect(event).toMatchObject({ packed: shortReceipt, inline_remote: !shortReceipt,
+      point: delivery.progressiveEvidence.pointContentSignature });
     await verifyReceiptBearingSignedReplay(db, delivery, store);
     await db.transaction(async (tx) => {
       await tx.execute(sql`SET TRANSACTION READ ONLY`);

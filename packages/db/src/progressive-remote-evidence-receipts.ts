@@ -1,3 +1,4 @@
+import { readAttemptEventDependencies } from "./attempt-evidence-proof-reader";
 import { isProgressiveReceiptVerifier } from "./attempt-receipt-verification";
 import { eq, is, sql } from "drizzle-orm";
 import { PgTransaction } from "drizzle-orm/pg-core";
@@ -151,6 +152,8 @@ async function assertSignedStorageBinding(
   const { source, receipt, receiptSignature } = observed;
   if (
     !receipt ||
+    !pin.archiveId ||
+    !pin.storageEventId ||
     receipt.resultAttemptId !== pin.attemptId ||
     receipt.resultId !== pin.resultId ||
     pin.originalSimJobId !== input.engineJobId
@@ -160,7 +163,7 @@ async function assertSignedStorageBinding(
     );
   const [binding] =
     await db.execute(sql`SELECT e.verification#>>'{dependencies,verifier}' AS verifier,
-      e.verification#>'{dependencies,progressiveScope}' AS scope
+      e.verification#>'{dependencies,progressiveScope}' AS scope, e.verification?'shortReceipt' AS packed
     FROM attempt_evidence_storage_events e JOIN progressive_remote_report_sources s
       ON s.sim_job_id=${input.engineJobId}::uuid AND s.sequence=${receipt.sequence}
       AND s.point_content_signature=${receipt.pointContentSignature} AND s.aoa_deg=${input.aoaDeg}
@@ -172,7 +175,14 @@ async function assertSignedStorageBinding(
       "Original source inventory or storage event is missing",
     );
   if (isProgressiveReceiptVerifier(binding.verifier)) {
-    const scope = binding.scope as {
+    // The short receipt keeps the remote binding in its archive-bound packed
+    // fields. All of the original signature and scientific comparisons below
+    // run against the same full scope as an ordinary receipt.
+    const dependencies = binding.packed === true
+      ? (await readAttemptEventDependencies(db, pin.storageEventId, pin.attemptId, pin.archiveId)) as
+          { progressiveScope?: unknown } | undefined
+      : undefined;
+    const scope = (binding.packed === true ? dependencies?.progressiveScope : binding.scope) as {
       scientific?: { attemptToken: string; applicationSha256: string } | null;
       remote?: Record<string, unknown> | null;
     } | null;

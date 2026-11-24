@@ -11993,7 +11993,7 @@ describe("progressive CFD evidence accounting", () => {
     const priorRole = process.env.AIRFOILFOAM_DEPLOYMENT_ROLE;
     process.env.AIRFOILFOAM_DEPLOYMENT_ROLE = "hub";
     try {
-      await withHistoryDatabaseCopy(async (connection) => {
+      for (const shortReceipt of [false, true]) await withHistoryDatabaseCopy(async (connection) => {
         const { stoppedHistoryFixture } = await import("./progressive-stopped-history-fixture");
         const { bindReceiptBearingSignedArchive, verifyReceiptBearingSignedTransition } = await import("./receipt-bearing-signed-replay-fixture");
         const solverId = randomUUID();
@@ -12001,7 +12001,7 @@ describe("progressive CFD evidence accounting", () => {
         await connection.execute(sql`INSERT INTO registered_remote_solvers(id,instance_id,instance_name,cpu_capacity,cpu_budget,max_active_polar_promises,auth_token_hash)
           VALUES (${solverId}::uuid,${randomUUID()},'signed history fixture',96,96,96,${analysisContentHash(randomUUID())})`);
         const { delivery } = await prepareStorageRecoveryProbeFixture(
-          connection, fixture, solverId, stoppedHistoryFixture(), bindReceiptBearingSignedArchive,
+          connection, fixture, solverId, stoppedHistoryFixture(shortReceipt ? 14 : 1500), bindReceiptBearingSignedArchive,
         );
         const [campaignRow] = await connection.execute(sql`SELECT current_plan_revision_id FROM sim_campaigns WHERE id=${fixture.campaignId}::uuid`);
         const lease = fixture.leases[0]!;
@@ -12010,7 +12010,7 @@ describe("progressive CFD evidence accounting", () => {
           planRevisionId: String(campaignRow.current_plan_revision_id), stage: 2,
         }, { limit: 1 });
         expect(recovery).toMatchObject({ selected: 1, linked: 1, errors: 0 });
-        await verifyReceiptBearingSignedTransition(connection, delivery);
+        await verifyReceiptBearingSignedTransition(connection, delivery, shortReceipt);
       });
     } finally {
       if (priorRole === undefined) delete process.env.AIRFOILFOAM_DEPLOYMENT_ROLE;
