@@ -10,7 +10,9 @@ import { PgDialect } from "drizzle-orm/pg-core";
 import type { SQL } from "drizzle-orm";
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
+import fs from "node:fs";
 import {
+  mkdir,
   mkdtemp,
   readFile,
   readdir,
@@ -20,8 +22,8 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { Readable } from "node:stream";
+import { basename, dirname, join } from "node:path";
+import { PassThrough, Readable } from "node:stream";
 import { fileURLToPath } from "node:url";
 import { gzipSync } from "node:zlib";
 import { afterEach, expect, it, vi } from "vitest";
@@ -42,6 +44,11 @@ import {
   releaseUpstreamReadableVolume,
   runWorkerVolumeCleanup,
 } from "../src/worker-report-volume-cleanup";
+
+vi.mock("node:crypto", async (loadOriginal) => {
+  const actual = await loadOriginal<typeof import("node:crypto")>();
+  return { ...actual, randomUUID: vi.fn(actual.randomUUID) };
+});
 
 const directories: string[] = [];
 const cli = fileURLToPath(
@@ -441,7 +448,7 @@ it("persists one exact compressed file and reuses a verified same-content copy w
   expect(files.some((file) => file.includes(".pending-"))).toBe(false);
 });
 
-it.each(["truncated", "wrong-hash", "extra-bytes", "late-stream-error"])(
+it.each(["truncated", "wrong-hash", "extra-bytes"])(
   "refuses %s input without installing a false copy or deleting the original",
   async (kind) => {
     const f = await fixture();
@@ -449,21 +456,13 @@ it.each(["truncated", "wrong-hash", "extra-bytes", "late-stream-error"])(
       kind === "wrong-hash"
         ? { ...f.archive, storedSha256: "0".repeat(64) }
         : f.archive;
-    const stream =
-      kind === "late-stream-error"
-        ? Readable.from(
-            (async function* () {
-              yield f.bytes;
-              throw new Error("late source read failure");
-            })(),
-          )
-        : Readable.from([
-            kind === "truncated"
-              ? f.bytes.subarray(0, -1)
-              : kind === "extra-bytes"
-                ? Buffer.concat([f.bytes, Buffer.from([1])])
-                : f.bytes,
-          ]);
+    const stream = Readable.from([
+      kind === "truncated"
+        ? f.bytes.subarray(0, -1)
+        : kind === "extra-bytes"
+          ? Buffer.concat([f.bytes, Buffer.from([1])])
+          : f.bytes,
+    ]);
     await expect(storeWorkerReportVolume(stream, identity)).rejects.toThrow();
     expect(await readWorkerReportVolume(identity)).toBeNull();
     expect(await readFile(f.sourcePath)).toEqual(f.bytes);
@@ -474,6 +473,63 @@ it.each(["truncated", "wrong-hash", "extra-bytes", "late-stream-error"])(
     ).toBe(false);
   },
 );
+
+it("closes and removes its pending file on a late source error during a lazy stream open", async () => {
+  const f = await fixture();
+  const shard = dirname(f.target);
+  const originalOpen = fs.open;
+  let releaseOpen!: () => void;
+  const sourceFailed = new Promise<void>((resolve) => { releaseOpen = resolve; });
+  // Hold the path-based WriteStream open until after the producer fails. An
+  // explicitly opened FileHandle already exists when its producer is pulled.
+  vi.spyOn(fs, "open").mockImplementation(((...args: Parameters<typeof fs.open>) => {
+    if (basename(String(args[0])).startsWith(".pending-")) {
+      void sourceFailed.then(() => originalOpen(...args));
+    } else {
+      originalOpen(...args);
+    }
+  }) as typeof fs.open);
+  let pendingAtFirstRead: string[] = [];
+  const source = Readable.from((async function* () {
+    pendingAtFirstRead = fs.readdirSync(shard).filter(name => name.startsWith(".pending-"));
+    yield f.bytes;
+    throw new Error("late source read failure");
+  })());
+  source.once("error", () => releaseOpen());
+  try {
+    await expect(storeWorkerReportVolume(source, f.archive)).rejects.toThrow("late source read failure");
+  } finally {
+    releaseOpen();
+  }
+  expect(pendingAtFirstRead).toHaveLength(1);
+  expect(await readdir(shard)).toEqual([]);
+  expect(await readWorkerReportVolume(f.archive)).toBeNull();
+  expect(await readFile(f.sourcePath)).toEqual(f.bytes);
+});
+
+it("preserves another owner's pending file when the exclusive open fails", async () => {
+  const f = await fixture();
+  const id = randomUUID();
+  const shard = dirname(f.target);
+  const pending = join(shard, ".pending-" + id);
+  await mkdir(shard, { recursive: true });
+  await writeFile(pending, "existing upload", { flag: "wx" });
+  vi.mocked(randomUUID).mockReturnValueOnce(id);
+  await expect(storeWorkerReportVolume(Readable.from([f.bytes]), f.archive)).rejects.toMatchObject({ code: "EEXIST" });
+  expect(await readFile(pending, "utf8")).toBe("existing upload");
+  expect(await readWorkerReportVolume(f.archive)).toBeNull();
+  expect(await readFile(f.sourcePath)).toEqual(f.bytes);
+});
+
+it("observes a producer failure during filesystem setup and finishes cleanup before rejecting", async () => {
+  const f = await fixture();
+  const source = new PassThrough();
+  const writing = storeWorkerReportVolume(source, f.archive);
+  source.destroy(new Error("source disconnected before first read"));
+  await expect(writing).rejects.toThrow("source disconnected before first read");
+  expect(await readdir(dirname(f.target))).toEqual([]);
+  expect(await readWorkerReportVolume(f.archive)).toBeNull();
+});
 
 it.each(["truncated", "same-size-corruption"])(
   "refuses reuse and broker reads of an existing %s file without replacing or masking it",

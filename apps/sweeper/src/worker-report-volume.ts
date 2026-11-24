@@ -1,8 +1,8 @@
-import { constants, createReadStream, createWriteStream } from "node:fs";
+import { constants, createReadStream } from "node:fs";
 import { link, lstat, mkdir, open, opendir, realpath, unlink } from "node:fs/promises";
 import { createHash, randomUUID } from "node:crypto";
 import { dirname, isAbsolute, join, resolve } from "node:path";
-import { Readable, Transform } from "node:stream";
+import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 
 export interface WorkerVolumeIdentity {
@@ -67,35 +67,31 @@ export async function readWorkerReportVolume(
   }
 }
 
-function hashStream(identity: WorkerVolumeIdentity) {
-  const hash = createHash("sha256");
-  let size = 0;
-  return new Transform({
-    transform(raw: Buffer, _encoding, done) {
-      size += raw.length;
-      if (size > identity.storedByteSize)
-        return done(new Error("Worker report exceeded its GCS size"));
-      hash.update(raw);
-      done(null, raw);
-    },
-    flush(done) {
-      done(
-        size === identity.storedByteSize &&
-          hash.digest("hex") === identity.storedSha256
-          ? undefined
-          : new Error("Worker report differs from the verified GCS bytes"),
-      );
-    },
-  });
-}
-
-// A worker unable to fetch evidence from its hub still needs its own original
-// history. Keep one compressed file per exact object on its persistent volume.
+// Observe source errors during filesystem setup. The destination pulls its
+// first chunk only after it owns the exclusive pending file.
 export async function storeWorkerReportVolume(
   source: Readable,
   identity: WorkerVolumeIdentity,
   root = process.env.AIRFOILFOAM_REPORT_VOLUME_DIR || defaultDirectory,
 ): Promise<void> {
+  let installation: Promise<void> | undefined;
+  try {
+    await pipeline(source, (chunks: AsyncIterable<Buffer>) => {
+      installation = installWorkerReportVolume(chunks, identity, root);
+      return installation;
+    });
+  } finally {
+    // Pipeline can reject on a producer error while its async destination
+    // is still writing or removing the pending file.
+    await installation;
+  }
+}
+
+async function installWorkerReportVolume(
+  chunks: AsyncIterable<Buffer>,
+  identity: WorkerVolumeIdentity,
+  root: string,
+) {
   const target = location(identity, root);
   const shard = dirname(target);
   const created = await mkdir(shard, { recursive: true, mode: 0o700 });
@@ -109,14 +105,21 @@ export async function storeWorkerReportVolume(
     }
   }
   const temp = join(shard, ".pending-" + randomUUID());
+  const file = await open(temp, "wx", 0o600);
   try {
-    await pipeline(
-      source,
-      hashStream(identity),
-      createWriteStream(temp, { flags: "wx", mode: 0o600 }),
-    );
-    const file = await open(temp, constants.O_RDONLY | constants.O_NOFOLLOW);
     try {
+      const hash = createHash("sha256");
+      let size = 0;
+      for await (const chunk of chunks) {
+        const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+        size += bytes.length;
+        if (size > identity.storedByteSize)
+          throw new Error("Worker report exceeded its GCS size");
+        hash.update(bytes);
+        await file.writeFile(bytes);
+      }
+      if (size !== identity.storedByteSize || hash.digest("hex") !== identity.storedSha256)
+        throw new Error("Worker report differs from the verified GCS bytes");
       await file.sync();
     } finally {
       await file.close();
@@ -126,7 +129,6 @@ export async function storeWorkerReportVolume(
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
     }
-    await syncDirectory(shard);
     const installed = await readWorkerReportVolume(identity, root);
     if (!installed) throw new Error("Installed worker report is missing");
     const hash = createHash("sha256");
@@ -142,9 +144,8 @@ export async function storeWorkerReportVolume(
     )
       throw new Error("Installed worker report failed exact readback");
   } finally {
-    await unlink(temp).catch((error: NodeJS.ErrnoException) => {
-      if (error.code !== "ENOENT") throw error;
-    });
+    await unlink(temp);
+    await syncDirectory(shard);
   }
 }
 
