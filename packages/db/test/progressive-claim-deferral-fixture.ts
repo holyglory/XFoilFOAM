@@ -60,41 +60,56 @@ export async function verifyProgressiveClaimDeferral(
   );
   const submit = vi.fn();
   try {
-    if (mode === "remote") {
-      const capability = {
-        version: 1,
-        solverBudgetVersion: 2,
-        meshRecoveryVersion: 1,
-        uransRecoveryVersion: 14,
-        engine: composed.request.expected_engine,
-        executionPools: [composed.request.expected_execution_pool],
-      };
-      await db.execute(
-        sql`UPDATE sync_api_settings SET enabled=true,remote_solver_enabled=false WHERE id=1`,
-      );
-      await db.execute(
-        sql`UPDATE sync_api_permissions SET can_fetch=true WHERE data_type='sweeps'`,
-      );
-      await db.execute(sql`INSERT INTO registered_remote_solvers(id,instance_id,instance_name,cpu_capacity,cpu_budget,max_active_polar_promises,
-        auth_token_hash,credential_version,last_heartbeat_at,metadata)
-        VALUES(${solverId}::uuid,${randomUUID()},'isolated contention worker',2,2,4,${"a".repeat(64)},1,clock_timestamp(),
-          ${JSON.stringify({ progressiveExecution: capability, progressiveExecutionObservedAt: new Date().toISOString() })}::jsonb)`);
-      expect(
-        await prepareProgressiveRemoteDispatch(db, solverId),
-      ).toMatchObject({ kind: "waiting", deferredUnits: leases.length });
-    } else {
-      expect(
-        await admitProgressiveCfdBatch(
-          db,
-          { submitPolar: submit } as unknown as EngineClient,
-          {
-            meshRecoveryVersion: 1,
-            uransRecoveryVersion: 14,
-            solverBudgetVersion: 2,
-          },
-        ),
-      ).toEqual({ kind: "deferred", units: leases.length });
-    }
+    await db.transaction(async (raw) => {
+      const connection = raw as unknown as DB;
+      // Untouched initial anchors normally precede a retried target. Observe
+      // the owned-cell refusal first, then release those siblings to verify
+      // that real independent work can still be composed.
+      const siblings = await connection.execute(sql`WITH old AS MATERIALIZED (
+        SELECT u.id,u.retry_after::text AS original FROM progressive_cfd_units u JOIN progressive_work w ON w.id=u.work_id
+        WHERE w.generation_id=${scope.generationId}::uuid AND w.target_id<>${leases[0].targetId} AND w.stage=${leases[0].stage}
+          AND u.state='pending' FOR UPDATE OF u)
+        UPDATE progressive_cfd_units u SET retry_after=clock_timestamp()+interval '1 hour' FROM old
+        WHERE u.id=old.id RETURNING u.id,old.original`);
+      expect(siblings.length).toBeGreaterThan(0);
+      if (mode === "remote") {
+        const capability = {
+          version: 1,
+          solverBudgetVersion: 2,
+          meshRecoveryVersion: 1,
+          uransRecoveryVersion: 14,
+          engine: composed.request.expected_engine,
+          executionPools: [composed.request.expected_execution_pool],
+        };
+        await connection.execute(
+          sql`UPDATE sync_api_settings SET enabled=true,remote_solver_enabled=false WHERE id=1`,
+        );
+        await connection.execute(
+          sql`UPDATE sync_api_permissions SET can_fetch=true WHERE data_type='sweeps'`,
+        );
+        await connection.execute(sql`INSERT INTO registered_remote_solvers(id,instance_id,instance_name,cpu_capacity,cpu_budget,max_active_polar_promises,
+          auth_token_hash,credential_version,last_heartbeat_at,metadata)
+          VALUES(${solverId}::uuid,${randomUUID()},'isolated contention worker',2,2,4,${"a".repeat(64)},1,clock_timestamp(),
+            ${JSON.stringify({ progressiveExecution: capability, progressiveExecutionObservedAt: new Date().toISOString() })}::jsonb)`);
+        expect(
+          await prepareProgressiveRemoteDispatch(connection, solverId),
+        ).toMatchObject({ kind: "waiting", deferredUnits: leases.length });
+      } else {
+        expect(
+          await admitProgressiveCfdBatch(
+            connection,
+            { submitPolar: submit } as unknown as EngineClient,
+            {
+              meshRecoveryVersion: 1,
+              uransRecoveryVersion: 14,
+              solverBudgetVersion: 2,
+            },
+          ),
+        ).toEqual({ kind: "deferred", units: leases.length });
+      }
+      await connection.execute(sql`UPDATE progressive_cfd_units u SET retry_after=s.original::timestamptz
+        FROM jsonb_to_recordset(${JSON.stringify(siblings)}::jsonb) AS s(id uuid,original text) WHERE u.id=s.id`);
+    });
     expect(submit).not.toHaveBeenCalled();
     expect(
       await db.execute(
