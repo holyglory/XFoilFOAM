@@ -96,6 +96,7 @@ export async function assertShortProof(
   attemptId: string,
   archiveId: string,
   expected?: AttemptEvidenceFreshVerification,
+  tiny = false,
 ) {
   const [proof] =
     await db.execute(sql`SELECT e.verification?'shortReceipt' AS packed_event,p.projection?'shortFacts' AS packed_projection,
@@ -117,7 +118,8 @@ export async function assertShortProof(
       Number(proof.projection_bytes) -
       Number(proof.event_bytes),
   );
-  expect(Number(proof.saved)).toBeGreaterThanOrEqual(1024);
+  if (tiny) expect(Number(proof.saved)).toBeLessThan(1024);
+  else expect(Number(proof.saved)).toBeGreaterThanOrEqual(1024);
   expect(Number(proof.recorded_projection)).toBe(
     Number(proof.projection_bytes),
   );

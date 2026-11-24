@@ -3851,6 +3851,8 @@ export const attemptEvidenceStoragePolicy = pgTable(
     stoppedProgressiveEnabled: boolean("stopped_progressive_enabled").notNull().default(false),
     shortProofsEnabled: boolean("short_proofs_enabled").notNull().default(false),
     shortProofCanaryAttemptId: uuid("short_proof_canary_attempt_id"),
+    tinyHistoriesEnabled: boolean("tiny_histories_enabled").notNull().default(false),
+    tinyHistoryCanaryAttemptId: uuid("tiny_history_canary_attempt_id"),
     hzRetainedEnabled: boolean("hz_retained_enabled").notNull().default(false),
     hzSettledReceiptsEnabled: boolean("hz_settled_receipts_enabled").notNull().default(false),
     hzWorkerOnly: boolean("hz_worker_only").notNull().default(false),

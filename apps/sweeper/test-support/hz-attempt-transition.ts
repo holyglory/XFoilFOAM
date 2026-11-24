@@ -122,6 +122,7 @@ export async function verifyHzAttemptTransition(
   periodic = false,
   independentAttempt?: string,
   shortProofJourney = false,
+  tinyDelivery?: "received" | "failed",
 ) {
   const fixture = await createSettlementFixture(true),
     db = fixture.db;
@@ -159,6 +160,8 @@ export async function verifyHzAttemptTransition(
       "result_attempts",
     ])
       await copy(table);
+    if (tinyDelivery === "failed")
+      await copy("progressive_worker_delivery_failures",sql`t.result_attempt_id=${id}::uuid`);
     const [r] = await db.execute(
       sql`SELECT instance_id::text AS instance FROM sync_api_settings`,
     );
@@ -318,22 +321,103 @@ export async function verifyHzAttemptTransition(
       expect(same.event).toBe(pending.event);
       return;
     }
-    async function shortProofPolicy(enable: boolean) {
+    async function shortProofPolicy(enable: boolean, tiny = false, pin = id) {
       const uri = new URL(databaseUrl());
       uri.searchParams.set("options", `-c search_path=${fixture.namespace},public`);
       const previous = process.env.DATABASE_URL;
       const printed = vi.spyOn(process.stdout,"write").mockReturnValue(true);
       try {
         process.env.DATABASE_URL = uri.toString();
-        await attemptEvidenceStorageMain(enable ? ["enable-short-proofs","--id",id] : ["disable-short-proofs"]);
-        expect(JSON.parse(String(printed.mock.calls.at(-1)?.[0]))).toMatchObject({
-          hzWorkerOnly:true,shortProofsEnabled:enable,shortProofCanaryAttemptId:enable ? id : null,
-        });
+        const name = tiny ? "tiny-histories" : "short-proofs";
+        await attemptEvidenceStorageMain(enable ? ["enable-"+name,"--id",pin] : ["disable-"+name]);
+        expect(JSON.parse(String(printed.mock.calls.at(-1)?.[0]))).toMatchObject(tiny ? {
+          hzWorkerOnly:true,tinyHistoriesEnabled:enable,tinyHistoryCanaryAttemptId:enable ? pin : null,
+        } : {hzWorkerOnly:true,shortProofsEnabled:enable,shortProofCanaryAttemptId:enable ? pin : null});
       } finally {
         printed.mockRestore();
         if (previous === undefined) delete process.env.DATABASE_URL;
         else process.env.DATABASE_URL = previous;
       }
+    }
+    if (tinyDelivery) {
+      // A complete signed terminal source with an independent 0207 original.
+      // Its genuine delivery failure, where present, must survive storage.
+      await db.execute(sql`UPDATE progressive_worker_reports SET report=${fullReport}::jsonb,
+        archived_at=NULL,archive_bundle_id=NULL,result_payload_hash=NULL,stopped_engine_job_id=${input.executionId}
+        WHERE sim_job_id=${input.executionId}::uuid AND sequence=${input.points[0]!.sequence}`);
+      const {packHzAttemptSource} = await import("../src/hz-attempt-custody");
+      const {loadSettledAttemptEvidenceCopy} = await import("@aerodb/db/attempt-evidence-storage");
+      const packed = await packHzAttemptSource(await loadSettledAttemptEvidenceCopy(db,id));
+      const binding = await relay.worker({operation:"bound"});
+      const fresh = await relay.hub({operation:"put",instance,solver:binding.solver,...packed});
+      const staged = await relay.worker({operation:"stage",...fresh,enable:true,retained:true,settled:true,
+        requireTransfers:true,owner:{instance,solver:binding.solver}},true);
+      const failure = async () => (await db.execute(sql`SELECT to_jsonb(f) AS row FROM progressive_worker_delivery_failures f WHERE f.result_attempt_id=${id}::uuid`))[0]?.row;
+      const prior = await failure();
+      const candidate = () => relay.worker({operation:"one",settled:true,retained:true,attemptId:id});
+      expect((await candidate()).limiter).not.toBeNull();
+      await shortProofPolicy(true,true,"00000001-0000-4000-8000-000000000001");
+      expect((await candidate()).limiter).not.toBeNull();
+      await shortProofPolicy(true,true);
+      expect((await candidate()).limiter).toBeNull();
+      if (tinyDelivery === "failed") {
+        await db.execute(sql`UPDATE progressive_worker_delivery_failures SET state='retry' WHERE result_attempt_id=${id}::uuid`);
+        expect((await candidate()).limiter).not.toBeNull();
+        await db.execute(sql`UPDATE progressive_worker_delivery_failures SET state='conflict' WHERE result_attempt_id=${id}::uuid`);
+      }
+      await db.execute(sql`UPDATE sim_jobs SET ingest_lease_token=gen_random_uuid(),
+        ingest_lease_expires_at=clock_timestamp()+interval '2 minutes' WHERE id=${input.executionId}::uuid`);
+      expect((await candidate()).limiter).not.toBeNull();
+      await db.execute(sql`UPDATE sim_jobs SET ingest_lease_token=NULL,ingest_lease_expires_at=NULL WHERE id=${input.executionId}::uuid`);
+      const page=await relay.worker({operation:"page",settled:true,retained:true,
+        after:"00000000-0000-0000-0000-000000000000",high:"ffffffff-ffff-ffff-ffff-ffffffffffff",limit:64});
+      expect(page.find((row: {id:string})=>row.id===id)).toMatchObject({limiter:null});
+      if (tinyDelivery === "failed") {
+        const interrupted: AttemptRelay = {...relay, async api(request) {
+          const actual = await relay.api(request);
+          if (request.forceArchive === false) throw Error("Failed tiny working readback");
+          return actual;
+        }};
+        await expect(hzAttemptStorage(["migrate",...config,"--id",id,"--include-settled-receipts"],
+          {...io,relay:interrupted})).rejects.toThrow("Failed tiny working readback");
+        const [restored] = await db.execute(sql`SELECT evidence_archive_id pointer,
+          evidence_payload::text source FROM result_attempts WHERE id=${id}::uuid`);
+        expect(restored).toMatchObject({pointer:null,source:original});
+        expect(await failure()).toEqual(prior);
+      }
+      let issued: AttemptEvidenceFreshVerification | undefined;
+      const recorded: AttemptRelay = {...relay, worker(request,write) {
+        if (request.operation==="commit") issued=request.proof as AttemptEvidenceFreshVerification;
+        return relay.worker(request,write);
+      }};
+      await hzAttemptStorage(["migrate",...config,"--id",id,"--include-settled-receipts"],{...io,relay:recorded});
+      expect(issued).toBeDefined();
+      const proof=await assertShortProof(db,id,staged.id,issued,true);
+      expect(proof.generation).toBe(fresh.identity.generation);
+      expect(objects.size).toBe(1);
+      expect(await readStoredAttemptEvidenceText(db,id)).toBe(original);
+      expect(await readStoredAttemptEvidenceText(db,id,{source:"worker-report"})).toBe(original);
+      expect(await failure()).toEqual(prior);
+      let expectedDisposition = prior;
+      if (tinyDelivery === "failed") {
+        expect(prior).toMatchObject({state:"conflict",last_http_status:409});
+        expect((await db.execute(sql`SELECT 1 FROM progressive_worker_hub_receipts WHERE result_attempt_id=${id}::uuid`))).toHaveLength(0);
+        expect(await relay.worker({operation:"replay",attemptId:id})).toMatchObject({replayDisposition:"would_requeue"});
+        // A legitimate subsequent replay may change the failure row. The sealed
+        // source, normal read and scientific classification survive that action.
+        const recovered = await replayProgressiveWorkerOutbox(db,input,{apply:true});
+        expect(recovered.points.find(p=>p.resultAttemptId===id)?.outcome).toBe("requeued");
+        expectedDisposition = await failure();
+        expect(expectedDisposition).toMatchObject({state:"retry"});
+        expect(await readStoredAttemptEvidenceText(db,id,{source:"worker-report"})).toBe(original);
+        expect(await db.execute(sql`SELECT 1 FROM progressive_worker_hub_receipts WHERE result_attempt_id=${id}::uuid`)).toHaveLength(0);
+      }
+      await shortProofPolicy(false,true);
+      expect(await readStoredAttemptEvidenceText(db,id)).toBe(original);
+      await hzAttemptStorage(["restore",...config,"--id",id],io);
+      expect(await readStoredAttemptEvidenceText(db,id)).toBe(original);
+      expect(await failure()).toEqual(expectedDisposition);
+      return;
     }
     async function verifySettledPoint() {
       // A normal running report delivered the point. Its assignment stopped at

@@ -65,7 +65,7 @@ export function archivedAttemptApplicationSha256Sql(
       AND event.archive_id=${attempt}.evidence_archive_id AND event.completed AND event.action='shorten'
       AND archive.result_id IS NOT DISTINCT FROM ${attempt}.result_id
       AND (${attempt}.sim_job_id IS NULL OR archive.sim_job_id=${attempt}.sim_job_id)
-      AND event.verification#>>'{dependencies,verifier}' IN ('server-consumers/stopped-progressive-rans-v1','server-consumers/receipt-bearing-rans-v1','server-consumers/receipt-bearing-urans-v1')
+      AND event.verification#>>'{dependencies,verifier}' IN ('server-consumers/stopped-progressive-rans-v1','server-consumers/receipt-bearing-rans-v1','server-consumers/receipt-bearing-urans-v1','server-consumers/hz-closed-undelivered-v1')
       AND event.verification#>>'{dependencies,sourceSha256}'=archive.source_sha256
       AND projection.projection->>'sourceSha256'=archive.source_sha256
       AND (projection.projection->>'sourceByteSize')::bigint=archive.source_byte_size

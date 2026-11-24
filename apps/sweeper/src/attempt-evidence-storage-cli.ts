@@ -94,9 +94,10 @@ export async function attemptEvidenceStorageMain(
       throw new Error("Invalid attempt evidence command options");
     flags.set(flag, args[index + 1]!);
   }
-  const shortPolicy = command === "enable-short-proofs" || command === "disable-short-proofs";
-  if (shortPolicy && [...flags.keys()].some(flag => command !== "enable-short-proofs" || flag !== "--id"))
-    throw new Error("enable-short-proofs accepts an optional canary --id; disable-short-proofs takes no options");
+  const tinyPolicy = command === "enable-tiny-histories" || command === "disable-tiny-histories";
+  const shortPolicy = tinyPolicy || command === "enable-short-proofs" || command === "disable-short-proofs";
+  if (shortPolicy && [...flags.keys()].some(flag => !command.startsWith("enable-") || flag !== "--id"))
+    throw new Error(command + " accepts only an optional canary --id on enablement");
   const verified =
     command === "enable-verified" || command === "preview-verified";
   if (verified) {
@@ -198,13 +199,15 @@ export async function attemptEvidenceStorageMain(
       "disable-shortening",
       "enable-short-proofs",
       "disable-short-proofs",
+      "enable-tiny-histories",
+      "disable-tiny-histories",
       "shorten",
       "shorten-pass",
       "restore-inline",
     ].includes(command ?? "")
   )
     throw new Error(
-      "Usage: attempt-evidence-storage-cli.ts sql|use-sql|audit|use-audit|copy|archive|backfill|restore|shortening-status|preview-verified|enable-verified|shortening-candidates|enable-shortening|disable-shortening|enable-short-proofs|disable-short-proofs|shorten|shorten-pass|restore-inline [--consumer-contract 1] [--stopped-progressive true|only] [--receipt-bearing true | --receipt-urans true [--urans-max-source-bytes N]] [--id ATTEMPT_UUID --archive-id ARCHIVE_UUID] [--after UUID] [--rows N] [--pages N] [--output NEW_FILE] [--bucket BUCKET] [--source-instance INSTANCE]",
+      "Usage: attempt-evidence-storage-cli.ts sql|use-sql|audit|use-audit|copy|archive|backfill|restore|shortening-status|preview-verified|enable-verified|shortening-candidates|enable-shortening|disable-shortening|enable-short-proofs|disable-short-proofs|enable-tiny-histories|disable-tiny-histories|shorten|shorten-pass|restore-inline [--consumer-contract 1] [--stopped-progressive true|only] [--receipt-bearing true | --receipt-urans true [--urans-max-source-bytes N]] [--id ATTEMPT_UUID --archive-id ARCHIVE_UUID] [--after UUID] [--rows N] [--pages N] [--output NEW_FILE] [--bucket BUCKET] [--source-instance INSTANCE]",
     );
   if (!process.env.DATABASE_URL)
     throw new Error("An explicit DATABASE_URL is required");
@@ -224,6 +227,8 @@ export async function attemptEvidenceStorageMain(
         "disable-shortening",
         "enable-short-proofs",
         "disable-short-proofs",
+        "enable-tiny-histories",
+        "disable-tiny-histories",
         "shorten",
         "shorten-pass",
         "restore-inline",
@@ -235,8 +240,8 @@ export async function attemptEvidenceStorageMain(
           "Attempt history shortening requires forward migration 0208",
         );
       if (shortPolicy) {
-        const enabled = command === "enable-short-proofs";
-        const update = (db: typeof client.db) => setShortAttemptProofPolicy(db, enabled, flags.get("--id"));
+        const enabled = command.startsWith("enable-");
+        const update = (db: typeof client.db) => setShortAttemptProofPolicy(db, enabled, flags.get("--id"), tinyPolicy ? "tiny-history" : "measured-floor");
         let updated;
         if (enabled && configuredDeploymentRole() === "remote-solver") {
           if (!policy.hzWorkerOnly) throw new Error("Short worker proofs require the native HZ-only policy");

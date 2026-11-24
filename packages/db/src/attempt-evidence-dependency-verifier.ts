@@ -332,7 +332,8 @@ export function createAttemptServerDependencyVerifier(
         forcePresent(original, new Map()) === hasForceHistory,
         "force-history existence changed",
       );
-      const settledWorker = workerScope?.contract === "settled-receipt-v3";
+      const undeliveredWorker = workerScope?.contract === "closed-undelivered-v1";
+      const settledWorker = workerScope?.contract === "settled-receipt-v3" || undeliveredWorker;
       const extendedWorker = settledWorker || workerScope?.contract === "retained-original-v2";
       // 0213 owns the cycle/time/frame continuation contract on both roles.
       if ((broad && urans) || extendedWorker) {
@@ -427,7 +428,9 @@ export function createAttemptServerDependencyVerifier(
         equalityEquivalent: true,
         scientificEquivalent: true,
         readDependenciesSatisfied: true,
-        verifier: settledWorker
+        verifier: undeliveredWorker
+          ? "server-consumers/hz-closed-undelivered-v1"
+          : settledWorker
           ? "server-consumers/hz-settled-receipt-v3"
           : extendedWorker
           ? "server-consumers/hz-retained-original-v2"

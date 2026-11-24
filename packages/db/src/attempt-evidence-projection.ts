@@ -330,6 +330,8 @@ export interface AttemptEvidenceStoragePolicy {
   hzWorkerOnly: boolean;
   shortProofsEnabled?: boolean;
   shortProofCanaryAttemptId?: string | null;
+  tinyHistoriesEnabled?: boolean;
+  tinyHistoryCanaryAttemptId?: string | null;
   shorteningEnabled: boolean;
   stoppedProgressiveEnabled: boolean;
   progressiveSourceScope: "legacy" | "stopped-only" | "receipt-bearing" | "receipt-urans" | "verified";
@@ -379,6 +381,8 @@ export async function getAttemptEvidenceStoragePolicy(
     coalesce((to_jsonb(policy)->>'hz_worker_only')::boolean,false) AS "hzWorkerOnly",
     coalesce((to_jsonb(policy)->>'short_proofs_enabled')::boolean,false) AS "shortProofsEnabled",
     to_jsonb(policy)->>'short_proof_canary_attempt_id' AS "shortProofCanaryAttemptId",
+    coalesce((to_jsonb(policy)->>'tiny_histories_enabled')::boolean,false) AS "tinyHistoriesEnabled",
+    to_jsonb(policy)->>'tiny_history_canary_attempt_id' AS "tinyHistoryCanaryAttemptId",
     (to_jsonb(policy)->>'urans_max_source_bytes')::integer AS "uransMaxSourceBytes"
     FROM attempt_evidence_storage_policy policy WHERE id=1`);
   return row as unknown as AttemptEvidenceStoragePolicy;
@@ -386,11 +390,17 @@ export async function getAttemptEvidenceStoragePolicy(
 
 /** Change only the signed, measured-floor fallback. Other cohort policies keep
  * running during a scoped canary. Disabling writing preserves every old reader. */
-export async function setShortAttemptProofPolicy(db: DB, enabled: boolean, canaryAttemptId?: string) {
+export async function setShortAttemptProofPolicy(
+  db: DB, enabled: boolean, canaryAttemptId?: string,
+  cohort: "measured-floor" | "tiny-history" = "measured-floor",
+) {
+  const tinyHistories = cohort === "tiny-history";
   if (canaryAttemptId) assertId(canaryAttemptId);
   if (!enabled && canaryAttemptId) throw new Error("A short-proof canary requires enablement");
-  const result = await db.execute(sql`UPDATE attempt_evidence_storage_policy SET short_proofs_enabled=${enabled},
-    short_proof_canary_attempt_id=${canaryAttemptId ?? null}::uuid
+  const enabledColumn = sql.identifier(tinyHistories ? "tiny_histories_enabled" : "short_proofs_enabled");
+  const canaryColumn = sql.identifier(tinyHistories ? "tiny_history_canary_attempt_id" : "short_proof_canary_attempt_id");
+  const result = await db.execute(sql`UPDATE attempt_evidence_storage_policy SET ${enabledColumn}=${enabled},
+    ${canaryColumn}=${canaryAttemptId ?? null}::uuid
     WHERE id=1 AND (${!enabled} OR (shortening_enabled AND consumer_contract_version=1)) RETURNING id`);
   if (!result.length) throw new Error("Short proofs require the active native attempt consumer contract");
   return getAttemptEvidenceStoragePolicy(db);

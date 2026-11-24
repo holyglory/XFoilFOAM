@@ -99,6 +99,7 @@ export async function verifyReceiptBearingHistory(
   db: DB,
   fixture: { composed: { jobId: string }; leases: ProgressiveCfdLease[] },
   calculateFit: Fit,
+  tiny = false,
 ) {
   const job = fixture.composed.jobId;
   const [owner] = await db.execute(
@@ -120,7 +121,7 @@ export async function verifyReceiptBearingHistory(
       converged: true,
       unsteady: false,
       first_order_fallback: false,
-      steady_history: stoppedHistoryFixture(),
+      steady_history: stoppedHistoryFixture(tiny ? 14 : 1500),
     };
     const [a] = await db
       .insert(resultAttempts)
@@ -241,6 +242,12 @@ export async function verifyReceiptBearingHistory(
         fence:"terminal_result",ownership_basis:"recorded_execution_namespace"},
     });
     const inlineSettlement = await settleProgressiveCfdExecution(db, job);
+    if (tiny) {
+      expect(await limiter()).toBe("missing-bounded-source-archive");
+      await setShortAttemptProofPolicy(db, true, ids[1]!, "tiny-history");
+      expect(await limiter()).toBe("missing-bounded-source-archive");
+      await setShortAttemptProofPolicy(db, true, undefined, "tiny-history");
+    }
     expect(await limiter()).toBeNull();
     const deps = {
       ...(await configuredAttemptEvidenceSettlementDependencies(db)),
@@ -273,27 +280,33 @@ export async function verifyReceiptBearingHistory(
       }),
     ).rejects.toThrow(/proof/i);
     const publicInline = await selectedDetailBaseline(db, id!);
-    const floors = [];
-    for (const [i, pointId] of ids.entries()) {
-      const verified = await verifiedHubFixtureProof(db,deps,pointId,ar[i]!.id);
-      floors.push(await measuredFixtureFloor(db,pointId,ar[i]!.id,verified));
+    let floor = 1024;
+    if (!tiny) {
+      // Enabling small originals must never waive this larger owner's fee.
+      await setShortAttemptProofPolicy(db,true,undefined,"tiny-history");
+      const floors = [];
+      for (const [i, pointId] of ids.entries()) {
+        const verified = await verifiedHubFixtureProof(db,deps,pointId,ar[i]!.id);
+        floors.push(await measuredFixtureFloor(db,pointId,ar[i]!.id,verified));
+      }
+      floor = Math.max(...floors);
+      await db.execute(sql`UPDATE attempt_evidence_storage_policy SET min_net_value_bytes=${floor} WHERE id=1`);
+      await expect(settleAttemptEvidenceHistory(db,deps,{attemptId:id!,archiveId:ar[0]!.id})).rejects.toThrow(/insufficient net/);
+      await setShortAttemptProofPolicy(db,false,undefined,"tiny-history");
+      await setShortAttemptProofPolicy(db,true,ids[1]!);
+      await expect(settleAttemptEvidenceHistory(db,deps,{attemptId:id!,archiveId:ar[0]!.id})).rejects.toThrow(/insufficient net/);
+      await setShortAttemptProofPolicy(db,true);
     }
-    const floor = Math.max(...floors);
-    await db.execute(sql`UPDATE attempt_evidence_storage_policy SET min_net_value_bytes=${floor} WHERE id=1`);
-    await expect(settleAttemptEvidenceHistory(db,deps,{attemptId:id!,archiveId:ar[0]!.id})).rejects.toThrow(/insufficient net/);
-    await setShortAttemptProofPolicy(db,true,ids[1]!);
-    await expect(settleAttemptEvidenceHistory(db,deps,{attemptId:id!,archiveId:ar[0]!.id})).rejects.toThrow(/insufficient net/);
-    await setShortAttemptProofPolicy(db,true);
     const pass = await runAttemptEvidenceSettlementPass(db, deps, {
       maxRows: 2,
     });
     expect(pass).toMatchObject({ shortened: 2, failures: [] });
     for (const [i, pointId] of ids.entries()) {
-      const stored = await assertShortProof(db,pointId,ar[i]!.id);
-      expect(Number(stored.saved)).toBeGreaterThanOrEqual(floor);
+      const stored = await assertShortProof(db,pointId,ar[i]!.id,undefined,tiny);
+      if (!tiny) expect(Number(stored.saved)).toBeGreaterThanOrEqual(floor);
       expect(stored.generation).toBe(ar[i]!.generation);
     }
-    await setShortAttemptProofPolicy(db,false);
+    await setShortAttemptProofPolicy(db,false,undefined,tiny ? "tiny-history" : "measured-floor");
     await db.execute(sql`UPDATE attempt_evidence_storage_policy SET min_net_value_bytes=1024 WHERE id=1`);
 
     await verifySelectedDetailField(db, publicInline, "steady_history");

@@ -33,8 +33,8 @@ import { env } from "../../../apps/api/src/env";
 import { reportTextIdentity } from "../src/progressive-report-archive";
 import { assertAttemptSourcePins, attemptSourceApplicationSha256, loadAttemptSourcePins, prepareAttemptSources } from "../src/attempt-receipt-source";
 
-export function stoppedHistoryFixture() {
-  const iterations = Array.from({ length: 1500 }, (_, index) => index + 1);
+export function stoppedHistoryFixture(samples = 1500) {
+  const iterations = Array.from({ length: samples }, (_, index) => index + 1);
   const values = (base: number, seed: number) =>
     iterations.map((i) =>
       Number((base + Math.sin(i * seed) / 2000).toFixed(10)),
@@ -44,7 +44,7 @@ export function stoppedHistoryFixture() {
     cl: values(0.4, 13),
     cd: values(0.03, 19),
     cm: values(-0.02, 23),
-    window: { start_iter: 1000, end_iter: 1500 },
+    window: { start_iter: Math.max(1, Math.floor(samples * 2 / 3)), end_iter: samples },
     mean_stable: false,
     note: "settled CFD fixture",
   };

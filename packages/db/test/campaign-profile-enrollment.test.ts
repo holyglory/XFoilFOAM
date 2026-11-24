@@ -11886,6 +11886,7 @@ describe("progressive CFD evidence accounting", () => {
     const fixture = await cfdEvidenceFixture(33.741, 2, [], [0, 2], false, undefined, {}, 2);
     const { verifyReceiptBearingHistory } = await import("./attempt-receipt-source-fixture");
     await withHistoryDatabaseCopy((connection) => verifyReceiptBearingHistory(connection, fixture, fitUsingPython));
+    await withHistoryDatabaseCopy((connection) => verifyReceiptBearingHistory(connection, fixture, fitUsingPython, true));
   }, 120_000);
 
   it("replays a signed remote point after its receipt-bearing RANS history moves to storage", async () => {

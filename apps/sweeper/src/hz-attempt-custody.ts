@@ -9,7 +9,7 @@ import {
   type HzWorkerOwner,
 } from "./hz-attempt-transfer-fence";
 import { ProgressiveWorkerReplayNeedsFinalReport, ProgressiveWorkerTransferPaused } from "./progressive-worker-outbox-replay";
-import { readSettledWorkerPoint, settledWorkerScope, type HzSettledReceiptScope } from "./hz-settled-attempt-receipt";
+import { readSettledWorkerPoint, settledWorkerScope, type HzSignedPointScope } from "./hz-settled-attempt-receipt";
 import { replayProgressiveWorkerOutbox } from "./progressive-worker-outbox-replay";
 import {
   loadAttemptSourcePins,
@@ -92,10 +92,17 @@ export async function attemptPage(
 ) {
   if (!Number.isInteger(limit) || limit < 1 || limit > 64)
     throw Error("Invalid page size");
-  const rows = await db.execute(sql`WITH keys AS MATERIALIZED (
+  // Merge at most one page from each existing owner index. Include native
+  // catalog keys even when the worker delivery failed before a point receipt.
+  // The full native limiter still checks the chosen archive and signed source.
+  const extra = settled ? sql`UNION (SELECT g.result_attempt_id AS id FROM attempt_evidence_archives g
+    WHERE g.result_attempt_id>${exactId(after)}::uuid AND g.result_attempt_id<=${exactId(high)}::uuid
+      AND (SELECT to_jsonb(p)->>'tiny_histories_enabled'='true' FROM attempt_evidence_storage_policy p WHERE p.id=1)
+    GROUP BY g.result_attempt_id ORDER BY g.result_attempt_id LIMIT ${limit})` : sql``;
+  const rows = await db.execute(sql`WITH receipt_keys AS MATERIALIZED (
   SELECT DISTINCT a.id FROM progressive_worker_hub_receipts h JOIN result_attempts a ON a.id=h.result_attempt_id WHERE h.result_attempt_id>${exactId(after)}::uuid AND h.result_attempt_id<=${exactId(high)}::uuid
    AND ${retained ? sql`a.status IN ('done','failed') AND h.receipt->>'kind'='retained-progressive-attempt'` : sql`a.status='done' AND a.regime='rans'`} AND h.receipt->'storageOnly' IN ('true'::jsonb,${retained ? sql`'false'::jsonb` : sql`'true'::jsonb`})
-  ORDER BY a.id LIMIT ${limit})
+  ORDER BY a.id LIMIT ${limit}), keys AS MATERIALIZED (SELECT id FROM receipt_keys ${extra} ORDER BY id LIMIT ${limit})
  SELECT k.id::text AS id,a.evidence_archive_id::text AS archive, e.app_readback_at IS NULL AND a.evidence_archive_id IS NOT NULL AS pending,
  CASE WHEN a.evidence_archive_id IS NULL THEN ${workerAttemptLimiter(sql`k.id`, retained, settled)} END AS limiter,
  pg_column_size(a.evidence_payload) AS stored,CASE WHEN a.evidence_archive_id IS NULL AND pg_column_size(a.evidence_payload)<=${settled ? 8388608 : 262144} THEN octet_length(a.evidence_payload::text)-octet_length(attempt_evidence_compact(a.evidence_payload)::text) END AS logical
@@ -236,8 +243,8 @@ export async function hzScience(db: DB, id: string, archiveId: string) {
       );
       if (!bound?.scope) throw Error("Worker custody scope changed");
       const scope = bound.scope as Record<string, unknown>;
-      const replay = scope.contract === "settled-receipt-v3"
-        ? await readSettledWorkerPoint(db, bound.scope as HzSettledReceiptScope, AbortSignal.timeout(30_000))
+      const replay = scope.contract === "settled-receipt-v3" || scope.contract === "closed-undelivered-v1"
+        ? await readSettledWorkerPoint(db, bound.scope as HzSignedPointScope, AbortSignal.timeout(30_000))
         : await readHzAttemptFromWorkerReport(db, attempt, AbortSignal.timeout(30_000));
       if (replay.payloadText !== original)
         throw Error("Signed worker report differs from original");
@@ -270,6 +277,8 @@ export async function verifyHzOutboxReplay(db: DB, id: string) {
   } | null;
   if (!scope || scope.attempt !== id)
     throw Error("Worker replay owner differs");
+  const sequence = scope.contract === "closed-undelivered-v1" ? scope.stopSequence : scope.sequence;
+  if (sequence === undefined) throw Error("Missing signed terminal sequence for failed worker delivery");
   const preview = await replayProgressiveWorkerOutbox(
     db,
     {
@@ -277,7 +286,7 @@ export async function verifyHzOutboxReplay(db: DB, id: string) {
       expectedCount: 1,
       points: [
         {
-          sequence: scope.sequence,
+          sequence,
           resultAttemptId: id,
           pointContentSignature: scope.point,
         },
@@ -300,6 +309,8 @@ export async function verifyHzOutboxReplay(db: DB, id: string) {
   // final-only requeue command. Its actual point and terminal signatures are
   // independently checked in the scientific source read.
   if (preview === null) return { replayDisposition: "nonfinal-already-received" };
+  if (scope.contract === "closed-undelivered-v1" && preview.points.length === 1 && preview.points[0]?.outcome === "would_requeue")
+    return { replayDisposition: "would_requeue" };
   if (
     preview.points.length !== 1 ||
     preview.points[0]?.outcome !== "already_delivered"
@@ -360,13 +371,15 @@ export async function confirmHzAttempt(
     | {
         verifier?: string;
         jobDecisionsSha256?: string;
-        workerScope?: HzSettledReceiptScope | { selectionSha256?: string };
+        workerScope?: HzSignedPointScope | { selectionSha256?: string };
       }
     | undefined;
-  if (deps?.verifier === "server-consumers/hz-retained-original-v2" || deps?.verifier === "server-consumers/hz-settled-receipt-v3") {
-    if (deps.verifier === "server-consumers/hz-settled-receipt-v3") {
+  const failedSource = deps?.verifier === "server-consumers/hz-closed-undelivered-v1";
+  const signedSource = failedSource || deps?.verifier === "server-consumers/hz-settled-receipt-v3";
+  if (deps && (deps.verifier === "server-consumers/hz-retained-original-v2" || signedSource)) {
+    if (signedSource) {
       const source = deps.workerScope;
-      if (!source || !("contract" in source) || source.contract !== "settled-receipt-v3")
+      if (!source || !("contract" in source) || source.contract !== (failedSource ? "closed-undelivered-v1" : "settled-receipt-v3"))
         throw Error("Missing sealed worker receipt");
       const signed = await readSettledWorkerPoint(db, source, AbortSignal.timeout(30_000));
       if (signed.payloadText !== text) throw Error("Stored attempt differs from the acknowledged signed point");
@@ -378,8 +391,9 @@ export async function confirmHzAttempt(
       await tx.execute(sql`SET LOCAL lock_timeout='1s'`);
       await checkHzTransferFence(tx, expected, true);
       await tx.execute(sql`SELECT attempt_evidence_lock_source(${id}::uuid)`);
-      if (deps.verifier === "server-consumers/hz-settled-receipt-v3") {
-        const [unchanged] = await tx.execute(sql`SELECT attempt_evidence_hz_settled_scope(${id}::uuid,${app.archiveId}::uuid)
+      if (signedSource) {
+        const scopeFunction = failedSource ? sql`attempt_evidence_hz_closed_failure_scope` : sql`attempt_evidence_hz_settled_scope`;
+        const [unchanged] = await tx.execute(sql`SELECT ${scopeFunction}(${id}::uuid,${app.archiveId}::uuid)
           = ${JSON.stringify(deps.workerScope)}::jsonb AS verified`);
         if (unchanged?.verified !== true) throw Error("Worker receipt, assignment or selected evidence changed");
       }
@@ -388,7 +402,7 @@ export async function confirmHzAttempt(
       );
       if (
         selection?.sha !== deps.workerScope?.selectionSha256 ||
-        (await storedJobDecisionSha256(tx, id, deps.verifier === "server-consumers/hz-settled-receipt-v3")) !== deps.jobDecisionsSha256
+        (await storedJobDecisionSha256(tx, id, signedSource)) !== deps.jobDecisionsSha256
       )
         throw Error(
           "Stored worker classification, selection, interpretation or fit changed",

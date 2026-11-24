@@ -8,8 +8,7 @@ import { isFinalProgressiveRemoteReport, resolveProgressiveReportedPoint, valida
 import { progressiveRemotePointProjection } from "@aerodb/db/progressive-remote-point-projection";
 import { reportTextIdentity } from "@aerodb/db/progressive-report-archive";
 
-export interface HzSettledReceiptScope {
-  contract: "settled-receipt-v3";
+interface SignedWorkerPoint {
   attempt: string;
   result: string;
   job: string;
@@ -23,20 +22,36 @@ export interface HzSettledReceiptScope {
   point: string;
   stopReport: string;
   stopSequence: number;
-  hubResult: string;
-  hubAttempt: string;
-  storageOnly: boolean;
   selectionSha256: string;
 }
 
+export interface HzSettledReceiptScope extends SignedWorkerPoint {
+  contract: "settled-receipt-v3";
+  hubResult: string;
+  hubAttempt: string;
+  storageOnly: boolean;
+}
+
+export interface HzClosedFailureScope extends SignedWorkerPoint {
+  contract: "closed-undelivered-v1";
+  failureHttp: number;
+  failureSha256: string;
+}
+export type HzSignedPointScope = HzSettledReceiptScope | HzClosedFailureScope;
+
 export async function settledWorkerScope(db: DB, attemptId: string, archiveId?: string) {
-  const [row] = await db.execute(sql`SELECT attempt_evidence_hz_settled_scope(${attemptId}::uuid,${archiveId ?? null}::uuid) AS scope`);
-  return (row?.scope ?? null) as HzSettledReceiptScope | null;
+  const [row] = await db.execute(sql`SELECT attempt_evidence_hz_settled_scope(${attemptId}::uuid,${archiveId ?? null}::uuid) AS scope,
+    EXISTS(SELECT FROM pg_proc p JOIN pg_class a ON a.oid=to_regclass('result_attempts') AND a.relnamespace=p.pronamespace
+      WHERE p.oid=to_regprocedure('attempt_evidence_hz_closed_failure_scope(uuid,uuid)')) AS has_failure_reader`);
+  if (row?.scope || row?.has_failure_reader !== true) return (row?.scope ?? null) as HzSettledReceiptScope | null;
+  const [failure] = await db.execute(sql`SELECT CASE WHEN attempt_evidence_tiny_selected(${attemptId}::uuid,${archiveId ?? null}::uuid)
+    THEN attempt_evidence_hz_closed_failure_scope(${attemptId}::uuid,${archiveId ?? null}::uuid) END AS scope`);
+  return (failure?.scope ?? null) as HzClosedFailureScope | null;
 }
 
 /** The observed point can precede the final report. Authenticate each sequence
  * under the same assignment before using the producer's original projection. */
-export async function readSettledWorkerPoint(db: DB, scope: HzSettledReceiptScope, signal?: AbortSignal) {
+export async function readSettledWorkerPoint(db: DB, scope: HzSignedPointScope, signal?: AbortSignal) {
   if (process.env.AIRFOILFOAM_DEPLOYMENT_ROLE !== "remote-solver")
     throw new Error("Settled worker points require the registered worker");
   signal?.throwIfAborted();

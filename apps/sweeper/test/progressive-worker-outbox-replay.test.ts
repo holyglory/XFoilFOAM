@@ -94,11 +94,13 @@ async function withFixture(
     failedPoints = false,
     includeHistory = false,
     periodicHistory = false,
+    tinyHistory = false,
   }: {
     pendingCount?: number;
     failedPoints?: boolean;
     includeHistory?: boolean;
     periodicHistory?: boolean;
+    tinyHistory?: boolean;
   } = {},
 ) {
   await client.db.transaction(async (transaction) => {
@@ -262,7 +264,7 @@ async function withFixture(
         aoa: { angles },
         solver: {
           warm_start: true,
-          ...(periodicHistory
+          ...(periodicHistory || tinyHistory
             ? { force_transient: true, urans_fidelity: "precalc" as const }
             : {}),
         },
@@ -316,7 +318,12 @@ async function withFixture(
                     converged: !(failedPoints && alpha >= 7),
                   }
                 : {}),
-              ...(includeHistory && !periodicHistory
+              ...(tinyHistory ? {
+                unsteady: true,
+                force_history: { t: [0,0.01,0.02], cl: [0.12,0.13,0.11],
+                  cd: [0.03,0.031,0.029], cm: [-0.01,-0.011,-0.009] },
+              } : {}),
+              ...(includeHistory && !periodicHistory && !tinyHistory
                 ? {
                     steady_history: {
                       iterations: Array.from({ length: 1100 }, (_, i) => i + 1),
@@ -1274,10 +1281,11 @@ it("runs CLI help and refuses ambiguous flags before connecting to a database", 
   });
 }, 30000);
 
-it.each(["steady", "periodic", "contended"])(
+it.each(["steady", "periodic", "contended", "tiny received", "tiny undelivered"])(
   "reads and migrates the %s attempt through its actual worker report and rejects stale custody",
   async (kind) => {
     const periodic = kind === "periodic";
+    const tiny = kind.startsWith("tiny");
     const root = await mkdtemp(join(tmpdir(), "hz-attempt-report-"));
     vi.stubEnv("AIRFOILFOAM_REPORT_VOLUME_DIR", root);
     const network = vi.spyOn(globalThis, "fetch");
@@ -1327,12 +1335,17 @@ it.each(["steady", "periodic", "contended"])(
             sql`UPDATE sync_sweep_promises SET status='cancelled'`,
           );
           await db.execute(
-            sql`UPDATE result_attempts SET regime=${periodic ? "urans" : "rans"} WHERE id=${id}::uuid`,
+            sql`UPDATE result_attempts SET regime=${periodic || tiny ? "urans" : "rans"} WHERE id=${id}::uuid`,
           );
           const ack = { ...receipt(p), storageOnly: true };
-          await db.execute(sql`INSERT INTO progressive_worker_hub_receipts VALUES(${input.executionId}::uuid,${p.sequence},
+          if (kind !== "tiny undelivered") await db.execute(sql`INSERT INTO progressive_worker_hub_receipts VALUES(${input.executionId}::uuid,${p.sequence},
         ${id}::uuid,${p.pointContentSignature},${JSON.stringify(ack)}::jsonb)`);
           const source = await readStoredAttemptEvidenceText(db, id);
+          if (tiny) {
+            await verifyHzAttemptTransition(db,id,input,source,root,full,false,undefined,false,
+              kind === "tiny undelivered" ? "failed" : "received");
+            return;
+          }
           const read = () =>
             readStoredAttemptEvidenceText(db, id, { source: "worker-report" });
           await expect(read()).rejects.toThrow("archive");
@@ -1386,7 +1399,8 @@ it.each(["steady", "periodic", "contended"])(
           includeHistory: true,
           pendingCount: kind === "contended" ? 2 : 1,
           periodicHistory: periodic,
-          failedPoints: periodic,
+          tinyHistory: tiny,
+          failedPoints: periodic || tiny,
         },
       );
     } finally {

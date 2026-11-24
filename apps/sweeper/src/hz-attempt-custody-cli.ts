@@ -66,14 +66,14 @@ export async function attemptWorkerOperation(db: DB, r: Record<string, any>) {
         coalesce(sum(e.net_value_bytes_saved),0)::text AS "netValueBytesReclaimed",coalesce(sum((p.projection->>'removedLogicalBytes')::bigint),0)::text AS "removedLogicalBytes"
         FROM result_attempts a JOIN attempt_evidence_storage_events e ON e.id=a.evidence_storage_event_id AND e.archive_id=a.evidence_archive_id AND e.result_attempt_id=a.id
         JOIN attempt_evidence_history_projections p ON p.result_attempt_id=a.id AND p.archive_id=e.archive_id
-        WHERE e.action='shorten' AND e.completed AND e.verification#>>'{dependencies,verifier}' IN ('server-consumers/hz-worker-steady-rans-v1','server-consumers/hz-retained-original-v2','server-consumers/hz-settled-receipt-v3')`);
+        WHERE e.action='shorten' AND e.completed AND e.verification#>>'{dependencies,verifier}' IN ('server-consumers/hz-worker-steady-rans-v1','server-consumers/hz-retained-original-v2','server-consumers/hz-settled-receipt-v3','server-consumers/hz-closed-undelivered-v1')`);
       return row;
     }
     case "pending": {
       const after = r.afterEvent === undefined ? null : exactId(r.afterEvent);
       return db.execute(sql`SELECT a.id::text AS id,e.id::text AS event FROM attempt_evidence_storage_events e JOIN result_attempts a
         ON a.evidence_storage_event_id=e.id AND a.evidence_archive_id=e.archive_id AND a.id=e.result_attempt_id
-  WHERE e.action='shorten' AND e.completed AND e.app_readback_at IS NULL AND e.verification#>>'{dependencies,verifier}' IN ('server-consumers/hz-worker-steady-rans-v1','server-consumers/hz-retained-original-v2','server-consumers/hz-settled-receipt-v3')
+  WHERE e.action='shorten' AND e.completed AND e.app_readback_at IS NULL AND e.verification#>>'{dependencies,verifier}' IN ('server-consumers/hz-worker-steady-rans-v1','server-consumers/hz-retained-original-v2','server-consumers/hz-settled-receipt-v3','server-consumers/hz-closed-undelivered-v1')
   ${r.attemptId === undefined ? sql`` : sql`AND a.id=${exactId(r.attemptId)}::uuid`}
   ${after === null ? sql`ORDER BY e.created_at,e.id LIMIT 8` : sql`AND e.id>${after}::uuid ORDER BY e.id LIMIT 1`}`);
     }

@@ -212,6 +212,38 @@ continue under their existing policies.
 Use `attempt_evidence_read_projections` and `attempt_evidence_read_events` for
 the expanded documents, including legacy rows. The event's source, remaining,
 projection and verification byte fields come from the stored PostgreSQL values.
-The same per-owner floor applies to the retry. A row below that floor retains
-its original arrays online. Heap, index and filesystem measurements have their
-own accounting.
+The same per-owner floor applies to the 0233 retry. Heap, index and filesystem
+measurements have their own accounting.
+
+## Registered originals with less than 4 KiB of numerical history
+
+Migration 0237 lets each role retire the arrays from settled attempts with a
+nonempty, generation-pinned original and less than 4,096 inventoried history
+bytes. The storage CLI accepts `enable-tiny-histories --id ATTEMPT_UUID` for
+one canary and `enable-tiny-histories` for continuous processing. The ordinary
+hub and registered-worker controllers also discover later originals. Turning
+off new writes with `disable-tiny-histories` preserves existing reads and
+exact restoration.
+
+The attempt points to the existing 0207 object. Its sparse projection uses the
+leaf hashes already in that catalog. The storage event retains the signed
+dependency fields and the actual two readback times. A matching point and stop
+share their signed sequence and digest in the stored proof. SQL compares the
+decoded proof with the full submitted PostgreSQL document before retaining the
+smaller encoding. The original app, fitting, publication and replay readers
+continue to receive the full evidence.
+
+A closed worker delivery can have an acknowledged execution report and a
+recorded scope-closed conflict on an individual point. For that case the worker
+authenticates the exact assigned source and final stop, the staged point,
+physical columns and the archived PostgreSQL text. It verifies that ordinary
+replay would requeue the failure and leaves the delivery disposition intact.
+The event contains the worker identity and recorded failure. Any later hub
+acknowledgement still uses ordinary evidence delivery.
+
+Some small arrays occupy fewer PostgreSQL bytes than the metadata needed to
+verify their removal. These events report their signed net value-byte change,
+including a cost when it is negative. The actual GCS generation remains the
+restore source. Opening a job, changing its signed ownership, losing a
+generation, or failing a scientific read prevents the transition or triggers
+the existing exact-source recovery.
