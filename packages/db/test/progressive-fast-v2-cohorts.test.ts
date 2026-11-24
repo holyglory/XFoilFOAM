@@ -3,6 +3,8 @@ import { sql } from "drizzle-orm";
 import { describe, expect, it } from "vitest";
 import { createClient, type DB } from "../src/client";
 import { advanceGeneration } from "../src/progressive-campaigns";
+import { readFastV2BenchmarkReport } from "../src/progressive-fast-v2-benchmark";
+import { SOURCE_GEOMETRY_POLICY_VERSION } from "../src/progressive-evidence-geometry";
 import { advanceProgressiveCfdStages } from "../src/progressive-cfd-stages";
 import {
   adoptProgressiveSubsonicPriority,
@@ -20,6 +22,7 @@ async function withCohortFixture(
     preciseCampaignId: string;
     preciseGenerationId: string;
   }) => Promise<void>,
+  benchmarkAngles: number[] = [-4, 7],
 ) {
   const client = createClient({ max: 1 });
   try {
@@ -61,8 +64,9 @@ async function withCohortFixture(
         await db.execute(sql`INSERT INTO progressive_generations
           (id,campaign_id,epoch_id,plan_revision_id,benchmark_only,stage,status,scope_signature)
           VALUES (${generationId},${benchmarkOnly ? campaignId : preciseCampaignId},${epochId},${planId},${benchmarkOnly},${benchmarkOnly ? 1 : 3},'active',${`sealed-${generationId}`})`);
+        const angles = benchmarkOnly ? benchmarkAngles : [-4, 7];
         await db.execute(sql`INSERT INTO progressive_generation_targets VALUES
-          (${generationId},${targetId},${randomUUID()},ARRAY[-4,7]::double precision[],
+          (${generationId},${targetId},${randomUUID()},ARRAY[${sql.join(angles.map(alpha => sql`${alpha}::double precision`), sql`,`)}],
           ${JSON.stringify({ fast: { recipeId: generationId === generations[1] ? "fast-v2" : "current-fast" }, precise: { recipeId: "unchanged-precise", solverProcesses: 4 } })}::jsonb)`);
         for (const stage of benchmarkOnly ? [1, 2] : [1, 2, 3]) {
           await db.execute(sql`INSERT INTO progressive_work VALUES
@@ -81,6 +85,38 @@ async function withCohortFixture(
     });
   } finally {
     await client.sql.end();
+  }
+}
+
+async function installStageTables(db: DB) {
+  await db.execute(sql`ALTER TABLE sim_campaigns
+    ADD COLUMN "createdAt" timestamptz NOT NULL DEFAULT clock_timestamp(),
+    ADD COLUMN "updatedAt" timestamptz,
+    ADD COLUMN "completedAt" timestamptz`);
+  await db.execute(sql`ALTER TABLE progressive_generations
+    ADD COLUMN created_at timestamptz NOT NULL DEFAULT clock_timestamp()`);
+  await db.execute(sql`ALTER TABLE progressive_work
+    ADD COLUMN error text, ADD COLUMN completed_at timestamptz`);
+  await db.execute(sql`ALTER TABLE progressive_generation_cohorts
+    ADD COLUMN adaptive_fast_deferred boolean NOT NULL DEFAULT false`);
+  await db.execute(sql`DROP TABLE progressive_cfd_units`);
+  for (const table of [
+    "progressive_cfd_units",
+    "progressive_cfd_attempts",
+    "progressive_cfd_execution_stops",
+    "progressive_cfd_evidence",
+    "progressive_cfd_evidence_reuses",
+    "progressive_prediction_links",
+    "neuralfoil_predictions",
+    "progressive_polar_fit_work",
+    "progressive_polar_geometry_verifications",
+    "progressive_polar_models",
+    "progressive_cfd_stage_decisions",
+    "progressive_scope_requests",
+  ]) {
+    await db.execute(sql`CREATE TEMP TABLE ${sql.identifier(table)}
+      (LIKE public.${sql.identifier(table)} INCLUDING DEFAULTS INCLUDING CONSTRAINTS INCLUDING INDEXES)
+      ON COMMIT DROP`);
   }
 }
 
@@ -353,37 +389,151 @@ describe.skipIf(!process.env.DATABASE_URL)(
       });
     });
 
+
+    it("settles physically stopped benchmark gaps with exhausted measured angles beside 8,208 open precise units", async () => {
+      const grid = Array.from({ length: 26 }, (_, index) => index - 5);
+      await withCohortFixture(async ({ db, campaignId, generations, preciseGenerationId }) => {
+        await installStageTables(db);
+        await db.execute(sql`ALTER TABLE progressive_generations ADD COLUMN scope_key text`);
+        await db.execute(sql`UPDATE progressive_generations SET scope_key='fast-v2-benchmark:test:' ||
+          CASE WHEN id=${generations[0]}::uuid THEN 'current-fast' ELSE 'fast-v2' END
+          WHERE campaign_id=${campaignId}`);
+        await db.execute(sql`UPDATE progressive_work SET state='complete'
+          WHERE generation_id IN (${generations[0]},${generations[1]}) AND stage=1`);
+        await adoptProgressiveSubsonicPriority(db, campaignId);
+
+        // A separate, current precise generation owns the open backlog.
+        const backlog = randomUUID();
+        await db.execute(sql`INSERT INTO progressive_generations
+          (id,campaign_id,epoch_id,plan_revision_id,benchmark_only,stage,status,scope_signature)
+          SELECT ${backlog},campaign_id,epoch_id,plan_revision_id,false,3,'active','precise-backlog'
+          FROM progressive_generations WHERE id=${preciseGenerationId}`);
+        await db.execute(sql`INSERT INTO progressive_generation_targets
+          SELECT ${backlog},md5('other-target-' || n),gen_random_uuid(),
+            ARRAY(SELECT generate_series(-5,10))::double precision[],source.recipes
+          FROM generate_series(1,513) n CROSS JOIN progressive_generation_targets source
+          WHERE source.generation_id=${preciseGenerationId}`);
+        await db.execute(sql`INSERT INTO progressive_work(id,generation_id,target_id,stage,state)
+          SELECT gen_random_uuid(),generation_id,target_id,3,'pending' FROM progressive_generation_targets WHERE generation_id=${backlog}`);
+        await db.execute(sql`INSERT INTO progressive_cfd_units
+          (work_id,aoa_deg,ordinal,purpose,recipe,reason,policy_version,active_budget_seconds)
+          SELECT work.id,angle,ordinal-1,'precise',scope.recipes->'precise','sealed grid','test',43200
+          FROM progressive_generation_targets scope JOIN progressive_work work USING (generation_id,target_id)
+          CROSS JOIN LATERAL unnest(scope.angles) WITH ORDINALITY a(angle,ordinal)
+          WHERE scope.generation_id=${backlog}`);
+
+        await db.execute(sql`INSERT INTO progressive_cfd_units
+          (work_id,aoa_deg,ordinal,purpose,recipe,reason,policy_version,active_budget_seconds,active_seconds,attempts,state)
+          SELECT work.id,angle,ordinal-1,CASE WHEN ordinal <= 2 THEN 'initial' ELSE 'adaptive' END,
+            scope.recipes->'fast','sealed benchmark','test',900,20,1,CASE WHEN angle=7 THEN 'complete' ELSE 'gap' END
+          FROM progressive_generation_targets scope JOIN progressive_work work USING (generation_id,target_id)
+          JOIN progressive_generations generation ON generation.id=work.generation_id
+          CROSS JOIN unnest(ARRAY[-4,7,14,13,16]) WITH ORDINALITY a(angle,ordinal)
+          WHERE generation.benchmark_only AND work.stage=2`);
+        await db.execute(sql`INSERT INTO progressive_cfd_attempts
+          (token,unit_id,owner,lease_until,outcome,active_seconds,finished_at,sim_job_id)
+          SELECT gen_random_uuid(),id,'test',now(),CASE WHEN state='complete' THEN 'complete' ELSE 'failed' END,
+            active_seconds,now(),gen_random_uuid() FROM progressive_cfd_units WHERE purpose <> 'precise'`);
+        await db.execute(sql`INSERT INTO sim_jobs SELECT attempt.sim_job_id,${campaignId},
+          CASE WHEN unit.state='complete' THEN 'done' ELSE 'failed' END,unit.recipe
+          FROM progressive_cfd_attempts attempt JOIN progressive_cfd_units unit ON unit.id=attempt.unit_id`);
+        await db.execute(sql`INSERT INTO progressive_cfd_evidence
+          (attempt_token,result_attempt_id,evidence_signature,solver_active_seconds)
+          SELECT token,gen_random_uuid(),encode(sha256(uuid_send(token)),'hex'),active_seconds FROM progressive_cfd_attempts`);
+        await db.execute(sql`CREATE TEMP TABLE result_attempts ON COMMIT DROP AS
+          SELECT id,result_id,aoa_deg,regime,"createdAt",status,valid_for_polar,cl,cd,cm FROM public.result_attempts WITH NO DATA`);
+        await db.execute(sql`CREATE TEMP TABLE result_classifications ON COMMIT DROP AS
+          SELECT id,result_attempt_id,"createdAt",state FROM public.result_classifications WITH NO DATA`);
+        await db.execute(sql`INSERT INTO result_attempts
+          SELECT evidence.result_attempt_id,gen_random_uuid(),unit.aoa_deg,'rans',now(),
+            (CASE WHEN unit.state='complete' THEN 'done' ELSE 'failed' END)::result_status,unit.state='complete',
+            CASE WHEN unit.state='complete' THEN 1.01 END,CASE WHEN unit.state='complete' THEN 0.04 END,
+            CASE WHEN unit.state='complete' THEN -0.07 END
+          FROM progressive_cfd_evidence evidence JOIN progressive_cfd_attempts attempt ON attempt.token=evidence.attempt_token
+          JOIN progressive_cfd_units unit ON unit.id=attempt.unit_id`);
+        await db.execute(sql`INSERT INTO result_classifications
+          SELECT gen_random_uuid(),id,now(),'accepted' FROM result_attempts WHERE valid_for_polar`);
+
+        const prediction = "a".repeat(64);
+        const [target] = await db.execute(sql`SELECT target_id FROM progressive_generation_targets WHERE generation_id=${generations[0]}`);
+        await db.execute(sql`INSERT INTO neuralfoil_predictions(id,epoch_id,target_id,payload)
+          SELECT ${prediction},id,${target.target_id},'{"kind":"prediction","method":"neuralfoil","cfd_evidence":false}'::jsonb FROM calculation_epochs`);
+        await db.execute(sql`INSERT INTO progressive_prediction_links SELECT work.id,${prediction}
+          FROM progressive_work work JOIN progressive_generations generation ON generation.id=work.generation_id
+          WHERE generation.benchmark_only AND work.stage=1`);
+        const [contributor] = await db.execute(sql`SELECT evidence_signature,result_attempt_id FROM progressive_cfd_evidence
+          JOIN result_attempts raw ON raw.id=result_attempt_id WHERE valid_for_polar LIMIT 1`);
+        const exhaustedModel = "b".repeat(64);
+        const openModel = "c".repeat(64);
+        const partialGridModel = "d".repeat(64);
+        for (const [id, candidateAngles] of [
+          [exhaustedModel, [16]], [openModel, [15, 16]], [partialGridModel, [16]],
+        ] as const) {
+          const response = { estimate: { version: "progressive-polar-gp-v2", target_signature: target.target_id,
+            alpha: id === partialGridModel ? grid.slice(1) : grid,
+            contributors: [{ attempt_id: contributor.result_attempt_id, evidence_signature: contributor.evidence_signature }],
+            acquisition: { version: "fixed-posterior-coverage-v1", status: "available",
+              candidates: candidateAngles.map(alpha => ({ alpha, integrated_variance_reduction_fraction: 0.8 })) } } };
+          await db.execute(sql`INSERT INTO progressive_polar_models(id,prediction_id,source_signature,request,response)
+            VALUES (${id},${prediction},${contributor.evidence_signature},'{}'::jsonb,${JSON.stringify(response)}::jsonb)`);
+          await db.execute(sql`INSERT INTO progressive_polar_geometry_verifications(model_id,policy_version,source_geometry_compatible)
+            VALUES (${id},${SOURCE_GEOMETRY_POLICY_VERSION},true)`);
+        }
+        await db.execute(sql`INSERT INTO progressive_polar_fit_work(prediction_id,state,model_id) VALUES (${prediction},'ready',${exhaustedModel})`);
+        await db.execute(sql`ANALYZE progressive_cfd_units`);
+        await db.execute(sql`ANALYZE progressive_work`);
+
+        const immutable = await sealedState(db);
+        const before = await readFastV2BenchmarkReport(db, campaignId);
+        expect(before.status).toBe("running");
+        // A terminal database unit still waits for its physical stop proof.
+        expect(await advanceProgressiveCfdStages(db)).toMatchObject({ admitted: 0, closed: 0 });
+        await db.execute(sql`INSERT INTO progressive_cfd_execution_stops
+          (sim_job_id,engine_job_id,epoch_id,proof,proof_signature,observed_at)
+          SELECT sim_job_id,sim_job_id::text,epoch.id,'{"execution_stopped":true}'::jsonb,
+            encode(sha256(uuid_send(sim_job_id)),'hex'),now() FROM progressive_cfd_attempts CROSS JOIN calculation_epochs epoch`);
+
+        // A genuinely untried measured angle follows normal admission. Roll back this alternative fixture.
+        await db.execute(sql`SAVEPOINT untried_angle`);
+        await db.execute(sql`UPDATE progressive_polar_fit_work SET model_id=${openModel}`);
+        expect(await advanceProgressiveCfdStages(db)).toMatchObject({ admitted: 2, closed: 0 });
+        expect(await db.execute(sql`SELECT aoa_deg FROM progressive_cfd_units WHERE purpose='adaptive' AND state='pending'`))
+          .toEqual([{ aoa_deg: 15 }, { aoa_deg: 15 }]);
+        await db.execute(sql`ROLLBACK TO SAVEPOINT untried_angle`);
+
+        await db.execute(sql`UPDATE progressive_polar_fit_work SET state='pending',model_id=NULL`);
+        expect(await advanceProgressiveCfdStages(db)).toMatchObject({ admitted: 0, closed: 0 });
+        await db.execute(sql`UPDATE progressive_polar_fit_work SET state='ready',model_id=${partialGridModel}`);
+        expect(await advanceProgressiveCfdStages(db)).toMatchObject({ admitted: 0, closed: 0 });
+        await db.execute(sql`UPDATE progressive_polar_fit_work SET model_id=${exhaustedModel}`);
+
+        // A gap without a retained execution attempt cannot exhaust a measured candidate.
+        await db.execute(sql`SAVEPOINT missing_attempt`);
+        await db.execute(sql`DELETE FROM progressive_cfd_attempts attempt USING progressive_cfd_units unit
+          WHERE unit.id=attempt.unit_id AND unit.aoa_deg=16`);
+        expect(await advanceProgressiveCfdStages(db)).toMatchObject({ admitted: 0, closed: 0 });
+        await db.execute(sql`ROLLBACK TO SAVEPOINT missing_attempt`);
+        expect(await advanceProgressiveCfdStages(db)).toMatchObject({ admitted: 0, closed: 2 });
+        expect(await advanceProgressiveCfdStages(db)).toMatchObject({ admitted: 0, closed: 0 });
+        const after = await readFastV2BenchmarkReport(db, campaignId);
+        expect(after).toMatchObject({ status: "inconclusive", preciseWorkCreated: false, summary: {
+          unfinishedCases: 0, unfinishedPoints: 0, failedAttempts: 8, runningAttempts: 0,
+          finalComparison: { status: "inconclusive", allAttemptCostRatio: null, speedup: null },
+        } });
+        expect(after.cases[0]).toMatchObject({ speedup: null, coefficientDeltas: before.cases[0]!.coefficientDeltas,
+          accuracy: { matchedPoints: 1, physicalTruthCertified: false }, firstPassTiming: before.cases[0]!.firstPassTiming });
+        const decisions = await db.execute(sql`SELECT work.state,decision.kind,decision.reason,decision.candidate_alpha
+          FROM progressive_cfd_stage_decisions decision JOIN progressive_work work ON work.id=decision.work_id`);
+        expect(decisions).toEqual(Array(2).fill({ state: "gap", kind: "close_fast", candidate_alpha: null,
+          reason: "fast_acquisition_candidates_already_attempted" }));
+        expect(await sealedState(db)).toEqual(immutable);
+        expect(await db.execute(sql`SELECT count(*)::int AS open FROM progressive_cfd_units WHERE state='pending'`)).toEqual([{ open: 8208 }]);
+      }, grid);
+    });
+
     it.each([2, 3])("appends immutable stage-%s closure history after the same units are reopened", async (stage) => {
       await withCohortFixture(async ({ db, generations, preciseGenerationId }) => {
-        await db.execute(sql`ALTER TABLE sim_campaigns
-          ADD COLUMN "createdAt" timestamptz NOT NULL DEFAULT clock_timestamp(),
-          ADD COLUMN "updatedAt" timestamptz,
-          ADD COLUMN "completedAt" timestamptz`);
-        await db.execute(sql`ALTER TABLE progressive_generations
-          ADD COLUMN created_at timestamptz NOT NULL DEFAULT clock_timestamp()`);
-        await db.execute(sql`ALTER TABLE progressive_work
-          ADD COLUMN error text, ADD COLUMN completed_at timestamptz`);
-        await db.execute(sql`ALTER TABLE progressive_generation_cohorts
-          ADD COLUMN adaptive_fast_deferred boolean NOT NULL DEFAULT false`);
-        await db.execute(sql`DROP TABLE progressive_cfd_units`);
-        for (const table of [
-          "progressive_cfd_units",
-          "progressive_cfd_attempts",
-          "progressive_cfd_execution_stops",
-          "progressive_cfd_evidence",
-          "progressive_cfd_evidence_reuses",
-          "progressive_prediction_links",
-          "neuralfoil_predictions",
-          "progressive_polar_fit_work",
-          "progressive_polar_geometry_verifications",
-          "progressive_polar_models",
-          "progressive_cfd_stage_decisions",
-          "progressive_scope_requests",
-        ]) {
-          await db.execute(sql`CREATE TEMP TABLE ${sql.identifier(table)}
-            (LIKE public.${sql.identifier(table)} INCLUDING DEFAULTS INCLUDING CONSTRAINTS INCLUDING INDEXES)
-            ON COMMIT DROP`);
-        }
+        await installStageTables(db);
         const generationId = stage === 2 ? generations[0] : preciseGenerationId;
         await db.execute(sql`UPDATE progressive_work SET state='complete'
           WHERE generation_id=${generationId}::uuid AND stage < ${stage}`);

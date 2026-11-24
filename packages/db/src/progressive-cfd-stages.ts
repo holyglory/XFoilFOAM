@@ -1,6 +1,6 @@
 import { nextFastAnchor, PROGRESSIVE_COMPUTE_POLICY } from "@aerodb/core";
 import type { ProgressivePolarEstimate } from "../../engine-client/src/progressive-polar";
-import { sql } from "drizzle-orm";
+import { sql, type SQL } from "drizzle-orm";
 import { canonicalAnalysisJson } from "./analysis-target";
 import type { DB } from "./client";
 import { tryProgressiveAdmissionLock } from "./progressive-admission-lock";
@@ -19,7 +19,7 @@ export const ADAPTIVE_FAST_REFINEMENT_DEFERRED_ERROR =
   "adaptive fast refinement deferred before precise low-Mach stage";
 const PROGRESSIVE_STAGE_OPEN_UNIT_THRESHOLD = 8192;
 
-async function finishCampaigns(db: DB, epochId: string): Promise<number> {
+async function finishCampaigns(db: DB, epochId: string, campaignId?: string): Promise<number> {
   const completed = await db.execute(sql`
     WITH settled AS (
       SELECT campaign.id, CASE WHEN EXISTS (
@@ -28,6 +28,7 @@ async function finishCampaigns(db: DB, epochId: string): Promise<number> {
           AND generation.status = 'attention'
       ) THEN 'attention' ELSE 'completed' END AS status
       FROM sim_campaigns campaign WHERE campaign.status IN ('active', 'attention')
+        ${campaignId ? sql`AND campaign.id=${campaignId}::uuid` : sql``}
         AND (campaign.status = 'active' OR NOT EXISTS (SELECT 1 FROM progressive_generations generation
           WHERE generation.campaign_id = campaign.id AND generation.epoch_id = ${epochId}
             AND generation.plan_revision_id = campaign.current_plan_revision_id AND generation.status = 'attention'))
@@ -44,6 +45,45 @@ async function finishCampaigns(db: DB, epochId: string): Promise<number> {
       FROM settled WHERE campaign.id = settled.id AND campaign.status <> settled.status RETURNING campaign.id
   `);
   return completed.length;
+}
+
+/** Restrict the large-backlog benchmark pass to its work and targets. Evidence
+ * from the same target retains its ordinary epoch and reuse checks. */
+function stageReadinessInputs(epochId: string, benchmarkCampaigns?: SQL) {
+  return sql`${benchmarkCampaigns ? sql`benchmark_stage_work AS MATERIALIZED (
+        SELECT work.id, work.target_id FROM progressive_generations generation
+        JOIN progressive_work work ON work.generation_id=generation.id
+        JOIN sim_campaigns campaign ON campaign.id=generation.campaign_id
+        WHERE generation.benchmark_only AND generation.epoch_id=${epochId}::uuid AND generation.status='active'
+          AND generation.plan_revision_id=campaign.current_plan_revision_id AND generation.campaign_id IN (${benchmarkCampaigns})
+          AND work.stage=2 AND work.state='pending'
+      ),` : sql``} progressive_stage_unsettled_units AS MATERIALIZED (
+        SELECT DISTINCT attempt.unit_id
+        FROM progressive_cfd_attempts attempt
+        ${benchmarkCampaigns ? sql`JOIN progressive_cfd_units selected_unit ON selected_unit.id=attempt.unit_id
+          JOIN benchmark_stage_work selected ON selected.id=selected_unit.work_id` : sql``}
+        LEFT JOIN progressive_cfd_execution_stops stopped ON stopped.sim_job_id = attempt.sim_job_id
+        WHERE attempt.outcome = 'running'
+          OR (attempt.sim_job_id IS NOT NULL AND stopped.sim_job_id IS NULL)
+      ), progressive_stage_evidence_targets AS MATERIALIZED (
+        SELECT DISTINCT source_work.target_id
+        FROM progressive_cfd_evidence evidence
+        JOIN progressive_cfd_attempts source_attempt ON source_attempt.token = evidence.attempt_token
+        JOIN progressive_cfd_units source_unit ON source_unit.id = source_attempt.unit_id
+        JOIN progressive_work source_work ON source_work.id = source_unit.work_id
+        JOIN progressive_generations source_generation ON source_generation.id = source_work.generation_id
+        WHERE source_generation.epoch_id = ${epochId}
+        ${benchmarkCampaigns ? sql`AND source_work.target_id IN (SELECT target_id FROM benchmark_stage_work)` : sql``}
+        UNION
+        SELECT DISTINCT successor_work.target_id
+        FROM progressive_cfd_evidence_reuses reuse
+        JOIN progressive_cfd_units successor_unit ON successor_unit.id = reuse.successor_unit_id
+        JOIN progressive_work successor_work ON successor_work.id = successor_unit.work_id
+        JOIN progressive_generations successor_generation ON successor_generation.id = successor_work.generation_id
+        WHERE successor_generation.epoch_id = ${epochId}
+          AND successor_generation.status <> 'cancelled'
+          ${benchmarkCampaigns ? sql`AND successor_work.target_id IN (SELECT target_id FROM benchmark_stage_work)` : sql``}
+      )`;
 }
 
 export async function advanceProgressiveCfdStages(db: DB) {
@@ -146,35 +186,39 @@ export async function advanceProgressiveCfdStages(db: DB) {
         AND unit.state NOT IN ('complete', 'gap')
       OFFSET ${PROGRESSIVE_STAGE_OPEN_UNIT_THRESHOLD} LIMIT 1
     `);
-    if (largeOpenCurrentStage && !settledCurrentStage)
-      return { ...receipt, waiting: 1 };
+    let benchmarkCampaigns: SQL | undefined;
+    if (largeOpenCurrentStage && !settledCurrentStage) {
+      // Fast-only benchmarks have no later precise work to wake this pass.
+      const candidates = await connection.execute<{ id: string }>(sql`
+        SELECT campaign.id FROM sim_campaigns campaign
+        WHERE campaign.status IN ('active','attention','paused') AND EXISTS (
+          SELECT 1 FROM progressive_generations generation
+          JOIN progressive_work work ON work.generation_id=generation.id
+          WHERE generation.campaign_id=campaign.id AND generation.epoch_id=${epoch.id}
+            AND generation.plan_revision_id=campaign.current_plan_revision_id
+            AND generation.status='active' AND generation.benchmark_only
+            AND work.stage=2 AND work.state='pending' AND work.stage=${effectiveProgressiveStageSql()}
+            AND EXISTS (SELECT 1 FROM progressive_cfd_units u WHERE u.work_id=work.id)
+            AND NOT EXISTS (SELECT 1 FROM progressive_cfd_units u WHERE u.work_id=work.id AND u.state NOT IN ('complete','gap'))
+            AND NOT EXISTS (
+              SELECT 1 FROM progressive_cfd_units u JOIN progressive_cfd_attempts attempt ON attempt.unit_id=u.id
+              LEFT JOIN progressive_cfd_execution_stops stopped ON stopped.sim_job_id=attempt.sim_job_id
+              WHERE u.work_id=work.id AND (attempt.outcome='running'
+                OR (attempt.sim_job_id IS NOT NULL AND stopped.sim_job_id IS NULL))
+            )
+        ) ORDER BY campaign.priority DESC, campaign."createdAt", campaign.id LIMIT 16
+      `);
+      if (!candidates.length) return { ...receipt, waiting: 1 };
+      benchmarkCampaigns = sql.join(candidates.map(c => sql`${c.id}::uuid`), sql`,`);
+    }
+    const withinBenchmark = benchmarkCampaigns ? sql`AND work.id IN (SELECT id FROM benchmark_stage_work)` : sql``;
     const [campaign] = await connection.execute(sql`
-      WITH progressive_stage_unsettled_units AS MATERIALIZED (
-        SELECT DISTINCT attempt.unit_id
-        FROM progressive_cfd_attempts attempt
-        LEFT JOIN progressive_cfd_execution_stops stopped ON stopped.sim_job_id = attempt.sim_job_id
-        WHERE attempt.outcome = 'running'
-          OR (attempt.sim_job_id IS NOT NULL AND stopped.sim_job_id IS NULL)
-      ), progressive_stage_evidence_targets AS MATERIALIZED (
-      SELECT DISTINCT source_work.target_id
-        FROM progressive_cfd_evidence evidence
-        JOIN progressive_cfd_attempts source_attempt ON source_attempt.token = evidence.attempt_token
-        JOIN progressive_cfd_units source_unit ON source_unit.id = source_attempt.unit_id
-        JOIN progressive_work source_work ON source_work.id = source_unit.work_id
-        JOIN progressive_generations source_generation ON source_generation.id = source_work.generation_id
-        WHERE source_generation.epoch_id = ${epoch.id}
-        UNION
-        SELECT DISTINCT successor_work.target_id
-        FROM progressive_cfd_evidence_reuses reuse
-        JOIN progressive_cfd_units successor_unit ON successor_unit.id = reuse.successor_unit_id
-        JOIN progressive_work successor_work ON successor_work.id = successor_unit.work_id
-        JOIN progressive_generations successor_generation ON successor_generation.id = successor_work.generation_id
-        WHERE successor_generation.epoch_id = ${epoch.id}
-          AND successor_generation.status <> 'cancelled'
-      ), candidate_campaigns AS MATERIALIZED (
+      WITH ${stageReadinessInputs(String(epoch.id), benchmarkCampaigns)}, candidate_campaigns AS MATERIALIZED (
         SELECT campaign.id, campaign.priority, campaign."createdAt"
         FROM sim_campaigns campaign
-        WHERE campaign.status IN ('active', 'attention', 'paused') AND EXISTS (
+        WHERE campaign.status IN ('active', 'attention', 'paused')
+          ${benchmarkCampaigns ? sql`AND campaign.id IN (${benchmarkCampaigns})` : sql``}
+          AND EXISTS (
           SELECT 1
           FROM progressive_generations generation
           JOIN progressive_generation_targets scope
@@ -187,7 +231,7 @@ export async function advanceProgressiveCfdStages(db: DB) {
             AND generation.plan_revision_id = campaign.current_plan_revision_id
             AND generation.status = 'active'
             AND work.stage IN (2, 3) AND work.stage = ${effectiveProgressiveStageSql()}
-            AND work.state = 'pending'
+            AND work.state = 'pending' ${withinBenchmark}
             AND EXISTS (SELECT 1 FROM progressive_cfd_units unit WHERE unit.work_id = work.id)
             AND NOT EXISTS (
               SELECT 1 FROM progressive_cfd_units unit
@@ -216,13 +260,14 @@ export async function advanceProgressiveCfdStages(db: DB) {
         LEFT JOIN progressive_stage_evidence_targets evidence_target ON evidence_target.target_id = work.target_id
         WHERE generation.campaign_id = campaign.id AND generation.epoch_id = ${epoch.id}
           AND generation.plan_revision_id = campaign.current_plan_revision_id AND generation.status = 'active'
-          AND work.stage IN (2, 3) AND work.stage = ${effectiveProgressiveStageSql()} AND work.state = 'pending'
+          AND work.stage IN (2, 3) AND work.stage = ${effectiveProgressiveStageSql()} AND work.state = 'pending' ${withinBenchmark}
           AND EXISTS (SELECT 1 FROM progressive_cfd_units unit WHERE unit.work_id = work.id)
           AND NOT EXISTS (SELECT 1 FROM progressive_cfd_units unit WHERE unit.work_id = work.id AND unit.state NOT IN ('complete', 'gap'))
           AND ${ready}
       ) ORDER BY campaign.priority DESC, campaign."createdAt", campaign.id LIMIT 1 FOR UPDATE SKIP LOCKED
     `);
     if (!campaign) {
+      if (benchmarkCampaigns) return { ...receipt, waiting: 1 };
       receipt.campaignsCompleted = await finishCampaigns(
         connection,
         String(epoch.id),
@@ -230,34 +275,12 @@ export async function advanceProgressiveCfdStages(db: DB) {
       return receipt;
     }
     const scopes = await connection.execute(sql`
-      WITH progressive_stage_unsettled_units AS MATERIALIZED (
-        SELECT DISTINCT attempt.unit_id
-        FROM progressive_cfd_attempts attempt
-        LEFT JOIN progressive_cfd_execution_stops stopped ON stopped.sim_job_id = attempt.sim_job_id
-        WHERE attempt.outcome = 'running'
-          OR (attempt.sim_job_id IS NOT NULL AND stopped.sim_job_id IS NULL)
-      ), progressive_stage_evidence_targets AS MATERIALIZED (
-        SELECT DISTINCT source_work.target_id
-        FROM progressive_cfd_evidence evidence
-        JOIN progressive_cfd_attempts source_attempt ON source_attempt.token = evidence.attempt_token
-        JOIN progressive_cfd_units source_unit ON source_unit.id = source_attempt.unit_id
-        JOIN progressive_work source_work ON source_work.id = source_unit.work_id
-        JOIN progressive_generations source_generation ON source_generation.id = source_work.generation_id
-        WHERE source_generation.epoch_id = ${epoch.id}
-        UNION
-        SELECT DISTINCT successor_work.target_id
-        FROM progressive_cfd_evidence_reuses reuse
-        JOIN progressive_cfd_units successor_unit ON successor_unit.id = reuse.successor_unit_id
-        JOIN progressive_work successor_work ON successor_work.id = successor_unit.work_id
-        JOIN progressive_generations successor_generation ON successor_generation.id = successor_work.generation_id
-        WHERE successor_generation.epoch_id = ${epoch.id}
-          AND successor_generation.status <> 'cancelled'
-      ), ${progressiveCohortReadinessSql(
+      WITH ${stageReadinessInputs(String(epoch.id), benchmarkCampaigns && sql`${campaign.id}::uuid`)}, ${progressiveCohortReadinessSql(
         String(epoch.id),
         sql`generation.campaign_id = ${campaign.id}`,
         false,
       )}
-      SELECT work.id, work.generation_id, work.target_id, work.stage, work.error AS work_error,
+      SELECT work.id, work.generation_id, work.target_id, work.stage, work.error AS work_error, generation.benchmark_only,
         EXISTS (
           SELECT 1 FROM progressive_generation_cohorts deferred
           WHERE deferred.generation_id = generation.id AND deferred.cohort = 'low'
@@ -287,7 +310,7 @@ export async function advanceProgressiveCfdStages(db: DB) {
       LEFT JOIN progressive_stage_evidence_targets evidence_target ON evidence_target.target_id = work.target_id
       WHERE generation.campaign_id = ${campaign.id} AND generation.epoch_id = ${epoch.id}
         AND generation.plan_revision_id = (SELECT current_plan_revision_id FROM sim_campaigns WHERE id = ${campaign.id})
-        AND generation.status = 'active' AND work.stage IN (2, 3) AND work.stage = ${effectiveProgressiveStageSql()} AND work.state = 'pending'
+        AND generation.status = 'active' AND work.stage IN (2, 3) AND work.stage = ${effectiveProgressiveStageSql()} AND work.state = 'pending' ${withinBenchmark}
         AND EXISTS (SELECT 1 FROM progressive_cfd_units unit WHERE unit.work_id = work.id)
         AND NOT EXISTS (SELECT 1 FROM progressive_cfd_units unit WHERE unit.work_id = work.id AND unit.state NOT IN ('complete', 'gap'))
         AND ${ready}
@@ -457,7 +480,19 @@ export async function advanceProgressiveCfdStages(db: DB) {
                 )
               )
                 reason = "requested_grid_already_observed";
-              else {
+              else if (
+                scope.benchmark_only === true &&
+                model.acquisition.status === "available" &&
+                candidates.length > 0 &&
+                requestedAngles.every((angle) => model.alpha.includes(angle)) &&
+                candidates.every((candidate) =>
+                  units.some((unit) => unit.has_attempt === true && Number(unit.aoa_deg) === candidate.alpha),
+                )
+              ) {
+                // Failed anchors remain gaps. The fitted grid has no further
+                // measured, unattempted candidate in the sealed request.
+                reason = "fast_acquisition_candidates_already_attempted";
+              } else {
                 receipt.waiting += 1;
                 continue;
               }
@@ -531,6 +566,7 @@ export async function advanceProgressiveCfdStages(db: DB) {
     receipt.campaignsCompleted = await finishCampaigns(
       connection,
       String(epoch.id),
+      benchmarkCampaigns ? String(campaign.id) : undefined,
     );
     return receipt;
   });
