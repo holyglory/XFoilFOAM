@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { Readable } from "node:stream";
 import { CRC32C } from "@google-cloud/storage";
-import { expect } from "vitest";
+import { expect, vi } from "vitest";
 import { sql } from "drizzle-orm";
 import { createClient, type DB } from "@aerodb/db/client";
 import { verifyProgressiveRemoteExecution } from "@aerodb/db";
@@ -172,25 +172,50 @@ export async function verifyColdPromotionHistory() {
         attempted_aoas: [trigger],
         intentionally_omitted_aoas: [7],
       };
+      const signals: Record<number, typeof signal> = { 7: signal, 8: signal, 9: signal };
+      if (trigger === 0) signals[10] = signal;
       const owner = await fixture({
-        reportCount: 4,
+        reportCount: 10,
         nullPrefix: 2,
+        historyRepeats: 4096,
         angles: [trigger, 7],
         promotionRun: {
           trigger,
           family,
           policy,
-          signals: { 3: signal, 4: signal },
+          // The result changes at 7, repeats through 9, and may or may
+          // not retain the signal in the terminal report.
+          signals,
         },
       });
-      expect(await archive(owner.scope.executionId)).toBe(4);
+      expect(await archive(owner.scope.executionId)).toBe(10);
       if (trigger === 5) {
         corrupt = true;
         await expect(preparePromotionHistory(client.db, owner)).rejects.toThrow(
           "changed pinned",
         );
       }
-      const history = await preparePromotionHistory(client.db, owner);
+      const fullCopies: number[] = [];
+      const nativeParse = JSON.parse;
+      const parse = vi.spyOn(JSON, "parse").mockImplementation((text, reviver) => {
+        const value = nativeParse(text, reviver);
+        if (value?.executionId === owner.scope.executionId && value.result?.job_id === owner.scope.executionId)
+          fullCopies.push(value.sequence);
+        return value;
+      });
+      let history;
+      try {
+        history = await preparePromotionHistory(client.db, owner);
+      } finally {
+        parse.mockRestore();
+      }
+      // Count complete copies at the domain validator while reading the real
+      // registered JSONL root. The sealed per-sequence full digests still apply.
+      expect(fullCopies).toEqual([3, 7, 10]);
+      const lastSignal = trigger === 0 ? 10 : 9;
+      const [original] = await client.sql`SELECT content_signature FROM progressive_remote_reports
+        WHERE sim_job_id=${owner.scope.executionId} AND sequence=${lastSignal}`;
+      expect(history.promotion?.signature).toBe(original.content_signature);
       if (policy === "continue") {
         await expect(
           promotionForSettlement(client.db, owner, history),
@@ -202,7 +227,7 @@ export async function verifyColdPromotionHistory() {
           triggerAoaDeg: trigger,
           attemptedAoas: [trigger],
           intentionallyOmittedAoas: [7],
-          sequence: 4,
+          sequence: lastSignal,
         });
       }
     }

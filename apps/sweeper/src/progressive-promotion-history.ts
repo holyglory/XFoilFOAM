@@ -12,8 +12,10 @@ import {
 import {
   assertProgressiveReportArchiveIdentity,
   parseReportJson,
+  reportJsonObject,
   reportTextIdentity,
   reportValidationValue,
+  splitProgressiveReportText,
   type ProgressiveReportArchiveReadIdentity,
   type ProgressiveReportArchiveEntry,
 } from "@aerodb/db/progressive-report-archive";
@@ -21,6 +23,11 @@ import {
   readProgressiveReport,
   visitInstalledRemoteJsonl,
 } from "@aerodb/db/progressive-report-reader";
+import {
+  canRepeatLiveReport,
+  progressiveRepeatedReportSigner,
+  sameLiveProgressStatus,
+} from "@aerodb/db/progressive-report-publication-batch";
 import { hasProgressStorageColumns } from "./progressive-repeated-progress";
 import { withSharedReportPageReads } from "./shared-report-archive";
 import { validateRansPrecalcPromotionSignal } from "./ingest";
@@ -184,6 +191,42 @@ type Member = {
   bytes: number;
   typedNull: boolean;
 };
+
+// The normal publication signer can authenticate a later running observation
+// from its own status and the exact, already validated result. Limit reuse to
+// the same complete PostgreSQL result token in this physical root.
+function promotionMemberReader(envelope: Assignment) {
+  let previous: {
+    prefix: string;
+    token: string;
+    report: ProgressiveRemoteReport;
+    sign?: ReturnType<typeof progressiveRepeatedReportSigner>;
+  } | undefined;
+  return (text: string) => {
+    if (previous && text.startsWith(previous.prefix) &&
+        text.startsWith(previous.token, previous.prefix.length)) {
+      const suffix = text.slice(previous.prefix.length + previous.token.length);
+      const fields = reportJsonObject(parseReportJson(previous.prefix + "null" + suffix));
+      if (fields.stopProof === null && reportJsonObject(fields.status!).state === "running") {
+        const { report } = validateProgressiveRemoteReport(reportValidationValue(fields), envelope);
+        if (sameLiveProgressStatus(previous.report.status, report.status)) {
+          previous.sign ??= progressiveRepeatedReportSigner(previous.report);
+          return {
+            report: { ...report, result: previous.report.result },
+            contentSignature: previous.sign(report),
+          };
+        }
+      }
+    }
+    previous = undefined;
+    const source = splitProgressiveReportText(text);
+    const checked = validateProgressiveRemoteReport(reportValidationValue(source.report), envelope);
+    if (source.result !== null && checked.report.result && canRepeatLiveReport(checked.report))
+      previous = { prefix: source.prefix, token: source.result, report: checked.report };
+    return checked;
+  };
+}
+
 async function readRoot(
   db: DB,
   envelope: Assignment,
@@ -290,6 +333,7 @@ async function readRoot(
     retainRoot(rootKey, projected);
     return;
   }
+  const readMember = promotionMemberReader(envelope);
   const inspect = (entry: ProgressiveReportArchiveEntry) => {
     if (entry.kind !== "report") return;
     const m = wanted.get(entry.sequence);
@@ -305,10 +349,7 @@ async function readRoot(
       throw new Error(
         "Cold RANS promotion member bytes differ from registration",
       );
-    const checked = validateProgressiveRemoteReport(
-      reportValidationValue(parseReportJson(entry.reportText)),
-      envelope,
-    );
+    const checked = readMember(entry.reportText);
     if (
       checked.contentSignature !== m.signature ||
       checked.report.sequence !== m.sequence
