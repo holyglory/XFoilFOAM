@@ -7,7 +7,15 @@ import subprocess
 import threading
 import time
 from pathlib import Path
-from closed_worker_report_host import MAX_REQUEST, MAX_RESPONSE, ROLE_READS, allowed, receive, send
+from closed_worker_report_host import MAX_REQUEST, MAX_RESPONSE, READ_CONTAINER_STOPPED, ROLE_READS, allowed, receive, send
+
+
+class ReadPeerStopped(RuntimeError):
+    """The exact registered read container was inspected and found stopped."""
+    def __init__(self, role):
+        super().__init__(f"{role} report reader container is stopped")
+        self.role = role
+        self.keys = []
 
 
 class ReadTransportLost(RuntimeError):
@@ -28,8 +36,13 @@ class ReportReadSession:
         self.count=0
         self.initialization_started=time.monotonic()
         try:
-            send(self.child.stdin,{"source":source})
-            ready=receive(self.child.stdout,65536,45)
+            try:
+                send(self.child.stdin, {"source": source})
+                ready = receive(self.child.stdout, 65536, 45)
+            except BrokenPipeError:
+                ready = None
+            if ready is None and self.child.wait(timeout=5) == READ_CONTAINER_STOPPED:
+                raise ReadPeerStopped(role)
             if not ready or ready.get("ready")!=role or ready.get("source")!=digest or ready.get("revision")!=args.runtime_revision:
                 raise RuntimeError("Persistent reader did not verify its installed owner")
             self.boot_ms=ready["bootMs"]
@@ -53,6 +66,8 @@ class ReportReadSession:
             raise ReadTransportLost(f"{role} reader timed out") from error
         if response is None:
             code=self.child.wait(timeout=5)
+            if code == READ_CONTAINER_STOPPED:
+                raise ReadPeerStopped(role)
             if code in (74,255):
                 raise ReadTransportLost(f"{role} reader pipe closed ({code})")
             raise RuntimeError(f"{role} reader refused ({code})")

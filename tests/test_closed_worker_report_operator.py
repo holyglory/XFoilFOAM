@@ -288,12 +288,16 @@ class ClosedReportOperator(unittest.TestCase):
             args=SimpleNamespace(runtime_revision="a"*40,hz_host="worker",hub_host="hub",hz_api="api",hz_sweeper="sweeper",hub_sweeper="sweeper",
                apply=True,limit=3,frozen_scope=scope,frozen_sha256=controller.digest(scope.read_bytes()),keys=inventory,keys_sha256=controller.digest(inventory.read_bytes()),
                state=root/"state",page_members=3,hub_account_file=account)
-            observed=[];lost=[True]
+            observed=[];lost=[True];hub_stopped=[False]
             def rpc(_args,role,m,_peer):
                 op=m["op"];n=len(m["items"]);observed.append((op,role,n))
                 if op=="source":return {"rows":[{"source":{"facts":{"byteSize":20}},"stored":10} for _ in range(n)]}
                 if op=="hub":return {"rows":[{"science":{}} for _ in range(n)]}
-                if op=="publish":return {"pins":[{"generation":"1"} for _ in range(n)],"deltaMembers":2}
+                if op=="publish":return {"pins":[dict(generation="1",storedSha256="b"*64,**k) for k in keys],"deltaMembers":2}
+                if op=="cloud" and hub_stopped[0]:
+                    error = controller.ReadPeerStopped("hub")
+                    error.keys = [x["key"] for x in m["items"]]
+                    raise error
                 if op=="cloud":return {"rows":[{"science":{}} for _ in range(n)],"generationDownloads":1}
                 if op=="settle":return {"rows":[{"outcome":"retired"} for _ in range(n)]}
                 if role=="api" and m["committed"] and lost[0]:
@@ -305,7 +309,18 @@ class ClosedReportOperator(unittest.TestCase):
                     controller.run(args)
                 self.assertEqual(json.loads((args.state/"progress.json").read_bytes())["after"],0)
                 args.page_members=1;args.limit=1
-                controller.run(args)
+                hub_stopped[0] = True
+                args.pause_file, args.reuse_read_passes = root/"pause", 1
+                snapshot = (args.state/"progress.json").read_bytes()
+                def restored(pause, delay):
+                    self.assertEqual((pause, delay), (args.pause_file, 10))
+                    self.assertEqual((args.state/"progress.json").read_bytes(), snapshot)
+                    self.assertFalse((args.state/"receipts/00000000.page.json").exists())
+                    hub_stopped[0] = False
+                    return True
+                with patch.object(controller,"wait_for_read_peer",side_effect=restored) as wait:
+                    controller.run_invocations(args)
+                self.assertEqual(wait.call_count, 1)
                 result=json.loads((args.state/"progress.json").read_bytes())
                 self.assertEqual((result["completed"],result["archived"],result["after"]),(3,3,inventory.stat().st_size))
                 self.assertEqual(observed.count(("publish","worker",3)),1)
@@ -399,6 +414,59 @@ class ClosedReportOperator(unittest.TestCase):
             with self.assertRaises(ValueError):
                 pool.ask(None,"worker",{"op":"publish"},"source")
             pool.close()
+
+    def test_only_the_unchanged_stopped_reader_has_an_availability_exit(self):
+        from unittest.mock import MagicMock
+        import closed_worker_report_host as host
+        import closed_worker_report_sessions as sessions
+        revision, container = "a"*40, "b"*64
+        with patch.object(host.Path, "read_bytes", return_value=json.dumps({"sourceRevision":revision}).encode()), \
+             patch.object(host.subprocess, "check_output") as inspect:
+            inspect.return_value = f"{container} start false exited"
+            with self.assertRaises(SystemExit) as stopped:
+                host.current_container(revision, "hub", [container,"start"])
+            self.assertEqual(stopped.exception.code, host.READ_CONTAINER_STOPPED)
+            for rev, lease in [(revision,["c"*64,"start"]), ("d"*40,[container,"start"])]:
+                with self.assertRaises(SystemExit) as changed:
+                    host.current_container(rev, "hub", lease)
+                self.assertEqual(changed.exception.code, 75)
+            inspect.return_value = "malformed"
+            with self.assertRaises(ValueError):
+                host.current_container(revision, "hub")
+        session = sessions.ReportReadSession.__new__(sessions.ReportReadSession)
+        session.child, session.count = MagicMock(), 0
+        with patch.object(sessions,"send"), patch.object(sessions,"receive",return_value=None) as receive:
+            session.child.wait.return_value = host.READ_CONTAINER_STOPPED
+            with self.assertRaises(sessions.ReadPeerStopped):
+                session.ask("hub", {"op":"cloud"})
+            session.child.wait.return_value = 65
+            with self.assertRaisesRegex(RuntimeError, r"refused \(65\)"):
+                session.ask("hub", {"op":"cloud"})
+            receive.return_value = {"n":3,"error":"signed source mismatch"}
+            with self.assertRaisesRegex(RuntimeError,"signed source mismatch"):
+                session.ask("hub", {"op":"cloud"})
+
+    def test_stopped_reader_requires_the_settled_exact_source_and_respects_pause(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            args=SimpleNamespace(apply=True, state=root, limit=16)
+            key={"executionId":"1"*36,"sequence":4,"signature":"b"*64}
+            pin=dict(key, generation="9", storedSha256="c"*64)
+            error=controller.ReadPeerStopped("api")
+            error.keys=[key]
+            pending=dict(key=key,pin=pin)
+            j=root/"progress.json"
+            j.write_text(json.dumps({"pending":pending}))
+            self.assertIsNone(controller.committed_read_retry(args,error))
+            pending["settled"]={"outcome":"retired"}
+            j.write_text(json.dumps({"pending":pending}))
+            retry=controller.committed_read_retry(args,error)
+            self.assertEqual((retry.limit,retry.retry_checkpoint_sha256),(1,controller.digest(j.read_bytes())))
+            error.keys=[dict(key,sequence=5)]
+            self.assertIsNone(controller.committed_read_retry(args,error))
+            pause=root/"pause"
+            pause.touch()
+            self.assertFalse(controller.wait_for_read_peer(pause,60))
 
     def test_exact_same_execution_keys_can_span_unowned_sequence_numbers(self):
         import io

@@ -13,6 +13,7 @@ MAX_REQUEST = 1024 * 1024
 MAX_RESPONSE = 2 * 1024 * 1024
 IDLE_SECONDS = 90
 REQUEST_SECONDS = 165
+READ_CONTAINER_STOPPED = 69
 ROLE_READS = {"hub": {"hub", "cloud", "discover-hub"},
               "api": {"read"}, "worker": {"read", "source", "discover-worker"}}
 
@@ -50,13 +51,18 @@ def send(stream, value):
     stream.flush()
 
 
-def current_container(revision, container):
+def current_container(revision, container, lease=None):
     marker=json.loads(Path("/opt/airfoils-pro/app/.deployment-source.json").read_bytes())
     if marker["sourceRevision"]!=revision:
         raise SystemExit(75)
-    fields=subprocess.check_output(["docker","inspect","-f","{{.Id}} {{.State.StartedAt}} {{.State.Running}}",container],
+    fields=subprocess.check_output(["docker","inspect","-f","{{.Id}} {{.State.StartedAt}} {{.State.Running}} {{.State.Status}}",container],
                                    timeout=8,text=True).split()
-    check(len(fields)==3 and re.fullmatch(r"[0-9a-f]{64}",fields[0]) and fields[2]=="true", "Container is unavailable")
+    check(len(fields) == 4 and re.fullmatch(r"[0-9a-f]{64}", fields[0]), "Invalid reader container identity")
+    if lease is not None and fields[:2] != lease:
+        raise SystemExit(75)
+    if fields[2:] == ["false", "exited"]:
+        raise SystemExit(READ_CONTAINER_STOPPED)
+    check(fields[2] == "true", "Reader container state is unavailable")
     return fields[:2]
 
 
@@ -78,6 +84,8 @@ def host_main(revision, container, role, program_sha):
     proc=subprocess.Popen(cmd,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL)
     try:
         ready=receive(proc.stdout,65536,30)
+        if ready is None:
+            current_container(revision, container, lease)
         check(ready and ready.get("ready")==role,"Reader did not start")
         send(sys.stdout.buffer,{**ready,"source":program_sha,"revision":revision,"container":lease})
         for counter in range(1,129):
@@ -86,18 +94,30 @@ def host_main(revision, container, role, program_sha):
                 break
             check(msg["n"]==counter,"Out-of-order report request")
             allowed(role,msg["request"])
-            if current_container(revision,container)!=lease:
-                raise SystemExit(75)
-            send(proc.stdin,msg)
-            res=receive(proc.stdout,MAX_RESPONSE,REQUEST_SECONDS)
+            current_container(revision, container, lease)
+            try:
+                send(proc.stdin, msg)
+                res = receive(proc.stdout, MAX_RESPONSE, REQUEST_SECONDS)
+            except BrokenPipeError:
+                current_container(revision, container, lease)
+                raise
+            if res is None:
+                current_container(revision, container, lease)
             check(res and res.get("n")==counter,"Mismatched report response")
-            if current_container(revision,container)!=lease:
-                raise SystemExit(75)
-            send(sys.stdout.buffer,res)
+            try:
+                current_container(revision, container, lease)
+            except SystemExit as change:
+                # A negative application reply stays final even if the inspected reader then stops.
+                if change.code != READ_CONTAINER_STOPPED or not res.get("error"):
+                    raise
+            send(sys.stdout.buffer, res)
             if res.get("error"):
                 break
     finally:
-        proc.stdin.close()
+        try:
+            proc.stdin.close()
+        except BrokenPipeError:
+            pass
         try:
             proc.wait(timeout=4)
         except subprocess.TimeoutExpired:

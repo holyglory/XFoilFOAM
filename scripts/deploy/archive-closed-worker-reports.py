@@ -17,7 +17,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from closed_worker_report_pages import process_page, qualified_width
-from closed_worker_report_sessions import ReportReadSessions, ROLE_READS
+from closed_worker_report_sessions import ReadPeerStopped, ReportReadSessions, ROLE_READS
 from closed_worker_report_discovery import discovery_step, revisit_held, revisit_prefix
 from closed_worker_report_order import OrderedInventory, ordered_inventory, remember_member_size
 
@@ -95,7 +95,12 @@ def run_peer(args, role, message, source):
     started = time.monotonic()
     sessions = getattr(args,"read_sessions",None)
     if sessions and message["op"] in ROLE_READS[role]:
-        record = sessions.ask(args,role,message,source)
+        try:
+            record = sessions.ask(args,role,message,source)
+        except ReadPeerStopped as error:
+            if message["op"] in ("hub", "cloud", "read"):
+                error.keys = [item["key"] for item in message.get("items", [message])]
+            raise
     else:
         record = single_request(args,role,message,source)
     value = record.pop("value")
@@ -193,7 +198,11 @@ def run(args):
         require(hashlib.file_digest(keys,"sha256").hexdigest() == args.keys_sha256, "Private signed-key inventory changed")
 
         path = args.state / "progress.json"
-        progress = json.loads(path.read_bytes()) if path.exists() else dict(binding=bind, after=0, completed=0, pending=None)
+        saved = path.read_bytes() if path.exists() else None
+        expected = getattr(args, "retry_checkpoint_sha256", None)
+        if expected:
+            require(saved is not None and digest(saved) == expected, "Committed report retry checkpoint changed")
+        progress = json.loads(saved) if saved is not None else dict(binding=bind, after=0, completed=0, pending=None)
         keys = ordered_inventory(args, keys, progress, bind, path, durable, lambda key: check_key(key, ranges))
         index = getattr(args,"recheck_held_index",None)
         if index is not None and args.apply and not progress.get("pending") and not progress.get("group"):
@@ -337,6 +346,44 @@ def run(args):
             advance(receipt, done)
 
 
+def committed_read_retry(args, error):
+    if not args.apply or not error.keys:
+        return None
+    path = args.state / "progress.json"
+    if not path.is_file():
+        return None
+    saved = path.read_bytes()
+    progress = json.loads(saved)
+    group, single = progress.get("group"), progress.get("pending")
+    if group and not single:
+        keys = [item["key"] for item in group["items"]]
+        pins = (group.get("publication") or {}).get("pins", [])
+        settlements = group.get("settled") or []
+    elif single and not group:
+        keys, pins, settlements = [single["key"]], [single.get("pin")], [single.get("settled")]
+    else:
+        return None
+    if keys != error.keys or not (len(keys) == len(pins) == len(settlements)):
+        return None
+    for key, pin, result in zip(keys, pins, settlements):
+        if (not pin or not result or result.get("outcome") not in ("retired", "already_retired")
+                or not pin.get("generation") or not pin.get("storedSha256")
+                or (key["executionId"], key["sequence"], key["signature"])
+                != (pin.get("executionId"), pin.get("sequence"), pin.get("signature"))):
+            return None
+    return argparse.Namespace(**(vars(args) | {"limit": len(keys), "retry_checkpoint_sha256": digest(saved)}))
+
+
+def wait_for_read_peer(pause_file, delay):
+    deadline = time.monotonic() + delay
+    while not pause_file.exists():
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return True
+        time.sleep(min(1, remaining))
+    return False
+
+
 def run_invocations(args):
     passes = args.reuse_read_passes
     require(0 <= passes <= 4, "Expected zero to four bounded read-session passes")
@@ -350,7 +397,26 @@ def run_invocations(args):
         for _ in range(passes):
             if args.pause_file.exists():
                 break
-            run(args)
+            current, delay = args, 10
+            while True:
+                try:
+                    run(current)
+                    break
+                except ReadPeerStopped as error:
+                    args.read_sessions.close()
+                    retry = committed_read_retry(current, error)
+                    if retry is None:
+                        raise
+                    previous = getattr(current, "retry_checkpoint_sha256", None)
+                    require(not previous or previous == retry.retry_checkpoint_sha256,
+                            "Committed report retry checkpoint changed")
+                    print(json.dumps({"waitingForReadPeer": error.role, "settledMembers": retry.limit,
+                                      "retrySeconds": delay}), flush=True)
+                    if not wait_for_read_peer(args.pause_file, delay):
+                        return
+                    current, delay = retry, min(60, delay * 2)
+            if current is not args:
+                return
             if not args.apply:
                 break
     finally:
