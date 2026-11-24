@@ -131,6 +131,21 @@ uvicorn.Server(uvicorn.Config(main.create_app(),log_level="error",lifespan="off"
     expect((await fetch(direct)).status).toBe(404);
     setUpstreamFailure(null);
     const opts = { headers: { authorization: "Bearer " + token } };
+    const workerRole = process.env.AIRFOILFOAM_DEPLOYMENT_ROLE;
+    expect(workerRole).toBe("remote-solver");
+    process.env.AIRFOILFOAM_DEPLOYMENT_ROLE = "hub";
+    try {
+      expect((await fetch(source, opts)).status).toBe(403);
+      const object = source + "/" + w.sources[0].upload + "/" + w.sources[0].generation;
+      expect((await fetch(object, opts)).status).toBe(403);
+      for (const url of [direct, media]) {
+        const rejected = await fetch(url);
+        expect(rejected.status).toBeGreaterThanOrEqual(400);
+        expect(Buffer.from(await rejected.arrayBuffer())).not.toEqual(bytes);
+      }
+    } finally {
+      process.env.AIRFOILFOAM_DEPLOYMENT_ROLE = workerRole;
+    }
     expect(
       (
         await fetch(
