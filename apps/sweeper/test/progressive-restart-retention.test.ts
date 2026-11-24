@@ -210,6 +210,9 @@ it("authenticates exact worker ownership and requests only checkpoint stripping"
     "sim_urans_verify_queue",
   ])
     expect(selected).toContain(guard);
+  const sourcePlanGuard = selected.indexOf("'closedProgressiveFiles'");
+  expect(sourcePlanGuard).toBeGreaterThan(0);
+  expect(sourcePlanGuard).toBeLessThan(selected.indexOf('ORDER BY job."updatedAt"'));
   const saved = dialect.sqlToQuery(state.execute.mock.calls[2][0]);
   expect(saved.sql).toContain("strip_report=");
   expect(saved.sql).not.toContain("ingestedAt");

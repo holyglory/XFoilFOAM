@@ -114,6 +114,27 @@ export async function verifyProgressiveRestartRetention(
       await connection.execute(
         sql`UPDATE sim_jobs SET ingest_lease_expires_at=NULL WHERE id=${executionId}::uuid`,
       );
+      // The registered job is otherwise fully eligible and has a signed final report.
+      // A source-bound plan owns native files even while its after-read is pending.
+      const audit = { retainedReportSequence: String(before[before.length - 1].sequence) };
+      for (const [field, plan] of [
+        ["closedProgressiveFiles", { complete: true, outcome: "duplicate-files" }],
+        ["closedProgressiveFiles", { complete: false, automaticVerification: { state: "awaiting-readback" } }],
+        ["closedProgressiveSiblingFiles", { complete: true, preservedSolver: { directory: "cases/foil/transient_a1" } }],
+        ["historicalRawFiles", { complete: true, outcome: "historical-raw-files" }],
+      ] as const) {
+        const inventory = { audit, [field]: plan };
+        await connection.execute(sql`UPDATE sim_jobs SET strip_report=${JSON.stringify(inventory)}::jsonb
+          WHERE id=${executionId}::uuid`);
+        expect(await reclaimProgressiveRestartState(connection, { stripJob }, executionId))
+          .toEqual({ stripped: 0, bytesFreed: 0 });
+        const [guarded] = await connection.execute(sql`SELECT stripped_at,strip_report FROM sim_jobs WHERE id=${executionId}::uuid`);
+        expect(guarded).toMatchObject({ stripped_at: null, strip_report: inventory });
+      }
+      expect(stripJob).not.toHaveBeenCalled();
+      const previousStrip = { audit, no_op: true, marker_path: "previous-engine-marker" };
+      await connection.execute(sql`UPDATE sim_jobs SET strip_report=${JSON.stringify(previousStrip)}::jsonb
+        WHERE id=${executionId}::uuid`);
       expect(
         await reclaimProgressiveRestartState(
           connection,
@@ -122,6 +143,8 @@ export async function verifyProgressiveRestartRetention(
         ),
       ).toEqual({ stripped: 1, bytesFreed: 8192 });
       expect(stripJob).toHaveBeenCalledOnce();
+      const [saved] = await connection.execute(sql`SELECT strip_report FROM sim_jobs WHERE id=${executionId}::uuid`);
+      expect(saved.strip_report).toEqual({ audit, ...(await stripJob.mock.results[0].value) });
       expect(
         await reclaimProgressiveRestartState(
           connection,
@@ -239,7 +262,7 @@ export async function verifyProgressiveRestartRetention(
           sql`SELECT stripped_at,strip_report FROM sim_jobs WHERE id=${executionId}::uuid`,
         );
         expect(saved.stripped_at).not.toBeNull();
-        expect(saved.strip_report).toEqual(retainedReport);
+        expect(saved.strip_report).toEqual({ ...retainedReport, audit });
         const calls = requests.length;
         expect(
           await reclaimProgressiveRestartState(connection, engine, executionId),

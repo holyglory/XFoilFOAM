@@ -255,6 +255,10 @@ export async function reclaimProgressiveRestartState(
         ${executionId ? sql`AND job.id=${executionId}::uuid` : sql``}
         AND job.request_payload ? 'remoteProgressiveExecution'
         AND (job.stripped_at IS NULL OR job.strip_report->>'kept_case_state'='true')
+        -- These receipts bind exact original paths, archived members and kept state.
+        -- A generic restart strip cannot replay any of their per-file plans.
+        AND NOT (coalesce(job.strip_report, '{}'::jsonb) ?|
+          ARRAY['closedProgressiveFiles','closedProgressiveSiblingFiles','historicalRawFiles'])
         AND (job.ingest_lease_expires_at IS NULL OR job.ingest_lease_expires_at<=clock_timestamp())
         AND EXISTS (SELECT 1 FROM progressive_worker_reports report
           WHERE report.sim_job_id=job.id AND report.stopped_engine_job_id=job.id::text)
@@ -321,7 +325,10 @@ export async function reclaimProgressiveRestartState(
       } catch {
         metadataError = "Retained brokered metadata could not be validated";
       }
-      await connection.execute(sql`UPDATE sim_jobs SET strip_report=${JSON.stringify(receipt)}::jsonb,
+      await connection.execute(sql`UPDATE sim_jobs SET strip_report=(
+          coalesce(strip_report,'{}'::jsonb) - ARRAY['job_id','kept_case_state','bytes_freed','files_removed',
+            'dirs_removed','no_op','marker_path','unknown_entries_count','unknown_entries']
+        ) || ${JSON.stringify(receipt)}::jsonb,
         stripped_at=${complete ? sql`clock_timestamp()` : sql`NULL`},"updatedAt"=clock_timestamp()
         WHERE id=${id}::uuid`);
       return {

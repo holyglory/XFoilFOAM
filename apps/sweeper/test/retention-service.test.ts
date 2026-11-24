@@ -55,18 +55,21 @@ it("serializes an emergency pass behind existing cleanup without dropping its op
       } as unknown as DB),
   } as unknown as DB;
   const engine = {} as EngineClient;
-  const first = retention.retentionTick(db, engine, { now: new Date(0) });
+  const options = { now: new Date(0), fileMaintenance: { strip: vi.fn(), discard: vi.fn() } };
+  const first = retention.retentionTick(db, engine, options);
   const emergency = retention.retentionTick(db, engine, {
-    now: new Date(0),
+    ...options,
     reclaimOptionalCaseState: true,
   });
   await vi.advanceTimersByTimeAsync(0);
   expect(execute).toHaveBeenCalledOnce();
   release([]);
   await Promise.all([first, emergency]);
-  expect(execute).toHaveBeenCalledTimes(4);
-  const original = dialect.sqlToQuery(execute.mock.calls[1][0]);
-  const requested = dialect.sqlToQuery(execute.mock.calls[3][0]);
+  const selections = execute.mock.calls
+    .map(([query]) => dialect.sqlToQuery(query))
+    .filter((query) => query.sql.includes("candidate_jobs AS MATERIALIZED"));
+  expect(selections).toHaveLength(2);
+  const [original, requested] = selections;
   expect(original.sql).toBe(requested.sql);
   expect(requested.params).not.toEqual(original.params);
 });
@@ -88,6 +91,7 @@ it("keeps cleanup active while scheduling is paused and preserves forecast recla
   try {
     await vi.advanceTimersByTimeAsync(0);
     expect(cleanup).toHaveBeenCalledWith(db, engine, {
+      signal: owner.signal,
       reclaimOptionalCaseState: true,
     });
     expect(progressive).toHaveBeenCalledWith(db, engine);
@@ -178,6 +182,7 @@ it("bounds the terminal cleanup query before evaluating evidence guards", async 
   } as unknown as DB;
 
   await retention.stripTerminalJobs(db, {} as EngineClient, {
+    fileMaintenance: { strip: vi.fn(), discard: vi.fn() },
     stripMaxPerTick: 1,
     now: new Date(0),
   });
