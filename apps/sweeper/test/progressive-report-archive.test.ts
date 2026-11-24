@@ -12,7 +12,7 @@ import {
   readProgressiveReport,
   resolveStoredProgressiveReport,
 } from "@aerodb/db/progressive-report-reader";
-import { advanceSettledStatusHeaders } from "../src/settled-report-status-headers";
+import { advanceSettledStatusHeaders, statusReadWindowMs } from "../src/settled-report-status-headers";
 import { progressiveRemoteReportInventory } from "@aerodb/db/progressive-remote-inventory";
 import { recordProgressiveWorkerEvidenceReceipt } from "../src/progressive-worker-evidence-delivery";
 import {
@@ -354,6 +354,120 @@ async function runWorkerVolumeCleanupPass(db: DB) {
 describe.each<ArchiveSource>(["remote", "worker"])(
   "%s progressive report archive database boundary",
   (source) => {
+    it("processes fast signed status members after an overdue copy and yields after a slow read", async () => {
+      await withArchiveFixture(
+        client,
+        source,
+        async (fixture) => {
+          const { db, executionId, reports } = fixture;
+          const cloud = cloudFixture();
+          expect(
+            await archiveProgressiveReportBatch(
+              db,
+              source,
+              executionId,
+              cloud.putFile,
+            ),
+          ).toBe(reports.length);
+          const { objects } = cloud;
+          let delayMs = 0;
+          const reads: number[] = [];
+          installProgressiveReportArchiveReader({
+            read: async (id) => {
+              if (delayMs) await new Promise((r) => setTimeout(r, delayMs));
+              const original = await readProgressiveReportArchiveText(
+                Readable.from([objects.get(id.objectKey)!]),
+                id,
+              );
+              expect(original).toBe(reports[id.sequence - 1]!.text);
+              reads.push(id.sequence);
+              return original;
+            },
+          });
+          const rows = () =>
+            db.execute(sql`SELECT sequence,content_signature,report::text AS body,archive_bundle_id FROM ${archiveTable(source)}
+          WHERE sim_job_id=${executionId}::uuid ORDER BY sequence`);
+          const original = await rows(),
+            rolledBack = new Error(
+              "restore identical signed input and discovery cursor",
+            );
+          const run = async (wait: number, connection = db) => {
+            reads.length = 0;
+            const start = performance.now();
+            const result = await advanceSettledStatusHeaders(
+              connection,
+              source,
+              undefined,
+              start + wait,
+            );
+            expect(reads.length).toBe(result.reduced);
+            return { ...result, elapsedMs: performance.now() - start };
+          };
+          // Exercise the previous expired deadline and a genuinely delayed member on the same rows.
+          for (const [delay, window] of [
+            [0, 0],
+            [20, statusReadWindowMs(-100)],
+          ]) {
+            delayMs = delay;
+            await expect(
+              db.transaction(async (tx) => {
+                const previous = await run(window, tx as unknown as typeof db);
+                expect(previous.reduced).toBe(1);
+                expect(reads).toEqual([1]);
+                throw rolledBack;
+              }),
+            ).rejects.toBe(rolledBack);
+            expect(await rows()).toEqual(original);
+          }
+          delayMs = 0;
+          expect(statusReadWindowMs(750)).toBe(750);
+          expect(statusReadWindowMs(-500)).toBe(20);
+          expect(statusReadWindowMs(-60_000)).toBe(1250);
+          const fast = await run(statusReadWindowMs(-38_406));
+          expect(fast.reduced).toBeGreaterThan(1);
+          expect(fast.reduced).toBeLessThanOrEqual(8);
+          expect(reads).toEqual(
+            reports.slice(0, fast.reduced).map((r) => r.sequence),
+          );
+          let restored = fast.reduced;
+          while (restored < 10) {
+            const next = await run(statusReadWindowMs(30_000));
+            expect(next.reduced).toBeGreaterThan(0);
+            expect(reads[0]).toBe(restored + 1);
+            restored += next.reduced;
+          }
+          const after = await rows();
+          expect(after.slice(10)).toEqual(original.slice(10));
+          for (const [i, r] of after.entries()) {
+            expect([r.content_signature, r.archive_bundle_id]).toEqual([
+              original[i]!.content_signature,
+              original[i]!.archive_bundle_id,
+            ]);
+            // The installed reader checks the entire original inside this call.
+            expect(
+              await readProgressiveReport(db, {
+                sourceKind: source,
+                executionId,
+                sequence: reports[i]!.sequence,
+                contentSignature: reports[i]!.contentSignature,
+              }),
+            ).toEqual(JSON.parse(reports[i]!.text));
+          }
+          expect((await run(statusReadWindowMs(-38_406))).reduced).toBe(0);
+          console.info(
+            "Overdue report storage turn",
+            JSON.stringify({
+              source,
+              reduced: fast.reduced,
+              elapsedMs: fast.elapsedMs,
+              retainedScientific: 2,
+            }),
+          );
+        },
+        { reportCount: 12, nullPrefix: 10, quietStatusPrefix: 10 },
+      );
+    }, 45_000);
+
     it("keeps exact positive counters and independently receipted angles through settlement, replay and late evidence", async () => {
       await withArchiveFixture(
         client,

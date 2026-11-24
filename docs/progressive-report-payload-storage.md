@@ -164,8 +164,10 @@ proof leaves the report available in its prior representation.
 
 Each discovery turn examines up to 128 archive keys and starts at most eight
 member reads totalling at most 1 MiB of original report text. Existing object
-reader limits apply separately to the packed archive. The worker yields to a
-due archive or copy after its current member and advances a role-specific cursor
+reader limits apply separately to the packed archive. If an archive or copy
+overruns its next poll, the worker may start further fast reads for up to 4%
+of the overrun, capped at 1.25 seconds. It finishes the current exact member
+and advances a role-specific cursor
 in `progressive_status_header_cursors`. It revisits held and newly archived
 members on subsequent sweeps. A restart reuses that cursor. An interrupted
 update or repeat cannot reduce the same header twice.

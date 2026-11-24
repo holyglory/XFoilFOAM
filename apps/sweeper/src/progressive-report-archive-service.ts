@@ -1,4 +1,7 @@
-import { advanceSettledStatusHeaders } from "./settled-report-status-headers";
+import {
+  advanceSettledStatusHeaders,
+  statusReadWindowMs,
+} from "./settled-report-status-headers";
 import {
   backfillWorkerReportPrefix,
   type WorkerPrefixCursor,
@@ -596,11 +599,21 @@ export async function runProgressiveReportArchiveService(
       // extra ordinary discovery pass during that pass's idle backoff.
       if (!signal.aborted && Date.now() >= nextStatusScan) {
         try {
-          // Finish one exact read, then give a due ordinary archive or copy its turn.
-          const availableMs = Math.max(0, Math.min(nextJobScan, store ? nextCopyScan : Infinity) - Date.now());
-          const status = await advanceSettledStatusHeaders(db, source, signal, performance.now() + availableMs);
+          const untilPollMs = Math.min(nextJobScan, store ? nextCopyScan : Infinity) - Date.now();
+          const readWindowMs = statusReadWindowMs(untilPollMs);
+          const started = performance.now();
+          const status = await advanceSettledStatusHeaders(db, source, signal, started + readWindowMs);
           nextStatusScan = Date.now() + (status.complete ? 60_000 : 250);
-          if (status.reduced) console.info(JSON.stringify({ component: "settled-report-status", source, ...status }));
+          if (status.reduced) {
+            console.info(JSON.stringify({
+              component: "settled-report-status",
+              source,
+              ...status,
+              untilPollMs,
+              readWindowMs,
+              elapsedMs: Math.round(performance.now() - started),
+            }));
+          }
         } catch {
           nextStatusScan = Date.now() + 30_000;
           console.warn(JSON.stringify({ component: "settled-report-status", source, result: "scan_unavailable" }));

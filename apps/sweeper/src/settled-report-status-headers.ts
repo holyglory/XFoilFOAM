@@ -10,6 +10,14 @@ const scanRows = 128;
 const pageReads = 8;
 const readBudget = 1024 * 1024;
 
+/** Use idle time; after a long archive overrun, allow fast members up to
+ * one twenty-fifth of that overrun before the next ordinary poll. The current
+ * member always retains its normal read deadline and write guard. */
+export function statusReadWindowMs(untilNextArchivePollMs: number) {
+  if (untilNextArchivePollMs >= 0) return untilNextArchivePollMs;
+  return Math.min(1250, -untilNextArchivePollMs / 25);
+}
+
 interface Cursor {
   job: string;
   sequence: number;
