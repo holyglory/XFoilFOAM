@@ -1,5 +1,6 @@
 import { sql } from "drizzle-orm";
 import { createHash } from "node:crypto";
+import type { ProgressiveReportArchiveEntry } from "./progressive-report-archive";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { LegacyOriginSigner } from "./legacy-report-signature";
 import type { DB } from "./client";
@@ -85,6 +86,26 @@ export class ProgressiveReportArchiveTimeout extends Error {
 
 export interface ProgressiveReportArchiveReader {
   read(identity: ProgressiveReportArchiveIdentity, connection: DB): Promise<string>;
+  visitRemoteJsonl?(
+    root: ProgressiveReportArchiveReadIdentity,
+    owner: { executionId: string; solverId: string; promiseId: string; assignmentSignature: string },
+    visit: (entry: ProgressiveReportArchiveEntry) => void,
+    signal: AbortSignal,
+  ): Promise<void>;
+}
+
+/** The callback is provisional until the entire pinned root has passed its EOF checks. */
+export async function visitInstalledRemoteJsonl(
+  root: ProgressiveReportArchiveReadIdentity,
+  owner: { executionId: string; solverId: string; promiseId: string; assignmentSignature: string },
+  visit: (entry: ProgressiveReportArchiveEntry) => void,
+): Promise<boolean> {
+  const adapter = installed?.reader;
+  if (!adapter?.visitRemoteJsonl || root.archiveFormat !== "jsonl") return false;
+  const timeout = AbortSignal.timeout(installed!.timeoutMs);
+  await adapter.visitRemoteJsonl(root, owner, visit, timeout);
+  timeout.throwIfAborted();
+  return true;
 }
 
 const UUID = /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i;
@@ -360,6 +381,15 @@ async function materializeProgressiveReport(
   return read;
 }
 
+interface PreparedRemoteReads {
+  executionId: string;
+  read: (db: DB, sequence: number, signature: string) => Promise<ProgressiveRemoteReport>;
+}
+const preparedRemoteReads = new AsyncLocalStorage<PreparedRemoteReads>();
+export function withPreparedRemoteReportReads<T>(scope: PreparedRemoteReads, action: () => Promise<T>) {
+  return preparedRemoteReads.run(scope, action);
+}
+
 /** Existing bounded selectors may already have reconstructed an inline body.
  * Existing consumer validation owns live bytes; compact bodies read through. */
 export async function resolveStoredProgressiveReport(
@@ -381,6 +411,14 @@ export async function resolveStoredProgressiveReport(
   if (!compact) return stored.report as ProgressiveRemoteReport;
   if (value?.executionId !== executionId)
     throw new Error("Stored progressive report has a foreign execution identity");
+  const scoped = preparedRemoteReads.getStore();
+  if (sourceKind === "remote" && scoped?.executionId === executionId) {
+    const report = await scoped.read(db,Number(value.sequence),String(stored.content_signature));
+    if (preparedOwner && (report.solverId!==preparedOwner.solverId || report.promiseId!==preparedOwner.promiseId ||
+        report.assignmentSignature!==preparedOwner.assignmentSignature))
+      throw new Error("Archived report header belongs to another dispatch");
+    return report;
+  }
   return readProgressiveReport(db, {
     sourceKind, executionId, sequence: Number(value.sequence), contentSignature: String(stored.content_signature),
   }, preparedOwner);

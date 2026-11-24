@@ -64,6 +64,11 @@ async function stillStored(db: DB, prepared: PreparedSource) {
   return Boolean(row);
 }
 
+export function recheckPreparedEvidenceReport(db: DB, reference: ProgressiveRemoteEvidenceReference) {
+  const prepared = preparedReports.get(reference);
+  return prepared ? stillStored(db, prepared) : Promise.resolve(false);
+}
+
 export function prepareProgressiveRemoteEvidence(db: DB, input: EvidenceInput) {
   if (input.progressiveEvidence)
     preparedReports.delete(input.progressiveEvidence);

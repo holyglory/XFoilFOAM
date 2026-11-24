@@ -1,3 +1,6 @@
+import {
+  promotionForSettlement, withUnlockedPromotionHistory, type PreparedPromotionHistory,
+} from "./progressive-promotion-history";
 import { resolveStoredProgressiveReport } from "@aerodb/db/progressive-report-reader";
 import { randomUUID } from "node:crypto";
 import { sql } from "drizzle-orm";
@@ -31,7 +34,7 @@ import {
 } from "@aerodb/db";
 import { EngineClient, type JobResult } from "@aerodb/engine-client";
 import {
-  readProgressiveRemoteRetention,
+  readProgressiveRemoteRetention, progressiveRetentionReader, withPreparedProgressiveRemoteRetention,
   readProgressiveRemoteSourceClassifications,
   terminalReportHasNoPhysicalEvidence,
 } from "@aerodb/db/progressive-remote-retention";
@@ -399,7 +402,6 @@ async function publishAcceptedProgressiveAttempts(db: DB, executionId: string) {
   }, histories);
 }
 
-import { validateRansPrecalcPromotionSignal } from "./ingest";
 
 type RetainedExecution = Extract<
   Awaited<ReturnType<typeof readProgressiveRemoteRetention>>,
@@ -463,103 +465,28 @@ async function recoveryPromotions(
   db: DB,
   envelope: ProgressiveRemoteExecutionEnvelope,
   retained: RetainedExecution,
+  prepared?: PreparedPromotionHistory,
 ): Promise<ProgressiveRansPromotion[] | null> {
-  const reports =
-    await db.execute(sql`WITH payload_owners AS MATERIALIZED (
-      SELECT DISTINCT ON (coalesce(stored.result_payload_hash, stored.content_signature))
-        stored.sim_job_id, stored.sequence, stored.content_signature, stored.result_payload_hash
-      FROM progressive_remote_reports stored
-      WHERE stored.sim_job_id = ${envelope.scope.executionId}::uuid
-        AND to_jsonb(stored.*)->>'archived_at' IS NULL
-        AND to_jsonb(stored.*)->>'archive_bundle_id' IS NULL
-        AND stored.report->>'archivedReport' IS DISTINCT FROM 'true'
-      ORDER BY coalesce(stored.result_payload_hash, stored.content_signature), stored.sequence
-    ), promotions AS MATERIALIZED (
-      SELECT owner.sim_job_id, owner.sequence,
-        public.resolve_progressive_report(stored.report, stored.result_payload_hash)#>'{result,polars,0,rans_precalc_promotion}' AS promotion
-      FROM payload_owners owner JOIN progressive_remote_reports stored
-        ON stored.sim_job_id=owner.sim_job_id AND stored.sequence=owner.sequence
-    ), selected AS MATERIALIZED (
-      SELECT DISTINCT ON (promotion) sim_job_id,sequence
-      FROM promotions WHERE promotion IS NOT NULL AND promotion <> 'null'::jsonb
-      ORDER BY promotion,sequence LIMIT 2
-    ) SELECT public.resolve_progressive_report(to_jsonb(stored.*)) AS report, stored.content_signature, stored.sequence
-      FROM selected JOIN progressive_remote_reports stored USING (sim_job_id,sequence)`);
-  // Compacted result headers cannot answer whether a promotion was present.
-  // Scan archived identities in bounded pages, reading one exact member at a
-  // time. Never infer an absent promotion from SQL's missing polars projection.
-  let after = 0;
-  const promotions = new Map<string, { report: unknown; content_signature: unknown }>();
-  for (const stored of reports) {
-    const report = await resolveStoredProgressiveReport(db, "remote", stored, envelope.scope.executionId);
-    promotions.set(canonicalAnalysisJson(report.result!.polars[0].rans_precalc_promotion), { report, content_signature: stored.content_signature });
-  }
-  while (true) {
-    const archived = await db.execute(sql`
-      SELECT sequence,content_signature,report FROM progressive_remote_reports
-      WHERE sim_job_id=${envelope.scope.executionId}::uuid AND sequence>${after}
-        AND (to_jsonb(progressive_remote_reports.*)->>'archived_at' IS NOT NULL
-          OR to_jsonb(progressive_remote_reports.*)->>'archive_bundle_id' IS NOT NULL
-          OR report->>'archivedReport'='true')
-      ORDER BY sequence LIMIT 32
-    `);
-    for (const stored of archived) {
-      const report = await resolveStoredProgressiveReport(db, "remote", stored, envelope.scope.executionId);
-      const checked = validateProgressiveRemoteReport(report, envelope);
-      if (checked.contentSignature !== stored.content_signature)
-        throw new Error("Remote RANS promotion has changed archived report bytes");
-      const promotion = checked.report.result?.polars[0]?.rans_precalc_promotion;
-      if (promotion != null)
-        promotions.set(canonicalAnalysisJson(promotion), { report: checked.report, content_signature: stored.content_signature });
-      after = Number(stored.sequence);
-    }
-    if (promotions.size > 1)
-      throw new Error("Remote execution has competing RANS promotion scopes");
-    if (archived.length < 32) break;
-  }
-  if (promotions.size > 1)
-    throw new Error("Remote execution has competing RANS promotion scopes");
-  const selected = [...promotions.values()][0];
-  if (!selected) return [];
-  const validated = validateProgressiveRemoteReport(selected.report, envelope);
-  if (validated.contentSignature !== selected.content_signature)
-    throw new Error("Remote RANS promotion has changed report bytes");
-  const polar = validated.report.result!.polars[0];
-  const promotion = polar.rans_precalc_promotion!;
-  const attempts = new Map(
-    (polar.attempts ?? []).map((point) => [point.aoa_deg, point]),
-  );
-  const trigger = attempts.get(promotion.trigger_aoa_deg);
-  const scope = validateRansPrecalcPromotionSignal({
-    promotion,
-    stagedAttemptAoas: [...attempts.keys()],
-    triggerFailureDisposition: trigger?.failure_disposition ?? null,
-    jobAoas: envelope.request.aoa?.angles ?? [],
-  });
-  if (!trigger || !scope)
-    throw new Error(
-      "Remote RANS promotion changed its exact attempt and omission scope",
-    );
-  const [source] = progressiveReportedPointSources({
-    ...validated.report.result!,
-    polars: [{ ...polar, points: [], attempts: [trigger] }],
-  });
+  const observed=await promotionForSettlement(db,envelope,prepared);
+  if(!observed) return [];
+  const {triggerAoaDeg,attemptedAoas,intentionallyOmittedAoas}=observed;
+  const scope={attemptedAoas,intentionallyOmittedAoas};
   const receipt = retained.sources.find(
     (item) =>
       item.delivery.progressiveEvidence.pointContentSignature ===
-      source.contentSignature,
+      observed.pointSignature,
   );
   // The original report remains the recovery obligation until its exact
   // trigger is retained. An accepted sibling cannot stand in for that source.
   if (!receipt) {
     const diagnostic = await readProgressiveDiagnosticRecoveryTrigger(db, envelope.scope.executionId, {
-      sequence: validated.report.sequence, reportContentSignature: validated.contentSignature,
-      pointContentSignature: source.contentSignature,
+      sequence: observed.sequence, reportContentSignature: observed.signature,
+      pointContentSignature: observed.pointSignature,
     });
     if (!diagnostic) return null;
     return [{
       revisionId: diagnostic.revisionId, triggerDiagnosticReceipt: diagnostic.reference,
-      triggerAoaDeg: promotion.trigger_aoa_deg, ...scope,
+      triggerAoaDeg: triggerAoaDeg, ...scope,
     }];
   }
   const [revision] =
@@ -571,7 +498,7 @@ async function recoveryPromotions(
     {
       revisionId: String(revision.simulation_preset_revision_id),
       triggerResultAttemptId: receipt.resultAttemptId,
-      triggerAoaDeg: promotion.trigger_aoa_deg,
+      triggerAoaDeg: triggerAoaDeg,
       ...scope,
     },
   ];
@@ -796,6 +723,15 @@ export async function selectPendingProgressiveRemoteReport(
 }
 
 export async function settleProgressiveRemoteJob(db: DB, executionId: string) {
+  const run = async () => {
+    await publishForSettlement(db,executionId);
+    return withUnlockedPromotionHistory(db,prepared=>settleWithCurrentOwnership(db,executionId,prepared));
+  };
+  const reader=progressiveRetentionReader();
+  return reader ? withPreparedProgressiveRemoteRetention(db,executionId,reader,run) : run();
+}
+
+async function publishForSettlement(db: DB, executionId: string) {
   try {
     await publishAcceptedProgressiveAttempts(db, executionId);
   } catch (error) {
@@ -806,6 +742,9 @@ export async function settleProgressiveRemoteJob(db: DB, executionId: string) {
     )
       throw error;
   }
+}
+
+async function settleWithCurrentOwnership(db:DB, executionId:string, prepared?:PreparedPromotionHistory) {
   return db.transaction(async (transaction) => {
     const connection = transaction as unknown as DB;
     const [dispatch] =
@@ -1080,6 +1019,7 @@ export async function settleProgressiveRemoteJob(db: DB, executionId: string) {
         connection,
         envelope,
         retained,
+        prepared,
       );
       if (promotions === null)
         return { kind: "waiting" as const, reason: "promotion_trigger" };

@@ -1,4 +1,5 @@
 import { CancelledReportCopyPriority, nextCancelledReportCopies, selectCancelledReportCopyPage } from "../src/cancelled-report-copies";
+import { verifyColdPromotionHistory } from "./closed-promotion-history-fixture";
 import { archiveProgressiveReportBatch } from "../src/progressive-report-archive-service";
 import { randomUUID } from "node:crypto";
 import { fork } from "node:child_process";
@@ -475,3 +476,6 @@ it(
   verifyStatusHeaderPublication,
   45000,
 );
+
+it("verifies sparse cold promotion roots outside the campaign lock and reuses intact roots across archive conversion",
+  verifyColdPromotionHistory, 120000);

@@ -5,6 +5,8 @@ import {
   readProgressiveReportArchiveText,
   validatedProgressiveReportArchiveLines,
   verifyProgressiveReportArchive,
+  visitVerifiedSignedReportArchive,
+  type ProgressiveReportArchiveEntry,
   type ProgressiveReportArchiveReadIdentity,
 } from "@aerodb/db/progressive-report-archive";
 import { createHash, randomUUID } from "node:crypto";
@@ -206,6 +208,23 @@ export class ProgressiveReportArchiveStore {
       file.createReadStream({ validation: "crc32c", decompress: false }),
       identity,
     );
+  }
+
+  async visitRemoteJsonl(
+    root: ProgressiveReportArchiveReadIdentity,
+    owner: { executionId: string; solverId: string; promiseId: string; assignmentSignature: string },
+    visit: (entry: ProgressiveReportArchiveEntry) => void,
+    signal: AbortSignal,
+  ): Promise<void> {
+    if (root.sourceKind !== "remote" || root.archiveFormat !== "jsonl" ||
+        root.bucket !== this.bucketName || root.executionId !== owner.executionId)
+      throw new Error("Promotion history has a foreign archive root");
+    assertProgressiveReportArchiveIdentity(root);
+    const stream = this.pinnedFile(root).createReadStream({ validation: "crc32c", decompress: false });
+    await visitVerifiedSignedReportArchive("remote", stream, root, owner, visit, {
+      maxMembers: root.memberCount,
+      maxReportBytes: 512 * 1024 * 1024,
+    }, signal);
   }
 
   private pinnedFile(identity: {

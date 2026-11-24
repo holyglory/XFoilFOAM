@@ -105,6 +105,12 @@ export async function withArchiveFixture(
     quietStatusPrefix?: number;
     statusOnlyCompleted?: Record<number, number>;
     scientificAngles?: Record<number, number>;
+    promotionRun?: {
+      trigger: number;
+      family: "simpleFoam" | "pimpleFoam";
+      policy: "abort_for_precalc" | "continue";
+      signals: Record<number, { trigger_aoa_deg: number; failure_disposition: "hard_solver"; attempted_aoas: number[]; intentionally_omitted_aoas: number[] }>;
+    };
     exhaustedBudgetSequence?: number;
     schedulingDiagnosticSequence?: number;
     angles?: number[];
@@ -217,7 +223,9 @@ export async function withArchiveFixture(
           chord_lengths: [0.987654],
           speeds: [19.876543],
           aoa: { angles: units.map((u) => u.alpha) },
-          solver: { warm_start: true },
+          solver: { warm_start: true, ...(options.promotionRun
+            ? { flow_solver_family: options.promotionRun.family, rans_failure_policy: options.promotionRun.policy }
+            : {}) },
           resources: { case_concurrency: 1, case_solver_budget_seconds: 900 },
         },
       });
@@ -470,7 +478,10 @@ export async function withArchiveFixture(
                       speed: 19.876543,
                       reynolds,
                       points: [],
-                      attempts: [sourcePoint],
+                      attempts: options.promotionRun
+                        ? [{ ...sourcePoint, aoa_deg: options.promotionRun.trigger, failure_disposition: "hard_solver" }]
+                        : [sourcePoint],
+                      ...(options.promotionRun?.signals[sequence] ? { rans_precalc_promotion: options.promotionRun.signals[sequence] } : {}),
                     },
                   ],
                 },

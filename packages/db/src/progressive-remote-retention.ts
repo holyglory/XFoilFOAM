@@ -1,10 +1,10 @@
-import { resolveStoredProgressiveReport } from "./progressive-report-reader";
+import { resolveStoredProgressiveReport, withPreparedRemoteReportReads, verifiedProgressiveReportMember, recheckRemoteReportMember } from "./progressive-report-reader";
 import { is, sql } from "drizzle-orm";
 import { PgTransaction } from "drizzle-orm/pg-core";
 import type { DB } from "./client";
 import { analysisContentHash, canonicalAnalysisJson } from "./analysis-target";
 import { readProgressiveEvidenceCustodyReceipt } from "./progressive-evidence-custody";
-import { prepareProgressiveRemoteEvidence, resolveProgressiveRemoteEvidence, ProgressiveRemoteEvidenceConflict } from "./progressive-remote-evidence";
+import { recheckPreparedEvidenceReport, prepareProgressiveRemoteEvidence, resolveProgressiveRemoteEvidence, ProgressiveRemoteEvidenceConflict } from "./progressive-remote-evidence";
 import { prepareProgressiveRemoteReceiptReplay, readProgressiveRemoteEvidenceReceipt, type ProgressiveRemoteEvidenceDelivery } from "./progressive-remote-evidence-receipts";
 import type { AttemptEvidenceArchiveReader } from "./attempt-evidence-reader";
 import { hasAttemptEvidenceStoragePointer } from "./attempt-evidence-storage";
@@ -25,7 +25,7 @@ export type ProgressiveDiagnosticFailureKind = "material_domain" | "infrastructu
 interface RetentionPreparation {
   executionId: string;
   deliveries: Map<string, ProgressiveRemoteEvidenceDelivery>;
-  reports: Map<string, ProgressiveRemoteReport>;
+  reports: Map<string, { report: ProgressiveRemoteReport; current: (connection: DB) => Promise<boolean> }>;
 }
 const retentionContext = new AsyncLocalStorage<RetentionPreparation>();
 let retentionReader: AttemptEvidenceArchiveReader | undefined;
@@ -96,22 +96,34 @@ export async function withPreparedProgressiveRemoteRetention<T>(
       if(receipt?.resultAttemptId!==row.result_attempt_id)throw new Error("Remote retention attempt changed during preparation");
     }
     prepared.deliveries.set(String(row.result_attempt_id), delivery);
-    prepared.reports.set(String(row.content_signature), source.report);
+    prepared.reports.set(String(row.content_signature), {report:source.report,
+      current: connection => recheckPreparedEvidenceReport(connection,delivery.progressiveEvidence)});
+
   }
   const others = await db.execute(sql`WITH distinct_sources AS MATERIALIZED (
       SELECT DISTINCT ON(point_content_signature) sequence FROM progressive_remote_report_sources
       WHERE sim_job_id=${executionId}::uuid ORDER BY point_content_signature,sequence LIMIT 2049
-    ), keys AS (SELECT sequence FROM distinct_sources UNION (SELECT sequence FROM progressive_remote_reports
+    ),
+    keys AS (SELECT sequence FROM distinct_sources UNION SELECT sequence FROM progressive_remote_diagnostic_receipts
+      WHERE sim_job_id=${executionId}::uuid UNION (SELECT sequence FROM progressive_remote_reports
       WHERE sim_job_id=${executionId}::uuid ORDER BY sequence DESC LIMIT 1))
     SELECT r.sequence,r.content_signature,r.report FROM keys JOIN progressive_remote_reports r USING(sequence)
     WHERE r.sim_job_id=${executionId}::uuid AND r.archived_at IS NOT NULL`);
-  for (const row of others)
-    if (!prepared.reports.has(String(row.content_signature)))
-      prepared.reports.set(
-        String(row.content_signature),
-        await resolveStoredProgressiveReport(db, "remote", row, executionId),
-      );
-  return retentionContext.run(prepared, action);
+  for (const row of others) {
+    const signature=String(row.content_signature);
+    if (prepared.reports.has(signature)) continue;
+    const report=await resolveStoredProgressiveReport(db, "remote", row, executionId);
+    const pin=verifiedProgressiveReportMember(report);
+    if (!pin) throw new Error("Archived retention member lost its verified storage binding");
+    prepared.reports.set(signature,{report,current:connection=>recheckRemoteReportMember(connection,pin)});
+  }
+  const read = async (connection:DB, sequence:number, signature:string) => {
+    const entry=prepared.reports.get(signature);
+    if (!entry || entry.report.sequence!==sequence || entry.report.executionId!==executionId || !await entry.current(connection))
+      throw new ProgressiveRemoteEvidenceConflict("Archived retention report changed; prepare again");
+    return entry.report;
+  };
+  return retentionContext.run(prepared, () => withPreparedRemoteReportReads({executionId,read},action));
 }
 
 function retentionReport(
@@ -119,13 +131,6 @@ function retentionReport(
   row: { report?: unknown; content_signature?: unknown },
   executionId: string,
 ) {
-  const prepared = retentionContext.getStore();
-  if (prepared?.executionId === executionId) {
-    const original = prepared.reports.get(String(row.content_signature));
-    if (original) return original;
-    if ((row.report as { archivedReport?: boolean } | null)?.archivedReport)
-      throw new Error("Archived retention report changed; prepare again");
-  }
   return resolveStoredProgressiveReport(db, "remote", row, executionId);
 }
 
