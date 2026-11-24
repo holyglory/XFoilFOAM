@@ -36,4 +36,3 @@ export async function assertOrdinaryRegisteredCustody(db: DB, id: string, signal
   if (owner.historicalRaw) throw Error("Historical raw gateway owns this execution");
   return envelope.contentSignature;
 }
-
