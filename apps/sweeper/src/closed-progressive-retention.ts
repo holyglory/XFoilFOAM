@@ -1,3 +1,4 @@
+import { assertOrdinaryRegisteredCustody } from "./registered-retention-owner";
 import { createHash } from "node:crypto";
 import { EngineError } from "@aerodb/engine-client";
 import { canonicalRemoteHubBaseUrl } from "@aerodb/core";
@@ -608,30 +609,6 @@ type Archive = {
   manifest: ClosedProgressiveManifest;
   remote: ProgressiveEvidenceCustodyReceipt["remote"];
 };
-async function assertOrdinaryRegisteredCustody(db: DB, id: string, signal: AbortSignal) {
-  const {baseUrl,authToken,envelope} = await registeredWorkerArchiveOwner(db,id);
-  const {readRegisteredArchive} = await import("@aerodb/core/registered-archive-read");
-  const res = await readRegisteredArchive(`${baseUrl}/progressive-executions/${id}/historical-raw-archives/retention-owner`,
-    authToken,signal,"application/json");
-  if (res.status !== 200 || !res.body || res.headers.get("content-type")?.split(";")[0] !== "application/json") {
-    await res.body?.cancel();
-    throw Error(`Registered retention owner unavailable (HTTP ${res.status})`);
-  }
-  const chunks: Buffer[] = [];
-  let size = 0;
-  for await (const part of res.body as unknown as AsyncIterable<Uint8Array>) {
-    size += part.length;
-    if (size > 1024) throw Error("Registered retention owner exceeded its byte bound");
-    chunks.push(Buffer.from(part));
-  }
-  const owner = JSON.parse(Buffer.concat(chunks).toString("utf8"));
-  if (owner?.version !== 1 || owner.executionId !== id || owner.solverId !== envelope.solverId ||
-      owner.promiseId !== envelope.promiseId || owner.assignmentSignature !== envelope.contentSignature ||
-      typeof owner.historicalRaw !== "boolean") throw Error("Registered retention owner changed or was ambiguous");
-  if (owner.historicalRaw) throw Error("Historical raw gateway owns this execution");
-  return envelope.contentSignature;
-}
-
 async function historicalCustody(db: DB, id: string, signal?: AbortSignal) {
   if (process.env.AIRFOILFOAM_DEPLOYMENT_ROLE !== "remote-solver")
     throw Error("Historical reclaim requires the registered source worker");

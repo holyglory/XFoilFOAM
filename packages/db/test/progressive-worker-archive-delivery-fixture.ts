@@ -398,13 +398,24 @@ export async function verifyProgressiveWorkerArchiveDelivery(
       let stealClaim = false;
       let pauseOwnedClaim = false;
       let engineReclaims = 0;
+      let historical = true;
+      let registerDuringRead = false;
+      const [assigned] = await connection.execute(sql`SELECT request_payload->'remoteProgressiveExecution' AS envelope
+        FROM sim_jobs WHERE id=${executionId}::uuid`);
+      const assignment = assigned.envelope as {contentSignature: string; solverId: string; promiseId: string};
       const previousControlToken = process.env.ENGINE_CONTROL_PLANE_TOKEN;
       process.env.ENGINE_CONTROL_PLANE_TOKEN =
         "isolated-progressive-reclaim-control";
       fetcher.mockImplementation(async (input, init) => {
         const url = String(input);
         expect(init?.redirect).toBe("error");
+        if (url.endsWith(`/progressive-executions/${executionId}/historical-raw-archives/retention-owner`)) {
+          expect(new Headers(init?.headers).get("x-xfoilfoam-solver-token")).toBe(reclaimSettings.remoteSolverAuthToken);
+          return Response.json({version:1,executionId,solverId:assignment.solverId,promiseId:assignment.promiseId,
+            assignmentSignature:assignment.contentSignature,historicalRaw:historical});
+        }
         if (url.endsWith(`/evidence-uploads/${uploadId}/download`)) {
+          if (registerDuringRead) historical=true;
           if (pauseOwnedClaim) {
             await connection.execute(
               sql`UPDATE sync_api_settings SET remote_solver_transfer_paused=true WHERE id=1`,
@@ -459,11 +470,26 @@ export async function verifyProgressiveWorkerArchiveDelivery(
         expect(
           await reclaimProgressiveArchives(connection, reclaimSettings, 1),
         ).toBe(0);
+        const [protectedOriginal] = await connection.execute(sql`SELECT completed_at,last_error FROM progressive_worker_archive_reclaims
+          WHERE sim_job_id=${executionId}::uuid`);
+        expect(protectedOriginal).toMatchObject({completed_at:null,last_error:"Historical raw gateway owns this execution"});
+        expect(engineReclaims).toBe(0);
+        const due = () => connection.execute(sql`UPDATE progressive_worker_archive_reclaims SET retry_after=clock_timestamp()-interval '1 second'
+          WHERE sim_job_id=${executionId}::uuid`);
+        historical=false; corruptReadback=false; registerDuringRead=true;
+        await due();
+        expect(await reclaimProgressiveArchives(connection,reclaimSettings,1)).toBe(0);
+        expect(engineReclaims).toBe(0);
+        expect((await connection.execute(sql`SELECT completed_at,last_error FROM progressive_worker_archive_reclaims
+          WHERE sim_job_id=${executionId}::uuid`))[0]).toMatchObject({completed_at:null,last_error:"Historical raw gateway owns this execution"});
+        historical=false; registerDuringRead=false; corruptReadback=true;
+        await due();
+        expect(await reclaimProgressiveArchives(connection,reclaimSettings,1)).toBe(0);
         const [refused] = await connection.execute(
           sql`SELECT attempt_count,last_error,completed_at FROM progressive_worker_archive_reclaims WHERE sim_job_id=${executionId}::uuid`,
         );
         expect(refused).toMatchObject({
-          attempt_count: 1,
+          attempt_count: 3,
           completed_at: null,
           last_error: expect.stringContaining("readback"),
         });

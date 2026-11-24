@@ -1,3 +1,4 @@
+import { ArchiveAdmissionBusy, assertOrdinaryRegisteredCustody } from "./registered-retention-owner";
 import { createHash, randomUUID } from "node:crypto";
 import {
   analysisContentHash,
@@ -43,11 +44,7 @@ export async function runArchiveReclaimPass(
   );
 }
 
-class ArchiveAdmissionBusy extends Error {
-  constructor(readonly retryAfterMs: number) {
-    super("Registered archive admission remains busy (HTTP 503)");
-  }
-}
+
 
 export async function preflightProgressiveArchive(
   url: string,
@@ -346,12 +343,15 @@ async function reclaimClaim(
           "Progressive archive reclaim conflicts with a stored remote reference",
         );
     });
+    const ordinaryAssignment = await assertOrdinaryRegisteredCustody(db, claim.executionId, signal);
     await preflightProgressiveArchive(
       downloadUrl,
       settings.remoteSolverAuthToken,
       remote,
       signal,
     );
+    if (await assertOrdinaryRegisteredCustody(db, claim.executionId, signal) !== ordinaryAssignment)
+      throw Error("Registered point-reclaim assignment changed during archive read");
     await renew();
     signal.throwIfAborted();
     const token = configuredControlPlaneToken();
