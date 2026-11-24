@@ -2,11 +2,13 @@ import { randomUUID } from "node:crypto";
 import { sql } from "drizzle-orm";
 import { afterAll, afterEach, expect, it, vi } from "vitest";
 import { analysisContentHash } from "../src/analysis-target";
+import { canonicalReportJson, parseReportJson, reportTextIdentity, reportValidationValue } from "../src/progressive-report-archive";
 import { createClient, type DB } from "../src/client";
 import {
   installProgressiveReportArchiveReader,
   readProgressiveReport,
   resolveStoredProgressiveReport,
+  withWorkerReportPageReads,
   type ProgressiveReportArchiveIdentity,
   type ProgressiveReportSourceKind,
 } from "../src/progressive-report-reader";
@@ -228,4 +230,36 @@ it("shares only concurrent authenticated reads of the same exact remote member a
       expect(read).toHaveBeenCalledTimes(2);
     }
   });
+});
+
+it.each(["90071992547409931234567890", "1e400"])("reopens each shared result and returns an independent native value for %s", async number => {
+  const executionId = randomUUID(), owner = { solverId: randomUUID(), promiseId: randomUUID(), assignmentSignature: "e".repeat(64) };
+  const token = `{"job_id":${JSON.stringify(executionId)},"values":[${number},-0,1.00]}`;
+  const frames = [2,3].map(sequence => {
+    const text = `{"result":${token},"version":1,"status":{"job_id":${JSON.stringify(executionId)}},"sequence":${sequence},"executionId":${JSON.stringify(executionId)},${JSON.stringify(owner).slice(1)}`;
+    const ref = { sourceKind: "worker" as const, executionId, sequence,
+      contentSignature: reportTextIdentity(canonicalReportJson(parseReportJson(text))).sha256 };
+    return { text, ref, proof: reportTextIdentity(text) };
+  });
+  let current = frames[0]!, returned = current.text, tokenSha = reportTextIdentity(token).sha256;
+  const read = vi.fn(async () => returned), bundle = randomUUID();
+  installProgressiveReportArchiveReader({ read });
+  const db = { execute: async () => [{ report: { ...owner, archivedReport: true }, archived_at: "now",
+    archive_bundle_id: bundle, verified_at: "now", report_sha256: current.proof.sha256, report_byte_size: current.proof.byteSize,
+    bucket: "isolated", object_key: "worker/page", generation: "18446744073709551614", mime_type: "application/gzip",
+    compression: "gzip", archive_format: "worker-result-ref-v1", stored_sha256: "c".repeat(64), stored_byte_size: 1500,
+    crc32c: "AAAAAA==", member_count: 2, first_sequence: 2, last_sequence: 3, worker_result_sha256: tokenSha }] } as unknown as DB;
+  await withWorkerReportPageReads(async () => {
+    const first = await readProgressiveReport(db,current.ref,owner);
+    expect(first).toEqual(reportValidationValue(parseReportJson(current.text)));
+    (first.result as unknown as {values: unknown[]}).values.length = 0;
+    current = frames[1]!; returned = current.text;
+    expect(await readProgressiveReport(db,current.ref,owner)).toEqual(reportValidationValue(parseReportJson(current.text)));
+    returned += " ";
+    await expect(readProgressiveReport(db,current.ref,owner)).rejects.toThrow("member bytes changed");
+    returned = current.text;
+    tokenSha = "d".repeat(64);
+    await expect(readProgressiveReport(db,current.ref,owner)).rejects.toThrow("registered token");
+  });
+  expect(read).toHaveBeenCalledTimes(4);
 });

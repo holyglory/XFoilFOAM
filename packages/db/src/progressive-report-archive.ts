@@ -194,7 +194,7 @@ export function canonicalReportJson(value: ReportJson): string {
     const number = Number(value.text);
     if (Number.isFinite(number)) {
       const candidate = JSON.stringify(number);
-      if (decimalIdentity(candidate) === decimalIdentity(value.text))
+      if (candidate === value.text || decimalIdentity(candidate) === decimalIdentity(value.text))
         return candidate;
     }
     return value.text;
@@ -214,16 +214,30 @@ export function canonicalReportJson(value: ReportJson): string {
 // numbers never determine returned text or integrity digests. Overflow tokens
 // stay objects, so numeric domain checks fail.
 export function reportValidationValue(value: ReportJson): unknown {
+  return validationValue(value);
+}
+
+/** Native JSON.parse produces this same independent domain view when every
+ * numeric token fits a finite JS number. Neither view determines byte identities. */
+export function reportValidationValueWithNumberRange(value: ReportJson) {
+  let allNumbersFinite = true;
+  const decoded = validationValue(value, () => { allNumbersFinite = false; });
+  return { decoded, allNumbersFinite };
+}
+
+function validationValue(value: ReportJson, onOverflow?: () => void): unknown {
   if (value instanceof ReportJsonNumber) {
     const number = Number(value.text);
-    return Number.isFinite(number) ? number : value;
+    if (Number.isFinite(number)) return number;
+    onOverflow?.();
+    return value;
   }
-  if (Array.isArray(value)) return value.map(reportValidationValue);
+  if (Array.isArray(value)) return value.map(item => validationValue(item, onOverflow));
   if (value !== null && typeof value === "object")
     return Object.fromEntries(
       Object.entries(value).map(([key, item]) => [
         key,
-        reportValidationValue(item),
+        validationValue(item, onOverflow),
       ]),
     );
   return value;

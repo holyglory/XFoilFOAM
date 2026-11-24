@@ -10,14 +10,10 @@ import { isDeepStrictEqual } from "node:util";
 import { sql } from "drizzle-orm";
 import { createClient } from "@aerodb/db/client";
 import {
-  parseReportJson,
   reportTextIdentity, splitProgressiveReportText,
   reportValidationValue,
 } from "@aerodb/db/progressive-report-archive";
-import {
-  installProgressiveReportArchiveReader,
-  readProgressiveReport,
-} from "@aerodb/db/progressive-report-reader";
+import * as productReportReader from "@aerodb/db/progressive-report-reader";
 import { LegacyOriginSigner } from "@aerodb/db/legacy-report-signature";
 import { retainedReportInventory, retainedReportInventorySignature } from "@aerodb/db/retained-solver-reports";
 import { verifyProgressiveRemoteExecution } from "@aerodb/db";
@@ -38,6 +34,7 @@ import {
 } from "./progressive-report-archive-store.ts";
 import { retainWorkerReportVolume } from "./worker-report-volume.ts";
 
+const { installProgressiveReportArchiveReader, readArchivedProgressiveReportText } = productReportReader;
 const byteLimit = 32 * 1024 ** 2;
 const hash = (value) => createHash("sha256").update(value).digest("hex");
 const eq = (a, b, message) => assert.ok(isDeepStrictEqual(a, b), message);
@@ -394,7 +391,7 @@ async function productRead(db, key, native, pin, reader, committed) {
     );
   } else {
     assert.ok(native.archivedBundle, "Native archive pointer missing");
-    const full = await readProgressiveReport(
+    const restored = await readArchivedProgressiveReportText(
       db,
       {
         sourceKind: "worker",
@@ -404,11 +401,12 @@ async function productRead(db, key, native, pin, reader, committed) {
       },
       native.owner,
     );
-    eq(
-      full,
-      reportValidationValue(parseReportJson(native.text)),
-      "Ordinary report read differs from authenticated PostgreSQL text",
-    );
+    // The normal reader materializes and verifies the application report before
+    // exposing its source text. Compare those exact bytes to the independent
+    // native original, including values that cannot fit in a JavaScript number.
+    assert.ok(restored && restored.bundleId === native.archivedBundle &&
+      restored.generation === pin.generation && restored.storedSha256 === pin.storedSha256 &&
+      restored.text === native.text, "Ordinary report read differs from authenticated PostgreSQL text");
   }
   return { pin, reader, committed, at: new Date().toISOString() };
 }
@@ -706,7 +704,11 @@ function requestFacts(m, basis) {
 async function runClosedReportPeer(db, m, readBasis) {
   if (m.op !== "read" || !m.committed) readBasis?.clear();
   try {
-    const value = await closedReportRequest(db, m, readBasis, requestFacts(m, readBasis));
+    const read = () => closedReportRequest(db, m, readBasis, requestFacts(m, readBasis));
+    const groupedProductRead = (m.op === "settle" || (m.op === "read" && m.committed)) &&
+      m.items?.length > 1 && m.items[0].pin?.archiveFormat === WORKER_RESULT_REF;
+    const value = groupedProductRead && productReportReader.withWorkerReportPageReads
+      ? await productReportReader.withWorkerReportPageReads(read) : await read();
     // A pre-commit native read already retained the authenticated originals in
     // readBasis. Its post-commit call still opens the actual product reader.
     const partial = m.op === "source" && m.items && value.rows.length !== m.items.length;

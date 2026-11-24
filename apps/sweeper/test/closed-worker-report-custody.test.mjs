@@ -437,6 +437,34 @@ it.each([
                 WHERE sim_job_id=${id}::uuid`);
               expect(dictionary.map(r => [Number(r.sequence),Number(r.witness_sequence)])).toEqual([[3,4]]);
               expect(cloudObjects.size).toBe(2);
+
+              const siblings = f.reports.slice(5, 7);
+              const nextKeys = siblings.map(row => ({ executionId: id, sequence: row.sequence, signature: row.contentSignature }));
+              const group = (op, items, fields = {}, connection = db) =>
+                run(op, { key: nextKeys[0], items, ...fields }, connection);
+              const src = (await group("source", nextKeys.map(key => ({ key })))).rows;
+              const copies = nextKeys.map((key,i) => ({ key, source: src[i].source }));
+              const witness = { ...copies[0], row: siblings[0] };
+              const evidence = (await asHub(tx => group("hub", copies, {}, tx), witness)).rows;
+              const receipt = await group("publish", copies.map((v,i) => ({ ...v, hub: evidence[i] })));
+              const bound = copies.map((v,i) => ({ ...v, pin: receipt.pins[i] }));
+              expect(bound.map(v => v.pin.archiveFormat)).toEqual(["worker-result-ref-v1","worker-result-ref-v1"]);
+              const cloudReads = await asHub(tx => group("cloud", bound, { hubAccount: account }, tx), witness);
+              expect(cloudReads.generationDownloads).toBe(2);
+              const apiReads = (await group("read", bound, { reader: "api" })).rows;
+              const sweepReads = (await group("read", bound, { reader: "sweeper" })).rows;
+              const actions = bound.map((v,i) => ({ ...v, hub: evidence[i], cloud: cloudReads.rows[i],
+                api: apiReads[i], sweeper: sweepReads[i] }));
+              const stale = [actions[0], { ...actions[1], api: { ...actions[1].api, at: "2000-01-01T00:00:00Z" } }];
+              await expect(group("settle", stale)).rejects.toThrow("Fresh independent read");
+              expect((await db.execute(sql`SELECT archived_at FROM progressive_worker_reports WHERE sim_job_id=${id}::uuid
+                AND sequence IN (6,7)`)).map(x=>x.archived_at)).toEqual([null,null]);
+              expect((await group("settle", actions)).rows.map(x=>x.outcome)).toEqual(["retired","retired"]);
+              for (const reader of ["api","sweeper"])
+                expect((await group("read", bound, { reader, committed: true })).rows.map(x=>x.pin))
+                  .toEqual(receipt.pins);
+              expect((await group("settle", actions)).rows.map(x=>x.outcome)).toEqual(["already_retired","already_retired"]);
+              expect(await archiveFixtureAttemptIdentity(db,workerAttempt,hubAttempt)).toEqual(nativeIdentity);
             }
             return;
           }
@@ -509,7 +537,7 @@ it.each([
           await rm(volume, { recursive: true, force: true });
         }
       },
-      { normalized, settled: false, reportCount: sparse ? 6 : 5 },
+      { normalized, settled: false, reportCount: sparse ? 8 : 5 },
     );
   },
   30000,

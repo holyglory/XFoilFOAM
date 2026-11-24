@@ -1,5 +1,7 @@
 import { sql } from "drizzle-orm";
 import { createHash } from "node:crypto";
+import { AsyncLocalStorage } from "node:async_hooks";
+import { LegacyOriginSigner } from "./legacy-report-signature";
 import type { DB } from "./client";
 import { analysisContentHash } from "./analysis-target";
 import {
@@ -7,6 +9,7 @@ import {
   parseReportJson,
   reportTextIdentity,
   reportValidationValue,
+  reportValidationValueWithNumberRange,
   type ProgressiveReportArchiveReadIdentity,
 } from "./progressive-report-archive";
 import type { ProgressiveRemoteReport } from "./progressive-remote-report";
@@ -125,6 +128,53 @@ function verifyBody(value: unknown, reference: ProgressiveReportReference, signa
   return report as ProgressiveRemoteReport;
 }
 
+/** Independent of the transport cache. Only a signed, byte-identical root result
+ * can reuse its canonical hash prefix. Each call still obtains a fresh product
+ * value and reopens and verifies the physical generations through its reader. */
+class WorkerResultReadPage {
+  private signer?: LegacyOriginSigner;
+  private scope?: string;
+  private nativeJsonMatches = false;
+
+  materialize(body: string, reference: ProgressiveReportReference, owner: ReportOwner, tokenSha256: string) {
+    const scope = JSON.stringify([reference.executionId, owner.solverId, owner.promiseId, owner.assignmentSignature, tokenSha256]);
+    if (!this.signer || scope !== this.scope) {
+      this.signer = new LegacyOriginSigner();
+      this.nativeJsonMatches = false;
+      this.scope = scope;
+    }
+    let value: unknown;
+    const signed = this.signer.matches(body, reference.executionId, owner.solverId, reference.sequence,
+      reference.contentSignature, (envelope, token, repeated) => {
+        if (typeof token !== "string" || envelope.promiseId !== owner.promiseId ||
+            envelope.assignmentSignature !== owner.assignmentSignature)
+          throw new Error("Worker report result belongs to another dispatch");
+        if (repeated) {
+          // The signer checked the complete original token before giving us the small envelope.
+          const report = reportValidationValue(envelope) as Record<string, unknown>;
+          report.result = this.nativeJsonMatches ? JSON.parse(token) : reportValidationValue(parseReportJson(token));
+          value = report;
+        } else {
+          if (reportTextIdentity(token).sha256 !== tokenSha256)
+            throw new Error("Worker report result differs from its registered token");
+          const report = reportValidationValue({ ...envelope, result: null }) as Record<string, unknown>;
+          const result = reportValidationValueWithNumberRange(envelope.result!);
+          this.nativeJsonMatches = result.allNumbersFinite;
+          report.result = result.decoded;
+          value = report;
+        }
+      });
+    if (!signed) throw new Error("Archived worker report differs from its exact stored signature");
+    return verifyBody(value, reference, reference.contentSignature);
+  }
+}
+
+const workerPage = new AsyncLocalStorage<WorkerResultReadPage>();
+
+export function withWorkerReportPageReads<T>(read: () => Promise<T>): Promise<T> {
+  return workerPage.run(new WorkerResultReadPage(), read);
+}
+
 /** Exactly one immutable sequence. Never substitutes a latest report or a compact header. */
 export function readProgressiveReport(
   db: DB,
@@ -146,9 +196,10 @@ interface ArchivedReportText {
 export async function readArchivedProgressiveReportText(
   db: DB,
   reference: ProgressiveReportReference,
+  preparedOwner?: ReportOwner,
 ): Promise<ArchivedReportText | null> {
   let restored: ArchivedReportText | null = null;
-  await materializeProgressiveReport(db, reference, undefined, (member) => { restored = member; });
+  await materializeProgressiveReport(db, reference, preparedOwner, (member) => { restored = member; });
   return restored;
 }
 
@@ -273,9 +324,15 @@ async function materializeProgressiveReport(
       const raw = reportTextIdentity(body);
       if (raw.byteSize !== reportByteSize || raw.sha256 !== stored.report_sha256)
         throw new Error("Archived progressive full report member bytes changed");
-      const parsed = parseReportJson(body);
-      const signature = createHash("sha256").update(canonicalReportJson(parsed), "utf8").digest("hex");
-      const report = verifyBody(reportValidationValue(parsed), reference, signature);
+      let report: ProgressiveRemoteReport;
+      const page = storedIdentity.archiveFormat === "worker-result-ref-v1" && preparedOwner ? workerPage.getStore() : undefined;
+      if (page && preparedOwner && storedIdentity.workerResultSha256) {
+        report = page.materialize(body, reference, preparedOwner, storedIdentity.workerResultSha256);
+      } else {
+        const parsed = parseReportJson(body);
+        const signature = createHash("sha256").update(canonicalReportJson(parsed), "utf8").digest("hex");
+        report = verifyBody(reportValidationValue(parsed), reference, signature);
+      }
       if (preparedOwner && (report.solverId !== preparedOwner.solverId || report.promiseId !== preparedOwner.promiseId ||
         report.assignmentSignature !== preparedOwner.assignmentSignature))
         throw new Error("Verified report belongs to another dispatch");
@@ -290,7 +347,7 @@ async function materializeProgressiveReport(
       controller.abort();
     }
   };
-  if (!scoped) return restore();
+  if (!scoped || capture) return restore();
   // Each preparer has independently selected this signed owner and catalog
   // member. Share only concurrent work of this installed reader, with the
   // original deadline. Nothing is reusable after success, abort or failure.
