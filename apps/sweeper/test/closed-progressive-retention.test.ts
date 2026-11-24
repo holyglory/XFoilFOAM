@@ -59,9 +59,15 @@ const tableDefinitions = [
   "field_render_cache(storage_key text)",
   "result_media_storage_uploads(result_media_id uuid)",
   "sweeper_state(id int primary key,closed_progressive_retention_after_id uuid,disk_admission_blocked boolean)",
-  "sync_api_settings(id int,remote_solver_registered_id uuid,remote_solver_auth_token text,upstream_base_url text)",
+  "sync_api_settings(id int,remote_solver_registered_id uuid,remote_solver_auth_token text,upstream_base_url text,instance_id uuid NOT NULL)",
   "sync_sweep_promises(id uuid,source_base_url text,registered_solver_id uuid)",
 ];
+
+async function insertWorkerSettings(db: DB, upstreamBaseUrl = root) {
+  await db.execute(sql`INSERT INTO sync_api_settings
+    (id,instance_id,remote_solver_registered_id,remote_solver_auth_token,upstream_base_url)
+    SELECT id,instance_id,${solver}::uuid,${token},${upstreamBaseUrl} FROM public.sync_api_settings WHERE id=1`);
+}
 
 async function fixture(db: DB, id: string, points: number, opts: {
   remote?: ProgressiveEvidenceCustodyReceipt["remote"]; base?: string;
@@ -163,9 +169,7 @@ it("rotates blocked and 409 jobs, authenticates every object before reclaim and 
     const db = transaction as unknown as DB;
     for (const def of tableDefinitions)
       await db.execute(sql.raw("CREATE TEMP TABLE " + def + " ON COMMIT DROP"));
-    await db.execute(
-      sql`INSERT INTO sync_api_settings VALUES(1,${solver},${token},${root})`,
-    );
+    await insertWorkerSettings(db);
     await db.execute(
       sql`INSERT INTO sync_sweep_promises VALUES(${promiseId},${root},${solver})`,
     );
@@ -399,7 +403,7 @@ it("runs the default sweeper past eight held jobs, restores every member, and re
       for (const col of missing) await connection.db.execute(sql`ALTER TABLE ${sql.identifier(name)} ADD COLUMN ${sql.identifier(String(col.name))} ${sql.raw(String(col.type))}`);
     }
     await connection.db.execute(sql`INSERT INTO sweeper_state(id,disk_admission_blocked) VALUES(1,false)`);
-    await connection.db.execute(sql`INSERT INTO sync_api_settings(id,remote_solver_registered_id,remote_solver_auth_token,upstream_base_url) VALUES(1,${solver},${token},${upstream})`);
+    await insertWorkerSettings(connection.db, upstream);
     await connection.db.execute(sql`INSERT INTO sync_sweep_promises(id,source_base_url,registered_solver_id) VALUES(${promiseId},${upstream},${solver})`);
     for (let i=1;i<=8;i++) {
       const [point]=await fixture(connection.db,owned(i),1,{base:upstream});
@@ -495,9 +499,7 @@ it.each(["rans", "urans", "superseded-urans"])("keeps %s point-owned images and 
     const db = transaction as unknown as DB;
     for (const def of tableDefinitions)
       await db.execute(sql.raw("CREATE TEMP TABLE " + def + " ON COMMIT DROP"));
-    await db.execute(
-      sql`INSERT INTO sync_api_settings VALUES(1,${solver},${token},${root})`,
-    );
+    await insertWorkerSettings(db);
     await db.execute(
       sql`INSERT INTO sync_sweep_promises VALUES(${promiseId},${root},${solver})`,
     );
@@ -740,7 +742,7 @@ it("binds an explicitly empty URANS image set to its normal per-job proof", asyn
     const db = tx as unknown as DB;
     for (const definition of tableDefinitions)
       await db.execute(sql.raw("CREATE TEMP TABLE " + definition + " ON COMMIT DROP"));
-    await db.execute(sql`INSERT INTO sync_api_settings VALUES(1,${solver},${token},${root})`);
+    await insertWorkerSettings(db);
     await db.execute(sql`INSERT INTO sync_sweep_promises VALUES(${promiseId},${root},${solver})`);
     const id = randomUUID();
     const [point] = await fixture(db, id, 1);
@@ -785,7 +787,7 @@ it.each([false,true])("keeps an unreported solver readable and records only its 
       await db.execute(sql.raw("CREATE TEMP TABLE " + definition + " ON COMMIT DROP"));
     await db.execute(sql`ALTER TABLE sync_sweep_promises ADD status text`);
     await db.execute(sql`ALTER TABLE sync_api_settings ADD remote_solver_transfer_paused boolean DEFAULT false`);
-    await db.execute(sql`INSERT INTO sync_api_settings VALUES(1,${solver},${token},${root})`);
+    await insertWorkerSettings(db);
     await db.execute(sql`INSERT INTO sync_sweep_promises VALUES(${promiseId},${root},${solver},'cancelled')`);
     const id = randomUUID();
     const [signed] = await fixture(db, id, 1);
@@ -956,7 +958,7 @@ it("reschedules only one deferred point after an exact registered read, preservi
     await db.execute(sql`ALTER TABLE sync_api_settings ADD remote_solver_transfer_paused boolean DEFAULT false`);
     await db.execute(sql`ALTER TABLE progressive_worker_archive_reclaims ADD claim_token uuid,ADD claim_expires_at timestamptz,
       ADD attempt_count int, ADD retry_after timestamptz,ADD last_error text,ADD reclaimed_bytes bigint`);
-    await db.execute(sql`INSERT INTO sync_api_settings VALUES(1,${solver},${token},${root})`);
+    await insertWorkerSettings(db);
     await db.execute(sql`INSERT INTO sync_sweep_promises VALUES(${promiseId},${root},${solver})`);
     const job = randomUUID(), [point] = await fixture(db,job,1);
     const target = {jobId:job,pointSignature:sha(point!.attempt),uploadId:point!.upload,attemptCount:11};
