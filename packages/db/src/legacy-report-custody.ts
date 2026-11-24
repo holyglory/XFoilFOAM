@@ -147,6 +147,7 @@ interface ScientificResultGroup {
 interface VerifiedScientificResult {
   group: ScientificResultGroup;
   signedPrefix?: { text: string; hash: Hash };
+  inlineResultPrefix?: string;
 }
 
 function postgresEnvelope(fields: Map<string, string>, result: string): string {
@@ -159,16 +160,18 @@ function appendScientificReport(group: ScientificResultGroup, member: LegacyRepo
     envelopeText: postgresEnvelope(fields, "null") });
 }
 
-function matchesOriginalReport(fields: ReadonlyMap<string, string>, result: string, text: string) {
-  if (!text.startsWith("{") || !fields.has("result")) return false;
+function originalResultOffset(fields: ReadonlyMap<string, string>, result: string, text: string): number | undefined {
+  if (!text.startsWith("{") || !fields.has("result")) return;
   let offset = 1;
+  let resultStart: number | undefined;
   for (const [key, value] of fields) {
     const name = (offset === 1 ? "" : ", ") + JSON.stringify(key) + ": ";
     const original = key === "result" ? result : value;
-    if (!text.startsWith(name, offset) || !text.startsWith(original, offset + name.length)) return false;
+    if (!text.startsWith(name, offset) || !text.startsWith(original, offset + name.length)) return;
+    if (key === "result") resultStart = offset + name.length;
     offset += name.length + original.length;
   }
-  return offset === text.length - 1 && text[offset] === "}";
+  if (offset === text.length - 1 && text[offset] === "}") return resultStart;
 }
 
 /** A 0198 hash is only a lookup hint. First match the entire original PG
@@ -178,7 +181,7 @@ function reuseScientificResult(member: LegacyReportMember, storedReport: string,
   if (!prior.signedPrefix) return false;
   const fields = new Map<string, string>();
   const envelope = reportJsonObject(parseReportJson(storedReport, fields));
-  if (!matchesOriginalReport(fields, prior.group.resultText, member.reportText)) return false;
+  if (originalResultOffset(fields, prior.group.resultText, member.reportText) === undefined) return false;
   const slot = resultSlot(envelope);
   if (!slot || slot.prefix !== prior.signedPrefix.text) return false;
   if (prior.signedPrefix.hash.copy().update(slot.suffix).digest("hex") !== member.contentSignature)
@@ -190,11 +193,23 @@ function reuseScientificResult(member: LegacyReportMember, storedReport: string,
 // Preserve the PostgreSQL text used for whole-report reconstruction. Only the
 // normal staging point identity uses the application's numerical representation.
 function collectScientificSource(member: LegacyReportMember, groups: Map<string, ScientificResultGroup>,
-  previous: VerifiedScientificResult | undefined, payloadHash: unknown, storedReport: string | undefined): VerifiedScientificResult | undefined {
+  previous: VerifiedScientificResult | undefined, payloadHash: unknown, storedReport: string | undefined,
+  inline: boolean): VerifiedScientificResult | undefined {
   if (member.kind !== "report") return;
-  if (previous && previous.group.executionId === member.executionId &&
-    previous.group.resultSha256 === payloadHash && storedReport?.startsWith("{") &&
-    reuseScientificResult(member, storedReport, previous)) return previous;
+  if (previous?.signedPrefix && previous.group.executionId === member.executionId) {
+    if (previous.group.resultSha256 === payloadHash && storedReport?.startsWith("{") &&
+      reuseScientificResult(member, storedReport, previous)) return previous;
+    // The offsets came from parsing the actual root result on the first
+    // member. Authenticate its complete token before omitting it from the
+    // temporary parser input. The joined PG spelling and this member's
+    // canonical transport signature are independently checked by reuseScientificResult.
+    const prefix = previous.inlineResultPrefix;
+    if (inline && prefix !== undefined && member.reportText.startsWith(prefix) &&
+        member.reportText.startsWith(previous.group.resultText, prefix.length)) {
+      const suffix = member.reportText.slice(prefix.length + previous.group.resultText.length);
+      if (reuseScientificResult(member, prefix + "null" + suffix, previous)) return previous;
+    }
+  }
 
   const fields = new Map<string, string>();
   const report = parseReportJson(member.reportText, fields);
@@ -229,7 +244,21 @@ function collectScientificSource(member: LegacyReportMember, groups: Map<string,
     throw new Error("Scientific result digest collision");
   }
   appendScientificReport(group, member, fields);
-  return { group, signedPrefix };
+  const offset = inline ? originalResultOffset(fields, resultText, member.reportText) : undefined;
+  return { group, signedPrefix, inlineResultPrefix: offset === undefined ? undefined : member.reportText.slice(0, offset) };
+}
+
+// PostgreSQL places "report" first in a native worker row. The full text is
+// already authenticated by its separate report and row digests. For this
+// spelling only, parse its owner columns without parsing the identical nested
+// report a second time. The original report still goes through the full
+// scientific/signature check. All other row layouts use the original parser.
+const inlineRowPrefix = '{"report": ';
+function inlineRowMetadata(member: LegacyReportMember): string | undefined {
+  if (member.kind !== "report" || !member.reportText.startsWith("{") ||
+      !member.rowText.startsWith(inlineRowPrefix) ||
+      !member.rowText.startsWith(member.reportText, inlineRowPrefix.length)) return;
+  return inlineRowPrefix + "null" + member.rowText.slice(inlineRowPrefix.length + member.reportText.length);
 }
 
 interface BoundPage {
@@ -310,7 +339,8 @@ export async function verifyLegacyReportCustodyPage(
       throw new Error("Legacy member differs from its exact exported PostgreSQL text");
     const rowFields = previousScientific && member.kind === "report" && member.rowText.length < member.reportText.length
       ? new Map<string, string>() : undefined;
-    const source = reportValidationValue(parseReportJson(member.rowText, rowFields)) as Record<string, unknown>;
+    const metadata = inlineRowMetadata(member);
+    const source = reportValidationValue(parseReportJson(metadata ?? member.rowText, rowFields)) as Record<string, unknown>;
     if (!source || source.sim_job_id !== member.executionId || source.sequence !== member.sequence ||
       source.content_signature !== member.contentSignature)
       throw new Error("Legacy member source row differs from its bound report key");
@@ -322,7 +352,7 @@ export async function verifyLegacyReportCustodyPage(
     members.push({ kind: member.kind, executionId: member.executionId, sequence: member.sequence,
       contentSignature: member.contentSignature, ...text });
     previousScientific = collectScientificSource(member, scientificResults, previousScientific,
-      source.result_payload_hash, rowFields?.get("report"));
+      source.result_payload_hash, rowFields?.get("report"), metadata !== undefined && source.result_payload_hash == null);
   }
   const memberProofs = Object.freeze(members.map((member) => Object.freeze(member)));
   const startedAt = Date.now();

@@ -289,6 +289,52 @@ it("rolls back the entire bounded page when a later source digest differs", asyn
   });
 });
 
+it("binds repeated inline scientific text to every original row, signature and committed member", async () => {
+  await withArchiveFixture(client, "worker", async (fixture) => {
+    const { instanceId, solverId } = await setup(fixture);
+    const all = await membersFor(fixture.db, fixture.executionId);
+    const prior = all[0]!, second = all[1]!;
+    const prefix = '{"report": ';
+    expect(second.rowText.startsWith(prefix + second.reportText)).toBe(true);
+    const tail = second.rowText.slice(prefix.length + second.reportText.length);
+    const verify = async (members: LegacyReportMember[]) => {
+      const input = pageFor(instanceId, solverId, members);
+      return verifyLegacyReportCustodyPage({ ...input, access: input.access("hub-local-reader") });
+    };
+    const changed = (reportText: string, rowText: string): LegacyReportMember => ({
+      ...second, reportText, reportSha256: digest(reportText), reportByteSize: Buffer.byteLength(reportText),
+      rowText, rowSha256: digest(rowText),
+    });
+    // Each invalid example has correct archive byte digests. Neither a coincident
+    // large result nor its placement in a row authenticates a changed envelope.
+    for (const body of [
+      second.reportText.replace('"sequence": 2', '"sequence": 3'),
+      second.reportText.replace('"chord": 0.987654', '"chord": 0.987655'),
+    ]) {
+      expect(body).not.toBe(second.reportText);
+      await expect(verify([prior, changed(body, prefix + body + tail)])).rejects.toThrow(/signature/);
+    }
+    await expect(verify([prior, changed(second.reportText, prefix + second.reportText + ',"report":null' + tail)]))
+      .rejects.toThrow(/JSON/);
+    const otherRow = tail.replace('"sequence": 2', '"sequence": 3');
+    expect(otherRow).not.toBe(tail);
+    await expect(verify([prior, changed(second.reportText, prefix + second.reportText + otherRow)]))
+      .rejects.toThrow(/source row/);
+    // Older JSON layouts still verify by the full parser, including unknown
+    // fields, Unicode and the fixture's number outside JavaScript's safe range.
+    const alternate = changed(second.reportText, '{ "report": ' + second.reportText + tail);
+    expect((await verify([prior, alternate])).memberProofs[1]!.rowSha256).toBe(alternate.rowSha256);
+
+    const proof = await verify(all);
+    expect(proof.memberProofs.map(m => [m.sequence, m.contentSignature, m.reportSha256, m.rowSha256]))
+      .toEqual(all.map(m => [m.sequence, m.contentSignature, m.reportSha256, m.rowSha256]));
+    const applied = await applyLegacyReportCustodyPage(fixture.db, proof, { apply: true, readersReady: true });
+    expect(applied.receipt).toMatchObject({ compactedReports: all.length, compactedConflicts: 0 });
+    expect((await applyLegacyReportCustodyPage(fixture.db, await verify(all), { apply: true, readersReady: true })).receipt)
+      .toMatchObject({ compactedReports: 0, replayedMembers: all.length });
+  }, { normalized: false, reportCount: 5, nullPrefix: 0 });
+});
+
 it("requires a fresh product read again instead of replaying an old saved receipt as authority", async () => {
   await withArchiveFixture(client, "worker", async (fixture) => {
     const { instanceId, solverId } = await setup(fixture);
