@@ -45,6 +45,7 @@ export class LegacyOriginSigner {
       envelope: ReturnType<typeof reportJsonObject>,
       resultText: string | null,
       repeated: boolean,
+      cut: { prefix: string; suffix: string },
     ) => void,
   ) {
     const owns = (report: ReturnType<typeof reportJsonObject>) =>
@@ -65,12 +66,12 @@ export class LegacyOriginSigner {
       if (slot?.prefix === prev.signedPrefix) {
         if (!owns(envelope) || prev.hash.copy().update(slot.suffix).digest("hex") !== signature)
           return false;
-        verified?.(envelope, prev.result, true);
+        verified?.(envelope, prev.result, true, { prefix: prev.prefix, suffix });
         return true;
       }
     }
     this.prior = undefined;
-    const { report, prefix, result } = splitProgressiveReportText(text);
+    const { report, prefix, result, suffix } = splitProgressiveReportText(text);
     if (!owns(report)) return false;
     const slot = this.retainResult && result !== null ? canonicalLegacyResultSlot(report) : undefined;
     if (result !== null && slot) {
@@ -79,13 +80,13 @@ export class LegacyOriginSigner {
         .update(canonicalReportJson(report.result!));
       if (hash.copy().update(slot.suffix).digest("hex") !== signature)
         return false;
-      verified?.(report, result, false);
+      verified?.(report, result, false, { prefix, suffix });
       this.prior = { prefix, result, signedPrefix: slot.prefix, hash };
       return true;
     }
     if (createHash("sha256").update(canonicalReportJson(report)).digest("hex") !== signature)
       return false;
-    verified?.(report, result, false);
+    verified?.(report, result, false, { prefix, suffix });
     return true;
   }
 }

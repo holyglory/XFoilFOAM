@@ -8277,6 +8277,7 @@ export const progressiveReportArchiveBundles = pgTable(
     firstSequence: bigint("first_sequence", { mode: "number" }).notNull(),
     lastSequence: bigint("last_sequence", { mode: "number" }).notNull(),
     verifiedAt: timestamp("verified_at", { withTimezone: true }).notNull(),
+    workerResultSha256: text("worker_result_sha256"),
     legacyInstanceId: uuid("legacy_instance_id"),
     legacySolverId: uuid("legacy_solver_id"),
     legacyScopeSha256: text("legacy_scope_sha256"),
@@ -8313,10 +8314,14 @@ export const progressiveReportArchiveBundles = pgTable(
       "progressive_report_archive_bundles_compression_check",
       sql`${table.compression} = 'gzip'`,
     ),
+    resultShape: check("progressive_report_worker_result_shape",
+      sql`(${table.archiveFormat}='worker-result-ref-v1')=(${table.workerResultSha256} IS NOT NULL)`),
     archiveFormatCheck: check("progressive_report_archive_bundles_archive_format_check",
-      sql`${table.archiveFormat} IN ('jsonl','legacy-jsonl','shared-result-v1')`),
+      sql`${table.archiveFormat} IN ('jsonl','legacy-jsonl','shared-result-v1','worker-result-ref-v1')`),
     legacyCheck: check("progressive_report_archive_bundles_legacy_check", sql`
-      ((${table.archiveFormat}='jsonl' OR (${table.archiveFormat}='shared-result-v1' AND ${table.sourceKind}='remote' AND ${table.mimeType}='application/gzip')) AND ${table.legacyInstanceId} IS NULL AND ${table.legacySolverId} IS NULL
+      ((${table.archiveFormat}='jsonl' OR (${table.archiveFormat}='worker-result-ref-v1' AND ${table.sourceKind}='worker' AND ${table.mimeType}='application/gzip'
+        AND ${table.memberCount} BETWEEN 1 AND 8 AND right(${table.objectKey},length('/worker/'||${table.simJobId}::text||'/'||${table.storedSha256}||'.jsonl.gz'))
+          ='/worker/'||${table.simJobId}::text||'/'||${table.storedSha256}||'.jsonl.gz') OR (${table.archiveFormat}='shared-result-v1' AND ${table.sourceKind}='remote' AND ${table.mimeType}='application/gzip')) AND ${table.legacyInstanceId} IS NULL AND ${table.legacySolverId} IS NULL
         AND ${table.legacyScopeSha256} IS NULL AND ${table.legacyPageMemberCount} IS NULL
         AND ${table.legacyReadMode} IS NULL AND ${table.legacyLocalStorageKey} IS NULL AND ${table.legacyLocalVerifiedAt} IS NULL)
       OR (${table.archiveFormat}='legacy-jsonl' AND ${table.sourceKind}='worker' AND ${table.mimeType}='application/gzip'
@@ -8401,6 +8406,26 @@ export const progressiveReportArchiveMembers = pgTable(
 );
 
 // Disabled until every report consumer has been upgraded to lossless reads.
+// The bundle-to-anchor FK is initially deferred so its witness and catalog
+// registration can commit together. Migration 0234 defines the deferred constraint.
+export const progressiveWorkerReportResultAnchors = pgTable("progressive_worker_report_result_anchors", {
+  simJobId: uuid("sim_job_id").notNull(),
+  resultSha256: text("result_sha256").notNull(),
+  resultByteSize: integer("result_byte_size").notNull(),
+  sequence: bigint("sequence", { mode: "number" }).notNull(),
+  witnessSequence: bigint("witness_sequence", { mode: "number" }).notNull(),
+  sourceKind: text("source_kind").notNull().default("worker"),
+  memberKind: text("member_kind").notNull().default("report"),
+}, table => ({
+  key: primaryKey({ columns: [table.simJobId, table.resultSha256] }),
+  member: foreignKey({ columns: [table.sourceKind, table.simJobId, table.memberKind, table.sequence],
+    foreignColumns: [progressiveReportArchiveMembers.sourceKind, progressiveReportArchiveMembers.simJobId,
+      progressiveReportArchiveMembers.memberKind, progressiveReportArchiveMembers.sequence] }).onDelete("restrict"),
+  witness: foreignKey({ columns: [table.sourceKind, table.simJobId, table.memberKind, table.witnessSequence],
+    foreignColumns: [progressiveReportArchiveMembers.sourceKind, progressiveReportArchiveMembers.simJobId,
+      progressiveReportArchiveMembers.memberKind, progressiveReportArchiveMembers.sequence] }).onDelete("restrict"),
+}));
+
 export const progressiveReportStoragePolicy = pgTable(
   "progressive_report_storage_policy",
   {

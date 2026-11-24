@@ -2,7 +2,6 @@ import { CRC32C, Storage, type Bucket, type File } from "@google-cloud/storage";
 import { pinExactGcsGeneration } from "@aerodb/core/gcs-exact-generation";
 import type { DB } from "@aerodb/db";
 import {
-  visitVerifiedWorkerReportArchive,
   WorkerReportMemberMismatch,
 } from "@aerodb/db/progressive-report-archive";
 import { sql } from "drizzle-orm";
@@ -16,6 +15,7 @@ import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { setImmediate as yieldToRequests } from "node:timers/promises";
 import { z } from "zod";
+import { visitWorkerReportGeneration, WorkerResultReadCache, WORKER_RESULT_REF } from "../../sweeper/src/worker-result-archive";
 import { env } from "./env";
 
 // A page may contain reports and their conflict copies. No whole-execution
@@ -41,7 +41,7 @@ export interface WorkerReportArchiveIdentity {
   generation: string;
   mimeType: string;
   compression: "gzip";
-  archiveFormat: "jsonl";
+  archiveFormat: "jsonl" | typeof WORKER_RESULT_REF;
   storedSha256: string;
   storedByteSize: number;
   crc32c: string;
@@ -115,6 +115,8 @@ async function ownedDispatch(
   };
 }
 
+const brokerResults = new WorkerResultReadCache();
+
 async function inspectBundle(
   path: string,
   identity: WorkerReportArchiveIdentity,
@@ -123,10 +125,10 @@ async function inspectBundle(
   dispatch: Dispatch,
 ) {
   try {
-    await visitVerifiedWorkerReportArchive(
+    await visitWorkerReportGeneration(
       createReadStream(path),
       identity,
-      { executionId, solverId: solver.id, ...dispatch },
+      { executionId, solverId: solver.id, workerInstance: solver.instanceId, ...dispatch },
       // Small deltas may expand into many envelopes within a single zlib chunk.
       () => yieldToRequests(),
       {
@@ -134,6 +136,11 @@ async function inspectBundle(
         maxDecodedBytes: MAX_JSON_BYTES,
         maxReportBytes: MAX_LINE_BYTES,
       },
+      async anchor => {
+        const { file } = await exactFile(solver, executionId,
+          { sha256: anchor.storedSha256, byteSize: anchor.storedByteSize }, anchor.generation, anchor.crc32c, "jsonl");
+        return file.createReadStream({ validation: "crc32c", decompress: false });
+      }, undefined, brokerResults,
     );
   } catch (error) {
     if (error instanceof WorkerReportMemberMismatch)
@@ -215,6 +222,7 @@ async function exactFile(
   identity: LocalIdentity,
   generation?: string,
   crc32c?: string,
+  expectedFormat?: WorkerReportArchiveIdentity["archiveFormat"],
 ): Promise<{ file: File; identity: WorkerReportArchiveIdentity }> {
   const scope = objectScope(executionId, identity.sha256);
   const bucket = brokerArchiveStorage().bucket(scope.bucket);
@@ -245,7 +253,8 @@ async function exactFile(
     custom.executionId !== executionId ||
     custom.solverId !== solver.id ||
     custom.sourceInstanceId !== solver.instanceId ||
-    custom.archiveFormat !== "jsonl"
+    (custom.archiveFormat !== "jsonl" && custom.archiveFormat !== WORKER_RESULT_REF) ||
+    (expectedFormat !== undefined && custom.archiveFormat !== expectedFormat)
   )
     reject("Worker report archive immutable metadata changed");
   return {
@@ -255,7 +264,7 @@ async function exactFile(
       generation: pinned,
       mimeType: "application/gzip",
       compression: "gzip",
-      archiveFormat: "jsonl",
+      archiveFormat: custom.archiveFormat,
       storedSha256: identity.sha256,
       storedByteSize: identity.byteSize,
       crc32c: String(metadata.crc32c),
@@ -270,6 +279,7 @@ export async function putBrokeredWorkerReportBundle(
   executionId: string,
   identity: LocalIdentity,
   body: Readable,
+  format: WorkerReportArchiveIdentity["archiveFormat"] = "jsonl",
 ): Promise<WorkerReportArchiveIdentity> {
   assertLocalIdentity(executionId, identity);
   const dispatch = await ownedDispatch(db, solver, executionId);
@@ -283,7 +293,7 @@ export async function putBrokeredWorkerReportBundle(
         generation: "1",
         mimeType: "application/gzip",
         compression: "gzip",
-        archiveFormat: "jsonl",
+        archiveFormat: format,
         storedSha256: identity.sha256,
         storedByteSize: identity.byteSize,
         crc32c: local.crc32c,
@@ -311,7 +321,7 @@ export async function putBrokeredWorkerReportBundle(
               executionId,
               solverId: solver.id,
               sourceInstanceId: solver.instanceId,
-              archiveFormat: "jsonl",
+              archiveFormat: format,
             },
           },
         });
@@ -324,6 +334,7 @@ export async function putBrokeredWorkerReportBundle(
       identity,
       undefined,
       local.crc32c,
+      format,
     );
     const proof = await stageBrokerArchive(
       remote.file.createReadStream({ validation: "crc32c", decompress: false }),
@@ -432,7 +443,7 @@ export async function registerReportArchiveBrokerRoutes(
         if (!solver) return;
         const params = paramsSchema.safeParse(req.params);
         const query = z
-          .object({ byteSize: sizeSchema })
+          .object({ byteSize: sizeSchema, format: z.literal(WORKER_RESULT_REF).optional() })
           .strict()
           .safeParse(req.query);
         if (
@@ -452,6 +463,7 @@ export async function registerReportArchiveBrokerRoutes(
             params.data.executionId,
             { sha256: params.data.sha256, byteSize: query.data.byteSize },
             req.body,
+            query.data.format,
           );
         } catch (error) {
           return failure(reply, error);

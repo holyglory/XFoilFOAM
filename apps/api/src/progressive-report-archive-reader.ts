@@ -16,6 +16,9 @@ import { env } from "./env";
 import { readSharedReport, verifySharedReportGeneration, SHARED_REPORT_FORMAT } from "../../sweeper/src/shared-report-archive";
 import { HubReportObjects } from "../../sweeper/src/shared-report-objects";
 
+import { WorkerResultReadCache } from "../../sweeper/src/worker-result-archive";
+
+const apiWorkerResults = new WorkerResultReadCache();
 let storage: Storage | null = null;
 
 export async function installApiReportArchiveReader(): Promise<void> {
@@ -26,7 +29,7 @@ export async function installApiReportArchiveReader(): Promise<void> {
       // Owner/credential lookups use the connection that selected the report,
       // including its transaction when a sync import already holds a slot.
       read: (identity, connection) =>
-        readStoredWorkerArchiveText(connection, identity),
+        readStoredWorkerArchiveText(connection, identity, apiWorkerResults),
     });
   } else if (env.evidenceBucket) {
     installProgressiveReportArchiveReader({

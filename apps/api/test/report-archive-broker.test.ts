@@ -1,5 +1,7 @@
 import { CRC32C, type File } from "@google-cloud/storage";
 import { analysisContentHash, type DB } from "@aerodb/db";
+import { retainedReportInventory } from "@aerodb/db/retained-solver-reports";
+import { encodeWorkerResultPage, WORKER_RESULT_REF } from "../../sweeper/src/worker-result-archive";
 import { reportTextIdentity } from "@aerodb/db/progressive-report-archive";
 import * as archiveCodec from "@aerodb/db/progressive-report-archive";
 import { PgDialect } from "drizzle-orm/pg-core";
@@ -9,7 +11,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { Readable } from "node:stream";
 import { setImmediate as nextTurn } from "node:timers/promises";
-import { gzipSync } from "node:zlib";
+import { gzipSync, gunzipSync } from "node:zlib";
 import { afterEach, expect, it, vi } from "vitest";
 import {
   putBrokeredWorkerReportBundle,
@@ -34,8 +36,8 @@ function checksum(bytes: Buffer) {
   return crc.toString();
 }
 
-async function fixture() {
-  const solver = { id: randomUUID(), instanceId: "isolated-worker" };
+async function fixture(instanceId = "isolated-worker") {
+  const solver = { id: randomUUID(), instanceId };
   const executionId = randomUUID();
   const promiseId = randomUUID();
   const assignmentSignature = "a".repeat(64);
@@ -151,7 +153,7 @@ async function fixture() {
     stopProof: null,
   });
   const bundle = (
-    reports = [report(10), report(11)],
+    reports: (Omit<ReturnType<typeof report>, "result"> & { result: unknown })[] = [report(10), report(11)],
     change?: (entry: Record<string, any>, index: number) => void,
   ) => {
     let previous = "";
@@ -626,4 +628,59 @@ it("rechecks reconstructed delta scope when restoring an already stored object",
   } finally {
     await f.app.close();
   }
+});
+
+it("authenticates a worker envelope and its original generation through the same closed dispatch", async () => {
+  const f = await fixture(randomUUID());
+  try {
+    const result = { job_id: f.executionId, polars: [{ chord: 1, speed: 2, reynolds: 100,
+      points: [{ aoa_deg: 2, case_slug: "first" }], attempts: [] }] };
+    const original = { ...f.report(10), result };
+    const base = f.bundle([original]);
+    const response = await f.app.inject({ method: "POST", url: base.url, headers: f.headers, payload: base.bytes });
+    expect(response.statusCode).toBe(200);
+    const { verifiedAt: _at, ...physical } = response.json();
+    const cut = archiveCodec.splitProgressiveReportText(base.texts[0]!);
+    const owner = { executionId: f.executionId, solverId: f.solver.id, workerInstance: f.solver.instanceId,
+      promiseId: f.promiseId, assignmentSignature: original.assignmentSignature };
+    const proof = reportTextIdentity(base.texts[0]!);
+    const anchor = { ...reportTextIdentity(cut.result!), member: { ...physical, sourceKind: "worker", memberKind: "report",
+      executionId: f.executionId, firstSequence: 10, lastSequence: 10, memberCount: 1, sequence: 10,
+      signature: analysisContentHash(original), reportSha256: proof.sha256, reportByteSize: proof.byteSize } };
+    const later = [{ ...original, sequence: 12 }, { ...original, sequence: 14 }];
+    const texts = f.bundle(later).texts;
+    const inputs = later.map((v,i) => {
+      const signature = analysisContentHash(v), text = texts[i]!;
+      return { sequence: v.sequence, signature, text, facts: { ...reportTextIdentity(text),
+        inventory: retainedReportInventory(archiveCodec.reportJsonObject(archiveCodec.parseReportJson(text)), signature).signature } };
+    });
+    const packed = encodeWorkerResultPage(owner, anchor, inputs)!;
+    const objectRoute = (bytes: Buffer) => `/api/sync/v1/progressive-executions/${f.executionId}/report-archives/${createHash("sha256").update(bytes).digest("hex")}`;
+    const put = (bytes: Buffer, headers: Record<string,string> = f.headers) => f.app.inject({ method: "POST",
+      url: objectRoute(bytes) + `?byteSize=${bytes.length}&format=${WORKER_RESULT_REF}`, headers, payload: bytes });
+    const altered = (change: (manifest: any) => void) => {
+      const manifest = JSON.parse(gunzipSync(packed).toString()); change(manifest);
+      return gzipSync(JSON.stringify(manifest), {level: 9});
+    };
+    expect((await put(packed, {...f.headers,"x-xfoilfoam-solver-token":"wrong"})).statusCode).toBe(401);
+    expect((await put(altered(v => { v.anchor.member.generation = "11"; }))).statusCode).toBe(409);
+    expect((await put(altered(v => { v.anchor.member.archiveFormat = WORKER_RESULT_REF; }))).statusCode).toBe(409);
+    expect((await put(altered(v => { v.owner.workerInstance = randomUUID(); }))).statusCode).toBe(409);
+    expect((await put(altered(v => { v.members[1].inventory = "e".repeat(64); }))).statusCode).toBe(409);
+    expect(f.objects.size).toBe(1);
+    const responses = await Promise.all([put(packed),put(packed)]);
+    expect(responses.map(r => r.statusCode)).toEqual([200,200]);
+    expect(responses.map(r => r.json().archiveFormat)).toEqual([WORKER_RESULT_REF,WORKER_RESULT_REF]);
+    expect(f.objects.size).toBe(2);
+    const get = () => f.app.inject({method:"GET",headers:f.headers,url:objectRoute(packed) +
+      `?byteSize=${packed.length}&generation=${f.generation}&crc32c=${encodeURIComponent(checksum(packed))}`});
+    expect((await get()).rawPayload).toEqual(packed);
+    f.state.canFetch = false; expect((await get()).statusCode).toBe(403); f.state.canFetch = true;
+    const stored = f.objects.get(physical.objectKey)!;
+    stored.bytes[stored.bytes.length-1]! ^= 1;
+    expect((await get()).statusCode).toBe(409);
+    stored.bytes[stored.bytes.length-1]! ^= 1;
+    f.state.readError = true; expect((await get()).statusCode).toBe(409); f.state.readError = false;
+    expect((await get()).rawPayload).toEqual(packed);
+  } finally { await f.app.close(); }
 });

@@ -7,7 +7,6 @@ export { registeredWorkerArchiveOwner };
 import {
   assertProgressiveReportArchiveIdentity,
   reportTextIdentity,
-  visitVerifiedWorkerReportArchive,
   type ProgressiveReportArchiveReadIdentity,
   type ProgressiveReportArchiveStoredIdentity,
 } from "@aerodb/db/progressive-report-archive";
@@ -24,6 +23,9 @@ export type {
   ProgressiveReportArchiveMember,
 } from "./progressive-report-archive-store";
 
+import { visitWorkerReportGeneration, WorkerResultReadCache, WORKER_RESULT_REF } from "./worker-result-archive";
+
+const workerResults = new WorkerResultReadCache();
 const SHA256 = /^[a-f0-9]{64}$/;
 const UUID = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
 const GENERATION = /^[1-9][0-9]{0,19}$/;
@@ -52,7 +54,7 @@ function assertArchive(
   archive: ProgressiveReportArchiveStoredIdentity,
   executionId: string,
 ) {
-  assertProgressiveReportArchiveIdentity(archive);
+  assertProgressiveReportArchiveIdentity(archive, archive.archiveFormat === WORKER_RESULT_REF ? WORKER_RESULT_REF : "jsonl");
   assertLocalIdentity(executionId, {
     sha256: archive.storedSha256,
     byteSize: archive.storedByteSize,
@@ -72,7 +74,6 @@ function assertArchive(
     BigInt(archive.generation) > 18_446_744_073_709_551_615n ||
     archive.mimeType !== "application/gzip" ||
     archive.compression !== "gzip" ||
-    archive.archiveFormat !== "jsonl" ||
     typeof archive.crc32c !== "string" ||
     !CRC.test(archive.crc32c)
   )
@@ -103,12 +104,13 @@ export async function readArchiveBrokerResponse(response: Response): Promise<unk
 
 /** Upload one bounded gzip/JSONL page through the trusted hub. No cloud
  * credentials or direct object-store access are needed on the worker. */
-export async function putWorkerReportBundle(
+export async function putWorkerReportBundle<F extends "jsonl" | typeof WORKER_RESULT_REF = "jsonl">(
   db: DB,
   path: string,
   identity: { sha256: string; byteSize: number },
   executionId: string,
-): Promise<ProgressiveReportArchiveIdentity> {
+  format: F = "jsonl" as F,
+): Promise<Omit<ProgressiveReportArchiveIdentity, "archiveFormat"> & { archiveFormat: F }> {
   assertLocalIdentity(executionId, identity);
   const owned = await registeredWorkerArchiveOwner(db, executionId);
   const file = await open(path, "r");
@@ -142,7 +144,7 @@ export async function putWorkerReportBundle(
       autoClose: false,
     });
     const response = await fetch(
-      `${archiveUrl(owned.baseUrl, executionId, identity.sha256)}?byteSize=${identity.byteSize}`,
+      `${archiveUrl(owned.baseUrl, executionId, identity.sha256)}?byteSize=${identity.byteSize}${format === "jsonl" ? "" : "&format=" + format}`,
       {
         method: "POST",
         redirect: "error",
@@ -173,14 +175,14 @@ export async function putWorkerReportBundle(
     const archive = {
       ...value,
       verifiedAt: new Date(value.verifiedAt),
-    } as unknown as ProgressiveReportArchiveIdentity;
+    } as unknown as Omit<ProgressiveReportArchiveIdentity, "archiveFormat"> & { archiveFormat: F };
     assertArchive(archive, executionId);
     if (!Number.isFinite(archive.verifiedAt.getTime()))
       throw new Error(
         "Worker report archive receipt has no verification timestamp",
       );
     if (
-      archive.storedSha256 !== identity.sha256 ||
+      archive.archiveFormat !== format || archive.storedSha256 !== identity.sha256 ||
       archive.storedByteSize !== identity.byteSize ||
       archive.crc32c !== crc.toString()
     )
@@ -225,17 +227,18 @@ export class WorkerReportFetchDisabled extends Error {
 export function readStoredWorkerArchiveText(
   db: DB,
   identity: ProgressiveReportArchiveReadIdentity & { signal?: AbortSignal },
+  dictionaryCache = workerResults,
 ) {
   return identity.archiveFormat === "legacy-jsonl"
     ? readLegacyWorkerReportArchiveText(db, identity)
-    : readWorkerReportArchiveText(db, identity);
+    : readWorkerReportArchiveText(db, identity, { dictionaryCache });
 }
 
 /** Lossless PG ::text reader for archive, conflict and post-terminal callers. */
 export async function readWorkerReportArchiveText(
   db: DB,
   identity: ProgressiveReportArchiveReadIdentity & { signal?: AbortSignal },
-  options: { upstreamOnly?: boolean } = {},
+  options: { upstreamOnly?: boolean; dictionaryCache?: WorkerResultReadCache } = {},
 ): Promise<string> {
   if (
     identity.sourceKind === "worker" &&
@@ -260,66 +263,18 @@ export async function readWorkerReportArchiveText(
     identity.reportByteSize > MAX_LINE_BYTES
   )
     throw new Error("Invalid exact worker report archive member");
-  const archive = identity;
   const owned = await registeredWorkerArchiveOwner(db, identity.executionId);
-  let stream = options.upstreamOnly
-    ? null
-    : await readWorkerReportVolume(identity);
-  if (!stream) {
-    const query = new URLSearchParams({
-      byteSize: String(archive.storedByteSize),
-      generation: archive.generation,
-      crc32c: archive.crc32c,
-    });
-    const response = await fetch(
-      `${archiveUrl(owned.baseUrl, identity.executionId, archive.storedSha256)}?${query}`,
-      {
-        redirect: "error",
-        signal: identity.signal
-          ? AbortSignal.any([
-              identity.signal,
-              AbortSignal.timeout(TRANSFER_TIMEOUT_MS),
-            ])
-          : AbortSignal.timeout(TRANSFER_TIMEOUT_MS),
-        headers: { "x-xfoilfoam-solver-token": owned.authToken },
-      },
-    );
-    if (response.status === 403) {
-      const body = (await readArchiveBrokerResponse(response)) as {
-        error?: unknown;
-      };
-      if (body?.error === "fetch disabled for evidence_artifacts")
-        throw new WorkerReportFetchDisabled();
-      throw new Error("The registered worker has no access to this archive");
-    }
-    if (
-      !response.ok ||
-      !response.body ||
-      response.headers.get("content-type") !== archive.mimeType ||
-      response.headers.get("content-length") !==
-        String(archive.storedByteSize) ||
-      response.headers.has("content-encoding") ||
-      response.headers.get("x-content-sha256") !== archive.storedSha256 ||
-      response.headers.get("x-content-crc32c") !== archive.crc32c ||
-      response.headers.get("x-gcs-generation") !== archive.generation ||
-      response.headers.get("x-report-archive-bucket") !== archive.bucket ||
-      response.headers.get("x-report-archive-object-key") !== archive.objectKey
-    ) {
-      await response.body?.cancel();
-      throw new Error(
-        `Worker report archive restore changed the exact identity (${response.status})`,
-      );
-    }
-
-    stream = Readable.fromWeb(response.body);
-  }
+  const open = (p: ProgressiveReportArchiveReadIdentity) =>
+    openWorkerGeneration({ ...p, signal: identity.signal }, owned, options.upstreamOnly);
+  const stream = await open(identity);
   let found: string | undefined;
   try {
-    await visitVerifiedWorkerReportArchive(
+    await visitWorkerReportGeneration(
       stream,
       identity,
       {
         executionId: identity.executionId,
+        workerInstance: owned.workerInstance,
         solverId: owned.envelope.solverId,
         promiseId: owned.envelope.promiseId,
         assignmentSignature: owned.envelope.contentSignature,
@@ -346,7 +301,7 @@ export async function readWorkerReportArchiveText(
         maxDecodedBytes: MAX_JSON_BYTES,
         maxReportBytes: MAX_LINE_BYTES,
       },
-      identity.signal,
+      open, identity.signal, options.dictionaryCache ?? workerResults,
     );
   } finally {
     stream.destroy();
@@ -354,4 +309,62 @@ export async function readWorkerReportArchiveText(
   if (found === undefined)
     throw new Error("Exact worker report archive member was not found");
   return found;
+}
+
+async function openWorkerGeneration(
+  identity: ProgressiveReportArchiveReadIdentity & { signal?: AbortSignal },
+  owned: Awaited<ReturnType<typeof registeredWorkerArchiveOwner>>, upstreamOnly?: boolean,
+) {
+  let stream = upstreamOnly
+    ? null
+    : await readWorkerReportVolume(identity);
+  if (!stream) {
+    const query = new URLSearchParams({
+      byteSize: String(identity.storedByteSize),
+      generation: identity.generation,
+      crc32c: identity.crc32c,
+    });
+    const response = await fetch(
+      `${archiveUrl(owned.baseUrl, identity.executionId, identity.storedSha256)}?${query}`,
+      {
+        redirect: "error",
+        signal: identity.signal
+          ? AbortSignal.any([
+              identity.signal,
+              AbortSignal.timeout(TRANSFER_TIMEOUT_MS),
+            ])
+          : AbortSignal.timeout(TRANSFER_TIMEOUT_MS),
+        headers: { "x-xfoilfoam-solver-token": owned.authToken },
+      },
+    );
+    if (response.status === 403) {
+      const body = (await readArchiveBrokerResponse(response)) as {
+        error?: unknown;
+      };
+      if (body?.error === "fetch disabled for evidence_artifacts")
+        throw new WorkerReportFetchDisabled();
+      throw new Error("The registered worker has no access to this archive");
+    }
+    if (
+      !response.ok ||
+      !response.body ||
+      response.headers.get("content-type") !== identity.mimeType ||
+      response.headers.get("content-length") !==
+        String(identity.storedByteSize) ||
+      response.headers.has("content-encoding") ||
+      response.headers.get("x-content-sha256") !== identity.storedSha256 ||
+      response.headers.get("x-content-crc32c") !== identity.crc32c ||
+      response.headers.get("x-gcs-generation") !== identity.generation ||
+      response.headers.get("x-report-archive-bucket") !== identity.bucket ||
+      response.headers.get("x-report-archive-object-key") !== identity.objectKey
+    ) {
+      await response.body?.cancel();
+      throw new Error(
+        `Worker report archive restore changed the exact identity (${response.status})`,
+      );
+    }
+
+    stream = Readable.fromWeb(response.body);
+  }
+  return stream;
 }

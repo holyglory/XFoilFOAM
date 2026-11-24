@@ -19,6 +19,7 @@ export interface ProgressiveReportArchiveStoredIdentity {
   storedSha256: string;
   storedByteSize: number;
   crc32c: string;
+  workerResultSha256?: string;
   memberCount?: number;
   firstSequence?: number;
   lastSequence?: number;
@@ -260,7 +261,7 @@ function exactInteger(value: ReportJson | undefined, minimum: number): number {
 
 export function assertProgressiveReportArchiveIdentity(
   identity: ProgressiveReportArchiveStoredIdentity,
-  format: "jsonl" | "shared-result-v1" = "jsonl",
+  format: "jsonl" | "shared-result-v1" | "worker-result-ref-v1" = "jsonl",
 ): void {
   if (
     !identity.bucket.trim() ||

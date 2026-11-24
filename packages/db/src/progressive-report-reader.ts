@@ -145,6 +145,7 @@ export async function readProgressiveReport(
       bundle.bucket,bundle.object_key,bundle.generation,bundle.mime_type,bundle.compression,bundle.archive_format,
       bundle.stored_sha256,bundle.stored_byte_size,bundle.crc32c,bundle.verified_at,
       bundle.member_count,bundle.first_sequence,bundle.last_sequence,
+      to_jsonb(bundle.*)->>'worker_result_sha256' AS worker_result_sha256,
       to_jsonb(bundle.*)->>'legacy_instance_id' AS legacy_instance_id,
       to_jsonb(bundle.*)->>'legacy_solver_id' AS legacy_solver_id,
       to_jsonb(bundle.*)->>'legacy_scope_sha256' AS legacy_scope_sha256,
@@ -175,7 +176,7 @@ export async function readProgressiveReport(
     typeof stored.bucket !== "string" || !stored.bucket || typeof stored.object_key !== "string" || !stored.object_key ||
     !/^[1-9][0-9]{0,19}$/.test(String(stored.generation)) || stored.mime_type !== "application/gzip" ||
     stored.compression !== "gzip" ||
-    (stored.archive_format !== "jsonl" && !(stored.archive_format === "legacy-jsonl" && reference.sourceKind === "worker")
+    (stored.archive_format !== "jsonl" && !((stored.archive_format === "legacy-jsonl" || stored.archive_format === "worker-result-ref-v1") && reference.sourceKind === "worker")
       && !(stored.archive_format === "shared-result-v1" && reference.sourceKind === "remote")) ||
     !SHA256.test(String(stored.stored_sha256)) || !Number.isSafeInteger(storedByteSize) || storedByteSize < 1 ||
     !/^[A-Za-z0-9+/]{6}==$/.test(String(stored.crc32c)) ||
@@ -184,6 +185,8 @@ export async function readProgressiveReport(
     !Number.isSafeInteger(Number(stored.last_sequence)) || Number(stored.last_sequence) < reference.sequence ||
     Number(stored.first_sequence) > reference.sequence)
     throw new Error("Archived progressive report lacks exact verified member custody");
+  if (stored.archive_format === "worker-result-ref-v1" && !SHA256.test(String(stored.worker_result_sha256)))
+    throw new Error("Archived worker report lacks its registered result identity");
   if (stored.archive_format === "legacy-jsonl" && (
     !UUID.test(String(stored.legacy_instance_id)) || !UUID.test(String(stored.legacy_solver_id)) ||
     !SHA256.test(String(stored.legacy_scope_sha256)) ||
@@ -203,6 +206,7 @@ export async function readProgressiveReport(
     mimeType: String(stored.mime_type), compression: String(stored.compression), archiveFormat: String(stored.archive_format),
     storedSha256: String(stored.stored_sha256), storedByteSize, crc32c: String(stored.crc32c),
     memberCount: Number(stored.member_count), firstSequence: Number(stored.first_sequence), lastSequence: Number(stored.last_sequence),
+    ...(stored.archive_format === "worker-result-ref-v1" ? { workerResultSha256: String(stored.worker_result_sha256) } : {}),
     ...(stored.archive_format === "legacy-jsonl" ? {
       legacyInstanceId: String(stored.legacy_instance_id), legacySolverId: String(stored.legacy_solver_id),
       legacyScopeSha256: String(stored.legacy_scope_sha256), legacyPageMemberCount: Number(stored.legacy_page_member_count),

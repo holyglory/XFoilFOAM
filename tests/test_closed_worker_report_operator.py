@@ -409,6 +409,16 @@ class ClosedReportOperator(unittest.TestCase):
         self.assertEqual([k for k,_ in adjacent(stream,4,lambda k:None,allow_gaps=True)],keys[:3])
         self.assertEqual(stream.tell(),0)
 
+    def test_existing_result_keeps_its_ordinary_order_across_changed_neighbors(self):
+        from closed_worker_report_pages import dictionary_prefix
+        old = {"knownResult": True, "resultMeta": {"sha256":"a"*64, "byteSize":100}}
+        new = {"knownResult": False, "resultMeta": {"sha256":"b"*64, "byteSize":110}}
+        other = {"knownResult": False, "resultMeta": {"sha256":"c"*64, "byteSize":120}}
+        self.assertEqual(dictionary_prefix([old, old, new]), [old, old])
+        self.assertEqual(dictionary_prefix([new, old, old]), [new])
+        self.assertEqual(dictionary_prefix([new, other]), [new, other])
+        self.assertEqual(dictionary_prefix([]), [])
+
     def test_wider_page_needs_the_pinned_scope_runtime_and_matching_sources(self):
         import hashlib
         from closed_worker_report_pages import qualified_width, fits_wide_page

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { assertWorkerAnchor, encodeWorkerResultPage, visitWorkerReportGeneration, WorkerResultReadCache, WORKER_RESULT_REF } from "./worker-result-archive.ts";
 import { tmpdir } from "node:os";
 import { Readable } from "node:stream";
 import { HubWorkloadGcs, boundedHubBody } from "./hub-workload-gcs.ts";
@@ -10,9 +11,8 @@ import { sql } from "drizzle-orm";
 import { createClient } from "@aerodb/db/client";
 import {
   parseReportJson,
-  reportTextIdentity,
+  reportTextIdentity, splitProgressiveReportText,
   reportValidationValue,
-  visitVerifiedWorkerReportArchive,
 } from "@aerodb/db/progressive-report-archive";
 import {
   installProgressiveReportArchiveReader,
@@ -64,12 +64,13 @@ class ClosedWorkerReportPageFacts {
     this.#signer = new LegacyOriginSigner(reuse);
   }
 
-  signedFacts(text, key, owner, resultMeta) {
+  signedFacts(text, key, owner, resultMeta, envelope) {
     assert.ok(Buffer.byteLength(text) <= byteLimit, "Report exceeds the bounded reader");
     let inventory;
     const signed = this.#signer.matches(
       text, key.executionId, owner.solverId, key.sequence, key.signature,
-      (report, token, repeated) => {
+      (report, token, repeated, cut) => {
+        if (envelope) Object.assign(envelope, cut);
         assert.equal(report.promiseId, owner.promiseId);
         assert.equal(report.assignmentSignature, owner.assignmentSignature);
         assert.equal(report.status?.job_id, key.executionId);
@@ -193,9 +194,10 @@ async function workerSource(
     text = source.text;
   }
   const resultMeta = reuse ? previous.resultMeta : {};
+  const envelope = reuse ? previous.envelope : {};
   const facts = reuse
     ? previous.facts
-    : page.signedFacts(text, key, owner, resultMeta);
+    : page.signedFacts(text, key, owner, resultMeta, envelope);
   const anchors =
     await db.execute(sql`SELECT h.point_content_signature AS signature,h.sequence::int AS sequence,
     a.id::text AS "workerAttempt",a.result_id::text AS "workerResult",h.receipt->>'resultAttemptId' AS "hubAttempt",h.receipt->>'resultId' AS "hubResult",
@@ -230,7 +232,7 @@ async function workerSource(
     owner,
     facts,
     anchors: [...anchors],
-    resultMeta,
+    resultMeta, envelope,
     stage,
     stored: Number(row.stored),
     fk: row.fk,
@@ -319,7 +321,8 @@ function validatePin(pin, key, source) {
   assert.equal(pin.signature, key.signature);
   assert.equal(pin.reportSha256, source.facts.sha256);
   assert.equal(pin.reportByteSize, source.facts.byteSize);
-  assert.equal(pin.archiveFormat, "jsonl");
+  assert.ok(pin.archiveFormat === "jsonl" || pin.archiveFormat === WORKER_RESULT_REF);
+  if (pin.archiveFormat === WORKER_RESULT_REF) assertWorkerAnchor(pin.resultAnchor, source.owner, pin);
   assert.ok(
     Number.isSafeInteger(pin.memberCount) &&
       pin.memberCount > 0 &&
@@ -355,7 +358,8 @@ async function verifyRegistration(db, key, bundle, p) {
       AND m.report_sha256=${p.reportSha256} AND m.report_byte_size=${p.reportByteSize}
       AND b.source_kind=m.source_kind AND b.sim_job_id=m.sim_job_id AND b.bucket=${p.bucket} AND b.object_key=${p.objectKey}
       AND b.generation=${p.generation} AND b.stored_sha256=${p.storedSha256} AND b.stored_byte_size=${p.storedByteSize}
-      AND b.crc32c=${p.crc32c} AND b.mime_type='application/gzip' AND b.compression='gzip' AND b.archive_format='jsonl'
+      ${p.archiveFormat === WORKER_RESULT_REF ? sql`AND b.worker_result_sha256=${p.resultAnchor.sha256}` : sql``}
+      AND b.crc32c=${p.crc32c} AND b.mime_type='application/gzip' AND b.compression='gzip' AND b.archive_format=${p.archiveFormat}
       AND b.first_sequence=${p.firstSequence} AND b.last_sequence=${p.lastSequence} AND b.member_count=${p.memberCount} AND b.verified_at IS NOT NULL`);
   assert.equal(
     rows.length,
@@ -437,7 +441,38 @@ function lineForReport(metadata, text, previous) {
   });
   return Buffer.byteLength(delta) < Buffer.byteLength(text) ? delta : inline();
 }
-async function uploadPage(db, keys, sources) {
+async function registeredResultAnchor(db, executionId, token, firstSequence) {
+  async function fullMember(predicate) {
+    const [row] = await db.execute(sql`SELECT m.sequence::float8 AS sequence, m.content_signature AS signature,
+    m.report_sha256 AS "reportSha256", m.report_byte_size::int AS "reportByteSize",
+    b.bucket,b.object_key AS "objectKey",b.generation,b.stored_sha256 AS "storedSha256",
+    b.stored_byte_size::int AS "storedByteSize",b.crc32c,b.member_count AS "memberCount",
+    b.first_sequence::float8 AS "firstSequence",b.last_sequence::float8 AS "lastSequence"
+    FROM progressive_report_archive_members m
+    JOIN progressive_report_archive_bundles b ON b.id=m.bundle_id AND b.source_kind='worker'
+      AND b.sim_job_id=m.sim_job_id AND b.archive_format='jsonl' AND b.member_count BETWEEN 1 AND 8
+      AND b.stored_byte_size<=${byteLimit} AND m.report_byte_size<=${byteLimit}
+      AND right(b.object_key,length('/worker/'||m.sim_job_id::text||'/'||b.stored_sha256||'.jsonl.gz'))
+        ='/worker/'||m.sim_job_id::text||'/'||b.stored_sha256||'.jsonl.gz'
+    JOIN progressive_worker_reports r ON r.sim_job_id=m.sim_job_id AND r.sequence=m.sequence
+      AND r.content_signature=m.content_signature AND r.archive_bundle_id=b.id AND r.archived_at IS NOT NULL
+    WHERE m.sim_job_id=${executionId}::uuid AND m.source_kind='worker' AND m.member_kind='report' AND ${predicate}`);
+    return row && { ...row, executionId, sourceKind: "worker", memberKind: "report",
+      mimeType: "application/gzip", compression: "gzip", archiveFormat: "jsonl" };
+  }
+  const member = await fullMember(sql`m.sequence=(SELECT a.sequence FROM progressive_worker_report_result_anchors a
+    WHERE a.sim_job_id=${executionId}::uuid AND a.result_sha256=${token.sha256} AND a.result_byte_size=${token.byteSize})`);
+  if (member) return { ...token, member };
+  // The first eligible page after an upgrade can already have a real dictionary.
+  // Inspect exactly the adjacent registered original, without scanning or rewriting old archives.
+  const previous = await fullMember(sql`m.sequence=${firstSequence - 1} AND NOT EXISTS (
+    SELECT FROM progressive_worker_report_result_anchors WHERE sim_job_id=${executionId}::uuid)`);
+  if (!previous) return null;
+  const text = await readStoredWorkerArchiveText(db, previous);
+  const { result } = splitProgressiveReportText(text);
+  return result !== null && isDeepStrictEqual(reportTextIdentity(result), token) ? { ...token, member: previous } : null;
+}
+async function uploadPage(db, keys, sources, shareResults) {
   const dir = await mkdtemp(join(tmpdir(), "closed-worker-report-"));
   try {
     const path = join(dir, "report.jsonl.gz");
@@ -464,18 +499,33 @@ async function uploadPage(db, keys, sources) {
         yield line;
       }
     }
-    const local = await writeProgressiveReportBundle(path, lines());
+    const token = sources[0].resultMeta;
+    const same = shareResults && sources.every(s => isDeepStrictEqual(s.resultMeta, token));
+    const anchor = same && await registeredResultAnchor(db, keys[0].executionId, token, keys[0].sequence);
+    const manifest = anchor && encodeWorkerResultPage(sources[0].owner, anchor, sources.map((s,i) => ({
+      text: s.text, cut: s.envelope, facts: s.facts, signature: keys[i].signature, sequence: keys[i].sequence,
+    })));
+    let local, format = "jsonl";
+    if (manifest) {
+      await writeFile(path, manifest, { mode: 0o600, flag: "wx" });
+      local = { sha256: hash(manifest), byteSize: manifest.byteLength };
+      format = WORKER_RESULT_REF;
+      encodedBytes = manifest.readUInt32LE(manifest.length - 4); // gzip ISIZE of our bounded manifest
+    } else {
+      local = await writeProgressiveReportBundle(path, lines());
+    }
     assert.ok(local.byteSize <= byteLimit);
     const remote = await putWorkerReportBundle(
       db,
       path,
       local,
-      keys[0].executionId,
+      keys[0].executionId, format,
     );
     const { verifiedAt, ...object } = remote;
     const pins = keys.map((key, i) => {
       const p = {
         ...object,
+        ...(manifest ? { resultAnchor: anchor } : {}),
         sourceKind: "worker",
         memberKind: "report",
         executionId: key.executionId,
@@ -513,8 +563,8 @@ async function uploadPage(db, keys, sources) {
     await rm(dir, { recursive: true, force: true });
   }
 }
-async function uploadOriginal(db, key, source) {
-  return (await uploadPage(db, [key], [source])).pins[0];
+async function uploadOriginal(db, key, source, shareResults) {
+  return (await uploadPage(db, [key], [source], shareResults)).pins[0];
 }
 const completePage = Symbol("verified complete page");
 async function settle(db, m, admitted, page) {
@@ -550,6 +600,9 @@ async function settle(db, m, admitted, page) {
       source,
       "Worker evidence or scheduling eligibility changed",
     );
+    if (pin.archiveFormat === WORKER_RESULT_REF)
+      eq(before.resultMeta, { sha256: pin.resultAnchor.sha256, byteSize: pin.resultAnchor.byteSize },
+        "Native PostgreSQL token differs from the pending worker dictionary");
     if (before.archivedBundle) {
       await productRead(tx, key, before, pin, "sweeper", true);
       return {
@@ -560,22 +613,32 @@ async function settle(db, m, admitted, page) {
     }
     // Timestamp checks run again after the locked source and every point have been read.
     for (const proof of [m.cloud, m.api, m.sweeper]) fresh(proof);
+    const dictionary = pin.archiveFormat === WORKER_RESULT_REF ? pin.resultAnchor : null;
     let [bundle] =
       await tx.execute(sql`INSERT INTO progressive_report_archive_bundles(source_kind,sim_job_id,bucket,object_key,generation,mime_type,compression,
-      archive_format,stored_sha256,stored_byte_size,crc32c,member_count,first_sequence,last_sequence,verified_at)
-      VALUES('worker',${key.executionId}::uuid,${pin.bucket},${pin.objectKey},${pin.generation},'application/gzip','gzip','jsonl',
-        ${pin.storedSha256},${pin.storedByteSize},${pin.crc32c},${pin.memberCount},${pin.firstSequence},${pin.lastSequence},${m.cloud.at}::timestamptz)
+      archive_format,stored_sha256,stored_byte_size,crc32c,member_count,first_sequence,last_sequence,verified_at${dictionary ? sql`,worker_result_sha256` : sql``})
+      VALUES('worker',${key.executionId}::uuid,${pin.bucket},${pin.objectKey},${pin.generation},'application/gzip','gzip',${pin.archiveFormat},
+        ${pin.storedSha256},${pin.storedByteSize},${pin.crc32c},${pin.memberCount},${pin.firstSequence},${pin.lastSequence},${m.cloud.at}::timestamptz${dictionary ? sql`,${dictionary.sha256}` : sql``})
        ON CONFLICT(bucket,object_key,generation,sim_job_id) DO NOTHING RETURNING id`);
     if (!bundle) {
       [bundle] =
         await tx.execute(sql`SELECT id FROM progressive_report_archive_bundles WHERE bucket=${pin.bucket} AND object_key=${pin.objectKey}
         AND generation=${pin.generation} AND sim_job_id=${key.executionId}::uuid AND source_kind='worker' AND stored_sha256=${pin.storedSha256}
-        AND stored_byte_size=${pin.storedByteSize} AND crc32c=${pin.crc32c} AND archive_format='jsonl' AND mime_type='application/gzip'
+        AND stored_byte_size=${pin.storedByteSize} AND crc32c=${pin.crc32c} AND archive_format=${pin.archiveFormat} AND mime_type='application/gzip'
+        ${dictionary ? sql`AND worker_result_sha256=${dictionary.sha256}` : sql``}
         AND compression='gzip' AND member_count=${pin.memberCount} AND first_sequence=${pin.firstSequence} AND last_sequence=${pin.lastSequence}`);
       assert.ok(bundle, "Page registration differs");
     }
     await tx.execute(sql`INSERT INTO progressive_report_archive_members(bundle_id,source_kind,sim_job_id,sequence,member_kind,content_signature,report_sha256,report_byte_size)
       VALUES(${bundle.id}::uuid,'worker',${key.executionId}::uuid,${key.sequence},'report',${key.signature},${pin.reportSha256},${pin.reportByteSize})`);
+    if (m.shareResults === true || pin.archiveFormat === WORKER_RESULT_REF) {
+      const anchorSequence = pin.archiveFormat === WORKER_RESULT_REF ? pin.resultAnchor.member.sequence : key.sequence;
+      await tx.execute(sql`INSERT INTO progressive_worker_report_result_anchors(sim_job_id,sequence,witness_sequence,result_sha256,result_byte_size)
+        SELECT ${key.executionId}::uuid,${anchorSequence},${key.sequence},${before.resultMeta.sha256},${before.resultMeta.byteSize}
+        WHERE NOT EXISTS (SELECT FROM progressive_worker_report_result_anchors
+          WHERE sim_job_id=${key.executionId}::uuid AND result_sha256=${before.resultMeta.sha256})
+        ON CONFLICT (sim_job_id,result_sha256) DO NOTHING`);
+    }
     // The 0202 trigger authenticates OLD resolved ::text, SHA-256, byte size and compact header in this transaction.
     const [changed] =
       await tx.execute(sql`UPDATE progressive_worker_reports SET report=progressive_report_compact_header(report),result_payload_hash=NULL,
@@ -615,20 +678,24 @@ function requestFacts(m, basis) {
   const grouped = (m.items?.length ?? 0) > 1;
   if (!basis) return new ClosedWorkerReportPageFacts(grouped);
   if (!["source", "cloud", "read"].includes(m.op)) {
-    sessionFacts.delete(basis);
+    if (!(m.shareResults && m.op === "hub")) sessionFacts.delete(basis);
     return new ClosedWorkerReportPageFacts(grouped);
   }
   const items = m.items ?? [m];
   assert.ok(items.length >= 1 && items.length <= 8);
   const role = m.op === "read" ? m.reader : m.op === "source" ? "sweeper" : "hub";
   const keys = items.map(({ key }) => [key.executionId, key.sequence, key.signature]);
-  const scope = JSON.stringify([role, m.scope, keys]);
-  const pins = items.some(i => i.pin) ? JSON.stringify(items.map(i => i.pin)) : null;
+  // Under the dictionary policy the signer may keep one token across pages of
+  // the same physical owner. It checks every new raw token and canonical prefix;
+  // custody receipts, native rows, GCS bytes and reader responses are never cached here.
+  const crossPage = m.shareResults === true;
+  const scope = JSON.stringify([role, m.scope, crossPage ? keys[0][0] : keys]);
+  const pins = !crossPage && items.some(i => i.pin) ? JSON.stringify(items.map(i => i.pin)) : null;
   let prior = sessionFacts.get(basis);
   if (!prior || prior.scope !== scope || (prior.pins !== null && prior.pins !== pins)) {
     // A lone native read has no sibling. Only a preceding source request
     // or a second cloud proof for this generation can reuse a singleton.
-    const reuse = grouped || m.op === "source" || m.op === "cloud";
+    const reuse = crossPage || grouped || m.op === "source" || m.op === "cloud";
     prior = { scope, pins, facts: new ClosedWorkerReportPageFacts(reuse) };
     sessionFacts.set(basis, prior);
   }
@@ -643,7 +710,7 @@ async function runClosedReportPeer(db, m, readBasis) {
     // A pre-commit native read already retained the authenticated originals in
     // readBasis. Its post-commit call still opens the actual product reader.
     const partial = m.op === "source" && m.items && value.rows.length !== m.items.length;
-    if (readBasis && (m.op === "read" || partial)) {
+    if (readBasis && ((m.op === "read" && !m.shareResults) || partial)) {
       sessionFacts.delete(readBasis);
     }
     return value;
@@ -684,6 +751,11 @@ async function closedReportRequest(db, m, readBasis, page) {
     if (op === "hub") return { key, science, at: new Date().toISOString() };
     validatePin(m.pin, key, m.source);
     assert.equal(m.pin.bucket, process.env.AIRFOILFOAM_EVIDENCE_BUCKET);
+    if (m.pin.archiveFormat === WORKER_RESULT_REF) {
+      const cloud = new ClosedWorkerCloud(m.pin.bucket, m.hubAccount);
+      const generationDownloads = await cloud.verify([m]);
+      return { reader: "cloud", pin: m.pin, science, generationDownloads, at: new Date().toISOString() };
+    }
     const text = await new ProgressiveReportArchiveStore(m.pin.bucket).read(
       m.pin,
     );
@@ -722,14 +794,23 @@ async function closedReportRequest(db, m, readBasis, page) {
     return { ...proof, storedFieldBytes: actual.stored };
   }
   const native = await workerSource(db, key, scope, false, m.pin, null, page);
-  if (op === "source")
+  if (op === "source") {
+    let knownResult;
+    if (m.shareResults === true) {
+      const [known] = await db.execute(sql`SELECT EXISTS(SELECT FROM progressive_worker_report_result_anchors
+        WHERE sim_job_id=${key.executionId}::uuid AND result_sha256=${native.resultMeta.sha256}
+        AND result_byte_size=${native.resultMeta.byteSize}) AS present`);
+      knownResult = known.present;
+    }
     return {
+      ...(knownResult !== undefined ? { knownResult } : {}),
       source: identity(native),
       resultMeta: native.resultMeta,
       stored: native.stored,
       fk: native.fk,
       archivedBundle: native.archivedBundle,
     };
+  }
   assert.equal(op, "publish");
   fresh(m.hub);
   eq(m.hub.key, key, "Hub proof belongs to a different source");
@@ -739,7 +820,7 @@ async function closedReportRequest(db, m, readBasis, page) {
     "Native signed original changed before upload",
   );
   assert.ok(!native.archivedBundle, "Existing archive must be resumed");
-  return uploadOriginal(db, key, native);
+  return uploadOriginal(db, key, native, m.shareResults === true);
 }
 async function verifyInstalledReportFiles(m) {
   // The controller pins the installed product dependencies on each role, including the actual API reader.
@@ -779,9 +860,9 @@ async function invokeClosedReport(m) {
 }
 
 export { runClosedReportPeer, invokeClosedReport };
+const independentCloudResults = new WorkerResultReadCache();
 class ClosedWorkerCloud extends HubWorkloadGcs {
-  async verify(items) {
-    const { pin: p, source } = items[0];
+  async open(p, source) {
     assert.equal(p.bucket, process.env.AIRFOILFOAM_EVIDENCE_BUCKET);
     const url = this.url(p.objectKey, p.generation);
     const meta = JSON.parse(
@@ -807,7 +888,7 @@ class ClosedWorkerCloud extends HubWorkloadGcs {
         stored.executionId === p.executionId &&
         stored.solverId === source.owner.solverId &&
         stored.sourceInstanceId === source.owner.workerInstance &&
-        stored.archiveFormat === "jsonl",
+        stored.archiveFormat === p.archiveFormat,
       "Cloud registered worker owner differs",
     );
     url.searchParams.set("alt", "media");
@@ -815,9 +896,13 @@ class ClosedWorkerCloud extends HubWorkloadGcs {
       await this.call(url.toString()),
       p.storedByteSize,
     );
-    let seen = 0;
-    await visitVerifiedWorkerReportArchive(
-      Readable.from([bytes]),
+    return Readable.from([bytes]);
+  }
+  async verify(items) {
+    const { pin: p, source } = items[0];
+    let seen = 0, downloads = 1;
+    await visitWorkerReportGeneration(
+      await this.open(p, source),
       p,
       source.owner,
       (entry) => {
@@ -843,9 +928,11 @@ class ClosedWorkerCloud extends HubWorkloadGcs {
         maxDecodedBytes: byteLimit * 2,
         maxReportBytes: byteLimit,
       },
-      AbortSignal.timeout(30000),
+      async anchor => { downloads++; return this.open(anchor, source); },
+      AbortSignal.timeout(30000), independentCloudResults,
     );
     assert.equal(seen, items.length, "Incomplete pinned worker page");
+    return downloads;
   }
 }
 async function runClosedPage(db, m, readBasis, page) {
@@ -874,7 +961,7 @@ async function runClosedPage(db, m, readBasis, page) {
     let bytes = 0;
     for (const item of items) {
       try {
-        const next = await closedReportRequest(db, { op, scope, ...item }, undefined, page);
+        const next = await closedReportRequest(db, { op, scope, shareResults: m.shareResults, ...item }, undefined, page);
         if (
           op === "source" &&
           (bytes += next.source.facts.byteSize) > byteLimit
@@ -908,7 +995,7 @@ async function runClosedPage(db, m, readBasis, page) {
       );
       sources.push(original);
     }
-    return uploadPage(db, keys, sources);
+    return uploadPage(db, keys, sources, m.shareResults === true);
   }
   // All independent proof requests must cover this exact object and every member, including the last sibling.
   const head = items[0].pin;
@@ -939,7 +1026,7 @@ async function runClosedPage(db, m, readBasis, page) {
       assert.equal(item.source.owner.workerInstance, scope.sourceInstance);
       science.push(await hubScience(db, item.key, item.source));
     }
-    await new ClosedWorkerCloud(head.bucket, m.hubAccount).verify(items);
+    const generationDownloads = await new ClosedWorkerCloud(head.bucket, m.hubAccount).verify(items);
     const at = new Date().toISOString();
     return {
       rows: items.map((v, i) => ({
@@ -948,7 +1035,7 @@ async function runClosedPage(db, m, readBasis, page) {
         reader: "cloud",
         at,
       })),
-      generationDownloads: 1,
+      generationDownloads,
     };
   }
   assert.equal(configuredDeploymentRole(), "remote-solver");
@@ -975,7 +1062,7 @@ async function runClosedPage(db, m, readBasis, page) {
   return db.transaction(async (tx) => {
     const rows = [];
     for (const item of items)
-      rows.push(await settle(tx, { ...item, scope }, completePage, page));
+      rows.push(await settle(tx, { ...item, scope, shareResults: m.shareResults }, completePage, page));
     return { rows };
   });
 }

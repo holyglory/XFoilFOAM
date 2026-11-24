@@ -9,6 +9,7 @@ import { CRC32C } from "@google-cloud/storage";
 import { sql } from "drizzle-orm";
 import { createHash, randomUUID } from "node:crypto";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { gunzipSync } from "node:zlib";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Readable } from "node:stream";
@@ -73,7 +74,7 @@ it.each([
         const run = (op, fields = {}, connection = db) =>
           runClosedReportPeer(
             connection,
-            { op, key, scope, ...fields },
+            { op, key, scope, shareResults: !!(normalized && grouped), ...fields },
             op === "read" ? comparison[fields.reader]
               : op === "source" ? comparison.sweeper
               : op === "cloud" || op === "hub" ? comparison.hub : undefined,
@@ -131,7 +132,7 @@ it.each([
           // Two independent database roles on one disposable PG. Roll the hub snapshot back before HZ writes.
           const nativeIdentity = await archiveFixtureAttemptIdentity(db,workerAttempt,hubAttempt);
           expect(nativeIdentity).toMatchObject([{material_domain:false,hub_attempt_present:false}]);
-          const asHub = async (work) => {
+          const asHub = async (work, subject = { key, source, row: target }) => {
             const rollback = new Error("finish hub role"),
               state = {};
             await expect(
@@ -166,14 +167,14 @@ it.each([
                 );
                 await tx.execute(sql`INSERT INTO progressive_remote_report_sources(sim_job_id,sequence,point_content_signature,aoa_deg,case_slug)
             VALUES(${id}::uuid,${origin.sequence},${point},0,'archive-case')`);
-                await expect(run("hub", { source }, tx)).rejects.toThrow(
+                await expect(run("hub", { key: subject.key, source: subject.source }, tx)).rejects.toThrow(
                   "every settled scientific source",
                 );
                 await tx.execute(sql`INSERT INTO progressive_remote_evidence_receipts(sim_job_id,sequence,point_content_signature,result_attempt_id,remote_result_attempt_id,remote_result_id)
             VALUES(${id}::uuid,${origin.sequence},${point},${hubAttempt}::uuid,${workerAttempt}::uuid,${result}::uuid)`);
                 state.value = await work(tx);
-                await insertRemote(target);
-                await expect(run("hub", { source }, tx)).rejects.toThrow(
+                await insertRemote(subject.row);
+                await expect(run("hub", { key: subject.key, source: subject.source }, tx)).rejects.toThrow(
                   "already owns this sequence",
                 );
                 throw rollback;
@@ -184,9 +185,8 @@ it.each([
             return state.value;
           };
           const scientific = await asHub((tx) => run("hub", { source }, tx));
-          vi.stubGlobal(
-            "fetch",
-            vi.fn(async (url, init) => {
+          const cloudObjects = new Map();
+          const upload = async (url, init) => {
               expect(init.method).toBe("POST");
               puts++;
               const chunks = [];
@@ -194,22 +194,22 @@ it.each([
               packed = Buffer.concat(chunks);
               const crc = new CRC32C();
               crc.update(packed);
-              return new Response(
-                JSON.stringify({
+              const receipt = {
                   bucket,
                   objectKey: `progressive-reports/v1/worker/${id}/${sha(packed)}.jsonl.gz`,
                   generation: "1795450558982963001",
-                  archiveFormat: "jsonl",
+                  archiveFormat: new URL(url).searchParams.get("format") ?? "jsonl",
                   compression: "gzip",
                   mimeType: "application/gzip",
                   storedByteSize: packed.length,
                   storedSha256: sha(packed),
                   crc32c: crc.toString(),
                   verifiedAt: new Date().toISOString(),
-                }),
-              );
-            }),
-          );
+              };
+              cloudObjects.set(receipt.objectKey, { pin: receipt, bytes: packed });
+              return new Response(JSON.stringify(receipt));
+          };
+          vi.stubGlobal("fetch", vi.fn(upload));
           if (grouped) {
             const keys = [
               key,
@@ -262,7 +262,8 @@ it.each([
             const account = "disposable@fixture.iam.gserviceaccount.com";
             vi.stubGlobal(
               "fetch",
-              vi.fn(async (url) => {
+              vi.fn(async (url, init) => {
+                if (init?.method === "POST") return upload(url, init);
                 if (String(url).startsWith("http://metadata.google.internal/"))
                   return new Response(
                     String(url).endsWith("/email")
@@ -274,29 +275,32 @@ it.each([
                     { headers: { "Metadata-Flavor": "Google" } },
                   );
                 const u = new URL(url);
-                expect(u.searchParams.get("generation")).toBe(head.generation);
+                const found = cloudObjects.get(decodeURIComponent(u.pathname.split("/o/")[1]));
+                if (!found) return new Response(null, { status: 404 });
+                const { pin: physical, bytes: body } = found;
+                expect(u.searchParams.get("generation")).toBe(physical.generation);
                 if (u.searchParams.get("alt") === "media") {
                   downloaded++;
-                  const bytes = Buffer.from(packed);
+                  const bytes = Buffer.from(body);
                   if (corrupt) bytes[bytes.length - 1] ^= 1;
                   return new Response(bytes);
                 }
                 return new Response(
                   JSON.stringify({
                     bucket,
-                    name: head.objectKey,
-                    generation: head.generation,
-                    size: String(packed.length),
-                    crc32c: head.crc32c,
+                    name: physical.objectKey,
+                    generation: physical.generation,
+                    size: String(body.length),
+                    crc32c: physical.crc32c,
                     contentType: "application/gzip",
                     metadata: {
                       sourceKind: "worker",
                       executionId: id,
                       sourceInstanceId: worker,
                       solverId: owner.solverId,
-                      archiveFormat: "jsonl",
-                      sha256: head.storedSha256,
-                      byteSize: String(packed.length),
+                      archiveFormat: physical.archiveFormat,
+                      sha256: physical.storedSha256,
+                      byteSize: String(body.length),
                     },
                   }),
                 );
@@ -348,7 +352,8 @@ it.each([
               sql`SELECT archived_at FROM progressive_worker_reports WHERE sim_job_id=${id}::uuid AND sequence IN(3,4)`,
             );
             expect(warm.map((r) => r.archived_at)).toEqual([null, null]);
-            const released = (await run("settle", { items: actions })).rows;
+            // The sparse case starts with a pre-upgrade full page and an empty dictionary index.
+            const released = (await run("settle", { items: actions, shareResults: !sparse && normalized })).rows;
             expect(released.map((r) => r.outcome)).toEqual([
               "retired",
               "retired",
@@ -390,6 +395,49 @@ it.each([
             ).toEqual(["already_retired", "already_retired"]);
             expect(puts).toBe(1);
             expect(downloaded).toBe(2);
+            if (sparse) {
+              // The first page archived 3 and 5. Reopen its physical result for the later visit to 4.
+              const next = f.reports[3], k = { executionId: id, sequence: next.sequence, signature: next.contentSignature };
+              const { source: original } = await run("source", { key: k });
+              const subject = { key: k, source: original, row: next };
+              const hubProof = await asHub(tx => run("hub", { key: k, source: original }, tx), subject);
+              const pin = await run("publish", { key: k, source: original, hub: hubProof });
+              expect(pin.archiveFormat).toBe("worker-result-ref-v1");
+              const manifest = JSON.parse(gunzipSync(cloudObjects.get(pin.objectKey).bytes));
+              expect(manifest.anchor.member).toMatchObject({ generation: head.generation,
+                storedSha256: head.storedSha256, signature: keys[0].signature, sequence: keys[0].sequence });
+              const fields = { key: k, pin, source: original, hub: hubProof };
+              const cloud = await asHub(async tx => {
+                const first = cloudObjects.get(head.objectKey);
+                cloudObjects.delete(head.objectKey);
+                await expect(run("cloud", { ...fields, hubAccount: account }, tx)).rejects.toThrow();
+                cloudObjects.set(head.objectKey, first);
+                return run("cloud", { ...fields, hubAccount: account }, tx);
+              }, subject);
+              expect(cloud.generationDownloads).toBe(2);
+              const api = await run("read", { ...fields, reader: "api" });
+              const sweeper = await run("read", { ...fields, reader: "sweeper" });
+              const commit = () => run("settle", { ...fields, cloud, api, sweeper });
+              const originalBytes = cloudObjects.get(head.objectKey).bytes;
+              const corruptAnchor = Buffer.from(originalBytes); corruptAnchor[corruptAnchor.length - 1] ^= 1;
+              await writeFile(generationPath, corruptAnchor);
+              // A saved pair of product proofs cannot release the SQL body if its real reader now fails.
+              await expect(commit()).rejects.toThrow();
+              const [warm] = await db.execute(sql`SELECT resolve_progressive_report(report,result_payload_hash)::text AS text,archived_at
+                FROM progressive_worker_reports WHERE sim_job_id=${id}::uuid AND sequence=${k.sequence}`);
+              expect(warm).toEqual({ text: next.text, archived_at: null });
+              await writeFile(generationPath, originalBytes);
+              expect((await commit()).outcome).toBe("retired");
+              for (const reader of ["api","sweeper"])
+                expect((await run("read", { ...fields, reader, committed: true })).committed).toBe(true);
+              expect((await commit()).outcome).toBe("already_retired");
+              expect(await archiveFixtureAttemptIdentity(db,workerAttempt,hubAttempt)).toEqual(nativeIdentity);
+              await db.execute(sql`SET CONSTRAINTS progressive_report_worker_result_fk IMMEDIATE`);
+              const dictionary = await db.execute(sql`SELECT sequence,witness_sequence FROM progressive_worker_report_result_anchors
+                WHERE sim_job_id=${id}::uuid`);
+              expect(dictionary.map(r => [Number(r.sequence),Number(r.witness_sequence)])).toEqual([[3,4]]);
+              expect(cloudObjects.size).toBe(2);
+            }
             return;
           }
           const pin = await run("publish", { source, hub: scientific });

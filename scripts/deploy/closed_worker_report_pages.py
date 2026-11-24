@@ -70,6 +70,20 @@ def fits_wide_page(rows, limits, *, prefix=False):
     return total + (8 - len(rows)) * result_bytes <= limits["maxPageBytes"]
 
 
+def dictionary_prefix(rows):
+    """Keep indexed results out of unrelated full pages, in the original signed order."""
+    if not rows:
+        return rows
+    first = rows[0]
+    for index, row in enumerate(rows[1:], 1):
+        if first.get("knownResult"):
+            if row["resultMeta"] != first["resultMeta"]:
+                return rows[:index]
+        elif row.get("knownResult"):
+            return rows[:index]
+    return rows
+
+
 def adjacent(stream, limit, validate, allow_gaps=False):
     start = stream.tell()
     entries = []
@@ -121,6 +135,8 @@ def process_page(args, stream, limit, progress, path, bind, runtime, peer_digest
             combined = originals + tail
             if fits_wide_page(combined, trial):
                 originals = combined
+        if getattr(args, "share_results", False):
+            originals = dictionary_prefix(originals)
         if len(originals)<2:
             return 0
         items=[dict(key=i["key"],source=v["source"]) for i,v in zip(items,originals)]
@@ -143,7 +159,8 @@ def process_page(args, stream, limit, progress, path, bind, runtime, peer_digest
         entries=entries[:len(hubs)]
         count=len(items)
         if not pending:
-            pending=dict(items=items,initials=originals[:count],end=entries[-1][1],publication=None)
+            pending=dict(items=items,initials=originals[:count],end=entries[-1][1],publication=None,
+                         shareResults=getattr(args,"share_results",False))
             if trial and count == 8:
                 pending["widthQualificationSha256"] = args.width_qualification_sha256
             progress["group"]=pending
@@ -151,7 +168,8 @@ def process_page(args, stream, limit, progress, path, bind, runtime, peer_digest
         require(pending["end"]==entries[-1][1],"Pending byte boundary changed")
         if not pending["publication"]:
             for attempt in range(3):
-                response=rpc("worker","publish",[dict(i,hub=h) for i,h in zip(items,hubs)])
+                response=rpc("worker","publish",[dict(i,hub=h) for i,h in zip(items,hubs)],
+                             shareResults=pending.get("shareResults",False))
                 if "retryableBrokerStatus" not in response:
                     require(len(response["pins"])==count,"Incomplete native page receipt")
                     pending["publication"]=response
@@ -171,7 +189,8 @@ def process_page(args, stream, limit, progress, path, bind, runtime, peer_digest
                 native={r:pool.submit(rpc,role,"read",batch,committed=committed,reader=r)
                         for role,r in (("api","api"),("worker","sweeper"))}
                 original=cloud.result()
-                require(original["generationDownloads"]==1 and len(original["rows"])==count,"Incomplete cloud page read")
+                expected_reads = 2 if batch[0]["pin"].get("archiveFormat")=="worker-result-ref-v1" else 1
+                require(original["generationDownloads"]==expected_reads and len(original["rows"])==count,"Incomplete cloud page read")
                 results={r:f.result()["rows"] for r,f in native.items()}
                 require(all(len(v)==count for v in results.values()),"Incomplete native page read")
                 require([r["science"] for r in original["rows"]]==[r["science"] for r in hubs],"Hub scientific evidence changed")
@@ -179,7 +198,7 @@ def process_page(args, stream, limit, progress, path, bind, runtime, peer_digest
         before=reads(False)
         if not pending.get("settled"):
             transactions=[dict(i,hub=hubs[n],**{r:b[n] for r,b in before.items()}) for n,i in enumerate(batch)]
-            pending["settled"]=rpc("worker","settle",transactions)["rows"]
+            pending["settled"]=rpc("worker","settle",transactions,shareResults=pending.get("shareResults",False))["rows"]
             require(len(pending["settled"])==count,"Incomplete HZ transaction receipt")
             durable(path,progress)
         after=reads(True)

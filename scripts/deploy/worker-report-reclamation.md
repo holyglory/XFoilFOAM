@@ -37,6 +37,29 @@ retired member still requires the generation-pinned cloud restore and both
 native readers. Sum the changes in stored PostgreSQL field sizes separately
 from measured filesystem allocations.
 
+## Sharing an exact result across worker report pages
+
+Install migration 0234 and the matching hub broker, worker API and sweeper
+readers before enabling `--share-results` on the existing closed-report
+controller. Supply the existing `--hub-account-file` for its independent
+generation read. Keep the same service, signed inventory and checkpoint.
+
+A full worker JSONL member can supply the exact PostgreSQL result token for
+later envelopes from its execution. The dictionary index records the original
+member and the native sequence whose full SQL text proved the token. At the
+first use on an execution, the controller can also reuse the immediately
+preceding registered full member. Each envelope pins that member's physical
+generation, signature, text digest and size. Restoring a reference opens the
+envelope and the full original through the same registered permissions. A
+fresh physical read authenticates the source even when its parsed result is
+already in memory. Each restored sequence must reproduce its own original
+bytes, signature and scientific inventory.
+
+New results use full JSONL. The controller retains its existing page budget
+and stores at most 1 MiB of uncompressed envelopes together. Removing the
+flag resumes full JSONL for new work. Any pending publication keeps its saved
+format, and existing references continue to need both generations.
+
 ## Measure the report table
 
 Run the read-only audit from the operator host. It uses the existing SSH aliases

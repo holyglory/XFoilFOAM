@@ -8,7 +8,7 @@ export async function registeredWorkerArchiveOwner(
   executionId: string,
 ) {
   const [owned] = await db.execute(sql`
-    SELECT settings.remote_solver_registered_id AS solver_id,
+    SELECT settings.instance_id::text AS worker_instance, settings.remote_solver_registered_id AS solver_id,
       settings.remote_solver_auth_token AS auth_token, settings.upstream_base_url,
       promise.id AS promise_id, promise.source_base_url, job.request_payload
     FROM sim_jobs job
@@ -43,5 +43,5 @@ export async function registeredWorkerArchiveOwner(
   });
   // Historical reads deliberately ignore pause, enabled and live lease state.
   // The stored assignment and trusted upstream still have to match exactly.
-  return { baseUrl, authToken, envelope };
+  return { baseUrl, authToken, envelope, workerInstance: String(owned.worker_instance) };
 }
