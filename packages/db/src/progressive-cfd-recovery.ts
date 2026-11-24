@@ -1,4 +1,4 @@
-import { sql } from "drizzle-orm";
+import { sql, type SQL } from "drizzle-orm";
 import { PROGRESSIVE_COMPUTE_POLICY } from "@aerodb/core";
 import type { DB } from "./client";
 import {
@@ -166,7 +166,133 @@ export async function recoverInactiveProgressiveRemoteGaps(
   });
 }
 
-export async function recoverTerminalProgressiveNoEvidenceGaps(
+/** Pure metadata settlement of one current campaign's already-consumed fallbacks.
+ * No archive reader is called while epoch, admission, campaign or unit locks are held. */
+export async function settleSpentProgressiveMaterialGaps(db: DB) {
+  return db.transaction(async (tx) => {
+    const connection = tx as unknown as DB;
+    const [epoch] = await connection.execute(sql`SELECT id FROM calculation_epochs WHERE current FOR SHARE SKIP LOCKED`);
+    if (!epoch) {
+      if (!(await connection.execute(sql`SELECT id FROM calculation_epochs WHERE current`)).length)
+        throw new Error("Calculation epoch is missing");
+      return { settled: 0, busy: true };
+    }
+    const epochId = String(epoch.id);
+    // Bind the active campaign keys before searching the much larger unit
+    // ledger. PostgreSQL can then seek the current generation for each key.
+    const campaigns = await connection.execute<{ id: string }>(sql`
+      SELECT campaign.id FROM sim_campaigns campaign
+      WHERE campaign.status IN ('active','attention','paused') AND EXISTS (
+        SELECT FROM progressive_generations generation WHERE generation.campaign_id=campaign.id
+          AND generation.epoch_id=${epochId}::uuid AND generation.status='active'
+          AND generation.plan_revision_id=campaign.current_plan_revision_id
+      ) ORDER BY campaign.id
+    `);
+    if (!campaigns.length) return { settled: 0, busy: false };
+    const activeIds = sql.join(campaigns.map(({id}) => sql`${id}::uuid`), sql`, `);
+    const pendingMaterial = (campaign?: string) => sql`pending_material AS MATERIALIZED (
+      SELECT plan.id AS plan_id, unit.id AS unit_id, generation.campaign_id
+      FROM progressive_cfd_recovery_plans plan
+      JOIN progressive_cfd_units unit ON unit.id=plan.unit_id
+      JOIN progressive_work work ON work.id=unit.work_id
+      JOIN progressive_generations generation ON generation.id=work.generation_id
+      JOIN sim_campaigns campaign ON campaign.id=generation.campaign_id
+      WHERE plan.reason='material_domain' AND plan.ordinal=1 AND plan.scope='targeted'
+        AND unit.state='pending' AND unit.lease_token IS NULL AND work.state IN ('pending','gap')
+        AND generation.epoch_id=${epochId}::uuid AND generation.status='active'
+        AND campaign.current_plan_revision_id=generation.plan_revision_id
+        AND campaign.status IN ('active','attention','paused')
+        AND campaign.id IN (${campaign ? sql`${campaign}::uuid` : activeIds})
+    )`;
+    if (!(await tryProgressiveAdmissionLock(connection))) {
+      const [pending] = await connection.execute(sql`WITH ${pendingMaterial()} SELECT EXISTS (SELECT FROM pending_material) AS busy`);
+      return { settled: 0, busy: pending?.busy === true };
+    }
+    // Choose an eligible campaign before locking its work. A locked campaign
+    // cannot hide an available sibling; an ineligible plan cannot pin the scan.
+    const [chosen] = await connection.execute<{ campaign: string | null; busy: boolean }>(sql`
+      WITH ${pendingMaterial()}, candidates AS MATERIALIZED (
+        SELECT DISTINCT campaign_id FROM pending_material
+      ), eligible AS MATERIALIZED (
+        SELECT c.campaign_id FROM candidates c
+        WHERE EXISTS (${spentMaterialUnits(epochId, sql`c.campaign_id`, false)})
+      ), available AS (
+        SELECT campaign.id FROM sim_campaigns campaign JOIN eligible e ON e.campaign_id=campaign.id
+        ORDER BY campaign.id LIMIT 1 FOR UPDATE OF campaign SKIP LOCKED
+      )
+      SELECT (SELECT id FROM available) AS campaign,
+        NOT EXISTS (SELECT FROM available) AND EXISTS (SELECT FROM eligible) AS busy
+    `);
+    if (!chosen?.campaign) return { settled: 0, busy: chosen?.busy === true };
+    // Recheck all facts in a fresh statement after taking the campaign mutex.
+    const page = await connection.execute(sql`
+      WITH ${pendingMaterial(chosen.campaign)}, spent_material AS MATERIALIZED (
+        ${spentMaterialUnits(epochId, sql`${chosen.campaign}::uuid`, true)}
+        LIMIT ${PROGRESSIVE_TERMINAL_RECOVERY_UNITS_PER_PASS}
+      )
+      UPDATE progressive_cfd_units unit SET state='gap', retry_after=NULL, error=spent_material.error
+      FROM spent_material WHERE unit.id=spent_material.id AND unit.state='pending' AND unit.lease_token IS NULL
+      RETURNING unit.id
+    `);
+    return { settled: page.length, busy: page.length === 0 };
+  });
+}
+
+function spentMaterialUnits(epochId: string, campaign: SQL, lock: boolean) {
+  return sql`SELECT eligible.id, eligible.error
+    FROM pending_material material CROSS JOIN LATERAL (
+      SELECT unit.id, attempt.error
+      FROM progressive_cfd_units unit
+      JOIN progressive_work work ON work.id = unit.work_id
+      JOIN progressive_generations generation ON generation.id = work.generation_id
+      JOIN sim_campaigns campaign ON campaign.id = generation.campaign_id
+      JOIN progressive_cfd_recovery_claims claim ON claim.recovery_plan_id = material.plan_id
+      JOIN progressive_cfd_attempts attempt ON attempt.token = claim.attempt_token AND attempt.unit_id = unit.id
+      JOIN sim_jobs job ON job.id = attempt.sim_job_id
+      JOIN progressive_cfd_execution_stops stopped ON stopped.sim_job_id = job.id AND stopped.engine_job_id = job.engine_job_id
+      WHERE unit.id=material.unit_id AND generation.epoch_id = ${epochId} AND campaign.id=material.campaign_id
+        AND generation.plan_revision_id = campaign.current_plan_revision_id AND generation.status = 'active'
+        AND ${effectiveProgressiveStageSql()} = work.stage AND work.state IN ('pending','gap')
+        AND unit.state = 'pending' AND unit.lease_token IS NULL AND unit.lease_owner IS NULL AND unit.lease_until IS NULL
+        AND attempt.outcome IN ('failed','cancelled') AND attempt.finished_at IS NOT NULL
+        AND attempt.error IN ${RECOVERABLE_TERMINAL_GAP_REASONS_SQL}
+        AND job.status IN ('done','failed','cancelled') AND job."ingestedAt" IS NOT NULL
+        AND NOT EXISTS (SELECT FROM progressive_cfd_attempts later WHERE later.unit_id = unit.id
+          AND (later.started_at,later.token) > (attempt.started_at,attempt.token))
+        AND NOT ${progressiveCfdMaterialPlanAllowsAttemptSql()}
+        AND NOT EXISTS (SELECT FROM progressive_cfd_budget_extensions e WHERE e.unit_id=unit.id AND e.state IN ('pending','claimed'))
+        AND NOT EXISTS (SELECT FROM progressive_cfd_evidence_reuses reuse WHERE reuse.successor_unit_id=unit.id)
+        AND ${progressiveCfdNoAcceptedHistoryAndSettledSql()}
+        -- Ingestion can persist valid evidence before attaching its CFD receipt.
+        AND NOT EXISTS (
+          SELECT FROM progressive_cfd_attempts history
+          JOIN sim_jobs origin ON origin.id=history.sim_job_id
+          JOIN result_attempts late ON late.sim_job_id=origin.id AND late.engine_job_id=origin.engine_job_id
+            AND late.simulation_preset_revision_id=origin.simulation_preset_revision_id AND late.aoa_deg=unit.aoa_deg
+          WHERE history.unit_id=unit.id AND late.status='done' AND late.valid_for_polar
+        )
+        AND NOT EXISTS (
+          SELECT FROM progressive_cfd_evidence e
+          JOIN LATERAL (
+            SELECT fit.state, fit.model_id FROM neuralfoil_predictions p JOIN progressive_polar_fit_work fit ON fit.prediction_id=p.id
+            WHERE p.target_id=work.target_id AND p.epoch_id=generation.epoch_id ORDER BY p.created_at DESC,p.id DESC LIMIT 1
+          ) current_fit ON true
+          LEFT JOIN progressive_polar_models model ON model.id=current_fit.model_id AND current_fit.state='ready'
+          WHERE work.stage=2 AND e.attempt_token=attempt.token AND (current_fit.state IN ('pending','leased')
+            OR model.response#>'{estimate,contributors}' @> jsonb_build_array(jsonb_build_object('attempt_id',e.result_attempt_id::text)))
+        )
+      LIMIT 1 ${lock ? sql`FOR UPDATE OF work, unit, attempt, job SKIP LOCKED` : sql``}
+    ) eligible WHERE material.campaign_id=${campaign}`;
+}
+
+// Existing callers receive the number of retries. Closing an already-spent
+// fallback has never been a retry or an admission.
+export async function recoverTerminalProgressiveNoEvidenceGaps(db: DB): Promise<number> {
+  await settleSpentProgressiveMaterialGaps(db);
+  return retryTerminalProgressiveNoEvidenceGaps(db);
+}
+
+export async function retryTerminalProgressiveNoEvidenceGaps(
   db: DB,
 ): Promise<number> {
   return db.transaction(async (transaction) => {
@@ -190,72 +316,6 @@ export async function recoverTerminalProgressiveNoEvidenceGaps(
     `);
     if (!campaigns.length) return 0;
     const campaignIds = sql.join(campaigns.map((campaign) => sql`${campaign.id}::uuid`), sql`, `);
-    // Older completion-retry passes could reopen a physically consumed material
-    // fallback. Restore the last settled gap, without changing its attempts.
-    await connection.execute(sql`
-      WITH pending_material AS MATERIALIZED (
-        SELECT plan.id AS plan_id, candidate.id AS unit_id
-        FROM progressive_cfd_recovery_plans plan
-        JOIN progressive_cfd_units candidate ON candidate.id=plan.unit_id
-        JOIN progressive_work pending_work ON pending_work.id=candidate.work_id
-        JOIN progressive_generations pending_generation ON pending_generation.id=pending_work.generation_id
-        JOIN sim_campaigns pending_campaign ON pending_campaign.id=pending_generation.campaign_id
-        WHERE plan.reason='material_domain' AND plan.ordinal=1 AND plan.scope='targeted'
-          AND candidate.state='pending' AND candidate.lease_token IS NULL
-          AND pending_work.state IN ('pending','gap') AND pending_campaign.id IN (${campaignIds})
-          AND pending_generation.epoch_id=${epoch.id} AND pending_generation.status='active'
-          AND pending_generation.plan_revision_id=pending_campaign.current_plan_revision_id
-      ), spent_material AS MATERIALIZED (
-        SELECT eligible.id, eligible.error
-        FROM pending_material material CROSS JOIN LATERAL (
-          SELECT unit.id, attempt.error
-          FROM progressive_cfd_units unit
-          JOIN progressive_work work ON work.id = unit.work_id
-          JOIN progressive_generations generation ON generation.id = work.generation_id
-          JOIN sim_campaigns campaign ON campaign.id = generation.campaign_id
-          JOIN progressive_cfd_recovery_claims claim ON claim.recovery_plan_id = material.plan_id
-          JOIN progressive_cfd_attempts attempt ON attempt.token = claim.attempt_token AND attempt.unit_id = unit.id
-          JOIN sim_jobs job ON job.id = attempt.sim_job_id
-          JOIN progressive_cfd_execution_stops stopped ON stopped.sim_job_id = job.id AND stopped.engine_job_id = job.engine_job_id
-          WHERE unit.id=material.unit_id AND generation.epoch_id = ${epoch.id} AND campaign.id IN (${campaignIds})
-            AND generation.plan_revision_id = campaign.current_plan_revision_id AND generation.status = 'active'
-            AND ${effectiveProgressiveStageSql()} = work.stage AND work.state IN ('pending','gap')
-            AND unit.state = 'pending' AND unit.lease_token IS NULL AND unit.lease_owner IS NULL AND unit.lease_until IS NULL
-            AND attempt.outcome IN ('failed','cancelled') AND attempt.finished_at IS NOT NULL
-            AND attempt.error IN ${RECOVERABLE_TERMINAL_GAP_REASONS_SQL}
-            AND job.status IN ('done','failed','cancelled') AND job."ingestedAt" IS NOT NULL
-            AND NOT EXISTS (SELECT FROM progressive_cfd_attempts later WHERE later.unit_id = unit.id
-              AND (later.started_at,later.token) > (attempt.started_at,attempt.token))
-            AND NOT ${progressiveCfdMaterialPlanAllowsAttemptSql()}
-            AND NOT EXISTS (SELECT FROM progressive_cfd_budget_extensions e WHERE e.unit_id=unit.id AND e.state IN ('pending','claimed'))
-            AND NOT EXISTS (SELECT FROM progressive_cfd_evidence_reuses reuse WHERE reuse.successor_unit_id=unit.id)
-            AND ${progressiveCfdNoAcceptedHistoryAndSettledSql()}
-            -- Ingestion can persist valid evidence before attaching its CFD receipt.
-            AND NOT EXISTS (
-              SELECT FROM progressive_cfd_attempts history
-              JOIN sim_jobs origin ON origin.id=history.sim_job_id
-              JOIN result_attempts late ON late.sim_job_id=origin.id AND late.engine_job_id=origin.engine_job_id
-                AND late.simulation_preset_revision_id=origin.simulation_preset_revision_id AND late.aoa_deg=unit.aoa_deg
-              WHERE history.unit_id=unit.id AND late.status='done' AND late.valid_for_polar
-            )
-            AND NOT EXISTS (
-              SELECT FROM progressive_cfd_evidence e
-              JOIN LATERAL (
-                SELECT fit.state, fit.model_id FROM neuralfoil_predictions p JOIN progressive_polar_fit_work fit ON fit.prediction_id=p.id
-                WHERE p.target_id=work.target_id AND p.epoch_id=generation.epoch_id ORDER BY p.created_at DESC,p.id DESC LIMIT 1
-              ) current_fit ON true
-              LEFT JOIN progressive_polar_models model ON model.id=current_fit.model_id AND current_fit.state='ready'
-              WHERE work.stage=2 AND e.attempt_token=attempt.token AND (current_fit.state IN ('pending','leased')
-                OR model.response#>'{estimate,contributors}' @> jsonb_build_array(jsonb_build_object('attempt_id',e.result_attempt_id::text)))
-            )
-          LIMIT 1
-          FOR UPDATE OF work, unit, attempt, job SKIP LOCKED
-        ) eligible
-        LIMIT ${PROGRESSIVE_TERMINAL_RECOVERY_UNITS_PER_PASS}
-      )
-      UPDATE progressive_cfd_units unit SET state='gap', retry_after=NULL, error=spent_material.error
-      FROM spent_material WHERE unit.id=spent_material.id AND unit.state='pending' AND unit.lease_token IS NULL
-    `);
     await connection.execute(sql`
       WITH stranded AS MATERIALIZED (
         SELECT attempt.token, unit.id AS unit_id

@@ -1,3 +1,4 @@
+import { verifySpentMaterialPages } from "../test-support/spent-material-pages";
 import { randomUUID } from "node:crypto";
 import {
   adoptProgressiveSubsonicPriority,
@@ -10057,6 +10058,10 @@ describe("bounded progressive numerical recovery", () => {
     // A material fallback which physically ran can stop before producing
     // a result row. Generic no-evidence recovery must not run it from scratch.
     expect(await recoverTerminalProgressiveNoEvidenceGaps(db)).toBe(0);
+    if (stage === 2 && !second) {
+      const sibling = await campaign("active", [166.531], [0]);
+      await verifySpentMaterialPages(db, targetUrl.toString(), fixture.campaignId, sibling, replacement.id, replacement.token);
+    }
     const historicalPending = new Error("roll back historical pending fixture");
     await expect(db.transaction(async tx => {
       const c = tx as unknown as DB;
@@ -10082,6 +10087,13 @@ describe("bounded progressive numerical recovery", () => {
       expect((await state()).state).toBe("pending");
       await c.execute(sql`UPDATE sim_jobs SET "ingestedAt"=${original.finished}::timestamptz
         WHERE id=${fallback.composed.jobId}::uuid`);
+      const unstopped = new Error("roll back missing physical stop fixture");
+      await expect(c.transaction(async held => {
+        await held.execute(sql`DELETE FROM progressive_cfd_execution_stops WHERE sim_job_id=${fallback.composed.jobId}::uuid`);
+        expect(await recoverTerminalProgressiveNoEvidenceGaps(held as unknown as DB)).toBe(0);
+        expect((await state()).state).toBe("pending");
+        throw unstopped;
+      })).rejects.toBe(unstopped);
       const lateEvidence = new Error("roll back unreceipted evidence fixture");
       await expect(c.transaction(async late => {
         const evidence = await late.execute(sql`

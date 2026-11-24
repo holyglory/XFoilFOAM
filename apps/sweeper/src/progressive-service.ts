@@ -5,7 +5,8 @@ import {
   advanceProgressiveCfdStages,
   recoverUnboundProgressiveCfdLeases,
   recoverInactiveProgressiveRemoteGaps,
-  recoverTerminalProgressiveNoEvidenceGaps,
+  retryTerminalProgressiveNoEvidenceGaps,
+  settleSpentProgressiveMaterialGaps,
   refreshPolarClassificationsForJob,
   invalidateProgressiveFitPolicy,
   type DB,
@@ -101,19 +102,47 @@ export async function runProgressiveBaselineService(
   let wake: (() => void) | null = null;
   let deadline: ReturnType<typeof setTimeout> | null = null;
   let maintenanceTimer: ReturnType<typeof setTimeout> | null = null;
-  let maintenanceDue = true;
+  let maintenancePage: Promise<void> | undefined;
+  let nextMaintenance = 0;
+  let maintenanceDue = false;
+  let contentionDelay = 2_000;
   const notify = () => {
     pending = true;
     wake?.();
   };
-  const scheduleMaintenance = () => {
-    if (signal.aborted || maintenanceTimer) return;
-    maintenanceTimer = setTimeout(() => {
-      maintenanceTimer = null;
+  // Use the service's existing maintenance timer for both roles. A full page
+  // can continue while unrelated fitting or archive reads are still pending.
+  const maintain = async () => {
+    if (signal.aborted) return;
+    let pageDelay = PROGRESSIVE_MAINTENANCE_INTERVAL_MS;
+    try {
+      const page = await settleSpentProgressiveMaterialGaps(db);
+      if (page.settled) {
+        report({ component: "progressive-spent-material-gaps", settled: page.settled });
+        // Every positive page gets one confirming pass, including the last
+        // partial page of a campaign when another campaign may still be ready.
+        pageDelay = 1_000;
+        contentionDelay = 2_000;
+      } else if (page.busy) {
+        pageDelay = contentionDelay;
+        contentionDelay = Math.min(30_000, contentionDelay * 2);
+      } else {
+        contentionDelay = 2_000;
+      }
+    } catch (error) {
+      report({ component: "progressive-spent-material-gaps", error: String(error) });
+      pageDelay = 30_000;
+    }
+    if (signal.aborted) return;
+    const now = Date.now();
+    if (now >= nextMaintenance) {
+      nextMaintenance = now + PROGRESSIVE_MAINTENANCE_INTERVAL_MS;
       maintenanceDue = true;
       notify();
-    }, PROGRESSIVE_MAINTENANCE_INTERVAL_MS);
-    maintenanceTimer.unref?.();
+    }
+    maintenanceTimer = setTimeout(() => { maintenancePage = maintain(); },
+      Math.min(pageDelay, nextMaintenance - now));
+    maintenanceTimer.unref();
   };
   signal.addEventListener("abort", notify);
   let unlisten: (() => Promise<void>) | null = null;
@@ -124,6 +153,7 @@ export async function runProgressiveBaselineService(
       notify,
     );
     unlisten = () => subscription.unlisten();
+    await maintain();
     while (!signal.aborted) {
       if (!pending)
         await new Promise<void>((resolve) => {
@@ -183,7 +213,7 @@ export async function runProgressiveBaselineService(
           });
         }
         const terminalNoEvidenceGaps = runMaintenance
-          ? await recoverTerminalProgressiveNoEvidenceGaps(db)
+          ? await retryTerminalProgressiveNoEvidenceGaps(db)
           : 0;
         if (terminalNoEvidenceGaps) {
           pending = true;
@@ -296,16 +326,15 @@ export async function runProgressiveBaselineService(
               Math.max(0, new Date(expiry.at).getTime() - Date.now()),
             );
         }
-        scheduleMaintenance();
       } catch (error) {
         report({ component: "progressive-baseline", error: String(error) });
-        scheduleMaintenance();
       }
     }
   } finally {
     signal.removeEventListener("abort", notify);
     if (deadline) clearTimeout(deadline);
     if (maintenanceTimer) clearTimeout(maintenanceTimer);
+    await maintenancePage;
     await unlisten?.();
   }
 }
