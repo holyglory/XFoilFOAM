@@ -27,7 +27,7 @@ RUNTIME = (
     "apps/sweeper/src/config.ts", "apps/sweeper/src/hz-attempt-transfer-fence.ts", "apps/sweeper/src/hub-workload-gcs.ts",
     "apps/sweeper/src/registered-worker-report-read.ts", "apps/sweeper/src/registered-worker-report-hub.ts",
     "apps/sweeper/src/worker-result-archive.ts", "apps/sweeper/src/shared-report-objects.ts",
-    "apps/sweeper/src/report-archive-broker-client.ts", "apps/sweeper/src/worker-report-volume.ts",
+    "apps/sweeper/src/report-archive-broker-client.ts", "apps/sweeper/src/worker-report-volume.ts", "apps/sweeper/src/closed-worker-page-read.ts",
     "apps/sweeper/src/progressive-report-archive-store.ts", "apps/api/src/progressive-report-archive-reader.ts",
     "apps/api/src/report-archive-broker.ts", "packages/db/src/progressive-report-reader.ts",
     "packages/db/src/progressive-report-archive.ts", "packages/db/src/progressive-remote-execution.ts",
@@ -255,7 +255,7 @@ def run(args):
             entry=check_key(key,ranges)
             return dict(sourceInstance=s["sourceInstance"],solverId=s["solverId"],sha256=args.frozen_sha256,range=entry)
         def ask(role, message):
-            return run_peer(args,role,{"shareResults":getattr(args,"share_results",False),**message,"runtime":runtime},peer)
+            return run_peer(args,role,{"shareResults":getattr(args,"share_results",False),"streamNativePageReads":getattr(args,"stream_native_page_reads",False),**message,"runtime":runtime},peer)
         # The invocation budget and mutation owner do not change when two normal
         # four-member windows share one authenticated generation.
         peer_hash = digest(peer.encode())
@@ -480,6 +480,7 @@ if __name__ == "__main__":
     parser.add_argument("--repeat-result-min-bytes",type=int,default=0,
                         help="Share a matching result above this size after two successive verified generations (0 disables)")
     parser.add_argument("--share-results",action="store_true",help="Use a verified same-execution worker dictionary for matching closed reports")
+    parser.add_argument("--stream-native-page-reads",action="store_true",help="Authenticate the complete bounded native page once per independent reader or transaction")
     parser.add_argument("--same-execution-pages",action="store_true",help="Pack consecutive inventory keys from one execution across sequence gaps")
     parser.add_argument("--page-members",type=int,default=1)
     parser.add_argument("--hub-account-file",type=Path,help="Confirmed workload identity for independent grouped GCS reads on the hub")

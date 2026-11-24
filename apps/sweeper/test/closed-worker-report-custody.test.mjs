@@ -74,7 +74,7 @@ it.each([
         const run = (op, fields = {}, connection = db) =>
           runClosedReportPeer(
             connection,
-            { op, key, scope, shareResults: !!(normalized && grouped), ...fields },
+            { op, key, scope, shareResults: !!(normalized && grouped), streamNativePageReads: !!(normalized && grouped), ...fields },
             op === "read" ? comparison[fields.reader]
               : op === "source" ? comparison.sweeper
               : op === "cloud" || op === "hub" ? comparison.hub : undefined,
@@ -350,6 +350,13 @@ it.each([
                 return cloudRead(tx);
               })
             ).rows;
+            if (normalized) {
+              const altered = pinned.map((member, index) => index === 0 ? member : {
+                ...member, pin: { ...member.pin, reportSha256: "f".repeat(64) },
+              });
+              await expect(run("read", { items: altered, reader: "api", committed: false })).rejects.toThrow();
+              await expect(run("read", { items: [pinned[0], pinned[0]], reader: "sweeper", committed: false })).rejects.toThrow();
+            }
             const api = (
               await run("read", {
                 items: pinned,

@@ -12,6 +12,7 @@ import {
   type ProgressiveReportArchiveStoredIdentity,
 } from "@aerodb/db/progressive-report-archive";
 import { createHash } from "node:crypto";
+import { currentClosedWorkerPageRead } from "./closed-worker-page-read";
 import { open } from "node:fs/promises";
 import { Readable } from "node:stream";
 import type {
@@ -265,19 +266,36 @@ export async function readWorkerReportArchiveText(
   const owned = await registeredWorkerArchiveOwner(db, identity.executionId);
   const open = (p: ProgressiveReportArchiveReadIdentity) =>
     openWorkerGeneration({ ...p, signal: identity.signal }, owned, options.upstreamOnly);
+  const owner = {
+    executionId: identity.executionId,
+    workerInstance: owned.workerInstance,
+    solverId: owned.envelope.solverId,
+    promiseId: owned.envelope.promiseId,
+    assignmentSignature: owned.envelope.contentSignature,
+  };
+  const page = !options.upstreamOnly && currentClosedWorkerPageRead();
+  if (page) {
+    identity.signal?.throwIfAborted();
+    const text = await page.read(identity, JSON.stringify([owner, owned.baseUrl]), async (head, accept) => {
+      const stream = await open(head);
+      try {
+        await visitWorkerReportGeneration(stream, head, owner, accept, {
+          maxMembers: 8, maxDecodedBytes: 64 * 1024 ** 2, maxReportBytes: 32 * 1024 ** 2,
+        }, open, identity.signal, options.dictionaryCache ?? workerResults);
+      } finally {
+        stream.destroy();
+      }
+    });
+    identity.signal?.throwIfAborted();
+    return text;
+  }
   const stream = await open(identity);
   let found: string | undefined;
   try {
     await visitWorkerReportGeneration(
       stream,
       identity,
-      {
-        executionId: identity.executionId,
-        workerInstance: owned.workerInstance,
-        solverId: owned.envelope.solverId,
-        promiseId: owned.envelope.promiseId,
-        assignmentSignature: owned.envelope.contentSignature,
-      },
+      owner,
       (entry) => {
         if (
           entry.kind === identity.memberKind &&

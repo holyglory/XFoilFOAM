@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { assertWorkerAnchor, encodeWorkerResultPage, visitWorkerReportGeneration, WorkerResultReadCache, WORKER_RESULT_REF } from "./worker-result-archive.ts";
 import { tmpdir } from "node:os";
+import { withClosedWorkerPageRead } from "./closed-worker-page-read.ts";
 import { Readable } from "node:stream";
 import { HubWorkloadGcs, boundedHubBody } from "./hub-workload-gcs.ts";
 import { join } from "node:path";
@@ -706,7 +707,10 @@ function requestFacts(m, basis) {
 async function runClosedReportPeer(db, m, readBasis) {
   if (m.op !== "read" || !m.committed) readBasis?.clear();
   try {
-    const read = () => closedReportRequest(db, m, readBasis, requestFacts(m, readBasis));
+    const request = () => closedReportRequest(db, m, readBasis, requestFacts(m, readBasis));
+    const read = () => m.streamNativePageReads === true && (m.op === "read" || m.op === "settle") && m.items?.length > 1
+      ? withClosedWorkerPageRead(m.items.map(item => item.pin), request)
+      : request();
     const groupedProductRead = (m.op === "settle" || (m.op === "read" && m.committed)) &&
       m.items?.length > 1 && m.items[0].pin?.archiveFormat === WORKER_RESULT_REF;
     const value = groupedProductRead && productReportReader.withWorkerReportPageReads
