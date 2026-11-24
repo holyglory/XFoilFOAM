@@ -106,6 +106,7 @@ export async function runProgressiveBaselineService(
   let nextMaintenance = 0;
   let maintenanceDue = false;
   let contentionDelay = 2_000;
+  let afterMaterialCampaign: string | undefined;
   const notify = () => {
     pending = true;
     wake?.();
@@ -116,7 +117,8 @@ export async function runProgressiveBaselineService(
     if (signal.aborted) return;
     let pageDelay = PROGRESSIVE_MAINTENANCE_INTERVAL_MS;
     try {
-      const page = await settleSpentProgressiveMaterialGaps(db);
+      const page = await settleSpentProgressiveMaterialGaps(db, afterMaterialCampaign);
+      afterMaterialCampaign = page.continueAfter;
       if (page.settled) {
         report({ component: "progressive-spent-material-gaps", settled: page.settled });
         // Every positive page gets one confirming pass, including the last
@@ -127,6 +129,7 @@ export async function runProgressiveBaselineService(
         pageDelay = contentionDelay;
         contentionDelay = Math.min(30_000, contentionDelay * 2);
       } else {
+        if (page.continueAfter) pageDelay = 1_000;
         contentionDelay = 2_000;
       }
     } catch (error) {

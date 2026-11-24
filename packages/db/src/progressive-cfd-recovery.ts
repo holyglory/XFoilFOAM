@@ -166,75 +166,73 @@ export async function recoverInactiveProgressiveRemoteGaps(
   });
 }
 
-/** Pure metadata settlement of one current campaign's already-consumed fallbacks.
- * No archive reader is called while epoch, admission, campaign or unit locks are held. */
-export async function settleSpentProgressiveMaterialGaps(db: DB) {
-  return db.transaction(async (tx) => {
+const SPENT_MATERIAL_CAMPAIGNS_PER_PASS = 8;
+
+type SpentMaterialPage = { settled: number; busy: boolean; continueAfter?: string };
+
+/** Inspect bounded current campaign keys. Each candidate has its own transaction
+ * and only one campaign can commit up to 64 existing gaps in a call. */
+export async function settleSpentProgressiveMaterialGaps(db: DB, afterCampaign?: string): Promise<SpentMaterialPage> {
+  const campaigns = await db.execute<{ id: string; epoch: string }>(sql`
+    SELECT campaign.id, epoch.id AS epoch FROM calculation_epochs epoch CROSS JOIN sim_campaigns campaign
+    WHERE epoch.current AND campaign.status IN ('active','attention','paused')
+      ${afterCampaign ? sql`AND campaign.id>${afterCampaign}::uuid` : sql``}
+      AND EXISTS (SELECT FROM progressive_generations generation WHERE generation.campaign_id=campaign.id
+        AND generation.epoch_id=epoch.id AND generation.status='active'
+        AND generation.plan_revision_id=campaign.current_plan_revision_id)
+    ORDER BY campaign.id LIMIT ${SPENT_MATERIAL_CAMPAIGNS_PER_PASS + 1}
+  `);
+  let busy = false;
+  for (const campaign of campaigns.slice(0, SPENT_MATERIAL_CAMPAIGNS_PER_PASS)) {
+    const page = await settleSpentMaterialCampaign(db, campaign.id, campaign.epoch);
+    if (page === "admission-busy") return { settled: 0, busy: true, continueAfter: afterCampaign };
+    if (page === "campaign-busy") busy = true;
+    else if (page) return { settled: page, busy: false, continueAfter: afterCampaign };
+  }
+  const more = campaigns.length > SPENT_MATERIAL_CAMPAIGNS_PER_PASS;
+  return { settled: 0, busy, continueAfter: more ? campaigns[SPENT_MATERIAL_CAMPAIGNS_PER_PASS - 1]!.id : undefined };
+}
+
+async function settleSpentMaterialCampaign(db: DB, campaignId: string, epochId: string) {
+  // A bound campaign key lets PostgreSQL seek the corresponding generations
+  // on a large live ledger. All eligibility facts are checked again after locking.
+  const pending = sql`pending_material AS MATERIALIZED (
+    SELECT plan.id AS plan_id, unit.id AS unit_id, generation.campaign_id
+    FROM progressive_cfd_recovery_plans plan
+    JOIN progressive_cfd_units unit ON unit.id=plan.unit_id
+    JOIN progressive_work work ON work.id=unit.work_id
+    JOIN progressive_generations generation ON generation.id=work.generation_id
+    JOIN sim_campaigns campaign ON campaign.id=generation.campaign_id
+    WHERE plan.reason='material_domain' AND plan.ordinal=1 AND plan.scope='targeted'
+      AND unit.state='pending' AND unit.lease_token IS NULL AND work.state IN ('pending','gap')
+      AND generation.epoch_id=${epochId}::uuid AND generation.status='active'
+      AND campaign.id=${campaignId}::uuid AND campaign.current_plan_revision_id=generation.plan_revision_id
+      AND campaign.status IN ('active','attention','paused')
+  )`;
+  const key = sql`${campaignId}::uuid`;
+  return db.transaction(async tx => {
     const connection = tx as unknown as DB;
-    const [epoch] = await connection.execute(sql`SELECT id FROM calculation_epochs WHERE current FOR SHARE SKIP LOCKED`);
-    if (!epoch) {
-      if (!(await connection.execute(sql`SELECT id FROM calculation_epochs WHERE current`)).length)
-        throw new Error("Calculation epoch is missing");
-      return { settled: 0, busy: true };
-    }
-    const epochId = String(epoch.id);
-    // Bind the active campaign keys before searching the much larger unit
-    // ledger. PostgreSQL can then seek the current generation for each key.
-    const campaigns = await connection.execute<{ id: string }>(sql`
-      SELECT campaign.id FROM sim_campaigns campaign
-      WHERE campaign.status IN ('active','attention','paused') AND EXISTS (
-        SELECT FROM progressive_generations generation WHERE generation.campaign_id=campaign.id
-          AND generation.epoch_id=${epochId}::uuid AND generation.status='active'
-          AND generation.plan_revision_id=campaign.current_plan_revision_id
-      ) ORDER BY campaign.id
+    const [candidate] = await connection.execute(sql`
+      WITH ${pending} ${spentMaterialUnits(epochId, key, false)} LIMIT 1
     `);
-    if (!campaigns.length) return { settled: 0, busy: false };
-    const activeIds = sql.join(campaigns.map(({id}) => sql`${id}::uuid`), sql`, `);
-    const pendingMaterial = (campaign?: string) => sql`pending_material AS MATERIALIZED (
-      SELECT plan.id AS plan_id, unit.id AS unit_id, generation.campaign_id
-      FROM progressive_cfd_recovery_plans plan
-      JOIN progressive_cfd_units unit ON unit.id=plan.unit_id
-      JOIN progressive_work work ON work.id=unit.work_id
-      JOIN progressive_generations generation ON generation.id=work.generation_id
-      JOIN sim_campaigns campaign ON campaign.id=generation.campaign_id
-      WHERE plan.reason='material_domain' AND plan.ordinal=1 AND plan.scope='targeted'
-        AND unit.state='pending' AND unit.lease_token IS NULL AND work.state IN ('pending','gap')
-        AND generation.epoch_id=${epochId}::uuid AND generation.status='active'
-        AND campaign.current_plan_revision_id=generation.plan_revision_id
-        AND campaign.status IN ('active','attention','paused')
-        AND campaign.id IN (${campaign ? sql`${campaign}::uuid` : activeIds})
-    )`;
-    if (!(await tryProgressiveAdmissionLock(connection))) {
-      const [pending] = await connection.execute(sql`WITH ${pendingMaterial()} SELECT EXISTS (SELECT FROM pending_material) AS busy`);
-      return { settled: 0, busy: pending?.busy === true };
-    }
-    // Choose an eligible campaign before locking its work. A locked campaign
-    // cannot hide an available sibling; an ineligible plan cannot pin the scan.
-    const [chosen] = await connection.execute<{ campaign: string | null; busy: boolean }>(sql`
-      WITH ${pendingMaterial()}, candidates AS MATERIALIZED (
-        SELECT DISTINCT campaign_id FROM pending_material
-      ), eligible AS MATERIALIZED (
-        SELECT c.campaign_id FROM candidates c
-        WHERE EXISTS (${spentMaterialUnits(epochId, sql`c.campaign_id`, false)})
-      ), available AS (
-        SELECT campaign.id FROM sim_campaigns campaign JOIN eligible e ON e.campaign_id=campaign.id
-        ORDER BY campaign.id LIMIT 1 FOR UPDATE OF campaign SKIP LOCKED
-      )
-      SELECT (SELECT id FROM available) AS campaign,
-        NOT EXISTS (SELECT FROM available) AND EXISTS (SELECT FROM eligible) AS busy
-    `);
-    if (!chosen?.campaign) return { settled: 0, busy: chosen?.busy === true };
-    // Recheck all facts in a fresh statement after taking the campaign mutex.
+    if (!candidate) return 0;
+    const [epoch] = await connection.execute(sql`SELECT id FROM calculation_epochs
+      WHERE id=${epochId}::uuid AND current FOR SHARE SKIP LOCKED`);
+    if (!epoch || !(await tryProgressiveAdmissionLock(connection))) return "admission-busy";
+    const [campaign] = await connection.execute(sql`SELECT id FROM sim_campaigns
+      WHERE id=${key} AND status IN ('active','attention','paused') FOR UPDATE SKIP LOCKED`);
+    if (!campaign) return "campaign-busy";
+
     const page = await connection.execute(sql`
-      WITH ${pendingMaterial(chosen.campaign)}, spent_material AS MATERIALIZED (
-        ${spentMaterialUnits(epochId, sql`${chosen.campaign}::uuid`, true)}
+      WITH ${pending}, spent_material AS MATERIALIZED (
+        ${spentMaterialUnits(epochId, key, true)}
         LIMIT ${PROGRESSIVE_TERMINAL_RECOVERY_UNITS_PER_PASS}
       )
       UPDATE progressive_cfd_units unit SET state='gap', retry_after=NULL, error=spent_material.error
       FROM spent_material WHERE unit.id=spent_material.id AND unit.state='pending' AND unit.lease_token IS NULL
       RETURNING unit.id
     `);
-    return { settled: page.length, busy: page.length === 0 };
+    return page.length || "campaign-busy";
   });
 }
 
@@ -288,7 +286,12 @@ function spentMaterialUnits(epochId: string, campaign: SQL, lock: boolean) {
 // Existing callers receive the number of retries. Closing an already-spent
 // fallback has never been a retry or an admission.
 export async function recoverTerminalProgressiveNoEvidenceGaps(db: DB): Promise<number> {
-  await settleSpentProgressiveMaterialGaps(db);
+  let after: string | undefined;
+  do {
+    const page = await settleSpentProgressiveMaterialGaps(db, after);
+    if (page.settled || page.busy) break;
+    after = page.continueAfter;
+  } while (after);
   return retryTerminalProgressiveNoEvidenceGaps(db);
 }
 
