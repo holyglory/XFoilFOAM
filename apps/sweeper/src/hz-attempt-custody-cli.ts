@@ -33,7 +33,7 @@ export async function attemptWorkerOperation(db: DB, r: Record<string, any>) {
   };
   if (
     r.requireTransfers === true &&
-    ["pending", "prepare", "page", "stage"].includes(r.operation)
+    ["pending", "prepare", "page", "stage", "canonical-candidates", "canonical-bind"].includes(r.operation)
   )
     await checkHzTransferFence(db, owner);
   switch (r.operation) {
@@ -42,6 +42,8 @@ export async function attemptWorkerOperation(db: DB, r: Record<string, any>) {
         await db.execute(sql`SELECT s.instance_id::text AS instance,s.remote_solver_registered_id::text AS solver,1 AS transfer_fence_protocol,
     to_regprocedure('attempt_evidence_hz_retained_limiter(uuid,uuid)') IS NOT NULL AS retained_contract,
     1 AS pending_cursor_protocol,
+    EXISTS(SELECT FROM pg_attribute WHERE attrelid=to_regclass('attempt_evidence_storage_policy') AND attname='canonical_history_subtrees_enabled' AND NOT attisdropped)
+      AS canonical_subtrees,
     to_regprocedure('attempt_evidence_hz_settled_limiter(uuid,uuid)') IS NOT NULL AS settled_receipt_contract,
     (SELECT a.id::text FROM result_attempts a ORDER BY a.id DESC LIMIT 1) AS high FROM sync_api_settings s
     WHERE s.id=1 AND s.remote_solver_registered_id IS NOT NULL AND s.upstream_base_url IS NOT NULL AND to_regprocedure('attempt_evidence_hz_limiter(uuid,uuid)') IS NOT NULL`);
@@ -57,8 +59,31 @@ export async function attemptWorkerOperation(db: DB, r: Record<string, any>) {
         ? (await limitSettledReportCandidates(db, [row]))[0]
         : row;
     }
-    case "page":
-      return attemptPage(db, r.after, r.high, r.limit, r.retained === true, r.settled === true);
+    case "page": {
+      let canonical = false;
+      if (r.settled === true && r.canonicalFields === true) {
+        const [p]=await db.execute(sql`SELECT canonical_history_subtrees_enabled AS enabled FROM attempt_evidence_storage_policy WHERE id=1`);
+        canonical=p?.enabled===true || await (await import("@aerodb/db/result-history-subtrees")).pendingCanonicalSubtrees(db);
+      }
+      return attemptPage(db,r.after,r.high,r.limit,r.retained === true,r.settled === true,canonical);
+    }
+    case "canonical-candidates": {
+      const {canonicalSubtreeCandidates} = await import("@aerodb/db/result-history-subtrees");
+      return canonicalSubtreeCandidates(db,exactId(r.attemptId));
+    }
+    case "canonical-bind": {
+      const {bindWorkerCanonicalField} = await import("./canonical-result-history");
+      const {originalPacked} = await import("./hz-attempt-originals");
+      return bindWorkerCanonicalField(db,r.candidate,{...r.identity,verifiedAt:new Date(r.identity.verifiedAt)},originalPacked(r.packed),owner);
+    }
+    case "canonical-confirm": {
+      const {confirmCanonicalSubtree} = await import("@aerodb/db/result-history-subtrees");
+      return {confirmed:await withActiveHzTransfer(db,owner,tx=>confirmCanonicalSubtree(tx,r.proof))};
+    }
+    case "canonical-restore": {
+      const {restoreCanonicalSubtree} = await import("@aerodb/db/result-history-subtrees");
+      return {restored:await restoreCanonicalSubtree(db,r.proof)};
+    }
     case "status": {
       const [row] =
         await db.execute(sql`SELECT count(*)::int AS archived,count(*) FILTER(WHERE e.app_readback_at IS NULL)::int AS pending,
@@ -144,8 +169,9 @@ export async function attemptHubOperation(r: Record<string, any>) {
   )
     throw Error("Unexpected hub role or bucket");
   const { HzAttemptHubStore } = await import("./hz-attempt-hub");
-  const store = new HzAttemptHubStore(r.bucket, r.account);
-  if (r.operation === "put") {
+  const canonicalRead = r.operation === "read-canonical-source";
+  const store = new HzAttemptHubStore(r.bucket, r.account,fetch,canonicalRead);
+  if (r.operation === "put" || canonicalRead) {
     const instance = exactId(r.instance),
       solver = exactId(r.solver);
     const { createClient } = await import("@aerodb/db/client");
@@ -165,9 +191,10 @@ export async function attemptHubOperation(r: Record<string, any>) {
     } finally {
       await c.sql.end({ timeout: 1 });
     }
-    return store.put(instance, r.proof, packedBytes(r.packed));
+    if (!canonicalRead) return store.put(instance, r.proof, packedBytes(r.packed));
+    if (r.identity?.sourceInstance!==instance) throw new HistoryOperationError("canonical_original_owner","denied");
   }
-  if (r.operation === "read")
+  if (r.operation === "read" || canonicalRead)
     return store.read({
       ...r.identity,
       verifiedAt: new Date(r.identity.verifiedAt),
@@ -179,8 +206,8 @@ if (
   import.meta.url === pathToFileURL(process.argv[1]).href
 ) {
   await attemptRpc(async (r) => {
-    if (["put", "read"].includes(r.operation)) return attemptHubOperation(r);
-    const write = ["stage", "commit", "confirm", "restore", "replay"].includes(
+    if (["put", "read","read-canonical-source"].includes(r.operation)) return attemptHubOperation(r);
+    const write = ["stage", "commit", "confirm", "restore", "replay","canonical-bind","canonical-confirm","canonical-restore"].includes(
       r.operation,
     );
     const { createClient } = await import("@aerodb/db/client");

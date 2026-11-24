@@ -26,7 +26,7 @@ export async function hzAttemptStorage(
   const report = io.report ?? ((value) => console.log(JSON.stringify(value)));
   if (args.length === 1 && args[0] === "--help") {
     console.log(
-      "hz-attempt-storage-cli.ts plan [--id UUID | --until-complete] | status | migrate --apply (--id UUID | --directory DIR [--until-complete]) | watch --apply --directory DIR [--poll-seconds N] | restore --apply --id UUID. Writes require --bucket BUCKET --hub-account-file FILE. Worker scopes: --include-retained or --include-settled-receipts. Add --originals-directory DIR [--originals-scope FILE] to the same watch for archive-only discovery and copies.",
+      "hz-attempt-storage-cli.ts plan [--id UUID | --until-complete] | status | migrate --apply (--id UUID | --directory DIR [--until-complete]) | watch --apply --directory DIR [--poll-seconds N] | restore --apply --id UUID. Writes require --bucket BUCKET --hub-account-file FILE. Worker scopes: --include-retained or --include-settled-receipts. Select --canonical-fields with a single settled-receipt migration to verify its canonical result fields. Add --originals-directory DIR [--originals-scope FILE] to the same watch for archive-only discovery and copies.",
     );
     return;
   }
@@ -37,6 +37,7 @@ export async function hzAttemptStorage(
       apply: { type: "boolean" },
       "include-retained": { type: "boolean" },
       "include-settled-receipts": { type: "boolean" },
+      "canonical-fields": { type: "boolean" },
       "originals-directory": { type: "string" },
       "originals-scope": { type: "string" },
       id: { type: "string" },
@@ -69,6 +70,7 @@ export async function hzAttemptStorage(
     write !== Boolean(v.apply) ||
     (mode === "restore" && !v.id) ||
     (v.id && (continuous || mode === "status")) ||
+    (v["canonical-fields"] && !(settled && mode==="migrate" && v.id)) ||
     (v["originals-directory"] && mode !== "watch") ||
     (v["originals-scope"] && !v["originals-directory"])
   )
@@ -223,6 +225,12 @@ export async function hzAttemptStorage(
       return;
     }
     if (id) {
+      if (v["canonical-fields"]) {
+        if (bound.canonical_subtrees!==true) throw Error("Canonical subtree storage is disabled");
+        const {settleWorkerCanonicalFields}=await import("./canonical-result-history");
+        report({canonicalFields:await retry(()=>settleWorkerCanonicalFields(relay,id))});
+        return;
+      }
       if (mode === "plan") {
         const row = await relay.worker({ operation: "one", attemptId: id });
         report(row);
@@ -364,6 +372,7 @@ export async function hzAttemptStorage(
         const rows = await retry(() =>
           relay.worker({
             operation: "page",
+            canonicalFields: settled && bound.canonical_subtrees===true,
             high: state.high,
             after: state.after,
             limit,
@@ -375,6 +384,20 @@ export async function hzAttemptStorage(
           if (key <= state.after || key > state.high)
             throw Error("Invalid keyset progress");
           if (watching) await revisitPending();
+          if (write && row.canonical_fields) {
+            const { settleWorkerCanonicalFields } = await import("./canonical-result-history");
+            await retry(async () => {
+              try {
+                const fields = await settleWorkerCanonicalFields(relay, key);
+                if (fields.length) report({ canonicalFields: fields });
+              } catch (error) {
+                if (!watching || !(error instanceof HistoryOperationError) ||
+                    !["database_busy", "integrity"].includes(error.category)) throw error;
+                // A held field stays inline or pending for the next fair scan.
+                report({ canonicalFieldDeferred: key, operation: error.operation, category: error.category });
+              }
+            });
+          }
           // Older peers return only their first eight pending entries. Their
           // ordinary forward page still identifies any later unconfirmed row.
           if (watching && bound.pending_cursor_protocol !== 1 && row.archive && row.pending && key !== previousPending)

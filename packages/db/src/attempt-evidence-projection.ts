@@ -332,6 +332,9 @@ export interface AttemptEvidenceStoragePolicy {
   shortProofCanaryAttemptId?: string | null;
   tinyHistoriesEnabled?: boolean;
   tinyHistoryCanaryAttemptId?: string | null;
+  canonicalHistorySubtreesEnabled?: boolean;
+  canonicalHistorySubtreeContract?: boolean;
+  canonicalHistoryCanaryResultId?: string | null;
   shorteningEnabled: boolean;
   stoppedProgressiveEnabled: boolean;
   progressiveSourceScope: "legacy" | "stopped-only" | "receipt-bearing" | "receipt-urans" | "verified";
@@ -383,6 +386,9 @@ export async function getAttemptEvidenceStoragePolicy(
     to_jsonb(policy)->>'short_proof_canary_attempt_id' AS "shortProofCanaryAttemptId",
     coalesce((to_jsonb(policy)->>'tiny_histories_enabled')::boolean,false) AS "tinyHistoriesEnabled",
     to_jsonb(policy)->>'tiny_history_canary_attempt_id' AS "tinyHistoryCanaryAttemptId",
+    coalesce((to_jsonb(policy)->>'canonical_history_subtrees_enabled')::boolean,false) AS "canonicalHistorySubtreesEnabled",
+    to_jsonb(policy)?'canonical_history_subtrees_enabled' AS "canonicalHistorySubtreeContract",
+    to_jsonb(policy)->>'canonical_history_canary_result_id' AS "canonicalHistoryCanaryResultId",
     (to_jsonb(policy)->>'urans_max_source_bytes')::integer AS "uransMaxSourceBytes"
     FROM attempt_evidence_storage_policy policy WHERE id=1`);
   return row as unknown as AttemptEvidenceStoragePolicy;
@@ -392,13 +398,13 @@ export async function getAttemptEvidenceStoragePolicy(
  * running during a scoped canary. Disabling writing preserves every old reader. */
 export async function setShortAttemptProofPolicy(
   db: DB, enabled: boolean, canaryAttemptId?: string,
-  cohort: "measured-floor" | "tiny-history" = "measured-floor",
+  cohort: "measured-floor" | "tiny-history" | "canonical-subtree" = "measured-floor",
 ) {
   const tinyHistories = cohort === "tiny-history";
   if (canaryAttemptId) assertId(canaryAttemptId);
   if (!enabled && canaryAttemptId) throw new Error("A short-proof canary requires enablement");
-  const enabledColumn = sql.identifier(tinyHistories ? "tiny_histories_enabled" : "short_proofs_enabled");
-  const canaryColumn = sql.identifier(tinyHistories ? "tiny_history_canary_attempt_id" : "short_proof_canary_attempt_id");
+  const enabledColumn = sql.identifier(cohort === "canonical-subtree" ? "canonical_history_subtrees_enabled" : tinyHistories ? "tiny_histories_enabled" : "short_proofs_enabled");
+  const canaryColumn = sql.identifier(cohort === "canonical-subtree" ? "canonical_history_canary_result_id" : tinyHistories ? "tiny_history_canary_attempt_id" : "short_proof_canary_attempt_id");
   const result = await db.execute(sql`UPDATE attempt_evidence_storage_policy SET ${enabledColumn}=${enabled},
     ${canaryColumn}=${canaryAttemptId ?? null}::uuid
     WHERE id=1 AND (${!enabled} OR (shortening_enabled AND consumer_contract_version=1)) RETURNING id`);
@@ -641,6 +647,7 @@ export async function restoreAttemptEvidence(
 
 type AttemptShorteningCandidate = {
   id: string;
+  canonical_fields?: boolean;
   limiter: string | null;
   archive_id: string | null;
   cohort?: string | null;
@@ -652,6 +659,7 @@ export async function attemptEvidenceShorteningCandidates(
   selection:
     | boolean
     | AttemptEvidenceStoragePolicy["progressiveSourceScope"] = false,
+  canonicalFields = false,
 ) {
   if (after !== null) assertId(after);
   return db.transaction(async (tx) => {
@@ -660,7 +668,7 @@ export async function attemptEvidenceShorteningCandidates(
     await tx.execute(sql`SET LOCAL lock_timeout='500ms'`);
     if (selection === "verified")
       return tx.execute<AttemptShorteningCandidate>(
-        verifiedAttemptCandidatesSql(after),
+        verifiedAttemptCandidatesSql(after,canonicalFields),
       );
     const stoppedProgressiveOnly =
       selection === true || selection === "stopped-only";

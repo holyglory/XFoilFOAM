@@ -6,6 +6,7 @@ import {
 } from "@aerodb/db/result-history-storage";
 import type { DB } from "@aerodb/db/client";
 import { env } from "./env";
+import { apiAttemptEvidenceReader } from "./attempt-evidence-reader";
 import { readHzPointHistory } from "./hz-point-history-reader";
 import type {
   ResultHistoryArchiveIdentity,
@@ -38,5 +39,6 @@ export function readStoredResultHistories<T extends ResultHistoryRow>(
     db,
     { read: (id) => readStoredResultHistory(db, id) },
     row,
+    apiAttemptEvidenceReader,
   );
 }

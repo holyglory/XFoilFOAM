@@ -8563,6 +8563,8 @@ export async function registerSyncRoutes(app: FastifyInstance): Promise<void> {
           const {
             steadyHistoryArchiveId: _steadyArchive,
             frameTrackArchiveId: _frameArchive,
+            steadyHistorySubtreeId: _steadySubtree,
+            frameTrackSubtreeId: _frameSubtree,
             ...exported
           } = hydrated;
           items.push(

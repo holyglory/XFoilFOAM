@@ -1,3 +1,4 @@
+import { canonicalSubtreeCandidateSql } from "@aerodb/db/result-history-subtrees";
 import { readAttemptEventDependencies, readAttemptWorkerReplayScope } from "@aerodb/db/attempt-evidence-proof-reader";
 import { exactId } from "./hz-attempt-wire";
 export { exactId, ZERO_ID, packedBytes } from "./hz-attempt-wire";
@@ -89,6 +90,7 @@ export async function attemptPage(
   limit: number,
   retained = false,
   settled = false,
+  canonicalFields = false,
 ) {
   if (!Number.isInteger(limit) || limit < 1 || limit > 64)
     throw Error("Invalid page size");
@@ -97,13 +99,14 @@ export async function attemptPage(
   // The full native limiter still checks the chosen archive and signed source.
   const extra = settled ? sql`UNION (SELECT g.result_attempt_id AS id FROM attempt_evidence_archives g
     WHERE g.result_attempt_id>${exactId(after)}::uuid AND g.result_attempt_id<=${exactId(high)}::uuid
-      AND (SELECT to_jsonb(p)->>'tiny_histories_enabled'='true' FROM attempt_evidence_storage_policy p WHERE p.id=1)
+      AND (${canonicalFields} OR (SELECT to_jsonb(p)->>'tiny_histories_enabled'='true' FROM attempt_evidence_storage_policy p WHERE p.id=1))
     GROUP BY g.result_attempt_id ORDER BY g.result_attempt_id LIMIT ${limit})` : sql``;
   const rows = await db.execute(sql`WITH receipt_keys AS MATERIALIZED (
   SELECT DISTINCT a.id FROM progressive_worker_hub_receipts h JOIN result_attempts a ON a.id=h.result_attempt_id WHERE h.result_attempt_id>${exactId(after)}::uuid AND h.result_attempt_id<=${exactId(high)}::uuid
    AND ${retained ? sql`a.status IN ('done','failed') AND h.receipt->>'kind'='retained-progressive-attempt'` : sql`a.status='done' AND a.regime='rans'`} AND h.receipt->'storageOnly' IN ('true'::jsonb,${retained ? sql`'false'::jsonb` : sql`'true'::jsonb`})
   ORDER BY a.id LIMIT ${limit}), keys AS MATERIALIZED (SELECT id FROM receipt_keys ${extra} ORDER BY id LIMIT ${limit})
  SELECT k.id::text AS id,a.evidence_archive_id::text AS archive, e.app_readback_at IS NULL AND a.evidence_archive_id IS NOT NULL AS pending,
+ ${canonicalSubtreeCandidateSql(sql`a`,canonicalFields)} AS canonical_fields,
  CASE WHEN a.evidence_archive_id IS NULL THEN ${workerAttemptLimiter(sql`k.id`, retained, settled)} END AS limiter,
  pg_column_size(a.evidence_payload) AS stored,CASE WHEN a.evidence_archive_id IS NULL AND pg_column_size(a.evidence_payload)<=${settled ? 8388608 : 262144} THEN octet_length(a.evidence_payload::text)-octet_length(attempt_evidence_compact(a.evidence_payload)::text) END AS logical
  FROM keys k JOIN result_attempts a ON a.id=k.id LEFT JOIN attempt_evidence_storage_events e ON e.id=a.evidence_storage_event_id ORDER BY k.id`);

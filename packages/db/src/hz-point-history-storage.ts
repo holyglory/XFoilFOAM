@@ -1,6 +1,8 @@
 import { solverHistorySha256 } from "@aerodb/core/solver-history-storage";
 import { sql } from "drizzle-orm";
 import type { DB } from "./client";
+import { getAttemptEvidenceArchive, type AttemptEvidenceArchiveRecord } from "./attempt-evidence-catalog";
+import { storedCanonicalSubtree } from "./result-history-subtrees";
 import {
   forceHistoryOffloadCandidates,
   loadSolverHistorySource,
@@ -37,6 +39,16 @@ export interface HistorySelection {
 export interface PreparedHistory extends HistorySelection {
   source: PointHistorySource | null;
   prior: PointHistoryIdentity | null;
+  subtree?: VerifiedSubtreeSelection;
+}
+export interface VerifiedSubtreeSelection {
+  resultId: string;
+  kind: "steady_history" | "frame_track";
+  reference: string;
+  solver: string;
+  archive: AttemptEvidenceArchiveRecord;
+  fieldSha: string;
+  fieldBytes: number;
 }
 export type HistoryCursor = Record<PointHistoryKind, string | null>;
 export const emptyHistoryCursor = (): HistoryCursor => ({
@@ -109,6 +121,13 @@ export async function prepareHzHistory(
       source: null,
       prior: historyArchiveIdentity(pointed),
     };
+  const subtree=await storedCanonicalSubtree(db,selection.id,selection.kind);
+  if(subtree){
+    const [cfg]=await db.execute(sql`SELECT remote_solver_registered_id solver FROM sync_api_settings WHERE id=1 AND remote_solver_enabled`);
+    if(typeof cfg?.solver!=="string") throw Error("Canonical field requires the registered worker");
+    return {...selection,source:null,prior:null,subtree:{resultId:selection.id,kind:selection.kind,reference:subtree.ref,
+      solver:cfg.solver,archive:await getAttemptEvidenceArchive(db,subtree.archive),fieldSha:subtree.sha,fieldBytes:subtree.bytes}};
+  }
   const source = await loadResultHistorySource(
     db,
     selection.id,

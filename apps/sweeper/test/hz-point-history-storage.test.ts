@@ -397,6 +397,7 @@ it("offloads all three kinds through normal HZ readers preserving PG precision, 
       inlineRetained: false,
       sourceBytes: Buffer.byteLength(source.payloadText),
     });
+    if ("attemptArchive" in applied) throw Error("Expected a standalone point-history archive");
     expect(
       (await readPointHistoryWorkingCopy(applied.identity)).payloadText,
     ).toBe(source.payloadText);

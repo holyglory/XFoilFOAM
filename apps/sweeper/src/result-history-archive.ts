@@ -1,4 +1,5 @@
 import type { DB } from "@aerodb/db/client";
+import { readCanonicalSubtree, storedCanonicalSubtree } from "@aerodb/db/result-history-subtrees";
 import {
   getResultHistoryArchive,
   loadResultHistorySource,
@@ -60,6 +61,13 @@ export async function archiveResultHistory(
       sourceBytes: 0,
       archive: prior,
     };
+  }
+  const reference=await storedCanonicalSubtree(db,input.resultId,input.sourceKind);
+  if (reference) {
+    const {sweeperAttemptArchiveReader}=await import("./attempt-evidence-consumer-reader");
+    const field=await readCanonicalSubtree(db,sweeperAttemptArchiveReader(),input.resultId,input.sourceKind,reference.ref);
+    if(!field) throw new Error("Canonical history changed while verifying its attempt source");
+    return {offloaded:false,retainedSmall:false,sourceBytes:0,archive:null,subtreeReference:field.reference};
   }
   const source = await loadResultHistorySource(
     db,

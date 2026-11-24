@@ -95,12 +95,16 @@ async function withFixture(
     includeHistory = false,
     periodicHistory = false,
     tinyHistory = false,
+    steadySamples = 1100,
+    singleUncertifiedPeriod = false,
   }: {
     pendingCount?: number;
     failedPoints?: boolean;
     includeHistory?: boolean;
     periodicHistory?: boolean;
     tinyHistory?: boolean;
+    steadySamples?: number;
+    singleUncertifiedPeriod?: boolean;
   } = {},
 ) {
   await client.db.transaction(async (transaction) => {
@@ -313,7 +317,7 @@ async function withFixture(
               first_order_fallback: false,
               ...(periodicHistory
                 ? {
-                    ...periodicPoint(alpha, 6, true),
+                    ...periodicPoint(alpha, singleUncertifiedPeriod ? 1 : 6, !singleUncertifiedPeriod),
                     case_slug: `fixture-${alpha}`,
                     converged: !(failedPoints && alpha >= 7),
                   }
@@ -326,16 +330,16 @@ async function withFixture(
               ...(includeHistory && !periodicHistory && !tinyHistory
                 ? {
                     steady_history: {
-                      iterations: Array.from({ length: 1100 }, (_, i) => i + 1),
-                      cl: Array.from({ length: 1100 }, (_, i) =>
+                      iterations: Array.from({ length: steadySamples }, (_, i) => i + 1),
+                      cl: Array.from({ length: steadySamples }, (_, i) =>
                         i === 0 ? 0.12 : Math.sin(i / 7),
                       ),
                       cd: Array.from(
-                        { length: 1100 },
+                        { length: steadySamples },
                         (_, i) => 0.03 + Math.sin(i) / 1000,
                       ),
                       cm: Array.from(
-                        { length: 1100 },
+                        { length: steadySamples },
                         (_, i) => Math.cos(i / 3) / 50,
                       ),
                       window: { start_iter: 1, end_iter: 2 },
@@ -1281,10 +1285,10 @@ it("runs CLI help and refuses ambiguous flags before connecting to a database", 
   });
 }, 30000);
 
-it.each(["steady", "periodic", "contended", "tiny received", "tiny undelivered"])(
+it.each(["steady", "periodic", "contended", "tiny received", "tiny undelivered", "canonical result", "canonical frames"])(
   "reads and migrates the %s attempt through its actual worker report and rejects stale custody",
   async (kind) => {
-    const periodic = kind === "periodic";
+    const periodic = kind === "periodic" || kind === "canonical frames";
     const tiny = kind.startsWith("tiny");
     const root = await mkdtemp(join(tmpdir(), "hz-attempt-report-"));
     vi.stubEnv("AIRFOILFOAM_REPORT_VOLUME_DIR", root);
@@ -1341,6 +1345,11 @@ it.each(["steady", "periodic", "contended", "tiny received", "tiny undelivered"]
           if (kind !== "tiny undelivered") await db.execute(sql`INSERT INTO progressive_worker_hub_receipts VALUES(${input.executionId}::uuid,${p.sequence},
         ${id}::uuid,${p.pointContentSignature},${JSON.stringify(ack)}::jsonb)`);
           const source = await readStoredAttemptEvidenceText(db, id);
+          if (kind === "canonical result" || kind === "canonical frames") {
+            await verifyHzAttemptTransition(db,id,input,source,root,full,false,undefined,false,undefined,
+              kind === "canonical frames" ? "frame_track" : "steady_history");
+            return;
+          }
           if (tiny) {
             await verifyHzAttemptTransition(db,id,input,source,root,full,false,undefined,false,
               kind === "tiny undelivered" ? "failed" : "received");
@@ -1400,6 +1409,8 @@ it.each(["steady", "periodic", "contended", "tiny received", "tiny undelivered"]
           pendingCount: kind === "contended" ? 2 : 1,
           periodicHistory: periodic,
           tinyHistory: tiny,
+          steadySamples: kind === "canonical result" ? 36 : 1100,
+          singleUncertifiedPeriod: kind === "canonical frames",
           failedPoints: periodic || tiny,
         },
       );

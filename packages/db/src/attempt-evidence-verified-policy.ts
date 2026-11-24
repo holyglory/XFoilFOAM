@@ -1,3 +1,4 @@
+import { canonicalSubtreeCandidateSql } from "./result-history-subtrees";
 import { sql } from "drizzle-orm";
 import type { DB } from "./client";
 
@@ -67,12 +68,13 @@ export async function verifiedAttemptProofScope(
 
 /** Examine at most one stable attempt-ID page. Multiple archive generations can exist
  * for one attempt. Only the exact archive that passed its own limiter can be offered. */
-export function verifiedAttemptCandidatesSql(after: string | null) {
+export function verifiedAttemptCandidatesSql(after: string | null, canonicalFields = false) {
   return sql`WITH ids AS MATERIALIZED (
     SELECT DISTINCT ar.result_attempt_id AS id FROM attempt_evidence_archives ar
     ${after ? sql`WHERE ar.result_attempt_id > ${after}::uuid` : sql``} ORDER BY ar.result_attempt_id LIMIT 32
   )
-  SELECT a.id, CASE WHEN a.evidence_archive_id IS NOT NULL THEN 'already-shortened' ELSE picked.limiter END AS limiter,
+  SELECT a.id, ${canonicalSubtreeCandidateSql(sql`a`,canonicalFields)} AS canonical_fields,
+    CASE WHEN a.evidence_archive_id IS NOT NULL THEN 'already-shortened' ELSE picked.limiter END AS limiter,
     CASE WHEN picked.limiter IS NULL THEN picked.archive_id END AS archive_id, picked.cohort
   FROM ids JOIN result_attempts a USING (id)
   LEFT JOIN LATERAL (

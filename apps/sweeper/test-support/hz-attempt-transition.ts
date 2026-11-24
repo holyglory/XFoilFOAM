@@ -123,8 +123,9 @@ export async function verifyHzAttemptTransition(
   independentAttempt?: string,
   shortProofJourney = false,
   tinyDelivery?: "received" | "failed",
+  canonicalSubtrees?: "steady_history" | "frame_track",
 ) {
-  const fixture = await createSettlementFixture(true),
+  const fixture = await createSettlementFixture(true,true,!!canonicalSubtrees),
     db = fixture.db;
   const prior = process.env.MEDIA_DIR;
   process.env.MEDIA_DIR = root;
@@ -216,8 +217,9 @@ export async function verifyHzAttemptTransition(
               ...(request.identity as any),
               verifiedAt: new Date((request.identity as any).verifiedAt),
             }),
-      api: (request) =>
-        hzAttemptApiProbe(
+      api: async (request) => request.operation==="canonical-read"
+        ? (await import("../../api/src/hz-attempt-custody-cli")).hzCanonicalFieldApiProbe(db,String(request.resultId),request.kind as "steady_history"|"frame_track",String(request.reference))
+        : hzAttemptApiProbe(
           db,
           String(request.attemptId),
           String(request.archiveId),
@@ -243,6 +245,11 @@ export async function verifyHzAttemptTransition(
       relay,
       report: (value: unknown) => reports.push(value as Record<string, any>),
     };
+    if (canonicalSubtrees) {
+      const {verifyCanonicalSubtreeJourney}=await import("./canonical-result-history-fixture");
+      await verifyCanonicalSubtreeJourney(db,id,String(input.executionId),original,fixture.namespace,config,io,objects,root,canonicalSubtrees);
+      return;
+    }
     if (independentAttempt) {
       const siblingSource = await readStoredAttemptEvidenceText(db, independentAttempt);
       const interrupted: AttemptRelay = {...relay, async api(request) {

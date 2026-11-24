@@ -1,6 +1,8 @@
 import { sql, type SQL } from "drizzle-orm";
 import type { DB } from "./client";
 import { canonicalAnalysisJson } from "./analysis-target";
+import type { AttemptEvidenceArchiveReader } from "./attempt-evidence-reader";
+import { readCanonicalSubtree, storedCanonicalSubtree } from "./result-history-subtrees";
 import {
   MAX_RESULT_HISTORY_BYTES,
   assertResultHistoryArchive,
@@ -77,6 +79,8 @@ export async function loadResultHistorySource(
     throw new Error(
       "Result history is missing, archived, or exceeds its byte limit",
     );
+  if (row.payload_text.includes('"subtreeRef"') && await storedCanonicalSubtree(db,resultId,kind))
+    throw new Error("Canonical result history is already archived as an attempt subtree");
   const source: ResultHistorySource = {
     sourceKind: kind,
     resultId,
@@ -226,6 +230,8 @@ export interface ResultHistoryRow {
   frameTrack?: unknown;
   steadyHistoryArchiveId?: string | null;
   frameTrackArchiveId?: string | null;
+  steadyHistorySubtreeId?: string | null;
+  frameTrackSubtreeId?: string | null;
 }
 export function hasArchivedResultHistory(value: unknown): boolean {
   if (!value || typeof value !== "object") return false;
@@ -243,6 +249,7 @@ export async function hydrateResultHistories<T extends ResultHistoryRow>(
   db: DB,
   reader: ResultHistoryReader,
   row: T,
+  attemptReader?: AttemptEvidenceArchiveReader,
 ): Promise<T> {
   const restoredRow = { ...row };
   for (const kind of ["steady_history", "frame_track"] as const) {
@@ -251,7 +258,21 @@ export async function hydrateResultHistories<T extends ResultHistoryRow>(
       kind === "steady_history"
         ? "steadyHistoryArchiveId"
         : "frameTrackArchiveId";
-    if (!row[archiveField] && !hasArchivedResultHistory(row[field])) continue;
+    const typed = kind === "steady_history" ? row.steadyHistorySubtreeId : row.frameTrackSubtreeId;
+    const value=row[field];
+    const marker = value && typeof value==="object" && !Array.isArray(value) ?
+      Object.values(value).find(v=>v && typeof v==="object" && v.archivedResultHistoryArray===true && typeof v.subtreeRef==="string")?.subtreeRef : undefined;
+    if (typed && marker && typed!==marker) throw new Error("Canonical history marker belongs to another generation");
+    const subtree=typed ?? marker;
+    if (!row[archiveField] && !subtree && !hasArchivedResultHistory(row[field])) continue;
+    if (!row[archiveField] && attemptReader) {
+      const stored = await readCanonicalSubtree(db,attemptReader,row.id,kind,subtree ?? undefined,row[field]);
+      if (stored) {
+        restoredRow[field] = JSON.parse(stored.fieldText);
+        continue;
+      }
+      if (subtree) throw new Error("Canonical history source changed");
+    }
     const archive = row[archiveField]
       ? await getResultHistoryArchive(db, row[archiveField]!)
       : await resultHistoryArchiveForRow(db, row.id, kind);

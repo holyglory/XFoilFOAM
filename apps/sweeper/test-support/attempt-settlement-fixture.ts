@@ -152,7 +152,7 @@ const dependencies = [
   "sync_brokered_evidence_uploads",
 ];
 
-export async function createSettlementFixture(workerCustody = false, projectionSealing = workerCustody) {
+export async function createSettlementFixture(workerCustody = false, projectionSealing = workerCustody, canonicalSubtrees = false) {
   const client = createClient({ max: 1 });
   const namespace = `attempt_settle_${randomUUID().replaceAll("-", "")}`;
   const db = client.db;
@@ -183,7 +183,11 @@ export async function createSettlementFixture(workerCustody = false, projectionS
       ADD PRIMARY KEY(id), ADD UNIQUE(id,result_id)`);
     await db.execute(sql`ALTER TABLE results ADD PRIMARY KEY(id)`);
     await db.execute(sql`ALTER TABLE sim_jobs ADD PRIMARY KEY(id)`);
+    if (canonicalSubtrees)
+      await db.execute(sql`ALTER TABLE results DROP COLUMN steady_history_archive_id,DROP COLUMN frame_track_archive_id,
+        DROP COLUMN steady_history_subtree_id,DROP COLUMN frame_track_subtree_id`);
     for (const file of [
+      ...(canonicalSubtrees ? ["0206_result_history_storage.sql"] : []),
       "0207_attempt_evidence_archives.sql",
       "0208_attempt_history_readthrough.sql",
       ...(workerCustody
@@ -200,6 +204,7 @@ export async function createSettlementFixture(workerCustody = false, projectionS
         : []),
       ...(projectionSealing ? ["0225_attempt_projection_sealing.sql", "0227_exact_attempt_storage_transition.sql", "0233_compact_signed_attempt_proofs.sql"] : []),
       ...(workerCustody && projectionSealing ? ["0237_tiny_attempt_original_references.sql"] : []),
+      ...(canonicalSubtrees ? ["0238_canonical_history_subtree_refs.sql"] : []),
     ]) {
       const body = await readFile(
         new URL(`../../../packages/db/migrations/${file}`, import.meta.url),

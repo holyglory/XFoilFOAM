@@ -285,6 +285,7 @@ export async function runAttemptEvidenceSettlementPass(
     recovered = 0;
   let payloadBytesReclaimed = 0,
     netValueBytesReclaimed = 0;
+  let canonicalFieldsVerified = 0;
   const failures: Array<{ attemptId: string; error: string }> = [];
   const limited: Array<{ attemptId: string; limiter: string }> = [];
   // Replay unacknowledged committed events before selecting new sources. This
@@ -314,10 +315,26 @@ export async function runAttemptEvidenceSettlementPass(
   }
   const candidates =
     automatic && processed < maxRows
-      ? await attemptEvidenceShorteningCandidates(db, next, policy?.progressiveSourceScope)
+      ? await attemptEvidenceShorteningCandidates(db, next, policy?.progressiveSourceScope,
+        policy?.canonicalHistorySubtreesEnabled || (policy?.canonicalHistorySubtreeContract &&
+          await (await import("@aerodb/db/result-history-subtrees")).pendingCanonicalSubtrees(db)))
       : [];
   for (const candidate of candidates) {
     if (options.signal?.aborted) break;
+    if (candidate.canonical_fields) {
+      if (processed >= maxRows) break;
+      next = candidate.id;
+      try {
+        const { settleHubCanonicalFields } = await import("./canonical-result-history");
+        canonicalFieldsVerified += (await settleHubCanonicalFields(db,deps.store,candidate.id)).length;
+      } catch(error) {
+        failures.push({attemptId:candidate.id,error:error instanceof Error ? error.message : String(error)});
+      }
+      if (candidate.limiter!==null || !candidate.archive_id) {
+        processed++;
+        continue;
+      }
+    }
     if (candidate.limiter !== null || !candidate.archive_id) {
       next = candidate.id;
       limited.push({
@@ -359,6 +376,7 @@ export async function runAttemptEvidenceSettlementPass(
     eligible,
     payloadBytesReclaimed,
     netValueBytesReclaimed,
+    canonicalFieldsVerified,
     failures,
     limited,
   };
@@ -384,7 +402,7 @@ export async function runAttemptEvidenceSettlementService(
       after = result.next;
       afterReadback = result.nextReadback;
       if (result.enabled && after !== null) pause = 250;
-      if (result.shortened || result.recovered || result.failures.length)
+      if (result.shortened || result.recovered || result.canonicalFieldsVerified || result.failures.length)
         console.info("attempt-history-shortening", result);
     } catch (error) {
       console.error(

@@ -247,3 +247,32 @@ including a cost when it is negative. The actual GCS generation remains the
 restore source. Opening a job, changing its signed ownership, losing a
 generation, or failing a scientific read prevents the transition or triggers
 the existing exact-source recovery.
+
+## Canonical result fields shared with an existing attempt original
+
+Migration 0238 can retire small, nonempty `results.steady_history` and
+`results.frame_track` fields when their complete PostgreSQL text matches
+the original field of an attempt for the same result, job, angle, and setup.
+The canonical result keeps its coefficients, status, provenance, scalar
+history metadata, and current attempt selection, including a null selection.
+The reference identifies the source archive and its sealed projection separately.
+
+Deploy the API, sweeper, and registered-worker controller from the same
+revision. Use the storage CLI command `enable-canonical-subtrees --id RESULT_UUID`
+for a single result. Use `enable-canonical-subtrees` to include future
+eligible results and `disable-canonical-subtrees` to stop new bindings.
+The existing verified hub and registered-worker attempt scanners own discovery.
+On the hub, `canonical-subtrees --id ATTEMPT_UUID` prepares one source.
+On the worker, the existing locked `migrate --apply --include-settled-receipts`
+command accepts `--canonical-fields --id ATTEMPT_UUID`.
+
+The hub reopens the exact original GCS generation. The worker independently
+checks the packed original through its own working volume. A locked database
+comparison checks the selection and byte-identical field again before binding
+it. Normal result reads verify the original field SHA and length while
+hydrating the stored metadata. A failed application read restores the original
+field using its exact reference. A lost acknowledgement remains available for
+the same controller to verify. Ordinary publication of a replacement clears
+the prior field reference. The source receipt retains the original stored
+value size; field and reference storage are accounted separately from attempt
+compaction.

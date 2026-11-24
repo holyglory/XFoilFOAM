@@ -95,7 +95,8 @@ export async function attemptEvidenceStorageMain(
     flags.set(flag, args[index + 1]!);
   }
   const tinyPolicy = command === "enable-tiny-histories" || command === "disable-tiny-histories";
-  const shortPolicy = tinyPolicy || command === "enable-short-proofs" || command === "disable-short-proofs";
+  const canonicalPolicy = command === "enable-canonical-subtrees" || command === "disable-canonical-subtrees";
+  const shortPolicy = canonicalPolicy || tinyPolicy || command === "enable-short-proofs" || command === "disable-short-proofs";
   if (shortPolicy && [...flags.keys()].some(flag => !command.startsWith("enable-") || flag !== "--id"))
     throw new Error(command + " accepts only an optional canary --id on enablement");
   const verified =
@@ -201,13 +202,16 @@ export async function attemptEvidenceStorageMain(
       "disable-short-proofs",
       "enable-tiny-histories",
       "disable-tiny-histories",
+      "enable-canonical-subtrees",
+      "disable-canonical-subtrees",
+      "canonical-subtrees",
       "shorten",
       "shorten-pass",
       "restore-inline",
     ].includes(command ?? "")
   )
     throw new Error(
-      "Usage: attempt-evidence-storage-cli.ts sql|use-sql|audit|use-audit|copy|archive|backfill|restore|shortening-status|preview-verified|enable-verified|shortening-candidates|enable-shortening|disable-shortening|enable-short-proofs|disable-short-proofs|enable-tiny-histories|disable-tiny-histories|shorten|shorten-pass|restore-inline [--consumer-contract 1] [--stopped-progressive true|only] [--receipt-bearing true | --receipt-urans true [--urans-max-source-bytes N]] [--id ATTEMPT_UUID --archive-id ARCHIVE_UUID] [--after UUID] [--rows N] [--pages N] [--output NEW_FILE] [--bucket BUCKET] [--source-instance INSTANCE]",
+      "Usage: attempt-evidence-storage-cli.ts sql|use-sql|audit|use-audit|copy|archive|backfill|restore|shortening-status|preview-verified|enable-verified|shortening-candidates|enable-shortening|disable-shortening|enable-short-proofs|disable-short-proofs|enable-tiny-histories|disable-tiny-histories|enable-canonical-subtrees|disable-canonical-subtrees|canonical-subtrees|shorten|shorten-pass|restore-inline [--consumer-contract 1] [--stopped-progressive true|only] [--receipt-bearing true | --receipt-urans true [--urans-max-source-bytes N]] [--id ATTEMPT_UUID --archive-id ARCHIVE_UUID] [--after UUID] [--rows N] [--pages N] [--output NEW_FILE] [--bucket BUCKET] [--source-instance INSTANCE]",
     );
   if (!process.env.DATABASE_URL)
     throw new Error("An explicit DATABASE_URL is required");
@@ -229,6 +233,9 @@ export async function attemptEvidenceStorageMain(
         "disable-short-proofs",
         "enable-tiny-histories",
         "disable-tiny-histories",
+        "enable-canonical-subtrees",
+        "disable-canonical-subtrees",
+        "canonical-subtrees",
         "shorten",
         "shorten-pass",
         "restore-inline",
@@ -241,7 +248,7 @@ export async function attemptEvidenceStorageMain(
         );
       if (shortPolicy) {
         const enabled = command.startsWith("enable-");
-        const update = (db: typeof client.db) => setShortAttemptProofPolicy(db, enabled, flags.get("--id"), tinyPolicy ? "tiny-history" : "measured-floor");
+        const update = (db: typeof client.db) => setShortAttemptProofPolicy(db, enabled, flags.get("--id"), canonicalPolicy ? "canonical-subtree" : tinyPolicy ? "tiny-history" : "measured-floor");
         let updated;
         if (enabled && configuredDeploymentRole() === "remote-solver") {
           if (!policy.hzWorkerOnly) throw new Error("Short worker proofs require the native HZ-only policy");
@@ -393,6 +400,14 @@ export async function attemptEvidenceStorageMain(
       const deps = await configuredAttemptEvidenceSettlementDependencies(
         client.db,
       );
+      if (command === "canonical-subtrees") {
+        const id=flags.get("--id");
+        if (!id || flags.size!==1) throw new Error("canonical-subtrees requires --id ATTEMPT_UUID");
+        if (!policy.canonicalHistorySubtreesEnabled) throw new Error("Canonical subtree storage is disabled");
+        const {settleHubCanonicalFields}=await import("./canonical-result-history");
+        process.stdout.write(JSON.stringify(await settleHubCanonicalFields(client.db,deps.store,id))+"\n");
+        return;
+      }
       if (command === "shorten") {
         const id = flags.get("--id"),
           archiveId = flags.get("--archive-id");

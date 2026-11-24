@@ -25,6 +25,7 @@ import type {
   PreparedHistory,
   HistoryCustodyResult,
   HistoryCursor,
+  VerifiedSubtreeSelection,
 } from "@aerodb/db/hz-point-history-storage";
 
 export interface HZRelayOptions {
@@ -233,6 +234,7 @@ export function openHistoryWorker(
   );
 }
 export interface HistoryRelayServices {
+  verifySubtree?(source: VerifiedSubtreeSelection): Promise<{reference:string; archiveId:string; generation:string; sourceSha256:string; sourceByteSize:number}>;
   prepare(selection: HistorySelection): Promise<PreparedHistory>;
   put(
     source: NonNullable<PreparedHistory["source"]>,
@@ -280,6 +282,14 @@ export async function migrateHzHistory(
   )
     throw new HistoryOperationError("pending_receipt", "integrity");
   const prepared = await services.prepare(selection);
+  if (prepared.subtree) {
+    if (pending || !services.verifySubtree || prepared.subtree.resultId!==selection.id ||
+      prepared.subtree.kind!==selection.kind || prepared.subtree.archive.sourceInstance!==instance)
+      throw new HistoryOperationError("canonical_subtree","integrity");
+    const checked=await services.verifySubtree(prepared.subtree);
+    return {...selection,offloaded:false,replayed:true,inlineRetained:false,reason:"verified-attempt-subtree",sourceBytes:0,
+      attemptArchive:prepared.subtree.archive,api:checked};
+  }
   const prior = prepared.prior && historyArchiveIdentity(prepared.prior);
   let identity: PointHistoryIdentity;
   let uploaded: Buffer | undefined;
@@ -368,9 +378,14 @@ export async function migrateHzHistory(
 /** Operator acceptance uses only the recorded generation and normal API reader. */
 export async function verifyStoredHzHistory(
   selection: HistorySelection,
-  services: HistoryRelayServices,
+  services: Pick<HistoryRelayServices, "prepare" | "verifySubtree" | "read" | "apiRead">,
 ) {
   const prepared = await services.prepare(selection);
+  if (prepared.subtree && services.verifySubtree) {
+    if (prepared.subtree.resultId!==selection.id || prepared.subtree.kind!==selection.kind)
+      throw new HistoryOperationError("canonical_subtree","integrity");
+    return {verified:true,selection,attemptArchive:prepared.subtree.archive,api:await services.verifySubtree(prepared.subtree)};
+  }
   if (!prepared.prior || prepared.source !== null)
     throw new HistoryOperationError("stored_pointer", "input");
   const identity = historyArchiveIdentity(prepared.prior);
@@ -384,6 +399,30 @@ export async function verifyStoredHzHistory(
   )
     throw new HistoryOperationError("verify", "integrity");
   return { verified: true, selection, archive: identity, api };
+}
+/** The normal point-history verification route can also encounter a field
+ * covered by an attempt object. Validate the real parent object and canonical
+ * field independently, without producing a standalone 0206 envelope. */
+export async function verifyCanonicalPointHistory(
+  source: VerifiedSubtreeSelection,
+  hub: (request: Record<string, unknown>) => Promise<{identity: import("@aerodb/db/attempt-evidence-catalog").AttemptEvidenceArchiveIdentity; packed: string}>,
+  api: (request: Record<string, unknown>) => Promise<import("@aerodb/db/result-history-subtrees").CanonicalFieldProof | null>,
+) {
+  const {canonicalFieldText}=await import("@aerodb/db/result-history-subtrees");
+  const {originalPacked}=await import("./hz-attempt-originals");
+  const {readAttemptEvidenceCopy}=await import("./attempt-evidence-archive");
+  const {sameArchive}=await import("./hz-attempt-custody");
+  const {Readable}=await import("node:stream");
+  const ar={...source.archive,verifiedAt:new Date(source.archive.verifiedAt)};
+  const read=await hub({operation:"read-canonical-source",identity:ar,instance:ar.sourceInstance,solver:source.solver});
+  sameArchive(ar,read.identity);
+  const original=await readAttemptEvidenceCopy(Readable.from([originalPacked(read.packed)]),ar);
+  const text=canonicalFieldText(original,ar,source.kind,source.fieldSha,source.fieldBytes);
+  const restored=await api({operation:"canonical-read",resultId:source.resultId,kind:source.kind,reference:source.reference});
+  if(!restored || restored.reference!==source.reference || restored.generation!==ar.generation || restored.archiveId!==ar.id ||
+    restored.resultId!==source.resultId || restored.kind!==source.kind || restored.fieldText!==text)
+    throw new HistoryOperationError("canonical_subtree","integrity");
+  return {reference:source.reference,archiveId:ar.id,generation:ar.generation,sourceSha256:source.fieldSha,sourceByteSize:source.fieldBytes};
 }
 export class HzHistoryConnections {
   private worker: HistorySshEndpoint;
@@ -432,6 +471,17 @@ export class HzHistoryConnections {
   }
   services(): HistoryRelayServices {
     return {
+      verifySubtree: async (source) => {
+        const hub = new HistorySshEndpoint(this.options.hubHost, this.options.hubSweeperContainer, "/app/apps/sweeper/src/hz-attempt-custody-cli.ts");
+        const api = new HistorySshEndpoint(this.options.hzHost, this.options.hzApiContainer, "/app/apps/api/src/hz-attempt-custody-cli.ts");
+        try {
+          return await verifyCanonicalPointHistory(source,
+            (request) => hub.ask({...request, bucket:this.options.bucket, account:this.options.hubServiceAccount}),
+            (request) => api.ask(request));
+        } finally {
+          await Promise.all([hub.close(),api.close()]);
+        }
+      },
       prepare: (selection) =>
         this.worker.ask({ operation: "prepare", selection }),
       put: async (source, instance) => {

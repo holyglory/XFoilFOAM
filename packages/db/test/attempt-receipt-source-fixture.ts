@@ -309,7 +309,7 @@ export async function verifyReceiptBearingHistory(
     await setShortAttemptProofPolicy(db,false,undefined,tiny ? "tiny-history" : "measured-floor");
     await db.execute(sql`UPDATE attempt_evidence_storage_policy SET min_net_value_bytes=1024 WHERE id=1`);
 
-    await verifySelectedDetailField(db, publicInline, "steady_history");
+    if (!tiny) await verifySelectedDetailField(db, publicInline, "steady_history");
     expect(await settleProgressiveCfdExecution(db, job)).toEqual(inlineSettlement);
     expect(
       await attemptEvidenceShorteningCandidates(db, null, "receipt-bearing"),
@@ -317,6 +317,60 @@ export async function verifyReceiptBearingHistory(
     expect(await modelSnapshot()).toEqual(before);
     const cold = await loadAttemptSourcePins(db, ids);
     const fetched = await prepareAttemptSources(db, store, [...cold.values()]);
+    if (tiny) {
+      const selected=ar[0]!;
+      const {enableVerifiedAttemptPolicy}=await import("../src/attempt-evidence-verified-policy");
+      const {readStoredResultHistories}=await import("../../../apps/api/src/result-history-reader");
+      const {resultHistoriesMatch}=await import("../src/result-history-storage");
+      const {withProgressiveSyncApi}=await import("../../../apps/api/test/progressive-polar-import-fixture");
+      const secret=randomUUID();
+      await db.execute(sql`UPDATE sync_api_settings SET enabled=true,secret=${secret} WHERE id=1`);
+      await db.execute(sql`INSERT INTO sync_api_permissions(data_type,can_fetch,can_push) VALUES('polars',true,false)
+        ON CONFLICT(data_type) DO UPDATE SET can_fetch=true`);
+      const exported=()=>withProgressiveSyncApi(db,async app=>{
+        const response=await app.inject({method:"GET",url:"/api/sync/v1/export?types=polars&limit=500",headers:{"x-xfoilfoam-sync-secret":secret}});
+        expect(response.statusCode).toBe(200);
+        const item=response.json().items.find((i:{data:{remoteResultId:string}})=>i.data.remoteResultId===selected.resultId);
+        expect(item).toBeDefined();
+        return item;
+      });
+      const beforeExport=await exported();
+      await enableVerifiedAttemptPolicy(db);
+      await setShortAttemptProofPolicy(db,true,selected.resultId!,"canonical-subtree");
+      const {canonicalSubtreeCandidates}=await import("../src/result-history-subtrees");
+      expect(await canonicalSubtreeCandidates(db,selected.attemptId)).toEqual([
+        expect.objectContaining({result_id:selected.resultId,kind:"steady_history",archive:selected.id})
+      ]);
+      const offered=await attemptEvidenceShorteningCandidates(db,null,"verified",true);
+      expect(offered.find(row=>row.id===selected.attemptId)).toMatchObject({canonical_fields:true});
+      const oldUploads=memory.uploads;
+      const [previous]=await db.execute(sql`SELECT steady_history::text field,current_result_attempt_id FROM results WHERE id=${selected.resultId}::uuid`);
+      const ownerCount=await modelSnapshot();
+      const normalPass=await runAttemptEvidenceSettlementPass(db,deps,{maxRows:2});
+      expect(normalPass).toMatchObject({canonicalFieldsVerified:1,shortened:0,failures:[]});
+      expect(memory.uploads).toBe(oldUploads);
+      const [field]=await db.execute(sql`SELECT id, steady_history AS "steadyHistory",current_result_attempt_id,
+        steady_history_subtree_id AS "steadyHistorySubtreeId",steady_history_archive_id AS "steadyHistoryArchiveId" FROM results WHERE id=${selected.resultId}::uuid`);
+      expect(field.current_result_attempt_id).toBe(previous.current_result_attempt_id);
+      expect(field.steadyHistorySubtreeId).toBeTruthy();
+      expect(field.steadyHistoryArchiveId).toBeNull();
+      const restored=await readStoredResultHistories(db,{id:String(field.id),steadyHistory:field.steadyHistory,steadyHistorySubtreeId:String(field.steadyHistorySubtreeId)});
+      expect(restored.steadyHistory).toEqual(JSON.parse(String(previous.field)));
+      expect(await resultHistoriesMatch(db,String(field.id),{steadyHistory:restored.steadyHistory,frameTrack:null})).toBe(true);
+      expect(await exported()).toEqual(beforeExport);
+      expect(beforeExport.data).not.toHaveProperty("steadyHistorySubtreeId");
+      expect(await modelSnapshot()).toEqual(ownerCount);
+      const currentPublic=await selectedDetailBaseline(db,selected.attemptId);
+      expect(currentPublic.body.steadyHistory).toEqual(publicInline.body.steadyHistory);
+      expect(currentPublic.body.cl).toBe(publicInline.body.cl);
+      const {restoreCanonicalSubtree}=await import("../src/result-history-subtrees");
+      expect(await restoreCanonicalSubtree(db,{resultId:String(field.id),kind:"steady_history",
+        reference:String(field.steadyHistorySubtreeId),archiveId:selected.id,generation:selected.generation,fieldText:String(previous.field)})).toBe(true);
+      await setShortAttemptProofPolicy(db,false,undefined,"canonical-subtree");
+      // Independently exercise the existing 0206 standalone archive contract
+      // against the restored canonical field.
+      await verifySelectedDetailField(db,publicInline,"steady_history");
+    }
     memory.failReads = true;
     try {
       await expect(prepareAttemptSources(db,store,[...cold.values()])).rejects.toThrow();

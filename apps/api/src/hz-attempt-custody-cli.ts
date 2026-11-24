@@ -34,9 +34,15 @@ export async function hzAttemptApiProbe(
     throw Error("Application attempt sources differ");
   return { ...proof, forceArchive, verifiedAt: new Date().toISOString() };
 }
+export async function hzCanonicalFieldApiProbe(db: DB, resultId: string, kind: "steady_history" | "frame_track", reference: string) {
+  if (process.env.AIRFOILFOAM_DEPLOYMENT_ROLE !== "remote-solver") throw Error("Unexpected canonical history reader role");
+  const {readCanonicalSubtree}=await import("@aerodb/db/result-history-subtrees");
+  const {apiAttemptEvidenceReader}=await import("./attempt-evidence-reader");
+  return readCanonicalSubtree(db,apiAttemptEvidenceReader,exactId(resultId),kind,exactId(reference));
+}
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href)
   await attemptRpc(async (r) => {
-    if (r.operation !== "api" || typeof r.forceArchive !== "boolean")
+    if (r.operation !== "canonical-read" && (r.operation !== "api" || typeof r.forceArchive !== "boolean"))
       throw Error("Unknown application operation");
     const c = createClient({
       max: 1,
@@ -49,6 +55,9 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href)
     try {
       const { installApiReportArchiveReader } = await import("./progressive-report-archive-reader");
       await installApiReportArchiveReader();
+      if (r.operation === "canonical-read") {
+        return hzCanonicalFieldApiProbe(c.db,r.resultId,r.kind,r.reference);
+      }
       return await hzAttemptApiProbe(
         c.db,
         exactId(r.attemptId),

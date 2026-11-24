@@ -1343,6 +1343,7 @@ export const results = pgTable(
     /** Migration 0206: a pointer means frameTrack retains compact metadata;
      * canonical row readers restore the exact original generation first. */
     frameTrackArchiveId: uuid("frame_track_archive_id"),
+    frameTrackSubtreeId: uuid("frame_track_subtree_id").references((): AnyPgColumn => resultHistorySubtreeRefs.id),
     /** Fidelity ladder tier this row's evidence was solved at (contract 3,
      *  migration 0034): 'rans' | 'urans_precalc' | 'urans_full'. Echoed by the
      *  engine on PolarPoint.fidelity; backfill graded pre-ladder urans rows
@@ -1355,6 +1356,7 @@ export const results = pgTable(
      *  result_attempts carry it inside evidence_payload (whole PolarPoint). */
     steadyHistory: jsonb("steady_history"),
     steadyHistoryArchiveId: uuid("steady_history_archive_id"),
+    steadyHistorySubtreeId: uuid("steady_history_subtree_id").references((): AnyPgColumn => resultHistorySubtreeRefs.id),
     /** Auto-retry-once marker (migration 0036): set when the sweeper's
      *  crash-class auto-retry requeued this cell after a failed ingest. A row
      *  that fails AGAIN with this set stays terminal/unavailable instead of a
@@ -3853,6 +3855,8 @@ export const attemptEvidenceStoragePolicy = pgTable(
     shortProofCanaryAttemptId: uuid("short_proof_canary_attempt_id"),
     tinyHistoriesEnabled: boolean("tiny_histories_enabled").notNull().default(false),
     tinyHistoryCanaryAttemptId: uuid("tiny_history_canary_attempt_id"),
+    canonicalHistorySubtreesEnabled: boolean("canonical_history_subtrees_enabled").notNull().default(false),
+    canonicalHistoryCanaryResultId: uuid("canonical_history_canary_result_id"),
     hzRetainedEnabled: boolean("hz_retained_enabled").notNull().default(false),
     hzSettledReceiptsEnabled: boolean("hz_settled_receipts_enabled").notNull().default(false),
     hzWorkerOnly: boolean("hz_worker_only").notNull().default(false),
@@ -3866,6 +3870,23 @@ export const attemptEvidenceStoragePolicy = pgTable(
     initialSubset: text("initial_subset").notNull(),
   },
 );
+
+export const resultHistorySubtreeRefs = pgTable("result_history_subtree_refs", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  resultId: uuid("result_id").notNull().references(() => results.id,{onDelete:"cascade"}),
+  sourceKind: text("source_kind").notNull(),
+  sourceAttemptId: uuid("source_attempt_id").notNull(),
+  sourceArchiveId: uuid("source_archive_id").notNull(),
+  selectedAttemptAtBind: uuid("selected_attempt_at_bind"),
+  originalValueBytes: integer("original_value_bytes").notNull(),
+  createdAt: timestamp("created_at",{withTimezone:true}).notNull().default(sql`clock_timestamp()`),
+  appReadbackAt: timestamp("app_readback_at",{withTimezone:true}),
+},(t)=>({
+  attemptOwner: foreignKey({name:"result_subtree_attempt_owner_fk",columns:[t.sourceAttemptId,t.resultId],
+    foreignColumns:[resultAttempts.id,resultAttempts.resultId]}).onDelete("cascade"),
+  projection: foreignKey({name:"result_subtree_projection_fk",columns:[t.sourceAttemptId,t.sourceArchiveId],
+    foreignColumns:[attemptEvidenceHistoryProjections.resultAttemptId,attemptEvidenceHistoryProjections.archiveId]}).onDelete("cascade"),
+}));
 
 export const attemptEvidenceHistoryProjections = pgTable(
   "attempt_evidence_history_projections",
