@@ -20,24 +20,41 @@ interface SignedCopyPage {
   bytes: number;
 }
 
-/** Keep the two largest offered pages from different owners. When both are
- * ready, a continuing owner gives the other a turn. The ordinary discovery
- * cursor still advances between priority writes, including after a refusal. */
+/** Keep two signed offers from different owners. Bytes already selected by
+ * the latest chronological scan add no priority. The offer remains usable
+ * when it is the only one. */
 export class CancelledReportCopyPriority {
   private readonly pages: SignedCopyPage[] = [];
   private lastExecutionId?: string;
   private chronologicalDue = false;
+  private chronological?: { executionId: string; sequences: Set<number> };
+
+  observeChronological(executionId: string | undefined, sequences: readonly number[]) {
+    this.chronological = executionId && sequences.length ? { executionId, sequences: new Set(sequences) } : undefined;
+    this.pages.sort((a, b) => this.compare(a, b));
+  }
+
+  private disjointBytes(page: SignedCopyPage) {
+    const scan = this.chronological;
+    if (!scan || scan.executionId !== page.executionId) return page.bytes;
+    return page.keys.reduce((n, key) => n + (scan.sequences.has(key.sequence) ? 0 : key.storedBytes), 0);
+  }
+
+  private compare(a: SignedCopyPage, b: SignedCopyPage) {
+    return this.disjointBytes(b) - this.disjointBytes(a) || b.bytes - a.bytes;
+  }
 
   offer(executionId: string, keys: readonly SignedCopyKey[]) {
     if (!keys.length) return;
     const bytes = keys.reduce((n, k) => n + k.storedBytes, 0);
+    const page = { executionId, keys, bytes };
     const prior = this.pages.findIndex(p => p.executionId === executionId);
     if (prior >= 0) {
-      if (this.pages[prior]!.bytes >= bytes) return;
+      if (this.compare(this.pages[prior]!, page) <= 0) return;
       this.pages.splice(prior, 1);
     }
-    this.pages.push({ executionId, keys, bytes });
-    this.pages.sort((a, b) => b.bytes - a.bytes);
+    this.pages.push(page);
+    this.pages.sort((a, b) => this.compare(a, b));
     if (this.pages.length > 2) this.pages.pop();
   }
 
@@ -47,7 +64,8 @@ export class CancelledReportCopyPriority {
       return;
     }
     if (!this.pages.length) return;
-    const index = this.pages.length === 2 && this.pages[0]!.executionId === this.lastExecutionId ? 1 : 0;
+    const alternate = this.pages[1];
+    const index = alternate && this.pages[0]!.executionId === this.lastExecutionId && this.disjointBytes(alternate) > 0 ? 1 : 0;
     const [page] = this.pages.splice(index, 1);
     this.lastExecutionId = page!.executionId;
     this.chronologicalDue = true;
@@ -59,7 +77,11 @@ export async function selectCancelledReportCopyPage(
   db: DB, after: ReportCopyCursor | null, priority?: CancelledReportCopyPriority,
 ) {
   const preferred = priority?.take();
-  if (!preferred) return { ...await nextCancelledReportCopies(db, after, true), preferred };
+  if (!preferred) {
+    const page = await nextCancelledReportCopies(db, after, true);
+    priority?.observeChronological(page.executionId, page.sequences);
+    return { ...page, preferred };
+  }
   return { executionId: preferred.executionId, sequences: preferred.keys.map(k => k.sequence), after, preferred };
 }
 

@@ -214,6 +214,24 @@ it("runs the stock recurring hub storage worker and serves both archive formats 
     }, selected.sequences, new Map(waitingKeys.map(k => [k.sequence,k.signature])))).toBe(0);
     expect(signedOffers.take()).toBeUndefined();
     expect(signedOffers.take()?.executionId).toBe(continuing);
+    // One owner's full signed offer can be the exact chronological window.
+    // Keep the two other owners with a signed source instead of counting the same bytes twice.
+    const third = originals[2].executionId;
+    const [thirdKey] = await db.db.execute<{sequence: number; signature: string; storedBytes: number}>(sql`
+      SELECT sequence::int, content_signature AS signature, pg_column_size(report)::int AS "storedBytes"
+      FROM progressive_remote_reports WHERE sim_job_id=${third}::uuid ORDER BY sequence DESC LIMIT 1`);
+    expect(continuingKeys.reduce((n, k) => n + k.storedBytes, 0)).toBeGreaterThan(thirdKey!.storedBytes);
+    const competing = new CancelledReportCopyPriority();
+    competing.offer(continuing, continuingKeys);
+    competing.observeChronological(continuing, continuingKeys.map(k => k.sequence));
+    competing.offer(waiting, waitingKeys);
+    competing.offer(third, [thirdKey!]);
+    const first = competing.take()!;
+    expect(competing.take()).toBeUndefined();
+    const other = competing.take()!;
+    expect(new Set([first.executionId, other.executionId])).toEqual(new Set([waiting, third]));
+    expect(first.keys).toEqual(first.executionId === waiting ? waitingKeys : [thirdKey!]);
+    expect(other.keys).toEqual(other.executionId === waiting ? waitingKeys : [thirdKey!]);
     const physicalRead = (f: ArchiveFixture) => {
       const first = f.reports.findIndex((r) => r.payloadHash !== null);
       return f.reports[first + 1];

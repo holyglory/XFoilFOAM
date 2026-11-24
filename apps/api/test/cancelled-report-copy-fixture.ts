@@ -208,6 +208,20 @@ export async function verifyCancelledReportCopyReplay(
   const exact = new Map(preferred.keys.map(k=>[k.sequence,k.signature]));
   const firstSourceWindow = await stoppedReportCopyKeys(db, id, 0, 1, true);
   expect(firstSourceWindow.at(-1)!.sequence).toBeLessThanOrEqual(anchorSequence);
+  // The chronological selector has both large copies in this execution. A
+  // smaller, disjoint signed window can win without becoming a custody proof.
+  const overlap = new CancelledReportCopyPriority();
+  const scannedCopies = await selectCancelledReportCopyPage(db, cursor, overlap);
+  expect(scannedCopies.sequences).toEqual(ready.map(k => k.sequence));
+  overlap.offer(id, ready);
+  overlap.offer(id, firstSourceWindow);
+  const disjoint = await selectCancelledReportCopyPage(db, scannedCopies.after, overlap);
+  expect(disjoint.preferred?.keys).toEqual(firstSourceWindow);
+  expect(disjoint.after).toEqual(scannedCopies.after);
+  expect(await archiveProgressiveReportBatch(db, "remote", id, async () => {
+    throw new Error("First receipt owner reached the ordinary copy writer");
+  }, disjoint.sequences, new Map(firstSourceWindow.map(k => [k.sequence, k.signature])))).toBe(0);
+  expect(await state()).toEqual(before);
   const signedWindows = new CancelledReportCopyPriority();
   await offerStoppedReportCopyWindows(db, id, firstSourceWindow, null, signedWindows);
   expect(signedWindows.take()).toBeUndefined();
