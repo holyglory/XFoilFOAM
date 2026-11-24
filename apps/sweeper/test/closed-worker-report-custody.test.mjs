@@ -252,6 +252,40 @@ it.each([
               items: items.map((item, i) => ({ ...item, hub: hubs[i] })),
             });
             expect(publication.deltaMembers).toBe(1);
+            if (!sparse) {
+              // Show the two real, signed fixture members as existing registrations
+              // on each independent role, then restore the warm fixture to settle it.
+              const occupied = async (connection, check) => {
+                const rollback = new Error("finish registered-member lookup");
+                await expect(connection.transaction(async tx => {
+                  await tx.execute(sql`CREATE TEMP TABLE progressive_report_archive_members
+                    (LIKE public.progressive_report_archive_members INCLUDING CONSTRAINTS INCLUDING DEFAULTS) ON COMMIT DROP`);
+                  for (const [i, pin] of publication.pins.entries()) {
+                    await tx.execute(sql`INSERT INTO progressive_report_archive_members
+                      (bundle_id,source_kind,sim_job_id,sequence,member_kind,content_signature,report_sha256,report_byte_size)
+                      VALUES (gen_random_uuid(),${i === 0 ? "remote" : "worker"},${id}::uuid,${pin.sequence},
+                              'report',${pin.signature},${pin.reportSha256},${pin.reportByteSize})`);
+                  }
+                  await check(tx);
+                  throw rollback;
+                })).rejects.toBe(rollback);
+              };
+              await occupied(db, async tx => {
+                const next = await run("discover-worker", { after: { executionId: id, sequence: 2 }, limit: 2 }, tx);
+                expect(next.keys).toEqual([]);
+                expect(next.last).toEqual(found.last);
+                for (const key of keys) {
+                  await expect(run("source", { key }, tx)).rejects.toThrow("Use the existing archive registration");
+                }
+              });
+              await asHub(tx => occupied(tx, async inner => {
+                expect((await run("discover-hub", { keys }, inner)).keys).toEqual([]);
+                for (const item of items) {
+                  await expect(run("hub", item, inner)).rejects.toThrow("already owns this sequence");
+                }
+              }));
+            }
+
             const pinned = items.map((v, i) => ({
                 ...v,
                 pin: publication.pins[i],

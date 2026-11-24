@@ -176,8 +176,10 @@ async function workerSource(
   } else if (row.archived_at) {
     text = await readStoredWorkerArchiveText(db, coldPin);
   } else {
+    // The primary key starts with source_kind. Either registered kind owns a report.
     const prior =
-      await db.execute(sql`SELECT 1 FROM progressive_report_archive_members WHERE sim_job_id=${id}::uuid
+      await db.execute(sql`SELECT 1 FROM progressive_report_archive_members
+      WHERE source_kind IN ('remote','worker') AND sim_job_id=${id}::uuid
       AND sequence=${seq} AND member_kind='report' LIMIT 1`);
     eligible(prior.length === 0, "Use the existing archive registration");
     const [source] =
@@ -256,7 +258,7 @@ async function hubScience(db, key, source) {
       AND (j.ingest_lease_token IS NULL OR j.ingest_lease_expires_at<=clock_timestamp()) AND p.status IN('expired','fulfilled','cancelled')
       AND EXISTS(SELECT FROM progressive_cfd_execution_stops s WHERE s.sim_job_id=j.id AND s.engine_job_id=j.engine_job_id)
       AND NOT EXISTS(SELECT FROM progressive_remote_reports t WHERE t.sim_job_id=j.id AND t.sequence=${seq})
-      AND NOT EXISTS(SELECT FROM progressive_report_archive_members m WHERE m.sim_job_id=j.id AND m.sequence=${seq} AND m.member_kind='report')
+      AND NOT EXISTS(SELECT FROM progressive_report_archive_members m WHERE m.source_kind IN ('remote','worker') AND m.sim_job_id=j.id AND m.sequence=${seq} AND m.member_kind='report')
       AND NOT EXISTS(SELECT FROM progressive_remote_report_inventories i WHERE i.sim_job_id=j.id AND i.sequence=${seq})`);
   eligible(
     r,
@@ -1109,7 +1111,7 @@ async function discoverOriginals(db, m) {
         AND NOT EXISTS(SELECT FROM progressive_worker_reports w WHERE w.sim_job_id=k.j AND w.acknowledged_at IS NULL)
         AND NOT EXISTS(SELECT FROM progressive_worker_evidence_receipts e WHERE e.sim_job_id=k.j AND e.sequence=k.s)
         AND NOT EXISTS(SELECT FROM progressive_worker_report_conflicts c WHERE c.sim_job_id=k.j AND c.sequence=k.s)
-        AND NOT EXISTS(SELECT FROM progressive_report_archive_members m WHERE m.sim_job_id=k.j AND m.sequence=k.s AND m.member_kind='report')
+        AND NOT EXISTS(SELECT FROM progressive_report_archive_members m WHERE m.source_kind IN ('remote','worker') AND m.sim_job_id=k.j AND m.sequence=k.s AND m.member_kind='report')
         AND NOT EXISTS(SELECT FROM progressive_worker_hub_report_links l WHERE l.sim_job_id=k.j AND l.sequence=k.s)
         AND NOT EXISTS(SELECT FROM result_attempts a WHERE a.sim_job_id=k.j AND a.status='running')
         AND NOT EXISTS(SELECT FROM progressive_worker_delivery_failures f WHERE f.sim_job_id=k.j AND f.state<>'conflict'))
@@ -1132,7 +1134,7 @@ async function discoverOriginals(db, m) {
       AND j."ingestedAt" IS NOT NULL AND (j.ingest_lease_token IS NULL OR j.ingest_lease_expires_at<=clock_timestamp())
       AND p.status IN('expired','fulfilled','cancelled') AND EXISTS(SELECT FROM progressive_cfd_execution_stops s WHERE s.sim_job_id=j.id AND s.engine_job_id=j.engine_job_id)
       AND NOT EXISTS(SELECT FROM progressive_remote_reports r WHERE r.sim_job_id=j.id AND r.sequence=k.sequence)
-      AND NOT EXISTS(SELECT FROM progressive_report_archive_members m WHERE m.sim_job_id=j.id AND m.sequence=k.sequence AND m.member_kind='report')
+      AND NOT EXISTS(SELECT FROM progressive_report_archive_members m WHERE m.source_kind IN ('remote','worker') AND m.sim_job_id=j.id AND m.sequence=k.sequence AND m.member_kind='report')
       AND NOT EXISTS(SELECT FROM progressive_remote_report_inventories i WHERE i.sim_job_id=j.id AND i.sequence=k.sequence)
     ORDER BY k."executionId",k.sequence`);
   return { keys: [...matches] };
