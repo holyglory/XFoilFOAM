@@ -1,6 +1,6 @@
 import { CRC32C } from "@google-cloud/storage";
 import { createHash, randomUUID } from "node:crypto";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Readable } from "node:stream";
@@ -37,6 +37,8 @@ import { archiveProgressiveReportBatch } from "../../sweeper/src/progressive-rep
 import { ColdReportWitnesses } from "../../sweeper/src/cold-report-witnesses";
 import { CancelledReportScanCheckpoint } from "../../sweeper/src/cancelled-report-scan-checkpoint";
 import { copyStoppedReportBatch, offerNextStoppedCopyPage, offerStoppedReportCopyWindows, stoppedReportCopyKeys } from "../../sweeper/src/shared-stopped-report-custody";
+import { advanceSharedReportOwner, stoppedReportOwnerFrontier } from "../../sweeper/src/shared-stopped-report-service";
+import { HubReportObjects } from "../../sweeper/src/shared-report-objects";
 import { readSharedReport, SHARED_REPORT_FORMAT } from "../../sweeper/src/shared-report-archive";
 import { memoryReportObjects } from "../../sweeper/test/shared-report-object-fixture";
 import type { importPolarPush } from "../src/sync-routes";
@@ -205,7 +207,32 @@ export async function verifyCancelledReportCopyReplay(
   expect(chronological.sequences).toEqual(page.sequences);
   expect(chronological.after).toEqual((await nextCancelledReportCopies(db,cursor,true)).after);
   expect((await selectCancelledReportCopyPage(db, chronological.after, priority)).preferred?.executionId).toBe(id);
-  const exact = new Map(preferred.keys.map(k=>[k.sequence,k.signature]));
+  const directory = await mkdtemp(join(tmpdir(), "cancelled-report-checkpoint-"));
+  onTestFinished(() => rm(directory, { recursive: true, force: true }));
+  // Restore the on-disk form left by a completed scan into an empty stock queue.
+  // These two reports share real bound evidence. The uncovered sibling and
+  // receipt-owning anchor in the same warm page must stay out of the offer.
+  const frontier = await stoppedReportOwnerFrontier(db, id);
+  expect(frontier).not.toBeNull();
+  await mkdir(join(directory, id));
+  const completedFile = join(directory, id, "cursor.json");
+  const completed = JSON.stringify({ frontier: frontier!.frontier, complete: true,
+    after: final.sequence, scientificAfter: final.sequence, scientificComplete: true });
+  await writeFile(completedFile, completed);
+  const restarted = new CancelledReportCopyPriority();
+  const objects = new HubReportObjects("disposable-hub", "reports");
+  const advance = () => advanceSharedReportOwner(db, objects, directory, id, false, restarted);
+  expect(await advance()).toEqual({ complete: true, changed: 0 });
+  const recovered = await selectCancelledReportCopyPage(db, cursor, restarted);
+  expect(recovered.preferred?.keys).toEqual(ready.map(({ sequence, signature, storedBytes }) =>
+    ({ sequence, signature, storedBytes })));
+  expect(recovered.after).toEqual(cursor);
+  expect(await readFile(completedFile, "utf8")).toBe(completed);
+  expect((await selectCancelledReportCopyPage(db, cursor, restarted)).preferred).toBeUndefined();
+  await advance();
+  expect(restarted.take()).toBeUndefined(); // the chronological pass already holds this owner
+  expect(await state()).toEqual(before);
+  const exact = new Map(recovered.preferred!.keys.map(k => [k.sequence,k.signature]));
   const firstSourceWindow = await stoppedReportCopyKeys(db, id, 0, 1, true);
   expect(firstSourceWindow.at(-1)!.sequence).toBeLessThanOrEqual(anchorSequence);
   // The chronological selector has both large copies in this execution. A
@@ -279,8 +306,6 @@ export async function verifyCancelledReportCopyReplay(
   expect(shared.json().fulfilledAoas).toEqual([]);
   expect(await readProgressiveRemoteRetention(db, id)).toEqual(waiting);
   let bytes = Buffer.alloc(0);
-  const directory = await mkdtemp(join(tmpdir(), "cancelled-report-checkpoint-"));
-  onTestFinished(() => rm(directory, { recursive: true, force: true }));
   const checkpoint = new CancelledReportScanCheckpoint(directory, "disposable-hub", "reports");
   const restoredCursor = () => new CancelledReportScanCheckpoint(directory, "disposable-hub", "/reports/").resume(db);
   expect(await restoredCursor()).toBeNull();

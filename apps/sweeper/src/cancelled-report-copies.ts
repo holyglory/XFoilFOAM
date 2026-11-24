@@ -58,6 +58,20 @@ export class CancelledReportCopyPriority {
     if (this.pages.length > 2) this.pages.pop();
   }
 
+  /** Refill an empty slot after the shared scan passed this owner. The waiting
+   * archive index bounds the probe even when all source rows are already cold. */
+  async refillFromWarmReports(db: DB, executionId: string) {
+    if (this.pages.length >= 2 || this.chronological?.executionId === executionId ||
+        this.pages.some(page => page.executionId === executionId)) return;
+    const keys = await db.execute<{ sequence: number; signature: string; storedBytes: number }>(sql`WITH warm AS MATERIALIZED (
+      SELECT sim_job_id,sequence,content_signature,pg_column_size(report) AS bytes
+      FROM progressive_remote_reports WHERE sim_job_id=${executionId}::uuid
+        AND archived_at IS NULL AND archive_bundle_id IS NULL ORDER BY sequence LIMIT 32)
+      SELECT r.sequence::int AS sequence,r.content_signature AS signature,r.bytes AS "storedBytes"
+      FROM warm r WHERE ${scientificallyReceiptedReportCopy} ORDER BY r.sequence`);
+    this.offer(executionId, keys);
+  }
+
   take() {
     if (this.chronologicalDue) {
       this.chronologicalDue = false;

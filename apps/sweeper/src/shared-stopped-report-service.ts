@@ -29,7 +29,7 @@ interface Cursor {
 interface PageLedger {
   members: Record<string, { signature: string; receipt: string }>;
 }
-async function ownerFrontier(db: DB, id: string) {
+export async function stoppedReportOwnerFrontier(db: DB, id: string) {
   const [o] =
     await db.execute(sql`SELECT d.content_signature AS assignment,st.proof_signature AS stop,
     (SELECT max(sequence)::text FROM progressive_remote_reports r WHERE r.sim_job_id=job.id) AS last,
@@ -70,7 +70,7 @@ export async function advanceSharedReportOwner(
 ) {
   if (!uuid.test(id) || !isAbsolute(dir))
     throw new Error("Invalid stopped report owner or receipt path");
-  const owner = await ownerFrontier(db, id);
+  const owner = await stoppedReportOwnerFrontier(db, id);
   if (!owner) return { complete: true, changed: 0 };
   const { frontier } = owner;
   const root = join(dir, id),
@@ -141,6 +141,16 @@ export async function advanceSharedReportOwner(
     if (step.more && prior?.complete) return { complete: false, changed: 0 };
   } else if (eligibleAnchors && state?.regular) {
     await write(anchorFile, { ...state, regular: false });
+  }
+  if (prior?.frontier === frontier && prior.scientificComplete && priority) {
+    // Signed offers live in memory. A completed on-disk scan can still own
+    // ordinary reports after a restart or after another owner's offer won.
+    try {
+      await priority.refillFromWarmReports(db, id);
+    } catch (error) {
+      console.warn("[sweeper] remaining stopped report window", id,
+        error instanceof Error ? error.message : String(error));
+    }
   }
   if (prior?.complete && prior.frontier === frontier)
     return { complete: true, changed: 0 };
