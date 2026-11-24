@@ -170,12 +170,40 @@ catch (e) {
     return json.loads(process.stdout)
 
 
+def stream_native_page(args, message):
+    if not getattr(args, "stream_native_page_reads", False):
+        return False
+    rule = getattr(args, "stream_native_page_class", None)
+    if not rule:
+        return True
+    archive_format, minimum_members, minimum_bytes = rule
+    items = message.get("items", [])
+    if message["op"] not in ("read", "settle") or not minimum_members <= len(items) <= 8:
+        return False
+    total = 0
+    for item in items:
+        pin = item["pin"]
+        size = pin.get("reportByteSize")
+        if pin.get("archiveFormat") != archive_format or type(size) is not int or size <= 0:
+            return False
+        total += size
+    return minimum_bytes <= total <= 32 * 1024**2
+
+
 def inputs(args):
     require(re.fullmatch(r"[0-9a-f]{40}", args.runtime_revision), "Expected deployed source revision")
     for host in (args.hub_host, args.hz_host, args.hub_sweeper, args.hz_sweeper, args.hz_api):
         require(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", host), "Invalid existing SSH target")
     require(args.hub_host != args.hz_host and args.hz_api != args.hz_sweeper, "Independent role subjects required")
     require(1 <= getattr(args,"page_members",1) <= 8, "Page membership must be between one and eight")
+    rule = getattr(args, "stream_native_page_class", None)
+    if rule:
+        archive_format, minimum_members, minimum_bytes = rule
+        require(getattr(args, "stream_native_page_reads", False) and archive_format in ("jsonl", "worker-result-ref-v1"),
+                "A native page cost class needs an enabled reader and supported format")
+        require(2 <= int(minimum_members) <= 8 and 1 <= int(minimum_bytes) <= 32 * 1024**2,
+                "Native page cost class exceeds the existing member or byte bound")
+        args.stream_native_page_class = (archive_format, int(minimum_members), int(minimum_bytes))
     minimum = getattr(args, "repeat_result_min_bytes", 0)
     require(0 <= minimum <= 32 * 1024**2, "Measured repeat size must be within the existing native page bound")
     if getattr(args,"page_members",1)>1 or getattr(args,"share_results",False) or minimum:
@@ -255,7 +283,7 @@ def run(args):
             entry=check_key(key,ranges)
             return dict(sourceInstance=s["sourceInstance"],solverId=s["solverId"],sha256=args.frozen_sha256,range=entry)
         def ask(role, message):
-            return run_peer(args,role,{"shareResults":getattr(args,"share_results",False),"streamNativePageReads":getattr(args,"stream_native_page_reads",False),**message,"runtime":runtime},peer)
+            return run_peer(args,role,{"shareResults":getattr(args,"share_results",False),"streamNativePageReads":stream_native_page(args, message),**message,"runtime":runtime},peer)
         # The invocation budget and mutation owner do not change when two normal
         # four-member windows share one authenticated generation.
         peer_hash = digest(peer.encode())
@@ -481,6 +509,8 @@ if __name__ == "__main__":
                         help="Share a matching result above this size after two successive verified generations (0 disables)")
     parser.add_argument("--share-results",action="store_true",help="Use a verified same-execution worker dictionary for matching closed reports")
     parser.add_argument("--stream-native-page-reads",action="store_true",help="Authenticate the complete bounded native page once per independent reader or transaction")
+    parser.add_argument("--stream-native-page-class", nargs=3, metavar=("FORMAT", "MIN_MEMBERS", "MIN_BYTES"),
+                        help="Restrict enabled page reads to this measured format, count and total original size")
     parser.add_argument("--same-execution-pages",action="store_true",help="Pack consecutive inventory keys from one execution across sequence gaps")
     parser.add_argument("--page-members",type=int,default=1)
     parser.add_argument("--hub-account-file",type=Path,help="Confirmed workload identity for independent grouped GCS reads on the hub")

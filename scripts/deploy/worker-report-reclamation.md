@@ -80,6 +80,14 @@ smaller row budget. A single-key cancellation waits for the scan interval.
 The default of zero
 leaves the existing `--discover-after-seed` schedule available.
 
+The optional `--stream-native-page-reads` reads one complete physical generation
+per native role and proof phase. To apply it only to a measured cost class,
+also provide `--stream-native-page-class FORMAT MIN_MEMBERS MIN_BYTES`.
+The controller checks the actual published pins on every grouped read and
+settlement. The byte count is the sum of the original member sizes. Other
+pages continue through their ordinary reads. Both paths keep the same signed
+input, independent cloud proof, size limits and recovery cursor.
+
 ## Measure the report table
 
 Run the read-only audit from the operator host. It uses the existing SSH aliases

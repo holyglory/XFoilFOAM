@@ -727,12 +727,14 @@ class ClosedReportOperator(unittest.TestCase):
             args=SimpleNamespace(runtime_revision="a"*40,hz_host="hz",hub_host="hub",hz_api="api",hz_sweeper="worker",hub_sweeper="hub-worker",
                 apply=True,limit=16,keys=source,keys_sha256=controller.digest(source.read_bytes()),frozen_scope=scope,
                 frozen_sha256=controller.digest(scope.read_bytes()),state=root/"state",page_members=4,hub_account_file=account,
-                width_qualification=root/"width.json",same_execution_pages=True)
+                width_qualification=root/"width.json",same_execution_pages=True,
+                stream_native_page_reads=True,stream_native_page_class=("jsonl","4","640"))
             calls=[]
             def rpc(_args,role,m,_peer):
                 items=m["items"];seq=[v["key"]["sequence"] for v in items]
                 self.assertEqual(m["key"],items[0]["key"])
                 calls.append((m["op"],seq))
+                self.assertEqual(m["streamNativePageReads"], m["op"] in ("read","settle") and seq[0]==11)
                 if m["op"]=="source":
                     rows=[]
                     for n in seq:
@@ -741,8 +743,11 @@ class ClosedReportOperator(unittest.TestCase):
                         rows.append(dict(stored=size,source={"facts":{"byteSize":size,"points":[{}]}},resultMeta={"sha256":"b"*64,"byteSize":size-4}))
                     return {"rows":rows}
                 if m["op"]=="hub":return {"rows":[{"science":{}} for _ in items]}
-                if m["op"]=="publish":return {"pins":[{"generation":str(seq[0])}for _ in items],"deltaMembers":len(items)-1}
-                if m["op"]=="cloud":return {"rows":[{"science":{}}for _ in items],"generationDownloads":1}
+                if m["op"]=="publish":
+                    fmt="jsonl" if seq[0]<15 else "worker-result-ref-v1"
+                    return {"pins":[{"generation":str(seq[0]),"archiveFormat":fmt,
+                                     "reportByteSize":16 if n<11 else 160}for n in seq],"deltaMembers":len(items)-1}
+                if m["op"]=="cloud":return {"rows":[{"science":{}}for _ in items],"generationDownloads":1 if seq[0]<15 else 2}
                 if m["op"]=="settle":return {"rows":[{"outcome":"retired"}for _ in items]}
                 return {"rows":[{"storedFieldBytes":5}for _ in items]}
             with patch.object(controller.subprocess,"check_output",return_value=b"runtime"),patch.object(controller,"run_peer",side_effect=rpc):
