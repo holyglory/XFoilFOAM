@@ -10036,6 +10036,7 @@ describe("bounded progressive numerical recovery", () => {
       await stopped(fallback);
       await expect(settleProgressiveCfdExecution(db, fallback.composed.jobId))
         .resolves.toMatchObject({ retry: 1, complete: 0, gaps: 0 });
+      expect(await recoverTerminalProgressiveNoEvidenceGaps(db)).toBe(0);
       const [continued] = await claimProgressiveCfdBatch(db, {
         owner: "material-checkpoint-continuation", leaseSeconds: 120,
         solverBudgetVersion: 2, allowedSolverFamilies: ["rhoPimpleFoam"],
@@ -10066,6 +10067,40 @@ describe("bounded progressive numerical recovery", () => {
         solverBudgetVersion: 2, allowedSolverFamilies: ["rhoPimpleFoam"],
         preferredWorkId: replacement.workId,
       })).toEqual([]);
+      const state = async () => (await c.execute(sql`SELECT state, error FROM progressive_cfd_units
+        WHERE id=${replacement.id}::uuid`))[0];
+      const evidenceHistory = () => c.execute(sql`
+        SELECT to_jsonb(a) AS attempt, to_jsonb(receipt) AS receipt, to_jsonb(stop) AS stop
+        FROM progressive_cfd_attempts a LEFT JOIN progressive_cfd_evidence receipt ON receipt.attempt_token=a.token
+        LEFT JOIN progressive_cfd_execution_stops stop ON stop.sim_job_id=a.sim_job_id
+        WHERE a.unit_id=${replacement.id}::uuid ORDER BY a.token, receipt.result_attempt_id`);
+      const beforeClosing = await evidenceHistory();
+      const [original] = await c.execute(sql`SELECT "ingestedAt"::text AS finished FROM sim_jobs
+        WHERE id=${fallback.composed.jobId}::uuid`);
+      await c.execute(sql`UPDATE sim_jobs SET "ingestedAt"=NULL WHERE id=${fallback.composed.jobId}::uuid`);
+      expect(await recoverTerminalProgressiveNoEvidenceGaps(c)).toBe(0);
+      expect((await state()).state).toBe("pending");
+      await c.execute(sql`UPDATE sim_jobs SET "ingestedAt"=${original.finished}::timestamptz
+        WHERE id=${fallback.composed.jobId}::uuid`);
+      const lateEvidence = new Error("roll back unreceipted evidence fixture");
+      await expect(c.transaction(async late => {
+        const evidence = await late.execute(sql`
+          INSERT INTO result_attempts (result_id, airfoil_id, bc_id, simulation_preset_revision_id,
+            sim_job_id, engine_job_id, aoa_deg, regime, status, source, converged, valid_for_polar, cl, cd)
+          SELECT cell.id,cell.airfoil_id,cell.bc_id,cell.simulation_preset_revision_id,
+            cell.sim_job_id,${fallback.engineJobId},cell.aoa_deg,'urans','done','solved',true,true,0.25,0.02
+          FROM results cell WHERE cell.sim_job_id=${fallback.composed.jobId}::uuid AND cell.aoa_deg=${replacement.alpha}
+          RETURNING id`);
+        expect(evidence).toHaveLength(1);
+        expect(await recoverTerminalProgressiveNoEvidenceGaps(late as unknown as DB)).toBe(0);
+        const [held] = await late.execute(sql`SELECT state FROM progressive_cfd_units WHERE id=${replacement.id}::uuid`);
+        expect(held.state).toBe("pending");
+        throw lateEvidence;
+      })).rejects.toBe(lateEvidence);
+      expect(await recoverTerminalProgressiveNoEvidenceGaps(c)).toBe(0);
+      expect(await state()).toMatchObject({ state: "gap", error: "terminal execution has no measured case evidence" });
+      expect(await recoverTerminalProgressiveNoEvidenceGaps(c)).toBe(0);
+      expect(await evidenceHistory()).toEqual(beforeClosing);
       throw historicalPending;
     })).rejects.toBe(historicalPending);
     expect(await readImmutable()).toEqual(immutable);
