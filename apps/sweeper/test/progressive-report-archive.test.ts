@@ -13,6 +13,8 @@ import {
   resolveStoredProgressiveReport,
 } from "@aerodb/db/progressive-report-reader";
 import { advanceSettledStatusHeaders } from "../src/settled-report-status-headers";
+import { progressiveRemoteReportInventory } from "@aerodb/db/progressive-remote-inventory";
+import { recordProgressiveWorkerEvidenceReceipt } from "../src/progressive-worker-evidence-delivery";
 import {
   backfillProgressiveReportPayloads,
   proveProgressiveReportsInline,
@@ -352,6 +354,206 @@ async function runWorkerVolumeCleanupPass(db: DB) {
 describe.each<ArchiveSource>(["remote", "worker"])(
   "%s progressive report archive database boundary",
   (source) => {
+    it("keeps exact positive counters and independently receipted angles through settlement, replay and late evidence", async () => {
+      await withArchiveFixture(
+        client,
+        source,
+        async (f) => {
+          const { db, executionId: job, reports } = f;
+          const table = archiveTable(source);
+          const proofFor = async (n: number) => {
+            const [r] =
+              await db.execute(sql`SELECT public.progressive_status_completed_angles_receipted(
+            ${source},sim_job_id,sequence,public.progressive_report_compact_header(report)) AS enough
+            FROM ${table} WHERE sim_job_id=${job}::uuid AND sequence=${n}`);
+            return r.enough;
+          };
+          const owners = await db.execute(
+            sql`SELECT id,result_id,aoa_deg FROM result_attempts WHERE sim_job_id=${job}::uuid`,
+          );
+          expect(owners).toHaveLength(2);
+          expect(await proofFor(3)).toBe(false);
+          const received = new Set<string>();
+          for (const n of [2, 4, 6, 8]) {
+            const member = reports[n - 1]!;
+            const points = progressiveRemoteReportInventory(
+              JSON.parse(member.text),
+            ).sources;
+            expect(points).toHaveLength(1);
+            const p = points[0]!,
+              attempt = owners.find((a) => Number(a.aoa_deg) === p.aoa_deg)!;
+            if (source === "worker") {
+              await db.execute(sql`INSERT INTO progressive_worker_evidence_attempts
+              (sim_job_id,sequence,result_attempt_id,point_content_signature)
+              VALUES (${job}::uuid,${n},${attempt.id}::uuid,${p.point_content_signature})`);
+            }
+            if (received.has(p.point_content_signature)) continue;
+            received.add(p.point_content_signature);
+            if (source === "worker") {
+              const expected = {
+                executionId: job,
+                pointContentSignature: p.point_content_signature,
+                resultId: String(attempt.result_id),
+                resultAttemptId: String(attempt.id),
+              };
+              await recordProgressiveWorkerEvidenceReceipt(
+                db,
+                {
+                  version: 1,
+                  kind: "retained-progressive-attempt",
+                  executionId: job,
+                  sequence: n,
+                  pointContentSignature: p.point_content_signature,
+                  remoteResultId: attempt.result_id,
+                  remoteResultAttemptId: attempt.id,
+                  resultId: randomUUID(),
+                  resultAttemptId: randomUUID(),
+                  receivedAt: new Date().toISOString(),
+                },
+                expected,
+              );
+            } else {
+              await db.execute(sql`INSERT INTO progressive_remote_evidence_receipts
+              (sim_job_id,sequence,point_content_signature,result_attempt_id,remote_result_id,remote_result_attempt_id)
+              VALUES (${job}::uuid,${n},${p.point_content_signature},${attempt.id}::uuid,${randomUUID()}::uuid,${randomUUID()}::uuid)`);
+            }
+          }
+          expect(received.size).toBe(2);
+          expect(await Promise.all([1, 3, 5, 7].map(proofFor))).toEqual([
+            false,
+            true,
+            false,
+            true,
+          ]);
+          const cloud = cloudFixture();
+          expect(
+            await archiveProgressiveReportBatch(db, source, job, cloud.putFile),
+          ).toBe(8);
+          installProgressiveReportArchiveReader({
+            read: async (i) =>
+              readProgressiveReportArchiveText(
+                Readable.from([cloud.objects.get(i.objectKey)!]),
+                i,
+              ),
+          });
+          const snapshot = async () => {
+            const v = await archiveSnapshot(f);
+            delete v[
+              source === "remote"
+                ? "progressive_remote_reports"
+                : "progressive_worker_reports"
+            ];
+            for (const owner of [
+              "progressive_remote_evidence_receipts",
+              "progressive_worker_evidence_attempts",
+              "progressive_worker_hub_receipts",
+            ]) {
+              v[owner] =
+                await db.execute(sql`SELECT to_jsonb(t)::text AS body FROM ${sql.identifier(owner)} t
+                WHERE sim_job_id=${job}::uuid ORDER BY to_jsonb(t)::text`);
+            }
+            return v;
+          };
+          const before = await snapshot();
+          const headers = () =>
+            db.execute(sql`SELECT sequence AS seq,report::text AS body,pg_column_size(report) AS bytes,content_signature,archive_bundle_id
+          FROM ${table} WHERE sim_job_id=${job}::uuid ORDER BY sequence`);
+          const old = await headers();
+          await expect(
+            db.transaction((tx) =>
+              tx.execute(sql`UPDATE ${table}
+            SET report=public.progressive_settled_status_header(report) WHERE sim_job_id=${job}::uuid AND sequence=3`),
+            ),
+          ).rejects.toThrow(/exact original/);
+          const [scaled] =
+            await db.execute(sql`SELECT public.progressive_settled_status_header(
+            jsonb_set(${old[2]!.body}::jsonb,'{status,completed_cases}','1.000'::jsonb))#>>'{status,completed_cases}' AS completed`);
+          expect(scaled.completed).toBe("1.000");
+          const [priorJob] = await db.execute(
+            sql`SELECT status FROM sim_jobs WHERE id=${job}::uuid`,
+          );
+          const [priorPromise] = await db.execute(
+            sql`SELECT status FROM sync_sweep_promises WHERE id=${f.promiseId}::uuid`,
+          );
+          await db.execute(
+            sql`UPDATE sim_jobs SET status='running' WHERE id=${job}::uuid`,
+          );
+          expect((await advanceSettledStatusHeaders(db, source)).reduced).toBe(
+            0,
+          );
+          await db.execute(
+            sql`UPDATE sim_jobs SET status=${priorJob.status}::sim_job_status WHERE id=${job}::uuid`,
+          );
+          await db.execute(
+            sql`UPDATE sync_sweep_promises SET status='active' WHERE id=${f.promiseId}::uuid`,
+          );
+          expect((await advanceSettledStatusHeaders(db, source)).reduced).toBe(
+            0,
+          );
+          await db.execute(
+            sql`UPDATE sync_sweep_promises SET status=${priorPromise.status} WHERE id=${f.promiseId}::uuid`,
+          );
+          await db.execute(
+            sql`UPDATE sim_jobs SET ingest_lease_token=${randomUUID()}::uuid,ingest_lease_expires_at=clock_timestamp()+interval '5 minutes' WHERE id=${job}::uuid`,
+          );
+          expect((await advanceSettledStatusHeaders(db, source)).reduced).toBe(
+            0,
+          );
+          expect(await headers()).toEqual(old);
+          await db.execute(
+            sql`UPDATE sim_jobs SET ingest_lease_token=NULL,ingest_lease_expires_at=NULL WHERE id=${job}::uuid`,
+          );
+          expect((await advanceSettledStatusHeaders(db, source)).reduced).toBe(
+            2,
+          );
+          const rows = await headers();
+          for (const [i, r] of rows.entries()) {
+            const n = Number(r.seq),
+              member = reports[i]!;
+            expect([r.content_signature, r.archive_bundle_id]).toEqual([
+              old[i]!.content_signature,
+              old[i]!.archive_bundle_id,
+            ]);
+            if (n === 3 || n === 7) {
+              expect(Number(r.bytes)).toBeLessThan(Number(old[i]!.bytes));
+              expect(JSON.parse(String(r.body)).status).toEqual({
+                state: "running",
+                job_id: job,
+                total_cases: 2,
+                completed_cases: n === 3 ? 1 : 2,
+              });
+            } else expect(r.body).toBe(old[i]!.body);
+            expect(
+              (
+                await readArchivedProgressiveReportText(db, {
+                  sourceKind: source,
+                  executionId: job,
+                  sequence: n,
+                  contentSignature: member.contentSignature,
+                })
+              )?.text,
+            ).toBe(member.text);
+          }
+          const [bounds] =
+            await db.execute(sql`SELECT bool_and(public.progressive_settled_status_header(
+          jsonb_set(jsonb_set(${old[2]!.body}::jsonb,'{status,completed_cases}',v.completed),'{status,total_cases}',v.total)) IS NULL) AS rejected
+          FROM (VALUES ('-1'::jsonb,'2'::jsonb),('1.1','2'),('3','2'),('"1"','2'),('1','1.5'),('1','9007199254740992'))v(completed,total)`);
+          expect(bounds.rejected).toBe(true);
+          expect(await snapshot()).toEqual(before);
+          expect((await advanceSettledStatusHeaders(db, source)).reduced).toBe(
+            0,
+          );
+          expect(await headers()).toEqual(rows);
+        },
+        {
+          reportCount: 8,
+          nullPrefix: 0,
+          angles: [0, 5],
+          statusOnlyCompleted: { 1: 1, 3: 1, 5: 2, 7: 2 },
+          scientificAngles: { 2: 0, 4: 0, 6: 5, 8: 5 },
+        },
+      );
+    }, 45_000);
     it("keeps ordered delivery keys and reads the exact original after reducing only settled quiet headers", async () => {
       await withArchiveFixture(
         client,

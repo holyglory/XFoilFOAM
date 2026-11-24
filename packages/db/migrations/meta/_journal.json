@@ -1653,6 +1653,13 @@
       "when": 1795363913066,
       "tag": "0235_settled_status_headers",
       "breakpoints": true
+    },
+    {
+      "idx": 236,
+      "version": "7",
+      "when": 1795363913067,
+      "tag": "0236_settled_status_after_angles",
+      "breakpoints": true
     }
   ]
 }

@@ -132,8 +132,16 @@ The job must be terminal and ingested, the scheduling promise closed, and
 execution stop independently recorded. The hub checks its dispatch, solver,
 signed empty point inventory and progress acknowledgement. HZ checks its own
 registration, assignment and upstream promise, worker acknowledgements, final
-stop evidence and outstanding delivery obligations. A null result, zero completed
-cases and ordinary engine progress message are required. The worker retains
+stop evidence and outstanding delivery obligations. A null result and an
+ordinary engine progress message are required. Migration 0235 admits zero
+completed cases. From 0236, completed and total cases must be nonnegative,
+integral, safe JSON numbers, with completed at most total. A positive counter
+also needs the matching number of units in the signed assignment and at least
+that many completed angles backed by distinct earlier point sources. Each
+angle must belong to that assignment and have an independent matching attempt
+or diagnostic receipt. Multiple snapshots or attempts for an angle count once.
+The original counter values and every point source and receipt survive.
+The worker retains
 terminal, latest, scientific or diagnostic reports, unknown status fields,
 conflicts and their source rows, and reports that own receipts, staging or a
 shared scientific source. It also checks the full original for exhausted solver

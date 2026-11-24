@@ -103,6 +103,8 @@ export async function withArchiveFixture(
     reportCount?: number;
     nullPrefix?: number;
     quietStatusPrefix?: number;
+    statusOnlyCompleted?: Record<number, number>;
+    scientificAngles?: Record<number, number>;
     exhaustedBudgetSequence?: number;
     schedulingDiagnosticSequence?: number;
     angles?: number[];
@@ -241,7 +243,7 @@ export async function withArchiveFixture(
           sql`UPDATE public.sync_sweep_promises SET source_base_url='https://staging-key.invalid/api/sync/v1' WHERE id=${promiseId}::uuid`,
         );
       }
-      if (source === "worker" && options.quietStatusPrefix) {
+      if (source === "worker" && (options.quietStatusPrefix || options.statusOnlyCompleted)) {
         await db.execute(sql`UPDATE sync_api_settings SET remote_solver_registered_id=${remote.id}::uuid,
           upstream_base_url='https://staging-key.invalid/api/sync/v1' WHERE id=1`);
         await db.execute(sql`UPDATE sync_sweep_promises SET source_base_url='https://staging-key.invalid/api/sync/v1'
@@ -259,7 +261,7 @@ export async function withArchiveFixture(
         status: "failed",
         engineState: "failed",
         totalCases: units.length,
-        completedCases: 1,
+        completedCases: options.statusOnlyCompleted ? Math.max(...Object.values(options.statusOnlyCompleted), 0) : 1,
         ingestedAt: new Date(),
         requestPayload:
           source === "remote"
@@ -268,7 +270,7 @@ export async function withArchiveFixture(
                 remoteSolver: true,
                 syncPromiseId: promiseId,
                 remoteProgressiveExecution: envelope,
-                ...(options.stagingAcceptance || options.quietStatusPrefix
+                ...(options.stagingAcceptance || options.quietStatusPrefix || options.statusOnlyCompleted
                   ? {
                       upstreamBaseUrl:
                         "https://staging-key.invalid/api/sync/v1",
@@ -294,7 +296,8 @@ export async function withArchiveFixture(
           fixture: executionId,
         }),
       };
-      const provenance = force || options.metadataOnlyDiagnostic
+      const validatedSource = Boolean(force || options.metadataOnlyDiagnostic || options.statusOnlyCompleted);
+      const provenance = validatedSource
         ? {
             engine: runtime,
             execution_pool: envelope.request.expected_execution_pool,
@@ -313,6 +316,7 @@ export async function withArchiveFixture(
         error: "repeated immutable history λ🌬️".repeat(
           options.historyRepeats ?? 512,
         ),
+        ...(options.statusOnlyCompleted ? { ...provenance, solver_active_seconds: 48 } : {}),
         ...(options.metadataOnlyDiagnostic
           ? { ...provenance, failure_disposition: "infrastructure", solver_active_seconds: 0 }
           : {}),
@@ -327,17 +331,19 @@ export async function withArchiveFixture(
           : {}),
       };
       let seededAttemptId: string | undefined;
-      if (!force) {
+      const slugForAngle = (angle: number) => angle === 0 ? "archive-case" : "archive-case-" + angle;
+      const storedAngles = new Set([0, ...Object.values(options.scientificAngles ?? {})]);
+      for (const angle of force ? [] : storedAngles) {
         const [result] = await db
           .insert(results)
           .values({
             airfoilId: airfoil.id,
             bcId: solver.bcId,
             simulationPresetRevisionId: revisionId,
-            aoaDeg: 0,
+            aoaDeg: angle,
             simJobId: executionId,
             engineJobId: executionId,
-            engineCaseSlug: "archive-case",
+            engineCaseSlug: slugForAngle(angle),
             status: "failed",
             source: "solved",
             regime: "rans",
@@ -351,10 +357,10 @@ export async function withArchiveFixture(
             airfoilId: airfoil.id,
             bcId: solver.bcId,
             simulationPresetRevisionId: revisionId,
-            aoaDeg: 0,
+            aoaDeg: angle,
             simJobId: executionId,
             engineJobId: executionId,
-            engineCaseSlug: "archive-case",
+            engineCaseSlug: slugForAngle(angle),
             status: "failed",
             source: "solved",
             regime: "rans",
@@ -363,9 +369,9 @@ export async function withArchiveFixture(
             error: "retained archive regression diagnostic",
           })
           .returning();
-        seededAttemptId = attempt.id;
+        if (angle === 0) seededAttemptId = attempt.id;
       }
-      if (options.stagingAcceptance) {
+      if (options.stagingAcceptance || (source === "worker" && options.statusOnlyCompleted)) {
         await db.insert(progressiveWorkerSubmissionIntents).values({
           simJobId: executionId,
           token: randomUUID(),
@@ -405,7 +411,14 @@ export async function withArchiveFixture(
       };
       const count = options.reportCount ?? 3;
       const nullPrefix=options.nullPrefix??1;
+      let completedCases = 0;
       for (let sequence = 1; sequence <= count; sequence++) {
+        const completed = options.statusOnlyCompleted?.[sequence];
+        const quiet = completed !== undefined || sequence <= (options.quietStatusPrefix ?? 0);
+        const resultNull = completed !== undefined || sequence <= nullPrefix;
+        completedCases = completed ?? Math.max(completedCases, resultNull ? 0 : 1);
+        const sourceAngle = options.scientificAngles?.[sequence];
+        const sourcePoint = sourceAngle === undefined ? point : { ...point, aoa_deg: sourceAngle, case_slug: slugForAngle(sourceAngle) };
         const report = {
           version: 1,
           solverId: remote.id,
@@ -418,9 +431,9 @@ export async function withArchiveFixture(
             job_id: executionId,
             state: sequence === count ? "failed" : "running",
             total_cases: units.length,
-            completed_cases: sequence <= nullPrefix ? 0 : 1,
+            completed_cases: completedCases,
             // Unknown diagnostic values must survive archival without JS rounding.
-            ...(sequence <= (options.quietStatusPrefix ?? 0) ? {
+            ...(quiet ? {
               phase: "solving_rans",
               message: "solving rans",
               active_solver: "simpleFoam",
@@ -435,7 +448,7 @@ export async function withArchiveFixture(
                     limit_seconds: 900, solver_running: true }] },
               } : {}),
             } : {
-              diagnosticLargeInteger: force || options.metadataOnlyDiagnostic ? 2147483647 : "__LARGE_INTEGER__",
+              diagnosticLargeInteger: validatedSource ? 2147483647 : "__LARGE_INTEGER__",
               diagnosticNull: null,
               message: [
               "archive diagnostic: λ 🌬️",
@@ -445,7 +458,7 @@ export async function withArchiveFixture(
             }),
           },
           result:
-            sequence <= nullPrefix
+            resultNull
               ? null
               : {
                   ...provenance,
@@ -457,14 +470,14 @@ export async function withArchiveFixture(
                       speed: 19.876543,
                       reynolds,
                       points: [],
-                      attempts: [point],
+                      attempts: [sourcePoint],
                     },
                   ],
                 },
           stopProof:
             sequence === count && options.stopped !== false ? proof : null,
         };
-        const inputText = force || options.metadataOnlyDiagnostic
+        const inputText = validatedSource
           ? JSON.stringify(
               validateProgressiveRemoteReport(report, envelope).report,
             )
@@ -529,7 +542,7 @@ export async function withArchiveFixture(
           else
             await db.execute(sql`UPDATE progressive_worker_reports SET acknowledged_at=clock_timestamp()
             WHERE sim_job_id=${executionId}::uuid AND sequence=${sequence}`);
-          if (!force && sequence > (options.quietStatusPrefix ?? 0))
+          if (!force && !quiet)
             await db.execute(sql`INSERT INTO progressive_worker_evidence_receipts (sim_job_id,sequence,content_signature)
             VALUES (${executionId}::uuid,${sequence},${contentSignature})`);
         }
