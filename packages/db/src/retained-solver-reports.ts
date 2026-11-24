@@ -35,6 +35,20 @@ function reportHash(value: ReportJson): string {
   return reportTextIdentity(canonicalReportJson(value)).sha256;
 }
 
+export function retainedReportInventorySignature(
+  report: { [key: string]: ReportJson },
+  signature: string,
+  sortedSources: { [key: string]: ReportJson }[],
+) {
+  return reportHash({
+    kind: "progressive-remote-report-inventory-v1",
+    executionId: report.executionId!,
+    sequence: report.sequence!,
+    reportContentSignature: signature,
+    sources: sortedSources,
+  });
+}
+
 // Same inventory contract as progressiveRemoteReportInventory. The token tree
 // retains numbers in point evidence that cannot survive a JS JSON round trip.
 export function retainedReportInventory(
@@ -76,13 +90,7 @@ export function retainedReportInventory(
   return {
     sources: sorted,
     sourceCount: sources.size,
-    signature: reportHash({
-      kind: "progressive-remote-report-inventory-v1",
-      executionId: report.executionId!,
-      sequence: report.sequence!,
-      reportContentSignature: signature,
-      sources: sorted,
-    }),
+    signature: retainedReportInventorySignature(report, signature, sorted),
   };
 }
 

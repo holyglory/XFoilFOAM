@@ -30,7 +30,7 @@ RUNTIME = (
     "apps/sweeper/src/progressive-report-archive-store.ts", "apps/api/src/progressive-report-archive-reader.ts",
     "apps/api/src/report-archive-broker.ts", "packages/db/src/progressive-report-reader.ts",
     "packages/db/src/progressive-report-archive.ts", "packages/db/src/progressive-remote-execution.ts",
-    "packages/db/src/retained-solver-reports.ts", "packages/db/src/client.ts",
+    "packages/db/src/retained-solver-reports.ts", "packages/db/src/legacy-report-signature.ts", "packages/db/src/client.ts",
     "packages/db/src/registered-worker-archive-owner.ts", "packages/db/src/progressive-remote-report.ts",
     "packages/core/src/point-history-protocol.ts", "packages/core/package.json",
     "packages/db/package.json", "apps/sweeper/package.json", "apps/api/package.json", "pnpm-lock.yaml",

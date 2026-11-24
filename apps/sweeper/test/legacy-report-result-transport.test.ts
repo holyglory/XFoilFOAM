@@ -296,12 +296,32 @@ it("only shares a signed result after matching its complete PG bytes and canonic
     `{"result": ${result}, "solverId": "owner", "executionId": "job", "sequence": ${seq}${extra}}`;
   const signed = (text: string) => reportTextIdentity(canonicalReportJson(parseReportJson(text))).sha256;
   const result = '{"wide": 90071992547409931234567891}';
+  const repeats: boolean[] = [];
   for (const [index, text] of [
     body(1, result), body(2, result), body(3, result, ', "before": null'),
     body(4, result.replace("7891", "7892")), body(5, result, ', "nested": {"result":null}'), body(6, "null"),
+    body(7, '{"decimal":1.0}'), body(8, '{"decimal":1.00}'), body(9, '{"decimal":1.00}'),
   ].entries()) {
-    expect(signer.matches(text, job, solver, index + 1, signed(text))).toBe(true);
-    expect(signer.matches(text, job, solver, index + 1, "0".repeat(64))).toBe(false);
-    expect(signer.matches(text, job, "different", index + 1, signed(text))).toBe(false);
+    expect(signer.matches(text, job, solver, index + 1, signed(text), (report, token, repeated) => {
+      repeats.push(repeated);
+      expect(report.executionId).toBe(job);
+      if (repeated) {
+        expect(report.result).toBeNull();
+        expect(token).toBe(index === 1 ? result : '{"decimal":1.00}');
+      }
+    })).toBe(true);
+    const refused = () => { throw new Error("Unverified result reached the consumer"); };
+    expect(signer.matches(text, job, solver, index + 1, "0".repeat(64), refused)).toBe(false);
+    expect(signer.matches(text, job, "different", index + 1, signed(text), refused)).toBe(false);
+  }
+  expect(repeats).toEqual([false, true, false, false, false, false, false, false, true]);
+  const once = new LegacyOriginSigner(false);
+  for (const n of [1,2]) {
+    const text = body(n, result);
+    expect(once.matches(text, job, solver, n, signed(text), (report, token, repeated) => {
+      expect(repeated).toBe(false);
+      expect(report.result).not.toBeNull();
+      expect(token).toBe(result);
+    })).toBe(true);
   }
 });

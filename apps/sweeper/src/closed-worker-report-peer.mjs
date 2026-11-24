@@ -9,9 +9,7 @@ import { isDeepStrictEqual } from "node:util";
 import { sql } from "drizzle-orm";
 import { createClient } from "@aerodb/db/client";
 import {
-  canonicalReportJson,
   parseReportJson,
-  reportJsonObject,
   reportTextIdentity,
   reportValidationValue,
   visitVerifiedWorkerReportArchive,
@@ -20,7 +18,8 @@ import {
   installProgressiveReportArchiveReader,
   readProgressiveReport,
 } from "@aerodb/db/progressive-report-reader";
-import { retainedReportInventory } from "@aerodb/db/retained-solver-reports";
+import { LegacyOriginSigner } from "@aerodb/db/legacy-report-signature";
+import { retainedReportInventory, retainedReportInventorySignature } from "@aerodb/db/retained-solver-reports";
 import { verifyProgressiveRemoteExecution } from "@aerodb/db";
 import { configuredDeploymentRole } from "./config.ts";
 import {
@@ -54,45 +53,58 @@ function matchingScience(actual, expected, reason) {
   eligible(isDeepStrictEqual(actual, expected), reason);
 }
 
-function signedFacts(text, key, owner, resultMeta) {
-  assert.ok(
-    Buffer.byteLength(text) <= byteLimit,
-    "Report exceeds the bounded reader",
-  );
-  const fields = resultMeta ? new Map() : undefined;
-  const value = reportJsonObject(parseReportJson(text, fields));
-  if (resultMeta) {
-    const raw = fields.get("result");
-    resultMeta.sha256 = hash(raw);
-    resultMeta.byteSize = Buffer.byteLength(raw);
+// The signer keeps one authenticated PG result token and a copyable signature
+// prefix. Only compact point identities accompany it. Each new envelope,
+// inventory signature and complete original-text identity is verified anew.
+class ClosedWorkerReportPageFacts {
+  #signer;
+  #result;
+
+  constructor(reuse = true) {
+    this.#signer = new LegacyOriginSigner(reuse);
   }
-  assert.equal(
-    hash(canonicalReportJson(value)),
-    key.signature,
-    "Signed report differs",
-  );
-  assert.equal(value.executionId, key.executionId);
-  assert.equal(canonicalReportJson(value.sequence), String(key.sequence));
-  assert.equal(value.solverId, owner.solverId);
-  assert.equal(value.promiseId, owner.promiseId);
-  assert.equal(value.assignmentSignature, owner.assignmentSignature);
-  assert.equal(value.status?.job_id, key.executionId);
-  assert.equal(value.result?.job_id, key.executionId);
-  const inventory = retainedReportInventory(value, key.signature);
-  eligible(
-    inventory.sourceCount > 0 && inventory.sourceCount <= 512,
-    "Expected a bounded signed point inventory",
-  );
-  const points = inventory.sources.map((p) => ({
-    signature: p.point_content_signature,
-    aoa: reportValidationValue(p.aoa_deg),
-    caseSlug: p.case_slug,
-  }));
-  return {
-    ...reportTextIdentity(text),
-    inventory: inventory.signature,
-    points,
-  };
+
+  signedFacts(text, key, owner, resultMeta) {
+    assert.ok(Buffer.byteLength(text) <= byteLimit, "Report exceeds the bounded reader");
+    let inventory;
+    const signed = this.#signer.matches(
+      text, key.executionId, owner.solverId, key.sequence, key.signature,
+      (report, token, repeated) => {
+        assert.equal(report.promiseId, owner.promiseId);
+        assert.equal(report.assignmentSignature, owner.assignmentSignature);
+        assert.equal(report.status?.job_id, key.executionId);
+        if (repeated) {
+          assert.equal(this.#result.job, key.executionId);
+          inventory = retainedReportInventorySignature(report, key.signature, this.#result.sources);
+        } else {
+          assert.equal(report.result?.job_id, key.executionId);
+          assert.equal(typeof token, "string");
+          const measured = retainedReportInventory(report, key.signature);
+          eligible(
+            measured.sourceCount > 0 && measured.sourceCount <= 512,
+            "Expected a bounded signed point inventory",
+          );
+          this.#result = {
+            job: report.result.job_id,
+            sources: measured.sources,
+            identity: reportTextIdentity(token),
+          };
+          inventory = measured.signature;
+        }
+      },
+    );
+    assert.ok(signed && inventory, "Signed report differs");
+    if (resultMeta) Object.assign(resultMeta, this.#result.identity);
+    return {
+      ...reportTextIdentity(text),
+      inventory,
+      points: this.#result.sources.map((p) => ({
+        signature: p.point_content_signature,
+        aoa: reportValidationValue(p.aoa_deg),
+        caseSlug: p.case_slug,
+      })),
+    };
+  }
 }
 
 // A source may be reused only inside this process. Each subsequent committed product
@@ -105,6 +117,7 @@ async function workerSource(
   lock = false,
   coldPin = null,
   previous = null,
+  page = new ClosedWorkerReportPageFacts(false),
 ) {
   const id = key.executionId,
     seq = key.sequence;
@@ -182,7 +195,7 @@ async function workerSource(
   const resultMeta = reuse ? previous.resultMeta : {};
   const facts = reuse
     ? previous.facts
-    : signedFacts(text, key, owner, resultMeta);
+    : page.signedFacts(text, key, owner, resultMeta);
   const anchors =
     await db.execute(sql`SELECT h.point_content_signature AS signature,h.sequence::int AS sequence,
     a.id::text AS "workerAttempt",a.result_id::text AS "workerResult",h.receipt->>'resultAttemptId' AS "hubAttempt",h.receipt->>'resultId' AS "hubResult",
@@ -504,7 +517,7 @@ async function uploadOriginal(db, key, source) {
   return (await uploadPage(db, [key], [source])).pins[0];
 }
 const completePage = Symbol("verified complete page");
-async function settle(db, m, admitted) {
+async function settle(db, m, admitted, page) {
   assert.ok(
     m.pin.memberCount === 1 || admitted === completePage,
     "Complete signed page required",
@@ -531,7 +544,7 @@ async function settle(db, m, admitted) {
   };
   return withActiveHzTransfer(db, expected, async (tx) => {
     await tx.execute(sql`SET LOCAL lock_timeout='700ms'`);
-    const before = await workerSource(tx, key, scope, true, pin);
+    const before = await workerSource(tx, key, scope, true, pin, null, page);
     eq(
       identity(before),
       source,
@@ -569,7 +582,7 @@ async function settle(db, m, admitted) {
       archived_at=clock_timestamp(),archive_bundle_id=${bundle.id}::uuid WHERE sim_job_id=${key.executionId}::uuid AND sequence=${key.sequence}
       AND content_signature=${key.signature} AND archived_at IS NULL AND archive_bundle_id IS NULL RETURNING sequence`);
     assert.ok(changed, "Native report changed before retirement");
-    const after = await workerSource(tx, key, scope, false, pin, before);
+    const after = await workerSource(tx, key, scope, false, pin, before, page);
     eq(
       identity(after),
       source,
@@ -594,10 +607,61 @@ async function settle(db, m, admitted) {
     };
   });
 }
+// Each authenticated read connection has its own basis. A warm source may bind
+// to its first physical pin, but a changed pin, role, scope or member list
+// starts a new page. The cache contains no GCS, SQL or product-read receipts.
+const sessionFacts = new WeakMap();
+function requestFacts(m, basis) {
+  const grouped = (m.items?.length ?? 0) > 1;
+  if (!basis) return new ClosedWorkerReportPageFacts(grouped);
+  if (!["source", "cloud", "read"].includes(m.op)) {
+    sessionFacts.delete(basis);
+    return new ClosedWorkerReportPageFacts(grouped);
+  }
+  const items = m.items ?? [m];
+  assert.ok(items.length >= 1 && items.length <= 8);
+  const role = m.op === "read" ? m.reader : m.op === "source" ? "sweeper" : "hub";
+  const keys = items.map(({ key }) => [key.executionId, key.sequence, key.signature]);
+  const scope = JSON.stringify([role, m.scope, keys]);
+  const pins = items.some(i => i.pin) ? JSON.stringify(items.map(i => i.pin)) : null;
+  let prior = sessionFacts.get(basis);
+  if (!prior || prior.scope !== scope || (prior.pins !== null && prior.pins !== pins)) {
+    // A lone native read has no sibling. Only a preceding source request
+    // or a second cloud proof for this generation can reuse a singleton.
+    const reuse = grouped || m.op === "source" || m.op === "cloud";
+    prior = { scope, pins, facts: new ClosedWorkerReportPageFacts(reuse) };
+    sessionFacts.set(basis, prior);
+  }
+  prior.pins = pins;
+  return prior.facts;
+}
+
 async function runClosedReportPeer(db, m, readBasis) {
+  if (m.op !== "read" || !m.committed) readBasis?.clear();
+  try {
+    const value = await closedReportRequest(db, m, readBasis, requestFacts(m, readBasis));
+    // A pre-commit native read already retained the authenticated originals in
+    // readBasis. Its post-commit call still opens the actual product reader.
+    const partial = m.op === "source" && m.items && value.rows.length !== m.items.length;
+    if (readBasis && (m.op === "read" || partial)) {
+      sessionFacts.delete(readBasis);
+    }
+    return value;
+  } catch (error) {
+    if (readBasis) {
+      sessionFacts.delete(readBasis);
+      readBasis.clear();
+    }
+    throw error;
+  } finally {
+    if (m.committed) readBasis?.clear();
+  }
+}
+
+async function closedReportRequest(db, m, readBasis, page) {
   if (m.op === "discover-worker" || m.op === "discover-hub")
     return discoverOriginals(db, m);
-  if (m.items) return runClosedPage(db, m, readBasis);
+  if (m.items) return runClosedPage(db, m, readBasis, page);
   const { op, key, scope } = m;
   assertSourceKey(key);
   assert.ok(
@@ -624,7 +688,7 @@ async function runClosedReportPeer(db, m, readBasis) {
       m.pin,
     );
     eq(
-      signedFacts(text, key, m.source.owner),
+      page.signedFacts(text, key, m.source.owner),
       m.source.facts,
       "Full GCS generation differs from signed native source",
     );
@@ -636,13 +700,13 @@ async function runClosedReportPeer(db, m, readBasis) {
     };
   }
   assert.equal(configuredDeploymentRole(), "remote-solver");
-  if (op === "settle") return settle(db, m);
+  if (op === "settle") return settle(db, m, undefined, page);
   if (op === "read") {
     validatePin(m.pin, key, m.source);
     const saved = m.committed ? readBasis?.get(key.sequence) : undefined;
     const prior =
       saved && isDeepStrictEqual(saved.pin, m.pin) ? saved.original : null;
-    const actual = await workerSource(db, key, scope, false, m.pin, prior);
+    const actual = await workerSource(db, key, scope, false, m.pin, prior, page);
     eq(identity(actual), m.source, "Native scientific evidence changed");
     if (m.committed) assert.ok(actual.archivedBundle);
     const proof = await productRead(
@@ -657,7 +721,7 @@ async function runClosedReportPeer(db, m, readBasis) {
       readBasis.set(key.sequence, { pin: m.pin, original: actual });
     return { ...proof, storedFieldBytes: actual.stored };
   }
-  const native = await workerSource(db, key, scope, false, m.pin);
+  const native = await workerSource(db, key, scope, false, m.pin, null, page);
   if (op === "source")
     return {
       source: identity(native),
@@ -784,7 +848,7 @@ class ClosedWorkerCloud extends HubWorkloadGcs {
     assert.equal(seen, items.length, "Incomplete pinned worker page");
   }
 }
-async function runClosedPage(db, m, readBasis) {
+async function runClosedPage(db, m, readBasis, page) {
   const { op, items, scope } = m,
     keys = items.map((i) => i.key);
   assert.ok(keys.length >= 2 && keys.length <= 8);
@@ -810,7 +874,7 @@ async function runClosedPage(db, m, readBasis) {
     let bytes = 0;
     for (const item of items) {
       try {
-        const next = await runClosedReportPeer(db, { op, scope, ...item });
+        const next = await closedReportRequest(db, { op, scope, ...item }, undefined, page);
         if (
           op === "source" &&
           (bytes += next.source.facts.byteSize) > byteLimit
@@ -835,7 +899,7 @@ async function runClosedPage(db, m, readBasis) {
     for (const item of items) {
       fresh(item.hub);
       eq(item.key, item.hub.key, "Mismatched hub sequence");
-      const original = await workerSource(db, item.key, scope);
+      const original = await workerSource(db, item.key, scope, false, null, null, page);
       assert.ok(!original.archivedBundle);
       eq(
         identity(original),
@@ -892,7 +956,7 @@ async function runClosedPage(db, m, readBasis) {
     const rows = [];
     for (const item of items)
       rows.push(
-        await runClosedReportPeer(
+        await closedReportRequest(
           db,
           {
             op,
@@ -902,6 +966,7 @@ async function runClosedPage(db, m, readBasis) {
             committed: m.committed,
           },
           readBasis,
+          page,
         ),
       );
     return { rows };
@@ -910,7 +975,7 @@ async function runClosedPage(db, m, readBasis) {
   return db.transaction(async (tx) => {
     const rows = [];
     for (const item of items)
-      rows.push(await settle(tx, { ...item, scope }, completePage));
+      rows.push(await settle(tx, { ...item, scope }, completePage, page));
     return { rows };
   });
 }
@@ -1021,9 +1086,6 @@ async function serveClosedReportReads(role) {
       const start = performance.now(),
         cpu = process.cpuUsage();
       try {
-        // Keep at most one pre-commit snapshot page per native role. Neither a
-        // generation proof nor a parsed ordinary read result survives in this map.
-        if (m.op !== "read" || !m.committed) basis.clear();
         await verifyInstalledReportFiles(m);
         let value;
         try {
@@ -1035,8 +1097,6 @@ async function serveClosedReportReads(role) {
           )
             throw e;
           value = { held: e.message };
-        } finally {
-          if (m.committed) basis.clear();
         }
         const used = process.cpuUsage(cpu);
         await emit({

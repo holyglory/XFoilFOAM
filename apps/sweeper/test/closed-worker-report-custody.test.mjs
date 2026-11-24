@@ -1,5 +1,6 @@
 import { createClient } from "@aerodb/db/client";
 import { retainedReportInventory } from "@aerodb/db/retained-solver-reports";
+import { LegacyOriginSigner } from "@aerodb/db/legacy-report-signature";
 import {
   parseReportJson,
   readProgressiveReportArchiveText,
@@ -68,12 +69,14 @@ it.each([
         const upstream = "https://source-report-fixture.invalid/api/sync/v1",
           bucket = "source-report-test";
         const volume = await mkdtemp(join(tmpdir(), "closed-report-"));
-        const comparison = { api: new Map(), sweeper: new Map() };
+        const comparison = { api: new Map(), sweeper: new Map(), hub: new Map() };
         const run = (op, fields = {}, connection = db) =>
           runClosedReportPeer(
             connection,
             { op, key, scope, ...fields },
-            op === "read" ? comparison[fields.reader] : undefined,
+            op === "read" ? comparison[fields.reader]
+              : op === "source" ? comparison.sweeper
+              : op === "cloud" || op === "hub" ? comparison.hub : undefined,
           );
         const sha = (bytes) => createHash("sha256").update(bytes).digest("hex");
         let packed,
@@ -219,6 +222,18 @@ it.each([
             const native = await run("source", {
               items: keys.map((key) => ({ key })),
             });
+            for (const [i, k] of keys.entries()) {
+              const stored = f.reports.find(row => row.sequence === k.sequence);
+              const tokens = new Map();
+              const parsed = parseReportJson(stored.text, tokens);
+              const exact = retainedReportInventory(parsed, k.signature);
+              expect(native.rows[i].resultMeta).toEqual({ sha256: sha(tokens.get("result")), byteSize: Buffer.byteLength(tokens.get("result")) });
+              expect(native.rows[i].source.facts).toMatchObject({
+                sha256: sha(stored.text), byteSize: Buffer.byteLength(stored.text), inventory: exact.signature,
+              });
+              expect(native.rows[i].source.facts.points.map(p => p.signature)).toEqual(exact.sources.map(p => p.point_content_signature));
+            }
+            expect(native.rows[0].source.facts.inventory).not.toBe(native.rows[1].source.facts.inventory);
             const items = keys.map((key, i) => ({
               key,
               source: native.rows[i].source,
@@ -383,8 +398,30 @@ it.each([
             .mockImplementation((i) =>
               readProgressiveReportArchiveText(Readable.from([packed]), i),
             );
-          const cloud = await asHub((tx) => run("cloud", { source, pin }, tx));
+          const sign = vi.spyOn(LegacyOriginSigner.prototype, "matches");
+          const cloud = await asHub(async (tx) => {
+            const first = await run("cloud", { source, pin }, tx);
+            const firstSigner = sign.mock.contexts.at(-1);
+            const repeat = await run("cloud", { source, pin }, tx);
+            expect(sign.mock.contexts.at(-1)).toBe(firstSigner);
+            expect(repeat.pin).toEqual(first.pin);
+            expect(repeat.science).toEqual(first.science);
+            // A separately named physical version can legitimately contain
+            // identical bytes. It still starts a new authenticated page.
+            const nextVersion = { ...pin, generation: String(BigInt(pin.generation) + 1n) };
+            await run("cloud", { source, pin: nextVersion }, tx);
+            expect(sign.mock.contexts.at(-1)).not.toBe(firstSigner);
+            cloudRead.mockResolvedValueOnce(target.text + " ");
+            await expect(run("cloud", { source, pin: nextVersion }, tx)).rejects.toThrow();
+            cloudRead.mockResolvedValueOnce(target.text.slice(0, -1) + ', "sequence": 3}');
+            await expect(run("cloud", { source, pin }, tx)).rejects.toThrow();
+            cloudRead.mockResolvedValueOnce(target.text.replace(LARGE_REPORT_INTEGER, LARGE_REPORT_INTEGER + "1"));
+            await expect(run("cloud", { source, pin }, tx)).rejects.toThrow();
+            return repeat;
+          });
           expect(cloudRead).toHaveBeenCalledWith(pin);
+          sign.mockRestore();
+          expect(cloudRead).toHaveBeenCalledTimes(6);
           const api = await run("read", { source, pin, reader: "api" }),
             sweeper = await run("read", { source, pin, reader: "sweeper" });
           const fields = { source, pin, hub: scientific, cloud, api, sweeper };
