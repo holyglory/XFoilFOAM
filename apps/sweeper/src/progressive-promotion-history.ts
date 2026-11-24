@@ -283,7 +283,9 @@ async function readRoot(
     firstSequence: Number(root.first_sequence),
     lastSequence: Number(root.last_sequence),
   };
-  assertProgressiveReportArchiveIdentity(rootPin);
+  if (rootPin.archiveFormat !== "jsonl" && rootPin.archiveFormat !== "shared-result-v1")
+    throw new Error("Unsupported remote promotion archive format");
+  assertProgressiveReportArchiveIdentity(rootPin, rootPin.archiveFormat);
   if (!wanted.size) {
     retainRoot(rootKey, projected);
     return;

@@ -1,5 +1,7 @@
 import { CancelledReportCopyPriority, nextCancelledReportCopies, selectCancelledReportCopyPage } from "../src/cancelled-report-copies";
 import { verifyColdPromotionHistory } from "./closed-promotion-history-fixture";
+import { preparePromotionHistory, promotionForSettlement } from "../src/progressive-promotion-history";
+import { verifyProgressiveRemoteExecution } from "@aerodb/db";
 import { archiveProgressiveReportBatch } from "../src/progressive-report-archive-service";
 import { randomUUID } from "node:crypto";
 import { fork } from "node:child_process";
@@ -462,6 +464,16 @@ it("runs the stock recurring hub storage worker and serves both archive formats 
       restartMediaReads: emulator.media.length - media,
     };
     console.info("Shared report daemon acceptance", JSON.stringify(result));
+    await stop();
+    const job = originals[1].executionId;
+    const [dispatch] = await db.sql`SELECT envelope, solver_id, promise_id, content_signature
+      FROM progressive_remote_dispatches WHERE sim_job_id=${job}`;
+    const envelope = verifyProgressiveRemoteExecution(dispatch.envelope, {
+      executionId: job, solverId: dispatch.solver_id, promiseId: dispatch.promise_id,
+      contentSignature: dispatch.content_signature,
+    });
+    const prepared = await preparePromotionHistory(db.db, envelope);
+    expect(await promotionForSettlement(db.db, envelope, prepared)).toBeNull();
   } finally {
     await stop();
     await app.close();
