@@ -631,6 +631,14 @@ it.each(["source","keys"] as const)("prioritizes active terminal reports and kee
     await transaction.execute(sql`CREATE UNIQUE INDEX fixture_receipt_idx
       ON progressive_worker_evidence_receipts(sim_job_id,sequence)`);
 
+    // Two owners have the same timestamp. Even the lower sequences of the
+    // higher UUID fall outside the newest 256 keys when later receipts arrive.
+    await transaction.execute(sql`INSERT INTO progressive_worker_reports
+      SELECT id,n,clock_timestamp(),'{"result":{}}'::jsonb,NULL,timestamptz '2026-02-01'
+      FROM fixture_jobs CROSS JOIN generate_series(2,260) n
+      WHERE variant IN ('ordinary','active-non-terminal')`);
+    await transaction.execute(sql`INSERT INTO progressive_worker_evidence_receipts
+      SELECT sim_job_id,sequence FROM progressive_worker_reports WHERE sequence>1`);
     if (reads === "keys") await useFixtureStagingKeys(transaction);
     const [activeTerminal] = await transaction.execute(
       sql`SELECT id FROM fixture_jobs WHERE variant='active-terminal'`,
@@ -671,6 +679,49 @@ it.each(["source","keys"] as const)("prioritizes active terminal reports and kee
       });
       expect(selectedFallback.sim_job_id).not.toBe(invalidTerminal.id);
     }
+
+    const choose = (active: boolean) => transaction.execute(progressiveStagingSelectionSql(active));
+    const fullSearchLoops = async () => {
+      const [result] = await transaction.execute(sql`EXPLAIN (ANALYZE, FORMAT JSON) ${progressiveStagingSelectionSql(true)}`);
+      type Plan = { "Subplan Name"?: string; "Actual Loops": number; Plans?: Plan[] };
+      const nodes: Plan[] = [(result["QUERY PLAN"] as { Plan: Plan }[])[0].Plan];
+      for (const node of nodes) {
+        if (node["Subplan Name"] === "CTE active_by_owner") return node["Actual Loops"];
+        nodes.push(...node.Plans ?? []);
+      }
+      throw new Error("Missing complete active-owner search in the staging plan");
+    };
+    const [newest] = await transaction.execute(sql`SELECT sim_job_id,sequence,created_at
+      FROM progressive_worker_staging_candidates ORDER BY created_at DESC,sim_job_id DESC,sequence DESC LIMIT 1`);
+    await transaction.execute(sql`DELETE FROM progressive_worker_evidence_receipts
+      WHERE sim_job_id=${newest.sim_job_id}::uuid AND sequence=${newest.sequence}`);
+    expect(await choose(true)).toEqual([newest]);
+    expect(await fullSearchLoops()).toBe(0);
+    const fifo = await choose(false);
+    await transaction.execute(sql`INSERT INTO progressive_worker_evidence_receipts
+      VALUES (${newest.sim_job_id}::uuid,${newest.sequence})`);
+    await transaction.execute(sql`DELETE FROM progressive_worker_evidence_receipts WHERE sequence IN (2,3)`);
+    const ties = await transaction.execute(sql`SELECT sim_job_id,sequence,created_at
+      FROM progressive_worker_staging_candidates WHERE sequence IN (2,3)
+      ORDER BY created_at DESC,sim_job_id DESC,sequence DESC`);
+    expect(ties).toHaveLength(4);
+    // Two distinct executions can belong to one live promise.
+    await transaction.execute(sql`UPDATE sim_jobs SET request_payload=jsonb_set(request_payload,
+      '{syncPromiseId}',to_jsonb(${ties[2].sim_job_id}::text)) WHERE id=${ties[0].sim_job_id}::uuid`);
+    expect(await fullSearchLoops()).toBe(1);
+    expect(await choose(true)).toEqual([ties[0]]);
+    await transaction.execute(sql`INSERT INTO progressive_worker_evidence_receipts
+      VALUES (${ties[0].sim_job_id}::uuid,${ties[0].sequence})`);
+    expect(await choose(true)).toEqual([ties[1]]);
+    await transaction.execute(sql`UPDATE sim_jobs SET ingest_lease_token=id,
+      ingest_lease_expires_at=clock_timestamp()+interval '1 hour' WHERE id=${ties[0].sim_job_id}::uuid`);
+    expect(await choose(true)).toEqual([ties[2]]);
+    await transaction.execute(sql`UPDATE sim_jobs SET ingest_lease_expires_at=clock_timestamp()-interval '1 hour'
+      WHERE id=${ties[0].sim_job_id}::uuid`);
+    expect(await choose(true)).toEqual([ties[1]]);
+    expect(await choose(false)).toEqual(fifo);
+    await transaction.execute(sql`UPDATE sync_sweep_promises SET "expiresAt"=clock_timestamp()-interval '1 hour'`);
+    expect(await choose(true)).toEqual(fifo);
   });
 });
 
