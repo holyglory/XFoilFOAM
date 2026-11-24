@@ -1,3 +1,6 @@
+import { execFile } from "node:child_process";
+import { setTimeout as delay } from "node:timers/promises";
+import { fileURLToPath } from "node:url";
 import { expect, vi } from "vitest";
 import { sql } from "drizzle-orm";
 import type { DB } from "@aerodb/db/client";
@@ -25,6 +28,53 @@ import {
   verifyCanonicalPointHistory,
   verifyStoredHzHistory,
 } from "../src/hz-point-history-relay";
+
+// Hold only this fixture's reference table. Observe the actual RPC process
+// waiting on PostgreSQL, then release it or let its normal lock timeout fire.
+async function verifyCanonicalApiProcess(db: DB, namespace: string, proof: CanonicalFieldProof) {
+  const url = new URL(databaseUrl());
+  url.searchParams.set("options", `-c search_path=${namespace},public`);
+  const entry = fileURLToPath(new URL("../../api/src/hz-attempt-custody-cli.ts", import.meta.url));
+  const request = { id: 1, operation: "canonical-read", resultId: proof.resultId, kind: proof.kind, reference: proof.reference };
+  for (const expectTimeout of [false, true]) {
+    let pid: number | undefined;
+    let reply!: Promise<string>;
+    await db.transaction(async tx => {
+      await tx.execute(sql`LOCK TABLE ${sql.identifier(namespace)}.result_history_subtree_refs IN ACCESS EXCLUSIVE MODE`);
+      let finished = false;
+      reply = new Promise<string>((resolve, reject) => {
+        const child = execFile(process.execPath, ["--import", "tsx", entry], {
+          env: { ...process.env, DATABASE_URL: url.toString() }, encoding: "utf8", timeout: 20000,
+        }, (err, stdout) => {
+          finished = true;
+          if (err) reject(err); else resolve(stdout);
+        });
+        child.stdin!.end(JSON.stringify(request) + "\n");
+      });
+      // Attach a handler now so an early process error is still observed
+      // while polling for its blocked database connection.
+      void reply.catch(() => undefined);
+      const deadline = Date.now() + 15000;
+      while (!pid && !finished && Date.now() < deadline) {
+        const [session] = await tx.execute(sql`SELECT DISTINCT waiting.pid FROM pg_locks held
+          JOIN pg_locks waiting ON waiting.relation=held.relation AND waiting.database=held.database
+          WHERE held.pid=pg_backend_pid() AND held.mode='AccessExclusiveLock' AND held.granted
+            AND waiting.mode='AccessShareLock' AND NOT waiting.granted`);
+        if (session) pid = Number(session.pid);
+        else await delay(10);
+      }
+      expect(pid, "the real canonical read must own an open connection while waiting").toBeDefined();
+      if (expectTimeout) await reply;
+    });
+    const response = JSON.parse(await reply);
+    if (expectTimeout) expect(response).toMatchObject({ id: 1, error: {
+      operation: "attempt_canonicalread_lock_timeout", retryable: true,
+    } });
+    else expect(response).toEqual({ id: 1, result: proof });
+    const stillOpen = await db.execute(sql`SELECT pid FROM pg_stat_activity WHERE pid=${pid} AND datname=current_database()`);
+    expect(stillOpen).toHaveLength(0);
+  }
+}
 
 export async function verifyCanonicalSubtreeJourney(
   db: DB,
@@ -260,6 +310,10 @@ export async function verifyCanonicalSubtreeJourney(
   const cold = await canonical();
   expect(cold.selected).toBeNull();
   expect(cold.archive).toBeNull();
+  await verifyCanonicalApiProcess(db, namespace, {
+    resultId: result, kind, reference: String(cold.subtree), archiveId: ar.id,
+    generation: fresh.identity.generation, fieldText,
+  });
   const inspection = await verifyStoredHzHistory(
     { kind, id: result },
     {

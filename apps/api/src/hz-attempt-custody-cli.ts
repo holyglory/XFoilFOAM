@@ -56,7 +56,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href)
       const { installApiReportArchiveReader } = await import("./progressive-report-archive-reader");
       await installApiReportArchiveReader();
       if (r.operation === "canonical-read") {
-        return hzCanonicalFieldApiProbe(c.db,r.resultId,r.kind,r.reference);
+        return await hzCanonicalFieldApiProbe(c.db,r.resultId,r.kind,r.reference);
       }
       return await hzAttemptApiProbe(
         c.db,
