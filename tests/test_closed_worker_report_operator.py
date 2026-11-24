@@ -548,9 +548,15 @@ class ClosedReportOperator(unittest.TestCase):
                     at_failure=json.loads((args.state/"progress.json").read_bytes())
                     pending=at_failure["group" if width==2 else "pending"]
                     self.assertTrue(pending["shareResults"])
-                    args.repeat_result_min_bytes=0
-                    controller.run(args)
+                    # A restart may bring a broader invocation budget and a new size policy.
+                    # Only the saved page is reconciled. The next owner gets freshly selected.
+                    args.repeat_result_min_bytes=2000
+                    args.limit=width*3
+                    self.assertIs(controller.run(args), True)
+                    recovered=json.loads((args.state/"progress.json").read_bytes())
+                    self.assertEqual(recovered["completed"], 3*width)
                     args.repeat_result_min_bytes=1000
+                    args.limit=width
                     for _ in range(3):
                         controller.run(args)
                 self.assertEqual([s for _,s in modes],[False,False,True,False,False,True])

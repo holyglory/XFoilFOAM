@@ -243,6 +243,11 @@ def run(args):
         peer_hash = digest(peer.encode())
         limits = qualified_width(args, bind, runtime, peer_hash)
         max_members = 8 if limits else getattr(args, "page_members", 1)
+        # A resumed page owns its saved format and may consume a different
+        # number of keys than the newly selected run. Return to the selector
+        # before admitting an unrelated key under those inherited arguments.
+        finish_pending = bool(getattr(args, "repeat_result_min_bytes", 0) and
+                              (progress.get("group") or progress.get("pending")))
         left = args.limit
         while left>0:
             if getattr(args,"pause_file",None) and args.pause_file.exists():
@@ -254,6 +259,8 @@ def run(args):
                 used=process_page(args, keys, page_limit, progress, path, bind, runtime, peer_hash,
                                   scope_for, ask, durable, require, limits)
                 if used:
+                    if finish_pending:
+                        return True
                     left-=used
                     continue
             left-=1
@@ -350,6 +357,8 @@ def run(args):
                             initial=state["initial"],pin=pin,settled=state["settled"],before=before,after=after)
                 durable(receipt,done,immutable=True)
             advance(receipt, done)
+            if finish_pending:
+                return True
 
 
 def committed_read_retry(args, error):
@@ -406,7 +415,8 @@ def run_invocations(args):
             current, delay = args, 10
             while True:
                 try:
-                    run(current)
+                    if run(current) is True:
+                        return
                     break
                 except ReadPeerStopped as error:
                     args.read_sessions.close()
