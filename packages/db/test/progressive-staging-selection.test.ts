@@ -307,7 +307,7 @@ it.each(wakeSources)(
         const ownership = nodes.filter(
           (node) => node["Relation Name"] === "sim_jobs",
         );
-        expect(unexpectedWorkerJobScans(ownership, scope === "staging")).toEqual([]);
+        expect(unexpectedWorkerJobScans(result.Plan as Record<string, unknown>, scope === "staging")).toEqual([]);
         const probes = ownership.reduce(
           (total, node) => total + Number(node["Actual Loops"]),
           0,
@@ -736,23 +736,41 @@ it.each(["source","keys"] as const)("prioritizes active terminal reports and kee
 });
 
 
-it("keeps the ownership scan guard for executed or foreign sequential scans", () => {
-  const viewNode = {
-    "Node Type": "Seq Scan", "Relation Name": "sim_jobs", Schema: "public", Alias: "j_2",
-    Filter: `((j_2."ingestedAt" IS NOT NULL) AND (j_2.status = ANY ('{done,failed,cancelled}'::sim_job_status[])) AND (j_2.engine_job_id = (j_2.id)::text))`,
-    Output: ["j_2.id"], "Actual Loops": 0, "Actual Rows": 0, "Rows Removed by Filter": 0,
+it("keeps the ownership scan guard for executed or unrelated sequential scans", () => {
+  const owner = {
+    "Node Type": "Seq Scan", "Relation Name": "sim_jobs", Schema: "public", Alias: "j_1",
+    Output: ["j_1.id"], "Actual Loops": 0, "Actual Rows": 0, "Rows Removed by Filter": 0,
   };
-  expect(unexpectedWorkerJobScans([viewNode], true)).toEqual([]);
-  expect(unexpectedWorkerJobScans([viewNode], false)).toHaveLength(1);
-  const keyed = { ...viewNode, Filter: viewNode.Filter.replace(" AND (j_2.status",
-    " AND (j_2.id = progressive_worker_reports.sim_job_id) AND (j_2.status") };
-  expect(unexpectedWorkerJobScans([keyed], true)).toEqual([]);
-  expect(unexpectedWorkerJobScans([{ ...keyed, "Actual Loops": 1 }], true)).toHaveLength(1);
-  expect(unexpectedWorkerJobScans([{ ...keyed, Filter: keyed.Filter.replace(
-    "progressive_worker_reports.sim_job_id", "foreign_owner.sim_job_id") }], true)).toHaveLength(1);
-  for (const changed of [
-    { "Actual Loops": 1 }, { "Actual Rows": 1 }, { "Rows Removed by Filter": 1 },
-    { Schema: "pg_temp" }, { Alias: "job" }, { Output: ["j_2.request_payload"] },
-    { Filter: "j_2.id IS NOT NULL" }, { "Actual Loops": undefined },
-  ]) expect(unexpectedWorkerJobScans([{ ...viewNode, ...changed }], true)).toHaveLength(1);
+  function plan(outerAlias: string, ref: string, change: Record<string, unknown> = {}, markerRef = ref) {
+    const index = (table: string, alias: string, key: string) => ({
+      "Node Type": "Index Scan", "Relation Name": table, Alias: alias, Schema: "public",
+      "Index Cond": `((${key}.sequence = ${alias}.sequence) AND (${alias}.sim_job_id = ${key}.sim_job_id))`,
+    });
+    const job = { ...owner, Filter: `((j_1.status = ANY ('{done,failed,cancelled}'::sim_job_status[])) AND (j_1.engine_job_id = (j_1.id)::text) AND (${ref}.sim_job_id = j_1.id) AND (j_1."ingestedAt" IS NOT NULL))`, ...change };
+    return { "Node Type": "Subquery Scan", Alias: outerAlias, Plans: [
+      { "Node Type": "Append", "Subplan Name": "SubPlan 3", Plans: [
+        index("progressive_worker_evidence_receipts", "receipt_1", ref),
+        { "Node Type": "Nested Loop", Plans: [job, index("progressive_worker_staging_copies", "c_1", markerRef),
+          ...["sync_sweep_promises","progressive_worker_reports","progressive_worker_evidence_receipts","sync_api_settings"]
+            .map(name => ({ "Node Type": "Index Scan", Schema: "public", "Relation Name": name }))] },
+      ] },
+    ] };
+  }
+  for (const [alias, ref] of [["fixture_staging_keys","fixture_staging_keys"], ["*SELECT* 1_2", '"*SELECT* 1_2"']]) {
+    expect(unexpectedWorkerJobScans(plan(alias, ref), true)).toEqual([]);
+    expect(unexpectedWorkerJobScans(plan(alias, ref), false)).toHaveLength(1);
+    expect(unexpectedWorkerJobScans(plan(alias, ref, {}, "foreign_owner"), true)).toHaveLength(1);
+    expect(unexpectedWorkerJobScans(plan("foreign_owner", ref), true)).toHaveLength(1);
+    for (const changed of [
+      { "Actual Loops": 1 }, { "Actual Rows": 1 }, { "Rows Removed by Filter": 1 }, { "Actual Loops": undefined },
+      { Schema: "pg_temp" }, { Alias: "job" }, { Output: ["j_1.request_payload"] }, { Filter: "j_1.id IS NOT NULL" },
+    ]) {
+      const rejected = unexpectedWorkerJobScans(plan(alias, ref, changed), true);
+      expect(rejected).toHaveLength(1);
+      expect(rejected[0]).toHaveProperty("filter");
+      expect(rejected[0]).toHaveProperty("output");
+      expect(rejected[0].ancestors).toContainEqual(expect.objectContaining({ subplan: "SubPlan 3", branch: 1 }));
+    }
+  }
+  expect(unexpectedWorkerJobScans(owner, true)).toHaveLength(1);
 });

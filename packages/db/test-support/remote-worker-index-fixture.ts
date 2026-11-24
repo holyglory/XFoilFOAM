@@ -115,7 +115,7 @@ export async function verifyRemoteWorkerIdentityIndex(
     for (const [position, selector] of selectors.entries()) {
       expect(await transaction.execute(selector.query(0))).toEqual([]);
       const after = await explain(selector.query(0));
-      expect(unexpectedWorkerJobScans(after.jobs, acknowledged)).toEqual([]);
+      expect(unexpectedWorkerJobScans(after.plan.Plan as Record<string, unknown>, acknowledged)).toEqual([]);
       expect(
         after.nodes.some(
           (node) =>
