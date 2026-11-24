@@ -115,7 +115,8 @@ export async function verifySpentMaterialPages(
     const dialect = new PgDialect();
     let foregroundReads = 0;
     const foreground = vi.spyOn(pageDb, "execute").mockImplementation(query => {
-      if (dialect.sqlToQuery(query.getSQL()).sql.includes("FROM sweeper_state")) {
+      const statement = typeof query === "string" ? query : dialect.sqlToQuery(query.getSQL()).sql;
+      if (statement.includes("FROM sweeper_state")) {
         foregroundReads++;
         entered();
         return blocked.then(() => { throw new Error("Disposable foreground wait ended"); }) as ReturnType<typeof actual>;
