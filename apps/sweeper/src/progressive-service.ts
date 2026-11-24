@@ -103,13 +103,16 @@ export async function runProgressiveBaselineService(
   let deadline: ReturnType<typeof setTimeout> | null = null;
   let maintenanceTimer: ReturnType<typeof setTimeout> | null = null;
   let maintenancePage: Promise<void> | undefined;
-  let nextMaintenance = 0;
-  let maintenanceDue = false;
+  let nextMaintenance = Infinity;
+  let maintenanceDue = true;
   let contentionDelay = 2_000;
   let afterMaterialCampaign: string | undefined;
   const notify = () => {
     pending = true;
     wake?.();
+  };
+  const scheduleMaintenance = () => {
+    if (nextMaintenance === Infinity) nextMaintenance = Date.now() + PROGRESSIVE_MAINTENANCE_INTERVAL_MS;
   };
   // Use the service's existing maintenance timer for both roles. A full page
   // can continue while unrelated fitting or archive reads are still pending.
@@ -139,7 +142,7 @@ export async function runProgressiveBaselineService(
     if (signal.aborted) return;
     const now = Date.now();
     if (now >= nextMaintenance) {
-      nextMaintenance = now + PROGRESSIVE_MAINTENANCE_INTERVAL_MS;
+      nextMaintenance = Infinity;
       maintenanceDue = true;
       notify();
     }
@@ -329,8 +332,10 @@ export async function runProgressiveBaselineService(
               Math.max(0, new Date(expiry.at).getTime() - Date.now()),
             );
         }
+        scheduleMaintenance();
       } catch (error) {
         report({ component: "progressive-baseline", error: String(error) });
+        scheduleMaintenance();
       }
     }
   } finally {

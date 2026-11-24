@@ -228,9 +228,9 @@ it.each([false, true])("continues committed spent pages through contention and a
     expect(reports.filter(r=>r.component==="progressive-spent-material-gaps").map(r=>r.settled)).toEqual([64,64,2]);
     expect(mocks.reconcileScope).toHaveBeenCalledOnce();
     finishRead();
-    await vi.advanceTimersByTimeAsync(111_000);
+    await vi.advanceTimersByTimeAsync(120_000);
     expect(mocks.spent).toHaveBeenCalledTimes(7);
-    expect(mocks.terminal).toHaveBeenCalledTimes(2);
+    expect(mocks.terminal).toHaveBeenCalledTimes(remote ? 1 : 2);
     if (remote) {
       expect(mocks.baseline).not.toHaveBeenCalled();
       expect(mocks.fit).not.toHaveBeenCalled();
