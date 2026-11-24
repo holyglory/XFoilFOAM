@@ -37,6 +37,21 @@ retired member still requires the generation-pinned cloud restore and both
 native readers. Sum the changes in stored PostgreSQL field sizes separately
 from measured filesystem allocations.
 
+Version 3 adds `priorityTurnsPerOrdinary` from 1 to 8. Priority turns
+rotate across the eligible owners. After the configured
+number of priority turns the controller visits one full ordinary block if
+available. Restart preserves the recorded order. On plan replacement an
+ordinary block goes first. A held key keeps its original receipt and recovery
+path.
+
+Price work using actual report-column values, removal of the old FK,
+the retained header and new catalog values. A shared PostgreSQL result can
+contribute its stored size **once**, and only after all its references are
+removed. The existing SQL deletion condition checks both referencing
+relations. Compare immutable compressed generations separately and distinguish
+an old full report containing the same scientific token from an archive of
+the entire new signed report.
+
 ## Sharing an exact result across worker report pages
 
 Install migration 0234 and the matching hub broker, worker API and sweeper
@@ -67,6 +82,13 @@ owner have the same exact result token. Each envelope still requires the
 original SQL text, a registered full generation, and the independent cloud,
 API and sweeper reads. A different token uses full JSONL until it qualifies
 in turn. Zero disables automatic selection.
+
+For rows already normalized in SQL, `--prefer-normalized-result-min-bytes`
+lets the same native publisher try a single-hop result reference at a separately
+measured size. Its authenticated source token must equal the SQL FK. The
+writer still needs a matching registered full member and reconstructs every
+signed original; without such a source it writes full JSONL. Restart follows
+the format already saved in the pending publication.
 
 The initial signed inventory has its own fair order. To discover newly closed
 executions while it drains, use `--discover-every-seed-members N`.

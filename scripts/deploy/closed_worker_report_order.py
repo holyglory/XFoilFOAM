@@ -115,7 +115,7 @@ def ordered_inventory(args, source, progress, bind, path, durable, validate):
         check(len(data) <= 128*1024 and digest == requested, "Priority hint digest differs")
         hint = json.loads(data)
         # Subordinate discovery and held-key recovery own different signed rosters.
-        if hint["inventory"] == bind["inventory"] and hint.get("version") == 2:
+        if hint["inventory"] == bind["inventory"] and hint.get("version") in (2, 3):
             pos = progress["after"]
             next_receipt = path.parent / "receipts" / f"{progress['completed']:08d}"
             occupied = any(next_receipt.with_suffix(ext).exists() for ext in (".json", ".page.json"))

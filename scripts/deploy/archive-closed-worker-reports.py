@@ -16,7 +16,7 @@ import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from closed_worker_report_pages import process_page, qualified_width, previous_result_matches, remember_verified_result
+from closed_worker_report_pages import process_page, qualified_width, previous_result_matches, prefer_normalized_result, remember_verified_result
 from closed_worker_report_write_session import NativeWriteSession, WriterTransportInterrupted
 from closed_worker_report_sessions import DiscoveryQueryCancelled, ReadPeerStopped, ReportReadSessions, ROLE_READS
 from closed_worker_report_discovery import discovery_step, revisit_held, revisit_prefix
@@ -218,7 +218,9 @@ def inputs(args):
         args.stream_native_page_class = (archive_format, int(minimum_members), int(minimum_bytes))
     minimum = getattr(args, "repeat_result_min_bytes", 0)
     require(0 <= minimum <= 32 * 1024**2, "Measured repeat size must be within the existing native page bound")
-    if getattr(args,"page_members",1)>1 or getattr(args,"share_results",False) or minimum:
+    normalized_minimum = getattr(args, "prefer_normalized_result_min_bytes", 0)
+    require(0 <= normalized_minimum <= 32 * 1024**2, "Normalized result size exceeds the native page bound")
+    if getattr(args,"page_members",1)>1 or getattr(args,"share_results",False) or minimum or normalized_minimum:
         require(args.hub_account_file and args.hub_account_file.is_file(),"Expected existing hub workload account file")
     require(getattr(args, "discover_every_seed_members", 0) >= 0, "Invalid discovery cadence")
     require(1 <= args.limit <= 128, "Expected 1 to 128 bounded operations")
@@ -304,7 +306,8 @@ def run(args):
         # A resumed page owns its saved format and may consume a different
         # number of keys than the newly selected run. Return to the selector
         # before admitting an unrelated key under those inherited arguments.
-        finish_pending = bool(getattr(args, "repeat_result_min_bytes", 0) and
+        normalized_reuse = getattr(args, "prefer_normalized_result_min_bytes", 0)
+        finish_pending = bool((getattr(args, "repeat_result_min_bytes", 0) or normalized_reuse) and
                               (progress.get("group") or progress.get("pending")))
         left = args.limit
         while left>0:
@@ -362,7 +365,8 @@ def run(args):
                         return
                     require(not initial["archivedBundle"], "Use the existing native receipt")
                     share = getattr(args, "share_results", False) or previous_result_matches(
-                        progress, key, initial, getattr(args, "repeat_result_min_bytes", 0))
+                        progress, key, initial, getattr(args, "repeat_result_min_bytes", 0)) or prefer_normalized_result(
+                        initial, getattr(args, "prefer_normalized_result_min_bytes", 0))
                     state = dict(key=key, initial=initial, pin=None, shareResults=share)
                     if args.apply:
                         progress["pending"] = state
@@ -577,6 +581,8 @@ if __name__ == "__main__":
     parser.add_argument("--width-qualification-sha256", help="SHA-256 of that local qualification")
     parser.add_argument("--repeat-result-min-bytes",type=int,default=0,
                         help="Share a matching result above this size after two successive verified generations (0 disables)")
+    parser.add_argument("--prefer-normalized-result-min-bytes", type=int, default=0,
+                        help="Try an exact registered worker result for matching SQL dictionary rows at this byte floor")
     parser.add_argument("--share-results",action="store_true",help="Use a verified same-execution worker dictionary for matching closed reports")
     parser.add_argument("--stream-native-page-reads",action="store_true",help="Authenticate the complete bounded native page once per independent reader or transaction")
     parser.add_argument("--stream-native-page-class", nargs=3, metavar=("FORMAT", "MIN_MEMBERS", "MIN_BYTES"),

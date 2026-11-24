@@ -80,6 +80,16 @@ def previous_result_matches(progress, key, original, minimum):
                 and key["executionId"] == prior["owner"]["executionId"] and token["byteSize"] >= minimum)
 
 
+def prefer_normalized_result(original, minimum):
+    # Only a publication preference. The writer must authenticate a registered
+    # full member with the exact token or publish a complete new original.
+    token = original.get("resultMeta")
+    fk = original.get("fk")
+    return bool(minimum and isinstance(fk, str) and re.fullmatch("[0-9a-f]{64}", fk)
+                and isinstance(token, dict) and token.get("sha256") == fk
+                and type(token.get("byteSize")) is int and minimum <= token["byteSize"] <= 32 * 1024**2)
+
+
 def remember_verified_result(progress, receipt, minimum):
     """Remember only one execution and token in the same atomic checkpoint as its receipt."""
     previous = progress.pop("lastVerifiedResult", None)
@@ -206,7 +216,9 @@ def process_page(args, stream, limit, progress, path, bind, runtime, peer_digest
                 originals = combined
         if share:
             originals = dictionary_prefix(originals)
-        elif originals and previous_result_matches(progress, entries[0][0], originals[0], minimum):
+        elif originals and (
+                previous_result_matches(progress, entries[0][0], originals[0], minimum) or
+                prefer_normalized_result(originals[0], getattr(args, "prefer_normalized_result_min_bytes", 0))):
             share = True
             for i, row in enumerate(originals[1:], 1):
                 if row["resultMeta"] != originals[0]["resultMeta"]:

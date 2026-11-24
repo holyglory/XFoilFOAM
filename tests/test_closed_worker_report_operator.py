@@ -86,6 +86,33 @@ class ClosedReportOperator(unittest.TestCase):
                     remaining=[json.loads(reader.readline(2049)) for _ in rows[8:]]
                     self.assertEqual(remaining,[keys[i] for i in (10,8,9,11,12,13,14)])
 
+                writes.clear()
+                lost.clear()
+                args.state=root/"weighted-state"
+                args.priority_turn=None
+                controller.run(args)  # Preserve the already visited ordinary prefix.
+                weighted=dict(version=3,inventory=args.keys_sha256,blockMembers=2,priorityTurnsPerOrdinary=2,
+                    owners=[dict(executionId=hi,ranges=[[3,6]],firstSequence=5),
+                            dict(executionId=other,ranges=[[3,6]])])
+                controller.durable(hint,weighted)
+                args.priority_turn, args.priority_turn_sha256 = hint, controller.digest(hint.read_bytes())
+                with self.assertRaisesRegex(OSError,"postcommit retry"):
+                    controller.run(args)
+                hint.unlink()
+                for _ in rows:
+                    controller.run(args)
+                self.assertEqual(writes,[(normal,3),(hi,5),(hi,6),(other,3),(other,4),(normal,4),
+                    (normal,5),(hi,3),(hi,4),(other,5),(other,6),(normal,6),(normal,7),(normal,8),(hi,7)])
+                self.assertCountEqual(writes,rows)
+                progress=json.loads((args.state/"progress.json").read_bytes())
+                self.assertEqual((progress["after"],progress["sourceOrder"]["priorityTurnsPerOrdinary"]),
+                                 (source.stat().st_size,2))
+                with source.open("rb") as fp:
+                    for invalid in (0,9,True):
+                        with self.assertRaisesRegex(ValueError,"priority turns"):
+                            fair_order(fp,[[0,source.stat().st_size]],[],dict(weighted,priorityTurnsPerOrdinary=invalid),
+                                       "bad",lambda k:controller.check_key(k,{}))
+
     def test_priority_turn_recovers_the_same_writer_and_conserves_the_displaced_keys(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -773,6 +800,36 @@ class ClosedReportOperator(unittest.TestCase):
                         controller.run(args)
                 self.assertEqual(modes[6:], [(100,False),(100+width,False),(100+width*2,True),(100+width*3,False)])
                 self.assertEqual(json.loads((args.state/"discovery/cursor.json").read_bytes())["archived"], 4*width)
+
+                # The SQL FK is a packing hint. Each new key keeps independent
+                # publication, normal product reads, complete cloud proof and settlement.
+                args.state=root/"normalized-state"
+                args.discover_every_seed_members=0
+                args.repeat_result_min_bytes=0
+                args.prefer_normalized_result_min_bytes=1000
+                modes.clear()
+                retired.clear()
+                def normalized(_args, role, m, source):
+                    answer=rpc(_args,role,m,source)
+                    if m["op"]=="source":
+                        rows=answer["rows"] if "items" in m else [answer]
+                        for item,row_value in zip(m.get("items",[m]),rows):
+                            batch=(item["key"]["sequence"]-2)//width
+                            token=row_value["resultMeta"]
+                            row_value["fk"]=None if batch==2 else ("f"*64 if batch==1 else token["sha256"])
+                            if batch==4:token["byteSize"]=999
+                    if m["op"]=="publish" and m["key"]["sequence"]==2:
+                        # The first hint found no registered physical source.
+                        for pin in answer.get("pins",[answer]):pin["archiveFormat"]="jsonl"
+                    return answer
+                with patch.object(controller,"run_peer",side_effect=normalized),patch.object(controller.subprocess,"check_output",return_value=b"runtime"):
+                    for _ in range(6):
+                        controller.run(args)
+                self.assertEqual([share for _,share in modes],[True,False,False,True,False,True])
+                self.assertEqual(retired,[k["sequence"]for k in keys])
+                first=json.loads(next((args.state/"receipts").glob("00000000*.json")).read_bytes())
+                pin=first["publication"]["pins"][0] if width==2 else first["pin"]
+                self.assertEqual(pin["archiveFormat"],"jsonl")
 
 
     def test_existing_result_keeps_its_ordinary_order_across_changed_neighbors(self):

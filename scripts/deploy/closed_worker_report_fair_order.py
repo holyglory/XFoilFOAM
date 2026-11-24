@@ -9,6 +9,10 @@ from uuid import UUID
 def fair_order(source, remaining, prefix, hint, digest, validate, *, start_ordinary=False):
     owners = hint["owners"]
     block = hint["blockMembers"]
+    weighted = hint.get("version") == 3
+    turns = hint.get("priorityTurnsPerOrdinary") if weighted else 1
+    if type(turns) is not int or not 1 <= turns <= 8:
+        raise ValueError("A weighted rotation requires one to eight priority turns per ordinary turn")
     if not isinstance(owners, list) or not 1 <= len(owners) <= 25 or type(block) is not int or not 1 <= block <= 32:
         raise ValueError("Invalid finite priority owner count or turn size")
     ranges = {}
@@ -63,8 +67,8 @@ def fair_order(source, remaining, prefix, hint, digest, validate, *, start_ordin
             selected.extend((pos, stop))
             pos = stop
 
-    # Append an equal-sized ordinary turn after every selected owner while
-    # ordinary keys remain. Adjacent physical key lines need only one interval.
+    # The owner rotation and the ordinary remainder use the same finite
+    # key budget. Adjacent physical lines need only one stored interval.
     result = [list(span) for span in prefix]
     def take(offsets, at, number):
         stop = min(len(offsets), at + 2*number)
@@ -84,6 +88,7 @@ def fair_order(source, remaining, prefix, hint, digest, validate, *, start_ordin
     try:
         if start_ordinary:
             at = take(ordinary, at, block)
+        priority_turns = 0
         while positions:
             keys, pos, remaining_keys = positions.popleft()
             wanted = min(block, remaining_keys)
@@ -93,11 +98,15 @@ def fair_order(source, remaining, prefix, hint, digest, validate, *, start_ordin
                 pos = take(keys, 0, wanted-before_wrap)
             if remaining_keys > wanted:
                 positions.append((keys, pos, remaining_keys-wanted))
-            at = take(ordinary, at, block)
+            priority_turns += 1
+            if priority_turns == turns:
+                at = take(ordinary, at, block)
+                priority_turns = 0
         take(ordinary, at, ordinary_count)
     except OverflowError:
         return None
-    return dict(hint=digest, spans=result, sizes={}, owners=list(ranges), blockMembers=block,
+    settings = {"priorityTurnsPerOrdinary": turns} if weighted else {}
+    return dict(**settings, hint=digest, spans=result, sizes={}, owners=list(ranges), blockMembers=block,
                 priorityStarts={j:n for j,n in starts_at.items() if j in offsets},
                 startsWithOrdinary=start_ordinary,
                 priorityKeys=count-ordinary_count, ordinaryKeys=ordinary_count)
