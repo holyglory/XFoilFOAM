@@ -67,7 +67,7 @@ import {
 } from "@aerodb/db/simulation-setup";
 import type { EngineClient } from "@aerodb/engine-client";
 import { observeProgressiveRemoteJob } from "./progressive-remote-observation";
-import { receiveProgressiveAssignmentPage } from "./progressive-remote-intake";
+import { ProgressiveAssignmentDeferred, receiveProgressiveAssignmentPage } from "./progressive-remote-intake";
 import { recordProgressiveWorkerArchiveCustody } from "./progressive-worker-archive-custody";
 import { recordProgressiveWorkerEvidenceReceipt } from "./progressive-worker-evidence-delivery";
 import { reopenResolvedProgressiveConflicts } from "./progressive-conflict-recovery";
@@ -3017,8 +3017,13 @@ export async function persistClaimedRemotePromise(
         AND promise.status = 'active'
         AND promise.source_base_url = ${input.sourceBaseUrl}
         AND promise.registered_solver_id = ${solverId}::uuid
-      FOR UPDATE OF promise
-    `);
+      FOR UPDATE OF promise NOWAIT
+    `).catch((error: unknown) => {
+      const pg = error as { code?: string; cause?: { code?: string } } | null;
+      if (pg?.code === "55P03" || pg?.cause?.code === "55P03")
+        throw new ProgressiveAssignmentDeferred("promise_locked");
+      throw error;
+    });
     const liveConflicts = conflicts.filter((row) => Boolean(row.live));
     if (liveConflicts.length)
       throw new Error(
@@ -3027,7 +3032,7 @@ export async function persistClaimedRemotePromise(
     // A replacement is authenticated for its own assignment. The previous
     // progressive promise still owns its reports, deliveries and review rights.
     if (conflicts.some((row) => row.progressive === true))
-      throw new Error("previous progressive promise requires registered terminal reconciliation");
+      throw new ProgressiveAssignmentDeferred("unreconciled_promise");
     const conflictIds = [
       ...new Set(conflicts.map((row) => String(row.promise_id))),
     ];

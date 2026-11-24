@@ -13,6 +13,16 @@ export interface ProgressiveAssignmentDocument extends Record<string, unknown> {
   promise: Record<string, unknown>;
 }
 
+export class ProgressiveAssignmentDeferred extends Error {
+  constructor(readonly reason: "promise_locked" | "unreconciled_promise") {
+    super(
+      reason === "promise_locked"
+        ? "overlapping local promise is busy; retry this assignment"
+        : "previous progressive promise requires registered terminal reconciliation",
+    );
+  }
+}
+
 function record(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
@@ -81,7 +91,11 @@ async function receiveAssignmentPage(
     existing: 0,
     stopped: 0,
     cursorAdvanced: false,
-    errors: [] as Array<{ executionId: string; error: string }>,
+    errors: [] as Array<{
+      executionId: string;
+      error: string;
+      deferred?: ProgressiveAssignmentDeferred["reason"];
+    }>,
   };
   const [settings] =
     await db.execute(sql`SELECT remote_solver_enabled, remote_solver_transfer_paused,
@@ -241,6 +255,9 @@ async function receiveAssignmentPage(
         receipt.errors.push({
           executionId: identity.executionId,
           error: error instanceof Error ? error.message : String(error),
+          ...(error instanceof ProgressiveAssignmentDeferred
+            ? { deferred: error.reason }
+            : {}),
         });
       }
     },

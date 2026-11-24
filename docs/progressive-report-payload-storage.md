@@ -1,5 +1,15 @@
 # Lossless progressive report payload storage
 
+## Worker lease reconciliation
+
+The terminal-mirror reconciler selects a worker promise with `p.status='active'`. Every supported writer that sets a worker report's `archive_bundle_id` first requires the same registered worker's **local** promise to be fulfilled, cancelled or expired.
+
+- The ordinary worker archiver checks `promise.status IN ('fulfilled','cancelled','expired')` in `closedScope`. Before writing the pointer, `archiveProgressiveReportBatch` repeats that query with `FOR UPDATE OF job,promise`. Its special cancelled-copy selector accepts only hub reports.
+- Legacy registration in migrations 0205 and 0209 selects the source job `FOR UPDATE` and the matching solver, upstream and terminal promise `FOR SHARE`. An ineligible owner is skipped before the member is compacted. Migration 0209 supplies the current definition of `register_legacy_report_archive_custody`.
+- Registered hub links from 0221 use `originalState(tx, link, true)` to recheck the terminal worker promise under a share lock. The closed-worker original publisher checks `p.status IN ('expired','fulfilled','cancelled')` in `workerSource` and repeats it under lock before retirement.
+
+Registered assignment intake preserves an existing terminal promise on conflict. Heartbeats renew active owners, and the hub excludes stopped dispatches from its active assignment list. If an externally restored database presents an active owner with a compact source outside this lifecycle, reconciliation retains the lease. The compact header alone cannot establish the original report's evidence obligations.
+
 ## Stored reports and automatic cleanup
 
 PostgreSQL keeps polar coefficients, report sequence numbers, signatures, rejection reasons and the records that tie a measured angle to its source. A completed execution can contain several angles. Cleanup checks each report's evidence before removing its full body from the database.

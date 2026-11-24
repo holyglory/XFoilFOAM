@@ -5642,8 +5642,8 @@ tier = "development"
 timeout_seconds = 600
 requires = ["seed"]
 env = { PROGRESSIVE_REPORT_ARCHIVE_DISPOSABLE_DB = "1" }
-command = ["/bin/bash", "scripts/dev/run-vitest-with-diagnostics.sh", "@aerodb/sweeper", "--no-file-parallelism", "test/progressive-report-archive.test.ts", "test/progressive-terminal-mirror.test.ts", "test/closed-worker-report-custody.test.mjs"]
-diagnostic_sources = [{ format = "junit", path = "report.xml" }]
+command = ["/bin/bash", "scripts/dev/check-registered-terminal-mirrors.sh"]
+diagnostic_sources = [{ format = "junit", path = "report.xml" },{ format = "junit", path = "registered/report.xml" }]
 
 # The actual lock-timeout tests contend on the singleton worker identity and
 # must not share it with concurrently running sync-route and archive fixtures.

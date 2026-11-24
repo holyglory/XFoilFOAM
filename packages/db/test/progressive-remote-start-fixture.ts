@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { sql } from "drizzle-orm";
 import { expect } from "vitest";
 import type { DB } from "../src/client";
+import { verifyRegisteredReplacementRound } from "./registered-replacement-round-fixture";
 import type { ProgressiveRemoteExecutionEnvelope } from "../src/progressive-remote-execution";
 import { authorizeProgressiveRemoteStart } from "../src/progressive-remote-start";
 import { PROGRESSIVE_REMOTE_START_AUTHORIZATION_MS } from "../src/progressive-remote-start";
@@ -11,6 +12,8 @@ export async function verifyProgressiveRemoteStart(
   db: DB,
   envelope: ProgressiveRemoteExecutionEnvelope,
 ) {
+  if (process.env.REGISTERED_REPLACEMENT_ROUND === "1")
+    await verifyRegisteredReplacementRound(db, envelope);
   const input = {
     solverId: envelope.solverId,
     executionId: envelope.scope.executionId,

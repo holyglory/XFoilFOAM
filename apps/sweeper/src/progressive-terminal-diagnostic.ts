@@ -90,6 +90,8 @@ export async function readTerminalDiagnostics(
     const sequence = Number(row.sequence);
     let verified = originals.get(sequence);
     if (!verified) {
+      // All worker archive writers lock a terminal local promise before
+      // compaction. This verifier serves active mirrors (see the storage contract).
       const [stored] =
         await db.execute(sql`SELECT resolve_progressive_report(r.report,r.result_payload_hash) AS original,r.content_signature
         FROM progressive_worker_reports r WHERE r.sim_job_id=${execution}::uuid AND r.sequence=${sequence}
