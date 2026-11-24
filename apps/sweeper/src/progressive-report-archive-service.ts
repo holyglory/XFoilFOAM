@@ -1,3 +1,4 @@
+import { advanceSettledStatusHeaders } from "./settled-report-status-headers";
 import {
   backfillWorkerReportPrefix,
   type WorkerPrefixCursor,
@@ -490,6 +491,7 @@ export async function runProgressiveReportArchiveService(
   let copyCursor: ReportCopyCursor | null = await checkpoint?.resume(db) ?? null;
   if (copyCursor) console.info(JSON.stringify({ component: "cancelled-report-copy-resume", ...copyCursor }));
   let nextCopyScan = 0;
+  let nextStatusScan = 0;
   let after: string | null = null;
   let hubArchivedThisSweep = false;
   while (!signal.aborted) {
@@ -592,7 +594,19 @@ export async function runProgressiveReportArchiveService(
       }
       // Both use the same connection budget. A copy page never starts an
       // extra ordinary discovery pass during that pass's idle backoff.
-      const wake = store ? Math.min(nextJobScan, nextCopyScan) : nextJobScan;
+      if (!signal.aborted && Date.now() >= nextStatusScan) {
+        try {
+          // Finish one exact read, then give a due ordinary archive or copy its turn.
+          const availableMs = Math.max(0, Math.min(nextJobScan, store ? nextCopyScan : Infinity) - Date.now());
+          const status = await advanceSettledStatusHeaders(db, source, signal, performance.now() + availableMs);
+          nextStatusScan = Date.now() + (status.complete ? 60_000 : 250);
+          if (status.reduced) console.info(JSON.stringify({ component: "settled-report-status", source, ...status }));
+        } catch {
+          nextStatusScan = Date.now() + 30_000;
+          console.warn(JSON.stringify({ component: "settled-report-status", source, result: "scan_unavailable" }));
+        }
+      }
+      const wake = Math.min(nextJobScan, nextStatusScan, store ? nextCopyScan : Infinity);
       try {
         await delay(Math.max(0, wake - Date.now()), undefined, { signal });
       } catch (error) {

@@ -8,8 +8,11 @@ import {
 } from "@aerodb/db/progressive-report-archive";
 import {
   installProgressiveReportArchiveReader,
+  readArchivedProgressiveReportText,
   readProgressiveReport,
+  resolveStoredProgressiveReport,
 } from "@aerodb/db/progressive-report-reader";
+import { advanceSettledStatusHeaders } from "../src/settled-report-status-headers";
 import {
   backfillProgressiveReportPayloads,
   proveProgressiveReportsInline,
@@ -349,6 +352,169 @@ async function runWorkerVolumeCleanupPass(db: DB) {
 describe.each<ArchiveSource>(["remote", "worker"])(
   "%s progressive report archive database boundary",
   (source) => {
+    it("keeps ordered delivery keys and reads the exact original after reducing only settled quiet headers", async () => {
+      await withArchiveFixture(
+        client,
+        source,
+        async (fixture) => {
+          const { db, executionId, reports } = fixture,
+            table = archiveTable(source),
+            cloud = cloudFixture();
+          expect(
+            await archiveProgressiveReportBatch(
+              db,
+              source,
+              executionId,
+              cloud.putFile,
+            ),
+          ).toBe(reports.length);
+          const snapshots = async () => {
+            const data = await archiveSnapshot(fixture);
+            delete data[
+              source === "remote"
+                ? "progressive_remote_reports"
+                : "progressive_worker_reports"
+            ];
+            return data;
+          };
+          const headers = () =>
+            db.execute(sql`SELECT sequence::integer AS n,content_signature,archive_bundle_id,
+          archived_at,report::text AS body,pg_column_size(report)::int AS bytes FROM ${table}
+          WHERE sim_job_id=${executionId}::uuid ORDER BY sequence`);
+          const before = await headers(),
+            invariant = await snapshots(),
+            key = reports[0]!;
+          const visit = () => advanceSettledStatusHeaders(db, source);
+          expect(
+            await db.execute(sql`SELECT progressive_settled_status_header(report) IS NOT NULL AS eligible
+          FROM ${table} WHERE sim_job_id=${executionId}::uuid AND sequence=1`),
+          ).toMatchObject([{ eligible: true }]);
+          const forged = () =>
+            db.transaction((tx) =>
+              tx.execute(sql`UPDATE ${table} SET report=progressive_settled_status_header(report)
+          WHERE sim_job_id=${executionId}::uuid AND sequence=1`),
+            );
+          await expect(forged()).rejects.toThrow(/exact original/);
+          const [pin] =
+            await db.execute(sql`SELECT b.generation,b.stored_sha256 FROM ${table} r
+          JOIN progressive_report_archive_bundles b ON b.id=r.archive_bundle_id
+          WHERE r.sim_job_id=${executionId}::uuid AND r.sequence=1`);
+          await expect(
+            db.transaction((tx) =>
+              tx.execute(sql`UPDATE ${table}
+          SET report=jsonb_build_object('statusHeaderOriginalText',${key.text + " "}::text,
+            'generation',${pin.generation}::text,'storedSha256',${pin.stored_sha256}::text)
+          WHERE sim_job_id=${executionId}::uuid AND sequence=1`),
+            ),
+          ).rejects.toThrow(/original or generation differs/);
+          const timestamp = sql.identifier(
+            source === "worker" ? "created_at" : "received_at",
+          );
+          await expect(
+            db.transaction((tx) =>
+              tx.execute(sql`UPDATE ${table} SET ${timestamp}=${timestamp}+interval '1 second',
+          report=jsonb_build_object('statusHeaderOriginalText',${key.text}::text,'generation',${pin.generation}::text,
+            'storedSha256',${pin.stored_sha256}::text) WHERE sim_job_id=${executionId}::uuid AND sequence=1`),
+            ),
+          ).rejects.toThrow();
+          installProgressiveReportArchiveReader({
+            read: async () => {
+              throw new Error("unavailable generation");
+            },
+          });
+          expect((await visit()).reduced).toBe(0);
+          expect(await headers()).toEqual(before);
+          const read = async (identity: ProgressiveReportArchiveReadIdentity) =>
+            readProgressiveReportArchiveText(
+              Readable.from([cloud.objects.get(identity.objectKey)!]),
+              identity,
+            );
+          // Restore succeeds, but the normal owner is reopened before the guarded UPDATE.
+          // The transaction must observe the changed lease and retain the old representation.
+          let reopen = true;
+          installProgressiveReportArchiveReader({
+            read: async (identity) => {
+              const text = await read(identity);
+              if (reopen) {
+                reopen = false;
+                await db.execute(sql`UPDATE sim_jobs SET ingest_lease_token=${randomUUID()}::uuid,
+              ingest_lease_expires_at=now()+interval '2 minutes' WHERE id=${executionId}::uuid`);
+              }
+              return text;
+            },
+          });
+          expect((await visit()).reduced).toBe(0);
+          expect(await headers()).toEqual(before);
+          await db.execute(
+            sql`UPDATE sim_jobs SET ingest_lease_token=NULL,ingest_lease_expires_at=NULL WHERE id=${executionId}::uuid`,
+          );
+          installProgressiveReportArchiveReader({ read });
+          const projected = await visit();
+          const expected = source === "worker" ? [1] : [1, 2];
+          expect(projected.reduced).toBe(expected.length);
+          const after = await headers();
+          expect(after.map((r) => r.n)).toEqual(before.map((r) => r.n));
+          for (let i = 0; i < before.length; i++) {
+            const old = before[i]!,
+              current = after[i]!,
+              report = reports[i]!;
+            expect([
+              current.content_signature,
+              current.archived_at,
+              current.archive_bundle_id,
+            ]).toEqual([
+              old.content_signature,
+              old.archived_at,
+              old.archive_bundle_id,
+            ]);
+            if (expected.includes(Number(current.n))) {
+              expect(Number(current.bytes)).toBeLessThan(Number(old.bytes));
+              expect(
+                Object.keys(JSON.parse(String(current.body)).status).sort(),
+              ).toEqual(["completed_cases", "job_id", "state", "total_cases"]);
+            } else expect(current.body).toBe(old.body);
+            const ref = {
+              sourceKind: source,
+              executionId,
+              sequence: report.sequence,
+              contentSignature: report.contentSignature,
+            };
+            const restored = await readArchivedProgressiveReportText(db, ref);
+            expect(restored?.text).toBe(report.text);
+            expect(await readProgressiveReport(db, ref)).toEqual(
+              JSON.parse(report.text),
+            );
+            expect(
+              await resolveStoredProgressiveReport(
+                db,
+                source,
+                {
+                  report: JSON.parse(String(current.body)),
+                  content_signature: report.contentSignature,
+                },
+                executionId,
+              ),
+            ).toEqual(JSON.parse(report.text));
+          }
+          expect(await snapshots()).toEqual(invariant);
+          expect((await visit()).reduced).toBe(0);
+          expect(await headers()).toEqual(after);
+          expect(key.contentSignature).toBe(after[0]!.content_signature);
+        },
+        {
+          reportCount: 7,
+          nullPrefix: 5,
+          quietStatusPrefix: 4,
+          exhaustedBudgetSequence: 3,
+          schedulingDiagnosticSequence: 4,
+          ...(source === "worker"
+            ? { legacyConflict: "identical" as const }
+            : {}),
+        },
+      );
+    }, 45_000);
+
+
     it("requires upgraded readers and counts archived bodies before permitting an old-reader rollback", async () => {
       await withArchiveFixture(
         client,

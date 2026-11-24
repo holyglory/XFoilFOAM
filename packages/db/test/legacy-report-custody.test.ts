@@ -12,6 +12,7 @@ import {
   type LegacyCustodyObject, type LegacyCustodyProductRead, type LegacyReportCustodyPage,
 } from "../src/legacy-report-custody";
 import { withArchiveFixture, type ArchiveFixture } from "../../../apps/sweeper/test/progressive-report-archive-fixture";
+import { compactSettledStatusHeader } from "../../../apps/sweeper/src/settled-report-status-headers";
 import { encodeLegacyPage } from "../src/legacy-report-storage-codec";
 
 const client = createClient({ max: 1 });
@@ -115,10 +116,37 @@ it.each(["registered-get", "hub-local-reader"] as const)("registers exact legacy
       engineJobId: fixture.executionId, aoaDeg: 0, engineCaseSlug: null,
       progressiveEvidence: { sequence: first.sequence, reportContentSignature: first.contentSignature, pointContentSignature: "a".repeat(64) },
     })).rejects.toThrow("no exact stored dispatch");
-    expect(await applyLegacyReportCustodyPage(fixture.db, proof, { apply: true, readersReady: true }))
-      .toMatchObject({ receipt: { compactedReports: 0, compactedConflicts: 0, replayedMembers: 4 } });
+    const [statusRow] = await fixture.db
+      .execute(sql`SELECT archive_bundle_id AS bundle
+      FROM progressive_worker_reports WHERE sim_job_id=${fixture.executionId}::uuid AND sequence=${first.sequence}`);
+    expect(
+      await compactSettledStatusHeader(fixture.db, "worker", {
+        job: fixture.executionId,
+        sequence: first.sequence,
+        signature: first.contentSignature,
+        bundle: String(statusRow.bundle),
+      }),
+    ).toBeGreaterThan(0);
+    const repeatedProof = await verifyLegacyReportCustodyPage({
+      ...input,
+      access: input.access(mode),
+    });
+    expect(repeatedProof.memberProofs).toEqual(proof.memberProofs);
+    expect(repeatedProof.object).toEqual(proof.object);
+    expect(
+      await applyLegacyReportCustodyPage(fixture.db, repeatedProof, {
+        apply: true,
+        readersReady: true,
+      }),
+    ).toMatchObject({
+      receipt: {
+        compactedReports: 0,
+        compactedConflicts: 0,
+        replayedMembers: 4,
+      },
+    });
     expect(await protectedRows(fixture.db, fixture.executionId)).toEqual(before);
-  }, { legacyConflict: "distinct" });
+  }, { legacyConflict: "distinct", quietStatusPrefix: 1 });
 });
 
 it("denied registered GET cannot mint custody and leaves verified 0198 normalization available", async () => {

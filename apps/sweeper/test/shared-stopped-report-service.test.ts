@@ -11,6 +11,7 @@ import { setTimeout as wait } from "node:timers/promises";
 import { it, expect } from "vitest";
 import { sql } from "drizzle-orm";
 import { createClient } from "@aerodb/db/client";
+import { readArchivedProgressiveReportText } from "@aerodb/db/progressive-report-reader";
 import {
   withArchiveFixture,
   type ArchiveFixture,
@@ -19,6 +20,7 @@ import { startReportObjectServer } from "./shared-report-gcs-server";
 import { sharedReportTotals } from "../src/shared-report-totals";
 import { stoppedReportCopyKeys } from "../src/shared-stopped-report-custody";
 import { STALE_HZ_RESET_REASON } from "@aerodb/db/progressive-remote-stale-recovery";
+import { verifyStatusHeaderPublication } from "./settled-status-publication-case";
 
 it("runs the stock recurring hub storage worker and serves both archive formats through the live retained-report API", async () => {
   expect(process.env.PROGRESSIVE_REPORT_ARCHIVE_DISPOSABLE_DB).toBe("1");
@@ -169,6 +171,7 @@ it("runs the stock recurring hub storage worker and serves both archive formats 
           normalized: true,
           reportCount: kind === "ordinary" ? 3 : order === 0 ? 75 : 36,
           nullPrefix: order === 0 ? 66 : 1,
+          quietStatusPrefix: kind === "ordinary" ? 1 : undefined,
         },
       );
     }
@@ -247,6 +250,16 @@ it("runs the stock recurring hub storage worker and serves both archive formats 
         ),
       ),
     );
+    const ordinary = originals[2]!;
+    const quiet = ordinary.reports[0]!;
+    const quietDownload = () => fetch(
+      host + "/api/admin/retained-reports/" + ordinary.executionId + "/" + quiet.sequence +
+        "?signature=" + quiet.contentSignature, { headers: { cookie: auth } },
+    );
+    // Retained scientific downloads require a source point. A status row has none.
+    const quietBefore = await quietDownload();
+    expect(quietBefore.status).toBe(404);
+    const quietDisposition = await quietBefore.json();
     // An interrupted optional seek hint must leave the ordinary stock writer
     // and readers operating on their normal catalogue and source checks.
     await writeFile(join(dir, "ordinary-chronological.json"), "{");
@@ -310,6 +323,19 @@ it("runs the stock recurring hub storage worker and serves both archive formats 
         await db.sql`SELECT b.archive_format f FROM progressive_remote_reports s JOIN progressive_report_archive_bundles b ON b.id=s.archive_bundle_id WHERE s.sim_job_id=${ids[2]} AND s.sequence=3`;
       return r?.f === "jsonl";
     });
+    await until(async () => {
+      const [row] = await db.sql`SELECT report->'status' AS status FROM progressive_remote_reports
+        WHERE sim_job_id=${ordinary.executionId} AND sequence=${quiet.sequence}
+        AND content_signature=${quiet.contentSignature} AND archived_at IS NOT NULL`;
+      return !!row && Object.keys(row.status).sort().join(",") === "completed_cases,job_id,state,total_cases";
+    });
+    const quietAfter = await quietDownload();
+    expect(quietAfter.status).toBe(quietBefore.status);
+    expect(await quietAfter.json()).toEqual(quietDisposition);
+    expect((await readArchivedProgressiveReportText(db.db, {
+      sourceKind: "remote", executionId: ordinary.executionId, sequence: quiet.sequence,
+      contentSignature: quiet.contentSignature,
+    }))?.text).toBe(quiet.text);
     for (const [i, f] of originals.entries())
       expect(
         await download(
@@ -420,3 +446,9 @@ it("runs the stock recurring hub storage worker and serves both archive formats 
     await rm(dir, { recursive: true, force: true });
   }
 }, 180000);
+
+it(
+  "retains an exact quiet report under a real late publisher's dispatch lock and replays it after reduction",
+  verifyStatusHeaderPublication,
+  45000,
+);

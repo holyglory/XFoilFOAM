@@ -126,10 +126,37 @@ function verifyBody(value: unknown, reference: ProgressiveReportReference, signa
 }
 
 /** Exactly one immutable sequence. Never substitutes a latest report or a compact header. */
-export async function readProgressiveReport(
+export function readProgressiveReport(
   db: DB,
   reference: ProgressiveReportReference,
   preparedOwner?: ReportOwner,
+): Promise<ProgressiveRemoteReport> {
+  return materializeProgressiveReport(db, reference, preparedOwner);
+}
+
+interface ArchivedReportText {
+  text: string;
+  bundleId: string;
+  generation: string;
+  storedSha256: string;
+}
+
+/** The same catalog, generation, member and signature checks as the stable-ID
+ * reader, with the original PostgreSQL text for a guarded storage transition. */
+export async function readArchivedProgressiveReportText(
+  db: DB,
+  reference: ProgressiveReportReference,
+): Promise<ArchivedReportText | null> {
+  let restored: ArchivedReportText | null = null;
+  await materializeProgressiveReport(db, reference, undefined, (member) => { restored = member; });
+  return restored;
+}
+
+async function materializeProgressiveReport(
+  db: DB,
+  reference: ProgressiveReportReference,
+  preparedOwner?: ReportOwner,
+  capture?: (member: ArchivedReportText) => void,
 ): Promise<ProgressiveRemoteReport> {
   if (!["remote", "worker"].includes(reference.sourceKind) || !UUID.test(reference.executionId) ||
     !Number.isSafeInteger(reference.sequence) || reference.sequence < 1 || !SHA256.test(reference.contentSignature))
@@ -255,6 +282,8 @@ export async function readProgressiveReport(
       if (identity.sourceKind === "remote")
         archivedMembers.set(report, Object.freeze({ bundleId: String(stored.archive_bundle_id), identity: Object.freeze(storedIdentity) }));
       if (scoped) freezeProgressiveReport(report);
+      capture?.({ text: body, bundleId: String(stored.archive_bundle_id),
+        generation: storedIdentity.generation, storedSha256: storedIdentity.storedSha256 });
       return report;
     } finally {
       clearTimeout(timer);

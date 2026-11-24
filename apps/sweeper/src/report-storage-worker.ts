@@ -1,5 +1,6 @@
 import { installProgressiveReportArchiveReader } from "@aerodb/db/progressive-report-reader";
 import { ProgressiveReportArchiveStore } from "./progressive-report-archive-store";
+import { readStoredWorkerArchiveText } from "./report-archive-broker-client";
 import { createClient } from "@aerodb/db/client";
 import { configuredDeploymentRole, makeReportStorageDatabase } from "./config";
 import {
@@ -17,8 +18,15 @@ import { runConfiguredAttemptEvidenceSettlementService } from "./attempt-evidenc
 
 const client = makeReportStorageDatabase("report-storage-backfill");
 const stop = new AbortController();
-const hubBucket=process.env.AIRFOILFOAM_EVIDENCE_BUCKET?.trim();
-if(configuredDeploymentRole()==="hub" && hubBucket)installProgressiveReportArchiveReader(new ProgressiveReportArchiveStore(hubBucket));
+const role = configuredDeploymentRole();
+const hubBucket = process.env.AIRFOILFOAM_EVIDENCE_BUCKET?.trim();
+if (role === "hub" && hubBucket) {
+  installProgressiveReportArchiveReader(new ProgressiveReportArchiveStore(hubBucket));
+} else if (role === "remote-solver") {
+  installProgressiveReportArchiveReader({
+    read: (identity, db) => readStoredWorkerArchiveText(db, identity),
+  });
+}
 const attemptEvidence = createClient({
   max: 1,
   connection: {
@@ -38,9 +46,9 @@ const attemptSettlement = createClient({
 for (const event of ["SIGTERM", "SIGINT", "disconnect"] as const)
   process.once(event, () => stop.abort());
 try {
-  const priority = configuredDeploymentRole() === "hub" ? new CancelledReportCopyPriority() : undefined;
+  const priority = role === "hub" ? new CancelledReportCopyPriority() : undefined;
   const work = [runProgressiveReportArchiveService(client.db, stop.signal, priority)];
-  if (configuredDeploymentRole() === "remote-solver") {
+  if (role === "remote-solver") {
     work.push(runDuplicateReportCleanup(client.db, stop.signal));
     work.push(runNativeWorkerReportSharing(client.db, stop.signal));
     work.push(runWorkerVolumeCleanup(client.db, stop.signal));

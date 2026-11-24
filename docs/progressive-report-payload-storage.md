@@ -117,6 +117,61 @@ payloads as solver/transport evidence and preserves the storage switch as
 execution metadata. Storage normalization does not require a reset. The legacy report-pruning
 function and CLI remain disabled.
 
+## Settled status reports
+
+After migration 0235, the ordinary report-storage worker on each role can shorten
+an older running-status header whose exact report already resides in a verified
+archive. The PostgreSQL delivery row keeps its execution, sequence, signature,
+original timestamps, archive bundle and member. Its JSON keeps the signed owner
+and assignment identifiers, null result and stop, and the status job ID, state,
+total cases and completed cases. The full message, phase, scheduling data and
+all original bytes remain available through the existing stable-ID reader.
+
+The worker considers a status only after a later report exists for that owner.
+The job must be terminal and ingested, the scheduling promise closed, and
+execution stop independently recorded. The hub checks its dispatch, solver,
+signed empty point inventory and progress acknowledgement. HZ checks its own
+registration, assignment and upstream promise, worker acknowledgements, final
+stop evidence and outstanding delivery obligations. A null result, zero completed
+cases and ordinary engine progress message are required. The worker retains
+terminal, latest, scientific or diagnostic reports, unknown status fields,
+conflicts and their source rows, and reports that own receipts, staging or a
+shared scientific source. It also checks the full original for exhausted solver
+budgets and scheduling diagnostics that the earlier header omitted.
+
+The stable-ID materializer authenticates the original PostgreSQL text, digest,
+size, signed content and pinned generation before taking write locks. Existing
+worker access rules apply, including HZ's verified working volume when general
+downloads are disabled. The SQL trigger checks the archived identity, hashes the
+original text, compares its prior header and rechecks the settled owner while
+holding short locks. A failed read, changed owner, busy publisher or mismatched
+proof leaves the report available in its prior representation.
+
+| Consumer | Contract preserved |
+| --- | --- |
+| Ordered publication, acknowledgement, duplicate and late deliveries | The original primary key, signature, assignment and progress receipt survive. The latest report retains its prior header. Duplicate sends and order checks use their existing stored keys and exact materializer. See [remote publication](../packages/db/src/progressive-remote-reports.ts) and [worker publication](../packages/db/src/progressive-worker-reports.ts). |
+| Stop, restart, incremental ingestion and recovery | The real terminal stop, latest row, unfinished jobs, active delivery owners and interpreted diagnostics stay intact. Full-body replay reopens the signed original. See [stop handling](../apps/sweeper/src/progressive-remote-stop-receipt.ts) and [outbox replay](../apps/sweeper/src/progressive-worker-outbox-replay.ts). |
+| Frozen archive membership, conflict aliases and registered reuse | Member kind, row and report hashes, signatures, object generation and working-volume identity survive. FK targets keep the same row. Separate conflict and scientific dictionary owners remain protected. See [legacy custody](../packages/db/src/legacy-report-custody.ts) and [registered reads](../apps/sweeper/src/registered-worker-report-read.ts). |
+| Scientific evidence, selection, fits and HTTP downloads | Result and attempt owners, evidence receipts and scientific anchors keep their original identities. The retained-science route continues to require a point source. Stable report reads still return the exact status original even when it has no point. See [retained science](../packages/db/src/retained-solver-reports.ts) and the [report reader](../packages/db/src/progressive-report-reader.ts). |
+
+Each discovery turn examines up to 128 archive keys and starts at most eight
+member reads totalling at most 1 MiB of original report text. Existing object
+reader limits apply separately to the packed archive. The worker yields to a
+due archive or copy after its current member and advances a role-specific cursor
+in `progressive_status_header_cursors`. It revisits held and newly archived
+members on subsequent sweeps. A restart reuses that cursor. An interrupted
+update or repeat cannot reduce the same header twice.
+
+To verify a rollout, record a settled nonlatest sequence and its member
+signature, generation, original report digest and `pg_column_size(report)`.
+Read it through the ordinary role-specific reader before and after the worker's
+turn. Compare the entire original, delivery identity and any related receipt.
+Also check a latest, unsettled or diagnostic sequence retains its old header.
+The worker records committed PostgreSQL field bytes removed. Heap and index
+allocation, dead tuples and filesystem free space require separate measurement.
+Older archive-capable readers use the same stable identity. A worker rollback
+can stop further reductions without expanding existing headers.
+
 ## Staged rollout and rollback
 
 1. Apply `0198`. `progressive_report_storage_policy.normalization_enabled`

@@ -102,6 +102,9 @@ export async function withArchiveFixture(
     settled?: boolean;
     reportCount?: number;
     nullPrefix?: number;
+    quietStatusPrefix?: number;
+    exhaustedBudgetSequence?: number;
+    schedulingDiagnosticSequence?: number;
     angles?: number[];
     historyRepeats?: number;
     metadataOnlyDiagnostic?: boolean;
@@ -238,6 +241,12 @@ export async function withArchiveFixture(
           sql`UPDATE public.sync_sweep_promises SET source_base_url='https://staging-key.invalid/api/sync/v1' WHERE id=${promiseId}::uuid`,
         );
       }
+      if (source === "worker" && options.quietStatusPrefix) {
+        await db.execute(sql`UPDATE sync_api_settings SET remote_solver_registered_id=${remote.id}::uuid,
+          upstream_base_url='https://staging-key.invalid/api/sync/v1' WHERE id=1`);
+        await db.execute(sql`UPDATE sync_sweep_promises SET source_base_url='https://staging-key.invalid/api/sync/v1'
+          WHERE id=${promiseId}::uuid`);
+      }
       // Hub ownership comes only from its dispatch. Worker ownership comes only
       // from its local mirror payload; neither fixture has the other's identity.
       await db.insert(simJobs).values({
@@ -259,7 +268,7 @@ export async function withArchiveFixture(
                 remoteSolver: true,
                 syncPromiseId: promiseId,
                 remoteProgressiveExecution: envelope,
-                ...(options.stagingAcceptance
+                ...(options.stagingAcceptance || options.quietStatusPrefix
                   ? {
                       upstreamBaseUrl:
                         "https://staging-key.invalid/api/sync/v1",
@@ -411,13 +420,29 @@ export async function withArchiveFixture(
             total_cases: units.length,
             completed_cases: sequence <= nullPrefix ? 0 : 1,
             // Unknown diagnostic values must survive archival without JS rounding.
-            diagnosticLargeInteger: force || options.metadataOnlyDiagnostic ? 2147483647 : "__LARGE_INTEGER__",
-            diagnosticNull: null,
-            message: [
+            ...(sequence <= (options.quietStatusPrefix ?? 0) ? {
+              phase: "solving_rans",
+              message: "solving rans",
+              active_solver: "simpleFoam",
+              active_pids: [12345],
+              last_progress_at: "2026-11-10T10:30:00Z",
+              ...(sequence === options.schedulingDiagnosticSequence ? {
+                scheduling: { queue_depth: 0, diagnostic: "engine restart investigation" },
+              } : {}),
+              ...(sequence === options.exhaustedBudgetSequence ? {
+                solver_budget_progress: { version: 1, job_id: executionId, observed_at: "2026-11-10T10:30:00Z",
+                  cases: [{ chord: 0.987654, speed: 19.876543, aoa_deg: 0, solver_active_seconds: 900,
+                    limit_seconds: 900, solver_running: true }] },
+              } : {}),
+            } : {
+              diagnosticLargeInteger: force || options.metadataOnlyDiagnostic ? 2147483647 : "__LARGE_INTEGER__",
+              diagnosticNull: null,
+              message: [
               "archive diagnostic: λ 🌬️",
               'quote "',
               String.fromCharCode(92),
-            ].join(String.fromCharCode(10)),
+              ].join(String.fromCharCode(10)),
+            }),
           },
           result:
             sequence <= nullPrefix
@@ -504,7 +529,7 @@ export async function withArchiveFixture(
           else
             await db.execute(sql`UPDATE progressive_worker_reports SET acknowledged_at=clock_timestamp()
             WHERE sim_job_id=${executionId}::uuid AND sequence=${sequence}`);
-          if (!force)
+          if (!force && sequence > (options.quietStatusPrefix ?? 0))
             await db.execute(sql`INSERT INTO progressive_worker_evidence_receipts (sim_job_id,sequence,content_signature)
             VALUES (${executionId}::uuid,${sequence},${contentSignature})`);
         }
