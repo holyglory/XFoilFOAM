@@ -7,6 +7,9 @@ import { advanceProgressiveCfdStages } from "../src/progressive-cfd-stages";
 import {
   adoptProgressiveSubsonicPriority,
   effectiveProgressiveStageSql,
+  progressiveCohortReadinessSql,
+  progressiveCohortInitializedSql,
+  progressiveInitialCoverageCompleteSql,
 } from "../src/progressive-execution-policy";
 
 async function withCohortFixture(
@@ -111,6 +114,105 @@ async function benchmarkStages(db: DB, campaignId: string) {
 describe.skipIf(!process.env.DATABASE_URL)(
   "fast-v2 benchmark cohort lifecycle",
   () => {
+    it("preserves whole-cohort initialization and adaptive coverage for one pinned work", async () => {
+      await withCohortFixture(async ({ db, campaignId, generations }) => {
+        const generation = generations[0];
+        const [w] = await db.execute(
+          sql`SELECT work.id,work.target_id,g.epoch_id FROM progressive_work work JOIN progressive_generations g ON g.id=work.generation_id WHERE work.generation_id=${generation}::uuid AND work.stage=2`,
+        );
+        const workId = String(w.id),
+          epoch = String(w.epoch_id),
+          high = "b".repeat(64);
+        const addSibling = async (target: string, mach: number) => {
+          const sibling = randomUUID();
+          await db.execute(
+            sql`INSERT INTO polar_analysis_targets(id,physical) VALUES (${target},${JSON.stringify({ derived: { mach }, geometrySignature: target })}::jsonb)`,
+          );
+          await db.execute(sql`INSERT INTO progressive_generation_targets(generation_id,target_id,revision_id,angles,recipes)
+            SELECT generation_id,${target},${randomUUID()}::uuid,angles,recipes FROM progressive_generation_targets
+            WHERE generation_id=${generation}::uuid AND target_id=${w.target_id}`);
+          await db.execute(
+            sql`INSERT INTO progressive_work(id,generation_id,target_id,stage,state) VALUES (${sibling}::uuid,${generation}::uuid,${target},2,'pending')`,
+          );
+          return sibling;
+        };
+        await db.execute(
+          sql`ALTER TABLE pg_temp.progressive_cfd_units ADD COLUMN purpose text NOT NULL DEFAULT 'initial'`,
+        );
+        await db.execute(
+          sql`UPDATE progressive_generations SET stage=2 WHERE id=${generation}::uuid`,
+        );
+        await addSibling(high, 1.2);
+        const initial = randomUUID(),
+          adaptive = randomUUID();
+        await db.execute(
+          sql`INSERT INTO progressive_cfd_units(id,work_id,state,purpose) VALUES (${initial}::uuid,${workId}::uuid,'pending','initial')`,
+        );
+        const accepted = async (pinned: boolean) => {
+          const readiness = progressiveCohortReadinessSql(
+            epoch,
+            sql`generation.campaign_id=${campaignId}::uuid`,
+            true,
+            pinned ? workId : undefined,
+          );
+          return db.execute(sql`WITH ${readiness} SELECT unit.purpose,${progressiveCohortInitializedSql()} AS initialized,
+            (unit.purpose<>'adaptive' OR ${progressiveInitialCoverageCompleteSql()}) AS coverage,
+            (SELECT count(*)::int FROM progressive_cohort_readiness) AS computed
+            FROM progressive_cfd_units unit JOIN progressive_work work ON work.id=unit.work_id JOIN progressive_generations generation ON generation.id=work.generation_id
+            WHERE work.id=${workId}::uuid AND unit.state='pending' ORDER BY unit.purpose,unit.id`);
+        };
+        const parity = async (
+          initialized: boolean,
+          adaptiveCovered?: boolean,
+        ) => {
+          const full = await accepted(false),
+            scoped = await accepted(true);
+          const consumed = (rows: typeof full) =>
+            rows.map((r) => [r.purpose, r.initialized, r.coverage]);
+          expect(consumed(scoped)).toEqual(consumed(full));
+          expect(scoped.length).toBeGreaterThan(0);
+          expect(
+            scoped.every(
+              (r) => r.computed === 1 && r.initialized === initialized,
+            ),
+          ).toBe(true);
+          for (const row of scoped)
+            expect(row.coverage).toBe(
+              row.purpose === "adaptive" ? adaptiveCovered : true,
+            );
+        };
+        // Legacy generations have a NULL cohort covering every sibling.
+        await parity(false);
+        await db.execute(
+          sql`INSERT INTO campaign_progressive_execution_policies(campaign_id,policy) VALUES(${campaignId}::uuid,'subsonic-through-precise-v1')`,
+        );
+        await db.execute(sql`INSERT INTO progressive_generation_cohorts(generation_id,cohort,stage) VALUES
+          (${generation}::uuid,'low',2),(${generation}::uuid,'high',2)`);
+        await db.execute(
+          sql`INSERT INTO progressive_generation_cohort_targets VALUES (${generation}::uuid,${w.target_id},'low'),(${generation}::uuid,${high},'high')`,
+        );
+        await parity(true); // the uninitialized high sibling belongs to another cohort
+        await db.execute(
+          sql`INSERT INTO progressive_cfd_units(id,work_id,state,purpose) VALUES (${adaptive}::uuid,${workId}::uuid,'pending','adaptive')`,
+        );
+        await parity(true, false); // an initial unit is still pending
+        await db.execute(
+          sql`UPDATE progressive_cfd_units SET state='gap' WHERE id=${initial}::uuid`,
+        );
+        await parity(true, true);
+        const low = "c".repeat(64);
+        const lowWork = await addSibling(low, 0.24);
+        await db.execute(
+          sql`INSERT INTO progressive_generation_cohort_targets VALUES (${generation}::uuid,${low},'low')`,
+        );
+        await parity(false, false); // an uninitialized low sibling is a genuine barrier
+        await db.execute(
+          sql`INSERT INTO progressive_cfd_units(id,work_id,state,purpose) VALUES (${randomUUID()}::uuid,${lowWork}::uuid,'gap','initial')`,
+        );
+        await parity(true, true);
+      });
+    });
+
     it("waits for baselines, then admits low-Mach fast work without changing precise work or sealed setup", async () => {
       await withCohortFixture(
         async ({ db, campaignId, generations, preciseGenerationId }) => {

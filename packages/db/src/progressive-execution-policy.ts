@@ -101,7 +101,24 @@ export function progressiveCohortReadinessSql(
   epochId: string,
   generationFilter: SQL = sql`TRUE`,
   includeInitialized = true,
+  requestedWorkId?: string,
 ) {
+  const fullInitialCoverage = sql`NOT EXISTS (
+        SELECT 1 FROM progressive_work sibling
+        LEFT JOIN progressive_generation_cohort_targets member ON member.generation_id = sibling.generation_id AND member.target_id = sibling.target_id
+        WHERE sibling.generation_id = generation.id AND sibling.stage = 2
+          AND (active.cohort IS NULL OR member.cohort = active.cohort) AND sibling.state NOT IN ('complete', 'gap')
+          AND (NOT EXISTS (SELECT 1 FROM progressive_cfd_units initial WHERE initial.work_id = sibling.id AND initial.purpose = 'initial')
+            OR EXISTS (SELECT 1 FROM progressive_cfd_units initial WHERE initial.work_id = sibling.id
+              AND initial.purpose = 'initial' AND initial.state NOT IN ('complete', 'gap')))
+      )`;
+  // A work-scoped candidate consumes initial coverage only for a pending
+  // adaptive unit. When it does, evaluate the same whole-cohort condition.
+  const coverage = requestedWorkId
+    ? sql`CASE WHEN EXISTS (SELECT FROM progressive_cfd_units requested
+        WHERE requested.work_id=${requestedWorkId}::uuid AND requested.purpose='adaptive' AND requested.state='pending')
+        THEN ${fullInitialCoverage} END`
+    : fullInitialCoverage;
   return sql`progressive_cohort_readiness AS MATERIALIZED (
     SELECT generation.id AS generation_id, active.cohort, active.stage,
       ${
@@ -115,15 +132,7 @@ export function progressiveCohortReadinessSql(
       ) AS initialized,`
           : sql``
       }
-      NOT EXISTS (
-        SELECT 1 FROM progressive_work sibling
-        LEFT JOIN progressive_generation_cohort_targets member ON member.generation_id = sibling.generation_id AND member.target_id = sibling.target_id
-        WHERE sibling.generation_id = generation.id AND sibling.stage = 2
-          AND (active.cohort IS NULL OR member.cohort = active.cohort) AND sibling.state NOT IN ('complete', 'gap')
-          AND (NOT EXISTS (SELECT 1 FROM progressive_cfd_units initial WHERE initial.work_id = sibling.id AND initial.purpose = 'initial')
-            OR EXISTS (SELECT 1 FROM progressive_cfd_units initial WHERE initial.work_id = sibling.id
-              AND initial.purpose = 'initial' AND initial.state NOT IN ('complete', 'gap')))
-      ) AS initial_coverage_complete
+      ${coverage} AS initial_coverage_complete
     FROM progressive_generations generation JOIN sim_campaigns campaign ON campaign.id = generation.campaign_id
     LEFT JOIN campaign_progressive_execution_policies execution_policy ON execution_policy.campaign_id = campaign.id
     CROSS JOIN LATERAL (
@@ -134,6 +143,15 @@ export function progressiveCohortReadinessSql(
     WHERE generation.epoch_id = ${epochId}::uuid AND generation.status = 'active'
       AND generation.plan_revision_id = campaign.current_plan_revision_id
       AND ${generationFilter}
+      ${
+        requestedWorkId
+          ? sql`AND EXISTS (
+        SELECT FROM progressive_work pinned LEFT JOIN progressive_generation_cohort_targets pinned_member
+          ON pinned_member.generation_id=pinned.generation_id AND pinned_member.target_id=pinned.target_id
+        WHERE pinned.id=${requestedWorkId}::uuid AND pinned.generation_id=generation.id AND pinned.stage=active.stage
+          AND (active.cohort IS NULL OR pinned_member.cohort=active.cohort))`
+          : sql``
+      }
   )`;
 }
 

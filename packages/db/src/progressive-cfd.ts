@@ -419,6 +419,8 @@ export async function claimProgressiveCfdUnit(
       : sql`, ${progressiveCohortReadinessSql(
           String(epoch.id),
           sql`generation.campaign_id = ${campaign.id}`,
+          true,
+          input.preferredWorkId,
         )}`;
     const cohortInitialized = campaign.all_stage3
       ? sql`true`
