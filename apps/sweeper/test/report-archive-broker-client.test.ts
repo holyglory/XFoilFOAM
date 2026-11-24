@@ -79,6 +79,7 @@ async function fixture() {
   const baseUrl = "https://trusted-hub.example/api/sync/v1";
   const authToken = "isolated-registered-worker-secret";
   const row = {
+    worker_instance: randomUUID(),
     solver_id: envelope.solverId,
     promise_id: envelope.promiseId,
     auth_token: authToken,
