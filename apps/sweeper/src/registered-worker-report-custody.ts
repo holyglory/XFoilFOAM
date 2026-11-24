@@ -60,7 +60,8 @@ function checkLink(l: HubReportLink) {
           (n === 0 || a.signature > l.anchors[n - 1]!.signature) &&
           Number.isSafeInteger(a.sequence) &&
           a.sequence > 0 &&
-          a.sequence < p.sequence &&
+          (a.sequence < p.sequence ||
+            (a.sequence > p.sequence && reportHash.test(a.receiptReportSignature ?? ""))) &&
           Number.isFinite(a.aoa) &&
           (a.caseSlug === null || typeof a.caseSlug === "string") &&
           [a.workerResult, a.workerAttempt, a.hubResult, a.hubAttempt].every(
@@ -147,7 +148,7 @@ export async function originalState(db: DB, l: HubReportLink, lock = false) {
   if (!closed) return "source_ineligible";
   const witnesses =
     await db.execute(sql`SELECT a.signature FROM jsonb_to_recordset(${JSON.stringify(l.anchors)}::jsonb)
-    a(signature text,sequence bigint,aoa double precision,"caseSlug" text,"workerAttempt" uuid,"workerResult" uuid,"hubAttempt" uuid,"hubResult" uuid)
+    a(signature text,sequence bigint,"receiptReportSignature" text,aoa double precision,"caseSlug" text,"workerAttempt" uuid,"workerResult" uuid,"hubAttempt" uuid,"hubResult" uuid)
     JOIN progressive_worker_hub_receipts e ON e.sim_job_id=${p.executionId}::uuid AND e.point_content_signature=a.signature
       AND e.sequence=a.sequence AND e.result_attempt_id=a."workerAttempt" AND e.receipt->>'resultId'=a."hubResult"::text
       AND e.receipt->>'resultAttemptId'=a."hubAttempt"::text
@@ -160,6 +161,11 @@ export async function originalState(db: DB, l: HubReportLink, lock = false) {
       AND attempt.result_id=a."workerResult" AND attempt.aoa_deg=a.aoa AND attempt.engine_case_slug IS NOT DISTINCT FROM a."caseSlug"
     JOIN sim_jobs j ON j.id=attempt.sim_job_id AND j.airfoil_id=attempt.airfoil_id AND j.simulation_preset_revision_id=attempt.simulation_preset_revision_id
       AND j.bc_ids ? attempt.bc_id::text
+    WHERE a.sequence<${p.sequence} OR (a.sequence>${p.sequence}
+      AND origin.content_signature=a."receiptReportSignature"
+      AND EXISTS (SELECT FROM progressive_worker_reports stop WHERE stop.sim_job_id=j.id
+        AND stop.stopped_engine_job_id=j.engine_job_id AND stop.assignment_signature=origin.assignment_signature
+        AND stop.acknowledged_at IS NOT NULL AND stop.sequence>=a.sequence))
     ${lock ? sql`FOR SHARE OF e,assoc,st,origin,attempt NOWAIT` : sql``}`);
   return witnesses.length === l.anchors.length
     ? "ready"

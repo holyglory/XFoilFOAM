@@ -37,6 +37,8 @@ export interface ReportOwner {
 export interface PointAnchor {
   signature: string;
   sequence: number;
+  /** Exact transport that later delivered this point; older links keep their original shape. */
+  receiptReportSignature?: string;
   aoa: number;
   caseSlug: string | null;
   workerAttempt: string;

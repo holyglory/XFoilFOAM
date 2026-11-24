@@ -31,8 +31,8 @@ export function assertSourceKey(k: SourceKey) {
     "Expected exact native report key",
   );
 }
-// One immutable catalog member, the real hub dispatch, and independent earlier
-// scientific acknowledgements. Refuse the current head and receipt-owning rows.
+// A separate signed report must own each point acknowledgement. Keep its original
+// sequence even when the target observed the point before it was acknowledged.
 export async function hubReportLink(
   db: DB,
   owner: ReportOwner,
@@ -110,18 +110,29 @@ export async function hubReportLink(
   assertReportPin(p);
   const a =
     await db.execute(sql`SELECT s.point_content_signature AS signature,s.aoa_deg,s.case_slug,e.sequence,
-      e.remote_result_attempt_id,e.remote_result_id,e.result_attempt_id,attempt.result_id
+      e.remote_result_attempt_id,e.remote_result_id,e.result_attempt_id,attempt.result_id,
+      later.content_signature AS later_transport_signature
     FROM progressive_remote_report_sources s JOIN progressive_remote_evidence_receipts e USING(sim_job_id,point_content_signature)
     JOIN result_attempts attempt ON attempt.id=e.result_attempt_id AND attempt.sim_job_id=s.sim_job_id
       AND attempt.engine_job_id=s.sim_job_id::text AND attempt.engine_case_slug IS NOT DISTINCT FROM s.case_slug AND attempt.aoa_deg=s.aoa_deg
-    JOIN progressive_remote_report_sources earlier ON earlier.sim_job_id=e.sim_job_id AND earlier.sequence=e.sequence
-      AND earlier.point_content_signature=s.point_content_signature AND earlier.aoa_deg=s.aoa_deg AND earlier.case_slug IS NOT DISTINCT FROM s.case_slug
-    WHERE s.sim_job_id=${key.executionId}::uuid AND s.sequence=${key.sequence} AND e.sequence<s.sequence
+    JOIN progressive_remote_report_sources origin ON origin.sim_job_id=e.sim_job_id AND origin.sequence=e.sequence
+      AND origin.point_content_signature=s.point_content_signature AND origin.aoa_deg=s.aoa_deg AND origin.case_slug IS NOT DISTINCT FROM s.case_slug
+    LEFT JOIN LATERAL (
+      SELECT transport.content_signature FROM progressive_remote_reports transport
+      JOIN progressive_remote_report_inventories inventory ON inventory.sim_job_id=transport.sim_job_id AND inventory.sequence=transport.sequence
+        AND inventory.report_content_signature=transport.content_signature
+      JOIN progressive_remote_progress_receipts applied ON applied.sim_job_id=transport.sim_job_id AND applied.sequence=transport.sequence
+        AND applied.content_signature=transport.content_signature
+      WHERE e.sequence>s.sequence AND transport.sim_job_id=e.sim_job_id AND transport.sequence=e.sequence
+    ) later ON true
+    WHERE s.sim_job_id=${key.executionId}::uuid AND s.sequence=${key.sequence}
+      AND (e.sequence<s.sequence OR later.content_signature IS NOT NULL)
     ORDER BY s.point_content_signature COLLATE "C" LIMIT 513`);
   if (a.length !== Number(r.source_count)) return null;
   const anchors: PointAnchor[] = a.map((v) => ({
     signature: String(v.signature),
     sequence: Number(v.sequence),
+    ...(v.later_transport_signature ? { receiptReportSignature: String(v.later_transport_signature) } : {}),
     aoa: Number(v.aoa_deg),
     caseSlug: v.case_slug === null ? null : String(v.case_slug),
     workerAttempt: String(v.remote_result_attempt_id),

@@ -38,10 +38,10 @@ import {
   LARGE_REPORT_INTEGER,
 } from "./progressive-report-archive-fixture";
 
-export async function registeredWorkerRoundtrip(f: ArchiveFixture) {
+export async function registeredWorkerRoundtrip(f: ArchiveFixture, laterReceipt = false) {
   const { db, executionId: id } = f,
-    anchor = f.reports[1]!,
-    target = f.reports[2]!;
+    anchor = f.reports[laterReceipt ? 6 : 1]!,
+    target = f.reports[laterReceipt ? 1 : 2]!;
   const upstream = "https://registered-report.invalid/api/sync/v1",
     volume = await mkdtemp(join(tmpdir(), "hz-linked-report-"));
   vi.stubEnv("AIRFOILFOAM_REPORT_VOLUME_DIR", volume);
@@ -124,7 +124,7 @@ export async function registeredWorkerRoundtrip(f: ArchiveFixture) {
         SELECT id,${f.promiseId}::uuid,${owner.solverId}::uuid,1,${owner.assignmentSignature},request_payload->'remoteProgressiveExecution' FROM sim_jobs WHERE id=${id}::uuid`);
         await hub.execute(sql`INSERT INTO progressive_remote_reports(sim_job_id,sequence,content_signature,report) SELECT sim_job_id,sequence,content_signature,report
         FROM progressive_worker_reports WHERE sim_job_id=${id}::uuid`);
-        for (const r of physical) {
+        for (const r of laterReceipt ? [...physical, anchor] : physical) {
           const inventory = retainedReportInventory(
             reportJsonObject(parseReportJson(r.text)),
             r.contentSignature,
@@ -133,9 +133,11 @@ export async function registeredWorkerRoundtrip(f: ArchiveFixture) {
           VALUES(${id}::uuid,${r.sequence},${r.contentSignature},${inventory.signature},1)`);
           await hub.execute(sql`INSERT INTO progressive_remote_report_sources(sim_job_id,sequence,point_content_signature,aoa_deg,case_slug)
           VALUES(${id}::uuid,${r.sequence},${point},0,'archive-case')`);
-          await hub.execute(
-            sql`INSERT INTO progressive_remote_progress_receipts(sim_job_id,sequence,content_signature) VALUES(${id}::uuid,${r.sequence},${r.contentSignature})`,
-          );
+          if (!laterReceipt || r !== anchor) {
+            await hub.execute(
+              sql`INSERT INTO progressive_remote_progress_receipts(sim_job_id,sequence,content_signature) VALUES(${id}::uuid,${r.sequence},${r.contentSignature})`,
+            );
+          }
         }
         await hub.execute(sql`INSERT INTO progressive_remote_evidence_receipts(sim_job_id,sequence,point_content_signature,result_attempt_id,remote_result_attempt_id,remote_result_id)
         VALUES(${id}::uuid,${anchor.sequence},${point},${hubAttempt}::uuid,${nativeAttempt}::uuid,${nativeResult}::uuid)`);
@@ -149,7 +151,15 @@ export async function registeredWorkerRoundtrip(f: ArchiveFixture) {
           await hub.execute(sql`UPDATE progressive_remote_reports SET archive_bundle_id=${b!.id}::uuid,archived_at=now(),
           report=progressive_report_compact_header(report) WHERE sim_job_id=${id}::uuid AND sequence=${r.sequence}`);
         }
+        if (laterReceipt) {
+          expect(await hubReportLink(hub, owner, key)).toBeNull();
+          await hub.execute(sql`INSERT INTO progressive_remote_progress_receipts(sim_job_id,sequence,content_signature)
+            VALUES(${id}::uuid,${anchor.sequence},${anchor.contentSignature})`);
+        }
         link = (await hubReportLink(hub, owner, key))!;
+        expect(link.anchors[0]!.sequence).toBe(anchor.sequence);
+        if (laterReceipt) expect(link.anchors[0]!.receiptReportSignature).toBe(anchor.contentSignature);
+        else expect(link.anchors[0]).not.toHaveProperty("receiptReportSignature");
         for (const r of physical.slice(2)) {
           const next = await hubReportLink(hub, owner, {
             executionId: id,
@@ -245,14 +255,21 @@ export async function registeredWorkerRoundtrip(f: ArchiveFixture) {
       registeredReportRequest(db, { operation: "state", link });
     expect(await state()).toBe("science_not_settled");
     await db.execute(
-      sql`INSERT INTO progressive_worker_evidence_receipts(sim_job_id,sequence,content_signature) VALUES(${id}::uuid,2,${anchor.contentSignature})`,
+      sql`INSERT INTO progressive_worker_evidence_receipts(sim_job_id,sequence,content_signature) VALUES(${id}::uuid,${anchor.sequence},${anchor.contentSignature})`,
     );
     await db.execute(
-      sql`INSERT INTO progressive_worker_evidence_attempts(sim_job_id,sequence,point_content_signature,result_attempt_id) VALUES(${id}::uuid,2,${point},${nativeAttempt}::uuid)`,
+      sql`INSERT INTO progressive_worker_evidence_attempts(sim_job_id,sequence,point_content_signature,result_attempt_id) VALUES(${id}::uuid,${anchor.sequence},${point},${nativeAttempt}::uuid)`,
     );
     await db.execute(sql`INSERT INTO progressive_worker_hub_receipts(sim_job_id,sequence,point_content_signature,result_attempt_id,receipt)
-      VALUES(${id}::uuid,2,${point},${nativeAttempt}::uuid,${JSON.stringify({ resultId: nativeResult, resultAttemptId: hubAttempt })}::jsonb)`);
+      VALUES(${id}::uuid,${anchor.sequence},${point},${nativeAttempt}::uuid,${JSON.stringify({ resultId: nativeResult, resultAttemptId: hubAttempt })}::jsonb)`);
     expect(await state()).toBe("ready");
+    if (laterReceipt) {
+      const witness = link.anchors[0]!;
+      const altered = (fields: Partial<typeof witness>) => ({ ...link, anchors: [{ ...witness, ...fields }] });
+      await expect(registeredReportRequest(db, { operation: "state", link: altered({ receiptReportSignature: undefined }) })).rejects.toThrow("source proof");
+      await expect(registeredReportRequest(db, { operation: "state", link: altered({ sequence: key.sequence }) })).rejects.toThrow("source proof");
+      expect(await registeredReportRequest(db, { operation: "state", link: altered({ receiptReportSignature: "f".repeat(64) }) })).toBe("science_not_settled");
+    }
     const before = await archiveSnapshot(f);
     const at = new Date().toISOString();
     const stage = (bytes = restored) =>
@@ -267,7 +284,7 @@ export async function registeredWorkerRoundtrip(f: ArchiveFixture) {
     expect(await stage()).toBe("staged");
     expect(
       await db.execute(
-        sql`SELECT FROM progressive_worker_reports WHERE sim_job_id=${id}::uuid AND sequence=3 AND archived_at IS NULL`,
+        sql`SELECT FROM progressive_worker_reports WHERE sim_job_id=${id}::uuid AND sequence=${key.sequence} AND archived_at IS NULL`,
       ),
     ).toHaveLength(1);
     const reader = (consumer: string, committed: boolean) =>
@@ -333,7 +350,7 @@ export async function registeredWorkerRoundtrip(f: ArchiveFixture) {
       "one",
       ...shared,
       "--job=" + id,
-      "--seq=3",
+      `--seq=${key.sequence}`,
       "--signature=" + key.signature,
     ];
     let lost = true,
@@ -390,7 +407,7 @@ export async function registeredWorkerRoundtrip(f: ArchiveFixture) {
     });
     await runRegisteredReportCli(one, connect);
     const plan = JSON.parse(
-      await readFile(join(directory, id + ".3.plan.json"), "utf8"),
+      await readFile(join(directory, id + "." + key.sequence + ".plan.json"), "utf8"),
     );
     expect(plan.pin.generation).toBe(generation);
     expect(commits).toBe(0);
@@ -415,7 +432,7 @@ export async function registeredWorkerRoundtrip(f: ArchiveFixture) {
     await runRegisteredReportCli([...one, "--apply"], connect);
     expect((await checkpoint()).pending).toBeNull();
     const receipt = JSON.parse(
-      await readFile(join(directory, id + ".3.json"), "utf8"),
+      await readFile(join(directory, id + "." + key.sequence + ".json"), "utf8"),
     );
     expect(receipt.proof.originalSha256).toBe(link.pin.reportSha256);
     expect(receipt.api.generation).toBe(generation);
@@ -618,6 +635,18 @@ export async function registeredWorkerRoundtrip(f: ArchiveFixture) {
         readWorkerReportArchiveText(db, more[0]!.pin, { upstreamOnly: true }),
       ).rejects.toThrow("volume");
     });
+    if (laterReceipt) {
+      const [source] = await db.execute(sql`SELECT t.content_signature target_sig, o.content_signature receipt_sig,
+        e.sequence AS receipt_sequence, l.point_anchors->0->>'receiptReportSignature' linked_sig,
+        o.archived_at IS NULL AS receipt_owner_retained
+        FROM progressive_worker_reports t JOIN progressive_worker_hub_report_links l USING(sim_job_id,sequence)
+        JOIN progressive_worker_hub_receipts e ON e.sim_job_id=t.sim_job_id AND e.point_content_signature=${point}
+        JOIN progressive_worker_reports o ON o.sim_job_id=e.sim_job_id AND o.sequence=e.sequence
+        WHERE t.sim_job_id=${id}::uuid AND t.sequence=${key.sequence}`);
+      expect(source).toMatchObject({ target_sig: key.signature, receipt_sig: anchor.contentSignature,
+        linked_sig: anchor.contentSignature, receipt_owner_retained: true });
+      expect(Number(source!.receipt_sequence)).toBe(anchor.sequence);
+    }
     const corrupted = Buffer.from(packed);
     corrupted[corrupted.length - 1]! ^= 1;
     await writeFile(file, corrupted);
@@ -638,7 +667,7 @@ export async function registeredWorkerRoundtrip(f: ArchiveFixture) {
     ).toHaveLength(3);
     expect(
       await db.execute(
-        sql`SELECT FROM progressive_worker_evidence_receipts WHERE sim_job_id=${id}::uuid AND sequence=3`,
+        sql`SELECT FROM progressive_worker_evidence_receipts WHERE sim_job_id=${id}::uuid AND sequence=${key.sequence}`,
       ),
     ).toHaveLength(0);
   } finally {

@@ -332,13 +332,13 @@ describe.sequential(
       vi.unstubAllEnvs();
       installProgressiveReportArchiveReader(null);
     });
-    it("retires an unstaged native report through its independent hub generation and both registered volume readers", async () => {
+    it.each([false, true])("retires an unstaged native report through its independent hub generation and both registered volume readers, later acknowledgement=%s", async (later) => {
       const { registeredWorkerRoundtrip } =
         await import("./registered-worker-report-fixture");
-      await withArchiveFixture(client, "worker", registeredWorkerRoundtrip, {
+      await withArchiveFixture(client, "worker", f => registeredWorkerRoundtrip(f, later), {
         normalized: false,
         settled: false,
-        reportCount: 7,
+        reportCount: later ? 8 : 7,
       });
     });
 
