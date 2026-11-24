@@ -477,6 +477,87 @@ class ClosedReportOperator(unittest.TestCase):
         self.assertEqual([k for k,_ in adjacent(stream,4,lambda k:None,allow_gaps=True)],keys[:3])
         self.assertEqual(stream.tell(),0)
 
+    def test_observed_large_results_share_only_after_two_distinct_generations_and_resume_once(self):
+        # Run through the ordinary private inventory and its real on-disk cursor twice:
+        # as singleton objects and as two-member signed pages.
+        for width in (1, 2):
+            with self.subTest(width=width), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                job = "11111111-1111-4111-8111-111111111111"
+                scope = {"version":1, "sourceInstance":job, "solverId":job,
+                         "executions":[{"executionId":job,"reportHighWater":1}]}
+                frozen = root / "scope.json"
+                frozen.write_bytes(controller.compact(scope))
+                keys = [{"executionId":job,"sequence":n,"signature":controller.digest(str(n).encode())}
+                        for n in range(2, 2 + 6 * width)]
+                source = root / "keys.jsonl"
+                source.write_bytes(b"".join(controller.compact(k) + b"\n" for k in keys))
+                account = root / "account"
+                account.write_text("fixture@fixture.iam.gserviceaccount.com")
+                args = SimpleNamespace(apply=True, runtime_revision="a"*40, hub_host="hub", hz_host="hz",
+                    hz_api="api", hz_sweeper="sweeper", hub_sweeper="sweeper", state=root/"state",
+                    keys=source,keys_sha256=controller.digest(source.read_bytes()),frozen_scope=frozen,
+                    frozen_sha256=controller.digest(frozen.read_bytes()),page_members=width,limit=width,
+                    repeat_result_min_bytes=1000,hub_account_file=account)
+                modes, retired = [], []
+                lost_post_read = [True]
+                owner = {"executionId":job,"solverId":job,"promiseId":job,"workerInstance":job,
+                         "assignmentSignature":"a"*64}
+                def row(k):
+                    sequence = k["sequence"]
+                    digest = "a"*64 if sequence < 2+width*3 else "b"*64
+                    return {"source":{"owner":owner,"facts":{"sha256":k["signature"],"byteSize":1030}},
+                            "resultMeta":{"sha256":digest,"byteSize":1000},"archivedBundle":None,"stored":700}
+                def rpc(_args, role, m, _source):
+                    group = "items" in m
+                    items = m["items"] if group else [m]
+                    head = items[0]["key"]["sequence"]
+                    def pack(rows):
+                        return {"rows":rows} if group else rows[0]
+                    if m["op"] == "source":
+                        return pack([row(i["key"]) for i in items])
+                    if m["op"] == "hub":
+                        return pack([{"key":i["key"],"science":{}} for i in items])
+                    if m["op"] == "publish":
+                        share = m["shareResults"]
+                        modes.append((head,share))
+                        pins=[dict(i["key"],bucket="fixture",objectKey=str(head),generation=str(head),
+                              storedSha256="c"*64,crc32c="AAAAAA==",storedByteSize=350,
+                              archiveFormat="worker-result-ref-v1" if share else "jsonl",
+                              reportSha256=i["key"]["signature"],reportByteSize=1030)
+                              for i in items]
+                        return {"pins":pins,"deltaMembers":0} if group else pins[0]
+                    if m["op"] == "cloud":
+                        response=pack([{"pin":i["pin"],"reader":"cloud","science":{}} for i in items])
+                        response["generationDownloads"]=2 if items[0]["pin"]["archiveFormat"]=="worker-result-ref-v1" else 1
+                        return response
+                    if m["op"] == "settle":
+                        retired.extend(i["key"]["sequence"] for i in items)
+                        return pack([{"outcome":"retired"} for i in items])
+                    if m["committed"] and role=="api" and head==2+width*2 and lost_post_read[0]:
+                        lost_post_read[0]=False
+                        raise OSError("dropped third receipt")
+                    return pack([{"pin":i["pin"],"reader":m["reader"],"committed":m["committed"],"storedFieldBytes":90}
+                                 for i in items])
+                with patch.object(controller,"run_peer",side_effect=rpc), patch.object(controller.subprocess,"check_output",return_value=b"runtime"):
+                    controller.run(args)
+                    controller.run(args)
+                    self.assertTrue(json.loads((args.state/"progress.json").read_bytes())["lastVerifiedResult"]["twoGenerations"])
+                    with self.assertRaisesRegex(OSError,"dropped third"):
+                        controller.run(args)
+                    at_failure=json.loads((args.state/"progress.json").read_bytes())
+                    pending=at_failure["group" if width==2 else "pending"]
+                    self.assertTrue(pending["shareResults"])
+                    args.repeat_result_min_bytes=0
+                    controller.run(args)
+                    args.repeat_result_min_bytes=1000
+                    for _ in range(3):
+                        controller.run(args)
+                self.assertEqual([s for _,s in modes],[False,False,True,False,False,True])
+                self.assertEqual(retired,[k["sequence"] for k in keys])
+                final=json.loads((args.state/"progress.json").read_bytes())
+                self.assertEqual((final["completed"],final["archived"],final["after"]),(len(keys),len(keys),source.stat().st_size))
+
     def test_existing_result_keeps_its_ordinary_order_across_changed_neighbors(self):
         from closed_worker_report_pages import dictionary_prefix
         old = {"knownResult": True, "resultMeta": {"sha256":"a"*64, "byteSize":100}}

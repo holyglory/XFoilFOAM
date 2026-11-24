@@ -16,7 +16,7 @@ import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from closed_worker_report_pages import process_page, qualified_width
+from closed_worker_report_pages import process_page, qualified_width, previous_result_matches, remember_verified_result
 from closed_worker_report_sessions import ReadPeerStopped, ReportReadSessions, ROLE_READS
 from closed_worker_report_discovery import discovery_step, revisit_held, revisit_prefix
 from closed_worker_report_order import OrderedInventory, ordered_inventory, remember_member_size
@@ -172,7 +172,9 @@ def inputs(args):
         require(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", host), "Invalid existing SSH target")
     require(args.hub_host != args.hz_host and args.hz_api != args.hz_sweeper, "Independent role subjects required")
     require(1 <= getattr(args,"page_members",1) <= 8, "Page membership must be between one and eight")
-    if getattr(args,"page_members",1)>1 or getattr(args,"share_results",False):
+    minimum = getattr(args, "repeat_result_min_bytes", 0)
+    require(0 <= minimum <= 32 * 1024**2, "Measured repeat size must be within the existing native page bound")
+    if getattr(args,"page_members",1)>1 or getattr(args,"share_results",False) or minimum:
         require(args.hub_account_file and args.hub_account_file.is_file(),"Expected existing hub workload account file")
     require(1 <= args.limit <= 128, "Expected 1 to 128 bounded operations")
     s = json.loads(args.frozen_scope.read_bytes())
@@ -226,6 +228,7 @@ def run(args):
             progress.setdefault("archived", progress["completed"] - progress.get("held", 0))
             progress[column] = progress.get(column, 0) + 1
             remember_member_size(progress, done.get("pin"))
+            remember_verified_result(progress, done, getattr(args, "repeat_result_min_bytes", 0))
             progress.update(after=keys.tell(), completed=progress["completed"]+1, pending=None)
             durable(path,progress)
             print(json.dumps(dict(receipt=str(receipt),sequence=done["key"]["sequence"],settled=done["settled"])),flush=True)
@@ -262,7 +265,8 @@ def run(args):
             key = json.loads(line)
             scope = scope_for(key)
             def rpc(role, op, **fields):
-                return run_peer(args, role, dict({"shareResults":getattr(args,"share_results",False)},scope=scope,key=key,runtime=runtime,op=op,**fields), peer)
+                selected = state.get("shareResults", False) if state else getattr(args, "share_results", False)
+                return run_peer(args, role, dict({"shareResults":selected},scope=scope,key=key,runtime=runtime,op=op,**fields), peer)
             state = progress["pending"]
             receipt = receipt_dir / f"{progress['completed']:08d}.json"
             def hold(proof):
@@ -292,7 +296,9 @@ def run(args):
                             continue
                         return
                     require(not initial["archivedBundle"], "Use the existing native receipt")
-                    state = dict(key=key, initial=initial, pin=None, shareResults=getattr(args,"share_results",False))
+                    share = getattr(args, "share_results", False) or previous_result_matches(
+                        progress, key, initial, getattr(args, "repeat_result_min_bytes", 0))
+                    state = dict(key=key, initial=initial, pin=None, shareResults=share)
                     if args.apply:
                         progress["pending"] = state
                         durable(path,progress)
@@ -440,6 +446,8 @@ if __name__ == "__main__":
     parser.add_argument("--pause-file",type=Path)
     parser.add_argument("--width-qualification", type=Path, help="Optional measured eight-member budget for the exact ordinary four-member scope")
     parser.add_argument("--width-qualification-sha256", help="SHA-256 of that local qualification")
+    parser.add_argument("--repeat-result-min-bytes",type=int,default=0,
+                        help="Share a matching result above this size after two successive verified generations (0 disables)")
     parser.add_argument("--share-results",action="store_true",help="Use a verified same-execution worker dictionary for matching closed reports")
     parser.add_argument("--same-execution-pages",action="store_true",help="Pack consecutive inventory keys from one execution across sequence gaps")
     parser.add_argument("--page-members",type=int,default=1)

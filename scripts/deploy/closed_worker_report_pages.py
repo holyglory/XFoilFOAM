@@ -70,6 +70,71 @@ def fits_wide_page(rows, limits, *, prefix=False):
     return total + (8 - len(rows)) * result_bytes <= limits["maxPageBytes"]
 
 
+def previous_result_matches(progress, key, original, minimum):
+    """A scheduling hint from completed reads; publication still verifies the SQL token and its physical anchor."""
+    prior = progress.get("lastVerifiedResult")
+    token = original.get("resultMeta")
+    return bool(minimum and prior and token and prior["twoGenerations"]
+                and prior["through"] == progress["completed"] and prior["lastSequence"] < key["sequence"]
+                and prior["owner"] == original["source"]["owner"] and prior["token"] == token
+                and key["executionId"] == prior["owner"]["executionId"] and token["byteSize"] >= minimum)
+
+
+def remember_verified_result(progress, receipt, minimum):
+    """Remember only one execution and token in the same atomic checkpoint as its receipt."""
+    previous = progress.pop("lastVerifiedResult", None)
+    if not minimum:
+        return
+    grouped = "keys" in receipt
+    keys = receipt["keys"] if grouped else [receipt["key"]]
+    settled = receipt["settled"] if grouped else [receipt["settled"]]
+    if any(row["outcome"] not in ("retired", "already_retired") for row in settled):
+        return
+    rows = receipt["initials"] if grouped else [receipt["initial"]]
+    pins = receipt["publication"]["pins"] if grouped else [receipt["pin"]]
+    token = rows[-1].get("resultMeta")
+    owner = rows[-1]["source"].get("owner")
+    # A receipt created before result-token metadata was collected can still advance.
+    if (not owner or not token or token["byteSize"] < minimum
+            or any(row.get("resultMeta") != token for row in rows)):
+        return
+    # Do not infer a repeated generation from a large FK or duplicate retries.
+    # A receipt is published only after all three independent readers finish.
+    for i, (key, row, pin) in enumerate(zip(keys, rows, pins, strict=True)):
+        facts = row["source"]["facts"]
+        if ((pin["executionId"], pin["sequence"], pin["signature"]) !=
+                (key["executionId"], key["sequence"], key["signature"])
+                or pin["reportSha256"] != facts["sha256"] or pin["reportByteSize"] != facts["byteSize"]
+                or row["source"]["owner"] != owner):
+            return
+        for role in ("cloud", "api", "sweeper"):
+            pre = receipt["before"][role][i] if grouped else receipt["before"][role]
+            post = receipt["after"][role][i] if grouped else receipt["after"][role]
+            if pre["pin"] != pin or post["pin"] != pin or pre["reader"] != role or post["reader"] != role:
+                return
+            if role == "cloud":
+                if pre["science"] != post["science"]:
+                    return
+            elif pre["committed"] or not post["committed"]:
+                return
+    last = pins[-1]
+    physical = [last[k] for k in ("bucket", "objectKey", "generation", "storedSha256", "storedByteSize", "crc32c")]
+    continuous = (previous and previous["through"] == progress["completed"]
+                  and previous["lastSequence"] < keys[0]["sequence"] and previous["owner"] == owner
+                  and previous["token"] == token and previous["physical"] != physical)
+    if last["archiveFormat"] == "worker-result-ref-v1":
+        # This signed envelope already has a cold source. It can continue the
+        # same verified run, but cannot bootstrap one by itself.
+        if not continuous:
+            return
+    elif last["archiveFormat"] != "jsonl":
+        return
+    progress["lastVerifiedResult"] = {
+        "through": progress["completed"] + len(keys), "lastSequence": keys[-1]["sequence"],
+        "owner": owner, "token": token, "physical": physical, "twoGenerations": bool(continuous),
+    }
+
+
 def dictionary_prefix(rows):
     """Keep indexed results out of unrelated full pages, in the original signed order."""
     if not rows:
@@ -109,6 +174,8 @@ def adjacent(stream, limit, validate, allow_gaps=False):
 def process_page(args, stream, limit, progress, path, bind, runtime, peer_digest,
                  scope_for, ask, durable, require, width_limits=None):
     pending = progress.get("group")
+    minimum = getattr(args, "repeat_result_min_bytes", 0)
+    share = getattr(args, "share_results", False)
     # On resume the saved exact member list owns the page, even if the preferred width or grouping changed.
     entries = adjacent(stream, len(pending["items"]) if pending else limit, scope_for,
                        allow_gaps=bool(pending) or getattr(args,"same_execution_pages",False))
@@ -120,10 +187,12 @@ def process_page(args, stream, limit, progress, path, bind, runtime, peer_digest
         return 0
     scope = scope_for(entries[0][0])
     def rpc(role, op, items, **extra):
+        extra.setdefault("shareResults", share)
         return ask(role, dict(key=items[0]["key"],scope=scope,op=op,items=items,**extra))
     if pending:
         require([k for k,_ in entries] == [i["key"] for i in pending["items"]], "Pending page keys differ")
         items = pending["items"]
+        share = pending.get("shareResults", False)
     else:
         items=[{"key":k} for k,_ in entries]
         # Most large sources are ineligible for the measured eight-member budget.
@@ -135,8 +204,14 @@ def process_page(args, stream, limit, progress, path, bind, runtime, peer_digest
             combined = originals + tail
             if fits_wide_page(combined, trial):
                 originals = combined
-        if getattr(args, "share_results", False):
+        if share:
             originals = dictionary_prefix(originals)
+        elif originals and previous_result_matches(progress, entries[0][0], originals[0], minimum):
+            share = True
+            for i, row in enumerate(originals[1:], 1):
+                if row["resultMeta"] != originals[0]["resultMeta"]:
+                    originals = originals[:i]
+                    break
         if len(originals)<2:
             return 0
         items=[dict(key=i["key"],source=v["source"]) for i,v in zip(items,originals)]
@@ -160,7 +235,7 @@ def process_page(args, stream, limit, progress, path, bind, runtime, peer_digest
         count=len(items)
         if not pending:
             pending=dict(items=items,initials=originals[:count],end=entries[-1][1],publication=None,
-                         shareResults=getattr(args,"share_results",False))
+                         shareResults=share)
             if trial and count == 8:
                 pending["widthQualificationSha256"] = args.width_qualification_sha256
             progress["group"]=pending
@@ -212,6 +287,7 @@ def process_page(args, stream, limit, progress, path, bind, runtime, peer_digest
     end=entries[-1][1]
     progress.setdefault("archived",progress["completed"]-progress.get("held",0))
     remember_member_size(progress, saved["publication"]["pins"][-1])
+    remember_verified_result(progress, saved, minimum)
     progress.update(after=end,completed=progress["completed"]+count,archived=progress["archived"]+count,group=None)
     durable(path,progress)
     stream.seek(end)
