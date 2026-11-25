@@ -782,10 +782,22 @@ def reclaim_closed_progressive_files(job_root: Path, proofs: list[dict], expecte
                     missing = job_root / _relative(name)
                     _require(not missing.exists() and not missing.is_symlink(), "previously inventoried file changed")
             if done_file.exists():
-                _require(stored is not None and not files and _json(done_file, 65536) == receipt, "completed receipt or files changed")
+                _require(stored is not None and _json(done_file, 65536) == receipt, "completed receipt changed")
                 _require(expected_plan is None or expected_plan == digest, "completed plan mismatch")
+                restored_bytes = 0
+                restore_ledger = job_root / "closed_progressive_working_file_restores"
+                if not historic and preserve_solver is None and (restore_ledger.exists() or restore_ledger.is_symlink()):
+                    from .working_file_recovery import restored_working_files
+                    records, restored_bytes = restored_working_files(job_root, digest, rows, proofs, files)
+                    receipt_files.extend(records)
+                else:
+                    _require(not files, "completed receipt or files changed")
+                allocation = _allocation(job_root, rows, files, stored, receipt_files)
+                if allocation is not None and restored_bytes:
+                    allocation["restoredWorkingFileAllocatedBytes"] = restored_bytes
+                    allocation["netAttributedAllocatedBytes"] -= restored_bytes
                 return {**receipt, **extra, "state": "planned" if expected_plan is None else "reclaimed", "replayed": True,
-                        "allocation": _allocation(job_root, rows, files, stored, receipt_files)}
+                        "allocation": allocation}
             if expected_plan is None:
                 return {**receipt, **extra, "state": "planned", "replayed": False}
             _require(digest == expected_plan, "job changed after preflight")

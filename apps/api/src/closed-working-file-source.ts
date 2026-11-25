@@ -255,6 +255,13 @@ export function registerClosedWorkingFileSource(app: FastifyInstance, db: DB) {
           return reply
             .code(404)
             .send({ error: "Source belongs to a separate registered reader" });
+        // The volume restorer rebinds the same terminal and historical owner after the full read.
+        if ((req.query as { verifyOwner?: string }).verifyOwner === "1")
+          return reply.code(204)
+            .header("cache-control", "private, no-store")
+            .header("x-content-sha256", remote.storedSha256)
+            .header("x-gcs-generation", remote.generation)
+            .send();
         const response = await readRegisteredArchive(
           owner.baseUrl + "/evidence-uploads/" + key.upload + "/download",
           owner.authToken,

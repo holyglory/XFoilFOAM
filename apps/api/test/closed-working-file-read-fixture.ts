@@ -1,5 +1,7 @@
-import { spawn } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { once } from "node:events";
+import { promisify } from "node:util";
+import { createHash } from "node:crypto";
 import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
@@ -197,6 +199,52 @@ uvicorn.Server(uvicorn.Config(main.create_app(),log_level="error",lifespan="off"
       env.engineUrl + "/jobs/" + job + "/files/cases/foil/transient_a0/1/p",
     );
     expect(await live.text()).toBe("latest pressure");
+    // A busy numerical host can serve a known original from the shared volume before a gateway switch.
+    const recoverScript = `
+import json,sys
+from pathlib import Path
+from types import SimpleNamespace
+from airfoilfoam import working_file_restore, working_file_recovery
+vol,origin,token,job,rel,plan,sha,size,generation,mode=sys.argv[1:]
+working_file_restore.GATEWAY=origin+"/internal/closed-working-files"
+print(json.dumps(working_file_recovery.recover(Path(vol), job, rel, plan, sha, int(size), generation, SimpleNamespace(control_plane_token=token), publish=mode=="restore")))
+`;
+    const head = w.sources[0]!;
+    const digest = createHash("sha256").update(bytes).digest("hex");
+    async function recover(mode: string, gen = head.generation) {
+      const { stdout } = await promisify(execFile)(python, [
+        "-B", "-c", recoverScript, volume, origin, token, job, working, w.plan, digest, String(bytes.length), gen, mode,
+      ], { cwd: root, env: { ...process.env, PYTHONPATH: join(root, "src") } });
+      return JSON.parse(stdout) as { state: string; native: { inode: string; allocatedBytes: number } | null };
+    }
+    await expect(recover("restore", "1")).rejects.toThrow();
+    expect((await recover("verify")).state).toBe("verified-absent");
+    const originalPath = join(volume, "jobs", job, working);
+    await expect(readFile(originalPath)).rejects.toThrow();
+    setUpstreamFailure("historical-owner");
+    await expect(recover("restore")).rejects.toThrow();
+    setUpstreamFailure(null);
+    const returned = await recover("restore");
+    expect(returned.state).toBe("restored");
+    expect(returned.native!.allocatedBytes).toBeGreaterThanOrEqual(bytes.length);
+    expect((await recover("restore")).native).toEqual(returned.native);
+    expect(await readFile(originalPath)).toEqual(bytes);
+    const replayed = await registerClosedWorkingFileRead(db, new RetentionFiles(volume), job, w.plan,
+      AbortSignal.timeout(45_000), true);
+    expect(replayed).toEqual(row.witness);
+    setUpstreamFailure("bad-bytes");
+    for (const url of [direct, media]) {
+      const restored = await fetch(url);
+      expect(restored.status).toBe(200);
+      expect(Buffer.from(await restored.arrayBuffer())).toEqual(bytes);
+    }
+    setUpstreamFailure(null);
+    await writeFile(originalPath, "foreign replacement");
+    await expect(recover("restore")).rejects.toThrow();
+    expect(await readFile(originalPath, "utf8")).toBe("foreign replacement");
+    await expect(registerClosedWorkingFileRead(db, new RetentionFiles(volume), job, w.plan,
+      AbortSignal.timeout(45_000), true)).rejects.toThrow();
+    await writeFile(originalPath, bytes);
     const [after] =
       await db.execute(sql`SELECT strip_report->'closedProgressiveFiles' AS receipt,
       request_payload#>>'{remoteProgressiveExecution,contentSignature}' AS assignment FROM sim_jobs WHERE id=${job}::uuid`);

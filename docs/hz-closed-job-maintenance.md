@@ -194,3 +194,14 @@ flock --shared --nonblock /tmp/airfoils-pro-deploy.lock docker exec -w /app/apps
 Preview uses a read-only database connection. Registration replays the actual completed native plan and restores every bound original through the ordinary registered worker. It compares the prior database receipt before recording the sibling entry. The old receipt and native files retain their identities. Registration can be retried after a capacity deferral.
 
 One cold download at a time is admitted per gateway process. It verifies the compressed size, SHA-256 and CRC32C, the original tar identity, the entire signed manifest and the selected member. An unavailable generation, changed receipt or ambiguous source fails closed. Missing worker state stays visible until a registered source can serve it. Earlier out-of-window fields and processor partitions require independent exact custody before they can be retired. The historical raw-file gateway retains its separate ownership of original evidence paths.
+
+### Reopening one working file while the pool is busy
+
+The installed HZ sweeper can restore a registered ordinary member to its original location on the shared results volume while numerical jobs continue. Use this when an existing client needs a particular missing path before the native gateway can switch. First preview and register the completed plan as described above. Use the real stored job ID, literal relative path, completed plan SHA, original member SHA and size, and exact decimal GCS generation.
+
+```sh
+scripts/deploy/restore-closed-working-file.sh "$revision" "$sweeper" verify "$job" "$relative" "$plan" "$member_sha" "$bytes" "$generation"
+scripts/deploy/restore-closed-working-file.sh "$revision" "$sweeper" restore "$job" "$relative" "$plan" "$member_sha" "$bytes" "$generation"
+```
+
+Verification authenticates the complete archive and the selected member. Publication rechecks registered ownership, takes the closed job's execution lock, fsyncs the new file and links it into place without replacing an existing file. The separate restore receipt binds the exact name and bytes to the original plan and generation. A retry after interruption reuses that receipt and the unchanged owner. Ordinary completed-plan replay accounts for the restored allocation. Check the entire member through both the native and Node URLs against its original SHA. The regular file remains available to the incumbent gateway when the cloud is busy. This procedure adds allocated bytes and leaves the existing reclamation receipt intact.

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 from contextlib import ExitStack
+from dataclasses import dataclass
 from functools import lru_cache
 import hashlib
 import json
@@ -20,8 +21,6 @@ from urllib.error import HTTPError, URLError
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
 import google_crc32c
-from fastapi import HTTPException
-from fastapi.responses import FileResponse
 
 from .evidence_store import (MAX_EVIDENCE_MANIFEST_BYTES, EvidenceStoreError, RemoteEvidencePointer,
                              _safe_extraction_capacity, extract_verified_evidence_archive)
@@ -210,21 +209,28 @@ def _materialize(folder, url, token, selected, identity, deadline):
     return file
 
 
-class _LeasedFile(FileResponse):
-    def __init__(self, file, lease, identity, generation, plan):
-        super().__init__(file, media_type=mimetypes.guess_type(file.name)[0] or "application/octet-stream",
-                         headers={"x-content-sha256": identity[1], "x-gcs-generation": str(generation), "x-working-file-plan": plan})
-        self.lease = lease
-
-    async def __call__(self, scope, receive, send):
-        try:
-            await super().__call__(scope, receive, send)
-        finally:
-            self.lease.close()
+class WorkingFileSourceError(RuntimeError):
+    def __init__(self, status, message, *, retry=False):
+        super().__init__(message)
+        self.status = status
+        self.retry = retry
 
 
-def original_file(root: Path, rel: str, target: Path, settings):
-    """Return a verified native FileResponse, or None for an unregistered original."""
+@dataclass
+class VerifiedWorkingFile:
+    file: Path
+    lease: ExitStack
+    identity: tuple[int, str]
+    plan: str
+    inventory: str
+    source: dict
+    pointer: RemoteEvidencePointer
+    url: str
+    snapshot: tuple
+
+
+def verified_working_file(root: Path, rel: str, target: Path, settings, *, allow_present=False):
+    """Open the exact registered member and transfer ownership of its temporary-file lease."""
     if not _UUID.fullmatch(root.name) or not _key(rel) or not rel.startswith("cases/") or root / rel != target:
         return None
     parts = PurePosixPath(rel).parts
@@ -246,7 +252,7 @@ def original_file(root: Path, rel: str, target: Path, settings):
             if identity is None:
                 return None
             if not _COLD_READ.acquire(blocking=False):
-                raise HTTPException(503, "Working-file restore is busy", headers={"Retry-After": "2"})
+                raise WorkingFileSourceError(503, "Working-file restore is busy", retry=True)
             lease.callback(_COLD_READ.release)
             url = f"{GATEWAY}/{root.name}/{plan}/{digest}/{parts[1]}"
             with _open(url, settings.control_plane_token, 10) as response:
@@ -265,18 +271,44 @@ def original_file(root: Path, rel: str, target: Path, settings):
             if re.fullmatch(r"transient_a[0-9]+", segment):
                 stem = "/".join((*parts[:2], segment.removeprefix("transient_"), "evidence"))
                 sources = [s for s in sources if s["directory"] == stem]
-            matches = [s for row in sources if (s := _matching_member(root, PurePosixPath(rel), row, identity))]
+            matches = [(row, matched) for row in sources
+                       if (matched := _matching_member(root, PurePosixPath(rel), row, identity))]
             _require(len(matches) == 1, "missing or ambiguous immutable working-file member")
+            row, selected = matches[0]
             temp = Path(lease.enter_context(TemporaryDirectory(prefix="working-file-restore-")))
-            file = _materialize(temp, url, settings.control_plane_token, matches[0], identity, time.monotonic() + 1200)
-            _require((_stat_key(intent), _stat_key(done)) == snapshot and not target.exists()
+            file = _materialize(temp, url, settings.control_plane_token, selected, identity, time.monotonic() + 1200)
+            _require((_stat_key(intent), _stat_key(done)) == snapshot and (allow_present or not target.exists())
                      and not target.is_symlink() and root / rel == target.resolve(), "original path or owner changed during restore")
-            return _LeasedFile(file, lease.pop_all(), identity, matches[0][3].generation, plan)
+            return VerifiedWorkingFile(file, lease.pop_all(), identity, plan, digest, row, selected[3], url, snapshot)
         except HTTPError as error:
             if error.code == 404:
                 return None
-            raise HTTPException(503 if error.code == 503 else 409, "Registered working-file source unavailable") from error
+            raise WorkingFileSourceError(503 if error.code == 503 else 409, "Registered working-file source unavailable") from error
         except (TimeoutError, URLError, OSError) as error:
-            raise HTTPException(503, "Working-file source or restore storage unavailable") from error
+            raise WorkingFileSourceError(503, "Working-file source or restore storage unavailable") from error
         except (KeyError, TypeError, ValueError, EvidenceStoreError) as error:
-            raise HTTPException(409, "Working-file receipt or immutable source differs") from error
+            raise WorkingFileSourceError(409, "Working-file receipt or immutable source differs") from error
+
+def original_file(root: Path, rel: str, target: Path, settings):
+    """Serve the verified member with byte-range support through the native endpoint."""
+    from fastapi import HTTPException
+    from fastapi.responses import FileResponse
+
+    try:
+        item = verified_working_file(root, rel, target, settings)
+    except WorkingFileSourceError as exc:
+        headers = {"Retry-After": "2"} if exc.retry else None
+        raise HTTPException(exc.status, str(exc), headers=headers) from exc
+    if item is None:
+        return None
+
+    class LeasedResponse(FileResponse):
+        async def __call__(self, scope, receive, send):
+            try:
+                await super().__call__(scope, receive, send)
+            finally:
+                item.lease.close()
+
+    return LeasedResponse(item.file, media_type=mimetypes.guess_type(item.file.name)[0] or "application/octet-stream",
+                          headers={"x-content-sha256": item.identity[1], "x-gcs-generation": str(item.pointer.generation),
+                                   "x-working-file-plan": item.plan})

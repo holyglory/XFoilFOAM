@@ -28,7 +28,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends python3-venv \
     && /opt/airfoilfoam-retention/bin/pip install --no-cache-dir --require-hashes --only-binary=:all: -r /tmp/retention-requirements.lock \
     && /opt/airfoilfoam-retention/bin/pip check \
     && rm /tmp/*-requirements.lock
-COPY src/airfoilfoam/__init__.py src/airfoilfoam/automatic_retention.py src/airfoilfoam/closed_progressive_retention.py src/airfoilfoam/config.py src/airfoilfoam/evidence_runtime.py src/airfoilfoam/evidence_store.py src/airfoilfoam/retention.py /app/src/airfoilfoam/
-RUN PYTHONPATH=/app/src /opt/airfoilfoam-retention/bin/python -B -c "from airfoilfoam.automatic_retention import main"
+COPY src/airfoilfoam/__init__.py src/airfoilfoam/automatic_retention.py src/airfoilfoam/closed_progressive_retention.py src/airfoilfoam/config.py src/airfoilfoam/evidence_runtime.py src/airfoilfoam/evidence_store.py src/airfoilfoam/retention.py src/airfoilfoam/working_file_restore.py src/airfoilfoam/working_file_recovery.py /app/src/airfoilfoam/
+RUN PYTHONPATH=/app/src /opt/airfoilfoam-retention/bin/python -B -c "from airfoilfoam.automatic_retention import main; from airfoilfoam.working_file_recovery import recover"
 
 FROM node-workspace AS node-runtime
