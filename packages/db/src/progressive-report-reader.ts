@@ -276,7 +276,7 @@ async function materializeProgressiveReport(
     !/^[1-9][0-9]{0,19}$/.test(String(stored.generation)) || stored.mime_type !== "application/gzip" ||
     stored.compression !== "gzip" ||
     (stored.archive_format !== "jsonl" && !((stored.archive_format === "legacy-jsonl" || stored.archive_format === "worker-result-ref-v1") && reference.sourceKind === "worker")
-      && !(stored.archive_format === "shared-result-v1" && reference.sourceKind === "remote")) ||
+      && stored.archive_format !== "shared-result-v1") ||
     !SHA256.test(String(stored.stored_sha256)) || !Number.isSafeInteger(storedByteSize) || storedByteSize < 1 ||
     !/^[A-Za-z0-9+/]{6}==$/.test(String(stored.crc32c)) ||
     !Number.isSafeInteger(Number(stored.member_count)) || Number(stored.member_count) < 1 ||

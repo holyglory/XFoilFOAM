@@ -342,6 +342,13 @@ describe.sequential(
       });
     });
 
+    it.each([false, true])("restores both shared hub objects on HZ and keeps only referenced SQL payloads, other reference=%s", async (keepPayload) => {
+      const { registeredWorkerRoundtrip } = await import("./registered-worker-report-fixture");
+      await withArchiveFixture(client, "worker", f => registeredWorkerRoundtrip(f, false, true, keepPayload), {
+        normalized: false, settled: false, reportCount: 7,
+      });
+    });
+
     it("crosses from the final warm report into cold conflict aliases using one verified original generation", async () => {
       const { readLegacyPage, legacyScopeHash, encodeLegacyPage } =
         await import("../src/legacy-report-storage");

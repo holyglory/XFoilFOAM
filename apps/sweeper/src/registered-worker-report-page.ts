@@ -4,7 +4,9 @@ import {
   type HubReportLink,
 } from "./registered-worker-report-read";
 import type { SourceKey } from "./registered-worker-report-hub";
+import type { PinnedScientificResult } from "./registered-shared-report";
 export type ReaderProof = {
+  scientific?: PinnedScientificResult;
   signature: string;
   generation: string;
   sha256: string;
@@ -110,6 +112,7 @@ export async function applyRegisteredPage(
       peers.write("stage_page", {
         links: links.slice(i),
         bytes: i ? null : cloud.packed,
+        ...(cloud.dependencies && !i ? { dependencies: cloud.dependencies } : {}),
         cloudAt: cloud.at,
       }),
     ["staged", "already_retired"],

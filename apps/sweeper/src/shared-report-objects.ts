@@ -14,6 +14,7 @@ export interface ReportObjectPin {
   size: number;
   crc32c: string;
 }
+export type ReportObjectReader = Pick<ReportObjects, "bucket" | "prefix" | "read">;
 export interface ReportObjects {
   bucket: string;
   prefix: string;

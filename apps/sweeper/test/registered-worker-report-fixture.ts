@@ -38,7 +38,9 @@ import {
   LARGE_REPORT_INTEGER,
 } from "./progressive-report-archive-fixture";
 
-export async function registeredWorkerRoundtrip(f: ArchiveFixture, laterReceipt = false) {
+import { exerciseRegisteredSharedWorkingCopy, readSharedFixtureHub, registeredSharedFixture } from "./registered-worker-shared-fixture";
+
+export async function registeredWorkerRoundtrip(f: ArchiveFixture, laterReceipt = false, sharedFormat = false, keepPayload = false) {
   const { db, executionId: id } = f,
     anchor = f.reports[laterReceipt ? 6 : 1]!,
     target = f.reports[laterReceipt ? 1 : 2]!;
@@ -84,9 +86,7 @@ export async function registeredWorkerRoundtrip(f: ArchiveFixture, laterReceipt 
       sql`UPDATE progressive_worker_reports SET acknowledged_at=clock_timestamp() WHERE sim_job_id=${id}::uuid`,
     );
     const owner = await nativeReportOwner(db, id);
-    const account = "disposable@fixture.iam.gserviceaccount.com",
-      bucket = "disposable-registered-hub-report";
-    const generation = "1795380355397132441";
+    const account = "disposable@fixture.iam.gserviceaccount.com";
     const line = (r: typeof target, signature = r.contentSignature) =>
       JSON.stringify({
         sourceKind: "remote",
@@ -101,11 +101,15 @@ export async function registeredWorkerRoundtrip(f: ArchiveFixture, laterReceipt 
       r.text +
       "}";
     const physical = f.reports.slice(1, 6);
-    const packed = gzipSync(physical.map((r) => line(r)).join("\n") + "\n"),
+    const sharedObjects = sharedFormat ? await registeredSharedFixture(owner, physical) : undefined;
+    const bucket = sharedObjects?.bucket ?? "disposable-registered-hub-report";
+    const generation = sharedObjects?.pin.generation ?? "1795380355397132441";
+    let material: Awaited<ReturnType<typeof readSharedFixtureHub>> | undefined;
+    const packed = sharedObjects?.manifest ?? gzipSync(physical.map((r) => line(r)).join("\n") + "\n"),
       sha = archiveSha256(packed),
       crc = new CRC32C();
     crc.update(packed);
-    const objectKey = `progressive-reports/v1/remote/${id}/${sha}.jsonl.gz`;
+    const objectKey = sharedObjects?.pin.key ?? `progressive-reports/v1/remote/${id}/${sha}.jsonl.gz`;
     vi.stubEnv("AIRFOILFOAM_EVIDENCE_BUCKET", bucket);
     let link!: HubReportLink, restored!: Buffer;
     const more: HubReportLink[] = [];
@@ -143,8 +147,8 @@ export async function registeredWorkerRoundtrip(f: ArchiveFixture, laterReceipt 
         VALUES(${id}::uuid,${anchor.sequence},${point},${hubAttempt}::uuid,${nativeAttempt}::uuid,${nativeResult}::uuid)`);
         const [b] =
           await hub.execute(sql`INSERT INTO progressive_report_archive_bundles(source_kind,sim_job_id,bucket,object_key,generation,stored_sha256,
-        stored_byte_size,crc32c,member_count,first_sequence,last_sequence,verified_at)
-        VALUES('remote',${id}::uuid,${bucket},${objectKey},${generation},${sha},${packed.length},${crc.toString()},5,2,6,clock_timestamp()) RETURNING id`);
+        stored_byte_size,crc32c,member_count,first_sequence,last_sequence,verified_at,archive_format)
+        VALUES('remote',${id}::uuid,${bucket},${objectKey},${generation},${sha},${packed.length},${crc.toString()},5,2,6,clock_timestamp(),${sharedFormat ? "shared-result-v1" : "jsonl"}) RETURNING id`);
         for (const r of physical) {
           await hub.execute(sql`INSERT INTO progressive_report_archive_members(bundle_id,source_kind,sim_job_id,sequence,member_kind,content_signature,report_sha256,report_byte_size)
           VALUES(${b!.id}::uuid,'remote',${id}::uuid,${r.sequence},'report',${r.contentSignature},${reportTextIdentity(r.text).sha256},${Buffer.byteLength(r.text)})`);
@@ -174,6 +178,13 @@ export async function registeredWorkerRoundtrip(f: ArchiveFixture, laterReceipt 
         await expect(
           hubReportLink(hub, { ...owner, workerInstance: randomUUID() }, key),
         ).rejects.toThrow("dispatch");
+        if (sharedObjects) {
+          const scan = await registeredReportRequest(hub, { operation: "scan", workerInstance, solverId: owner.solverId,
+            after: { job: id, seq: physical[0]!.sequence - 1 } }) as { keys: { signature: string }[] };
+          expect(scan.keys.some(k=>k.signature===key.signature)).toBe(true);
+          material = await readSharedFixtureHub(sharedObjects, account, [link, more[0]!]);
+          throw rollback;
+        }
         const cloud = vi.fn<typeof fetch>(async (url) => {
           const u = new URL(String(url));
           if (u.host === "metadata.google.internal")
@@ -271,6 +282,34 @@ export async function registeredWorkerRoundtrip(f: ArchiveFixture, laterReceipt 
       expect(await registeredReportRequest(db, { operation: "state", link: altered({ receiptReportSignature: "f".repeat(64) }) })).toBe("science_not_settled");
     }
     const before = await archiveSnapshot(f);
+    if (sharedObjects) {
+      if (!material) throw new Error("Missing authenticated shared hub originals");
+      // The native normalizer can move any of these bodies while a hub catalog
+      // scan is advancing. Resolve the exact original; prune only the final FK.
+      const normalized = keepPayload ? [link, more[1]!] : [link, more[0]!];
+      await db.execute(sql`UPDATE progressive_report_storage_policy SET normalization_enabled=true WHERE id=1`);
+      const refs = await db.execute(sql`UPDATE progressive_worker_reports
+        SET result_payload_hash=public.store_progressive_report_result(report->'result'),
+          report=jsonb_set(report,'{result}',public.progressive_report_result_header(report->'result'),false)
+        WHERE sim_job_id=${id}::uuid AND sequence IN (${sql.join(normalized.map(x=>sql`${x.pin.sequence}`),sql`,`)})
+        RETURNING result_payload_hash`);
+      expect(refs).toHaveLength(2);
+      expect(refs[0]!.result_payload_hash).toBe(refs[1]!.result_payload_hash);
+      const claim = await registeredReportRequest(db, { operation: "key", key });
+      expect(claim).toMatchObject({status:"candidate", normalized:true});
+      const filter = (sharedHub: boolean) => registeredReportRequest(db, { operation:"filter", workerInstance,
+        solverId:owner.solverId, keys:[{...key, sharedHub}] });
+      expect(await filter(false)).toEqual([]);
+      expect(await filter(true)).toEqual([key]);
+      await exerciseRegisteredSharedWorkingCopy(db, [link, more[0]!], material, volume);
+      const remaining = await db.execute(sql`SELECT content_hash FROM progressive_report_result_payloads
+        WHERE content_hash=${String(refs[0]!.result_payload_hash)}`);
+      expect(remaining).toHaveLength(keepPayload ? 1 : 0);
+      const final = await archiveSnapshot(f);
+      for (const k of ["result_attempts","results","promise","progressive_worker_evidence_attempts","progressive_worker_hub_receipts"])
+        expect(final[k]).toEqual(before[k]);
+      return;
+    }
     const at = new Date().toISOString();
     const stage = (bytes = restored) =>
       registeredReportRequest(db, {

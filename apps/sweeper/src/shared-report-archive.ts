@@ -19,6 +19,7 @@ import {
   hashPattern,
   sha256,
   type ReportObjects,
+  type ReportObjectReader,
   type ReportObjectPin,
 } from "./shared-report-objects";
 
@@ -48,7 +49,7 @@ export interface SharedReportOwner {
   promiseId: string;
   assignmentSignature: string;
 }
-interface SharedResult {
+export interface SharedResult {
   pin: ReportObjectPin;
   rawSize: number;
 }
@@ -69,14 +70,14 @@ interface RestoredResult {
   canonical: string;
   sources?: ReturnType<typeof retainedReportInventory>["sources"];
 }
-const resultKey = (s: ReportObjects, hash: string) =>
+const resultKey = (s: ReportObjectReader, hash: string) =>
   `${s.prefix}/shared-result-v1/results/${hash.slice(0, 2)}/${hash}.json.gz`;
-const manifestKey = (s: ReportObjects, id: string, hash: string) =>
+const manifestKey = (s: ReportObjectReader, id: string, hash: string) =>
   `${s.prefix}/shared-result-v1/remote/${id}/${hash}.json.gz`;
 const gunzip = (bytes: Buffer, max: number) =>
   utf8.decode(gunzipSync(bytes, { maxOutputLength: max }));
 
-function verifyManifest(s: ReportObjects, value: SharedReportManifest) {
+function verifyManifest(s: ReportObjectReader, value: SharedReportManifest) {
   if (
     value.format !== SHARED_REPORT_FORMAT ||
     !uuid.test(value.executionId) ||
@@ -140,11 +141,11 @@ function verifyManifest(s: ReportObjects, value: SharedReportManifest) {
 // Keep one decoded scientific generation per storage client. Every reuse still
 // requires a successful fresh pinned media GET with the same compressed bytes.
 const lastResult = new WeakMap<
-  ReportObjects,
+  ReportObjectReader,
   { pin: string; value: RestoredResult }
 >();
 async function resultText(
-  s: ReportObjects,
+  s: ReportObjectReader,
   hash: string,
   r: SharedResult,
   signal?: AbortSignal,
@@ -234,7 +235,7 @@ function restore(
 }
 
 async function readManifest(
-  store: ReportObjects,
+  store: ReportObjectReader,
   pin: ReportObjectPin,
   job: string,
   signal?: AbortSignal,
@@ -288,15 +289,15 @@ async function withSharedReadDeadline<T>(
 }
 
 export function readSharedReport(
-  store: ReportObjects,
+  store: ReportObjectReader,
   id: ProgressiveReportArchiveReadIdentity,
   signal?: AbortSignal,
 ) {
-  return withSharedReadDeadline(signal, bounded => readPinnedSharedReport(store, id, bounded));
+  return withSharedReadDeadline(signal, async bounded => (await readPinnedSharedReport(store, id, bounded)).text);
 }
 
 async function selectSharedMember(
-  store: ReportObjects,
+  store: ReportObjectReader,
   id: ProgressiveReportArchiveReadIdentity,
   signal: AbortSignal,
 ) {
@@ -362,26 +363,39 @@ async function selectSharedMember(
 }
 
 async function readPinnedSharedReport(
-  store: ReportObjects,
+  store: ReportObjectReader,
   id: ProgressiveReportArchiveReadIdentity,
   signal: AbortSignal,
+  owner?: SharedReportOwner,
 ) {
   const { m, manifest, cache } = await selectSharedMember(store, id, signal);
+  if (owner && (manifest.executionId !== owner.executionId || manifest.solverId !== owner.solverId ||
+      manifest.promiseId !== owner.promiseId || manifest.assignmentSignature !== owner.assignmentSignature))
+    throw new Error("Shared report belongs to another registered dispatch");
   const hash = m.resultHash;
+  if (owner && hash && manifest.results[hash]!.rawSize > id.reportByteSize)
+    throw new Error("Registered scientific result exceeds its signed report");
   const value = hash
     ? cache?.result?.hash === hash
       ? cache.result.value
       : await resultText(store, hash, manifest.results[hash], signal)
     : undefined;
   if (cache && hash && value) cache.result = { hash, value };
-  return restore(manifest, m, value);
+  return { text: restore(manifest, m, value), scientific: hash ? { hash, ...manifest.results[hash]! } : null };
+}
+
+/** Read an exact remote member for its registered native owner, keeping both physical pins. */
+export function readOwnedSharedReport(
+  store: ReportObjectReader, id: ProgressiveReportArchiveReadIdentity, owner: SharedReportOwner, signal?: AbortSignal,
+) {
+  return withSharedReadDeadline(signal, bounded => readPinnedSharedReport(store, id, bounded, owner));
 }
 
 /** A previously issued polar/raw receipt already proves the exact point.
  * Authenticate both registered generations and reconstruct the original byte
  * digest without parsing or retaining unrelated points from a cumulative result. */
 export function verifySharedReportGeneration(
-  store: ReportObjects,
+  store: ReportObjectReader,
   id: ProgressiveReportArchiveReadIdentity,
   signal?: AbortSignal,
 ) {
@@ -390,7 +404,7 @@ export function verifySharedReportGeneration(
 }
 
 async function verifyPinnedSharedGeneration(
-  store: ReportObjects,
+  store: ReportObjectReader,
   id: ProgressiveReportArchiveReadIdentity,
   signal: AbortSignal,
 ) {

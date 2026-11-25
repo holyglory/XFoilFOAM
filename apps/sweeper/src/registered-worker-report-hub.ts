@@ -1,4 +1,6 @@
 import { Readable } from "node:stream";
+import { SHARED_REPORT_FORMAT } from "./shared-report-archive";
+import { openRegisteredSharedPage } from "./registered-shared-report";
 import { verifyProgressiveRemoteExecution, type DB } from "@aerodb/db";
 import { sql } from "drizzle-orm";
 import { configuredDeploymentRole } from "./config";
@@ -7,6 +9,7 @@ import {
   assertReportPin,
   assertRegisteredPage,
   inspectHubReportPage,
+  verifyInventory,
   maxPacked,
   reportUuid,
   reportHash,
@@ -58,7 +61,7 @@ export async function hubReportLink(
     JOIN progressive_remote_report_inventories inv ON inv.sim_job_id=r.sim_job_id AND inv.sequence=r.sequence AND inv.report_content_signature=r.content_signature
     JOIN progressive_remote_progress_receipts applied ON applied.sim_job_id=r.sim_job_id AND applied.sequence=r.sequence AND applied.content_signature=r.content_signature
     WHERE r.sim_job_id=${key.executionId}::uuid AND r.sequence=${key.sequence} AND r.content_signature=${key.signature}
-      AND r.archived_at IS NOT NULL AND b.verified_at IS NOT NULL AND b.archive_format='jsonl'
+      AND r.archived_at IS NOT NULL AND b.verified_at IS NOT NULL AND b.archive_format IN ('jsonl','shared-result-v1')
       AND pr.status IN ('expired','cancelled','fulfilled') AND job.status IN ('done','failed','cancelled')
       AND (job.ingest_lease_token IS NULL OR job.ingest_lease_expires_at<=clock_timestamp())
       AND EXISTS(SELECT FROM progressive_cfd_execution_stops s WHERE s.sim_job_id=r.sim_job_id AND s.engine_job_id=job.engine_job_id)
@@ -150,6 +153,31 @@ export async function hubReportLink(
   };
 }
 export class ExistingHubReportStore extends HubWorkloadGcs {
+  async restoreForWorker(links: readonly HubReportLink[], needBytes: boolean) {
+    assertRegisteredPage(links);
+    const head = links[0]!.pin;
+    if (head.archiveFormat !== SHARED_REPORT_FORMAT) {
+      const bytes = await this.restorePage(links);
+      return { packed: needBytes ? bytes.toString("base64") : null, sha: head.storedSha256, at: new Date().toISOString() };
+    }
+    requireReportProof(configuredDeploymentRole() === "hub" && head.bucket === this.bucket &&
+      this.bucket === process.env.AIRFOILFOAM_EVIDENCE_BUCKET, "Foreign registered shared archive bucket");
+    const checked = await openRegisteredSharedPage(links.map(l => l.pin), links[0]!.owner, async (p, limit, signal) => {
+      signal?.throwIfAborted();
+      const url = this.url(p.key, p.generation);
+      const metadata = JSON.parse((await boundedHubBody(await this.call(url.toString()), 65536)).toString("utf8"));
+      requireReportProof(metadata.bucket === this.bucket && metadata.name === p.key && metadata.generation === p.generation &&
+        metadata.size === String(p.size) && metadata.crc32c === p.crc32c && metadata.contentType === "application/gzip" &&
+        !metadata.contentEncoding && metadata.metadata?.sha256 === p.sha256, "Pinned shared hub object metadata differs");
+      url.searchParams.set("alt", "media");
+      return boundedHubBody(await this.call(url.toString()), Math.min(limit, p.size));
+    });
+    for (const l of links) verifyInventory(l, checked.members.get(l.pin.sequence)!.text);
+    const root = checked.objects.get(head.storedSha256)!;
+    return { packed: needBytes ? root.bytes.toString("base64") : null, sha: head.storedSha256,
+      dependencies: needBytes ? [...checked.objects.values()].filter(p => p !== root).map(p => p.bytes.toString("base64")) : [],
+      at: new Date().toISOString() };
+  }
   restore(link: HubReportLink) {
     return this.restorePage([link]);
   }

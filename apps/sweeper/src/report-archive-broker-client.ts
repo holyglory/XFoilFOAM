@@ -12,6 +12,7 @@ import {
   type ProgressiveReportArchiveStoredIdentity,
 } from "@aerodb/db/progressive-report-archive";
 import { createHash } from "node:crypto";
+import { registeredSharedKey } from "./registered-shared-report";
 import { currentClosedWorkerPageRead } from "./closed-worker-page-read";
 import { open } from "node:fs/promises";
 import { Readable } from "node:stream";
@@ -242,11 +243,9 @@ export async function readWorkerReportArchiveText(
 ): Promise<string> {
   if (
     identity.sourceKind === "worker" &&
-    identity.archiveFormat === "jsonl" &&
     typeof identity.objectKey === "string" &&
-    identity.objectKey.endsWith(
-      `/remote/${identity.executionId}/${identity.storedSha256}.jsonl.gz`,
-    )
+    ((identity.archiveFormat === "jsonl" && identity.objectKey.endsWith(`/remote/${identity.executionId}/${identity.storedSha256}.jsonl.gz`)) ||
+      (identity.archiveFormat === "shared-result-v1" && identity.objectKey.endsWith(registeredSharedKey(identity))))
   ) {
     return readRegisteredWorkerReportArchiveText(db, identity, options);
   }

@@ -44,6 +44,17 @@ import {
   hzAttemptRpcFailure,
 } from "./hz-attempt-transfer-fence";
 
+import { SHARED_REPORT_FORMAT } from "./shared-report-archive";
+import { MissingRegisteredSharedObject, openRegisteredSharedPage, volumeSharedObject } from "./registered-shared-report";
+
+function sharedDependencies(value: unknown): Buffer[] {
+  if (value === undefined) return [];
+  requireReportProof(Array.isArray(value) && value.length <= 8 &&
+    value.every(v => typeof v === "string") &&
+    value.reduce((n: number, v: string) => n + v.length, 0) <= 4 * Math.ceil((32 * 1024 ** 2 + 8 * 65536) / 3) + 32,
+    "Invalid bounded registered shared dependencies");
+  return value.map(v => boundedPacked(v));
+}
 export async function registeredReaderBuild() {
   const files = [
     "registered-worker-report-rpc.ts",
@@ -51,6 +62,11 @@ export async function registeredReaderBuild() {
     "registered-worker-report-hub.ts",
     "registered-worker-report-custody.ts",
     "registered-worker-report-page.ts",
+    "registered-shared-report.ts",
+    "shared-report-archive.ts",
+    "shared-report-objects.ts",
+    "report-archive-source-proof.ts",
+    "../../../packages/db/migrations/0239_registered_worker_shared_hub_reports.sql",
     "report-archive-broker-client.ts",
     "worker-report-volume.ts",
     "hz-attempt-transfer-fence.ts",
@@ -104,7 +120,7 @@ export async function registeredReportRequest(db: DB, m: Message) {
       await db.execute(sql`WITH page AS MATERIALIZED (SELECT sim_job_id,sequence,content_signature,bundle_id
       FROM progressive_report_archive_members WHERE source_kind='remote' AND member_kind='report' AND (sim_job_id,sequence)>(${m.after.job}::uuid,${m.after.seq}::bigint)
       ORDER BY sim_job_id,sequence LIMIT 128)
-      SELECT p.sim_job_id,p.sequence,p.content_signature,(b.archive_format='jsonl' AND reg.id IS NOT NULL) AS eligible
+      SELECT p.sim_job_id,p.sequence,p.content_signature,b.archive_format,(b.archive_format IN('jsonl','shared-result-v1') AND reg.id IS NOT NULL) AS eligible
       FROM page p JOIN progressive_report_archive_bundles b ON b.id=p.bundle_id AND b.sim_job_id=p.sim_job_id AND b.source_kind='remote'
       LEFT JOIN progressive_remote_dispatches d ON d.sim_job_id=p.sim_job_id AND d.solver_id=${m.solverId}::uuid
       LEFT JOIN registered_remote_solvers reg ON reg.id=d.solver_id AND reg.instance_id=${m.workerInstance} AND reg.revoked_at IS NULL
@@ -116,6 +132,7 @@ export async function registeredReportRequest(db: DB, m: Message) {
           executionId: r.sim_job_id,
           sequence: Number(r.sequence),
           signature: r.content_signature,
+          ...(r.archive_format === SHARED_REPORT_FORMAT ? { sharedHub: true } : {}),
         })),
       after: rows.length
         ? { job: rows.at(-1)!.sim_job_id, seq: Number(rows.at(-1)!.sequence) }
@@ -140,15 +157,8 @@ export async function registeredReportRequest(db: DB, m: Message) {
         "Pending hub member or scientific source changed",
       );
     }
-    const bytes = await new ExistingHubReportStore(
-      String(process.env.AIRFOILFOAM_EVIDENCE_BUCKET ?? ""),
-      m.account,
-    ).restorePage(links);
-    return {
-      packed: m.needBytes === true ? bytes.toString("base64") : null,
-      at: new Date().toISOString(),
-      sha: links[0]!.pin.storedSha256,
-    };
+    return new ExistingHubReportStore(String(process.env.AIRFOILFOAM_EVIDENCE_BUCKET ?? ""), m.account)
+      .restoreForWorker(links, m.needBytes === true);
   }
   if (m.operation === "describe" || m.operation === "restore") {
     requireReportProof(
@@ -161,11 +171,8 @@ export async function registeredReportRequest(db: DB, m: Message) {
       isDeepStrictEqual(link, m.expected),
       "Existing report generation or owner changed",
     );
-    const packed = await new ExistingHubReportStore(
-      String(process.env.AIRFOILFOAM_EVIDENCE_BUCKET ?? ""),
-      m.account,
-    ).restore(link);
-    return { packed: packed.toString("base64"), at: new Date().toISOString() };
+    return new ExistingHubReportStore(String(process.env.AIRFOILFOAM_EVIDENCE_BUCKET ?? ""), m.account)
+      .restoreForWorker([link], true);
   }
   requireReportProof(role === "remote-solver", "Expected worker report reader");
   if (m.operation === "filter") {
@@ -183,9 +190,9 @@ export async function registeredReportRequest(db: DB, m: Message) {
     for (const k of m.keys) assertSourceKey(k);
     return await db
       .execute(
-        sql`SELECT k."executionId",k.sequence,k.signature FROM jsonb_to_recordset(${JSON.stringify(m.keys)}::jsonb) k("executionId" uuid,sequence int8,signature text)
+        sql`SELECT k."executionId",k.sequence,k.signature FROM jsonb_to_recordset(${JSON.stringify(m.keys)}::jsonb) k("executionId" uuid,sequence int8,signature text,"sharedHub" boolean)
       JOIN progressive_worker_reports r ON r.sim_job_id=k."executionId" AND r.sequence=k.sequence AND r.content_signature=k.signature
-      WHERE r.result_payload_hash IS NULL AND r.archived_at IS NULL AND r.acknowledged_at IS NOT NULL AND r.stopped_engine_job_id IS NULL
+      WHERE (r.result_payload_hash IS NULL OR k."sharedHub" IS TRUE) AND r.archived_at IS NULL AND r.acknowledged_at IS NOT NULL AND r.stopped_engine_job_id IS NULL
       AND NOT EXISTS(SELECT FROM progressive_worker_evidence_receipts s WHERE s.sim_job_id=r.sim_job_id AND s.sequence=r.sequence)
       AND NOT EXISTS(SELECT FROM progressive_worker_report_conflicts c WHERE c.sim_job_id=r.sim_job_id AND c.sequence=r.sequence)
       ORDER BY k."executionId",k.sequence`,
@@ -221,6 +228,15 @@ export async function registeredReportRequest(db: DB, m: Message) {
       instance: l.owner.workerInstance,
       solver: l.owner.solverId,
     });
+    if (l.pin.archiveFormat === SHARED_REPORT_FORMAT) {
+      try {
+        await openRegisteredSharedPage((m.links as HubReportLink[]).map(x => x.pin), l.owner, volumeSharedObject);
+        return true;
+      } catch (error) {
+        if (error instanceof MissingRegisteredSharedObject) return false;
+        throw error;
+      }
+    }
     const stream = await readWorkerReportVolume(l.pin);
     stream?.destroy();
     return Boolean(stream);
@@ -230,12 +246,12 @@ export async function registeredReportRequest(db: DB, m: Message) {
       db,
       m.links,
       m.bytes === null ? null : boundedPacked(m.bytes),
-      m.cloudAt,
+      m.cloudAt, sharedDependencies(m.dependencies),
     );
   if (m.operation === "retire_page")
     return retireRegisteredPage(db, m.links, m.cloudAt, m.api, m.sweeper);
   if (m.operation === "stage")
-    return stageRegisteredReport(db, m.link, boundedPacked(m.bytes), m.cloudAt);
+    return stageRegisteredReport(db, m.link, boundedPacked(m.bytes), m.cloudAt, sharedDependencies(m.dependencies));
   if (m.operation === "retire")
     return retireRegisteredReport(db, m.link, m.cloudAt, m.api);
   if (m.operation === "read" || m.operation === "read_page") {

@@ -17,6 +17,12 @@ import { configuredDeploymentRole } from "./config";
 import { registeredWorkerArchiveOwner } from "./report-archive-broker-client";
 import { readWorkerReportVolume } from "./worker-report-volume";
 
+import { SHARED_REPORT_FORMAT } from "./shared-report-archive";
+import {
+  openRegisteredSharedPage, registeredSharedKey, volumeSharedObject,
+  type PinnedScientificResult,
+} from "./registered-shared-report";
+
 export const reportUuid = /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/;
 export const reportHash = /^[a-f0-9]{64}$/;
 export const maxPacked = 32 * 1024 ** 2;
@@ -61,7 +67,7 @@ export function requireReportProof(
   if (!value) throw new Error(message);
 }
 export function assertReportPin(p: ReportPin) {
-  assertProgressiveReportArchiveIdentity(p);
+  assertProgressiveReportArchiveIdentity(p, p.archiveFormat === SHARED_REPORT_FORMAT ? SHARED_REPORT_FORMAT : "jsonl");
   requireReportProof(
     p.sourceKind === "worker" &&
       p.memberKind === "report" &&
@@ -84,9 +90,8 @@ export function assertReportPin(p: ReportPin) {
       /^[a-z0-9][a-z0-9_.-]{1,220}[a-z0-9]$/.test(p.bucket) &&
       /^[A-Za-z0-9_./-]+$/.test(p.objectKey) &&
       p.objectKey.split("/").every((k) => k && k !== "." && k !== "..") &&
-      p.objectKey.endsWith(
-        `/remote/${p.executionId}/${p.storedSha256}.jsonl.gz`,
-      ) &&
+      p.objectKey.endsWith(p.archiveFormat === SHARED_REPORT_FORMAT ? registeredSharedKey(p) :
+        `/remote/${p.executionId}/${p.storedSha256}.jsonl.gz`) &&
       BigInt(p.generation) <= 18446744073709551615n,
     "Invalid registered hub report pin",
   );
@@ -151,7 +156,7 @@ export function assertRegisteredPage(links: readonly HubReportLink[]) {
     );
   }
 }
-type PageMember = { pin: ReportPin; text: string };
+type PageMember = { pin: ReportPin; text: string; scientific?: PinnedScientificResult };
 async function exactHubMembers(
   source: Readable,
   pins: readonly ReportPin[],
@@ -195,7 +200,7 @@ async function exactHubMembers(
   );
   return rows;
 }
-function verifyInventory(link: HubReportLink, text: string) {
+export function verifyInventory(link: Pick<HubReportLink, "pin" | "anchors" | "inventory">, text: string) {
   const p = link.pin;
   const inv = retainedReportInventory(
     reportJsonObject(parseReportJson(text)),
@@ -251,14 +256,16 @@ export async function withRegisteredWorkingPage<T>(
     isDeepStrictEqual(owner, links[0]!.owner),
     "Registered working page owner differs",
   );
-  const file = await readWorkerReportVolume(p);
-  requireReportProof(file, "Registered hub report working copy unavailable");
-  const members = await exactHubMembers(
-    file,
-    links.map((l) => l.pin),
-    owner,
-    AbortSignal.timeout(15000),
-  );
+  const pins = links.map(l => l.pin);
+  let members: Map<number, PageMember>;
+  if (p.archiveFormat === SHARED_REPORT_FORMAT) {
+    members = (await openRegisteredSharedPage(pins, owner, volumeSharedObject)).members;
+    for (const link of links) verifyInventory(link, members.get(link.pin.sequence)!.text);
+  } else {
+    const file = await readWorkerReportVolume(p);
+    requireReportProof(file, "Registered hub report working copy unavailable");
+    members = await exactHubMembers(file, pins, owner, AbortSignal.timeout(15000));
+  }
   try {
     return await localPage.run({ db, owner, members }, work);
   } finally {
@@ -279,7 +286,8 @@ export async function readRegisteredWorkerReportArchiveText(
   signal?.throwIfAborted();
   const owner = await nativeReportOwner(db, pin.executionId);
   const [binding] =
-    await db.execute(sql`SELECT l.hub_bundle_id FROM progressive_worker_hub_report_links l
+    await db.execute(sql`SELECT l.hub_bundle_id ${pin.archiveFormat === SHARED_REPORT_FORMAT
+      ? sql`,l.shared_result_object,l.point_anchors,l.inventory_signature` : sql``} FROM progressive_worker_hub_report_links l
     JOIN progressive_worker_reports r ON r.sim_job_id=l.sim_job_id AND r.sequence=l.sequence
     WHERE l.hub_source_kind='remote' AND l.sim_job_id=${pin.executionId}::uuid AND l.sequence=${pin.sequence} AND l.read_identity=${JSON.stringify(pin)}::jsonb
     AND l.worker_instance=${owner.workerInstance}::uuid AND l.registered_solver_id=${owner.solverId}::uuid
@@ -293,11 +301,18 @@ export async function readRegisteredWorkerReportArchiveText(
       page.db === db &&
         isDeepStrictEqual(owner, page.owner) &&
         row &&
-        isDeepStrictEqual(row.pin, pin),
+        isDeepStrictEqual(row.pin, pin) &&
+        (pin.archiveFormat !== SHARED_REPORT_FORMAT || isDeepStrictEqual(row.scientific, binding.shared_result_object)),
       "Product reader differs from registered working page",
     );
     signal?.throwIfAborted();
     return row.text;
+  }
+  if (pin.archiveFormat === SHARED_REPORT_FORMAT) {
+    const result = (await openRegisteredSharedPage([pin], owner, volumeSharedObject, signal)).members.get(pin.sequence)!;
+    requireReportProof(isDeepStrictEqual(result.scientific, binding.shared_result_object), "Registered scientific generation differs");
+    verifyInventory({ pin, inventory: String(binding.inventory_signature), anchors: binding.point_anchors as PointAnchor[] }, result.text);
+    return result.text;
   }
   const file = await readWorkerReportVolume(pin);
   requireReportProof(file, "Registered hub report working copy unavailable");

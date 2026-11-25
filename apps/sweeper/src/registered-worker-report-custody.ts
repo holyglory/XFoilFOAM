@@ -29,12 +29,16 @@ import {
   reportUuid,
   reportHash,
   requireReportProof,
+  verifyInventory,
   type HubReportLink,
 } from "./registered-worker-report-read";
 import {
   assertSourceKey,
   type SourceKey,
 } from "./registered-worker-report-hub";
+
+import { SHARED_REPORT_FORMAT } from "./shared-report-archive";
+import { openRegisteredSharedPage, stageSharedObjects, volumeSharedObject, type PinnedScientificResult } from "./registered-shared-report";
 
 function checkLink(l: HubReportLink) {
   const { pin: p, owner: o } = l;
@@ -84,9 +88,9 @@ export async function checkNativeKey(db: DB, k: SourceKey) {
     WHERE r.sim_job_id=${k.executionId}::uuid AND r.sequence=${k.sequence}`);
   if (!r || r.content_signature !== k.signature)
     return { status: "different_source" as const };
-  if ((r.archived_at && !r.linked) || r.result_payload_hash)
+  if (r.archived_at && !r.linked)
     return { status: "other_storage" as const };
-  return { status: "candidate" as const, owner: o };
+  return { status: "candidate" as const, owner: o, ...(r.result_payload_hash ? { normalized: true } : {}) };
 }
 export async function originalState(db: DB, l: HubReportLink, lock = false) {
   checkLink(l);
@@ -126,7 +130,7 @@ export async function originalState(db: DB, l: HubReportLink, lock = false) {
         AND m.content_signature=${p.signature} AND m.report_sha256=${p.reportSha256} AND m.report_byte_size=${p.reportByteSize}`);
     return exact ? "already_retired" : "other_storage";
   }
-  if (r.result_payload_hash) return "other_storage";
+  if (r.result_payload_hash && p.archiveFormat !== SHARED_REPORT_FORMAT) return "other_storage";
   if (
     !r.acknowledged_at ||
     r.stopped_engine_job_id ||
@@ -171,20 +175,25 @@ export async function originalState(db: DB, l: HubReportLink, lock = false) {
     ? "ready"
     : "science_not_settled";
 }
-async function assertBinding(db: DB, l: HubReportLink) {
+async function assertBinding(db: DB, l: HubReportLink, scientific?: PinnedScientificResult) {
   const { pin: p, owner: o } = l;
   const [proof] =
-    await db.execute(sql`SELECT FROM progressive_worker_hub_report_links WHERE sim_job_id=${p.executionId}::uuid AND sequence=${p.sequence}
+    await db.execute(sql`SELECT ${p.archiveFormat === SHARED_REPORT_FORMAT ? sql`shared_result_object` : sql`1`} FROM progressive_worker_hub_report_links WHERE sim_job_id=${p.executionId}::uuid AND sequence=${p.sequence}
     AND worker_instance=${o.workerInstance}::uuid AND hub_instance=${l.hubInstance}::uuid AND hub_bundle_id=${l.hubBundle}::uuid
     AND registered_solver_id=${o.solverId}::uuid AND promise_id=${o.promiseId}::uuid AND assignment_signature=${o.assignmentSignature}
     AND upstream_base_url=${o.upstream} AND inventory_signature=${l.inventory} AND point_anchors=${JSON.stringify(l.anchors)}::jsonb
     AND read_identity=${JSON.stringify(p)}::jsonb`);
-  requireReportProof(proof, "Existing registered report binding differs");
+  requireReportProof(proof && (!scientific || isDeepStrictEqual(scientific, proof.shared_result_object)), "Existing registered report binding differs");
+  return proof.shared_result_object;
 }
 export async function verifyNativeBytes(db: DB, p: HubReportLink["pin"]) {
-  const [exact] =
-    await db.execute(sql`SELECT FROM progressive_worker_reports WHERE archived_at IS NULL AND result_payload_hash IS NULL AND content_signature=${p.signature} AND sim_job_id=${p.executionId}::uuid AND sequence=${p.sequence}
-      AND octet_length(report::text)=${p.reportByteSize} AND encode(sha256(convert_to(report::text,'UTF8')),'hex')=${p.reportSha256}`);
+  const shared = p.archiveFormat === SHARED_REPORT_FORMAT;
+  const [exact] = await db.execute(sql`WITH original AS MATERIALIZED (
+    SELECT ${shared ? sql`public.resolve_progressive_report(report,result_payload_hash)` : sql`report`}::text body
+    FROM progressive_worker_reports WHERE sim_job_id=${p.executionId}::uuid AND sequence=${p.sequence}
+      AND content_signature=${p.signature} AND archived_at IS NULL ${shared ? sql`` : sql`AND result_payload_hash IS NULL`}
+  ) SELECT FROM original WHERE octet_length(body)=${p.reportByteSize}
+    AND encode(sha256(convert_to(body,'UTF8')),'hex')=${p.reportSha256}`);
   requireReportProof(
     exact,
     "Native PostgreSQL report differs from independently restored hub member",
@@ -202,7 +211,11 @@ export async function stageRegisteredReport(
   l: HubReportLink,
   packed: Buffer,
   cloudReadAt: string,
+  dependencies: readonly Buffer[] = [],
 ) {
+  if (l.pin.archiveFormat === SHARED_REPORT_FORMAT)
+    return (await stageRegisteredPage(db, [l], packed, cloudReadAt, dependencies))[0]!;
+  requireReportProof(!dependencies.length, "Unexpected JSONL dependencies");
   checkLink(l);
   fresh(cloudReadAt);
   const { pin: p, owner: o } = l;
@@ -218,24 +231,26 @@ async function registerStagedMember(
   db: DB,
   l: HubReportLink,
   cloudReadAt: string,
+  scientific?: PinnedScientificResult,
 ) {
   fresh(cloudReadAt);
   const { pin: p, owner: o } = l;
+  requireReportProof((p.archiveFormat === SHARED_REPORT_FORMAT) === Boolean(scientific), "Missing shared scientific object");
   const fence = { instance: o.workerInstance, solver: o.solverId };
   return withActiveHzTransfer(db, fence, async (tx) => {
     const status = await originalState(tx, l, true);
     if (status === "already_retired") {
-      await assertBinding(tx, l);
+      await assertBinding(tx, l, scientific);
       return status;
     }
     if (status !== "ready") return status;
     await verifyNativeBytes(tx, p);
     await tx.execute(sql`INSERT INTO progressive_worker_hub_report_links(sim_job_id,sequence,worker_instance,hub_instance,hub_bundle_id,registered_solver_id,
-      promise_id,assignment_signature,upstream_base_url,inventory_signature,point_anchors,read_identity,hub_read_at)
+      promise_id,assignment_signature,upstream_base_url,inventory_signature,point_anchors,read_identity,hub_read_at${scientific ? sql`,shared_result_object` : sql``})
       VALUES(${p.executionId}::uuid,${p.sequence},${o.workerInstance}::uuid,${l.hubInstance}::uuid,${l.hubBundle}::uuid,${o.solverId}::uuid,
-        ${o.promiseId}::uuid,${o.assignmentSignature},${o.upstream},${l.inventory},${JSON.stringify(l.anchors)}::jsonb,${JSON.stringify(p)}::jsonb,${cloudReadAt}::timestamptz)
+        ${o.promiseId}::uuid,${o.assignmentSignature},${o.upstream},${l.inventory},${JSON.stringify(l.anchors)}::jsonb,${JSON.stringify(p)}::jsonb,${cloudReadAt}::timestamptz${scientific ? sql`,${JSON.stringify(scientific)}::jsonb` : sql``})
       ON CONFLICT(sim_job_id,sequence) DO NOTHING`);
-    await assertBinding(tx, l);
+    await assertBinding(tx, l, scientific);
     return "staged" as const;
   });
 }
@@ -245,7 +260,7 @@ export async function proveRegisteredReader(
   committed: boolean,
 ) {
   checkLink(l);
-  await assertBinding(db, l);
+  const scientific = await assertBinding(db, l);
   const p = l.pin;
   const text = await readStoredWorkerArchiveText(db, {
     ...p,
@@ -272,6 +287,7 @@ export async function proveRegisteredReader(
   return {
     generation: p.generation,
     signature: p.signature,
+    ...(p.archiveFormat === SHARED_REPORT_FORMAT ? { scientific } : {}),
     ...exact,
     at: new Date().toISOString(),
   };
@@ -293,7 +309,9 @@ export async function retireRegisteredReport(
       api.signature === p.signature,
     "API reader proof differs",
   );
-  await proveRegisteredReader(db, l, false);
+  const sweeper = await proveRegisteredReader(db, l, false);
+  if (p.archiveFormat === SHARED_REPORT_FORMAT)
+    requireReportProof(api.scientific && isDeepStrictEqual(api.scientific, sweeper.scientific), "Scientific reader proof differs");
   return commitRegisteredMember(db, l, cloudReadAt, api.at);
 }
 async function commitRegisteredMember(
@@ -321,19 +339,32 @@ async function commitRegisteredMember(
         await tx.execute(sql`SELECT id FROM progressive_report_archive_bundles WHERE sim_job_id=${p.executionId}::uuid AND source_kind='worker'
       AND id<>${l.hubBundle}::uuid AND bucket=${p.bucket} AND object_key=${p.objectKey} AND generation=${p.generation} AND stored_sha256=${p.storedSha256}
       AND crc32c=${p.crc32c} AND stored_byte_size=${p.storedByteSize} AND member_count=${p.memberCount} AND first_sequence=${p.firstSequence}
-      AND last_sequence=${p.lastSequence} AND archive_format='jsonl' AND mime_type='application/gzip' AND compression='gzip'`);
+      AND last_sequence=${p.lastSequence} AND archive_format=${p.archiveFormat} AND mime_type='application/gzip' AND compression='gzip'`);
       requireReportProof(b, "Registered local archive catalog differs");
       await tx.execute(sql`INSERT INTO progressive_report_archive_members(bundle_id,source_kind,sim_job_id,sequence,member_kind,content_signature,report_sha256,report_byte_size)
       VALUES(${b.id}::uuid,'worker',${p.executionId}::uuid,${p.sequence},'report',${p.signature},${p.reportSha256},${p.reportByteSize})`);
       // 0202 reauthenticates the actual old PG bytes inside this same transaction.
-      const changed =
-        await tx.execute(sql`UPDATE progressive_worker_reports SET report=progressive_report_compact_header(report),archive_bundle_id=${b.id}::uuid,
-      archived_at=clock_timestamp() WHERE sim_job_id=${p.executionId}::uuid AND sequence=${p.sequence} AND content_signature=${p.signature}
-      AND result_payload_hash IS NULL AND archived_at IS NULL RETURNING sequence`);
+      let previousPayload: string | null = null;
+      if (p.archiveFormat === SHARED_REPORT_FORMAT) {
+        // originalState already locked this exact signed report. A 0198 reference
+        // remains live through the independent OLD-body archive trigger.
+        const [row] = await tx.execute(sql`SELECT result_payload_hash AS hash FROM progressive_worker_reports
+          WHERE sim_job_id=${p.executionId}::uuid AND sequence=${p.sequence} AND content_signature=${p.signature}`);
+        previousPayload = row?.hash == null ? null : String(row.hash);
+      }
+      const changed = await tx.execute(sql`UPDATE progressive_worker_reports
+        SET report=progressive_report_compact_header(report), result_payload_hash=NULL, archive_bundle_id=${b.id}::uuid,
+        archived_at=clock_timestamp() WHERE sim_job_id=${p.executionId}::uuid AND sequence=${p.sequence} AND content_signature=${p.signature}
+        AND result_payload_hash IS NOT DISTINCT FROM ${previousPayload}::text AND archived_at IS NULL RETURNING sequence`);
       requireReportProof(
         changed.length === 1,
         "Native report changed before commit",
       );
+      if (previousPayload) {
+        await tx.execute(sql`DELETE FROM progressive_report_result_payloads p WHERE p.content_hash=${previousPayload}
+          AND NOT EXISTS(SELECT FROM progressive_worker_reports w WHERE w.result_payload_hash=p.content_hash)
+          AND NOT EXISTS(SELECT FROM progressive_remote_reports r WHERE r.result_payload_hash=p.content_hash)`);
+      }
       return "retired" as const;
     },
   );
@@ -373,6 +404,7 @@ export async function stageRegisteredPage(
   links: HubReportLink[],
   bytes: Buffer | null,
   cloudAt: string,
+  dependencies: readonly Buffer[] = [],
 ) {
   const started = performance.now();
   assertRegisteredPage(links);
@@ -396,6 +428,15 @@ export async function stageRegisteredPage(
     before.every((status) => status !== "ready" && status !== "already_retired")
   )
     return before;
+  if (p.archiveFormat === SHARED_REPORT_FORMAT) {
+    const checked = await stageSharedObjects(links.map(l => l.pin), first.owner, bytes, dependencies,
+      members => { for (const l of links) verifyInventory(l, members.get(l.pin.sequence)!.text); });
+    return writePrefix(admitted, started, (l, i) =>
+      before[i] === "ready" || before[i] === "already_retired"
+        ? registerStagedMember(db, l, cloudAt, checked.get(l.pin.sequence)!.scientific)
+        : Promise.resolve(before[i]!));
+  }
+  requireReportProof(!dependencies.length, "Unexpected JSONL dependencies");
   const local = await readWorkerReportVolume(p);
   if (local) {
     await inspectHubReportPage(local, admitted);
@@ -450,29 +491,40 @@ export async function retireRegisteredPage(
   // Reopen the physical working file inside the host write fence. Its bytes
   // must still be the generation decoded independently by both product readers.
   const pin = links[0]!.pin;
-  const file = await readWorkerReportVolume(pin);
-  requireReportProof(
-    file,
-    "Registered working copy disappeared before retirement",
-  );
-  let size = 0;
-  const hash = createHash("sha256");
-  try {
-    for await (const part of file) {
-      size += part.length;
-      requireReportProof(
-        size <= pin.storedByteSize,
-        "Working file exceeds pin",
-      );
-      hash.update(part);
+  if (pin.archiveFormat === SHARED_REPORT_FORMAT) {
+    const checked = await openRegisteredSharedPage(links.map(l => l.pin), links[0]!.owner, volumeSharedObject);
+    for (const [i, l] of links.entries()) {
+      const member = checked.members.get(l.pin.sequence)!;
+      verifyInventory(l, member.text);
+      requireReportProof(isDeepStrictEqual(member.scientific, api[i]!.scientific) &&
+        isDeepStrictEqual(member.scientific, sweeper[i]!.scientific), "Scientific reader proof differs");
+      await assertBinding(db, l, member.scientific);
     }
-  } finally {
-    file.destroy();
+  } else {
+    const file = await readWorkerReportVolume(pin);
+    requireReportProof(
+      file,
+      "Registered working copy disappeared before retirement",
+    );
+    let size = 0;
+    const hash = createHash("sha256");
+    try {
+      for await (const part of file) {
+        size += part.length;
+        requireReportProof(
+          size <= pin.storedByteSize,
+          "Working file exceeds pin",
+        );
+        hash.update(part);
+      }
+    } finally {
+      file.destroy();
+    }
+    requireReportProof(
+      size === pin.storedByteSize && hash.digest("hex") === pin.storedSha256,
+      "Working file changed before retirement",
+    );
   }
-  requireReportProof(
-    size === pin.storedByteSize && hash.digest("hex") === pin.storedSha256,
-    "Working file changed before retirement",
-  );
   return writePrefix(links, started, async (l, i) => {
     for (const r of [api[i]!, sweeper[i]!]) {
       fresh(r.at);

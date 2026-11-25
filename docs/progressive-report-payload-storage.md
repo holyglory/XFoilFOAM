@@ -310,6 +310,16 @@ Use the existing sweeper report-storage process with `AIRFOILFOAM_NATIVE_REPORT_
 
 The `progressive-report-archive` graph check `native-report-prefix` compares the prefix and original per-row algorithm on identical PostgreSQL rows in alternating rollback trials. It checks every full-body digest and exercises ordinary product reads, the portable CLI, locks, exclusions, rollback and replay.
 
+## Registered HZ copies of shared hub reports
+
+After migration 0239 and deployment of both role readers, the existing registered report watcher discovers verified hub `shared-result-v1` members. A selected member must match its native execution, sequence, report signature and exact resolved PostgreSQL bytes. The closed dispatch, acknowledgement, signed point inventory, scientific receipts and normal readback gates still apply. A report that first observed a point keeps its own sequence. An acknowledgement on a different report keeps its original signed transport.
+
+The hub reader fetches the pinned manifest and the scientific generation named by that member. HZ stores their original gzip bytes on its results volume. The native link records the distinct hub bundle, manifest generation, scientific hash and scientific object pin. The HZ API and sweeper can reopen both files with ordinary registered ownership checks when general downloads are disabled. Volume cleanup retains each file referenced by a shared native link.
+
+The normal controller supports a pre-existing 0198 result reference on this path. It verifies the fully resolved original, lets the archive trigger check it again before retirement, and removes a dictionary payload only after the last local worker and remote SQL references are gone. A manifest or scientific file that fails authentication holds the member. Before retirement its SQL source remains readable.
+
+For a bounded canary, pass an ordered JSON array of `{executionId, sequence, signature}` records from one genuine execution to the existing controller's `selected --keys-file=FILE --bundle-members=4 --apply` command. Use its existing checkpoint, frozen scope and registered SSH arguments. Finish any saved group on its original identity first. Selected reads leave the normal discovery cursor in place. The ordinary `watch` continues coverage of new catalog members and revisits older ones on the next pass.
+
 ## Closed historical staging copies
 
 Migration 0217 tracks scheduling coverage separately from staging receipts. The automatic HZ backlog drain can cover up to 32 acknowledged, still-online snapshots in one transaction before taking an ingestion lease. It checks closed job and promise ownership, the stop proof, actual source attempt IDs and hub acknowledgements. The ordinary point reuse verifier authenticates the stored projection and evidence. Failed and rejected attempts keep their scientific classifications.

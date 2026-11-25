@@ -15,7 +15,10 @@ export async function releaseUpstreamReadableVolume(db:DB, file:WorkerVolumeIden
         SELECT * FROM progressive_report_archive_members item WHERE item.bundle_id=b.id
         ORDER BY item.sequence LIMIT 1
       ) m ON true WHERE b.source_kind='worker' AND b.stored_sha256=${file.storedSha256}
-      AND b.stored_byte_size=${file.storedByteSize} ORDER BY b.id`);
+      AND b.stored_byte_size=${file.storedByteSize}
+      AND NOT EXISTS (SELECT FROM progressive_worker_hub_report_links
+        WHERE shared_result_object IS NOT NULL AND ARRAY[read_identity->>'storedSha256',shared_result_object#>>'{pin,sha256}']
+          @> ARRAY[${file.storedSha256}::text]) ORDER BY b.id`);
     if (!rows.length) return false;
     for (const row of rows) {
       if (signal.aborted || !row.sequence || !["conflict","report"].includes(String(row.member_kind))) return false;

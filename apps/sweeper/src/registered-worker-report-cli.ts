@@ -320,6 +320,9 @@ export async function runRegisteredReportCli(
             owner: src.owner,
             key,
           });
+          if (src.normalized && link?.pin.archiveFormat !== "shared-result-v1" &&
+              (!pending || pending.link.pin.archiveFormat !== "shared-result-v1"))
+            return { status: "other_storage" };
           if (pending)
             requireReportProof(
               link && isDeepStrictEqual(link, pending.link),
@@ -376,6 +379,7 @@ export async function runRegisteredReportCli(
           const staged = await write("stage", {
             link,
             bytes: restored.packed,
+            ...(restored.dependencies ? { dependencies: restored.dependencies } : {}),
             cloudAt: restored.at,
           });
           if (staged !== "staged" && staged !== "already_retired")
@@ -406,6 +410,9 @@ export async function runRegisteredReportCli(
           sweeperProof: ReaderProof,
         ) {
           const key = sourceKey(link);
+          if (link.pin.archiveFormat === "shared-result-v1")
+            requireReportProof(apiProof.scientific && isDeepStrictEqual(apiProof.scientific, sweeperProof.scientific),
+              "Committed scientific object pins differ");
           const proof = {
             binding,
             key,
@@ -415,6 +422,7 @@ export async function runRegisteredReportCli(
             originalBytes: link.pin.reportByteSize,
             packedSha256: link.pin.storedSha256,
             packedBytes: link.pin.storedByteSize,
+            ...(apiProof.scientific ? { scientific: apiProof.scientific } : {}),
             anchors: link.anchors.length,
           };
           for (const x of [apiProof, sweeperProof])
