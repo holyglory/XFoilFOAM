@@ -830,39 +830,6 @@ async function settleWithCurrentOwnership(db:DB, executionId:string, prepared?:P
     );
     if (!stop) return { kind: "waiting" as const, reason: "physical_stop" };
     if (job.ingestedAt) {
-      const [lateRecovery] = await connection.execute(sql`
-        SELECT EXISTS (
-          SELECT 1
-          FROM progressive_cfd_attempts attempt
-          JOIN progressive_cfd_units unit ON unit.id = attempt.unit_id
-          JOIN progressive_work work ON work.id = unit.work_id
-          JOIN progressive_generations generation ON generation.id = work.generation_id
-          JOIN sim_campaigns campaign ON campaign.id = generation.campaign_id
-          JOIN sim_jobs job ON job.id = attempt.sim_job_id
-          JOIN progressive_cfd_evidence evidence ON evidence.attempt_token = attempt.token
-          WHERE attempt.sim_job_id = ${executionId}::uuid
-            AND job.request_payload->'engineRequest'->'solver'->>'flow_solver_family' = 'rhoPimpleFoam'
-            AND work.stage = 3
-            AND unit.state = 'gap'
-            AND unit.error = 'precise evidence remains unresolved'
-            AND job."ingestedAt" <= clock_timestamp() - interval '5 minutes'
-            AND generation.status = 'active'
-            AND generation.plan_revision_id = campaign.current_plan_revision_id
-            AND campaign.status IN ('active', 'attention', 'paused')
-        ) AS present
-      `);
-      if (job.status === "failed" && lateRecovery?.present === true) {
-        try {
-          await recordProgressiveCfdRecoveryPlans(connection, executionId);
-        } catch (error) {
-          const message = error instanceof Error ? error.message : String(error);
-          if (
-            !(error instanceof ProgressiveCfdEvidenceScopeClosed) &&
-            message !== "Obsolete or settled progressive CFD execution scope"
-          )
-            throw error;
-        }
-      }
       await retireSettledProgressivePromise(connection, executionId);
       return {
         kind: "settled" as const,

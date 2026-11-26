@@ -20,6 +20,8 @@ import {
   progressiveCfdBudgetExtensionPendingSql,
   progressiveCfdEffectiveBudgetSql,
 } from "./progressive-cfd-budget-extension";
+import { recordProgressiveCfdRecoveryPlans } from "./progressive-cfd-numerical-recovery";
+import { settleProgressiveCfdExecution } from "./progressive-cfd-settlement";
 
 const TERMINAL_NO_EVIDENCE_REASON =
   "terminal execution has no measured case evidence";
@@ -295,10 +297,58 @@ export async function recoverTerminalProgressiveNoEvidenceGaps(db: DB): Promise<
   return retryTerminalProgressiveNoEvidenceGaps(db);
 }
 
+async function recoverLateRhoPimplePreciseGaps(db: DB): Promise<number> {
+  const candidates = await db.execute(sql`
+    SELECT DISTINCT job.id
+    FROM sim_jobs job
+    JOIN progressive_cfd_attempts attempt ON attempt.sim_job_id = job.id
+    JOIN progressive_cfd_units unit ON unit.id = attempt.unit_id
+    JOIN progressive_work work ON work.id = unit.work_id
+    JOIN progressive_generations generation ON generation.id = work.generation_id
+    JOIN sim_campaigns campaign ON campaign.id = generation.campaign_id
+    JOIN progressive_cfd_evidence evidence ON evidence.attempt_token = attempt.token
+    WHERE job.status = 'failed'
+      AND job."ingestedAt" <= clock_timestamp() - interval '5 minutes'
+      AND job.request_payload->'engineRequest'->'solver'->>'flow_solver_family' = 'rhoPimpleFoam'
+      AND work.stage = 3
+      AND unit.state = 'gap'
+      AND unit.error = 'precise evidence remains unresolved'
+      AND generation.status = 'active'
+      AND generation.plan_revision_id = campaign.current_plan_revision_id
+      AND campaign.status IN ('active', 'attention', 'paused')
+    ORDER BY job.id
+    LIMIT 32
+  `);
+  let recovered = 0;
+  for (const candidate of candidates) {
+    try {
+      const planned = await recordProgressiveCfdRecoveryPlans(
+        db,
+        String(candidate.id),
+      );
+      if (planned) {
+        const settled = await settleProgressiveCfdExecution(
+          db,
+          String(candidate.id),
+        );
+        recovered += Number(settled.retry ?? planned);
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (
+        message !== "Obsolete or settled progressive CFD execution scope" &&
+        message !== "Numerical recovery requires a progressive parent execution"
+      )
+        throw error;
+    }
+  }
+  return recovered;
+}
+
 export async function retryTerminalProgressiveNoEvidenceGaps(
   db: DB,
 ): Promise<number> {
-  return db.transaction(async (transaction) => {
+  const recovered = await db.transaction(async (transaction) => {
     const connection = transaction as unknown as DB;
     const [epoch] = await connection.execute(
       sql`SELECT id FROM calculation_epochs WHERE current FOR SHARE`,
@@ -600,4 +650,5 @@ export async function retryTerminalProgressiveNoEvidenceGaps(
     }
     return recovered;
   });
+  return recovered + (await recoverLateRhoPimplePreciseGaps(db));
 }
