@@ -320,6 +320,18 @@ async function recoverLateRhoPimplePreciseGaps(db: DB): Promise<number> {
       )
       AND NOT EXISTS (
         SELECT 1
+        FROM progressive_cfd_attempts parent_attempt
+        WHERE parent_attempt.sim_job_id = job.id
+          AND EXISTS (
+            SELECT 1
+            FROM progressive_cfd_attempts later_attempt
+            WHERE later_attempt.unit_id = parent_attempt.unit_id
+              AND (later_attempt.started_at, later_attempt.token) >
+                (parent_attempt.started_at, parent_attempt.token)
+          )
+      )
+      AND NOT EXISTS (
+        SELECT 1
         FROM progressive_cfd_attempts fallback_attempt
         JOIN progressive_cfd_execution_recipes fallback_recipe
           ON fallback_recipe.id = fallback_attempt.execution_recipe_id
