@@ -10352,13 +10352,25 @@ describe("bounded progressive numerical recovery", () => {
       });
       expect(base).toEqual(original);
     }
-    for (const family of ["pimpleFoam", "rhoPimpleFoam", "rhoCentralFoam"])
+    for (const family of ["pimpleFoam", "rhoCentralFoam"])
       expect(
         progressiveUnsteadyRecipe(
           { selection: { solver: family } },
           "hard_solver",
         ),
       ).toBeNull();
+    expect(
+      progressiveUnsteadyRecipe(
+        { selection: { solver: "rhoPimpleFoam", pressureKind: "absolute" } },
+        "hard_solver",
+      ),
+    ).toMatchObject({
+      selection: {
+        solver: "rhoPimpleFoam",
+        reason: "bounded_hard_solver_recovery",
+      },
+      solver: { momentumScheme: "upwind", transientMaxCourant: 0.2 },
+    });
   });
 
   it("persists an engine promotion through terminal ingestion before admitting its original replacement scope", async () => {

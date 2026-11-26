@@ -372,7 +372,7 @@ export async function recordProgressiveCfdRecoveryPlans(
         : remoteTrigger || diagnostic!.evidence_payload.failure_disposition === "hard_solver"
           ? "hard_solver"
           : "needs_urans";
-      const executedRecipe = unit.executed_solver
+      const executedRecipe = reason === "hard_solver" && unit.executed_solver
         ? {
             ...unit.recipe,
             selection: {

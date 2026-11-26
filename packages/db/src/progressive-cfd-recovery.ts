@@ -299,7 +299,7 @@ export async function recoverTerminalProgressiveNoEvidenceGaps(db: DB): Promise<
 
 async function recoverLateRhoPimplePreciseGaps(db: DB): Promise<number> {
   const candidates = await db.execute(sql`
-    SELECT DISTINCT job.id
+    SELECT DISTINCT job.id, job."updatedAt"
     FROM sim_jobs job
     JOIN progressive_cfd_attempts attempt ON attempt.sim_job_id = job.id
     JOIN progressive_cfd_units unit ON unit.id = attempt.unit_id
@@ -316,7 +316,7 @@ async function recoverLateRhoPimplePreciseGaps(db: DB): Promise<number> {
       AND generation.status = 'active'
       AND generation.plan_revision_id = campaign.current_plan_revision_id
       AND campaign.status IN ('active', 'attention', 'paused')
-    ORDER BY job.id
+    ORDER BY job."updatedAt", job.id
     LIMIT 32
   `);
   let recovered = 0;
