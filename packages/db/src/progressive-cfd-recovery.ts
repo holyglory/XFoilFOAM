@@ -307,19 +307,24 @@ async function recoverLateRhoPimplePreciseGaps(db: DB): Promise<number> {
     JOIN progressive_generations generation ON generation.id = work.generation_id
     JOIN sim_campaigns campaign ON campaign.id = generation.campaign_id
     JOIN progressive_cfd_evidence evidence ON evidence.attempt_token = attempt.token
+    JOIN result_attempts raw ON raw.id = evidence.result_attempt_id
     WHERE job.status = 'failed'
       AND job."ingestedAt" <= clock_timestamp() - interval '5 minutes'
       AND job.request_payload->'engineRequest'->'solver'->>'flow_solver_family' = 'rhoPimpleFoam'
       AND work.stage = 3
       AND unit.state = 'gap'
       AND unit.error = 'precise evidence remains unresolved'
+      AND (
+        (raw.regime = 'rans' AND raw.evidence_payload->>'failure_disposition' = 'hard_solver')
+        OR (raw.regime = 'urans' AND raw.evidence_payload->>'failure_disposition' = 'hard_solver')
+      )
       AND NOT EXISTS (
         SELECT 1
         FROM progressive_cfd_attempts fallback_attempt
         JOIN progressive_cfd_execution_recipes fallback_recipe
           ON fallback_recipe.id = fallback_attempt.execution_recipe_id
         WHERE fallback_attempt.sim_job_id = job.id
-          AND fallback_recipe.recipe->'selection'->>'reason' = 'bounded_hard_solver_recovery'
+          AND fallback_recipe.recipe->'selection'->>'reason' LIKE 'bounded_%_recovery'
       )
       AND generation.status = 'active'
       AND generation.plan_revision_id = campaign.current_plan_revision_id
