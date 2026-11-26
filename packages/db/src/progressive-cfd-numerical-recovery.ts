@@ -104,6 +104,7 @@ interface RecoveryUnit {
   token: string;
   aoa_deg: number;
   recipe: Record<string, unknown>;
+  executed_solver: string | null;
   execution_revision_id: string;
   recovery_plan_id: string | null;
   stage: number;
@@ -130,6 +131,26 @@ export function progressiveUnsteadyRecipe(
 ): Record<string, unknown> | null {
   const selection = recipe.selection as Record<string, unknown> | undefined;
   const family = selection?.solver;
+  if (selection?.reason === "bounded_hard_solver_recovery") return null;
+  if (family === "rhoPimpleFoam" && reason === "hard_solver") {
+    const solver = { ...(recipe.solver as Record<string, unknown>) };
+    const configuredCourant = Number(solver.transientMaxCourant);
+    return {
+      ...recipe,
+      solver: {
+        ...solver,
+        momentumScheme: "upwind",
+        transientMaxCourant: Number.isFinite(configuredCourant)
+          ? Math.min(configuredCourant, 0.2)
+          : 0.2,
+      },
+      selection: {
+        ...selection,
+        solver: "rhoPimpleFoam",
+        reason: "bounded_hard_solver_recovery",
+      },
+    };
+  }
   const localDensity =
     family === "rhoCentralFoam" &&
     recipe.timeCoordinate === "local_pseudo_time_iterations";
@@ -202,12 +223,15 @@ export async function recordProgressiveCfdRecoveryPlans(
         "Numerical recovery requires a progressive parent execution",
       );
     const units = (await connection.execute(sql`
-      SELECT unit.id, attempt.token, unit.aoa_deg, recipe.recipe, recipe.execution_revision_id,
+      SELECT unit.id, attempt.token, unit.aoa_deg, recipe.recipe,
+        job.request_payload->'engineRequest'->'solver'->>'flow_solver_family' AS executed_solver,
+        recipe.execution_revision_id,
         claim.recovery_plan_id, work.stage, unit.policy_version, recovery.ordinal AS recovery_ordinal,
         recovery.scope AS recovery_scope, recovery.recipe AS recovery_recipe
       FROM progressive_cfd_attempts attempt JOIN progressive_cfd_units unit ON unit.id = attempt.unit_id
       JOIN progressive_work work ON work.id = unit.work_id
       JOIN progressive_cfd_execution_recipes recipe ON recipe.id = attempt.execution_recipe_id
+      JOIN sim_jobs job ON job.id = attempt.sim_job_id
       LEFT JOIN progressive_cfd_recovery_claims claim ON claim.attempt_token = attempt.token
       LEFT JOIN progressive_cfd_recovery_plans recovery ON recovery.id = claim.recovery_plan_id
       WHERE attempt.sim_job_id = ${simJobId} ORDER BY unit.ordinal, unit.id
@@ -345,10 +369,19 @@ export async function recordProgressiveCfdRecoveryPlans(
         : remoteTrigger || diagnostic!.evidence_payload.failure_disposition === "hard_solver"
           ? "hard_solver"
           : "needs_urans";
+      const executedRecipe = unit.executed_solver
+        ? {
+            ...unit.recipe,
+            selection: {
+              ...(unit.recipe.selection as Record<string, unknown>),
+              solver: unit.executed_solver,
+            },
+          }
+        : unit.recipe;
       const recipe = verification
         ? { ...unit.recovery_recipe!, uransFidelity: "full" }
         : progressiveUnsteadyRecipe(
-            unit.recipe,
+            executedRecipe,
             reason as "hard_solver" | "needs_urans",
           );
       if (!recipe) continue;
