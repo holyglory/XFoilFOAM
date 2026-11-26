@@ -313,6 +313,14 @@ async function recoverLateRhoPimplePreciseGaps(db: DB): Promise<number> {
       AND work.stage = 3
       AND unit.state = 'gap'
       AND unit.error = 'precise evidence remains unresolved'
+      AND NOT EXISTS (
+        SELECT 1
+        FROM progressive_cfd_attempts fallback_attempt
+        JOIN progressive_cfd_execution_recipes fallback_recipe
+          ON fallback_recipe.id = fallback_attempt.execution_recipe_id
+        WHERE fallback_attempt.sim_job_id = job.id
+          AND fallback_recipe.recipe->'selection'->>'reason' = 'bounded_hard_solver_recovery'
+      )
       AND generation.status = 'active'
       AND generation.plan_revision_id = campaign.current_plan_revision_id
       AND campaign.status IN ('active', 'attention', 'paused')
