@@ -354,14 +354,17 @@ export async function recordProgressiveCfdRecoveryPlans(
           evidence.find(
             (item) =>
               item.attempt_token === unit.token &&
-              item.regime === "rans" &&
-              ![
-                "infrastructure",
-                "deterministic_mesh",
-                "material_domain",
-              ].includes(String(item.evidence_payload.failure_disposition)) &&
-              (item.evidence_payload.failure_disposition === "hard_solver" ||
-                item.classification === "needs_urans"),
+              ((item.regime === "rans" &&
+                ![
+                  "infrastructure",
+                  "deterministic_mesh",
+                  "material_domain",
+                ].includes(String(item.evidence_payload.failure_disposition)) &&
+                (item.evidence_payload.failure_disposition === "hard_solver" ||
+                  item.classification === "needs_urans")) ||
+                (unit.executed_solver === "rhoPimpleFoam" &&
+                  item.regime === "urans" &&
+                  item.evidence_payload.failure_disposition === "hard_solver")),
           ));
       if (!diagnostic && !remoteTrigger) continue;
       const reason = verification
