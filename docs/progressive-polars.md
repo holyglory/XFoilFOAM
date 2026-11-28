@@ -133,9 +133,13 @@ frontier until every low precise obligation is settled.
 
 New claims prioritize eligible initial FAST anchors that have never been
 attempted, before new precise work or budget extensions. This gives untouched
-targets their first CFD coverage. Once no such anchor is eligible, the existing
-precise and retry ordering applies. Running jobs, recipes, time budgets, and
-acceptance requirements are unchanged.
+targets their first CFD coverage. When eligible subsonic initial FAST retries
+and ordinary precise jobs compete for the next batch, the scheduler alternates
+between them. It records one turn for the first successful claim in a batch.
+All angles in that batch use the same target and recipe. If the preferred stage
+has no eligible work, the other stage can run immediately. A rolled-back offer
+preserves the turn. The calculation epoch and campaign plan revision scope the
+record so that new plans start with their own ordering.
 
 Every current generation's low precise work must close successfully before a
 new high CFD claim is issued. A fast gap can advance into precise recovery; a
