@@ -1430,6 +1430,30 @@ it.each([
           }),
         ).toBe(fixture.reports[0]!.text);
         expect(await readFile(path)).toEqual(bytes);
+        // This real, upstream-readable bundle would be released below. Vary only
+        // the ownership pins in this transaction's private one-row fixture.
+        await fixture.db.execute(sql`CREATE TEMP TABLE progressive_worker_hub_report_links
+          ON COMMIT DROP AS SELECT read_identity, shared_result_object
+          FROM public.progressive_worker_hub_report_links WITH NO DATA`);
+        const addPins = (manifestSha: string, scientificSha: string) =>
+          fixture.db.execute(sql`INSERT INTO pg_temp.progressive_worker_hub_report_links
+            (read_identity, shared_result_object) VALUES (
+              jsonb_build_object('storedSha256', ${manifestSha}::text),
+              jsonb_build_object('pin', jsonb_build_object('sha256', ${scientificSha}::text)))`);
+        const otherSha = member.reportSha256;
+        expect(otherSha).not.toBe(archive.storedSha256);
+        for (const [manifestSha, scientificSha] of [
+          [archive.storedSha256, otherSha],
+          [otherSha, archive.storedSha256],
+        ] as const) {
+          await addPins(manifestSha, scientificSha);
+          const fetchesBefore = fetcher.mock.calls.length;
+          expect(await releaseUpstreamReadableVolume(fixture.db, archive, AbortSignal.timeout(5000))).toBe(false);
+          expect(fetcher).toHaveBeenCalledTimes(fetchesBefore);
+          expect(await readFile(path)).toEqual(bytes);
+          await fixture.db.execute(sql`DELETE FROM pg_temp.progressive_worker_hub_report_links`);
+        }
+        await addPins(otherSha, otherSha);
         const released = await runWorkerVolumeCleanupPass(fixture.db);
         expect(released).toHaveLength(1);
         expect(JSON.parse(String(released[0]))).toEqual({

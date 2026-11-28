@@ -223,6 +223,11 @@ export async function exerciseRegisteredSharedWorkingCopy(
   ).toHaveLength(0);
   expect(await stage(transfer.dependencies)).toEqual(links.map(() => "staged"));
   expect(await retire()).toEqual(links.map(() => "retired"));
+  expect(dependency.sha256).not.toBe(head.storedSha256);
+  for (const pin of [head, { storedSha256: dependency.sha256, storedByteSize: dependency.size }]) {
+    await expect(releaseUpstreamReadableVolume(db, pin, AbortSignal.timeout(5000))).resolves.toBe(false);
+  }
+  // Both product readers must still reopen the original bytes after cleanup.
   for (const reader of ["api", "sweeper"]) {
     const proofs = await read(reader, true);
     if (!Array.isArray(proofs)) throw new Error("Missing committed originals");
@@ -234,13 +239,6 @@ export async function exerciseRegisteredSharedWorkingCopy(
     );
   }
   expect(await retire()).toEqual(links.map(() => "already_retired"));
-  for (const pin of [
-    { storedSha256: dependency.sha256, storedByteSize: dependency.size },
-    head,
-  ])
-    await expect(
-      releaseUpstreamReadableVolume(db, pin, AbortSignal.timeout(5000)),
-    ).resolves.toBe(false);
   const crc = new CRC32C();
   crc.update(bytes);
   expect(crc.toString()).toBe(dependency.crc32c);

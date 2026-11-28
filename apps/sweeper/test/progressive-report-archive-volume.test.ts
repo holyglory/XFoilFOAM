@@ -157,6 +157,7 @@ it("leaves an unowned volume file untouched when the catalog scope is empty", as
     expect(query.params).toEqual([
       f.archive.storedSha256,
       f.archive.storedByteSize,
+      f.archive.storedSha256, // The shared manifest or scientific object may still own this file.
     ]);
     return [];
   });
