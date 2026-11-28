@@ -7760,6 +7760,7 @@ export const progressiveCfdClaimTurns = pgTable(
     planRevisionId: uuid("plan_revision_id").notNull()
       .references(() => simCampaignPlanRevisions.id, { onDelete: "cascade" }),
     lastStage: smallint("last_stage").notNull(),
+    lastPreciseMeasured: boolean("last_precise_measured").notNull().default(false),
   },
   (table) => ({
     stageCheck: check("progressive_cfd_claim_turns_last_stage_check", sql`${table.lastStage} IN (2, 3)`),
