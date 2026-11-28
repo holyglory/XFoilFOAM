@@ -40,6 +40,10 @@ const RECOVERABLE_TERMINAL_GAP_REASONS_SQL = sql`(${sql.join(
 )})`;
 const PROGRESSIVE_INACTIVE_RECOVERY_UNITS_PER_PASS = 64;
 const PROGRESSIVE_TERMINAL_RECOVERY_UNITS_PER_PASS = 64;
+const LATE_RHO_PIMPLE_JOBS_PER_PASS = 32;
+// Scan position only; the recovery transaction remains the authority. Restarts
+// begin a new oldest-first cycle without storing scheduling state in the DB.
+const lateRhoPimpleCursors = new WeakMap<DB, { id: string; updatedAt: string }>();
 
 export async function recoverUnboundProgressiveCfdLeases(
   db: DB,
@@ -297,8 +301,9 @@ export async function recoverTerminalProgressiveNoEvidenceGaps(db: DB): Promise<
 }
 
 async function recoverLateRhoPimplePreciseGaps(db: DB): Promise<number> {
+  const after = lateRhoPimpleCursors.get(db);
   const candidates = await db.execute(sql`
-    SELECT DISTINCT job.id, job."updatedAt"
+    SELECT DISTINCT job.id, job."updatedAt", job."updatedAt"::text AS cursor_updated_at
     FROM sim_jobs job
     JOIN progressive_cfd_attempts attempt ON attempt.sim_job_id = job.id
     JOIN progressive_cfd_units unit ON unit.id = attempt.unit_id
@@ -332,13 +337,22 @@ async function recoverLateRhoPimplePreciseGaps(db: DB): Promise<number> {
       AND generation.status = 'active'
       AND generation.plan_revision_id = campaign.current_plan_revision_id
       AND campaign.status IN ('active', 'attention', 'paused')
+      ${after ? sql`AND (job."updatedAt",job.id)>(${after.updatedAt}::timestamptz,${after.id}::uuid)` : sql``}
     ORDER BY job."updatedAt", job.id
-    LIMIT 32
+    LIMIT ${LATE_RHO_PIMPLE_JOBS_PER_PASS}
   `);
   let recovered = 0;
   for (const candidate of candidates) {
+    // Refused or busy histories must not pin the page. Keep PostgreSQL's full
+    // timestamp text: a JS Date would truncate the microsecond ordering key.
+    lateRhoPimpleCursors.set(db, {
+      id: String(candidate.id), updatedAt: String(candidate.cursor_updated_at),
+    });
     recovered += await recoverLateRhoPimplePreciseExecution(db, String(candidate.id));
   }
+  // One bounded page per maintenance pass. Revisit earlier refusals on the
+  // next cycle, including an empty tail after an exactly full final page.
+  if (candidates.length < LATE_RHO_PIMPLE_JOBS_PER_PASS) lateRhoPimpleCursors.delete(db);
   return recovered;
 }
 

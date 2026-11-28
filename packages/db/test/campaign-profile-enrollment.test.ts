@@ -8848,6 +8848,101 @@ describe("progressive execution stop and settlement", () => {
 });
 
 describe("bounded progressive numerical recovery", () => {
+  it("rotates late precise rhoPimple pages past refused duplicate histories and wraps with exact timestamps", async () => {
+    const fixtures = [];
+    for (const speed of [166.1951, 177.1952]) {
+      const fixture = await cfdEvidenceFixture(speed, 3, [], [0, 1], false, undefined, { chordM: speed / 100 }, 2);
+      const evidence = await Promise.all([0, 1].map(alpha => fixture.save(20, "urans", alpha, {
+        failure_disposition: "hard_solver", fidelity: "urans_full",
+      })));
+      await fixture.record(evidence);
+      await stopped(fixture);
+      expect(await settleProgressiveCfdExecution(db, fixture.composed.jobId)).toMatchObject({ gaps: 2 });
+      fixtures.push(fixture);
+    }
+    const [head, tail] = fixtures;
+    await db.transaction(async transaction => {
+      const connection = transaction as unknown as DB;
+      // Fan out scheduling rows only, in transaction-local tables. Scientific
+      // evidence stays in public unchanged. The extra histories deliberately
+      // fail recovery authority; both real jobs retain their exact receipts.
+      for (const table of ["sim_jobs", "progressive_cfd_units", "progressive_cfd_attempts", "progressive_cfd_evidence"])
+        await connection.execute(sql`CREATE TEMP TABLE ${sql.identifier(table)} ON COMMIT DROP AS SELECT * FROM public.${sql.identifier(table)}`);
+      await connection.execute(sql`CREATE TEMP TABLE late_rho_page ON COMMIT DROP AS
+        SELECT n,gen_random_uuid() AS job_id FROM generate_series(1,32) n`);
+      await connection.execute(sql`CREATE TEMP TABLE late_rho_units ON COMMIT DROP AS
+        SELECT page.*,attempt.unit_id AS source_unit,attempt.token AS source_token,
+          gen_random_uuid() AS unit_id,gen_random_uuid() AS token
+        FROM late_rho_page page CROSS JOIN public.progressive_cfd_attempts attempt
+        WHERE attempt.sim_job_id=${head.composed.jobId}::uuid`);
+      await connection.execute(sql`INSERT INTO sim_jobs
+        SELECT (jsonb_populate_record(NULL::pg_temp.sim_jobs,to_jsonb(job)||jsonb_build_object(
+          'id',page.job_id,'updatedAt',timestamptz '2000-01-01 00:00:00.123456+00'+((page.n-1)/2)*interval '1 microsecond',
+          'ingestedAt',timestamptz '2000-01-01'))).*
+        FROM late_rho_page page CROSS JOIN public.sim_jobs job WHERE job.id=${head.composed.jobId}::uuid`);
+      await connection.execute(sql`INSERT INTO progressive_cfd_units
+        SELECT (jsonb_populate_record(NULL::pg_temp.progressive_cfd_units,to_jsonb(unit)||jsonb_build_object(
+          'id',page.unit_id,'active_seconds',unit.active_budget_seconds))).*
+        FROM late_rho_units page JOIN public.progressive_cfd_units unit ON unit.id=page.source_unit`);
+      await connection.execute(sql`INSERT INTO progressive_cfd_attempts
+        SELECT (jsonb_populate_record(NULL::pg_temp.progressive_cfd_attempts,to_jsonb(attempt)||jsonb_build_object(
+          'token',page.token,'unit_id',page.unit_id,'sim_job_id',page.job_id))).*
+        FROM late_rho_units page JOIN public.progressive_cfd_attempts attempt ON attempt.token=page.source_token`);
+      await connection.execute(sql`INSERT INTO progressive_cfd_evidence
+        SELECT (jsonb_populate_record(NULL::pg_temp.progressive_cfd_evidence,to_jsonb(receipt)||jsonb_build_object('attempt_token',page.token))).*
+        FROM late_rho_units page JOIN public.progressive_cfd_evidence receipt ON receipt.attempt_token=page.source_token`);
+      await connection.execute(sql`UPDATE sim_jobs SET "ingestedAt"=timestamptz '2000-01-01',
+        "updatedAt"=CASE WHEN id=${head.composed.jobId}::uuid THEN timestamptz '2000-01-01 00:00:00.123455+00'
+          ELSE timestamptz '2000-01-01 00:00:00.123472+00' END
+        WHERE id IN (${head.composed.jobId}::uuid,${tail.composed.jobId}::uuid)`);
+      await connection.execute(sql`UPDATE progressive_cfd_units SET active_seconds=active_budget_seconds
+        WHERE id IN (${head.leases[0].id}::uuid,${head.leases[1].id}::uuid)`);
+      const ordered = await connection.execute(sql`SELECT id,"updatedAt"::text AS stamp FROM sim_jobs
+        WHERE id IN (SELECT job_id FROM late_rho_page) OR id IN (${head.composed.jobId}::uuid,${tail.composed.jobId}::uuid)
+        ORDER BY "updatedAt",id`);
+      expect(ordered).toHaveLength(34);
+      expect(ordered[0].id).toBe(head.composed.jobId);
+      expect(ordered.at(-1)?.id).toBe(tail.composed.jobId);
+      // Every timestamp is in the same millisecond; pairs also share the same
+      // microsecond, so both native timestamp precision and the UUID tie matter.
+      expect(ordered.every(row => String(row.stamp).includes(".1234"))).toBe(true);
+      const pages: string[][] = [];
+      const execute = connection.execute.bind(connection);
+      const dialect = new PgDialect();
+      const observed = vi.spyOn(connection, "execute").mockImplementation((async (query: SQL) => {
+        const rows = await execute(query);
+        if (dialect.sqlToQuery(query).sql.includes("SELECT DISTINCT job.id"))
+          pages.push(rows.map(row => String(row.id)));
+        return rows;
+      }) as typeof connection.execute);
+      const science = () => execute(sql`SELECT raw.*,receipt.evidence_signature FROM public.result_attempts raw
+        JOIN public.progressive_cfd_evidence receipt ON receipt.result_attempt_id=raw.id
+        WHERE raw.sim_job_id IN (${head.composed.jobId}::uuid,${tail.composed.jobId}::uuid) ORDER BY raw.id`);
+      const before = await science();
+      try {
+        expect(await recoverTerminalProgressiveNoEvidenceGaps(connection)).toBe(0);
+        expect(pages).toEqual([ordered.slice(0,32).map(row => row.id)]);
+        // A refused oldest job becomes eligible while the next page is due.
+        // It must wait for wrap instead of displacing the untouched tail.
+        await execute(sql`UPDATE progressive_cfd_units SET active_seconds=20
+          WHERE id IN (${head.leases[0].id}::uuid,${head.leases[1].id}::uuid)`);
+        expect(await recoverTerminalProgressiveNoEvidenceGaps(connection)).toBe(2);
+        expect(pages[1]).toEqual(ordered.slice(32).map(row => row.id));
+        expect(await execute(sql`SELECT DISTINCT parent_job_id FROM progressive_cfd_recovery_plans
+          WHERE parent_job_id IN (${head.composed.jobId}::uuid,${tail.composed.jobId}::uuid)`)).toEqual([{ parent_job_id:tail.composed.jobId }]);
+        expect(await recoverTerminalProgressiveNoEvidenceGaps(connection)).toBe(2);
+        expect(pages[2]).toEqual(ordered.slice(0,32).map(row => row.id));
+        expect(pages.every(page => page.length<=32 && new Set(page).size===page.length)).toBe(true);
+        expect(await execute(sql`SELECT parent_job_id,count(*)::int AS count FROM progressive_cfd_recovery_plans
+          WHERE parent_job_id IN (${head.composed.jobId}::uuid,${tail.composed.jobId}::uuid)
+          GROUP BY parent_job_id ORDER BY parent_job_id`)).toEqual([head,tail].map(fixture => ({ parent_job_id:fixture.composed.jobId,count:2 }))
+            .sort((left,right) => left.parent_job_id.localeCompare(right.parent_job_id)));
+        expect(await recoverTerminalProgressiveNoEvidenceGaps(connection)).toBe(0);
+        expect(await science()).toEqual(before);
+      } finally { observed.mockRestore(); }
+    });
+  }, 120_000);
+
   it("recovers late precise rhoPimple diagnostics after settlement through maintenance claim and dispatch", async () => {
     const angles = [0, 1, 2, 3, 4, 5, 6, 7];
     const fixture = await cfdEvidenceFixture(
