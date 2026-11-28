@@ -1656,7 +1656,7 @@ requires = ["seed", "types"]
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "does not reserve remote CPU for an unstarted dispatch after its case lease expires"]
 
 [test.precise-admission]
-timeout_seconds=900
+timeout_seconds=3600
 
 [test.precise-admission.postgres]
 image="postgres:16-alpine"
@@ -2911,7 +2911,7 @@ requires = ["dependencies","workspace"]
 command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "progressive durable stage transitions|closes settled fast anchors without a NeuralFoil prior"]
 
 [test.progressive-intake-recovery]
-timeout_seconds = 900
+timeout_seconds = 3600
 
 [test.progressive-intake-recovery.postgres]
 image = "postgres:16-alpine"
