@@ -24,6 +24,8 @@ export type ProgressiveDiagnosticFailureKind = "material_domain" | "infrastructu
 
 interface RetentionPreparation {
   executionId: string;
+  selectedAttempts?: ReadonlySet<string>;
+  preparationFailures: Map<string, Error>;
   deliveries: Map<string, ProgressiveRemoteEvidenceDelivery>;
   reports: Map<string, { report: ProgressiveRemoteReport; current: (connection: DB) => Promise<boolean> }>;
 }
@@ -45,8 +47,13 @@ export async function withPreparedProgressiveRemoteRetention<T>(
   executionId: string,
   reader: AttemptEvidenceArchiveReader,
   action: () => Promise<T>,
+  selectedAttempts?: readonly string[],
 ): Promise<T> {
-  if(retentionContext.getStore()?.executionId===executionId)return action();
+  if (selectedAttempts && (selectedAttempts.length === 0 || selectedAttempts.length > 512))
+    throw new Error("Selected retention preparation requires a bounded point scope");
+  const current = retentionContext.getStore();
+  const available = current?.selectedAttempts;
+  if (current?.executionId === executionId && (!available || selectedAttempts?.every(id => available.has(id)))) return action();
   const attemptPointer=await hasAttemptEvidenceStoragePointer(db);
   const [schema]=await db.execute(sql`SELECT EXISTS(SELECT FROM pg_attribute WHERE attrelid=to_regclass('progressive_remote_reports')
     AND attname='archived_at' AND NOT attisdropped) AS reports`);
@@ -58,7 +65,10 @@ export async function withPreparedProgressiveRemoteRetention<T>(
     FROM progressive_remote_evidence_receipts e JOIN result_attempts a ON a.id=e.result_attempt_id
     JOIN progressive_remote_reports r ON r.sim_job_id=e.sim_job_id AND r.sequence=e.sequence
     JOIN progressive_remote_dispatches d ON d.sim_job_id=e.sim_job_id
-    WHERE e.sim_job_id=${executionId}::uuid AND (${archivedAttempt} IS NOT NULL OR ${archivedReport}) ORDER BY e.result_attempt_id LIMIT 2049`);
+    WHERE e.sim_job_id=${executionId}::uuid AND (${archivedAttempt} IS NOT NULL OR ${archivedReport})
+      ${selectedAttempts ? sql`AND NOT e.storage_only AND e.result_attempt_id IN
+        (${sql.join(selectedAttempts.map(id => sql`${id}::uuid`), sql`,`)})` : sql``}
+    ORDER BY e.result_attempt_id LIMIT 2049`);
   if(!rows.length){
     if(!schema?.reports)return action();
     const [cold]=await db.execute(sql`SELECT 1 FROM progressive_remote_reports WHERE sim_job_id=${executionId}::uuid AND archive_bundle_id IS NOT NULL LIMIT 1`);
@@ -70,6 +80,8 @@ export async function withPreparedProgressiveRemoteRetention<T>(
     );
   const prepared: RetentionPreparation = {
     executionId,
+    selectedAttempts: selectedAttempts && new Set(selectedAttempts),
+    preparationFailures: new Map(),
     deliveries: new Map(),
     reports: new Map(),
   };
@@ -89,24 +101,35 @@ export async function withPreparedProgressiveRemoteRetention<T>(
         pointContentSignature: String(row.point_content_signature),
       },
     };
-    const source = await prepareProgressiveRemoteEvidence(db, delivery);
-    if (!source) throw new Error("Remote retention source changed during preparation");
-    if(row.archived_attempt){
-      const receipt=await prepareProgressiveRemoteReceiptReplay(db,delivery,reader);
-      if(receipt?.resultAttemptId!==row.result_attempt_id)throw new Error("Remote retention attempt changed during preparation");
+    const id = String(row.result_attempt_id);
+    try {
+      const source = await prepareProgressiveRemoteEvidence(db, delivery);
+      if (!source) throw new Error("Remote retention source changed during preparation");
+      if (row.archived_attempt) {
+        const receipt = await prepareProgressiveRemoteReceiptReplay(db, delivery, reader);
+        if (receipt?.resultAttemptId !== id) throw new Error("Remote retention attempt changed during preparation");
+      }
+      prepared.deliveries.set(id, delivery);
+      prepared.reports.set(String(row.content_signature), { report: source.report,
+        current: connection => recheckPreparedEvidenceReport(connection, delivery.progressiveEvidence) });
+    } catch (error) {
+      // A damaged selected member refuses its own unit. Whole-job retention
+      // and operational database errors still propagate to the caller.
+      if (!selectedAttempts || !(error instanceof Error) || error.name !== "Error" || "code" in error ||
+          (error.cause instanceof Error && "code" in error.cause)) throw error;
+      prepared.preparationFailures.set(id, error);
     }
-    prepared.deliveries.set(String(row.result_attempt_id), delivery);
-    prepared.reports.set(String(row.content_signature), {report:source.report,
-      current: connection => recheckPreparedEvidenceReport(connection,delivery.progressiveEvidence)});
-
   }
-  const others = await db.execute(sql`WITH distinct_sources AS MATERIALIZED (
-      SELECT DISTINCT ON(point_content_signature) sequence FROM progressive_remote_report_sources
-      WHERE sim_job_id=${executionId}::uuid ORDER BY point_content_signature,sequence LIMIT 2049
-    ),
-    keys AS (SELECT sequence FROM distinct_sources UNION SELECT sequence FROM progressive_remote_diagnostic_receipts
-      WHERE sim_job_id=${executionId}::uuid UNION (SELECT sequence FROM progressive_remote_reports
-      WHERE sim_job_id=${executionId}::uuid ORDER BY sequence DESC LIMIT 1))
+  const latest = sql`(SELECT sequence FROM progressive_remote_reports
+    WHERE sim_job_id=${executionId}::uuid ORDER BY sequence DESC LIMIT 1)`;
+  // A reuse pass needs the selected receipt anchors (prepared above) and the
+  // signed final report. Other physical or diagnostic deliveries may be absent.
+  const keys = selectedAttempts ? latest : sql`
+    (SELECT DISTINCT ON(point_content_signature) sequence FROM progressive_remote_report_sources
+      WHERE sim_job_id=${executionId}::uuid ORDER BY point_content_signature,sequence LIMIT 2049)
+    UNION SELECT sequence FROM progressive_remote_diagnostic_receipts WHERE sim_job_id=${executionId}::uuid
+    UNION ${latest}`;
+  const others = await db.execute(sql`WITH keys AS (${keys})
     SELECT r.sequence,r.content_signature,r.report FROM keys JOIN progressive_remote_reports r USING(sequence)
     WHERE r.sim_job_id=${executionId}::uuid AND r.archived_at IS NOT NULL`);
   for (const row of others) {
@@ -326,19 +349,37 @@ export async function readProgressiveRemoteRetention(
     if (result.kind !== "verified_sources") return result;
     return { kind: "retained" as const, report: result.report, sources: result.sources };
   };
-  if (reader && !is(db, PgTransaction) && retentionContext.getStore()?.executionId !== executionId)
+  if (reader && !is(db, PgTransaction))
     return withPreparedProgressiveRemoteRetention(db, executionId, reader, inspect);
   return inspect();
 }
 
-// Only the stopped canonical publication path can consume independently verified
-// sources. An incomplete inventory of delivered evidence never settles the job.
+// Canonical publication can consume independently verified sources.
+// An incomplete inventory of delivered evidence never settles the job.
 export async function readStoppedPublicationSources(db: DB, executionId: string) {
   const result = await inspectRemoteSources(db, executionId, true);
   return result.kind === "verified_sources" ? result : null;
 }
 
-async function inspectRemoteSources(db: DB, executionId: string, allowMissingSiblings: boolean) {
+/** Authenticate custody of one final-report point without making any claim about its siblings. */
+export async function readSelectedPrecisePointSource(db: DB, executionId: string, resultAttemptId: string) {
+  const checked = await inspectRemoteSources(db, executionId, true, resultAttemptId);
+  if (checked.kind !== "verified_sources" || !checked.report.result || checked.sources.length !== 1) return null;
+  const [source] = checked.sources;
+  const result = checked.report.result;
+  if (source.resultAttemptId !== resultAttemptId || source.storageOnly || !source.archived ||
+      !progressiveReportedPointSources({ ...result, polars: result.polars.map(polar => ({ ...polar, attempts: [] })) })
+        .some(point => point.contentSignature === source.delivery.progressiveEvidence.pointContentSignature)) return null;
+  return { source, report: checked.report };
+}
+
+async function inspectRemoteSources(db: DB, executionId: string, allowMissingSiblings: boolean, resultAttemptId?: string) {
+  const prepared = retentionContext.getStore();
+  if (prepared?.executionId === executionId && prepared.selectedAttempts &&
+      (!resultAttemptId || !prepared.selectedAttempts.has(resultAttemptId)))
+    throw new Error("Selected point preparation cannot authorize another point or whole-job retention");
+  const failure = resultAttemptId && prepared?.executionId === executionId && prepared.preparationFailures.get(resultAttemptId);
+  if (failure) throw failure;
   const [latest] =
     await db.execute(sql`SELECT report.report, report.sequence, report.content_signature,
       dispatch.envelope FROM progressive_remote_dispatches dispatch
@@ -359,6 +400,8 @@ async function inspectRemoteSources(db: DB, executionId: string, allowMissingSib
     await db.execute(sql`SELECT report.sequence FROM progressive_remote_reports report
     LEFT JOIN progressive_remote_report_inventories inventory USING (sim_job_id, sequence)
     WHERE report.sim_job_id = ${executionId}::uuid AND report.sequence <= ${report.sequence}
+      ${resultAttemptId ? sql`AND (report.sequence=${report.sequence} OR EXISTS (SELECT FROM progressive_remote_evidence_receipts selected
+        WHERE selected.result_attempt_id=${resultAttemptId}::uuid AND selected.sim_job_id=report.sim_job_id AND selected.sequence=report.sequence))` : sql``}
       AND (inventory.sequence IS NULL OR inventory.report_content_signature <> report.content_signature
         OR inventory.source_count <> (SELECT count(*) FROM progressive_remote_report_sources source
           WHERE source.sim_job_id = inventory.sim_job_id AND source.sequence = inventory.sequence)) LIMIT 1`);
@@ -369,6 +412,9 @@ async function inspectRemoteSources(db: DB, executionId: string, allowMissingSib
       SELECT DISTINCT source.point_content_signature, source.aoa_deg, source.case_slug
       FROM progressive_remote_report_sources source
       WHERE source.sim_job_id = ${executionId}::uuid AND source.sequence <= ${report.sequence}
+        ${resultAttemptId ? sql`AND EXISTS (SELECT FROM progressive_remote_evidence_receipts selected
+          WHERE selected.result_attempt_id=${resultAttemptId}::uuid AND selected.sim_job_id=source.sim_job_id
+            AND selected.point_content_signature=source.point_content_signature AND NOT selected.storage_only)` : sql``}
       ORDER BY source.point_content_signature, source.aoa_deg, source.case_slug LIMIT 2049
     )
     SELECT source.point_content_signature, source.aoa_deg, source.case_slug,
