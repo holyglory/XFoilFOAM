@@ -321,15 +321,24 @@ export async function readProgressiveRemoteRetention(
   executionId: string,
   reader = retentionReader,
 ) {
+  const inspect = async () => {
+    const result = await inspectRemoteSources(db, executionId, false);
+    if (result.kind !== "verified_sources") return result;
+    return { kind: "retained" as const, report: result.report, sources: result.sources };
+  };
   if (reader && !is(db, PgTransaction) && retentionContext.getStore()?.executionId !== executionId)
-    return withPreparedProgressiveRemoteRetention(db,executionId,reader,() => readRemoteRetention(db,executionId));
-  return readRemoteRetention(db,executionId);
+    return withPreparedProgressiveRemoteRetention(db, executionId, reader, inspect);
+  return inspect();
 }
 
-async function readRemoteRetention(
-  db: DB,
-  executionId: string,
-) {
+// Only the stopped canonical publication path can consume independently verified
+// sources. An incomplete inventory of delivered evidence never settles the job.
+export async function readStoppedPublicationSources(db: DB, executionId: string) {
+  const result = await inspectRemoteSources(db, executionId, true);
+  return result.kind === "verified_sources" ? result : null;
+}
+
+async function inspectRemoteSources(db: DB, executionId: string, allowMissingSiblings: boolean) {
   const [latest] =
     await db.execute(sql`SELECT report.report, report.sequence, report.content_signature,
       dispatch.envelope FROM progressive_remote_dispatches dispatch
@@ -394,8 +403,8 @@ async function readRemoteRetention(
       !terminalNoEvidence.has(String(source.point_content_signature)),
   ).length;
   if (missingEvidence && terminalReportHasNoPhysicalEvidence(report))
-    return { kind: "retained" as const, report, sources: [] };
-  if (missingEvidence)
+    return { kind: "verified_sources" as const, report, sources: [], incomplete: false };
+  if (missingEvidence && !allowMissingSiblings)
     return {
       kind: "waiting" as const,
       reason: "raw_evidence" as const,
@@ -410,11 +419,7 @@ async function readRemoteRetention(
   }> = [];
   let pendingArchives = 0;
   for (const source of sources) {
-    if (
-      source.result_attempt_id == null &&
-      terminalNoEvidence.has(String(source.point_content_signature))
-    )
-      continue;
+    if (source.result_attempt_id == null) continue;
     if (
       source.archive_id == null && source.storage_only !== true &&
       (!source.evidence_signature ||
@@ -483,12 +488,12 @@ async function readRemoteRetention(
       storageOnly: source.storage_only === true,
     });
   }
-  if (pendingArchives)
+  if (pendingArchives && !allowMissingSiblings)
     return {
       kind: "waiting" as const,
       reason: "archives" as const,
       sourceCount: sources.length,
       pendingCount: pendingArchives,
     };
-  return { kind: "retained" as const, report, sources: retained };
+  return { kind: "verified_sources" as const, report, sources: retained, incomplete: missingEvidence > 0 || pendingArchives > 0 };
 }

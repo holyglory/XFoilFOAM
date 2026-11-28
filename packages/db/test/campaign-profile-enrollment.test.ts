@@ -5781,16 +5781,20 @@ describe("progressive CPU admission", () => {
     }, [32.1799]);
   }, 120_000);
 
-  it.each([false, true])("retains exact stopped failed attempts without canonical publication (prior raw: %s)", async (priorRaw) => {
+  it.each([false, true, "mixed stopped owners", "missing physical siblings"] as const)("retains exact stopped failed attempts without canonical publication (prior raw: %s)", async (priorRaw) => {
+    const mixed = priorRaw === "mixed stopped owners";
+    const incomplete = priorRaw === "missing physical siblings";
+    const angles = incomplete ? [3, 4, 5, 6, 7, 8, 9, 10] : mixed ? [-5, -4, -3, -2, -1, 0, 1, 2] : [-4, -3, -2, -1, 0, 1, 2];
     const verify = async (priorRaw: boolean) => {
       const prepared = priorRaw ? await cfdEvidenceFixture(
-        32.1803, 3, [], [-4, -3, -2, -1, 0, 1, 2], false, undefined, {}, 7, true,
+        incomplete ? 166.281 : mixed ? 32.1861 : 32.1803, 3, [], angles, false, undefined, {}, angles.length, true,
+        false, 1, mixed ? { historicalTransient: true } : undefined,
       ) : null;
       const leases = prepared?.leases ?? await claimProgressiveCfdBatch(db, {
         owner: "stopped-failed-storage-fixture", leaseSeconds: 120,
-        maximumUnits: priorRaw ? 7 : 2, solverBudgetVersion: 2, localTimeStepVersion: 1,
+        maximumUnits: priorRaw ? angles.length : 2, solverBudgetVersion: 2, localTimeStepVersion: 1,
       });
-      expect(leases).toHaveLength(priorRaw ? 7 : 2);
+      expect(leases).toHaveLength(priorRaw ? angles.length : 2);
       const composed = prepared?.composed ?? await composeProgressiveCfdJob(db, leases, {
         cpuSlots: 1, meshRecoveryVersion: 3, solverBudgetVersion: 2,
       });
@@ -5812,12 +5816,13 @@ describe("progressive CPU admission", () => {
             (promise_id,airfoil_id,simulation_preset_revision_id,aoa_deg)
             VALUES (${promiseId}::uuid,${job.airfoilId}::uuid,${job.simulationPresetRevisionId}::uuid,${lease.alpha})`);
         const { envelope } = await bindProgressiveRemoteDispatch(db, { simJobId: job.id, solverId, promiseId });
-        const { verifyStoppedFailedProgressiveDelivery, verifyPriorRawStoppedProgressiveSettlement } = await import("./progressive-stopped-failed-delivery-fixture");
+        const { verifyStoppedFailedProgressiveDelivery, verifyPriorRawStoppedProgressiveSettlement, verifyCancelledAcceptedPublication } = await import("./progressive-stopped-failed-delivery-fixture");
         if (!priorRaw) {
           const { verifyHistoricalRawArchive } = await import("../../../apps/api/test/historical-raw-archive-fixture");
           await verifyHistoricalRawArchive(db, envelope);
         }
-        await (priorRaw ? verifyPriorRawStoppedProgressiveSettlement : verifyStoppedFailedProgressiveDelivery)(db, envelope);
+        if (incomplete || mixed) await verifyCancelledAcceptedPublication(db, envelope, incomplete ? "incomplete" : "mixed");
+        else await (priorRaw ? verifyPriorRawStoppedProgressiveSettlement : verifyStoppedFailedProgressiveDelivery)(db, envelope);
       } finally {
         await db.update(sweeperState).set({ enabled: admission.enabled }).where(eq(sweeperState.id, 1));
         await db.execute(sql`DELETE FROM progressive_remote_dispatches WHERE sim_job_id=${job.id}::uuid`);
