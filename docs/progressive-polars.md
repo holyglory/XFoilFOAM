@@ -141,6 +141,14 @@ has no eligible work, the other stage can run immediately. A rolled-back offer
 preserves the turn. The calculation epoch and campaign plan revision scope the
 record so that new plans start with their own ordering.
 
+Within ordinary low-Mach precise turns, batches alternate between the usual
+precise work and steady cases explicitly requeued by the completion-retry
+operator after one attempt spent at least 3,600 solver seconds and left budget
+available. The current recipe must select `simpleFoam` or `rhoSimpleFoam`.
+If either class has no eligible case, the other can take the turn immediately.
+Material recovery and checkpoint extensions keep their priority. A pinned
+short-work offer or a same-target batch fill does not consume this class turn.
+
 Every current generation's low precise work must close successfully before a
 new high CFD claim is issued. A fast gap can advance into precise recovery; a
 precise gap keeps the high cohort waiting. In-flight, locked, deferred or

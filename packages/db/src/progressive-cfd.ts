@@ -22,6 +22,7 @@ import {
 } from "./analysis-target";
 import type { DB } from "./client";
 import { tryProgressiveAdmissionLock } from "./progressive-admission-lock";
+import { FIRST_COMPLETION_RETRY_ADMITTED } from "./progressive-completion-retry";
 import {
   currentLocalStepPolicySql,
   localStepRecipeSql,
@@ -425,16 +426,33 @@ export async function claimProgressiveCfdUnit(
     // One durable turn per first claim, serialized by the campaign mutex. Do
     // not derive turns from heartbeat time, scan attempt history, or rotate
     // while filling the rest of a homogeneous same-target batch.
-    const alternateLowStages = !input.sameTarget && campaign.subsonic_first === true && !campaign.all_stage3;
+    const firstLowClaim = !input.sameTarget && campaign.subsonic_first === true;
+    const alternateLowStages = firstLowClaim && !campaign.all_stage3;
+    const alternateLowPrecise = firstLowClaim && !input.preferredWorkId;
+    const [turn] = alternateLowStages || alternateLowPrecise ? await connection.execute(sql`
+      SELECT last_stage, last_precise_measured FROM progressive_cfd_claim_turns
+      WHERE campaign_id=${campaign.id}::uuid AND epoch_id=${epoch.id}::uuid
+        AND plan_revision_id=${campaign.current_plan_revision_id}::uuid
+    `) : [];
+    const lowPrecise = sql`target.mach >= 0 AND target.mach < 1
+      AND work.stage = 3 AND unit.purpose = 'precise'`;
+    // The operator validated the stopped history before setting this marker.
+    // Check the effective solver only for marked first retries with measured time.
+    const measuredSteady = sql`CASE WHEN ${lowPrecise} AND unit.attempts = 1
+      AND unit.error = ${FIRST_COMPLETION_RETRY_ADMITTED} AND unit.active_seconds >= 3600
+      AND unit.active_seconds < unit.active_budget_seconds
+      THEN coalesce((${effectiveRecipe})#>>'{selection,solver}' IN ('simpleFoam','rhoSimpleFoam'), false)
+      ELSE false END`;
+    const lastMeasured = turn?.last_precise_measured === true;
+    const preciseClassOrder = alternateLowPrecise
+      ? sql`CASE WHEN ${measuredSteady} THEN ${lastMeasured ? 1 : 0}::int ELSE ${lastMeasured ? 0 : 1}::int END,`
+      : sql``;
     let lowClaimPriority = sql``;
     if (alternateLowStages) {
-      const [turn] = await connection.execute(sql`
-        SELECT last_stage FROM progressive_cfd_claim_turns
-        WHERE campaign_id=${campaign.id}::uuid AND epoch_id=${epoch.id}::uuid
-          AND plan_revision_id=${campaign.current_plan_revision_id}::uuid
-      `);
       const preferInitialRetry = Number(turn?.last_stage) !== 2;
       lowClaimPriority = sql`CASE
+        WHEN target.mach >= 0 AND target.mach < 1 AND work.stage = 2
+          AND unit.purpose = 'initial' AND unit.attempts = 0 THEN -1
         WHEN target.mach >= 0 AND target.mach < 1 AND work.stage = 2
           AND unit.purpose = 'initial' AND unit.attempts > 0 THEN ${preferInitialRetry ? 0 : 1}::int
         WHEN target.mach >= 0 AND target.mach < 1 AND work.stage = 3
@@ -462,6 +480,13 @@ export async function claimProgressiveCfdUnit(
       : progressiveInitialCoverageCompleteSql();
     let selected: SQL;
     let candidatePrefix: { heads: SQL; selected: SQL } | undefined;
+    // Global rankings hash the small priority sets once. Pinned/fill claims
+    // retain their indexed per-unit checks and do not use precise class ordering.
+    const globalRank = !input.preferredWorkId && !input.sameTarget;
+    const materialPriority = globalRank ? sql`unit.id IN (${progressiveAvailableMaterialUnitIds()})`
+      : progressiveCfdMaterialDomainRecoveryAvailableSql("unit");
+    const extensionPriority = globalRank ? sql`unit.id IN (SELECT extension.unit_id FROM progressive_cfd_budget_extensions extension
+      WHERE extension.state='pending')` : pendingBudgetExtension;
     if (campaign.all_stage3) {
       const selectStage3Candidate = async (
         machPredicate: SQL,
@@ -498,7 +523,9 @@ export async function claimProgressiveCfdUnit(
       };
       let selectedId = await selectStage3Candidate(
         sql`target.mach < 1.0`,
-        sql`generation.created_at, generation.id, CASE WHEN unit.purpose = 'initial' THEN 0 ELSE 1 END,
+        sql`${alternateLowPrecise ? sql`CASE WHEN ${materialPriority} THEN 0 ELSE 1 END,
+          CASE WHEN ${extensionPriority} THEN 0 ELSE 1 END, ${preciseClassOrder}` : sql``}
+          generation.created_at, generation.id, CASE WHEN unit.purpose = 'initial' THEN 0 ELSE 1 END,
           unit.retry_after NULLS FIRST, unit.retry_after, unit.ordinal, work.target_id`,
       );
       if (!selectedId && campaign.high_allowed)
@@ -531,20 +558,14 @@ export async function claimProgressiveCfdUnit(
         AND unit.state = 'pending' AND ${attemptAvailable} AND unit.active_seconds < ${effectiveBudget}
         AND (unit.retry_after IS NULL OR unit.retry_after <= clock_timestamp())
         AND (unit.purpose <> 'adaptive' OR ${initialCoverageComplete})`;
-      // A global ranking can hash the small priority sets once. A single
-      // target or pinned work uses the existing indexed per-unit checks.
-      const globalRank = !input.preferredWorkId && !input.sameTarget;
-      const materialPriority = globalRank ? sql`unit.id IN (${progressiveAvailableMaterialUnitIds()})`
-        : progressiveCfdMaterialDomainRecoveryAvailableSql("unit");
-      const extensionPriority = globalRank ? sql`unit.id IN (SELECT extension.unit_id FROM progressive_cfd_budget_extensions extension
-        WHERE extension.state='pending')` : pendingBudgetExtension;
       const candidateOrder = sql`CASE WHEN ${materialPriority} THEN 0 ELSE 1 END,
         CASE WHEN target.mach < 1.0 THEN 0 WHEN target.mach >= 1.0 THEN 1 ELSE 2 END,
         CASE WHEN target.mach >= 1.0 THEN target.mach END ASC NULLS LAST,
         CASE WHEN ${extensionPriority} THEN 0 ELSE 1 END,
+        ${lowClaimPriority} ${preciseClassOrder}
         generation.created_at, generation.id,
         CASE WHEN work.stage = 2 AND unit.purpose = 'initial' AND unit.attempts = 0 THEN 0 ELSE 1 END,
-        ${lowClaimPriority} CASE WHEN work.stage = 3 THEN 0 ELSE 1 END,
+        CASE WHEN work.stage = 3 THEN 0 ELSE 1 END,
         CASE WHEN unit.purpose = 'initial' THEN 0 ELSE 1 END,
         unit.retry_after NULLS FIRST, unit.retry_after, unit.ordinal, work.target_id`;
       const candidateQuery = (headId?: SQL) => sql`
@@ -599,6 +620,8 @@ export async function claimProgressiveCfdUnit(
       WITH ${progressiveAdmissionFrontierSql(String(epoch.id))}${cohortReadiness}${heads ? sql`, ${heads}` : sql``}, ${selection}
       SELECT unit.id, unit.work_id, work.generation_id, work.target_id, scope.revision_id,
         work.stage, unit.purpose, unit.attempts, unit.aoa_deg, ${effectiveRecipe} AS recipe, target.physical,
+        ${alternateLowPrecise ? sql`CASE WHEN ${lowPrecise} AND NOT ${pendingBudgetExtension}
+          AND NOT ${progressiveCfdMaterialDomainRecoveryAvailableSql("unit")} THEN ${measuredSteady} END` : sql`NULL::boolean`} AS precise_turn_measured,
         (SELECT recovery.id FROM progressive_cfd_recovery_plans recovery WHERE recovery.unit_id = unit.id ORDER BY recovery.ordinal DESC LIMIT 1) AS recovery_plan_id,
         (${localStepPolicy}) AS local_step_policy_id,
         ${recoveryParent} AS recovery_parent_job_id,${publicationRecovery} AS publication_recovery,
@@ -641,6 +664,7 @@ export async function claimProgressiveCfdUnit(
       stage: 2 | 3;
       purpose: string;
       attempts: number;
+      precise_turn_measured: boolean | null;
       aoa_deg: number;
       recipe: Record<string, unknown>;
       physical: AnalysisPhysical;
@@ -698,17 +722,20 @@ export async function claimProgressiveCfdUnit(
       await connection.execute(sql`INSERT INTO progressive_publication_recovery_claims(unit_id,attempt_token)
         VALUES(${unit.id}::uuid,${token}::uuid)`);
     const mach = unit.physical.derived.mach;
-    if (alternateLowStages && mach != null && mach >= 0 && mach < 1
+    const stageTurn = alternateLowStages && mach != null && mach >= 0 && mach < 1
       && ((unit.stage === 2 && unit.purpose === "initial" && unit.attempts > 0)
-        || (unit.stage === 3 && unit.purpose === "precise")))
+        || (unit.stage === 3 && unit.purpose === "precise"));
+    if (stageTurn || unit.precise_turn_measured !== null)
       await connection.execute(sql`
-        INSERT INTO progressive_cfd_claim_turns(campaign_id,epoch_id,plan_revision_id,last_stage)
-        VALUES(${campaign.id}::uuid,${epoch.id}::uuid,${campaign.current_plan_revision_id}::uuid,${unit.stage})
+        INSERT INTO progressive_cfd_claim_turns(campaign_id,epoch_id,plan_revision_id,last_stage,last_precise_measured)
+        VALUES(${campaign.id}::uuid,${epoch.id}::uuid,${campaign.current_plan_revision_id}::uuid,
+          ${stageTurn ? unit.stage : turn?.last_stage ?? 3}, ${unit.precise_turn_measured ?? lastMeasured})
         ON CONFLICT(campaign_id) DO UPDATE SET epoch_id=excluded.epoch_id,
-          plan_revision_id=excluded.plan_revision_id,last_stage=excluded.last_stage
+          plan_revision_id=excluded.plan_revision_id,last_stage=excluded.last_stage,
+          last_precise_measured=excluded.last_precise_measured
         WHERE (progressive_cfd_claim_turns.epoch_id, progressive_cfd_claim_turns.plan_revision_id,
-          progressive_cfd_claim_turns.last_stage) IS DISTINCT FROM
-          (excluded.epoch_id, excluded.plan_revision_id, excluded.last_stage)
+          progressive_cfd_claim_turns.last_stage, progressive_cfd_claim_turns.last_precise_measured) IS DISTINCT FROM
+          (excluded.epoch_id, excluded.plan_revision_id, excluded.last_stage, excluded.last_precise_measured)
       `);
     return {
       id: unit.id,

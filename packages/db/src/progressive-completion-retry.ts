@@ -9,6 +9,9 @@ const COMPLETION_RETRY_REASONS = [
   "precise evidence remains unresolved",
 ] as const;
 
+export const FIRST_COMPLETION_RETRY_ADMITTED =
+  "Completion retry admitted after an under-budget unresolved attempt";
+
 export async function requeueProgressiveCompletionRetries(
   db: DB,
   input: { campaignId: string; expectedCount: number; unitIds?: readonly string[] },
@@ -97,7 +100,7 @@ export async function requeueProgressiveCompletionRetries(
         SET state = 'pending', lease_token = NULL, lease_owner = NULL,
           lease_until = NULL, retry_after = NULL,
           error = CASE WHEN attempts >= 2 THEN error
-            ELSE 'Completion retry admitted after an under-budget unresolved attempt' END
+            ELSE ${FIRST_COMPLETION_RETRY_ADMITTED}::text END
         WHERE id IN (${sql.join(units.map((unit) => sql`${unit.id}::uuid`), sql`, `)})
           AND state = 'gap' AND attempts IN (1, 2)
           AND active_seconds < active_budget_seconds

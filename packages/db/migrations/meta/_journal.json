@@ -1688,6 +1688,13 @@
       "when": 1795613168618,
       "tag": "0240_progressive_cfd_claim_turns",
       "breakpoints": true
+    },
+    {
+      "idx": 241,
+      "version": "7",
+      "when": 1795613168619,
+      "tag": "0241_progressive_precise_claim_turn",
+      "breakpoints": true
     }
   ]
 }

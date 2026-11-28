@@ -16254,10 +16254,14 @@ describe("subsonic through precise priority", () => {
     }]);
   }, 120_000);
 
-  async function initialFastRetryCoverage(additionalProfiles = 2, differentSolverFamilies = false) {
+  async function initialFastRetryCoverage(
+    additionalProfiles = 2,
+    { angles = [-2, 0, 2], differentSolverFamilies = false }:
+      { angles?: number[]; differentSolverFamilies?: boolean } = {},
+  ) {
     const fixture = differentSolverFamilies
-      ? await scope(true, [-2, 0, 2], 0, 0.1)
-      : await scope(true, [-2, 0, 2], additionalProfiles);
+      ? await scope(true, angles, 0, 0.1)
+      : await scope(true, angles, additionalProfiles);
     await initializeProgressiveCfdWork(db);
     const batch = (family?: "simpleFoam" | "rhoSimpleFoam") => claimProgressiveCfdBatch(db, {
       owner: "initial-fast-retry-coverage-fixture",
@@ -16366,10 +16370,104 @@ describe("subsonic through precise priority", () => {
     expect(batches.map(batch => batch.length)).toEqual([2, 2, 2, 1]);
   }, 120_000);
 
+  it("alternates measured operator-requeued steady repairs with ordinary precise first claims", async () => {
+    const fixture = await initialFastRetryCoverage(2, { angles: [0, 1, 2, 3, 4, 5] });
+    const [work] = await db.execute(sql`SELECT work.id FROM progressive_work work
+      JOIN progressive_cfd_units unit ON unit.work_id=work.id
+      WHERE work.generation_id=${fixture.generationId} AND work.stage=3 AND unit.state='pending' LIMIT 1`);
+    const options = { owner: "measured-steady-turn", leaseSeconds: 120, maximumUnits: 1,
+      solverBudgetVersion: 2, localTimeStepVersion: 1 };
+    const first = await claimProgressiveCfdBatch(db, { ...options, preferredWorkId: String(work.id), maximumUnits: 4 });
+    expect(first.map(lease => lease.alpha)).toEqual([0, 1, 2, 3]);
+    const source = await cfdEvidenceFixture(undefined, 3, [], [], false,
+      { campaignId: fixture.campaignId, leases: first }, {}, undefined, false, false, 1, { historicalTransient: true });
+    expect(source.execution.snapshot.solver.flowSolverFamily).toBe("rhoSimpleFoam");
+    expect(source.composed.request.solver?.flow_solver_family).toBe("rhoPimpleFoam");
+    const seconds = [5000, 3599, 3600, 7200];
+    const evidence = [];
+    for (const lease of first) {
+      await heartbeatProgressiveCfdUnit(db, lease, { attemptActiveSeconds: seconds[lease.alpha], leaseSeconds: 120 });
+      evidence.push(await source.save(seconds[lease.alpha], "urans", lease.alpha, {
+        fidelity: "urans_full", failure_disposition: "hard_solver",
+      }));
+    }
+    await source.record(evidence);
+    await acknowledgeProgressiveCfdExecutionStop(db, { simJobId: source.composed.jobId,
+      proof: executionStopProof(source.engineJobId) });
+    await db.update(simJobs).set({ status: "failed", ingestedAt: new Date() }).where(eq(simJobs.id, source.composed.jobId));
+    await releaseResultClaimsForJob(db, source.composed.jobId, ["queued", "running"]);
+    expect(await settleProgressiveCfdExecution(db, source.composed.jobId)).toMatchObject({ gaps: 4 });
+    expect(await requeueProgressiveCompletionRetries(db, { campaignId: fixture.campaignId,
+      unitIds: first.map(lease => lease.id), expectedCount: 4 })).toEqual({ requeued: 4 });
+
+    // An approved transient plan wins over the unit's original steady recipe.
+    // Despite its marker and 5,000 seconds it competes on the ordinary turn.
+    const recovery = progressiveUnsteadyRecipe({ ...first[0].recipe,
+      selection: { ...(first[0].recipe.selection as object), solver: "rhoPimpleFoam" } }, "hard_solver");
+    const [plan] = await db.execute(sql`INSERT INTO progressive_cfd_recovery_plans
+      (unit_id,ordinal,parent_attempt_token,parent_job_id,diagnostic_attempt_id,diagnostic_signature,scope,reason,recipe)
+      SELECT ${first[0].id}::uuid,1,${first[0].token}::uuid,${source.composed.jobId}::uuid,result_attempt_id,evidence_signature,
+        'targeted','hard_solver',${JSON.stringify(recovery)}::jsonb FROM progressive_cfd_evidence
+      WHERE result_attempt_id=${evidence[0]}::uuid RETURNING *`);
+    const history = () => db.execute(sql`SELECT to_jsonb(attempt) AS attempt,to_jsonb(receipt) AS receipt
+      FROM progressive_cfd_attempts attempt JOIN progressive_cfd_evidence receipt ON receipt.attempt_token=attempt.token
+      WHERE attempt.sim_job_id=${source.composed.jobId}::uuid ORDER BY attempt.token`);
+    const before = await history();
+    const next = async () => {
+      const client = createClient({ url: targetUrl.toString(), max: 1 });
+      try {
+        const batch = await claimProgressiveCfdBatch(client.db, options);
+        expect(batch).toHaveLength(1);
+        return batch[0]!;
+      } finally { await client.sql.end(); }
+    };
+    expect((await next()).stage).toBe(2);
+    // A failed offer with a compatible fill must roll back both leases and
+    // both cursors. Check the first unit separately since batches sort by AoA.
+    const rollback = new Error("discard isolated measured offer");
+    await expect(db.transaction(async tx => {
+      const batch = await claimProgressiveCfdBatch(tx as unknown as DB, { ...options, maximumUnits: 2 });
+      expect(batch).toHaveLength(2);
+      expect(batch.map(lease => lease.id)).toContain(first[2].id);
+      expect(batch.every(lease => lease.targetId === first[2].targetId && lease.recoveryParentJobId === null)).toBe(true);
+      throw rollback;
+    })).rejects.toBe(rollback);
+    const measured = await next();
+    expect(measured).toMatchObject({ id: first[2].id, stage: 3, recipe: first[2].recipe,
+      remainingActiveSeconds: first[2].remainingActiveSeconds - 3600, recoveryPlanId: null, budgetExtension: null });
+    const corrected = await cfdEvidenceFixture(undefined, 3, [], [], false,
+      { campaignId: fixture.campaignId, leases: [measured] });
+    expect(corrected.composed.request.solver).toMatchObject({ flow_solver_family: "rhoSimpleFoam", force_transient: false });
+    expect(corrected.composed.request.resources?.case_solver_budget_seconds).toBe(measured.remainingActiveSeconds);
+    expect((await next()).stage).toBe(2);
+    const ordinary = await next();
+    expect(ordinary).toMatchObject({ id: first[0].id, recipe: recovery, recoveryPlanId: plan.id,
+      remainingActiveSeconds: first[0].remainingActiveSeconds - 5000 });
+
+    // With no eligible FAST work the stage-3-only selector uses the same cursor.
+    await db.execute(sql`UPDATE progressive_cfd_units SET retry_after=clock_timestamp()+interval '1 hour'
+      WHERE work_id IN (SELECT id FROM progressive_work WHERE generation_id=${fixture.generationId} AND stage=2)
+        AND state='pending'`);
+    const secondMeasured = await next();
+    expect(secondMeasured).toMatchObject({ id: first[3].id, recipe: first[3].recipe,
+      remainingActiveSeconds: first[3].remainingActiveSeconds - 7200 });
+    await expect(db.transaction(async tx => {
+      const pinned = await claimProgressiveCfdBatch(tx as unknown as DB, { ...options, preferredWorkId: String(work.id) });
+      expect(pinned[0].id).toBe(first[1].id);
+      expect(await tx.execute(sql`SELECT last_precise_measured FROM progressive_cfd_claim_turns
+        WHERE campaign_id=${fixture.campaignId}::uuid`)).toEqual([{ last_precise_measured: true }]);
+      throw rollback;
+    })).rejects.toBe(rollback);
+    expect((await next()).id).toBe(first[1].id); // 3,599 seconds is ordinary.
+    expect((await next()).alpha).toBe(4); // measured class empty, no idle turn.
+    expect(await history()).toEqual(before);
+    expect(await db.execute(sql`SELECT * FROM progressive_cfd_recovery_plans WHERE id=${plan.id}::uuid`)).toEqual([plan]);
+  }, 120_000);
+
   it.each(["deferred", "capability"] as const)(
     "falls back to low precise when the reserved initial FAST retry is %s and gives FAST the next usable turn",
     async (blocked) => {
-      const fixture = await initialFastRetryCoverage(1, blocked === "capability");
+      const fixture = await initialFastRetryCoverage(1, { differentSolverFamilies: blocked === "capability" });
       if (blocked === "deferred")
         await db.execute(sql`UPDATE progressive_cfd_units SET retry_after=clock_timestamp()+interval '1 hour'
           WHERE id IN (${sql.join(fixture.units.map(unit => sql`${unit.id}::uuid`), sql`,`)})`);
