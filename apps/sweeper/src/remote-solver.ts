@@ -2773,6 +2773,7 @@ export async function receiveProgressiveCampaignAssignments(
       });
       await mirrorProgressiveRemoteJob(db, {
         envelope: document.envelope,
+        fetcher,
         assignment: {
           solverId: owner.solverId,
           promiseId: document.envelope.promiseId,

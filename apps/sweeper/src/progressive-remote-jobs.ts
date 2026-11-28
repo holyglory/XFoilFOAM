@@ -12,24 +12,103 @@ import {
   verifyProgressiveRemoteExecution,
   validateProgressiveRemoteReport,
   type DB,
+  type Airfoil,
 } from "@aerodb/db";
-import type { SimulationSetupSnapshot } from "@aerodb/db/simulation-setup";
+import { simulationSetupSignature, type SimulationSetupSnapshot } from "@aerodb/db/simulation-setup";
 import type { JobResult } from "@aerodb/engine-client";
 import { eq, sql } from "drizzle-orm";
 import {
   admissionCpuSlotsForRequest,
+  buildPolarRequest,
   engineIdentityForSetup,
   solverImplementationIdForSetup,
 } from "./build-request";
+import { fetchProgressiveRemote } from "./progressive-remote-http";
+
+async function expiredLegacyStopOnly(
+  setup: SimulationSetupSnapshot,
+  sourceSignature: string,
+  envelope: ReturnType<typeof verifyProgressiveRemoteExecution>,
+  promise: Record<string, unknown>,
+  authToken: string,
+  baseUrl: string,
+  fetcher: typeof fetch,
+) {
+  const family = setup.solver.flowSolverFamily;
+  const requested = envelope.request.solver?.flow_solver_family;
+  const coordinates = envelope.request.airfoil.points;
+  if (envelope.scope.stage !== 3 || setup.solver.timeCoordinate !== undefined ||
+      !((family === "simpleFoam" && requested === "pimpleFoam") ||
+        (family === "rhoSimpleFoam" && requested === "rhoPimpleFoam")) ||
+      envelope.request.solver?.force_transient !== true ||
+      envelope.request.solver?.transient_fallback !== true ||
+      envelope.request.solver?.urans_fidelity !== "full" ||
+      promise.expired !== true || !["active", "expired"].includes(String(promise.status)))
+    throw new Error("The local setup or engine pool differs from the exact assigned request");
+  if (!coordinates || coordinates.length < 3)
+    throw new Error("Expired legacy stop-only request has no exact source geometry");
+  const expected = buildPolarRequest({
+    airfoil: { name: envelope.request.airfoil.name, pointFormat: envelope.request.airfoil.format,
+      points: coordinates.map(([x, y]) => ({ x, y })) } as Airfoil,
+    setup: { ...setup, solver: { ...setup.solver, flowSolverFamily: requested, timeCoordinate: undefined } },
+    aoaList: envelope.scope.units.map(unit => unit.alpha).sort((a, b) => a - b),
+    wave: 2, uransFidelity: "full",
+  }).request;
+  expected.solver = { ...expected.solver, warm_start: true };
+  for (const key of ["expected_engine", "airfoil", "fluid", "flow_state", "roughness",
+    "mesh", "urans_mesh", "urans_precalc_mesh", "solver", "speeds", "chord_lengths"] as const)
+    if (canonicalAnalysisJson(expected[key] ?? null) !== canonicalAnalysisJson(envelope.request[key] ?? null))
+      throw new Error("Expired legacy stop-only request changes its original numerical setup");
+  // Re-read the exact assignment over the authenticated upstream channel.
+  // Local expiry or a caller-supplied absence flag is never a fence proof.
+  const response = await fetchProgressiveRemote(fetcher,
+    `${baseUrl}/progressive-executions/${envelope.scope.executionId}`, {
+      headers: { "x-xfoilfoam-solver-token": authToken }, redirect: "error",
+      signal: AbortSignal.timeout(10_000),
+    });
+  if (!response.ok) throw new Error("Expired legacy stop-only assignment could not be freshly verified");
+  const body = await response.json() as {
+    assignment?: {
+      envelope?: unknown;
+      promise?: { id?: string; status?: string; expired?: boolean; expiresAt?: string;
+        airfoil?: { points?: unknown; pointFormat?: string };
+        setupRevision?: { id?: string; signatureHash?: string; snapshot?: unknown } };
+    };
+    continuation?: { kind?: string };
+  };
+  const fresh = body?.assignment;
+  const remote = fresh?.promise;
+  const catalogPoints = remote?.airfoil?.points;
+  const remoteCoordinates = Array.isArray(catalogPoints) && catalogPoints.every(point =>
+    point !== null && typeof point === "object" && !Array.isArray(point) &&
+    typeof point.x === "number" && Number.isFinite(point.x) &&
+    typeof point.y === "number" && Number.isFinite(point.y))
+    ? catalogPoints.map(point => [point.x, point.y])
+    : null;
+  if (!fresh || body.continuation?.kind !== "stop" || !remote ||
+      remote.id !== envelope.promiseId || remote.expired !== true ||
+      !["active", "expired"].includes(String(remote.status)) ||
+      !Number.isFinite(Date.parse(remote.expiresAt ?? "")) || Date.parse(remote.expiresAt!) > Date.now() ||
+      remote.airfoil?.pointFormat !== envelope.request.airfoil.format ||
+      canonicalAnalysisJson(remoteCoordinates) !== canonicalAnalysisJson(envelope.request.airfoil.points) ||
+      typeof remote.setupRevision?.id !== "string" ||
+      !/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(remote.setupRevision.id) ||
+      remote.setupRevision.signatureHash !== sourceSignature || !remote.setupRevision.snapshot ||
+      simulationSetupSignature(remote.setupRevision.snapshot as SimulationSetupSnapshot) !== sourceSignature ||
+      canonicalAnalysisJson(fresh.envelope ?? null) !== canonicalAnalysisJson(envelope))
+    throw new Error("Expired legacy stop-only assignment changed or is no longer expired");
+  return { reason: "expired_7f04bf99_solver_mismatch", checkedAt: new Date().toISOString(),
+    assignmentSignature: envelope.contentSignature, promiseExpiresAt: remote.expiresAt,
+    sourceRevisionId: remote.setupRevision.id };
+}
 import { requireExecutionPoolForSetup } from "./engine-pool";
 
 export function progressiveRemoteExecutionSolverFamily(
-  stage: 2 | 3,
   configuredFamily: ProgressiveSolverFamily,
+  requestedFamily: ProgressiveSolverFamily | undefined,
 ): ProgressiveSolverFamily {
-  if (stage === 3 && configuredFamily === "simpleFoam") return "pimpleFoam";
-  if (stage === 3 && configuredFamily === "rhoSimpleFoam")
-    return "rhoPimpleFoam";
+  if (configuredFamily !== requestedFamily)
+    throw new Error("The local setup or engine pool differs from the exact assigned request");
   return configuredFamily;
 }
 
@@ -115,6 +194,7 @@ export async function mirrorProgressiveRemoteJob(
       executionId: string;
       contentSignature: string;
     };
+    fetcher?: typeof fetch;
   },
 ) {
   const envelope = verifyProgressiveRemoteExecution(
@@ -141,7 +221,8 @@ export async function mirrorProgressiveRemoteJob(
       );
     const baseUrl = canonicalRemoteHubBaseUrl(settings.upstreamBaseUrl);
     const [promise] = await connection.execute(sql`
-      SELECT id, airfoil_id, simulation_preset_revision_id, request_payload
+      SELECT id, airfoil_id, simulation_preset_revision_id, request_payload,
+        status, "expiresAt" <= clock_timestamp() AS expired
       FROM sync_sweep_promises WHERE id = ${envelope.promiseId}::uuid
         AND registered_solver_id = ${envelope.solverId}::uuid AND source_base_url = ${baseUrl}
         AND request_payload->>'remoteSolver' = 'true' FOR UPDATE
@@ -193,10 +274,13 @@ export async function mirrorProgressiveRemoteJob(
     const family = setup.solver.flowSolverFamily;
     if (!family)
       throw new Error("The local setup has no solver family");
-    const executionFamily = progressiveRemoteExecutionSolverFamily(
-      envelope.scope.stage,
-      family,
-    );
+    const stopOnly = family !== envelope.request.solver?.flow_solver_family
+      ? await expiredLegacyStopOnly(setup, revision.signatureHash, envelope, promise,
+          settings.remoteSolverAuthToken, baseUrl, input.fetcher ?? fetch)
+      : undefined;
+    const executionFamily = stopOnly
+      ? envelope.request.solver!.flow_solver_family!
+      : progressiveRemoteExecutionSolverFamily(family, envelope.request.solver?.flow_solver_family);
     const boundaryId = setup.preset.legacyBoundaryConditionId;
     if (
       !boundaryId ||
@@ -224,7 +308,7 @@ export async function mirrorProgressiveRemoteJob(
       throw new Error("The mirrored promise changes the assigned angle list");
     const transient = progressiveSolverIsTransient(
       executionFamily,
-      executionFamily === family ? setup.solver.timeCoordinate : undefined,
+      stopOnly ? undefined : setup.solver.timeCoordinate,
     );
     if (envelope.request.solver?.force_transient !== transient)
       throw new Error(
@@ -250,6 +334,7 @@ export async function mirrorProgressiveRemoteJob(
       admissionCpuSlots: slots,
       totalCases: angles.length,
       requestPayload: {
+        ...(stopOnly ? { progressiveStopOnly: stopOnly } : {}),
         remoteSolver: true,
         solverId: envelope.solverId,
         syncPromiseId: envelope.promiseId,

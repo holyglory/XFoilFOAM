@@ -3,15 +3,23 @@ import { progressiveRemoteExecutionSolverFamily } from "../src/progressive-remot
 
 describe("progressive remote execution solver family", () => {
   it.each([
-    [2, "simpleFoam", "simpleFoam"],
-    [2, "rhoSimpleFoam", "rhoSimpleFoam"],
-    [3, "simpleFoam", "pimpleFoam"],
-    [3, "rhoSimpleFoam", "rhoPimpleFoam"],
-    [3, "pimpleFoam", "pimpleFoam"],
-    [3, "rhoPimpleFoam", "rhoPimpleFoam"],
-  ] as const)("maps stage %s %s to %s", (stage, configured, expected) => {
-    expect(progressiveRemoteExecutionSolverFamily(stage, configured)).toBe(
+    ["simpleFoam", "simpleFoam"],
+    ["rhoSimpleFoam", "rhoSimpleFoam"],
+    ["pimpleFoam", "pimpleFoam"],
+    ["rhoPimpleFoam", "rhoPimpleFoam"],
+    ["rhoCentralFoam", "rhoCentralFoam"],
+  ] as const)("retains the materialized %s request", (configured, expected) => {
+    expect(progressiveRemoteExecutionSolverFamily(configured, expected)).toBe(
       expected,
     );
+  });
+  it.each([
+    ["simpleFoam", "pimpleFoam"],
+    ["rhoSimpleFoam", "rhoPimpleFoam"],
+    ["rhoCentralFoam", "rhoPimpleFoam"],
+    ["pimpleFoam", undefined],
+  ] as const)("rejects an incompatible %s / %s request", (configured, requested) => {
+    expect(() => progressiveRemoteExecutionSolverFamily(configured, requested))
+      .toThrow("exact assigned request");
   });
 });

@@ -1,7 +1,6 @@
 import {
   gasThermodynamicsForMaterial,
   progressiveSolverIsTransient,
-  type ProgressiveSolverFamily,
   type Point,
 } from "@aerodb/core";
 import {
@@ -90,9 +89,6 @@ export function buildPolarRequest(opts: {
   /** Logical numerical implementation selected by the immutable setup.
    * Defaults only to the historical OpenCFD-v2406 compatibility path. */
   engineIdentity?: EngineIdentity;
-  /** Progressive recovery recipes may deliberately promote a steady setup to
-   * a transient solver without mutating the immutable setup snapshot. */
-  solverFamilyOverride?: ProgressiveSolverFamily;
 }): { request: PolarRequest; speed: number; nu: number } {
   const {
     airfoil,
@@ -104,12 +100,9 @@ export function buildPolarRequest(opts: {
     cpuSlots,
     speeds,
     engineIdentity,
-    solverFamilyOverride,
   } = opts;
-  const solverFamily = solverFamilyOverride ?? setup.solver.flowSolverFamily;
-  const timeCoordinate = solverFamilyOverride
-    ? undefined
-    : setup.solver.timeCoordinate;
+  const solverFamily = setup.solver.flowSolverFamily;
+  const timeCoordinate = setup.solver.timeCoordinate;
   const cpuBudget =
     cpuSlots == null
       ? (setup.scheduling.cpuBudget ?? undefined)

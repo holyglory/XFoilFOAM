@@ -27,9 +27,7 @@ import { ProgressiveEvidenceCellOwned } from "./progressive-claim-deferral";
 
 const DEFAULT_PROGRESSIVE_FAST_SOLVER_PROCESSES = 4;
 const DEFAULT_PROGRESSIVE_PRECISE_SOLVER_PROCESSES = 4;
-const DEFAULT_PROGRESSIVE_PRECISE_CASE_CONCURRENCY = 1;
 const MAX_PROGRESSIVE_FAST_SOLVER_PROCESSES = 8;
-const MAX_PROGRESSIVE_PRECISE_CASE_CONCURRENCY = 4;
 
 export function progressiveFastSolverProcesses(
   cpuSlots: number,
@@ -65,28 +63,6 @@ export function progressivePreciseSolverProcesses(
       ? Math.min(parsed, MAX_PROGRESSIVE_FAST_SOLVER_PROCESSES)
       : DEFAULT_PROGRESSIVE_PRECISE_SOLVER_PROCESSES;
   return Math.min(requested, availableCpuSlots);
-}
-
-export function progressivePreciseCaseConcurrency(
-  cpuSlots: number,
-  solverProcesses: number,
-  raw = process.env.SWEEPER_PROGRESSIVE_PRECISE_CASE_CONCURRENCY,
-): number {
-  const availableCases = Math.max(
-    1,
-    Math.trunc(cpuSlots) / Math.max(1, Math.trunc(solverProcesses)),
-  );
-  if (raw == null || raw.trim() === "")
-    return Math.min(
-      DEFAULT_PROGRESSIVE_PRECISE_CASE_CONCURRENCY,
-      Math.floor(availableCases),
-    );
-  const parsed = Number(raw);
-  const requested =
-    Number.isInteger(parsed) && parsed >= 1
-      ? Math.min(parsed, MAX_PROGRESSIVE_PRECISE_CASE_CONCURRENCY)
-      : DEFAULT_PROGRESSIVE_PRECISE_CASE_CONCURRENCY;
-  return Math.min(requested, Math.floor(availableCases));
 }
 
 export function progressiveSolverProcessesForStage(
@@ -236,25 +212,9 @@ export async function composeProgressiveCfdJob(
       .limit(1);
     if (!airfoil || airfoil.archivedAt || airfoil.deletedAt)
       throw new Error("CFD profile is missing or inactive");
-    const recipeSelection = first.recipe.selection as
-      | Record<string, unknown>
-      | undefined;
-    const configuredRecipeSolver = recipeSelection?.solver as
-      | "simpleFoam"
-      | "pimpleFoam"
-      | "rhoSimpleFoam"
-      | "rhoPimpleFoam"
-      | "rhoCentralFoam"
-      | undefined;
-    const recipeSolver =
-      first.stage === 3 && configuredRecipeSolver === "simpleFoam"
-        ? "pimpleFoam"
-        : first.stage === 3 && configuredRecipeSolver === "rhoSimpleFoam"
-          ? "rhoPimpleFoam"
-          : configuredRecipeSolver;
     const transient = progressiveSolverIsTransient(
-      recipeSolver ?? execution.snapshot.solver.flowSolverFamily!,
-      recipeSolver ? undefined : execution.snapshot.solver.timeCoordinate,
+      execution.snapshot.solver.flowSolverFamily!,
+      execution.snapshot.solver.timeCoordinate,
     );
     const angles = leases
       .map((lease) => lease.alpha)
@@ -278,11 +238,22 @@ export async function composeProgressiveCfdJob(
       ransFailurePolicy:
         !transient && angles.length > 1 ? "abort_for_precalc" : "continue",
       cpuSlots: input.cpuSlots,
-      solverFamilyOverride: recipeSolver,
     });
     request.expected_execution_pool = pool.routingKey;
     request.expected_mesh_recovery_version = input.meshRecoveryVersion;
     request.solver = { ...request.solver, warm_start: true };
+    if (execution.continuationRequest) {
+      // A checkpoint resumes the original numerical request. A matching solver
+      // name alone cannot authorize different material, mesh or time controls.
+      for (const key of [
+        "expected_engine", "airfoil", "fluid", "flow_state", "roughness",
+        "mesh", "urans_mesh", "urans_precalc_mesh", "solver", "speeds",
+        "chord_lengths",
+      ] as const)
+        if (canonicalAnalysisJson(request[key] ?? null) !==
+            canonicalAnalysisJson(execution.continuationRequest[key] ?? null))
+          throw new Error("Progressive continuation differs from its source request");
+    }
     const configuredSolverProcesses =
       execution.snapshot.scheduling.solverProcesses;
     const solverProcesses = progressiveSolverProcessesForStage(
@@ -291,16 +262,6 @@ export async function composeProgressiveCfdJob(
       input.cpuSlots,
       configuredSolverProcesses,
     );
-  const preciseCaseConcurrency =
-    first.stage === 3 &&
-    transient &&
-    configuredSolverProcesses == null &&
-    solverProcesses != null
-      ? progressivePreciseCaseConcurrency(
-          input.cpuSlots,
-          solverProcesses,
-        )
-      : 1;
     if (continuation) {
       if (!transient || fidelity !== (first.stage === 2 ? "precalc" : "full"))
         throw new Error("Progressive continuation requires matching URANS fidelity");
@@ -319,11 +280,13 @@ export async function composeProgressiveCfdJob(
     }
     request.resources = {
       ...request.resources,
-      case_concurrency: preciseCaseConcurrency,
+      // progressive-cfd-v1 marches one shared mesh with warm starts. The
+      // historical benchmark lane override is not part of this contract.
+      case_concurrency: 1,
       ...(solverProcesses != null
         ? {
             solver_processes: solverProcesses,
-            cpu_budget: solverProcesses * preciseCaseConcurrency,
+            cpu_budget: solverProcesses,
           }
         : {}),
       ...(mixedBudgets
