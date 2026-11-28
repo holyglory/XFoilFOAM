@@ -12677,7 +12677,7 @@ describe("progressive CFD evidence accounting", () => {
   it("publishes the exact pointerless URANS cycle history after verified offload", async () => {
     const angles = [0, 2, 4];
     const fixture = await cfdEvidenceFixture(34.347, 3, [], angles, false, undefined, {}, 3,
-      false, false, 1, { legacyPolicy: true });
+      false, false, 1, { legacyPolicy: true, minimumCriticalMach: 0.8 });
     expect(fixture.leases[0].recipe.selection).toMatchObject({ solver: "pimpleFoam" });
     const { verifyUransAttemptPublication } = await import("./urans-attempt-publication-fixture");
     await withHistoryDatabaseCopy(db => verifyUransAttemptPublication(db, fixture.composed.jobId, angles));
