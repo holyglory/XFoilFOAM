@@ -8851,7 +8851,8 @@ describe("bounded progressive numerical recovery", () => {
   it("rotates late precise rhoPimple pages past refused duplicate histories and wraps with exact timestamps", async () => {
     const fixtures = [];
     for (const speed of [166.1951, 177.1952]) {
-      const fixture = await cfdEvidenceFixture(speed, 3, [], [0, 1], false, undefined, { chordM: speed / 100 }, 2);
+      const fixture = await cfdEvidenceFixture(speed, 3, [], [0, 1], false, undefined, { chordM: speed / 100 }, 2,
+        undefined, undefined, undefined, { historicalTransient: true });
       const evidence = await Promise.all([0, 1].map(alpha => fixture.save(20, "urans", alpha, {
         failure_disposition: "hard_solver", fidelity: "urans_full",
       })));
@@ -8954,6 +8955,10 @@ describe("bounded progressive numerical recovery", () => {
       undefined,
       { chordM: 1.1947 },
       8,
+      undefined,
+      undefined,
+      undefined,
+      { historicalTransient: true },
     );
     expect(fixture.composed.request.solver?.flow_solver_family).toBe(
       "rhoPimpleFoam",
@@ -9111,6 +9116,10 @@ describe("bounded progressive numerical recovery", () => {
       undefined,
       { chordM: 1.1948 },
       2,
+      undefined,
+      undefined,
+      undefined,
+      { historicalTransient: true },
     );
     const ids = await Promise.all(
       [0, 1].map((alpha) =>
@@ -9334,6 +9343,10 @@ describe("bounded progressive numerical recovery", () => {
         undefined,
         { chordM: 1.1949 },
         1,
+        undefined,
+        undefined,
+        undefined,
+        { historicalTransient: true },
       );
       const id = await fixture.save(20, "urans", 0, {
         failure_disposition: disposition,
