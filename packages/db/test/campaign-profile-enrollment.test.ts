@@ -8848,6 +8848,437 @@ describe("progressive execution stop and settlement", () => {
 });
 
 describe("bounded progressive numerical recovery", () => {
+  it("recovers late precise rhoPimple diagnostics after settlement through maintenance claim and dispatch", async () => {
+    const angles = [0, 1, 2, 3, 4, 5, 6, 7];
+    const fixture = await cfdEvidenceFixture(
+      166.1947,
+      3,
+      [],
+      angles,
+      false,
+      undefined,
+      { chordM: 1.1947 },
+      8,
+    );
+    expect(fixture.composed.request.solver?.flow_solver_family).toBe(
+      "rhoPimpleFoam",
+    );
+    const ids = await Promise.all(
+      angles.map((alpha) =>
+        fixture.save(20, "urans", alpha, {
+          failure_disposition: "hard_solver",
+          fidelity: "urans_full",
+        }),
+      ),
+    );
+    await fixture.record(ids);
+    await stopped(fixture);
+    expect(
+      await settleProgressiveCfdExecution(db, fixture.composed.jobId),
+    ).toMatchObject({ retry: 0, gaps: 8 });
+    await db.execute(sql`UPDATE sim_jobs SET "ingestedAt"=clock_timestamp()-interval '6 minutes'
+      WHERE id=${fixture.composed.jobId}::uuid`);
+    await db.execute(sql`UPDATE progressive_work SET state='gap',error='precise evidence remains unresolved',completed_at=clock_timestamp()
+      WHERE id=${fixture.leases[0].workId}::uuid`);
+    const history = () =>
+      db.execute(sql`SELECT raw.*, evidence.evidence_signature
+      FROM result_attempts raw JOIN progressive_cfd_evidence evidence ON evidence.result_attempt_id=raw.id
+      WHERE raw.sim_job_id=${fixture.composed.jobId}::uuid ORDER BY raw.id`);
+    const before = await history();
+    await expect(
+      recordProgressiveCfdRecoveryPlans(db, fixture.composed.jobId),
+    ).rejects.toThrow("settled progressive CFD execution scope");
+    const concurrent = await Promise.all([
+      recoverTerminalProgressiveNoEvidenceGaps(db),
+      recoverTerminalProgressiveNoEvidenceGaps(db),
+    ]);
+    expect(concurrent.reduce((sum, count) => sum + count, 0)).toBe(8);
+    expect(await recoverTerminalProgressiveNoEvidenceGaps(db)).toBe(0);
+    const plans =
+      await db.execute(sql`SELECT * FROM progressive_cfd_recovery_plans
+      WHERE parent_job_id=${fixture.composed.jobId}::uuid ORDER BY unit_id`);
+    expect(plans).toHaveLength(8);
+    for (const plan of plans)
+      expect(plan).toMatchObject({
+        ordinal: 1,
+        reason: "hard_solver",
+        scope: "targeted",
+        diagnostic_attempt_id: expect.any(String),
+        recipe: {
+          uransFidelity: "full",
+          selection: {
+            solver: "rhoPimpleFoam",
+            reason: "bounded_hard_solver_recovery",
+          },
+        },
+      });
+    const leases = await claimProgressiveCfdBatch(db, {
+      owner: "late-precise-diagnostic-recovery",
+      leaseSeconds: 120,
+      maximumUnits: 8,
+      solverBudgetVersion: 2,
+      allowedSolverFamilies: ["rhoPimpleFoam"],
+    });
+    expect(leases.map((lease) => lease.alpha)).toEqual(angles);
+    for (const lease of leases)
+      expect(lease).toMatchObject({
+        recoveryPlanId: expect.any(String),
+        recoveryParentJobId: fixture.composed.jobId,
+        remainingActiveSeconds: 43_180,
+      });
+    const dispatched = await composeRecovery(leases);
+    expect(dispatched.request.aoa.angles).toEqual(angles);
+    expect(dispatched.request.solver).toMatchObject({
+      flow_solver_family: "rhoPimpleFoam",
+      force_transient: true,
+      urans_fidelity: "full",
+      momentum_scheme: "upwind",
+      transient_max_courant: 0.2,
+    });
+    expect(dispatched.request.mesh).toEqual(fixture.composed.request.mesh);
+    for (const key of [
+      "airfoil",
+      "speeds",
+      "chord_lengths",
+      "fluid",
+      "flow_state",
+      "roughness",
+    ] as const)
+      expect(dispatched.request[key]).toEqual(fixture.composed.request[key]);
+    const solverId = randomUUID();
+    const promiseId = randomUUID();
+    const [admission] = await db
+      .select({ enabled: sweeperState.enabled })
+      .from(sweeperState)
+      .where(eq(sweeperState.id, 1));
+    try {
+      await db.execute(sql`INSERT INTO registered_remote_solvers
+        (id,instance_id,instance_name,cpu_capacity,cpu_budget,max_active_polar_promises)
+        VALUES (${solverId}::uuid,${randomUUID()},'late precise recovery worker',96,96,96)`);
+      await db.execute(sql`INSERT INTO sync_sweep_promises
+        (id,registered_solver_id,airfoil_id,simulation_preset_revision_id,aoa_count,"expiresAt")
+        SELECT ${promiseId}::uuid,${solverId}::uuid,airfoil_id,simulation_preset_revision_id,8,clock_timestamp()+interval '1 hour'
+        FROM sim_jobs WHERE id=${dispatched.jobId}::uuid`);
+      await db.execute(sql`INSERT INTO sync_sweep_promise_points(promise_id,airfoil_id,simulation_preset_revision_id,aoa_deg)
+        SELECT ${promiseId}::uuid,airfoil_id,simulation_preset_revision_id,aoa_deg FROM results WHERE sim_job_id=${dispatched.jobId}::uuid`);
+      await db
+        .update(sweeperState)
+        .set({ enabled: true })
+        .where(eq(sweeperState.id, 1));
+      const { envelope } = await bindProgressiveRemoteDispatch(db, {
+        simJobId: dispatched.jobId,
+        solverId,
+        promiseId,
+      });
+      expect(envelope.request).toEqual(dispatched.request);
+      expect(envelope.scope.tokens).toEqual(leases.map((lease) => lease.token));
+      expect(
+        await db.execute(sql`SELECT sim_job_id,solver_id,promise_id FROM progressive_remote_dispatches
+        WHERE sim_job_id=${dispatched.jobId}::uuid`),
+      ).toEqual([
+        {
+          sim_job_id: dispatched.jobId,
+          solver_id: solverId,
+          promise_id: promiseId,
+        },
+      ]);
+    } finally {
+      await db
+        .update(sweeperState)
+        .set({ enabled: admission.enabled })
+        .where(eq(sweeperState.id, 1));
+      await db.execute(
+        sql`DELETE FROM progressive_remote_dispatches WHERE sim_job_id=${dispatched.jobId}::uuid`,
+      );
+      await db.execute(
+        sql`DELETE FROM sync_sweep_promises WHERE id=${promiseId}::uuid`,
+      );
+      await db.execute(
+        sql`DELETE FROM registered_remote_solvers WHERE id=${solverId}::uuid`,
+      );
+    }
+    expect(await recoverTerminalProgressiveNoEvidenceGaps(db)).toBe(0);
+    expect(await history()).toEqual(before);
+    expect(
+      await db.execute(sql`SELECT count(*)::int AS count FROM progressive_cfd_recovery_claims
+      WHERE recovery_plan_id IN (SELECT id FROM progressive_cfd_recovery_plans
+        WHERE parent_job_id=${fixture.composed.jobId}::uuid)`),
+    ).toEqual([{ count: 8 }]);
+  }, 120_000);
+
+  it("keeps late precise rhoPimple recovery scoped to eligible authentic unowned attempts", async () => {
+    const fixture = await cfdEvidenceFixture(
+      166.1948,
+      3,
+      [],
+      [0, 1],
+      false,
+      undefined,
+      { chordM: 1.1948 },
+      2,
+    );
+    const ids = await Promise.all(
+      [0, 1].map((alpha) =>
+        fixture.save(20, "urans", alpha, {
+          failure_disposition: "hard_solver",
+          fidelity: "urans_full",
+        }),
+      ),
+    );
+    await fixture.record(ids);
+    await stopped(fixture);
+    expect(
+      await settleProgressiveCfdExecution(db, fixture.composed.jobId),
+    ).toMatchObject({ gaps: 2 });
+    await db.execute(sql`UPDATE sim_jobs SET "ingestedAt"=clock_timestamp()-interval '6 minutes'
+      WHERE id=${fixture.composed.jobId}::uuid`);
+    const unit = fixture.leases[0];
+    const rawId = ids[0];
+    const protectedRows = async (connection: DB) => ({
+      scientific:
+        await connection.execute(sql`SELECT raw.*,to_jsonb(cell.*) AS cell
+        FROM result_attempts raw JOIN results cell ON cell.id=raw.result_id
+        WHERE raw.sim_job_id=${fixture.composed.jobId}::uuid ORDER BY raw.id`),
+      attempts: await connection.execute(
+        sql`SELECT * FROM progressive_cfd_attempts WHERE sim_job_id=${fixture.composed.jobId}::uuid ORDER BY token`,
+      ),
+      receipts:
+        await connection.execute(sql`SELECT receipt.* FROM progressive_cfd_evidence receipt
+        JOIN result_attempts raw ON raw.id=receipt.result_attempt_id WHERE raw.sim_job_id=${fixture.composed.jobId}::uuid ORDER BY raw.id`),
+      stopped: await connection.execute(
+        sql`SELECT * FROM progressive_cfd_execution_stops WHERE sim_job_id=${fixture.composed.jobId}::uuid`,
+      ),
+      reviews:
+        await connection.execute(sql`SELECT * FROM result_review_verdicts WHERE result_id IN
+        (SELECT result_id FROM result_attempts WHERE sim_job_id=${fixture.composed.jobId}::uuid) ORDER BY id`),
+      classifications:
+        await connection.execute(sql`SELECT * FROM result_classifications WHERE result_attempt_id IN
+        (SELECT id FROM result_attempts WHERE sim_job_id=${fixture.composed.jobId}::uuid) ORDER BY id`),
+    });
+    async function guard(
+      label: string,
+      change: (connection: DB) => Promise<unknown>,
+      recovered = 1,
+    ) {
+      const rollback = new Error(`restore late diagnostic guard: ${label}`);
+      await expect(
+        db.transaction(async (transaction) => {
+          const connection = transaction as unknown as DB;
+          await change(connection);
+          const before = await protectedRows(connection);
+          const [held] = await connection.execute(
+            sql`SELECT * FROM progressive_cfd_units WHERE id=${unit.id}::uuid`,
+          );
+          expect(
+            await recoverTerminalProgressiveNoEvidenceGaps(connection),
+            label,
+          ).toBe(recovered);
+          expect(await protectedRows(connection), label).toEqual(before);
+          expect(
+            await connection.execute(
+              sql`SELECT * FROM progressive_cfd_units WHERE id=${unit.id}::uuid`,
+            ),
+            label,
+          ).toEqual([held]);
+          expect(
+            await recoverTerminalProgressiveNoEvidenceGaps(connection),
+            label,
+          ).toBe(0);
+          throw rollback;
+        }),
+      ).rejects.toBe(rollback);
+    }
+    await guard("active owner", (connection) =>
+      connection.execute(sql`UPDATE progressive_cfd_units
+      SET state='leased',lease_token=${randomUUID()}::uuid,lease_owner='another-owner',lease_until=clock_timestamp()+interval '1 minute'
+      WHERE id=${unit.id}::uuid`),
+    );
+    await guard("newer attempt", (connection) =>
+      connection.execute(sql`INSERT INTO progressive_cfd_attempts
+      (token,unit_id,owner,execution_recipe_id,started_at,lease_until,outcome,finished_at)
+      SELECT ${randomUUID()}::uuid,unit_id,owner,execution_recipe_id,started_at+interval '1 second',
+        lease_until+interval '1 second','failed',clock_timestamp() FROM progressive_cfd_attempts WHERE token=${unit.token}::uuid`),
+    );
+    await guard("accepted classification", (connection) =>
+      connection.execute(sql`INSERT INTO result_classifications
+      (result_attempt_id,airfoil_id,simulation_preset_revision_id,aoa_deg,classifier_version,state,reasons)
+      SELECT id,airfoil_id,simulation_preset_revision_id,aoa_deg,'late-diagnostic-guard','accepted','{}'
+      FROM result_attempts WHERE id=${rawId}::uuid`),
+    );
+    for (const verdict of ["exclude", "defer"])
+      await guard(`review ${verdict}`, (connection) =>
+        connection.execute(sql`
+      INSERT INTO result_review_verdicts(result_id,verdict,reviewer)
+      SELECT result_id,${verdict},'late-diagnostic-guard' FROM result_attempts WHERE id=${rawId}::uuid`),
+      );
+    await guard("spent budget", (connection) =>
+      connection.execute(
+        sql`UPDATE progressive_cfd_units SET active_seconds=active_budget_seconds WHERE id=${unit.id}::uuid`,
+      ),
+    );
+    await guard("attempt ceiling", (connection) =>
+      connection.execute(
+        sql`UPDATE progressive_cfd_units SET attempts=3 WHERE id=${unit.id}::uuid`,
+      ),
+    );
+    await guard("retry delay", (connection) =>
+      connection.execute(
+        sql`UPDATE progressive_cfd_units SET retry_after=clock_timestamp()+interval '1 hour' WHERE id=${unit.id}::uuid`,
+      ),
+    );
+    await expect(
+      db.execute(
+        sql`UPDATE progressive_cfd_units SET policy_version='obsolete-policy' WHERE id=${unit.id}::uuid`,
+      ),
+    ).rejects.toThrow("CFD unit scope and numerical recipe are immutable");
+    await guard(
+      "unfinished FAST target",
+      (connection) =>
+        connection.execute(sql`UPDATE progressive_cfd_units SET state='pending'
+      WHERE work_id IN (SELECT id FROM progressive_work WHERE generation_id=${unit.generationId}::uuid AND stage=2)`),
+      0,
+    );
+    for (const claimed of [false, true])
+      await guard(`existing plan claimed=${claimed}`, async (connection) => {
+        const [plan] =
+          await connection.execute(sql`INSERT INTO progressive_cfd_recovery_plans
+        (unit_id,ordinal,parent_attempt_token,parent_job_id,diagnostic_attempt_id,diagnostic_signature,scope,reason,recipe)
+        SELECT ${unit.id}::uuid,1,${unit.token}::uuid,${fixture.composed.jobId}::uuid,raw.id,receipt.evidence_signature,
+          'targeted','hard_solver',${JSON.stringify(progressiveUnsteadyRecipe({ ...unit.recipe, selection: { ...(unit.recipe.selection as Record<string, unknown>), solver: "rhoPimpleFoam" } }, "hard_solver"))}::jsonb
+        FROM result_attempts raw JOIN progressive_cfd_evidence receipt ON receipt.result_attempt_id=raw.id
+        WHERE raw.id=${rawId}::uuid RETURNING id`);
+        if (claimed)
+          await connection.execute(
+            sql`INSERT INTO progressive_cfd_recovery_claims(attempt_token,recovery_plan_id) VALUES (${unit.token}::uuid,${plan.id})`,
+          );
+      });
+    await guard(
+      "missing stop",
+      (connection) =>
+        connection.execute(
+          sql`DELETE FROM progressive_cfd_execution_stops WHERE sim_job_id=${fixture.composed.jobId}::uuid`,
+        ),
+      0,
+    );
+    await guard(
+      "missing ingestion",
+      (connection) =>
+        connection.execute(
+          sql`UPDATE sim_jobs SET "ingestedAt"=NULL WHERE id=${fixture.composed.jobId}::uuid`,
+        ),
+      0,
+    );
+    await guard(
+      "active ingestion",
+      (connection) =>
+        connection.execute(sql`UPDATE sim_jobs SET ingest_lease_token=${randomUUID()}::uuid,
+      ingest_lease_expires_at=clock_timestamp()+interval '1 hour' WHERE id=${fixture.composed.jobId}::uuid`),
+      0,
+    );
+    await guard(
+      "foreign execution",
+      (connection) =>
+        connection.execute(
+          sql`UPDATE sim_jobs SET engine_job_id=${randomUUID()} WHERE id=${fixture.composed.jobId}::uuid`,
+        ),
+      0,
+    );
+    await guard(
+      "changed scope",
+      (connection) =>
+        connection.execute(sql`UPDATE sim_jobs SET request_payload=jsonb_set(request_payload,
+      '{progressive,epochId}',to_jsonb(${randomUUID()}::text)) WHERE id=${fixture.composed.jobId}::uuid`),
+      0,
+    );
+    await guard(
+      "obsolete generation",
+      (connection) =>
+        connection.execute(
+          sql`UPDATE progressive_generations SET status='cancelled' WHERE id=${unit.generationId}::uuid`,
+        ),
+      0,
+    );
+    await guard(
+      "changed stop digest",
+      async (connection) => {
+        const [stop] = await connection.execute(
+          sql`DELETE FROM progressive_cfd_execution_stops WHERE sim_job_id=${fixture.composed.jobId}::uuid RETURNING *`,
+        );
+        await connection.execute(sql`INSERT INTO progressive_cfd_execution_stops SELECT * FROM jsonb_populate_record(NULL::progressive_cfd_execution_stops,
+        ${JSON.stringify({ ...stop, proof_signature: "0".repeat(64) })}::jsonb)`);
+      },
+      0,
+    );
+    await guard(
+      "changed evidence digest",
+      async (connection) => {
+        const [receipt] = await connection.execute(
+          sql`DELETE FROM progressive_cfd_evidence WHERE result_attempt_id=${rawId}::uuid RETURNING *`,
+        );
+        await connection.execute(sql`INSERT INTO progressive_cfd_evidence SELECT * FROM jsonb_populate_record(NULL::progressive_cfd_evidence,
+        ${JSON.stringify({ ...receipt, evidence_signature: "0".repeat(64) })}::jsonb)`);
+      },
+      0,
+    );
+    expect(
+      await db.execute(
+        sql`SELECT * FROM progressive_cfd_recovery_plans WHERE parent_job_id=${fixture.composed.jobId}::uuid`,
+      ),
+    ).toEqual([]);
+  }, 120_000);
+
+  it.each(["infrastructure", "deterministic_mesh", "material_domain"])(
+    "does not admit late precise rhoPimple %s diagnostics as hard-solver recovery",
+    async (disposition) => {
+      const fixture = await cfdEvidenceFixture(
+        166.1949,
+        3,
+        [],
+        [0],
+        false,
+        undefined,
+        { chordM: 1.1949 },
+        1,
+      );
+      const id = await fixture.save(20, "urans", 0, {
+        failure_disposition: disposition,
+        fidelity: "urans_full",
+      });
+      await fixture.record([id]);
+      await stopped(fixture);
+      expect(
+        await settleProgressiveCfdExecution(db, fixture.composed.jobId),
+      ).toMatchObject(
+        disposition === "infrastructure"
+          ? { retry: 1, gaps: 0 }
+          : { retry: 0, gaps: 1 },
+      );
+      await db.execute(
+        sql`UPDATE sim_jobs SET "ingestedAt"=clock_timestamp()-interval '6 minutes' WHERE id=${fixture.composed.jobId}::uuid`,
+      );
+      expect(await recoverTerminalProgressiveNoEvidenceGaps(db)).toBe(0);
+      expect(
+        await db.execute(
+          sql`SELECT * FROM progressive_cfd_recovery_plans WHERE parent_job_id=${fixture.composed.jobId}::uuid`,
+        ),
+      ).toEqual([]);
+      expect(
+        await db.execute(
+          sql`SELECT state,active_seconds FROM progressive_cfd_units WHERE id=${fixture.leases[0].id}::uuid`,
+        ),
+      ).toEqual([
+        {
+          state: disposition === "infrastructure" ? "pending" : "gap",
+          active_seconds: 20,
+        },
+      ]);
+      expect(
+        await db.select().from(resultAttempts).where(eq(resultAttempts.id, id)),
+      ).toMatchObject([{ status: "failed", validForPolar: false }]);
+    },
+    120_000,
+  );
+
   async function withFreshDiagnosticExecution(
     speed: number,
     angles: number[],

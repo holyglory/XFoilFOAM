@@ -20,8 +20,7 @@ import {
   progressiveCfdBudgetExtensionPendingSql,
   progressiveCfdEffectiveBudgetSql,
 } from "./progressive-cfd-budget-extension";
-import { recordProgressiveCfdRecoveryPlans } from "./progressive-cfd-numerical-recovery";
-import { settleProgressiveCfdExecution } from "./progressive-cfd-settlement";
+import { recoverLateRhoPimplePreciseExecution } from "./progressive-cfd-rho-pimple-gap";
 
 const TERMINAL_NO_EVIDENCE_REASON =
   "terminal execution has no measured case evidence";
@@ -318,18 +317,10 @@ async function recoverLateRhoPimplePreciseGaps(db: DB): Promise<number> {
         (raw.regime = 'rans' AND raw.evidence_payload->>'failure_disposition' = 'hard_solver')
         OR (raw.regime = 'urans' AND raw.evidence_payload->>'failure_disposition' = 'hard_solver')
       )
-      AND NOT EXISTS (
-        SELECT 1
-        FROM progressive_cfd_attempts parent_attempt
-        WHERE parent_attempt.sim_job_id = job.id
-          AND EXISTS (
-            SELECT 1
-            FROM progressive_cfd_attempts later_attempt
-            WHERE later_attempt.unit_id = parent_attempt.unit_id
-              AND (later_attempt.started_at, later_attempt.token) >
-                (parent_attempt.started_at, parent_attempt.token)
-          )
-      )
+      AND unit.lease_token IS NULL AND unit.lease_owner IS NULL AND unit.lease_until IS NULL
+      AND NOT EXISTS (SELECT 1 FROM progressive_cfd_attempts later_attempt
+        WHERE later_attempt.unit_id=unit.id AND (later_attempt.started_at,later_attempt.token)>(attempt.started_at,attempt.token))
+      AND NOT EXISTS (SELECT 1 FROM progressive_cfd_recovery_plans plan WHERE plan.unit_id=unit.id)
       AND NOT EXISTS (
         SELECT 1
         FROM progressive_cfd_attempts fallback_attempt
@@ -346,26 +337,7 @@ async function recoverLateRhoPimplePreciseGaps(db: DB): Promise<number> {
   `);
   let recovered = 0;
   for (const candidate of candidates) {
-    try {
-      const planned = await recordProgressiveCfdRecoveryPlans(
-        db,
-        String(candidate.id),
-      );
-      if (planned) {
-        const settled = await settleProgressiveCfdExecution(
-          db,
-          String(candidate.id),
-        );
-        recovered += Number(settled.retry ?? planned);
-      }
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      if (
-        message !== "Obsolete or settled progressive CFD execution scope" &&
-        message !== "Numerical recovery requires a progressive parent execution"
-      )
-        throw error;
-    }
+    recovered += await recoverLateRhoPimplePreciseExecution(db, String(candidate.id));
   }
   return recovered;
 }
