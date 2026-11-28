@@ -16075,17 +16075,21 @@ describe("subsonic through precise priority", () => {
     expect(progressiveCfdBatchMaximum(3)).toBe(8);
   });
 
-  async function scope(policyBeforeBaselines = false, angles = [0], additionalProfileCount = 0) {
+  async function scope(
+    policyBeforeBaselines = false, angles = [0], additionalProfileCount = 0,
+    additionalLowMach?: number,
+  ) {
     const profileIds = [originalId];
     for (let profileIndex = 0; profileIndex < additionalProfileCount; profileIndex += 1)
       profileIds.push(await newProfile());
-    const campaignId = await campaign("active", [340.3 * 0.5, 340.3, 340.3 * 2], angles, {}, profileIds);
+    const machNumbers = additionalLowMach === undefined ? [0.5, 1, 2] : [0.5, additionalLowMach, 1, 2];
+    const campaignId = await campaign("active", machNumbers.map(mach => 340.3 * mach), angles, {}, profileIds);
     await reconcileProgressiveGenerationRequest(db);
     const [generation] = await db.execute(sql`SELECT id, epoch_id FROM progressive_generations
       WHERE campaign_id = ${campaignId} ORDER BY created_at, id LIMIT 1`);
     if (policyBeforeBaselines) await adoptProgressiveSubsonicPriority(db, campaignId);
     const baselines: ProgressiveLease[] = [];
-    for (let index = 0; index < 3 * profileIds.length; index += 1) {
+    for (let index = 0; index < machNumbers.length * profileIds.length; index += 1) {
       const baseline = (await claim([1]))!;
       expect(baseline.generationId).toBe(generation.id);
       baselines.push(baseline);
@@ -16093,7 +16097,12 @@ describe("subsonic through precise priority", () => {
         expect(await initializeProgressiveCfdWork(db)).toBe(0);
         expect(await claimCfd()).toBeNull();
       }
-      await storeNeuralFoilPrediction(db, baseline, predictionFixture(baseline));
+      await storeNeuralFoilPrediction(db, baseline, {
+        ...predictionFixture(baseline),
+        ...(additionalLowMach === undefined ? {} : {
+          compressibility_diagnostics: { critical_mach: baseline.angles.map(() => 0.85) },
+        }),
+      });
     }
     return { campaignId, generationId: String(generation.id), epochId: String(generation.epoch_id), baselines };
   }
@@ -16245,16 +16254,19 @@ describe("subsonic through precise priority", () => {
     }]);
   }, 120_000);
 
-  async function initialFastRetryCoverage(additionalProfiles = 2) {
-    const fixture = await scope(true, [-2, 0, 2], additionalProfiles);
+  async function initialFastRetryCoverage(additionalProfiles = 2, differentSolverFamilies = false) {
+    const fixture = differentSolverFamilies
+      ? await scope(true, [-2, 0, 2], 0, 0.1)
+      : await scope(true, [-2, 0, 2], additionalProfiles);
     await initializeProgressiveCfdWork(db);
-    const batch = () => claimProgressiveCfdBatch(db, {
+    const batch = (family?: "simpleFoam" | "rhoSimpleFoam") => claimProgressiveCfdBatch(db, {
       owner: "initial-fast-retry-coverage-fixture",
+      ...(family ? { allowedSolverFamilies: [family] } : {}),
       leaseSeconds: 120,
       maximumUnits: 2,
       localTimeStepVersion: 1,
     });
-    const settled = await batch();
+    const settled = await batch(differentSolverFamilies ? "rhoSimpleFoam" : undefined);
     expect(settled).toHaveLength(2);
     for (const lease of settled) {
       expect(lease.stage).toBe(2);
@@ -16265,11 +16277,11 @@ describe("subsonic through precise priority", () => {
     await initializeProgressiveCfdWork(db);
     const retries: ProgressiveCfdLease[] = [];
     for (let index = 0; index < additionalProfiles; index += 1) {
-      const firstAttempts = await batch();
+      const firstAttempts = await batch(differentSolverFamilies ? "simpleFoam" : undefined);
       expect(firstAttempts).toHaveLength(2);
       for (const lease of firstAttempts) {
         expect(lease.stage).toBe(2);
-        expect(lease.physical.derived.mach).toBeCloseTo(0.5);
+        expect(lease.physical.derived.mach).toBeCloseTo(differentSolverFamilies ? 0.1 : 0.5);
         expect((await finish(lease, false, true)).settlement).toMatchObject({ retry: 1 });
         retries.push(lease);
       }
@@ -16357,7 +16369,7 @@ describe("subsonic through precise priority", () => {
   it.each(["deferred", "capability"] as const)(
     "falls back to low precise when the reserved initial FAST retry is %s and gives FAST the next usable turn",
     async (blocked) => {
-      const fixture = await initialFastRetryCoverage(1);
+      const fixture = await initialFastRetryCoverage(1, blocked === "capability");
       if (blocked === "deferred")
         await db.execute(sql`UPDATE progressive_cfd_units SET retry_after=clock_timestamp()+interval '1 hour'
           WHERE id IN (${sql.join(fixture.units.map(unit => sql`${unit.id}::uuid`), sql`,`)})`);
@@ -16366,11 +16378,13 @@ describe("subsonic through precise priority", () => {
         leaseSeconds: 120,
         maximumUnits: 1,
         localTimeStepVersion: 1,
-        ...(blocked === "capability" ? { allowedSolverFamilies: ["rhoPimpleFoam"] as const } : {}),
+        ...(blocked === "capability" ? { allowedSolverFamilies: ["rhoSimpleFoam"] as const } : {}),
       });
       expect(fallback).toHaveLength(1);
       expect(fallback[0]!.stage).toBe(3);
       expect(fallback[0]!.physical.derived.mach).toBeCloseTo(0.5);
+      if (blocked === "capability")
+        expect(fallback[0]!.recipe.selection).toMatchObject({ solver: "rhoSimpleFoam" });
       await db.execute(sql`UPDATE progressive_cfd_units SET retry_after=NULL
         WHERE id IN (${sql.join(fixture.units.map(unit => sql`${unit.id}::uuid`), sql`,`)})`);
       const next = await claimCfd();
