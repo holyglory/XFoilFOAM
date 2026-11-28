@@ -459,6 +459,7 @@ export async function verifyRegisteredReplacementRound(
           error:
             "previous progressive promise requires registered terminal reconciliation",
           deferred: "unreconciled_promise",
+          conflictingPromiseId: oldPromise,
         });
         expect(retryPage.existing).toBeGreaterThanOrEqual(1);
         expect(await oldSource()).toEqual(priorOwner);

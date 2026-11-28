@@ -120,6 +120,7 @@ import { verifyProgressiveRemoteReportInventory } from "./progressive-remote-inv
 import { verifyProgressiveRemoteStart } from "./progressive-remote-start-fixture";
 import { verifyRegisteredShortWork } from "./registered-short-work-window-fixture";
 import { verifyProgressiveWorkerJobMirror } from "./progressive-worker-job-fixture";
+import { verifyExpiredProgressiveIntake } from "./progressive-expired-intake-fixture";
 import {
   progressiveRemoteEvidenceResult,
   verifyProgressiveRemoteEvidenceSource,
@@ -5967,6 +5968,7 @@ describe("progressive CPU admission", () => {
             throw forecastRollback;
           }),
         ).rejects.toBe(forecastRollback);
+        await verifyExpiredProgressiveIntake(db, bound.envelope);
         const report: ProgressiveRemoteReport = {
           version: 1,
           solverId,

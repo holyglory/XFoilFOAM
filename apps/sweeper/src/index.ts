@@ -116,6 +116,13 @@ try {
         runProgressiveAssignmentIntakeService(db, engine, signal),
     },
     {
+      name: "progressive-expired-assignment-recovery",
+      run: (signal) =>
+        runProgressiveAssignmentIntakeService(db, engine, signal, {
+          expiredPending: true,
+        }),
+    },
+    {
       name: "retention",
       run: (signal) => runRetentionService(retention.db, engine, signal),
     },

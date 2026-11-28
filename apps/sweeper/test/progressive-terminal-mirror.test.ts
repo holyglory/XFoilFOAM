@@ -12,6 +12,7 @@ import {
   type DB,
 } from "@aerodb/db";
 import { sql, type SQL } from "drizzle-orm";
+import { PgDialect } from "drizzle-orm/pg-core";
 import { withArchiveFixture } from "./progressive-report-archive-fixture";
 import { verifyDiagnosticMirror } from "./progressive-terminal-diagnostic-fixture";
 import { persistClaimedRemotePromise } from "../src/remote-solver";
@@ -233,6 +234,70 @@ async function verifyUnstartedCancellation(
       VALUES(${id}::uuid,1,${other.contentSignature},${JSON.stringify(other.report)}::jsonb,'changed remote report')`);
     expect((await run(conn, remote)).outcome).toBe("unsettled");
   });
+  // A named background retry preserves the already verified report scan when
+  // the hub refuses the final read. Nothing is released by the failed HTTP call.
+  const dialect = new PgDialect();
+  let pages = 0;
+  const counted = new Proxy(db, {
+    get(target, property) {
+      if (property === "execute")
+        return (statement: SQL) => {
+          if (
+            dialect
+              .sqlToQuery(statement)
+              .sql.includes("WITH page AS MATERIALIZED")
+          )
+            pages += 1;
+          return target.execute(statement);
+        };
+      const value = Reflect.get(target, property);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+  let reads = 0;
+  let release!: () => void;
+  const fetcher: typeof fetch = async () => {
+    if (++reads === 1) return Response.json({ assignment: remote });
+    if (reads === 2) {
+      await new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      return new Response(null, { status: 403 });
+    }
+    return Response.json({ assignment: remote });
+  };
+  const bounded = reconcileTerminalProgressiveMirror(counted, {
+    promiseId,
+    bounded: true,
+    preview: true,
+    fetcher,
+  });
+  await vi.waitFor(() => expect(reads).toBe(2));
+  expect(
+    await reconcileTerminalProgressiveMirror(counted, {
+      promiseId,
+      bounded: true,
+      fetcher,
+    }),
+  ).toEqual({ outcome: "busy" });
+  release();
+  expect(await bounded).toMatchObject({
+    outcome: "no-terminal-proof",
+    httpStatus: 403,
+  });
+  expect(pages).toBe(1);
+  expect(
+    await reconcileTerminalProgressiveMirror(counted, {
+      promiseId,
+      bounded: true,
+      preview: true,
+      fetcher,
+    }),
+  ).toMatchObject({ outcome: "eligible", reports: 1, provedResults: 0 });
+  expect(pages).toBe(1);
+  await expect(persistReplacement(db, remote, replacement)).rejects.toThrow(
+    "requires registered terminal reconciliation",
+  );
   // The controller must retain this exact object until its own lease has expired.
   await db.execute(
     sql`UPDATE sim_jobs SET ingest_lease_token=gen_random_uuid(),ingest_lease_expires_at=now()-interval '1 minute' WHERE id=${id}::uuid`,
@@ -580,7 +645,11 @@ describe("registered terminal progressive mirror reconciliation", () => {
             }
             expect((await promise())[0]).toEqual(before);
             const normal = () =>
-              reconcileTerminalProgressiveMirror(db, { fetcher: http() });
+              reconcileTerminalProgressiveMirror(db, {
+                promiseId,
+                bounded: true,
+                fetcher: http(),
+              });
             if (!normalized) expect((await normal()).outcome).toBe("checking");
             expect((await normal()).outcome).toBe("reconciled");
             expect((await promise())[0]).toMatchObject({

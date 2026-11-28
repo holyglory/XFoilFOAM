@@ -2683,6 +2683,7 @@ export async function receiveProgressiveCampaignAssignments(
   db: DB,
   engine: EngineClient,
   fetcher: typeof fetch = fetch,
+  options: { expiredPending?: boolean } = {},
 ) {
   return receiveProgressiveAssignmentPage(
     db,
@@ -2700,6 +2701,16 @@ export async function receiveProgressiveCampaignAssignments(
           "The worker configuration changed before assignment receipt",
         );
       const raw = document.promise;
+      if (options.expiredPending) {
+        if (!raw.expired || !["active", "expired"].includes(String(raw.status)))
+          throw new Error("Recovery assignment is no longer expired pending work");
+        const [started] = await db.execute(sql`SELECT job.id FROM sim_jobs job
+          LEFT JOIN progressive_worker_submission_intents intent ON intent.sim_job_id = job.id
+          WHERE job.id = ${document.envelope.scope.executionId}::uuid
+            AND (job.engine_job_id IS NOT NULL OR intent.sim_job_id IS NOT NULL)`);
+        if (started)
+          throw new Error("Existing worker execution requires its ordinary observation path");
+      }
       const airfoil = raw.airfoil as RemoteClaim["airfoil"] | undefined;
       const revision = raw.setupRevision as
         | RemoteClaim["setupRevision"]
@@ -2778,6 +2789,7 @@ export async function receiveProgressiveCampaignAssignments(
         );
     },
     fetcher,
+    options,
   );
 }
 
@@ -3031,8 +3043,12 @@ export async function persistClaimedRemotePromise(
       );
     // A replacement is authenticated for its own assignment. The previous
     // progressive promise still owns its reports, deliveries and review rights.
-    if (conflicts.some((row) => row.progressive === true))
-      throw new ProgressiveAssignmentDeferred("unreconciled_promise");
+    const priorProgressive = conflicts.find((row) => row.progressive === true);
+    if (priorProgressive)
+      throw new ProgressiveAssignmentDeferred(
+        "unreconciled_promise",
+        String(priorProgressive.promise_id),
+      );
     const conflictIds = [
       ...new Set(conflicts.map((row) => String(row.promise_id))),
     ];

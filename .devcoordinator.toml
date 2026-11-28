@@ -2930,8 +2930,9 @@ command = ["/usr/bin/corepack", "pnpm", "-r", "typecheck"]
 [[test.progressive-intake-recovery.check]]
 name = "dispatch-intake"
 tier = "development"
-requires = ["seed"]
-command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vitest", "run", "test/campaign-profile-enrollment.test.ts", "-t", "progressive remote dispatch pins one exact request"]
+requires = ["seed", "types"]
+command = ["/bin/bash", "scripts/dev/verify-expired-unpicked-dispatch.sh"]
+diagnostic_sources = [{format="junit",path="recovery.xml"},{format="junit",path="fences.xml"},{format="junit",path="terminal.xml"}]
 
 [[test.progressive-intake-recovery.check]]
 name = "staging-and-lifecycle"
@@ -2943,7 +2944,9 @@ command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/db", "exec", "vites
 name = "intake-service"
 tier = "development"
 requires = ["workspace"]
-command = ["/usr/bin/corepack", "pnpm", "--filter", "@aerodb/sweeper", "exec", "vitest", "run", "test/progressive-intake-service.test.ts", "test/progressive-evidence-service.test.ts"]
+env = { VITEST_PURE_REDUCER_TEST = "1" }
+command = ["/bin/bash", "scripts/dev/verify-expired-unpicked-dispatch.sh", "--intake"]
+diagnostic_sources = [{format="junit",path="intake.xml"}]
 
 [test.progressive-missing-baseline]
 timeout_seconds = 900

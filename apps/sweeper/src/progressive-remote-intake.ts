@@ -14,7 +14,10 @@ export interface ProgressiveAssignmentDocument extends Record<string, unknown> {
 }
 
 export class ProgressiveAssignmentDeferred extends Error {
-  constructor(readonly reason: "promise_locked" | "unreconciled_promise") {
+  constructor(
+    readonly reason: "promise_locked" | "unreconciled_promise",
+    readonly conflictingPromiseId?: string,
+  ) {
     super(
       reason === "promise_locked"
         ? "overlapping local promise is busy; retry this assignment"
@@ -48,6 +51,22 @@ const pendingPages = new WeakMap<
   DB,
   ReturnType<typeof receiveAssignmentPage>
 >();
+const pendingRecoveryPages = new WeakMap<
+  DB,
+  ReturnType<typeof receiveAssignmentPage>
+>();
+// Recovery may restart its bounded scan after a worker restart. It must never
+// advance or wait on the durable cursor used to collect fresh assignments.
+const recoveryCursors = new WeakMap<
+  DB,
+  {
+    solverId: string;
+    baseUrl: string;
+    cycle_started_at: string | null;
+    after_created_at: string | null;
+    after_execution_id: string | null;
+  }
+>();
 
 const PROGRESSIVE_ASSIGNMENT_INTAKE_TIMEOUT_MS = Number(
   process.env.SWEEPER_PROGRESSIVE_ASSIGNMENT_INTAKE_TIMEOUT_MS ?? 30_000,
@@ -66,14 +85,15 @@ export async function receiveProgressiveAssignmentPage(
   ...args: Parameters<typeof receiveAssignmentPage>
 ) {
   const [db] = args;
-  const existing = pendingPages.get(db);
+  const pages = args[3]?.expiredPending ? pendingRecoveryPages : pendingPages;
+  const existing = pages.get(db);
   if (existing) return existing;
   const operation = receiveAssignmentPage(...args);
-  pendingPages.set(db, operation);
+  pages.set(db, operation);
   try {
     return await operation;
   } finally {
-    if (pendingPages.get(db) === operation) pendingPages.delete(db);
+    if (pages.get(db) === operation) pages.delete(db);
   }
 }
 
@@ -84,6 +104,7 @@ async function receiveAssignmentPage(
     owner: { solverId: string; baseUrl: string },
   ) => Promise<void>,
   fetcher: typeof fetch = fetch,
+  options: { expiredPending?: boolean } = {},
 ) {
   const receipt = {
     seen: 0,
@@ -95,6 +116,7 @@ async function receiveAssignmentPage(
       executionId: string;
       error: string;
       deferred?: ProgressiveAssignmentDeferred["reason"];
+      conflictingPromiseId?: string;
     }>,
   };
   const [settings] =
@@ -111,8 +133,15 @@ async function receiveAssignmentPage(
     return receipt;
   const solverId = String(settings.solver_id);
   const baseUrl = canonicalRemoteHubBaseUrl(String(settings.upstream_base_url));
-  const [cursor] =
-    await db.execute(sql`SELECT cycle_started_at, after_created_at, after_execution_id FROM progressive_worker_assignment_cursors
+  const recoveryCursor = recoveryCursors.get(db);
+  const [cursor] = options.expiredPending
+    ? [
+        recoveryCursor?.solverId === solverId &&
+        recoveryCursor.baseUrl === baseUrl
+          ? recoveryCursor
+          : undefined,
+      ]
+    : await db.execute(sql`SELECT cycle_started_at, after_created_at, after_execution_id FROM progressive_worker_assignment_cursors
     WHERE settings_id = 1 AND solver_id = ${solverId}::uuid AND upstream_base_url = ${baseUrl}`);
   const cycleStartedAt = databaseTimestamp(cursor?.cycle_started_at);
   const afterCreatedAt = cycleStartedAt
@@ -138,13 +167,14 @@ async function receiveAssignmentPage(
       );
     return response.json() as Promise<unknown>;
   };
+  const pageLimit = options.expiredPending ? 4 : 50;
   const page = await request(
-    `/progressive-executions?limit=50${cycleStartedAt ? `&beforeCreatedAt=${encodeURIComponent(cycleStartedAt)}` : ""}${after && afterCreatedAt ? `&afterCreatedAt=${encodeURIComponent(afterCreatedAt)}&after=${encodeURIComponent(after)}` : ""}`,
+    `/progressive-executions?limit=${pageLimit}${options.expiredPending ? "&expiredPending=true" : ""}${cycleStartedAt ? `&beforeCreatedAt=${encodeURIComponent(cycleStartedAt)}` : ""}${after && afterCreatedAt ? `&afterCreatedAt=${encodeURIComponent(afterCreatedAt)}&after=${encodeURIComponent(after)}` : ""}`,
   );
   if (
     !record(page) ||
     !Array.isArray(page.items) ||
-    page.items.length > 50 ||
+    page.items.length > pageLimit ||
     !timestamp(page.cycleStartedAt) ||
     !(page.nextCursor === null || uuid(page.nextCursor)) ||
     !(page.nextCreatedAt === null || timestamp(page.nextCreatedAt))
@@ -213,11 +243,11 @@ async function receiveAssignmentPage(
   };
   await runWithConcurrency(
     identities,
-    progressiveAssignmentIntakeConcurrency(),
+    options.expiredPending ? 1 : progressiveAssignmentIntakeConcurrency(),
     async (identity) => {
       receipt.seen += 1;
       try {
-        if (await mirrored(identity)) {
+        if (!options.expiredPending && (await mirrored(identity))) {
           receipt.existing += 1;
           return;
         }
@@ -256,12 +286,28 @@ async function receiveAssignmentPage(
           executionId: identity.executionId,
           error: error instanceof Error ? error.message : String(error),
           ...(error instanceof ProgressiveAssignmentDeferred
-            ? { deferred: error.reason }
+            ? {
+                deferred: error.reason,
+                ...(error.conflictingPromiseId
+                  ? { conflictingPromiseId: error.conflictingPromiseId }
+                  : {}),
+              }
             : {}),
         });
       }
     },
   );
+  if (options.expiredPending) {
+    recoveryCursors.set(db, {
+      solverId,
+      baseUrl,
+      cycle_started_at: page.nextCursor === null ? null : page.cycleStartedAt,
+      after_created_at: page.nextCreatedAt,
+      after_execution_id: page.nextCursor,
+    });
+    receipt.cursorAdvanced = true;
+    return receipt;
+  }
   const [advanced] = await db.execute(sql`
     INSERT INTO progressive_worker_assignment_cursors (settings_id, solver_id, upstream_base_url, cycle_started_at, after_created_at, after_execution_id)
     SELECT 1, ${solverId}::uuid, ${baseUrl},

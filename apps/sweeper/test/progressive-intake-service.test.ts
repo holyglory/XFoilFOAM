@@ -6,6 +6,7 @@ import { receiveProgressiveCampaignAssignments } from "../src/remote-solver";
 import { runProgressiveAssignmentIntakeService } from "../src/progressive-intake-service";
 import { reconcileProgressiveRemoteWorker } from "../src/progressive-remote-reconciliation";
 import { runProgressiveRemoteObservationService } from "../src/progressive-observation-service";
+import { reconcileTerminalProgressiveMirror } from "../src/progressive-terminal-mirror";
 import {
   activeReconcileConcurrency,
   activeReconcileJobLimit,
@@ -18,6 +19,9 @@ vi.mock("../src/progressive-remote-reconciliation", () => ({
 
 vi.mock("../src/remote-solver", () => ({
   receiveProgressiveCampaignAssignments: vi.fn(),
+}));
+vi.mock("../src/progressive-terminal-mirror", () => ({
+  reconcileTerminalProgressiveMirror: vi.fn(),
 }));
 vi.mock("node:timers/promises", () => ({
   setTimeout: (
@@ -101,6 +105,128 @@ it("shares a slow intake between the independent service and controller", async 
   execute.mockResolvedValue([]);
   await receiveProgressiveAssignmentPage(db, receive);
   expect(execute).toHaveBeenCalledTimes(2);
+});
+
+it("drains a held recovery independently while normal intake keeps receiving", async () => {
+  vi.useFakeTimers();
+  const owner = new AbortController();
+  let release!: () => void;
+  const receipt = {
+    seen: 0,
+    mirrored: 0,
+    existing: 0,
+    stopped: 0,
+    cursorAdvanced: false,
+    errors: [],
+  };
+  const intake = vi.mocked(receiveProgressiveCampaignAssignments);
+  intake.mockImplementation(async (_db, _engine, _fetcher, options) => {
+    if (options?.expiredPending)
+      await new Promise<void>((resolve) => {
+        release = resolve;
+      });
+    return receipt;
+  });
+  const db = {} as DB;
+  const engine = {} as EngineClient;
+  let recovered = false;
+  const recovery = runProgressiveAssignmentIntakeService(
+    db,
+    engine,
+    owner.signal,
+    { expiredPending: true },
+  ).then(() => {
+    recovered = true;
+  });
+  const normal = runProgressiveAssignmentIntakeService(
+    db,
+    engine,
+    owner.signal,
+  );
+  await vi.advanceTimersByTimeAsync(15_000);
+  expect(
+    intake.mock.calls.filter((call) => call[3]?.expiredPending),
+  ).toHaveLength(1);
+  expect(
+    intake.mock.calls.filter((call) => !call[3]?.expiredPending),
+  ).toHaveLength(4);
+  owner.abort();
+  await normal;
+  expect(recovered).toBe(false);
+  release();
+  await recovery;
+  expect(recovered).toBe(true);
+});
+
+it("queues a named rolled-back conflict for independent bounded reconciliation and ordinary intake retry", async () => {
+  vi.useFakeTimers();
+  const db = {} as DB;
+  const engine = {} as EngineClient;
+  const owner = new AbortController();
+  const promiseId = "10000000-0000-4000-8000-000000000001";
+  const empty = {
+    seen: 0,
+    mirrored: 0,
+    existing: 0,
+    stopped: 0,
+    cursorAdvanced: false,
+    errors: [],
+  };
+  let offered = false;
+  const intake = vi.mocked(receiveProgressiveCampaignAssignments);
+  intake.mockImplementation(async (_db, _engine, _fetcher, options) => {
+    if (!options?.expiredPending && !offered) {
+      offered = true;
+      return {
+        ...empty,
+        errors: [
+          {
+            executionId: "replacement",
+            error: "previous promise",
+            deferred: "unreconciled_promise",
+            conflictingPromiseId: promiseId,
+          },
+        ],
+      };
+    }
+    return empty;
+  });
+  let release!: () => void;
+  const reconcile = vi.mocked(reconcileTerminalProgressiveMirror);
+  reconcile.mockImplementation(async () => {
+    await new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    throw new Error("retained HTTP failure");
+  });
+  vi.spyOn(console, "log").mockImplementation(() => {});
+  vi.spyOn(console, "error").mockImplementation(() => {});
+  const normal = runProgressiveAssignmentIntakeService(
+    db,
+    engine,
+    owner.signal,
+  );
+  const recovery = runProgressiveAssignmentIntakeService(
+    db,
+    engine,
+    owner.signal,
+    { expiredPending: true },
+  );
+  await vi.advanceTimersByTimeAsync(15_000);
+  expect(reconcile).toHaveBeenCalledOnce();
+  expect(reconcile).toHaveBeenCalledWith(db, {
+    promiseId,
+    bounded: true,
+  });
+  expect(
+    intake.mock.calls.filter((call) => !call[3]?.expiredPending),
+  ).toHaveLength(4);
+  release();
+  await vi.advanceTimersByTimeAsync(0);
+  await vi.advanceTimersByTimeAsync(30_000);
+  expect(reconcile).toHaveBeenCalledOnce();
+  owner.abort();
+  await Promise.all([normal, recovery]);
 });
 
 it.each([
