@@ -8,7 +8,7 @@ case "$1" in
     exec corepack pnpm --filter @aerodb/db "$action" ;;
   types)
     exec corepack pnpm --filter @aerodb/sweeper --filter @aerodb/api --filter @aerodb/engine-client typecheck ;;
-  node|engine)
+  node|engine|custody)
     # Worktrees can use the repository's installed interpreter; always import this checkout's sources.
     python="$PWD/.venv/bin/python"
     if [ ! -x "$python" ]; then
@@ -18,6 +18,11 @@ case "$1" in
     test -x "$python"
     export AIRFOILFOAM_RETENTION_PYTHON="$python" PYTHONPATH="$PWD/src" PYTHONDONTWRITEBYTECODE=1
     if [ "$1" = engine ]; then exec "$python" -m pytest tests/test_retention.py -q; fi
+    if [ "$1" = custody ]; then
+      corepack pnpm --filter @aerodb/db migrate
+      corepack pnpm --filter @aerodb/db seed
+      exec bash scripts/dev/run-vitest-with-diagnostics.sh @aerodb/sweeper --no-file-parallelism test/retention.test.ts test/closed-progressive-retention.test.ts
+    fi
     corepack pnpm --filter @aerodb/sweeper exec vitest run --no-file-parallelism test/retention.test.ts test/closed-progressive-retention.test.ts
     exec corepack pnpm --filter @aerodb/db exec vitest run test/campaign-profile-enrollment.test.ts -t "delivers an exact physical case beside a retained terminal material diagnostic" ;;
   *) exit 2 ;;

@@ -5769,7 +5769,7 @@ name = "closed-job-custody"
 tier = "development"
 requires = ["workspace"]
 timeout_seconds = 600
-case_command = ["/bin/bash", "-c", "/usr/bin/corepack pnpm --filter @aerodb/db migrate && /usr/bin/corepack pnpm --filter @aerodb/db seed && exec /usr/bin/corepack pnpm --filter @aerodb/sweeper exec vitest run --no-file-parallelism test/retention.test.ts test/closed-progressive-retention.test.ts --reporter=default --reporter=junit --outputFile.junit=\"$DEVCOORDINATOR_DIAGNOSTICS_DIR/report.xml\""]
+case_command = ["/bin/sh", "scripts/dev/check-closed-retention.sh", "custody"]
 cases = [{ id = "closed-job-database", args = [], postgres = "default" }]
 diagnostic_sources = [{ format = "junit", path = "report.xml" }]
 
@@ -5900,9 +5900,9 @@ name = "terminal-recovery"
 tier = "development"
 timeout_seconds = 900
 requires = ["workspace"]
-env = { CAMPAIGN_ENROLLMENT_CASE_DB = "1" }
-case_command = ["/bin/bash", "scripts/dev/run-vitest-with-diagnostics.sh", "@aerodb/db", "test/campaign-profile-enrollment.test.ts", "-t", "terminal evidence inventory preserves exact ownership|recovers an authenticated mixed RANS promotion from a fresh stage-2 execution|progressive remote dispatch pins one exact request|progressive remote dispatch composes only after authenticated capabilities"]
-cases = [{ id = "enrollment", args = [], postgres = "default" }]
+# The registered round creates independent hub and worker databases in the
+# run's PostgreSQL instance. The enrollment fixture creates and drops its own database.
+command = ["/bin/bash", "scripts/dev/run-vitest-with-diagnostics.sh", "@aerodb/db", "test/campaign-profile-enrollment.test.ts", "-t", "terminal evidence inventory preserves exact ownership|recovers an authenticated mixed RANS promotion from a fresh stage-2 execution|progressive remote dispatch pins one exact request|progressive remote dispatch composes only after authenticated capabilities"]
 diagnostic_sources = [{ format = "junit", path = "report.xml" }]
 
 # Exact per-attempt shortening boundary: disposable schema, real 0207/0208,
