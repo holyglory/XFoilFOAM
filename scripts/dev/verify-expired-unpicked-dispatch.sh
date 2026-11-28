@@ -18,7 +18,7 @@ result=0
   -k 'current_route_unregistered_cancellation or stop_requires_the_real_execution_lock_and_no_remaining_children' \
   --junitxml="$DEVCOORDINATOR_DIAGNOSTICS_DIR/fences.xml" || result=1
 /usr/bin/corepack pnpm --filter @aerodb/db exec vitest run test/campaign-profile-enrollment.test.ts \
-  -t 'progressive remote dispatch pins one exact request' --reporter=default --reporter=junit \
+  -t 'progressive remote dispatch pins one exact request|sealed dispatch cutover compatibility' --reporter=default --reporter=junit \
   --outputFile.junit="$DEVCOORDINATOR_DIAGNOSTICS_DIR/recovery.xml" || result=1
 PROGRESSIVE_REPORT_ARCHIVE_DISPOSABLE_DB=1 /usr/bin/corepack pnpm --filter @aerodb/sweeper exec vitest run \
   test/progressive-terminal-mirror.test.ts --reporter=default --reporter=junit \
