@@ -455,6 +455,14 @@ idempotent retries but neither fulfills a promise nor authorizes local cleanup.
 Unconverged evidence remains distinct from accepted points. The full archive path
 carries the same source proof; a prior compact receipt must not suppress later
 publication when the complete evidence passes the still-current execution gates.
+After an assignment expires, the worker can retain an original converged point or
+a finite nonconverged measurement that has recorded solver time and a manifest.
+The registered retention route authenticates the original report and records a
+storage-only receipt. The worker keeps its source through archive verification.
+The maintenance pass revisits a bounded page of closed-scope delivery refusals,
+checks the registered start and stop for each source, and leaves actual content
+conflicts available for review.
+
 Remote settlement can recover an empty canonical point selection only from the
 exact final-report point, a non-storage-only receipt, and authenticated archive
 custody after physical stopping. It rechecks classification and review under the

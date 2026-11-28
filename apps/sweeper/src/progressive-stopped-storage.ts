@@ -32,8 +32,14 @@ export async function progressiveStoppedStorageEligible(
     // An expired lease cannot publish or select a point. The retention route
     // may store a genuinely measured, signed point after the immutable stop.
     const disposition = mode === "expired-measured"
-      ? sql`promise.status='expired' AND attempt.status='done' AND attempt.valid_for_polar
-          AND attempt.converged AND attempt.cl IS NOT NULL AND attempt.cd IS NOT NULL AND attempt.cm IS NOT NULL`
+      ? sql`promise.status='expired' AND attempt.status='done'
+          AND attempt.cl IS NOT NULL AND attempt.cd IS NOT NULL AND attempt.cm IS NOT NULL
+          AND greatest(abs(attempt.cl),abs(attempt.cd),abs(attempt.cm)) < 'Infinity'::double precision
+          AND ((attempt.valid_for_polar AND attempt.converged)
+            OR (NOT attempt.valid_for_polar AND NOT attempt.converged AND attempt.source='solved'
+              AND attempt.regime IN ('rans','urans')
+              AND CASE WHEN jsonb_typeof(attempt.evidence_payload->'solver_active_seconds')='number'
+                THEN (attempt.evidence_payload->>'solver_active_seconds')::numeric > 0 ELSE false END))`
       : sql`attempt.status='failed' AND NOT attempt.valid_for_polar AND NOT attempt.converged
           AND attempt.evidence_payload->>'failure_disposition' IN('material_domain','infrastructure','hard_solver')`;
     const rows = await db.execute(sql`SELECT job.id FROM sim_jobs job

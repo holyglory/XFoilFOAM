@@ -17,6 +17,7 @@ import { sql } from "drizzle-orm";
 import { effectiveProgressiveStageSql } from "@aerodb/db/progressive-execution-policy";
 import { reconcileAcceptedProgressiveCfdEvidence } from "@aerodb/db/progressive-cfd-reuse";
 import { runProgressiveBaselineBatch } from "./progressive-baselines";
+import { requeueExpiredProgressiveDeliveries } from "./progressive-expired-evidence-retry";
 import {
   PROGRESSIVE_FIT_POLICY_ID,
   runProgressiveFitBatch,
@@ -238,7 +239,13 @@ export async function runProgressiveBaselineService(
             classified: retainedClassifications,
           });
         }
-        if (settings?.remote) continue;
+        if (settings?.remote) {
+          if (runMaintenance) {
+            const count = await requeueExpiredProgressiveDeliveries(db);
+            if (count) report({ component: "progressive-expired-evidence-retry", requeued: count });
+          }
+          continue;
+        }
         if (!settings?.enabled || signal.aborted) continue;
         if (!policyReconciled) {
           const invalidated = await invalidateProgressiveFitPolicy(

@@ -35,6 +35,7 @@ import { installProgressiveReportArchiveReader } from "@aerodb/db/progressive-re
 import { archiveReportFixture } from "../../../packages/db/test-support/progressive-report-archive-fixture";
 import { fixtureStagingCandidateView } from "../../../packages/db/test-support/staging-candidate-view";
 import { progressiveStoppedStorageEligible } from "../src/progressive-stopped-storage";
+import { requeueExpiredProgressiveDeliveries } from "../src/progressive-expired-evidence-retry";
 import { reconcileProgressiveRemoteWorker } from "../src/progressive-remote-reconciliation";
 import { deliverNextProgressiveWorkerEvidence } from "../src/progressive-worker-evidence-delivery";
 import {
@@ -92,6 +93,7 @@ async function withFixture(
   {
     pendingCount = 2,
     failedPoints = false,
+    unconvergedMeasured = false,
     includeManifest = false,
     includeHistory = false,
     periodicHistory = false,
@@ -101,6 +103,7 @@ async function withFixture(
   }: {
     pendingCount?: number;
     failedPoints?: boolean;
+    unconvergedMeasured?: boolean;
     includeManifest?: boolean;
     includeHistory?: boolean;
     periodicHistory?: boolean;
@@ -314,14 +317,14 @@ async function withFixture(
               cl: alpha / 10,
               cd: 0.03,
               cm: -0.01,
-              converged: !(failedPoints && alpha >= 7),
+              converged: !((failedPoints || unconvergedMeasured) && alpha >= 7),
               unsteady: false,
               first_order_fallback: false,
               ...(periodicHistory
                 ? {
                     ...periodicPoint(alpha, singleUncertifiedPeriod ? 1 : 6, !singleUncertifiedPeriod),
                     case_slug: `fixture-${alpha}`,
-                    converged: !(failedPoints && alpha >= 7),
+                    converged: !((failedPoints || unconvergedMeasured) && alpha >= 7),
                   }
                 : {}),
               ...(tinyHistory ? {
@@ -461,12 +464,13 @@ async function withFixture(
       };
       await connection.execute(sql`INSERT INTO result_attempts
         (id,sim_job_id,engine_job_id,result_id,airfoil_id,bc_id,simulation_preset_revision_id,aoa_deg,
-         engine_case_slug,evidence_payload,cl,cd,cm,converged,unsteady,status,source,valid_for_polar)
+         engine_case_slug,evidence_payload,cl,cd,cm,converged,unsteady,status,source,regime,valid_for_polar)
         VALUES (${resultAttemptId}::uuid,${executionId}::uuid,
         ${executionId},${resultId}::uuid,${airfoilId}::uuid,${bcId}::uuid,${revisionId}::uuid,${alpha},
         ${reported.point.case_slug!},${JSON.stringify(projection.evidencePayload)}::jsonb,
         ${projection.cl},${projection.cd},${projection.cm},${projection.converged},${projection.unsteady},
-        ${projection.status},${projection.source},${projection.status === "done"})`);
+        ${projection.status},${projection.source},${unconvergedMeasured ? (projection.unsteady ? "urans" : "rans") : null},
+        ${projection.status === "done" && !(unconvergedMeasured && alpha >= 7)})`);
       await connection.execute(sql`INSERT INTO results
         (id,airfoil_id,bc_id,simulation_preset_revision_id,aoa_deg,reynolds,speed,chord,mach,status,source,converged)
         VALUES (${resultId}::uuid,${airfoilId}::uuid,${bcId}::uuid,
@@ -990,14 +994,16 @@ it("leaves another scope-closed rejection terminal after one explicit replay", a
   });
 });
 
-it.each([true, false])("requires an exact storage-only receipt for a measured point of an expired stopped dispatch (storageOnly=%s)", async (storageOnly) => {
+it.each([
+  [true, false], [false, false], [true, true], [false, true],
+])("requires an exact storage-only receipt for an expired measured point (receipt=%s, unconverged=%s)", async (storageOnly, unconvergedMeasured) => {
   await withFixture(async ({connection,input,receipt}) => {
     const point=input.points[0]!;
     input.points=[point];input.expectedCount=1;
     // A still-active promise never qualifies for the expired-source route.
     await connection.execute(sql`UPDATE sync_sweep_promises SET status='active'`);
     expect(await progressiveStoppedStorageEligible(connection,input.executionId,point,"expired-measured")).toBe(false);
-    await connection.execute(sql`UPDATE sync_sweep_promises SET status='expired'`);
+    await connection.execute(sql`UPDATE sync_sweep_promises SET status='expired',"expiresAt"=clock_timestamp()-interval '1 hour'`);
     expect(await progressiveStoppedStorageEligible(connection,input.executionId)).toBe(false);
     expect(await progressiveStoppedStorageEligible(connection,input.executionId,point,"failed")).toBe(false);
     expect(await progressiveStoppedStorageEligible(connection,input.executionId,point,"expired-measured")).toBe(true);
@@ -1007,7 +1013,24 @@ it.each([true, false])("requires an exact storage-only receipt for a measured po
     expect(await progressiveStoppedStorageEligible(connection,input.executionId,point,"expired-measured")).toBe(false);
     await connection.execute(sql`UPDATE result_attempts SET evidence_payload=${originalAttempt.original}::jsonb WHERE id=${point.resultAttemptId}::uuid`);
     const original=await snapshot(connection,["sync_sweep_promises","sim_jobs","results","result_attempts"]);
-    await replayProgressiveWorkerOutbox(connection,input,{apply:true});
+    // The sender stored the scope code in its 409 message. A real content
+    // conflict remains terminal even when that particular source is eligible.
+    await connection.execute(sql`UPDATE progressive_worker_delivery_failures SET attempt_count=1,
+      last_error='Progressive evidence delivery failed (409): progressive_scope_closed Obsolete or settled progressive CFD execution scope',
+      remote_conflict_ids=${JSON.stringify([randomUUID()])}::jsonb WHERE result_attempt_id=${point.resultAttemptId}::uuid`);
+    expect(await requeueExpiredProgressiveDeliveries(connection)).toBe(0);
+    await connection.execute(sql`UPDATE progressive_worker_delivery_failures SET remote_conflict_ids='[]'::jsonb
+      WHERE result_attempt_id=${point.resultAttemptId}::uuid`);
+    if (unconvergedMeasured) {
+      await connection.execute(sql`UPDATE result_attempts SET evidence_payload=jsonb_set(evidence_payload,'{solver_active_seconds}','0'::jsonb)
+        WHERE id=${point.resultAttemptId}::uuid`);
+      expect(await progressiveStoppedStorageEligible(connection,input.executionId,point,"expired-measured")).toBe(false);
+      expect(await requeueExpiredProgressiveDeliveries(connection)).toBe(0);
+      await connection.execute(sql`UPDATE result_attempts SET evidence_payload=${String(originalAttempt.original)}::jsonb
+        WHERE id=${point.resultAttemptId}::uuid`);
+    }
+    expect(await requeueExpiredProgressiveDeliveries(connection)).toBe(1);
+    expect(await requeueExpiredProgressiveDeliveries(connection)).toBe(0);
     const calls:string[]=[];
     const fetcher: typeof fetch = async (url,opts) => {
       calls.push(String(url));
@@ -1024,7 +1047,7 @@ it.each([true, false])("requires an exact storage-only receipt for a measured po
     const [saved]=await connection.execute(sql`SELECT receipt FROM progressive_worker_hub_receipts WHERE result_attempt_id=${point.resultAttemptId}::uuid`);
     if (storageOnly) expect(saved.receipt).toMatchObject({storageOnly:true,pointContentSignature:point.pointContentSignature});
     else expect(saved).toBeUndefined();
-  },{includeManifest:true,periodicHistory:true});
+  },{includeManifest:true,periodicHistory:!unconvergedMeasured,includeHistory:unconvergedMeasured,unconvergedMeasured});
 });
 
 it("keeps a failed attempt eligible for stopped storage beneath an accepted canonical cell", async () => {
