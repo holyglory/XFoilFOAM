@@ -1773,7 +1773,8 @@ async function verifyLegacyClosedProgressiveStorage(db: DB, envelope: Progressiv
           return new Response(response.body, { status: response.statusCode, headers: { "content-type": "application/json" } });
         };
         await withRollbackFixture(connection, "Restore active promise refusal for cancelled original", async (nested) => {
-          await nested.execute(sql`UPDATE sync_sweep_promises SET status='active' WHERE id=${envelope.promiseId}::uuid`);
+          await nested.execute(sql`UPDATE sync_sweep_promises SET status='active',
+            "expiresAt"=clock_timestamp()+interval '1 hour' WHERE id=${envelope.promiseId}::uuid`);
           if (variant === "untyped-failed") {
             await nested.execute(sql`UPDATE progressive_cfd_attempts SET outcome='running',finished_at=NULL
               WHERE sim_job_id=${executionId}::uuid AND token=${envelope.scope.units[0].token}::uuid`);
