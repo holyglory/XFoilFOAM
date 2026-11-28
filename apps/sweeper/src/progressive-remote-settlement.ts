@@ -14,7 +14,7 @@ import { effectiveProgressiveStageSql } from "@aerodb/db/progressive-execution-p
 import { progressiveBenchmarkAttemptSql } from "@aerodb/db/progressive-recipe-policy";
 import { assertProgressiveCfdTerminalDiagnostics, readProgressiveDiagnosticRecoveryTrigger } from "@aerodb/db/progressive-cfd-evidence";
 import { issueProgressiveRemoteDiagnosticReceipts } from "@aerodb/db/progressive-remote-diagnostic-receipts";
-import { readStoppedAcceptedProgressivePublication, lockStoppedPublicationResults } from "@aerodb/db/progressive-stopped-publication";
+import { readStoppedAcceptedProgressivePublication, lockStoppedPublicationResults, stoppedPublicationState } from "@aerodb/db/progressive-stopped-publication";
 import { polarEvidencePublicationRank } from "@aerodb/core";
 import {
   acknowledgeProgressiveCfdExecutionStop,
@@ -280,22 +280,24 @@ export async function promoteRetainedProgressiveAttempts(
   }
 }
 
+async function publishStoppedAttempts(db: DB, executionId: string, status: "cancelled" | "ingesting") {
+  const candidate = sql`a.sim_job_id=${executionId}::uuid AND a.status='done' AND a.valid_for_polar
+    AND EXISTS (SELECT FROM result_classifications c WHERE c.result_attempt_id=a.id AND c.state='accepted')
+    AND EXISTS (SELECT FROM progressive_cfd_evidence receipt WHERE receipt.result_attempt_id=a.id)
+    AND EXISTS (SELECT FROM results r WHERE r.id=a.result_id AND r.current_result_attempt_id IS NULL)`;
+  if (!(await db.execute(sql`SELECT 1 FROM result_attempts a WHERE ${candidate} LIMIT 1`)).length) return;
+  const histories = await preparePublicationHistories(db, candidate);
+  await db.transaction(async transaction => {
+    const connection = transaction as unknown as DB;
+    const publication = await readStoppedAcceptedProgressivePublication(connection, executionId, false, status);
+    if (publication?.attemptIds.length)
+      await promoteRetainedProgressiveAttempts(connection, { ...publication, stoppedPublication: true }, histories);
+  });
+}
+
 async function publishAcceptedProgressiveAttempts(db: DB, executionId: string) {
-  const [historical] = await db.execute(sql`SELECT id FROM sim_jobs
-    WHERE id=${executionId}::uuid AND status='cancelled' AND "ingestedAt" IS NULL`);
-  if (historical) {
-    const histories = await preparePublicationHistories(db, sql`
-      a.sim_job_id=${executionId}::uuid AND a.status='done' AND a.valid_for_polar
-      AND EXISTS (SELECT FROM results r WHERE r.id=a.result_id AND r.current_result_attempt_id IS NULL)
-    `);
-    await db.transaction(async (transaction) => {
-      const connection = transaction as unknown as DB;
-      const publication = await readStoppedAcceptedProgressivePublication(connection, executionId);
-      if (publication?.attemptIds.length)
-        await promoteRetainedProgressiveAttempts(connection, { ...publication, stoppedPublication: true }, histories);
-    });
-    return;
-  }
+  const state = await stoppedPublicationState(db, executionId);
+  if (state === "cancelled") return publishStoppedAttempts(db, executionId, state);
   const [candidate] = await db.execute(sql`
     SELECT job.airfoil_id, job.simulation_preset_revision_id, job.campaign_id
     FROM sim_jobs job
@@ -340,7 +342,11 @@ async function publishAcceptedProgressiveAttempts(db: DB, executionId: string) {
   `);
   if (!candidate) return;
   const retained = await readProgressiveRemoteRetention(db, executionId);
-  if (retained.kind !== "retained") return;
+  if (retained.kind !== "retained") {
+    if (state === "ingesting" && (retained.reason === "raw_evidence" || retained.reason === "archives"))
+      await publishStoppedAttempts(db, executionId, state);
+    return;
+  }
   const result = retained.report.result;
   const finalSources = result ? progressiveReportedPointSources({
     ...result,
@@ -375,14 +381,21 @@ async function publishAcceptedProgressiveAttempts(db: DB, executionId: string) {
   if (!current || current.ingestion_owned) return;
   if (!current.ingestedAt) {
     const signatures = new Set(publicationSources.map((source) => source.delivery.progressiveEvidence.pointContentSignature));
-    await assertProgressiveCfdEvidenceJob(db, executionId, executionId,
-      finalSources.filter((source) => signatures.has(source.contentSignature)).map((source) => ({
-        alpha: source.point.aoa_deg,
-        speed: source.polar.speed,
-        chord: source.polar.chord,
-        solverActiveSeconds: source.point.solver_active_seconds,
-      })),
-    );
+    try {
+      await assertProgressiveCfdEvidenceJob(db, executionId, executionId,
+        finalSources.filter((source) => signatures.has(source.contentSignature)).map((source) => ({
+          alpha: source.point.aoa_deg,
+          speed: source.polar.speed,
+          chord: source.polar.chord,
+          solverActiveSeconds: source.point.solver_active_seconds,
+        })),
+      );
+    } catch (error) {
+      if (state !== "ingesting" || !(error instanceof ProgressiveCfdEvidenceScopeClosed)) throw error;
+      // New evidence still requires the full ingestion scope. Only previously
+      // receipted, classified, archived points can use stopped publication.
+      return publishStoppedAttempts(db, executionId, state);
+    }
   }
   await refreshPolarClassificationsForJob(
     db,
@@ -784,13 +797,12 @@ async function settleWithCurrentOwnership(db:DB, executionId:string, prepared?:P
     // Reuse stopped-publication validation for occupied cells before taking the
     // job lock: epoch -> campaign -> generation/work/unit/attempt -> job.
     // This authorizes retirement only; it never promotes an occupied cell.
-    const [historical] = await connection.execute(sql`SELECT id FROM sim_jobs
-      WHERE id=${executionId}::uuid AND status='cancelled' AND "ingestedAt" IS NULL`);
+    const historical = await stoppedPublicationState(connection, executionId);
     let stoppedAcceptedIds: readonly string[] = [];
     if (historical) {
       try {
         stoppedAcceptedIds = (await readStoppedAcceptedProgressivePublication(
-          connection, executionId, true,
+          connection, executionId, true, historical,
         ))?.attemptIds ?? [];
       } catch (error) {
         if (!(error instanceof ProgressiveCfdEvidenceScopeClosed)) throw error;
@@ -988,7 +1000,7 @@ async function settleWithCurrentOwnership(db:DB, executionId:string, prepared?:P
               source.selected_regime as "rans" | "urans" | null,
             );
             return source.selected_accepted !== true || source.selected_exact_cell !== true ||
-              (job.status === "cancelled"
+              (historical
                 ? !stoppedAcceptedIds.includes(String(source.id)) ||
                   source.selected_retained_owner !== true || selectedRank < incomingRank
                 : selectedRank <= incomingRank);
