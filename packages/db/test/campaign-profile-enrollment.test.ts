@@ -5894,6 +5894,8 @@ describe("progressive CPU admission", () => {
     }, [32.1797]);
   }, 120_000);
 
+  // This journey also clones the hub and worker databases and starts the
+  // registered HTTP service to verify a genuine rejection and expiry fence.
   it("progressive remote dispatch pins one exact request and holds CPU through promise expiry until physical stop", async () => {
     await ready(async () => {
       const leases = await claimProgressiveCfdBatch(db, {
@@ -6353,7 +6355,7 @@ describe("progressive CPU admission", () => {
         );
       }
     });
-  }, 60_000);
+  }, 120_000);
 
   it("does not reserve remote CPU for an unstarted dispatch after its case lease expires", async () => {
     await ready(async () => {
