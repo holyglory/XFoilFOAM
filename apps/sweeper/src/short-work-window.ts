@@ -2,7 +2,6 @@ import { progressiveSolverIsTransient } from "@aerodb/core";
 import { progressiveRemoteExecutionSolverFamily } from "./progressive-remote-jobs";
 import {
   progressiveSolverProcessesForStage,
-  progressivePreciseCaseConcurrency,
 } from "./progressive-cfd-jobs";
 import { observedProgressiveRemoteCapabilities } from "./progressive-remote-capabilities";
 import { sql } from "drizzle-orm";
@@ -188,12 +187,7 @@ export async function previewShortWork(
   );
   if (
     (ranks ?? 1) > capacity ||
-    (selection.slots !== undefined && (ranks ?? 1) !== selection.slots) ||
-    (stage === 3 &&
-      transient &&
-      setup.scheduling.solverProcesses == null &&
-      ranks != null &&
-      progressivePreciseCaseConcurrency(capacity, ranks) !== 1)
+    (selection.slots !== undefined && (ranks ?? 1) !== selection.slots)
   )
     return null;
   const capability = observedProgressiveRemoteCapabilities(

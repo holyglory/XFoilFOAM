@@ -7354,6 +7354,40 @@ describe("progressive submission recovery", () => {
 });
 
 describe("progressive execution stop and settlement", () => {
+  it.each(["2", "4", "invalid", undefined])(
+    "keeps the v1 precise march at one lane and four default ranks under legacy concurrency %s",
+    async (concurrency) => {
+      const laneKey = "SWEEPER_PROGRESSIVE_PRECISE_CASE_CONCURRENCY";
+      const rankKey = "SWEEPER_PROGRESSIVE_PRECISE_SOLVER_PROCESSES";
+      const oldLane = process.env[laneKey];
+      const oldRanks = process.env[rankKey];
+      try {
+        if (concurrency === undefined) delete process.env[laneKey];
+        else process.env[laneKey] = concurrency;
+        delete process.env[rankKey];
+        const fixture = await cfdEvidenceFixture(
+          33.197, 3, [], [-2, 0, 2], false, undefined, { chordM: 0.763198 },
+          undefined, true, false, 96, { legacyPolicy: true },
+        );
+        expect(fixture.composed.request.resources).toMatchObject({
+          solver_processes: 4, case_concurrency: 1, cpu_budget: 4,
+        });
+        expect(fixture.composed.request.solver).toMatchObject({
+          warm_start: true, force_transient: true, urans_fidelity: "full",
+        });
+        expect(fixture.composed.request.aoa?.angles).toEqual([-2, 0, 2]);
+        expect(await db.execute(sql`SELECT admission_cpu_slots,wave FROM sim_jobs
+          WHERE id=${fixture.composed.jobId}::uuid`))
+          .toEqual([{ admission_cpu_slots: 4, wave: 2 }]);
+      } finally {
+        if (oldLane === undefined) delete process.env[laneKey];
+        else process.env[laneKey] = oldLane;
+        if (oldRanks === undefined) delete process.env[rankKey];
+        else process.env[rankKey] = oldRanks;
+      }
+    },
+  );
+
   it("admits one exact saved-case FAST continuation and binds it to a new attempt", async () => {
     const fixture = await fitFixture(2, false, [0]);
     const lease = fixture.leases[0];
