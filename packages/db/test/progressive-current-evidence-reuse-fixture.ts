@@ -6,6 +6,9 @@ import type { DB } from "../src/client";
 import { analysisContentHash } from "../src/analysis-target";
 import { reconcileCurrentPreciseEvidenceReuse, type CurrentPreciseReuseCursor } from "../src/progressive-current-evidence-reuse";
 import { reconcileAcceptedProgressiveCfdEvidence } from "../src/progressive-cfd-reuse";
+import { archiveReportFixture } from "../test-support/progressive-report-archive-fixture";
+import { installProgressiveReportArchiveReader } from "../src/progressive-report-reader";
+import { withPreparedProgressiveRemoteRetention, readProgressiveRemoteRetention } from "../src/progressive-remote-retention";
 import { claimProgressiveCfdUnit } from "../src/progressive-cfd";
 import { acknowledgeProgressiveCfdExecutionStop } from "../src/progressive-cfd-settlement";
 import { sealProgressiveRemoteExecution, type ProgressiveRemoteExecutionEnvelope } from "../src/progressive-remote-execution";
@@ -38,6 +41,9 @@ function observeLockOrder(db: DB, order: string[]): DB {
       if (statement.includes("from sim_campaigns") && statement.includes("for update")) order.push("campaign");
       if (statement.includes("for update of generation,work,unit,source")) order.push("unit");
       if (statement.includes("from sim_jobs") && statement.includes("for update")) order.push("job");
+      if (compiled.params.some((param) => typeof param === "string" && param.startsWith("precalc-cell:"))) order.push("cell reservation");
+      if (compiled.params.some((param) => typeof param === "string" && param.startsWith("result-evidence:"))) order.push("evidence");
+      if (compiled.params.some((param) => typeof param === "string" && param.startsWith("result-review-verdict:"))) order.push("review");
       if (compiled.params.some((param) => typeof param === "string" && param.startsWith("polar-compatibility:"))) order.push("compatibility");
       if (compiled.params.some((param) => typeof param === "string" && param.startsWith("polar-revision:"))) order.push("revision");
       if (statement.includes("for update of cell for share of classification")) order.push("canonical");
@@ -52,7 +58,7 @@ function observeLockOrder(db: DB, order: string[]): DB {
 
 // A real validated cancellation envelope/receipt, with no engine submission or
 // raw result, models the two never-started successors in the production history.
-async function stoppedSuccessor(db: DB, original: ProgressiveRemoteExecutionEnvelope) {
+async function stoppedSuccessor(db: DB, original: ProgressiveRemoteExecutionEnvelope, neverStarted = true) {
   const [parent] = await db.select().from(simJobs).where(eq(simJobs.id, original.scope.executionId));
   const jobId = randomUUID();
   const promiseId = randomUUID();
@@ -71,13 +77,13 @@ async function stoppedSuccessor(db: DB, original: ProgressiveRemoteExecutionEnve
     FROM progressive_remote_dispatches WHERE sim_job_id=${original.scope.executionId}::uuid`);
   for (const unit of units) await db.execute(sql`INSERT INTO progressive_cfd_attempts
     (token,unit_id,sim_job_id,owner,execution_recipe_id,outcome,started_at,finished_at,lease_until,active_seconds)
-    VALUES(${unit.token}::uuid,${unit.unitId}::uuid,${jobId}::uuid,'authenticated never-started successor',${scope.recipeId},
+    VALUES(${unit.token}::uuid,${unit.unitId}::uuid,${jobId}::uuid,'authenticated stopped successor',${scope.recipeId},
       'cancelled',clock_timestamp(),clock_timestamp(),clock_timestamp(),0)`);
   const report: ProgressiveRemoteReport = { version: 1, solverId: original.solverId, promiseId, executionId: jobId,
     assignmentSignature: envelope.contentSignature, sequence: 1,
     status: { job_id: jobId, state: "cancelled", total_cases: units.length, completed_cases: 0 }, result: null,
     stopProof: { version: 1, job_id: jobId, execution_stopped: true, producer_stopped: true, namespace_verified: true,
-      remaining: [], observed_at: new Date().toISOString(), error: null, fence: "cancel_marker", ownership_basis: "never_started_cancellation_fence" } };
+      remaining: [], observed_at: new Date().toISOString(), error: null, fence: "cancel_marker", ownership_basis: neverStarted ? "never_started_cancellation_fence" : "recorded_execution_namespace" } };
   await storeProgressiveRemoteReport(db, { executionId: jobId, solverId: original.solverId, promiseId, report });
   await acknowledgeProgressiveCfdExecutionStop(db, { simJobId: jobId, proof: report.stopProof! });
   return { jobId, promiseId, token: units[0].token };
@@ -216,7 +222,7 @@ export async function verifyCurrentPreciseEvidenceReuse(
       const credited = await reconcileCurrentPreciseEvidenceReuse(observeLockOrder(connection, order), input);
       expect(credited, scenario).toEqual({ reusedUnitIds: [unitId], replayedUnitIds: [], refused: [] });
       expect(order, "epoch must precede admission; classification/revision rows must not precede cache locks")
-        .toEqual(["epoch", "admission", "campaign", "unit", "job", "compatibility", "revision", "canonical"]);
+        .toEqual(["epoch", "admission", "campaign", "unit", "job", "cell reservation", "compatibility", "revision", "evidence", "review", "canonical"]);
       legitimateCompletions += credited.reusedUnitIds.length;
       expect(await connection.execute(sql`SELECT state FROM progressive_cfd_units WHERE id=${unitId}::uuid`)).toEqual([{ state: "complete" }]);
       const [link] = await connection.execute(sql`SELECT * FROM progressive_cfd_evidence_reuses WHERE successor_unit_id=${unitId}::uuid`);
@@ -240,4 +246,164 @@ export async function verifyCurrentPreciseEvidenceReuse(
     });
   }
   expect(legitimateCompletions).toBe(2);
+}
+
+// This fixture starts after normal publication and cache refresh. Five final
+// points have archives and canonical pointers; two other physical sources are
+// missing and the eighth angle is diagnostic-only.
+export async function verifySelectedIncompleteUnitReuse(
+  db: DB, envelope: ProgressiveRemoteExecutionEnvelope, rawIds: string[], eligibleOriginalRequest: boolean,
+) {
+  const job = envelope.scope.executionId;
+  const units = envelope.scope.units.slice(0, 5);
+  const ids = units.map(unit => unit.unitId);
+  const missing = envelope.scope.units.slice(5).map(unit => unit.unitId);
+  const [parent] = await db.execute(sql`SELECT campaign_id FROM sim_jobs WHERE id=${job}::uuid`);
+  const exact = { campaignId: String(parent.campaign_id), unitIds: ids };
+  const states = (c: DB) => c.execute(sql`SELECT u.id,u.state,reuse.source_result_attempt_id AS credited
+    FROM progressive_cfd_attempts a JOIN progressive_cfd_units u ON u.id=a.unit_id
+    LEFT JOIN progressive_cfd_evidence_reuses reuse ON reuse.successor_unit_id=u.id
+    WHERE a.sim_job_id=${job}::uuid ORDER BY u.aoa_deg`);
+  const immutable = async (c: DB) => analysisContentHash(await c.execute(sql`SELECT
+    to_jsonb(a) AS original,to_jsonb(u)-'state'-'error' AS unit_budget,to_jsonb(e) AS receipt,to_jsonb(raw) AS raw,
+    to_jsonb(cell) AS canonical,to_jsonb(proof) AS stop,to_jsonb(j) AS job,
+    (SELECT jsonb_agg(to_jsonb(f) ORDER BY f.id) FROM polar_fit_sets f WHERE f.is_current
+      AND f.airfoil_id=j.airfoil_id AND f.simulation_preset_revision_id=j.simulation_preset_revision_id) AS fit,
+    (SELECT count(*) FROM sim_jobs j2 WHERE j2.campaign_id=j.campaign_id) AS jobs,
+    (SELECT count(*) FROM progressive_cfd_attempts h WHERE h.unit_id=u.id) AS attempts
+    FROM sim_jobs j JOIN progressive_cfd_execution_stops proof ON proof.sim_job_id=j.id
+    JOIN progressive_cfd_attempts a ON a.sim_job_id=j.id JOIN progressive_cfd_units u ON u.id=a.unit_id
+    LEFT JOIN progressive_cfd_evidence e ON e.attempt_token=a.token LEFT JOIN result_attempts raw ON raw.id=e.result_attempt_id
+    LEFT JOIN results cell ON cell.id=raw.result_id WHERE j.id=${job}::uuid ORDER BY a.token,raw.id`));
+  expect(await states(db)).toEqual(envelope.scope.units.map(u => ({id:u.unitId,state:"pending",credited:null})));
+  const before = await immutable(db);
+  if (!eligibleOriginalRequest) {
+    // A signed transient execution can carry a RANS-labelled point. The
+    // canonical record alone cannot establish original steady-solve authority.
+    const outcome = await reconcileCurrentPreciseEvidenceReuse(db, exact);
+    expect(outcome.reusedUnitIds).toEqual([]);
+    expect(outcome.refused).toHaveLength(5);
+    expect(await immutable(db)).toBe(before);
+    return;
+  }
+
+  await rollback(db, "withdraw selected points after discovery", async c => {
+    let discovered = false;
+    const input = new Proxy(c, { get(target, prop) {
+      if (prop === "execute") return async (query: Parameters<DB["execute"]>[0]) => {
+        const rows = await target.execute(query);
+        if (!discovered) {
+          // This is the actual exact-ID discovery SELECT. Change authority
+          // after its snapshot; the per-unit locked recheck decides each row.
+          expect(rows.map(r => String(r.unit_id)).sort()).toEqual([...ids].sort());
+          discovered = true;
+          await c.execute(sql`UPDATE results SET current_result_attempt_id=NULL WHERE current_result_attempt_id=${rawIds[0]}::uuid`);
+          await c.execute(sql`INSERT INTO result_review_verdicts(result_id,verdict,reviewer)
+            SELECT result_id,'defer','selected-point-withdrawal' FROM result_attempts WHERE id=${rawIds[1]}::uuid`);
+          const promise = randomUUID();
+          await c.execute(sql`INSERT INTO sync_sweep_promises(id,registered_solver_id,airfoil_id,simulation_preset_revision_id,aoa_count,"expiresAt")
+            SELECT ${promise}::uuid,${envelope.solverId}::uuid,airfoil_id,simulation_preset_revision_id,1,clock_timestamp()+interval '1 hour'
+            FROM result_attempts WHERE id=${rawIds[2]}::uuid`);
+          await c.execute(sql`INSERT INTO sync_sweep_promise_points(promise_id,airfoil_id,simulation_preset_revision_id,aoa_deg)
+            SELECT ${promise}::uuid,airfoil_id,simulation_preset_revision_id,aoa_deg FROM result_attempts WHERE id=${rawIds[2]}::uuid`);
+        }
+        return rows;
+      };
+      const value = Reflect.get(target, prop, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    } });
+    const outcome = await reconcileCurrentPreciseEvidenceReuse(input, exact);
+    expect(discovered).toBe(true);
+    expect(outcome.reusedUnitIds.sort()).toEqual(ids.slice(3).sort());
+    expect(outcome.refused.map(row => row.unitId).sort()).toEqual(ids.slice(0,3).sort());
+    expect((await states(c)).filter(row => row.credited).map(row => row.id)).toEqual(ids.slice(3));
+  });
+  await rollback(db, "later physically stopped execution still owns the unit", async c => {
+    await stoppedSuccessor(c, envelope, false);
+    const outcome = await reconcileCurrentPreciseEvidenceReuse(c, exact);
+    expect(outcome.reusedUnitIds).toEqual([]);
+    expect(outcome.refused).toHaveLength(ids.length);
+    expect((await states(c)).every(r => !r.credited)).toBe(true);
+  });
+  await rollback(db, "storage-only source is never unit credit", async c => {
+    await shadow(c,"progressive_remote_evidence_receipts");
+    await c.execute(sql`UPDATE progressive_remote_evidence_receipts SET storage_only=true WHERE result_attempt_id=${rawIds[0]}::uuid`);
+    const outcome = await reconcileCurrentPreciseEvidenceReuse(c,{...exact,unitIds:[ids[0]]});
+    expect(outcome.reusedUnitIds).toEqual([]);
+    expect(outcome.refused).toHaveLength(1);
+  });
+
+  // Verify the compact final report against its original archive member before
+  // crediting selected evidence under the unit and canonical locks.
+  await shadow(db, "progressive_remote_reports");
+  const anchor = await archiveReportFixture(db, "remote", job, 1);
+  const final = await archiveReportFixture(db, "remote", job, 2);
+  const inlineAttempts = { read: async () => { throw new Error("Raw fixture attempts are inline"); } };
+  let reads = 0;
+  installProgressiveReportArchiveReader({ read: async ({sequence}) => {
+    reads++;
+    if (sequence === 1) return anchor.text;
+    if (sequence === 2) return final.text;
+    throw new Error("Unexpected report sequence");
+  } });
+  try {
+    await rollback(db, "one withheld archive source does not block its siblings", async c => {
+      await shadow(c, "progressive_remote_evidence_receipts");
+      await c.execute(sql`UPDATE progressive_remote_evidence_receipts SET point_content_signature=${"0".repeat(64)}
+        WHERE result_attempt_id=${rawIds[0]}::uuid`);
+      const outcome = await withPreparedProgressiveRemoteRetention(c, job, inlineAttempts,
+        () => reconcileCurrentPreciseEvidenceReuse(c, exact), rawIds);
+      expect(outcome.reusedUnitIds.sort()).toEqual(ids.slice(1).sort());
+      expect(outcome.refused.map(row => row.unitId)).toEqual([ids[0]]);
+    });
+    await withPreparedProgressiveRemoteRetention(db, job, inlineAttempts, async () => {
+      const preparedReads = reads;
+      expect(preparedReads).toBeGreaterThan(0);
+      expect(await reconcileAcceptedProgressiveCfdEvidence(db, exact.campaignId)).toBe(5);
+      const links = await db.execute(sql`SELECT reuse.* FROM progressive_cfd_evidence_reuses reuse JOIN progressive_cfd_units u ON u.id=reuse.successor_unit_id
+        WHERE u.work_id=(SELECT work_id FROM progressive_cfd_units WHERE id=${ids[0]}::uuid) ORDER BY u.aoa_deg`);
+      expect(links).toHaveLength(5);
+      for (const [i,link] of links.entries()) {
+        const [receipt] = await db.execute(sql`SELECT evidence_signature FROM progressive_cfd_evidence WHERE result_attempt_id=${rawIds[i]}::uuid`);
+        expect(link).toMatchObject({successor_unit_id:ids[i],source_attempt_token:units[i].token,source_result_attempt_id:rawIds[i],
+          source_evidence_signature:receipt.evidence_signature,source_generation_id:envelope.scope.generationId,source_execution_recipe_id:envelope.scope.recipeId});
+      }
+      const replay = await reconcileCurrentPreciseEvidenceReuse(db,{...exact,unitIds:[...ids,...missing]});
+      expect(replay.reusedUnitIds).toEqual([]);
+      expect(replay.replayedUnitIds.sort()).toEqual([...ids].sort());
+      expect(replay.refused.map(r => r.unitId).sort()).toEqual([...missing].sort());
+      expect(await reconcileAcceptedProgressiveCfdEvidence(db,exact.campaignId)).toBe(0);
+      expect(await states(db)).toEqual(envelope.scope.units.map((u,i) => ({id:u.unitId,state:i<5?"complete":"pending",credited:rawIds[i]??null})));
+      await expect(readProgressiveRemoteRetention(db,job)).rejects.toThrow("whole-job retention");
+      await rollback(db, "withdrawal after credit refuses replay without rewriting its receipt", async c => {
+        await c.execute(sql`UPDATE results SET current_result_attempt_id=NULL WHERE current_result_attempt_id=${rawIds[0]}::uuid`);
+        const withdrawn = await reconcileCurrentPreciseEvidenceReuse(c, { ...exact, unitIds: [ids[0]] });
+        expect(withdrawn.replayedUnitIds).toEqual([]);
+        expect(withdrawn.reusedUnitIds).toEqual([]);
+        expect(withdrawn.refused).toHaveLength(1);
+        expect(await c.execute(sql`SELECT * FROM progressive_cfd_evidence_reuses WHERE successor_unit_id=${ids[0]}::uuid`)).toEqual([links[0]]);
+      });
+      expect(await db.execute(sql`SELECT status,"ingestedAt" FROM sim_jobs WHERE id=${job}::uuid`)).toEqual([{status:"cancelled",ingestedAt:null}]);
+      expect(await immutable(db)).toBe(before);
+      expect(reads).toBe(preparedReads);
+    }, rawIds);
+    const entire = await withPreparedProgressiveRemoteRetention(db, job, inlineAttempts, () => readProgressiveRemoteRetention(db, job));
+    expect(entire).toMatchObject({kind:"waiting",reason:"raw_evidence",pendingCount:2});
+  } finally {installProgressiveReportArchiveReader(null);}
+
+  // Drive the ordinary claimant. Only the three still-unresolved siblings can
+  // be issued, and the rollback leaves their original attempt histories intact.
+  await rollback(db,"do not re-execute completed selected angles",async c => {
+    const [unit] = await c.execute(sql`SELECT recipe,active_budget_seconds-active_seconds AS remaining FROM progressive_cfd_units WHERE id=${ids[0]}::uuid`);
+    const offered: string[] = [];
+    for (let n=0;n<=envelope.scope.units.length;n++) {
+      const lease=await claimProgressiveCfdUnit(c,{owner:"selected-precise-reuse",leaseSeconds:120,solverBudgetVersion:2,
+        localTimeStepVersion:1,sameTarget:{generationId:envelope.scope.generationId,targetId:envelope.scope.targetId,
+          recipe:unit.recipe as Record<string,unknown>,remainingActiveSeconds:Number(unit.remaining),recoveryParentJobId:null}});
+      if(!lease) break;
+      offered.push(lease.id);
+    }
+    expect(offered.sort()).toEqual([...missing].sort());
+  });
+  expect(await immutable(db)).toBe(before);
 }

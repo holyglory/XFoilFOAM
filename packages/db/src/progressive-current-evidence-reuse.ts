@@ -1,6 +1,10 @@
 import { attemptDigestColumns, matchesOriginalAttemptDigest } from "./attempt-evidence-digest";
 import { resolveStoredProgressiveReport } from "./progressive-report-reader";
-import { sql } from "drizzle-orm";
+import { is, sql } from "drizzle-orm";
+import { PgTransaction } from "drizzle-orm/pg-core";
+import { progressiveSolverIsTransient } from "@aerodb/core";
+import type { SimulationSetupSnapshot } from "./simulation-setup";
+import { precalcCellLockKey } from "./precalc-cell-lock";
 import type { DB } from "./client";
 import { analysisContentHash, canonicalAnalysisJson } from "./analysis-target";
 import { tryProgressiveAdmissionLock } from "./progressive-admission-lock";
@@ -8,8 +12,8 @@ import { effectiveProgressiveStageSql } from "./progressive-execution-policy";
 import { progressiveEvidencePreservesGeometry } from "./progressive-evidence-geometry";
 import { validateProgressiveExecutionStopProof } from "./progressive-cfd-settlement";
 import { verifyProgressiveRemoteExecution } from "./progressive-remote-execution";
-import { isFinalProgressiveRemoteReport, progressiveReportedPointSources, validateProgressiveRemoteReport } from "./progressive-remote-report";
-import { readProgressiveRemoteRetention } from "./progressive-remote-retention";
+import { isFinalProgressiveRemoteReport, validateProgressiveRemoteReport } from "./progressive-remote-report";
+import { progressiveRetentionReader, readSelectedPrecisePointSource, withPreparedProgressiveRemoteRetention } from "./progressive-remote-retention";
 import { resolveProgressiveRemoteEvidence } from "./progressive-remote-evidence";
 import { assertProgressiveRemoteEvidenceAttempt } from "./progressive-remote-evidence-receipts";
 import { assertProgressiveRemotePhysicalCase } from "./progressive-remote-point-projection";
@@ -39,7 +43,7 @@ export interface CurrentPreciseEvidenceReuseResult {
   refused: Array<{ unitId: string; reason: string }>;
 }
 
-type Candidate = { unit_id: string; result_attempt_id: string; campaign_id: string; epoch_id: string };
+type Candidate = { unit_id: string; sim_job_id: string; result_attempt_id: string; campaign_id: string; epoch_id: string };
 class ReuseRefused extends Error {}
 function requireProof(condition: unknown, reason: string): asserts condition {
   if (!condition) throw new ReuseRefused(reason);
@@ -52,6 +56,24 @@ async function authenticate<T>(read: () => T | Promise<T>): Promise<T> {
     if (!(error instanceof Error) || failure.code || failure.cause?.code || error.name !== "Error") throw error;
     throw new ReuseRefused(`Source authentication failed: ${error.message}`);
   }
+}
+
+// The signed original numerical request is checked again for RANS below.
+function preciseRegimeSql() {
+  return sql`((raw.regime='urans' AND raw.evidence_payload->>'fidelity'='urans_full') OR
+    (raw.regime='rans' AND raw.converged AND raw.stalled IS NOT TRUE AND raw.unsteady IS NOT TRUE
+      AND coalesce(raw.evidence_payload->>'fidelity','rans')='rans'))`;
+}
+
+function unreservedCellSql() {
+  return sql`NOT EXISTS (SELECT FROM sync_sweep_promise_points point
+    JOIN sync_sweep_promises promise ON promise.id=point.promise_id
+    WHERE point.airfoil_id=cell.airfoil_id AND point.simulation_preset_revision_id=cell.simulation_preset_revision_id
+      AND point.aoa_deg=cell.aoa_deg AND point.status='active' AND promise.status='active'
+      AND promise."expiresAt">clock_timestamp())
+    AND NOT EXISTS (SELECT FROM sim_precalc_obligations obligation WHERE obligation.airfoil_id=cell.airfoil_id
+      AND obligation.revision_id=cell.simulation_preset_revision_id AND obligation.aoa_deg=cell.aoa_deg
+      AND obligation.state IN ('pending','running','blocked'))`;
 }
 
 async function reuseCurrentUnit(db: DB, candidate: Candidate): Promise<"reused" | "replayed"> {
@@ -131,19 +153,28 @@ async function reuseCurrentUnit(db: DB, candidate: Candidate): Promise<"reused" 
     await connection.execute(sql`SELECT id FROM sim_jobs WHERE id IN (${sql.join(jobIds.map((id) => sql`${id}::uuid`), sql`, `)})
       ORDER BY id FOR UPDATE`);
     // Fresh statement after locking catches an owner/lease change while waiting.
-    const owners = await connection.execute(sql`SELECT id,status,"ingestedAt",request_payload,engine_job_id,ingest_lease_token,
+    const owners = await connection.execute(sql`SELECT id,status,engine_state,"ingestedAt",request_payload,engine_job_id,ingest_lease_token,
         ingest_lease_expires_at,ingest_lease_expires_at>clock_timestamp() AS ingest_live
       FROM sim_jobs WHERE id IN (${sql.join(jobIds.map((id) => sql`${id}::uuid`), sql`, `)})`);
     const assignments = await connection.execute(sql`SELECT dispatch.sim_job_id,dispatch.content_signature,dispatch.promise_id,dispatch.solver_id
       FROM progressive_remote_dispatches dispatch JOIN registered_remote_solvers solver ON solver.id=dispatch.solver_id AND solver.revoked_at IS NULL
       JOIN sync_sweep_promises promise ON promise.id=dispatch.promise_id AND promise.status<>'active'
       WHERE dispatch.sim_job_id IN (${sql.join(jobIds.map((id) => sql`${id}::uuid`), sql`, `)})
+        AND promise.registered_solver_id=dispatch.solver_id
       ORDER BY dispatch.sim_job_id FOR SHARE OF dispatch,solver,promise`);
     let sourceEnvelope: ReturnType<typeof verifyProgressiveRemoteExecution> | undefined;
+    let sourceStopSignature: unknown;
+    let sourceTerminalState: unknown;
+    let sourceRetired = false;
     for (const row of history) {
       const owner = owners.find((item) => item.id === row.job_id);
       const assignment = assignments.find((item) => item.sim_job_id === row.job_id);
-      requireProof(owner && ["done", "failed", "cancelled"].includes(String(owner.status)) && owner.ingestedAt != null &&
+      // Only the job which produced this exact point can still await siblings.
+      const retired = owner?.ingestedAt != null && ["done", "failed", "cancelled"].includes(String(owner.status));
+      const stoppedSource = owner && row.token === scope.token && owner.ingestedAt == null &&
+        ["ingesting", "done", "failed", "cancelled"].includes(String(owner.status)) &&
+        ["completed", "failed", "cancelled"].includes(String(owner.engine_state));
+      requireProof(owner && (retired || stoppedSource) &&
         assignment && assignment.content_signature === row.content_signature && assignment.promise_id === row.promise_id && assignment.solver_id === row.solver_id &&
         ["complete", "failed", "cancelled"].includes(String(row.outcome)) && row.finished_at != null &&
         !(owner.ingest_lease_token != null && (owner.ingest_live || owner.ingest_lease_expires_at == null)) &&
@@ -168,6 +199,9 @@ async function reuseCurrentUnit(db: DB, candidate: Candidate): Promise<"reused" 
         requireProof(row.execution_recipe_id === scope.execution_recipe_id && row.simulation_preset_revision_id === scope.execution_revision_id &&
           proof.ownership_basis !== "never_started_cancellation_fence", "source was not the exact physical execution");
         sourceEnvelope = envelope;
+        sourceStopSignature = row.proof_signature;
+        sourceTerminalState = owner.engine_state;
+        sourceRetired = retired;
       }
       if (row.later) {
         requireProof(row.outcome === "cancelled" && Number(row.active_seconds) === 0 && row.has_evidence === false &&
@@ -188,24 +222,38 @@ async function reuseCurrentUnit(db: DB, candidate: Candidate): Promise<"reused" 
     // Use try locks so a busy publisher/reviewer leaves this unit for a later pass.
     const method = await resolveRevisionMethodCompatibilityHash(connection, String(scope.execution_revision_id));
     requireProof(method, "numerical compatibility unavailable");
-    for (const key of [`polar-compatibility:${POLAR_COMPATIBILITY_VERSION}:${scope.airfoil_id}:${method}`,
+    for (const key of [precalcCellLockKey({
+      airfoilId: String(scope.airfoil_id), revisionId: String(scope.execution_revision_id), aoaDeg: Number(scope.aoa_deg),
+    }), `polar-compatibility:${POLAR_COMPATIBILITY_VERSION}:${scope.airfoil_id}:${method}`,
       `polar-revision:${scope.airfoil_id}:${scope.execution_revision_id}`, `result-evidence:${scope.result_id}`,
       `result-review-verdict:${scope.result_id}`]) {
       const [lock] = await connection.execute(sql`SELECT pg_try_advisory_xact_lock(hashtextextended(${key},0)) AS acquired`);
       requireProof(lock?.acquired === true, "canonical evidence busy");
     }
-    const [accepted] = await connection.execute(sql`SELECT raw.id FROM result_attempts raw
+    const [accepted] = await connection.execute(sql`SELECT raw.id,raw.regime FROM result_attempts raw
       JOIN results cell ON cell.id=raw.result_id AND cell.current_result_attempt_id=raw.id
         AND cell.airfoil_id=raw.airfoil_id AND cell.simulation_preset_revision_id=raw.simulation_preset_revision_id
         AND cell.aoa_deg=raw.aoa_deg AND cell.sim_job_id=raw.sim_job_id AND cell.status='done'
       JOIN result_classifications classification ON classification.result_attempt_id=raw.id AND classification.state='accepted'
       WHERE raw.id=${candidate.result_attempt_id}::uuid AND raw.result_id=${scope.result_id}::uuid
         AND raw.status='done' AND raw.source='solved' AND raw.valid_for_polar
-        AND raw.regime='urans' AND raw.evidence_payload->>'fidelity'='urans_full'
+        AND ${preciseRegimeSql()} AND ${unreservedCellSql()}
         AND NOT EXISTS(SELECT 1 FROM result_review_verdicts review WHERE review.result_id=cell.id
           AND review."revokedAt" IS NULL AND review.verdict IN ('exclude','defer'))
       FOR UPDATE OF cell FOR SHARE OF classification`);
-    requireProof(accepted, "selected canonical accepted full URANS changed");
+    requireProof(accepted, "selected accepted precise point changed or reserved");
+    if (accepted.regime === "rans") {
+      const solver = (scope.snapshot as SimulationSetupSnapshot).solver;
+      const request = sourceEnvelope.request.solver;
+      const selection = (scope.recipe as { selection?: { solver?: string } }).selection;
+      const family = solver.flowSolverFamily;
+      requireProof(family && ["simpleFoam", "rhoSimpleFoam", "rhoCentralFoam"].includes(family) &&
+        selection?.solver === family && request?.flow_solver_family === family && (request.force_transient === false || request.force_transient === undefined) &&
+        !await authenticate(() => progressiveSolverIsTransient(family, solver.timeCoordinate)) &&
+        (family !== "rhoCentralFoam" || (sourceEnvelope.request.expected_local_time_step_version === 1 &&
+          request.local_time_step_smoothing === solver.localTimeStepSmoothing)),
+      "RANS evidence requires its original signed steady request");
+    }
     const [currentGeometry] = await connection.execute(sql`SELECT points FROM airfoils WHERE id=${scope.airfoil_id}::uuid FOR SHARE`);
     requireProof(currentGeometry && canonicalAnalysisJson(currentGeometry.points) === canonicalAnalysisJson(scope.points), "geometry changed during reconciliation");
     const archives = await connection.execute(sql`SELECT archive.id FROM solver_evidence_archives archive
@@ -214,14 +262,15 @@ async function reuseCurrentUnit(db: DB, candidate: Candidate): Promise<"reused" 
       WHERE archive.result_attempt_id=${candidate.result_attempt_id}::uuid AND archive.result_id=${scope.result_id}::uuid AND archive.state='current'
       FOR SHARE OF archive,manifest`);
     requireProof(archives.length === 1, "current archive/manifest missing or ambiguous");
-    const retention = await authenticate(() => readProgressiveRemoteRetention(connection, String(scope.sim_job_id)));
-    requireProof(retention.kind === "retained", "source custody incomplete");
-    const retained = retention.sources.find((entry) => entry.resultAttemptId === candidate.result_attempt_id);
-    requireProof(retained && retained.archived && !retained.storageOnly && retention.report.result &&
-      progressiveReportedPointSources({ ...retention.report.result,
-        polars: retention.report.result.polars.map((polar) => ({ ...polar, attempts: [] })) })
-        .some((entry) => entry.contentSignature === retained.delivery.progressiveEvidence.pointContentSignature),
-    "source is not an archived final physical point");
+    const point = await authenticate(() => readSelectedPrecisePointSource(connection, String(scope.sim_job_id), candidate.result_attempt_id));
+    requireProof(point, "source is not an archived final physical point");
+    const finalStop = point.report.stopProof;
+    requireProof(point.report.assignmentSignature === sourceEnvelope.contentSignature && finalStop && finalStop.job_id === scope.sim_job_id &&
+      finalStop.ownership_basis !== "never_started_cancellation_fence" &&
+      ((sourceRetired && accepted.regime === "urans") ||
+        (analysisContentHash(finalStop) === sourceStopSignature && point.report.status.state === sourceTerminalState)),
+    "signed final report differs from the stopped source");
+    const retained = point.source;
     await authenticate(() => assertProgressiveRemoteEvidenceAttempt(connection, { ...retained.delivery, resultAttemptId: candidate.result_attempt_id }));
     const reported = await authenticate(() => resolveProgressiveRemoteEvidence(connection, retained.delivery));
     requireProof(reported, "source report unavailable");
@@ -265,7 +314,7 @@ export async function reconcileCurrentPreciseEvidenceReuse(
     cursor = scopes.get(key);
     if (!cursor) { cursor = {}; scopes.set(key, cursor); }
   }
-  const candidates = await db.execute(sql`SELECT DISTINCT unit.id AS unit_id,raw.id AS result_attempt_id,
+  const candidates = await db.execute(sql`SELECT DISTINCT unit.id AS unit_id,raw.id AS result_attempt_id,job.id AS sim_job_id,
       generation.campaign_id,generation.epoch_id
     FROM progressive_cfd_units unit JOIN progressive_work work ON work.id=unit.work_id
     JOIN progressive_generations generation ON generation.id=work.generation_id
@@ -285,11 +334,16 @@ export async function reconcileCurrentPreciseEvidenceReuse(
     JOIN result_classifications classification ON classification.result_attempt_id=raw.id AND classification.state='accepted'
     WHERE work.stage=3 AND generation.plan_revision_id=campaign.current_plan_revision_id AND NOT generation.benchmark_only
       AND generation.status IN ('active','complete') AND campaign.status IN ('active','attention','paused','completed')
-      AND raw.status='done' AND raw.valid_for_polar AND raw.regime='urans' AND raw.evidence_payload->>'fidelity'='urans_full'
+      AND raw.status='done' AND raw.source='solved' AND raw.valid_for_polar AND ${preciseRegimeSql()}
+      AND (raw.regime<>'rans' OR (job.request_payload#>>'{engineRequest,solver,flow_solver_family}'=recipe.recipe#>>'{selection,solver}'
+        AND coalesce(job.request_payload#>'{engineRequest,solver,force_transient}','false'::jsonb)='false'::jsonb))
       AND raw.sim_job_id=job.id AND raw.engine_job_id=job.id::text AND raw.aoa_deg=unit.aoa_deg
       AND raw.simulation_preset_revision_id=recipe.execution_revision_id
       AND attempt.outcome IN ('complete','failed','cancelled') AND attempt.finished_at IS NOT NULL
-      AND job.status IN ('done','failed','cancelled') AND job."ingestedAt" IS NOT NULL
+      AND ((job.status IN ('done','failed','cancelled') AND job."ingestedAt" IS NOT NULL)
+        OR (job.status IN ('ingesting','done','failed','cancelled') AND job."ingestedAt" IS NULL
+          AND job.engine_state IN ('completed','failed','cancelled')))
+      AND ${unreservedCellSql()}
       AND (job.ingest_lease_token IS NULL OR job.ingest_lease_expires_at<=clock_timestamp())
       AND NOT EXISTS(SELECT 1 FROM progressive_cfd_recovery_plans p WHERE p.unit_id=unit.id)
       AND NOT EXISTS(SELECT 1 FROM progressive_cfd_budget_extensions e WHERE e.unit_id=unit.id)
@@ -305,17 +359,31 @@ export async function reconcileCurrentPreciseEvidenceReuse(
       ${cursor?.after ? sql`AND (unit.id,raw.id)>(${cursor.after.unitId}::uuid,${cursor.after.resultAttemptId}::uuid)` : sql``}
     ORDER BY unit.id,raw.id LIMIT ${limit}`) as unknown as Candidate[];
   const result: CurrentPreciseEvidenceReuseResult = { reusedUnitIds: [], replayedUnitIds: [], refused: [] };
-  for (const candidate of candidates) {
-    // Advance on refusals too, including a hard error: the next maintenance
-    // pass must not restart at an unchanged corrupt or busy prefix.
-    if (cursor) cursor.after = { unitId: candidate.unit_id, resultAttemptId: candidate.result_attempt_id };
-    try {
-      const outcome = await reuseCurrentUnit(db, candidate);
-      (outcome === "reused" ? result.reusedUnitIds : result.replayedUnitIds).push(candidate.unit_id);
-    } catch (error) {
-      if (!(error instanceof ReuseRefused)) throw error;
-      result.refused.push({ unitId: candidate.unit_id, reason: error.message });
+  const reader = progressiveRetentionReader();
+  const visit = async (group: readonly Candidate[]) => {
+    for (const candidate of group) {
+      if (cursor) cursor.after = { unitId: candidate.unit_id, resultAttemptId: candidate.result_attempt_id };
+      try {
+        const outcome = await reuseCurrentUnit(db, candidate);
+        (outcome === "reused" ? result.reusedUnitIds : result.replayedUnitIds).push(candidate.unit_id);
+      } catch (error) {
+        if (!(error instanceof ReuseRefused)) throw error;
+        result.refused.push({ unitId: candidate.unit_id, reason: error.message });
+      }
     }
+  };
+  // Preserve cursor order and per-unit transactions. Adjacent candidates from
+  // the same job share cold source preparation outside admission/cache locks.
+  for (let start = 0; start < candidates.length;) {
+    const first = candidates[start];
+    let end = start + 1;
+    while (end < candidates.length && candidates[end].sim_job_id === first.sim_job_id) end++;
+    const group = candidates.slice(start, end);
+    if (cursor) cursor.after = { unitId: first.unit_id, resultAttemptId: first.result_attempt_id };
+    if (reader && !is(db, PgTransaction))
+      await withPreparedProgressiveRemoteRetention(db, first.sim_job_id, reader, () => visit(group), group.map(c => c.result_attempt_id));
+    else await visit(group);
+    start = end;
   }
   if (cursor && candidates.length < limit) delete cursor.after;
   for (const id of input.unitIds ?? []) if (!candidates.some((candidate) => candidate.unit_id.toLowerCase() === id.toLowerCase()))

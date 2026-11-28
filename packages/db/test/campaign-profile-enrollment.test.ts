@@ -5782,14 +5782,16 @@ describe("progressive CPU admission", () => {
     }, [32.1799]);
   }, 120_000);
 
-  it.each([false, true, "mixed stopped owners", "missing physical siblings"] as const)("retains exact stopped failed attempts without canonical publication (prior raw: %s)", async (priorRaw) => {
+  it.each([false, true, "mixed stopped owners", "missing physical siblings", "missing siblings in full URANS", "RANS labels on a transient request"] as const)("retains exact stopped failed attempts without canonical publication (prior raw: %s)", async (priorRaw) => {
     const mixed = priorRaw === "mixed stopped owners";
-    const incomplete = priorRaw === "missing physical siblings";
+    const fullUrans = priorRaw === "missing siblings in full URANS";
+    const nonsteady = priorRaw === "RANS labels on a transient request";
+    const incomplete = priorRaw === "missing physical siblings" || fullUrans || nonsteady;
     const angles = incomplete ? [3, 4, 5, 6, 7, 8, 9, 10] : mixed ? [-5, -4, -3, -2, -1, 0, 1, 2] : [-4, -3, -2, -1, 0, 1, 2];
     const verify = async (priorRaw: boolean) => {
       const prepared = priorRaw ? await cfdEvidenceFixture(
-        incomplete ? 166.281 : mixed ? 32.1861 : 32.1803, 3, [], angles, false, undefined, {}, angles.length, true,
-        false, 1, mixed ? { historicalTransient: true } : undefined,
+        fullUrans ? 450.281 : incomplete ? 166.281 : mixed ? 32.1861 : 32.1803, 3, [], angles, false, undefined, {}, angles.length, true,
+        false, 1, mixed || nonsteady ? { historicalTransient: true } : undefined,
       ) : null;
       const leases = prepared?.leases ?? await claimProgressiveCfdBatch(db, {
         owner: "stopped-failed-storage-fixture", leaseSeconds: 120,
@@ -5822,7 +5824,8 @@ describe("progressive CPU admission", () => {
           const { verifyHistoricalRawArchive } = await import("../../../apps/api/test/historical-raw-archive-fixture");
           await verifyHistoricalRawArchive(db, envelope);
         }
-        if (incomplete || mixed) await verifyCancelledAcceptedPublication(db, envelope, incomplete ? "incomplete" : "mixed");
+        if (incomplete || mixed) await verifyCancelledAcceptedPublication(db, envelope,
+          fullUrans ? "incomplete-urans" : nonsteady ? "nonsteady-rans" : incomplete ? "incomplete" : "mixed");
         else await (priorRaw ? verifyPriorRawStoppedProgressiveSettlement : verifyStoppedFailedProgressiveDelivery)(db, envelope);
       } finally {
         await db.update(sweeperState).set({ enabled: admission.enabled }).where(eq(sweeperState.id, 1));

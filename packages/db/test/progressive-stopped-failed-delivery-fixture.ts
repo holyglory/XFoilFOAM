@@ -771,9 +771,10 @@ export async function verifyDiagnosticOnlyPromotionRecovery(
   });
 }
 
-export async function verifyCancelledAcceptedPublication(db: DB, envelope: ProgressiveRemoteExecutionEnvelope, mode: "historical" | "mixed" | "incomplete" = "historical") {
+export async function verifyCancelledAcceptedPublication(db: DB, envelope: ProgressiveRemoteExecutionEnvelope, mode: "historical" | "mixed" | "incomplete" | "incomplete-urans" | "nonsteady-rans" = "historical") {
   const mixed = mode === "mixed";
-  const incomplete = mode === "incomplete";
+  const fullUrans = mode === "incomplete-urans";
+  const incomplete = mode === "incomplete" || fullUrans || mode === "nonsteady-rans";
   const variants = mode === "historical"
     ? (["urans_full", "urans_precalc"] as const).flatMap(incomingFidelity => [false, true].map(retired => ({ incomingFidelity, retired })))
     : [{ incomingFidelity: "urans_full" as const, retired: false }];
@@ -811,9 +812,13 @@ export async function verifyCancelledAcceptedPublication(db: DB, envelope: Progr
     polar.points = mixed ? [accepted, second, rejected] : [accepted];
     polar.attempts = mixed ? [] : [accepted, rejected, diagnostic];
     if (incomplete) {
-      expect(envelope.request.solver?.flow_solver_family).toBe("rhoSimpleFoam");
+      expect(envelope.request.solver).toMatchObject({
+        flow_solver_family: mode === "incomplete" ? "rhoSimpleFoam" : "rhoPimpleFoam",
+        force_transient: mode !== "incomplete",
+      });
       polar.points = envelope.scope.units.slice(0, 5).map(({ alpha }) => ({
-        ...acceptedWithoutHistory, aoa_deg: alpha, case_slug: `accepted-rans-${alpha}`, unsteady: false, fidelity: "rans",
+        ...(fullUrans ? accepted : acceptedWithoutHistory), aoa_deg: alpha, case_slug: `accepted-precise-${alpha}`,
+        unsteady: fullUrans, fidelity: fullUrans ? "urans_full" : "rans",
       }));
       polar.attempts = [...polar.points];
     }
@@ -857,7 +862,8 @@ export async function verifyCancelledAcceptedPublication(db: DB, envelope: Progr
         sha256: "a".repeat(64), byteSize: 1 });
     }
     const classify = () => refreshPolarClassificationsForJob(connection, String(job.airfoil_id), String(job.simulation_preset_revision_id), executionId);
-    if (!incomplete) await storeFixtureVideo(raw.id);
+    if (fullUrans) { for (const id of ids) await storeFixtureVideo(id); }
+    else if (!incomplete) await storeFixtureVideo(raw.id);
     await classify();
     if (mixed) {
       const [beforeVideo] = await connection.execute(sql`SELECT state,reasons FROM result_classifications WHERE result_attempt_id=${ids[1]}::uuid`);
@@ -888,6 +894,8 @@ export async function verifyCancelledAcceptedPublication(db: DB, envelope: Progr
     await applyProgressiveRemoteProgress(connection, executionId);
     if (incomplete) {
       await verifyIncompleteStoppedPublication(connection, envelope, ids);
+      const { verifySelectedIncompleteUnitReuse } = await import("./progressive-current-evidence-reuse-fixture");
+      await verifySelectedIncompleteUnitReuse(connection, envelope, ids, mode !== "nonsteady-rans");
       return;
     }
     if (mixed) {

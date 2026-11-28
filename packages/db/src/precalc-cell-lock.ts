@@ -9,6 +9,10 @@ export interface PrecalcCellLockKey {
   aoaDeg: number;
 }
 
+export function precalcCellLockKey(cell: PrecalcCellLockKey): string {
+  return `precalc-cell:${cell.airfoilId}:${cell.revisionId}:${canonicalAoa(cell.aoaDeg)}`;
+}
+
 type CellLockClient = Pick<DB, "execute">;
 
 /**
@@ -24,14 +28,7 @@ export async function lockPrecalcCells(
   tx: CellLockClient,
   cells: PrecalcCellLockKey[],
 ): Promise<void> {
-  const keys = [
-    ...new Set(
-      cells.map(
-        (cell) =>
-          `precalc-cell:${cell.airfoilId}:${cell.revisionId}:${canonicalAoa(cell.aoaDeg)}`,
-      ),
-    ),
-  ].sort();
+  const keys = [...new Set(cells.map(precalcCellLockKey))].sort();
   if (!keys.length) return;
   const keyArray = sql`ARRAY[${sql.join(
     keys.map((key) => sql`${key}`),
