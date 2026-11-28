@@ -422,6 +422,24 @@ def test_pipeline_march_marker_uses_remaining_physical_case_budget(
         def write_transient(self, *_a, **_k) -> None:
             pass
 
+    providers = []
+    original_monitor = pipeline._make_urans_monitor
+
+    def make_monitor(*args, **kwargs):
+        provider = kwargs["solver_active_seconds"]
+        assert callable(provider)
+        providers.append(provider)
+        return original_monitor(*args, **kwargs)
+
+    def observe_live_duration():
+        value = providers[-1]()
+        if budgeted:
+            assert value is not None and value >= 0.0
+        else:
+            assert value is None
+
+    monkeypatch.setattr(pipeline, "_make_urans_monitor", make_monitor)
+
     class InnerRunner:
         external_paths_visible = False
         settings = SimpleNamespace(
@@ -431,6 +449,7 @@ def test_pipeline_march_marker_uses_remaining_physical_case_budget(
 
         def solver(self, case_dir, app, *_args, **_kwargs):
             commands.append(app)
+            observe_live_duration()
             raise InfrastructureError("budget-marker launch probe")
 
         def application(self, case_dir, command, **_kwargs):
@@ -439,6 +458,7 @@ def test_pipeline_march_marker_uses_remaining_physical_case_budget(
 
         def run(self, case_dir, command, **_kwargs):
             commands.append(command)
+            observe_live_duration()
             raise InfrastructureError("budget-marker launch probe")
 
     monkeypatch.setattr(pipeline, "CaseBuilder", FakeCaseBuilder)
@@ -472,6 +492,7 @@ def test_pipeline_march_marker_uses_remaining_physical_case_budget(
     if budgeted and n_proc > 1:
         expected = f"mpirun --allow-run-as-root --bind-to none --use-hwthread-cpus -np {n_proc} {expected} -parallel"
     assert commands == [expected]
+    assert len(providers) == 1
     assert pipeline.update_march_budget_target(tcase, 0.5)
     updated = read_march_budget_marker(tcase)
     assert updated == {**marker, "end_t": 0.5}

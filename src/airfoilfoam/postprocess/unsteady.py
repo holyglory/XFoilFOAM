@@ -10,11 +10,14 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 import math
 from pathlib import Path
-from typing import Sequence
+from typing import TYPE_CHECKING, Sequence
 
 import numpy as np
 
 from .forces import OSCILLATING_AMPLITUDE_GROWTH_MAX, _data_rows
+
+if TYPE_CHECKING:
+    from .live_coefficients import LiveCoefficientReader
 
 
 @dataclass
@@ -1121,6 +1124,8 @@ def stable_two_period_window(
     mean_drift_tolerance: float = 0.12,
     alpha_deg: float | None = None,
     section_thickness_ratio: float | None = None,
+    *,
+    live_reader: LiveCoefficientReader | None = None,
 ) -> StablePeriodResult:
     """Return a live-cadence candidate when the final two periods are repeatable.
 
@@ -1147,7 +1152,8 @@ def stable_two_period_window(
         # The first segment is the trajectory origin, not a continuation seam.
         restart_boundaries = tuple(sorted(starts)[1:])
     try:
-        t, cl, cd, cm = _coefficient_series(path)
+        cached = live_reader.read(path) if live_reader is not None else None
+        t, cl, cd, cm = _coefficient_series(path) if cached is None else cached
     except Exception as exc:  # noqa: BLE001 - in-flight coefficient file may be incomplete
         return StablePeriodResult(ok=False, reason=f"coefficient history unavailable: {exc}")
     if t.size < max(16, min_samples_per_cycle * 2):

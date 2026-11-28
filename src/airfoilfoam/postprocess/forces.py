@@ -1,6 +1,7 @@
 """Parse OpenFOAM forceCoeffs and yPlus function-object output."""
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 import math
 from pathlib import Path
@@ -19,9 +20,13 @@ class ForceCoefficients:
 
 
 def _data_rows(path: Path) -> tuple[list[str], list[list[float]]]:
+    return _data_lines(path.read_text().splitlines())
+
+
+def _data_lines(lines: Iterable[str]) -> tuple[list[str], list[list[float]]]:
     header: list[str] = []
     rows: list[list[float]] = []
-    for line in path.read_text().splitlines():
+    for line in lines:
         line = line.strip()
         if not line:
             continue

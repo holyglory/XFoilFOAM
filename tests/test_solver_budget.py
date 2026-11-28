@@ -10,6 +10,7 @@ from airfoilfoam.openfoam.budget import (
     BudgetedRunner,
     begin_case_budget,
     case_solver_seconds,
+    case_solver_active_seconds,
     case_solver_remaining_seconds,
     case_solver_budget,
     register_case_budget,
@@ -153,11 +154,16 @@ def test_live_measurement_does_not_wait_for_the_active_solver(monkeypatch, tmp_p
             assert observed == [{"chord": 1.0, "speed": 30.0, "aoa_deg": 0.0,
                                  "solver_active_seconds": 4.25, "limit_seconds": 10.0, "solver_running": True}]
             assert runner.consumed(case()) == 0
+            assert case_solver_active_seconds(runner, case()) == observed[0]["solver_active_seconds"]
+            assert case_solver_active_seconds(runner, case(1)) is None
+            assert case_solver_active_seconds(runner.inner, case()) is None
         finally:
             release.set()
         assert solver.result(timeout=2).ok
     assert runner.snapshot()[0] == {**observed[0], "solver_running": False}
     assert runner.consumed(case()) == 4.25
+    clock["now"] += 7200  # Idle/postprocessing time does not count.
+    assert case_solver_active_seconds(runner, case()) == 4.25
 
 
 def test_register_case_publishes_budget_without_claiming_solver_thread(budget, tmp_path):
@@ -182,6 +188,7 @@ def test_mpi_only_charges_solver_not_mesh_decomposition_or_reconstruction(budget
     result = runner.solver(tmp_path, "rhoPimpleFoam", 4, restart=True, monitor=monitor)
     assert result.ok
     assert runner.consumed(case()) == 4
+    assert case_solver_active_seconds(runner, case()) == 4  # Not four ranks * 4 s.
     assert inner.commands == [
         ("decomposePar -latestTime -force", 7200, None),
         ("mpirun --allow-run-as-root --bind-to none --use-hwthread-cpus -np 4 rhoPimpleFoam -parallel", 10, monitor),
@@ -243,9 +250,76 @@ def test_legacy_runner_remains_unbudgeted(budget, tmp_path):
     inner = budget[1]
     begin_case_budget(inner, case())
     assert case_solver_seconds(inner, case()) is None
+    assert case_solver_active_seconds(inner, case()) is None
     assert inner.solver(tmp_path, "simpleFoam", 1, timeout=42).ok
     assert inner.commands[0][1] == 42
     assert ResourceParams().case_solver_budget_seconds is None
+
+
+def test_monitor_waits_for_one_active_case_hour_across_solver_passes(tmp_path, monkeypatch):
+    """Exercise the actual budget wrapper and monitor; no native solver starts."""
+    from airfoilfoam import pipeline
+    from airfoilfoam.postprocess import live_coefficients
+
+    clock = Clock()
+    monkeypatch.setattr("airfoilfoam.openfoam.budget.time.monotonic", clock.now)
+    current = case()
+    readers, observed_seconds, probes, constructed = [], [], [], []
+
+    class PollingRunner(TimedRunner):
+        def run(self, case_dir, command, timeout=7200, monitor=None):
+            if monitor is None:
+                return super().run(case_dir, command, timeout, monitor)
+            self.commands.append((command, timeout, monitor))
+            started = clock.now()
+            for offset in (1799.999, 1800.0, 1810.0):
+                clock.local.elapsed = started + offset
+                observed_seconds.append(case_solver_active_seconds(runner, current))
+                monitor()
+            return RunResult(command, 0, "isolated monitor replay")
+
+    inner = PollingRunner(clock)
+    runner = BudgetedRunner(inner, 7200)
+    runner.begin_case(current)
+    inner.duration = 1800
+    runner.solver(tmp_path, "simpleFoam", 1)
+    runner.begin_case(case(1))
+    inner.duration = 4000  # A long sibling must not qualify the current angle.
+    runner.solver(tmp_path, "simpleFoam", 1)
+    clock.advance(86400)
+    runner.begin_case(current)
+    assert case_solver_active_seconds(runner, current) == 1800
+    tcase = tmp_path / "transient"
+    tcase.mkdir()
+    monkeypatch.setattr(pipeline, "_transient_coeff_selection", lambda *_a: [tcase / "coefficient.dat"])
+
+    def window(*_args, **kwargs):
+        readers.append(kwargs.get("live_reader"))
+        return pipeline.StablePeriodResult(ok=False, reason="isolated unsettled history")
+
+    original_reader = live_coefficients.LiveCoefficientReader
+
+    def new_reader():
+        reader = original_reader()
+        constructed.append(reader)
+        return reader
+
+    def active():
+        value = case_solver_active_seconds(runner, current)
+        probes.append(value)
+        return value
+
+    monkeypatch.setattr(pipeline, "stable_two_period_window", window)
+    monkeypatch.setattr(live_coefficients, "LiveCoefficientReader", new_reader)
+    monitor = pipeline._make_urans_monitor(tcase, current, solver_active_seconds=active)
+    assert constructed == []
+    runner.solver(tcase, "pimpleFoam", 4, monitor=monitor)
+    assert observed_seconds == pytest.approx([3599.999, 3600, 3610])
+    assert probes == pytest.approx([3599.999, 3600])
+    assert len(constructed) == 1
+    assert readers == [None, constructed[0], constructed[0]]
+    assert case_solver_active_seconds(runner, current) == 3610
+    assert case_solver_active_seconds(runner, case(1)) == 4000
 
 
 def test_distinct_allocations_preserve_fresh_budget_and_shared_recovery_ownership(budget, tmp_path):
