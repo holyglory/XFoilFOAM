@@ -37,6 +37,7 @@ import { applyProgressiveRemoteProgress } from "../../../apps/sweeper/src/progre
 import { settleProgressiveRemoteJob, promoteRetainedProgressiveAttempts } from "../../../apps/sweeper/src/progressive-remote-settlement";
 import { progressiveSettlementJobsSql } from "../../../apps/sweeper/src/progressive-progress-selection";
 import { buildProgressiveFitRequest } from "../../../apps/sweeper/src/progressive-fitting";
+import { requeueExpiredProgressiveDeliveries } from "../../../apps/sweeper/src/progressive-expired-evidence-retry";
 import { deliverNextProgressiveWorkerEvidence } from "../../../apps/sweeper/src/progressive-worker-evidence-delivery";
 import { resolveEngineRuntimeBuild } from "../../../apps/api/src/engine-provenance";
 
@@ -1642,8 +1643,10 @@ export async function verifyStoppedFailedProgressiveDelivery(
 }
 
 async function verifyLegacyClosedProgressiveStorage(db: DB, envelope: ProgressiveRemoteExecutionEnvelope) {
-  for (const variant of ["failed", "untyped-failed", "accepted"] as const) {
+  for (const variant of ["failed", "untyped-failed", "accepted", "expired-unconverged"] as const) {
     const accepted = variant === "accepted";
+    const expired = variant === "expired-unconverged";
+    const measured = accepted || expired;
     await withRollbackFixture(db, `Restore legacy closed storage ${variant}`, async (transaction) => {
       const connection = transaction as unknown as DB;
       const executionId = envelope.scope.executionId;
@@ -1655,12 +1658,19 @@ async function verifyLegacyClosedProgressiveStorage(db: DB, envelope: Progressiv
         WHERE job.id=${executionId}::uuid`);
       result.polars[0].reynolds = Number((job.snapshot as { derived: { reynolds: number } }).derived.reynolds);
       const point = result.polars[0].attempts![0];
-      point.cl = accepted ? 0.4 : null;
-      point.cd = accepted ? 0.03 : null;
-      point.cm = accepted ? 0 : null;
+      point.cl = measured ? 0.4 : null;
+      point.cd = measured ? 0.03 : null;
+      point.cm = measured ? 0 : null;
       point.converged = accepted;
-      point.error = accepted ? null : "Retained physical failure from cancelled assignment";
-      if (accepted || variant === "untyped-failed") delete point.failure_disposition;
+      point.error = measured ? null : "Retained physical failure from cancelled assignment";
+      if (measured || variant === "untyped-failed") delete point.failure_disposition;
+      if (expired) {
+        point.solver_active_seconds = 371;
+        point.force_history = {
+          t: [0, 0.1, 0.2, 0.3], cl: [0.38, 0.41, 0.39, 0.4],
+          cd: [0.029, 0.031, 0.03, 0.03], cm: [0, 0, 0, 0], samples: 4,
+        };
+      }
       const report: ProgressiveRemoteReport = {
         version: 1, solverId: envelope.solverId, promiseId: envelope.promiseId, executionId,
         assignmentSignature: envelope.contentSignature, sequence: 1,
@@ -1694,7 +1704,7 @@ async function verifyLegacyClosedProgressiveStorage(db: DB, envelope: Progressiv
       expect(before.some((unit) => unit.token === newerToken && unit.outcome === "running")).toBe(true);
       const source = progressiveReportedPointSources(result)[0];
       const projection = progressiveRemotePointProjection({ ...source, envelope, report });
-      expect(projection.status).toBe(accepted ? "done" : "failed");
+      expect(projection.status).toBe(measured ? "done" : "failed");
       if (variant === "untyped-failed") expect(projection.evidencePayload.failure_disposition ?? null).toBeNull();
       const [cell] = await connection.execute(sql`SELECT id,status,current_result_attempt_id FROM results
         WHERE airfoil_id=${job.airfoil_id}::uuid AND simulation_preset_revision_id=${job.simulation_preset_revision_id}::uuid
@@ -1708,7 +1718,8 @@ async function verifyLegacyClosedProgressiveStorage(db: DB, envelope: Progressiv
       await connection.execute(sql`UPDATE sync_api_permissions SET can_push=true WHERE data_type IN('polars','sweeps')`);
       await connection.execute(sql`UPDATE registered_remote_solvers SET auth_token_hash=${createHash("sha256").update(token).digest("hex")}
         WHERE id=${envelope.solverId}::uuid`);
-      await connection.execute(sql`UPDATE sync_sweep_promises SET status='cancelled',source_base_url=${baseUrl},
+      await connection.execute(sql`UPDATE sync_sweep_promises SET status=${expired ? "expired" : "cancelled"}::sync_promise_status,
+        "expiresAt"=CASE WHEN ${expired} THEN clock_timestamp()-interval '1 hour' ELSE "expiresAt" END,source_base_url=${baseUrl},
         source_instance_id=${solver.instance_id},
         request_payload=coalesce(request_payload,'{}'::jsonb)||${JSON.stringify({ solverId: envelope.solverId, executionContract: "progressive-cfd-v1" })}::jsonb
         WHERE id=${envelope.promiseId}::uuid`);
@@ -1779,6 +1790,14 @@ async function verifyLegacyClosedProgressiveStorage(db: DB, envelope: Progressiv
           }
         });
         paths.length = 0;
+        if (expired) {
+          await connection.execute(sql`INSERT INTO progressive_worker_delivery_failures
+            (sim_job_id,sequence,result_attempt_id,point_content_signature,state,attempt_count,last_http_status,last_error)
+            VALUES(${executionId}::uuid,${queued.sequence},${raw.id}::uuid,${source.contentSignature},'conflict',1,409,
+              'Progressive evidence delivery failed (409): progressive_scope_closed Obsolete or settled progressive CFD execution scope')`);
+          expect(await requeueExpiredProgressiveDeliveries(connection)).toBe(1);
+          expect(await requeueExpiredProgressiveDeliveries(connection)).toBe(0);
+        }
         expect(await deliverNextProgressiveWorkerEvidence(connection, fetcher)).toBe(true);
         expect(paths).toEqual(["/api/sync/v1/polars", "/api/sync/v1/retained-progressive-evidence"]);
         const [stored] = await connection.execute(sql`SELECT receipt FROM progressive_worker_hub_receipts
@@ -1788,6 +1807,12 @@ async function verifyLegacyClosedProgressiveStorage(db: DB, envelope: Progressiv
         const replay = await app.inject({ method: "POST", url: "/api/sync/v1/retained-progressive-evidence", headers, payload });
         expect(replay.statusCode, replay.body).toBe(200);
         expect(replay.json().progressiveEvidenceReceipts[0]).toEqual(stored.receipt);
+        if (expired) {
+          const [original] = await connection.execute(sql`SELECT status, valid_for_polar, converged, cl, cd, cm, evidence_payload
+            FROM result_attempts WHERE id=${(stored.receipt as {resultAttemptId: string}).resultAttemptId}::uuid`);
+          expect(original).toMatchObject({ status: "done", valid_for_polar: false, converged: false, cl: 0.4, cd: 0.03, cm: 0 });
+          expect(original.evidence_payload).toMatchObject({ solver_active_seconds: 371, force_history: point.force_history });
+        }
         expect(await connection.select().from(resultAttempts).where(eq(resultAttempts.id, raw.id))).toEqual([raw]);
         expect(await deliverNextProgressiveWorkerEvidence(connection, fetcher)).toBe(false);
         expect(await connection.execute(sql`SELECT evidence.result_attempt_id FROM progressive_cfd_evidence evidence
@@ -1806,7 +1831,7 @@ async function verifyLegacyClosedProgressiveStorage(db: DB, envelope: Progressiv
         WHERE attempt.sim_job_id=${executionId}::uuid AND classification.state='accepted'`)).toHaveLength(0);
       expect(await connection.execute(sql`SELECT result_id,result_attempt_id FROM sync_sweep_promise_points
         WHERE promise_id=${envelope.promiseId}::uuid AND (result_id IS NOT NULL OR result_attempt_id IS NOT NULL)`)).toHaveLength(0);
-      expect(await connection.execute(sql`SELECT status FROM sync_sweep_promises WHERE id=${envelope.promiseId}::uuid`)).toEqual([{ status: "cancelled" }]);
+      expect(await connection.execute(sql`SELECT status FROM sync_sweep_promises WHERE id=${envelope.promiseId}::uuid`)).toEqual([{ status: expired ? "expired" : "cancelled" }]);
     });
   }
 }
