@@ -250,10 +250,13 @@ function startScan(m: Mirror, diagnostics: TerminalDiagnostics) {
     required: new Set<string>(),
     verified: new Set<string>(),
     hash: createHash("sha256"),
+    proof: null as string | null,
   };
 }
 type Scan = ReturnType<typeof startScan>;
 const scans = new WeakMap<DB, Scan>();
+const namedScans = new WeakMap<DB, Map<string, Scan>>();
+const pending = new WeakSet<DB>();
 function isUnstartedReport(
   value: unknown,
   signature: unknown,
@@ -282,7 +285,14 @@ function isUnstartedReport(
     return false;
   }
 }
-async function evidenceProof(db: DB, m: Mirror, scan: Scan, pageLimit: number) {
+async function evidenceProof(
+  db: DB,
+  m: Mirror,
+  scan: Scan,
+  pageLimit: number,
+  deadline = Infinity,
+) {
+  if (scan.proof) return scan.proof;
   const { anchors, required, verified, hash } = scan;
   const unstartedReport =
     m.engineJobId === null
@@ -290,6 +300,7 @@ async function evidenceProof(db: DB, m: Mirror, scan: Scan, pageLimit: number) {
         AND p.report->'result'='null'::jsonb THEN p.report END`
       : sql`NULL::jsonb`;
   for (let page = 0; scan.after < m.sequence && page < pageLimit; page++) {
+    if (Date.now() >= deadline) return "checking";
     const rows = await db.execute(sql`WITH page AS MATERIALIZED (
       SELECT r.sim_job_id,r.sequence,r.report,r.content_signature,r.assignment_signature,r.archive_bundle_id,r.result_payload_hash,
         e.content_signature AS staged_signature,links.points IS NOT NULL AS point_anchor,encode(${reportStamp},'hex') AS stamp
@@ -354,6 +365,7 @@ async function evidenceProof(db: DB, m: Mirror, scan: Scan, pageLimit: number) {
   let checked = 0;
   for (const key of required) {
     if (verified.has(key)) continue;
+    if (Date.now() >= deadline) return "checking";
     if (checked >= pageLimit) return "checking";
     const anchor = anchors.get(key);
     if (!anchor) return null;
@@ -383,7 +395,8 @@ async function evidenceProof(db: DB, m: Mirror, scan: Scan, pageLimit: number) {
     verified.add(key);
     checked++;
   }
-  return hash.digest("hex");
+  scan.proof = hash.digest("hex");
+  return scan.proof;
 }
 
 const binding = (
@@ -396,13 +409,14 @@ const binding = (
   AND j.request_payload->'remoteProgressiveExecution'=${JSON.stringify(m.envelope)}::jsonb
   AND j.status=${m.status} AND j.engine_state=${m.engine}`;
 
-export async function reconcileTerminalProgressiveMirror(
+async function reconcileTerminalMirror(
   db: DB,
   options: {
     promiseId?: string;
     preview?: boolean;
     waitForCapacity?: boolean;
     fetcher?: typeof fetch;
+    bounded?: boolean;
   } = {},
 ) {
   if (configuredDeploymentRole() !== "remote-solver")
@@ -411,16 +425,36 @@ export async function reconcileTerminalProgressiveMirror(
     throw new Error("Invalid progressive promise ID");
   // The existing single-flight transfer pass advances a bounded page budget.
   // An explicit execution of the same operation can finish one named promise.
-  const previous = options.promiseId ? undefined : scans.get(db);
-  if (previous) scans.delete(db);
+  const named = options.bounded && options.promiseId ? options.promiseId : null;
+  const cache = namedScans.get(db) ?? new Map<string, Scan>();
+  const previous = named
+    ? cache.get(named)
+    : options.promiseId
+      ? undefined
+      : scans.get(db);
+  if (previous && !named) scans.delete(db);
+  const deadline = options.bounded ? Date.now() + 15_000 : Infinity;
   const m = await candidate(db, options.promiseId ?? previous?.promiseId);
-  if (!m) return { outcome: "no-candidate" } as const;
+  if (!m) {
+    if (named) cache.delete(named);
+    return { outcome: "no-candidate" } as const;
+  }
   const identity = {
     promiseId: m.id,
     executionId: m.execution,
     sequence: m.sequence,
   };
-  const fetcher = options.fetcher ?? fetch;
+  const transport = options.fetcher ?? fetch;
+  const signal = options.bounded ? AbortSignal.timeout(15_000) : null;
+  const fetcher: typeof fetch = signal
+    ? (url, init) =>
+        transport(url, {
+          ...init,
+          signal: init?.signal
+            ? AbortSignal.any([signal, init.signal])
+            : signal,
+        })
+    : transport;
   const resume =
     previous?.final === m.finalSignature &&
     previous.signature === m.signature &&
@@ -430,7 +464,7 @@ export async function reconcileTerminalProgressiveMirror(
   // An automatic pass probes the owner before starting a historical scan. A
   // specifically named operation always fetches the owner immediately after
   // the proof and before the write, without duplicating the initial GET.
-  if (!resume && !options.promiseId) {
+  if (!resume && (!options.promiseId || options.bounded)) {
     const now = Date.now();
     const recent = nextInspection.get(db) ?? new Map<string, number>();
     for (const [key, until] of recent) if (until <= now) recent.delete(key);
@@ -455,17 +489,27 @@ export async function reconcileTerminalProgressiveMirror(
   );
   if (!ready) return { ...identity, outcome: "unsettled" } as const;
   const scan = resume ? previous : startScan(m, diagnostics);
+  if (named) {
+    if (!cache.has(named) && cache.size >= 64)
+      cache.delete(cache.keys().next().value!);
+    cache.set(named, scan);
+    namedScans.set(db, cache);
+  }
   const proof = await evidenceProof(
     db,
     m,
     scan,
-    options.promiseId ? Infinity : 2,
+    options.promiseId && !options.bounded ? Infinity : 2,
+    deadline,
   );
   if (proof === "checking") {
-    scans.set(db, scan);
+    if (!named) scans.set(db, scan);
     return { ...identity, outcome: "checking" } as const;
   }
-  if (!proof) return { ...identity, outcome: "unsettled-reports" } as const;
+  if (!proof) {
+    if (named) cache.delete(named);
+    return { ...identity, outcome: "unsettled-reports" } as const;
+  }
   let remote = await cancelledAtHub(m, fetcher, diagnostics.signature);
   // Under hub admission pressure, retain the in-memory proof during a
   // bounded named operation. Re-read the hub and rebind every local row
@@ -474,6 +518,7 @@ export async function reconcileTerminalProgressiveMirror(
     let retry = 0;
     options.promiseId &&
     options.waitForCapacity &&
+    !options.bounded &&
     remote.httpStatus === 503 &&
     retry < 2;
     retry++
@@ -537,5 +582,19 @@ export async function reconcileTerminalProgressiveMirror(
       WHERE promise_id=${m.id}::uuid AND status='active'`);
     return "reconciled";
   });
+  if (named) cache.delete(named);
   return { ...identity, ...evidence, outcome };
+}
+
+export async function reconcileTerminalProgressiveMirror(
+  ...args: Parameters<typeof reconcileTerminalMirror>
+) {
+  const [db] = args;
+  if (pending.has(db)) return { outcome: "busy" } as const;
+  pending.add(db);
+  try {
+    return await reconcileTerminalMirror(...args);
+  } finally {
+    pending.delete(db);
+  }
 }

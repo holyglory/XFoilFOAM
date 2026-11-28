@@ -200,6 +200,54 @@ export async function verifyProgressiveAssignmentIntake(
       scope: { ...envelope.scope, executionId: importedExecutionId },
       request: { ...envelope.request, execution_id: importedExecutionId },
     });
+    const recoveryQueries: URL[] = [];
+    const recoveryFetcher: typeof fetch = async (input, options) => {
+      const url = new URL(String(input));
+      if (url.pathname.endsWith("/progressive-executions")) {
+        recoveryQueries.push(url);
+        expect(url.searchParams.get("limit")).toBe("4");
+        expect(url.searchParams.get("expiredPending")).toBe("true");
+        const offset = url.searchParams.has("after") ? 4 : 0;
+        const items = assignments
+          .slice(offset, Math.min(offset + 4, 6))
+          .map((item) => ({
+            executionId: item.scope.executionId,
+            promiseId: item.promiseId,
+            contentSignature: item.contentSignature,
+            createdAt: createdAtByExecutionId.get(item.scope.executionId),
+          }));
+        return Response.json({
+          items,
+          cycleStartedAt: new Date(Date.UTC(2026, 0, 1, 0, 1)).toISOString(),
+          nextCursor: offset === 0 ? items.at(-1)!.executionId : null,
+          nextCreatedAt: offset === 0 ? items.at(-1)!.createdAt : null,
+        });
+      }
+      // One refusal must not monopolize subsequent bounded recovery pages.
+      if (url.pathname.endsWith(assignments[0]!.scope.executionId))
+        return Response.json({ error: "retained refusal" }, { status: 409 });
+      const response = await fetcher(input, options);
+      const body = await response.json();
+      body.assignment.executionStopped = true;
+      return Response.json(body);
+    };
+    const normalCursor = await readCursor();
+    for (const expectedSeen of [4, 2, 4]) {
+      const receipt = await receiveProgressiveAssignmentPage(
+        db,
+        receive,
+        recoveryFetcher,
+        { expiredPending: true },
+      );
+      expect(receipt.seen).toBe(expectedSeen);
+      expect(receipt.errors).toHaveLength(expectedSeen === 4 ? 1 : 0);
+      expect(await readCursor()).toEqual(normalCursor);
+    }
+    expect(recoveryQueries[0]!.searchParams.has("after")).toBe(false);
+    expect(recoveryQueries[1]!.searchParams.get("after")).toBe(
+      assignments[3]!.scope.executionId,
+    );
+    expect(recoveryQueries[2]!.searchParams.has("after")).toBe(false);
     const proof = {
       version: 1,
       job_id: importedExecutionId,

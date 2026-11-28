@@ -7191,6 +7191,7 @@ export async function registerSyncRoutes(app: FastifyInstance): Promise<void> {
         afterCreatedAt: z.string().datetime().optional(),
         beforeCreatedAt: z.string().datetime().optional(),
         limit: z.coerce.number().int().min(1).max(50).optional(),
+        expiredPending: z.literal("true").optional(),
       })
       .strict()
       .safeParse(req.query);
@@ -7198,9 +7199,14 @@ export async function registerSyncRoutes(app: FastifyInstance): Promise<void> {
       return reply
         .code(400)
         .send({ error: "invalid progressive assignment query" });
+    if (query.data.expiredPending && (query.data.limit ?? 4) > 4)
+      return reply
+        .code(400)
+        .send({ error: "expired pending page exceeds four assignments" });
     return listProgressiveRemoteAssignments(db, {
       solverId: solver.id,
       ...query.data,
+      expiredPending: query.data.expiredPending === "true",
     });
   });
 

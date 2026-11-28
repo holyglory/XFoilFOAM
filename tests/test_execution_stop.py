@@ -1,6 +1,7 @@
 import fcntl
 import json
 import multiprocessing
+from uuid import uuid4
 
 import pytest
 
@@ -9,6 +10,8 @@ from airfoilfoam.execution_stop import execution_stop_proof, record_execution_ow
 from airfoilfoam.storage import JobStore
 from airfoilfoam.models import Polar, PolarPoint, PolarRequest, JobPhase, JobResult, JobState, JobStatus
 from airfoilfoam import tasks
+from airfoilfoam.openfoam.dialects import OPENCFD_2606_IDENTITY
+from airfoilfoam.submission import fence_stable_submission, register_stable_submission, SubmissionError
 
 
 def retained_partial(job_id):
@@ -310,6 +313,49 @@ def test_queued_cancellation_can_prove_no_execution_without_inventing_a_worker_o
     assert tasks.run_polar(job_id, request.model_dump_json())["state"] == "cancelled"
     assert not owner_path.exists()
     assert execution_stop_proof(store, job_id)["execution_stopped"] is True
+
+
+@pytest.mark.parametrize("invalid", [None, "wrong_marker", "missing_marker", "running_status", "remaining_child"])
+def test_current_route_unregistered_cancellation_requires_real_fence_and_blocks_submission(tmp_path, monkeypatch, invalid):
+    store = JobStore(Settings(data_dir=tmp_path / "data"))
+    job_id = str(uuid4())
+    assert not store.exists(job_id)
+    assert execution_stop_proof(store, job_id)["execution_stopped"] is False
+    fence_stable_submission(store, job_id, OPENCFD_2606_IDENTITY)
+    processes = [12345] if invalid == "remaining_child" else []
+    monkeypatch.setattr(store, "job_processes", lambda identity, *, strict=False: processes)
+    marker = store.job_dir(job_id) / ".execution-not-started.json"
+    if invalid == "wrong_marker":
+        marker.write_text(json.dumps({"version": 1, "job_id": str(uuid4())}))
+    elif invalid == "missing_marker":
+        marker.unlink()
+    elif invalid == "running_status":
+        status = store.read_status(job_id)
+        status.state = JobState.running
+        # Deliberately corrupt this isolated fixture; the normal writer refuses
+        # reopening an already-cancelled status.
+        store._write_json_atomic(store.job_dir(job_id) / "status.json", status.model_dump_json())
+    with (store.job_dir(job_id) / ".execute.lock").open("a") as producer:
+        fcntl.flock(producer.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        assert execution_stop_proof(store, job_id)["execution_stopped"] is False
+    proof = execution_stop_proof(store, job_id)
+    assert proof["execution_stopped"] is (invalid is None)
+    if invalid is None:
+        assert proof["ownership_basis"] == "never_started_cancellation_fence"
+        assert proof["namespace_verified"] and proof["remaining"] == []
+        assert store.read_status(job_id).total_cases == 0
+        assert store.read_status(job_id).completed_cases == 0
+        assert store.read_result(job_id) is None
+        assert not (store.job_dir(job_id) / ".execution-owner.json").exists()
+        original = marker.read_bytes()
+        fence_stable_submission(store, job_id, OPENCFD_2606_IDENTITY)
+        assert marker.read_bytes() == original
+        request = PolarRequest(execution_id=job_id, expected_engine=OPENCFD_2606_IDENTITY,
+                               airfoil={"name": "unused", "coordinates": "not loaded"}, aoa={"angles": [0]})
+        def unexpected(*args):
+            raise AssertionError("A fenced expired execution must never be dispatched")
+        with pytest.raises(SubmissionError):
+            register_stable_submission(store, request, unexpected)
 
 
 @pytest.mark.parametrize("invalid", ["wrong_marker", "missing_marker", "running_status", "terminal_result", "remaining_child"])

@@ -259,6 +259,25 @@ existing credential. Fetching an assignment returns the exact sealed request and
 the actual promise/receipt state; it is not permission to restart expired work.
 Expired assignments remain discoverable until their exact physical stop has been
 acknowledged. Discovery never creates solved points or changes execution status.
+The active intake feed retains its existing population and durable cursor. A
+separate authenticated `expiredPending=true` scan recovers at most four expired,
+pending, unbound dispatches per page, with expired exact zero-work case ownership
+and no received reports, runtime or result evidence. Its independent worker loop
+checks one candidate at a time without delaying active intake or submission; its
+scan may safely restart after a worker restart. A refusal advances the scan and
+is retried on the next cycle. An already submitted worker execution remains on
+its ordinary observation path. Recovery persists the original assignment before
+asking the exact engine route for its real cancellation fence and recording the
+zero-case report. Only authenticated report delivery and normal hub settlement
+can release ownership; discovery and local absence cannot prove a stop.
+When intake defers a replacement because a previous progressive promise still
+owns its cells, the rolled-back attempt identifies that exact prior promise.
+The independent recovery loop uses the existing registered terminal-mirror
+reconciler for one named conflict per pass. It keeps the normal two-page/two-source
+verification bound and a 15-second request/launch budget, without capacity waits.
+Verified scan progress survives HTTP failure; overlapping reconciliation shares
+one in-flight owner. All terminal report, delivery, custody and hub receipt checks
+still apply before release. Intake retries normally after reconciliation.
 
 A separate authenticated start check verifies the current epoch, campaign stage,
 exact case leases, request, worker identity, admission state and existing transfer

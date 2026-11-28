@@ -10,11 +10,16 @@ export async function listProgressiveRemoteAssignments(
     afterCreatedAt?: string;
     after?: string;
     limit?: number;
+    expiredPending?: boolean;
   },
 ) {
-  const limit = input.limit ?? 25;
+  const limit = input.limit ?? (input.expiredPending ? 4 : 25);
   if (!Number.isSafeInteger(limit) || limit < 1 || limit > 50)
     throw new Error("Remote assignment page size must be between 1 and 50");
+  if (input.expiredPending && limit > 4)
+    throw new Error(
+      "Expired pending assignment page size must be between 1 and 4",
+    );
   if (Boolean(input.afterCreatedAt) !== Boolean(input.after))
     throw new Error("Remote assignment cursor requires created time and id");
   const cycleStartedAt = input.beforeCreatedAt ?? new Date().toISOString();
@@ -26,9 +31,30 @@ export async function listProgressiveRemoteAssignments(
     JOIN registered_remote_solvers solver ON solver.id = dispatch.solver_id AND solver.revoked_at IS NULL
     JOIN sync_sweep_promises promise
       ON promise.id = dispatch.promise_id
-      AND promise.status = 'active'
-      AND promise."expiresAt" > clock_timestamp()
+      AND promise.registered_solver_id = dispatch.solver_id
+    JOIN sim_jobs job ON job.id = dispatch.sim_job_id
     WHERE dispatch.solver_id = ${input.solverId}::uuid
+      ${
+        input.expiredPending
+          ? sql`
+        AND promise.status IN ('active', 'expired') AND promise."expiresAt" <= clock_timestamp()
+        AND job.status = 'pending' AND job.engine_job_id IS NULL AND job.engine_state IS NULL
+        AND EXISTS (SELECT 1 FROM progressive_cfd_attempts a WHERE a.sim_job_id = job.id)
+        AND NOT EXISTS (
+          SELECT 1 FROM progressive_cfd_attempts a
+          LEFT JOIN progressive_cfd_units u ON u.id = a.unit_id
+          WHERE a.sim_job_id = job.id AND (a.outcome <> 'running' OR a.active_seconds <> 0
+            OR u.state IS DISTINCT FROM 'leased' OR u.lease_token IS DISTINCT FROM a.token
+            OR u.lease_until IS NULL OR u.lease_until > clock_timestamp()))
+        AND NOT EXISTS (SELECT 1 FROM progressive_remote_reports r WHERE r.sim_job_id = job.id)
+        AND NOT EXISTS (SELECT 1 FROM result_attempts r WHERE r.sim_job_id = job.id)
+        AND NOT EXISTS (SELECT 1 FROM progressive_cfd_runtime_progress p
+          JOIN progressive_cfd_attempts a ON a.token = p.attempt_token WHERE a.sim_job_id = job.id)
+        AND NOT EXISTS (SELECT 1 FROM progressive_cfd_evidence e
+          JOIN progressive_cfd_attempts a ON a.token = e.attempt_token WHERE a.sim_job_id = job.id)
+      `
+          : sql`AND promise.status = 'active' AND promise."expiresAt" > clock_timestamp()`
+      }
       AND date_trunc('milliseconds', dispatch.created_at) <= ${cycleStartedAt}::timestamptz
       ${
         input.after && input.afterCreatedAt
