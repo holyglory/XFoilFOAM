@@ -1681,6 +1681,13 @@
       "when": 1795363913070,
       "tag": "0239_registered_worker_shared_hub_reports",
       "breakpoints": true
+    },
+    {
+      "idx": 240,
+      "version": "7",
+      "when": 1795613168618,
+      "tag": "0240_progressive_cfd_claim_turns",
+      "breakpoints": true
     }
   ]
 }

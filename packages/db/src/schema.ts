@@ -7748,6 +7748,24 @@ export const progressiveCfdAttempts = pgTable(
   }),
 );
 
+/** One first-claim turn per campaign. This is execution metadata, separate from
+ * numerical profiles, solver evidence and user-editable scheduling settings. */
+export const progressiveCfdClaimTurns = pgTable(
+  "progressive_cfd_claim_turns",
+  {
+    campaignId: uuid("campaign_id").primaryKey()
+      .references(() => simCampaigns.id, { onDelete: "cascade" }),
+    epochId: uuid("epoch_id").notNull()
+      .references(() => calculationEpochs.id, { onDelete: "cascade" }),
+    planRevisionId: uuid("plan_revision_id").notNull()
+      .references(() => simCampaignPlanRevisions.id, { onDelete: "cascade" }),
+    lastStage: smallint("last_stage").notNull(),
+  },
+  (table) => ({
+    stageCheck: check("progressive_cfd_claim_turns_last_stage_check", sql`${table.lastStage} IN (2, 3)`),
+  }),
+);
+
 export const progressiveIngestionOwnershipRecoveries = pgTable(
   "progressive_ingestion_ownership_recoveries",
   {

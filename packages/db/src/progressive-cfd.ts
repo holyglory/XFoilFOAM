@@ -376,7 +376,9 @@ export async function claimProgressiveCfdUnit(
     }
     const [campaign] = await connection.execute(sql`
       WITH ${progressiveAdmissionFrontierSql(String(epoch.id))}
-      SELECT campaign.id,
+      SELECT campaign.id, campaign.current_plan_revision_id,
+        EXISTS (SELECT 1 FROM progressive_admission_frontier frontier
+          WHERE frontier.campaign_id = campaign.id) AS subsonic_first,
         coalesce((SELECT high_allowed FROM progressive_admission_frontier frontier
           WHERE frontier.campaign_id = campaign.id), true) AS high_allowed,
         NOT EXISTS (
@@ -420,6 +422,25 @@ export async function claimProgressiveCfdUnit(
     // mutex in this lock order. A busy mutex unwinds the campaign lock.
     if (input.acquireAdmissionAfterCampaign && !(await tryProgressiveAdmissionLock(connection)))
       throw new ProgressiveCfdAdmissionBusy("Progressive admission is busy with another campaign maintenance pass");
+    // One durable turn per first claim, serialized by the campaign mutex. Do
+    // not derive turns from heartbeat time, scan attempt history, or rotate
+    // while filling the rest of a homogeneous same-target batch.
+    const alternateLowStages = !input.sameTarget && campaign.subsonic_first === true && !campaign.all_stage3;
+    let lowClaimPriority = sql``;
+    if (alternateLowStages) {
+      const [turn] = await connection.execute(sql`
+        SELECT last_stage FROM progressive_cfd_claim_turns
+        WHERE campaign_id=${campaign.id}::uuid AND epoch_id=${epoch.id}::uuid
+          AND plan_revision_id=${campaign.current_plan_revision_id}::uuid
+      `);
+      const preferInitialRetry = Number(turn?.last_stage) !== 2;
+      lowClaimPriority = sql`CASE
+        WHEN target.mach >= 0 AND target.mach < 1 AND work.stage = 2
+          AND unit.purpose = 'initial' AND unit.attempts > 0 THEN ${preferInitialRetry ? 0 : 1}::int
+        WHEN target.mach >= 0 AND target.mach < 1 AND work.stage = 3
+          AND unit.purpose = 'precise' THEN ${preferInitialRetry ? 1 : 0}::int
+        ELSE 2 END,`;
+    }
     // Choose the winning campaign with the ordinary policy first. A preference
     // within that campaign cannot advance a lower-priority campaign or stage.
     const preferredWork = input.preferredWorkId
@@ -523,7 +544,7 @@ export async function claimProgressiveCfdUnit(
         CASE WHEN ${extensionPriority} THEN 0 ELSE 1 END,
         generation.created_at, generation.id,
         CASE WHEN work.stage = 2 AND unit.purpose = 'initial' AND unit.attempts = 0 THEN 0 ELSE 1 END,
-        CASE WHEN work.stage = 3 THEN 0 ELSE 1 END,
+        ${lowClaimPriority} CASE WHEN work.stage = 3 THEN 0 ELSE 1 END,
         CASE WHEN unit.purpose = 'initial' THEN 0 ELSE 1 END,
         unit.retry_after NULLS FIRST, unit.retry_after, unit.ordinal, work.target_id`;
       const candidateQuery = (headId?: SQL) => sql`
@@ -577,7 +598,7 @@ export async function claimProgressiveCfdUnit(
     const readSelectedUnit = (selection: SQL, heads?: SQL) => connection.execute(sql`
       WITH ${progressiveAdmissionFrontierSql(String(epoch.id))}${cohortReadiness}${heads ? sql`, ${heads}` : sql``}, ${selection}
       SELECT unit.id, unit.work_id, work.generation_id, work.target_id, scope.revision_id,
-        work.stage, unit.aoa_deg, ${effectiveRecipe} AS recipe, target.physical,
+        work.stage, unit.purpose, unit.attempts, unit.aoa_deg, ${effectiveRecipe} AS recipe, target.physical,
         (SELECT recovery.id FROM progressive_cfd_recovery_plans recovery WHERE recovery.unit_id = unit.id ORDER BY recovery.ordinal DESC LIMIT 1) AS recovery_plan_id,
         (${localStepPolicy}) AS local_step_policy_id,
         ${recoveryParent} AS recovery_parent_job_id,${publicationRecovery} AS publication_recovery,
@@ -618,6 +639,8 @@ export async function claimProgressiveCfdUnit(
       target_id: string;
       revision_id: string;
       stage: 2 | 3;
+      purpose: string;
+      attempts: number;
       aoa_deg: number;
       recipe: Record<string, unknown>;
       physical: AnalysisPhysical;
@@ -674,6 +697,19 @@ export async function claimProgressiveCfdUnit(
     if (unit.publication_recovery)
       await connection.execute(sql`INSERT INTO progressive_publication_recovery_claims(unit_id,attempt_token)
         VALUES(${unit.id}::uuid,${token}::uuid)`);
+    const mach = unit.physical.derived.mach;
+    if (alternateLowStages && mach != null && mach >= 0 && mach < 1
+      && ((unit.stage === 2 && unit.purpose === "initial" && unit.attempts > 0)
+        || (unit.stage === 3 && unit.purpose === "precise")))
+      await connection.execute(sql`
+        INSERT INTO progressive_cfd_claim_turns(campaign_id,epoch_id,plan_revision_id,last_stage)
+        VALUES(${campaign.id}::uuid,${epoch.id}::uuid,${campaign.current_plan_revision_id}::uuid,${unit.stage})
+        ON CONFLICT(campaign_id) DO UPDATE SET epoch_id=excluded.epoch_id,
+          plan_revision_id=excluded.plan_revision_id,last_stage=excluded.last_stage
+        WHERE (progressive_cfd_claim_turns.epoch_id, progressive_cfd_claim_turns.plan_revision_id,
+          progressive_cfd_claim_turns.last_stage) IS DISTINCT FROM
+          (excluded.epoch_id, excluded.plan_revision_id, excluded.last_stage)
+      `);
     return {
       id: unit.id,
       workId: unit.work_id,

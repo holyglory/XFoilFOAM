@@ -221,6 +221,7 @@ import {
 import {
   createAnalysisTarget,
   analysisContentHash,
+  canonicalAnalysisJson,
   progressiveComparisonConditionKey,
 } from "../src/analysis-target";
 import {
@@ -16243,6 +16244,140 @@ describe("subsonic through precise priority", () => {
       recipe: initialBefore.recipe,
     }]);
   }, 120_000);
+
+  async function initialFastRetryCoverage(additionalProfiles = 2) {
+    const fixture = await scope(true, [-2, 0, 2], additionalProfiles);
+    await initializeProgressiveCfdWork(db);
+    const batch = () => claimProgressiveCfdBatch(db, {
+      owner: "initial-fast-retry-coverage-fixture",
+      leaseSeconds: 120,
+      maximumUnits: 2,
+      localTimeStepVersion: 1,
+    });
+    const settled = await batch();
+    expect(settled).toHaveLength(2);
+    for (const lease of settled) {
+      expect(lease.stage).toBe(2);
+      expect(lease.physical.derived.mach).toBeCloseTo(0.5);
+      expect((await finish(lease)).settlement).toMatchObject({ gaps: 1 });
+    }
+    await advanceProgressiveCfdStages(db);
+    await initializeProgressiveCfdWork(db);
+    const retries: ProgressiveCfdLease[] = [];
+    for (let index = 0; index < additionalProfiles; index += 1) {
+      const firstAttempts = await batch();
+      expect(firstAttempts).toHaveLength(2);
+      for (const lease of firstAttempts) {
+        expect(lease.stage).toBe(2);
+        expect(lease.physical.derived.mach).toBeCloseTo(0.5);
+        expect((await finish(lease, false, true)).settlement).toMatchObject({ retry: 1 });
+        retries.push(lease);
+      }
+    }
+    const units = await db.execute(sql`SELECT unit.id, unit.attempts, unit.active_seconds,
+        unit.active_budget_seconds, unit.recipe, work.target_id
+      FROM progressive_cfd_units unit JOIN progressive_work work ON work.id=unit.work_id
+      JOIN polar_analysis_targets target ON target.id=work.target_id
+      WHERE work.generation_id=${fixture.generationId} AND work.stage=2 AND target.mach<1
+        AND unit.state='pending' ORDER BY unit.id`);
+    expect(units).toHaveLength(additionalProfiles * 2);
+    expect(units.every(unit => unit.attempts === 1 && Number(unit.active_seconds) === 25)).toBe(true);
+    return { ...fixture, units, retries };
+  }
+
+  it("gives required low initial FAST retries alternating claim turns beside recurring low precise across connections", async () => {
+    const fixture = await initialFastRetryCoverage();
+    // A registered offer can still fail after its batch claim.
+    await expect(db.transaction(async (transaction) => {
+      const batch = await claimProgressiveCfdBatch(transaction as unknown as DB, {
+        owner: "rolled-back-fast-retry-offer",
+        leaseSeconds: 120,
+        maximumUnits: 1,
+        localTimeStepVersion: 1,
+      });
+      expect(batch.map(lease => lease.stage)).toEqual([2]);
+      throw new Error("rolled back before dispatch");
+    })).rejects.toThrow("rolled back before dispatch");
+    const stages: number[] = [];
+    const leases: ProgressiveCfdLease[] = [];
+    for (let turn = 0; turn < 6; turn += 1) {
+      const restarted = createClient({ url: targetUrl.toString(), max: 1 });
+      try {
+        const batch = await claimProgressiveCfdBatch(restarted.db, {
+          owner: `initial-fast-fair-turn-${turn}`,
+          leaseSeconds: 120,
+          maximumUnits: 1,
+          localTimeStepVersion: 1,
+        });
+        expect(batch).toHaveLength(1);
+        leases.push(batch[0]!);
+        stages.push(batch[0]!.stage);
+        expect(batch[0]!.physical.derived.mach).toBeCloseTo(0.5);
+      } finally {
+        await restarted.sql.end();
+      }
+    }
+    expect(stages).toEqual([2, 3, 2, 3, 2, 3]);
+    for (const lease of leases.filter(lease => lease.stage === 2)) {
+      const before = fixture.units.find(unit => unit.id === lease.id)!;
+      expect(before).toBeTruthy();
+      expect(await db.execute(sql`SELECT attempts, active_seconds, active_budget_seconds, recipe
+        FROM progressive_cfd_units WHERE id=${lease.id}`)).toEqual([{
+        attempts: 2,
+        active_seconds: before.active_seconds,
+        active_budget_seconds: before.active_budget_seconds,
+        recipe: before.recipe,
+      }]);
+    }
+    expect(await db.execute(sql`SELECT unit.id FROM progressive_cfd_units unit
+      JOIN progressive_work work ON work.id=unit.work_id JOIN polar_analysis_targets target ON target.id=work.target_id
+      WHERE work.generation_id=${fixture.generationId} AND target.mach>=1 AND unit.attempts>0`)).toEqual([]);
+  }, 120_000);
+
+  it("keeps a reserved low initial FAST retry batch homogeneous and counts its additional selections as one turn", async () => {
+    await initialFastRetryCoverage();
+    const batches: ProgressiveCfdLease[][] = [];
+    for (let turn = 0; turn < 4; turn += 1) {
+      const batch = await claimProgressiveCfdBatch(db, {
+        owner: `initial-fast-fair-batch-${turn}`,
+        leaseSeconds: 120,
+        maximumUnits: 2,
+        localTimeStepVersion: 1,
+      });
+      expect(batch.length).toBeGreaterThan(0);
+      expect(new Set(batch.map(lease => lease.targetId)).size).toBe(1);
+      expect(new Set(batch.map(lease => canonicalAnalysisJson(lease.recipe))).size).toBe(1);
+      expect(new Set(batch.map(lease => lease.recoveryParentJobId)).size).toBe(1);
+      batches.push(batch);
+    }
+    expect(batches.map(batch => batch[0]!.stage)).toEqual([2, 3, 2, 3]);
+    expect(batches.map(batch => batch.length)).toEqual([2, 2, 2, 1]);
+  }, 120_000);
+
+  it.each(["deferred", "capability"] as const)(
+    "falls back to low precise when the reserved initial FAST retry is %s and gives FAST the next usable turn",
+    async (blocked) => {
+      const fixture = await initialFastRetryCoverage(1);
+      if (blocked === "deferred")
+        await db.execute(sql`UPDATE progressive_cfd_units SET retry_after=clock_timestamp()+interval '1 hour'
+          WHERE id IN (${sql.join(fixture.units.map(unit => sql`${unit.id}::uuid`), sql`,`)})`);
+      const fallback = await claimProgressiveCfdBatch(db, {
+        owner: "initial-fast-retry-fallback",
+        leaseSeconds: 120,
+        maximumUnits: 1,
+        localTimeStepVersion: 1,
+        ...(blocked === "capability" ? { allowedSolverFamilies: ["rhoPimpleFoam"] as const } : {}),
+      });
+      expect(fallback).toHaveLength(1);
+      expect(fallback[0]!.stage).toBe(3);
+      expect(fallback[0]!.physical.derived.mach).toBeCloseTo(0.5);
+      await db.execute(sql`UPDATE progressive_cfd_units SET retry_after=NULL
+        WHERE id IN (${sql.join(fixture.units.map(unit => sql`${unit.id}::uuid`), sql`,`)})`);
+      const next = await claimCfd();
+      expect(next?.stage).toBe(2);
+      expect(fixture.units.some(unit => unit.id === next!.id)).toBe(true);
+    }, 120_000,
+  );
 
   it("keeps precise selection adoption busy until stopped attempts are settled", async () => {
     const fixture = await cfdEvidenceFixture(undefined, 2, [], [0]);
