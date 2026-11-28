@@ -19,6 +19,7 @@ import {
   normalizeProgressiveMaterialDomainRecoveryRecipeSql,
 } from "./progressive-cfd-numerical-recovery";
 import type { ProgressiveCfdLease } from "./progressive-cfd";
+import { progressiveContinuationExecutionRecipe } from "./progressive-cfd-continuation-recipe";
 import {
   boundaryConditions,
   meshProfiles,
@@ -151,9 +152,10 @@ export async function materializeProgressiveCfdExecution(
   return db.transaction(async (transaction) => {
     const connection = transaction as unknown as DB;
     await lockProgressiveCfdExecution(connection, lease);
+    const { recipe, continuationRequest } = await progressiveContinuationExecutionRecipe(connection, lease);
     const identity = analysisContentHash({
       sourceRevisionId: lease.revisionId,
-      recipe: lease.recipe,
+      recipe,
     });
     await connection.execute(
       sql`SELECT pg_advisory_xact_lock(hashtextextended(${identity}, 0))`,
@@ -183,6 +185,7 @@ export async function materializeProgressiveCfdExecution(
         revision: existing[0].revision,
         snapshot: existing[0].revision
           .snapshot as unknown as SimulationSetupSnapshot,
+        continuationRequest,
       };
     }
     const [source] = await connection
@@ -209,21 +212,21 @@ export async function materializeProgressiveCfdExecution(
     });
     if (physical.signature !== lease.targetId)
       throw new Error("CFD source revision does not match the physical target");
-    const mesh = lease.recipe.mesh as
+    const mesh = recipe.mesh as
       | Omit<SimulationSetupSnapshot["mesh"], "id" | "slug" | "name">
       | undefined;
-    const solver = lease.recipe.solver as
+    const solver = recipe.solver as
       | Omit<SimulationSetupSnapshot["solver"], "id" | "slug" | "name">
       | undefined;
-    const selection = lease.recipe.selection as
+    const selection = recipe.selection as
       | { solver?: ProgressiveSolverFamily; pressureKind?: string }
       | undefined;
     const family = selection?.solver;
-    const timeCoordinate = lease.recipe.timeCoordinate as
+    const timeCoordinate = recipe.timeCoordinate as
       | ProgressiveTimeCoordinate
       | undefined;
-    const turbulentPrandtl = lease.recipe.turbulentPrandtl;
-    const compressibleFarfieldBoundary = lease.recipe
+    const turbulentPrandtl = recipe.turbulentPrandtl;
+    const compressibleFarfieldBoundary = recipe
       .compressibleFarfieldBoundary as
       | "static_freestream"
       | "density_static_freestream"
@@ -462,7 +465,7 @@ export async function materializeProgressiveCfdExecution(
     await connection.insert(progressiveCfdExecutionRecipes).values({
       id: identity,
       sourceRevisionId: source.id,
-      recipe: lease.recipe,
+      recipe,
       executionRevisionId: revision.id,
     });
     await connection
@@ -474,6 +477,6 @@ export async function materializeProgressiveCfdExecution(
           eq(progressiveCfdAttempts.outcome, "running"),
         ),
       );
-    return { recipeId: identity, revision, snapshot };
+    return { recipeId: identity, revision, snapshot, continuationRequest };
   });
 }

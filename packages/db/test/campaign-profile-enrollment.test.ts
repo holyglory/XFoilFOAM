@@ -45,7 +45,7 @@ import {
 } from "@aerodb/core";
 import { sourceAirModel } from "../../core/test/fixtures/source-air-model";
 import { progressivePredictionFixture as predictionFixture } from "../test-support/progressive-prediction";
-import { buildPolarRequest } from "../../../apps/sweeper/src/build-request";
+import { buildPolarRequest, REQUIRED_PRECALC_EVIDENCE_RECOVERY_VERSION } from "../../../apps/sweeper/src/build-request";
 import { progressiveRecipes } from "../src/progressive-materialization";
 import { delimiter, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -65,7 +65,7 @@ import {
   vi,
 } from "vitest";
 import { EngineClient, EngineError } from "../../engine-client/src/client";
-import type { EngineExecutionStopProof } from "../../engine-client/src/types";
+import type { EngineExecutionStopProof, PolarRequest } from "../../engine-client/src/types";
 import type { SteadyHistory } from "../../engine-client/src/fidelity";
 import {
   acknowledgeProgressiveCfdExecutionStop,
@@ -119,6 +119,8 @@ import { verifyProgressiveAcceptedArchiveReplay } from "./progressive-accepted-a
 import { verifyProgressiveRemoteReportInventory } from "./progressive-remote-inventory-fixture";
 import { verifyProgressiveRemoteStart } from "./progressive-remote-start-fixture";
 import { verifyRegisteredShortWork } from "./registered-short-work-window-fixture";
+import { verifyHistoricalWorkerCutover } from "./progressive-historical-cutover-fixture";
+import { periodicPoint } from "../test-support/periodic-urans-point";
 import { verifyProgressiveWorkerJobMirror } from "./progressive-worker-job-fixture";
 import {
   progressiveRemoteEvidenceResult,
@@ -127,6 +129,7 @@ import {
 import type { ProgressiveRemoteReport } from "../src/progressive-remote-report";
 import {
   sealProgressiveRemoteExecution,
+  verifyProgressiveRemoteExecution,
   type ProgressiveRemoteExecutionEnvelope,
 } from "../src/progressive-remote-execution";
 import { advanceProgressiveCfdStages } from "../src/progressive-cfd-stages";
@@ -248,6 +251,7 @@ import {
   simCampaigns,
   simJobs,
   solverProfiles,
+  simulationPresetRevisions,
   solverExecutionPools,
   sweeperState,
   syncSweepPromises,
@@ -1714,12 +1718,26 @@ async function cfdEvidenceFixture(
   deferSubmission = false,
   historicalRansSweep = false,
   cpuSlots = 1,
+  dispatchFixture: {
+    historicalTransient?: boolean;
+    minimumCriticalMach?: number;
+    legacyPolicy?: boolean;
+  } = {},
 ) {
   const campaignId = prepared?.campaignId ?? await campaign("active", [speed, ...extraSpeeds], angles, physical);
   let retriedUnitId: string | undefined;
   let generationId: string | undefined;
   if (!prepared) {
-  const materialized = await materializeProgressiveCampaignScope(
+  const legacyScope = dispatchFixture.legacyPolicy
+    ? await progressiveScope(campaignId, `legacy-dispatch-${sequence}`, [originalId], true)
+    : null;
+  if (legacyScope) {
+    legacyScope.targets[0].angles = angles;
+    delete legacyScope.targets[0].recipes.precise.selectionPolicy;
+  }
+  const materialized = legacyScope
+    ? await sealProgressiveGeneration(db, legacyScope)
+    : await materializeProgressiveCampaignScope(
     db,
     campaignId,
     undefined,
@@ -1760,7 +1778,14 @@ async function cfdEvidenceFixture(
         maximumAngles: 32768,
       },
     }))!;
-    await storeNeuralFoilPrediction(db, baseline, predictionFixture(baseline));
+    await storeNeuralFoilPrediction(db, baseline, {
+      ...predictionFixture(baseline),
+      ...(dispatchFixture.minimumCriticalMach != null ? {
+        compressibility_diagnostics: {
+          critical_mach: baseline.angles.map(() => dispatchFixture.minimumCriticalMach),
+        },
+      } : {}),
+    });
     await db.execute(sql`UPDATE progressive_generations SET stage = 2 WHERE id = ${generationId}::uuid`);
     await initializeProgressiveCfdWork(db);
     await db.execute(sql`UPDATE progressive_work SET state = 'complete', completed_at = clock_timestamp()
@@ -1844,6 +1869,7 @@ async function cfdEvidenceFixture(
     composed = await composeProgressiveCfdJob(db, leases, {
       cpuSlots,
       meshRecoveryVersion: 1,
+      uransRecoveryVersion: REQUIRED_PRECALC_EVIDENCE_RECOVERY_VERSION,
       solverBudgetVersion: 2,
       localTimeStepVersion: 1,
     });
@@ -1858,19 +1884,17 @@ async function cfdEvidenceFixture(
       .where(eq(sweeperState.id, 1));
   }
   if (historicalRansSweep) {
-    // Historical RANS recovery remains supported, but the current stage-3
-    // composer deliberately submits URANS. Build that older request from the
-    // steady execution snapshot while this new fixture job is still unstarted.
+    // Reconstruct a historical RANS request while this fixture is unstarted.
     // Never rewrite a submitted request, report, stop fence, or result history.
     expect(stage).toBe(3);
-    expect(composed.request.solver).toMatchObject({ rans_failure_policy: "continue", force_transient: true });
+    expect(composed.request.solver?.force_transient).toBe(false);
     const family = execution.snapshot.solver.flowSolverFamily;
     expect(["simpleFoam", "rhoSimpleFoam"]).toContain(family);
     const [airfoil] = await db.select().from(airfoils).where(eq(airfoils.id, leases[0].physical.airfoilId));
     const { request } = buildPolarRequest({
       airfoil: { ...airfoil, points: leases[0].physical.geometry.map(([x, y]) => ({ x, y })) },
       setup: execution.snapshot, aoaList: leases.map((lease) => lease.alpha).sort((a, b) => a - b),
-      wave: 1, ransFailurePolicy: "abort_for_precalc", cpuSlots: 1, solverFamilyOverride: family!,
+      wave: 1, ransFailurePolicy: "abort_for_precalc", cpuSlots: 1,
     });
     const historicalRequest = {
       ...request, execution_id: composed.request.execution_id,
@@ -1891,6 +1915,37 @@ async function cfdEvidenceFixture(
     composed = { ...composed, request: historicalRequest };
     expect(composed.request.solver).toMatchObject({ rans_failure_policy: "abort_for_precalc", force_transient: false });
     expect(composed.request.aoa?.angles).toEqual([...angles].sort((a, b) => a - b));
+  }
+  if (dispatchFixture.historicalTransient) {
+    // Reproduce 7f04bf99's historical actual/recorded mismatch before any
+    // dispatch or evidence exists. Production history is never rewritten.
+    const selected = execution.snapshot.solver.flowSolverFamily;
+    const family = selected === "simpleFoam" ? "pimpleFoam" : "rhoPimpleFoam";
+    expect(["simpleFoam", "rhoSimpleFoam"]).toContain(selected);
+    const [airfoil] = await db.select().from(airfoils).where(eq(airfoils.id, leases[0].physical.airfoilId));
+    const request = buildPolarRequest({
+      airfoil,
+      setup: { ...execution.snapshot, solver: {
+        ...execution.snapshot.solver, flowSolverFamily: family, timeCoordinate: undefined,
+      } },
+      aoaList: leases.map(lease => lease.alpha).sort((a, b) => a - b),
+      wave: 2, uransFidelity: "full", cpuSlots,
+    }).request;
+    request.solver = { ...request.solver, warm_start: true };
+    const historicalRequest = {
+      ...request, execution_id: composed.request.execution_id,
+      expected_execution_pool: composed.request.expected_execution_pool,
+      expected_mesh_recovery_version: composed.request.expected_mesh_recovery_version,
+      expected_solver_budget_version: composed.request.expected_solver_budget_version,
+      resources: composed.request.resources,
+    };
+    const updated = await db.execute(sql`UPDATE sim_jobs SET wave=2,method_key='openfoam.urans',
+      request_payload=jsonb_set(request_payload,'{engineRequest}',${JSON.stringify(historicalRequest)}::jsonb)
+      WHERE id=${composed.jobId}::uuid AND status='pending' AND engine_job_id IS NULL
+      AND NOT EXISTS(SELECT 1 FROM result_attempts WHERE sim_job_id=${composed.jobId}::uuid)
+      RETURNING id`);
+    expect(updated).toEqual([{ id: composed.jobId }]);
+    composed = { ...composed, request: historicalRequest };
   }
   const engineJobId = composed.request.execution_id!;
   if (!deferSubmission)
@@ -7445,8 +7500,11 @@ describe("progressive execution stop and settlement", () => {
     ]);
   });
 
-  it("continues one bounded precise full-URANS case from settled wall-clock evidence", async () => {
-    const fixture = await fitFixture(3, false, [-2, 0, 2], 1);
+  it.each([undefined, 0.8])("continues one bounded precise full-URANS case from settled wall-clock evidence (sonic margin %s)", async (minimumCriticalMach) => {
+    const fixture = await cfdEvidenceFixture(
+      33.187, 3, [], [-2, 0, 2], false, undefined, {}, 1, false, false, 1,
+      { historicalTransient: true, minimumCriticalMach },
+    );
     const lease = fixture.leases[0];
     const resultAttemptId = await fixture.save(
       PROGRESSIVE_COMPUTE_POLICY.preciseInitialActiveSeconds,
@@ -7550,6 +7608,25 @@ describe("progressive execution stop and settlement", () => {
       .where(eq(solverExecutionPools.id, pool.id));
     let composed: Awaited<ReturnType<typeof composeProgressiveCfdJob>>;
     try {
+      for (const [path, value, error] of [
+        ["{engineRequest,solver,force_transient}", false, "physical-time URANS"],
+        ["{engineRequest,solver,flow_solver_family}", "rhoCentralFoam", "solver differs"],
+        ["{engineRequest,solver,urans_fidelity}", "precalc", "physical-time URANS"],
+        ["{engineRequest,execution_id}", randomUUID(), "identity conflict"],
+        ["{engineRequest,solver,n_iterations}", fixture.composed.request.solver!.n_iterations! + 1, "differs from its source request"],
+      ] as const) {
+        const rollback = new Error("restore historical continuation negative");
+        await expect(db.transaction(async tx => {
+          const connection = tx as unknown as DB;
+          await connection.execute(sql`UPDATE sim_jobs SET request_payload=jsonb_set(request_payload,
+            ${path}::text[],${JSON.stringify(value)}::jsonb) WHERE id=${fixture.composed.jobId}::uuid`);
+          await expect(composeProgressiveCfdJob(connection, [continuationLease!], {
+            cpuSlots: 1, meshRecoveryVersion: 1, uransRecoveryVersion: 2,
+            solverBudgetVersion: 2, localTimeStepVersion: 1,
+          })).rejects.toThrow(error);
+          throw rollback;
+        })).rejects.toThrow(rollback);
+      }
       composed = await composeProgressiveCfdJob(db, [continuationLease!], {
         cpuSlots: 1,
         meshRecoveryVersion: 1,
@@ -7557,6 +7634,10 @@ describe("progressive execution stop and settlement", () => {
         solverBudgetVersion: 2,
         localTimeStepVersion: 1,
       });
+      expect(await composeProgressiveCfdJob(db, [continuationLease!], {
+        cpuSlots: 1, meshRecoveryVersion: 1, uransRecoveryVersion: 2,
+        solverBudgetVersion: 2, localTimeStepVersion: 1,
+      })).toEqual({ ...composed, replayed: true });
     } finally {
       await db
         .update(solverExecutionPools)
@@ -7575,6 +7656,19 @@ describe("progressive execution stop and settlement", () => {
       PROGRESSIVE_COMPUTE_POLICY.preciseInitialActiveSeconds,
     );
     expect(composed.request.expected_urans_recovery_version).toBe(2);
+    expect(composed.request.solver).toEqual(fixture.composed.request.solver);
+    const [continuedRecipe] = await db.execute(sql`SELECT executed.recipe, executed.execution_revision_id
+      FROM progressive_cfd_attempts attempt
+      JOIN progressive_cfd_execution_recipes executed ON executed.id=attempt.execution_recipe_id
+      WHERE attempt.token=${continuationLease!.token}::uuid`);
+    expect(continuedRecipe.recipe).toMatchObject({
+      selection: { solver: fixture.composed.request.solver!.flow_solver_family },
+      timeCoordinate: "physical_time_seconds",
+    });
+    expect(continuedRecipe.execution_revision_id).not.toBe(fixture.execution.revision.id);
+    expect((await db.select().from(simulationPresetRevisions)
+      .where(eq(simulationPresetRevisions.id, fixture.execution.revision.id)))[0].snapshot)
+      .toEqual(fixture.execution.revision.snapshot);
     const [storedJob] = await db
       .select({ parentJobId: simJobs.parentJobId, totalCases: simJobs.totalCases })
       .from(simJobs)
@@ -10082,6 +10176,14 @@ describe("bounded progressive numerical recovery", () => {
         recoveryPlanId: replacement.recoveryPlanId,
         budgetExtension: { sourceResultAttemptId: source, engineJobId: fallback.engineJobId, engineCaseSlug: "c1_u166/a0" },
       });
+      const resumed = await cfdEvidenceFixture(166, stage, [], [0], false, {
+        campaignId: fixture.campaignId, leases: [continued],
+      });
+      expect(resumed.composed.request.continue_from).toEqual({
+        engine_job_id: fallback.engineJobId, case_slug: "c1_u166/a0",
+      });
+      expect(resumed.composed.request.solver).toEqual(fallback.composed.request.solver);
+      expect(resumed.execution.recipeId).toBe(fallback.execution.recipeId);
       expect(await readImmutable()).toEqual(immutable);
       return;
     }
@@ -14743,6 +14845,36 @@ describe("durable progressive CFD units", () => {
         predictionFixture(baseline),
       );
       await initializeProgressiveCfdWork(db);
+      // Replay an explicitly historical density-based pseudo-time recipe.
+      // The current high-Mach selector chooses a pressure-based solver; this
+      // fixture must not change that production policy to exercise old work.
+      const historical = await db.execute(sql`SELECT unit.id,unit.recipe
+        FROM progressive_cfd_units unit JOIN progressive_work work ON work.id=unit.work_id
+        JOIN progressive_generations generation ON generation.id=work.generation_id
+        WHERE generation.campaign_id=${id}::uuid AND work.stage=2
+          AND unit.state='pending' AND unit.attempts=0`);
+      for (const unit of historical) {
+        const recipe = unit.recipe as Record<string, unknown>;
+        const legacy = { ...recipe,
+          recipe_id: "isolated-historical-local-density",
+          timeCoordinate: "local_pseudo_time_iterations",
+          selection: { ...(recipe.selection as object), solver: "rhoCentralFoam" },
+          solver: { ...(recipe.solver as object), momentumScheme: "upwind",
+            nIterations: 5000, localTimeStepSmoothing: smoothing ?? 0.2 },
+        };
+        // Construct a fresh immutable historical fixture; never update the
+        // sealed recipe or disable its protection trigger.
+        const inserted = await db.execute(sql`WITH unstarted AS (
+          DELETE FROM progressive_cfd_units candidate WHERE candidate.id=${unit.id}::uuid
+            AND candidate.state='pending' AND candidate.attempts=0
+            AND NOT EXISTS(SELECT 1 FROM progressive_cfd_attempts attempt WHERE attempt.unit_id=candidate.id)
+          RETURNING work_id,aoa_deg,ordinal,purpose,reason,active_budget_seconds,policy_version
+        ) INSERT INTO progressive_cfd_units
+          (work_id,aoa_deg,ordinal,purpose,recipe,reason,active_budget_seconds,policy_version)
+          SELECT work_id,aoa_deg,ordinal,purpose,${JSON.stringify(legacy)}::jsonb,
+            reason,active_budget_seconds,policy_version FROM unstarted RETURNING id`);
+        expect(inserted).toHaveLength(1);
+      }
       if (smoothing != null)
         expect(
           await claimProgressiveCfdBatch(db, {
@@ -15569,7 +15701,7 @@ describe("subsonic through precise priority", () => {
       active_budget_seconds: initialBefore.active_budget_seconds,
       recipe: initialBefore.recipe,
     }]);
-  });
+  }, 120_000);
 
   it("keeps precise selection adoption busy until stopped attempts are settled", async () => {
     const fixture = await cfdEvidenceFixture(undefined, 2, [], [0]);
@@ -17018,4 +17150,178 @@ describe("durable profile enrollment", () => {
       );
     expect(rows).toHaveLength(1);
   });
+});
+
+// Dispatch ownership: keep this regression separate from terminal recovery tests.
+describe("sealed progressive solver dispatch", () => {
+  const options = { cpuSlots: 1, meshRecoveryVersion: 1, solverBudgetVersion: 2, localTimeStepVersion: 1 };
+
+  async function admission<T>(run: () => Promise<T>) {
+    const [state] = await db.execute(sql`SELECT enabled FROM sweeper_state WHERE id=1`);
+    try {
+      await db.execute(sql`UPDATE sweeper_state SET enabled=true WHERE id=1`);
+      return await run();
+    } finally {
+      await db.execute(sql`UPDATE sweeper_state SET enabled=${state.enabled} WHERE id=1`);
+    }
+  }
+
+  it.each([
+    [32.317, 0.8, false, "simpleFoam"],
+    [166.317, undefined, false, "rhoSimpleFoam"],
+    [32.317, 0.8, true, "pimpleFoam"],
+    [166.317, undefined, true, "rhoPimpleFoam"],
+  ] as const)("keeps the sealed %s / sonic margin %s / legacy %s solver on hub and remote replay", async (speed, minimumCriticalMach, legacyPolicy, family) => {
+    const fixture = await cfdEvidenceFixture(speed, 3, [], [-2, 0, 2], false,
+      undefined, { chordM: 0.763197 }, undefined, true, false, 1,
+      { minimumCriticalMach, legacyPolicy });
+    const transient = legacyPolicy;
+    expect(fixture.leases[0].recipe.selection).toMatchObject({ solver: family });
+    expect(fixture.execution.snapshot.solver.flowSolverFamily).toBe(family);
+    expect(fixture.composed.request.solver).toMatchObject({
+      flow_solver_family: family, force_transient: transient,
+      transient_fallback: transient, warm_start: true,
+      n_iterations: fixture.execution.snapshot.solver.nIterations,
+      convergence_tolerance: fixture.execution.snapshot.solver.convergenceTolerance,
+      momentum_scheme: fixture.execution.snapshot.solver.momentumScheme,
+      transient_cycles: fixture.execution.snapshot.solver.transientCycles,
+      transient_discard_fraction: fixture.execution.snapshot.solver.transientDiscardFraction,
+      transient_max_courant: fixture.execution.snapshot.solver.transientMaxCourant,
+    });
+    if (transient) expect(fixture.composed.request.solver?.urans_fidelity).toBe("full");
+    else expect(fixture.composed.request.solver).not.toHaveProperty("urans_fidelity");
+    expect(fixture.composed.request).not.toHaveProperty("continue_from");
+    const [job] = await db.select().from(simJobs).where(eq(simJobs.id, fixture.composed.jobId));
+    expect(job).toMatchObject({ wave: transient ? 2 : 1,
+      methodKey: transient ? "openfoam.urans" : "openfoam.rans",
+      simulationPresetRevisionId: fixture.execution.revision.id });
+    const payload = job.requestPayload as { engineRequest: PolarRequest; progressive: unknown; setupSnapshot: SimulationSetupSnapshot };
+    expect(payload.setupSnapshot).toEqual(fixture.execution.snapshot);
+    const replay = await admission(() => composeProgressiveCfdJob(db, fixture.leases, options));
+    expect(replay).toEqual({ ...fixture.composed, replayed: true });
+    const envelope = sealProgressiveRemoteExecution({ solverId: randomUUID(), promiseId: randomUUID(),
+      scope: payload.progressive, request: replay.request });
+    const received = verifyProgressiveRemoteExecution(envelope, {
+      solverId: envelope.solverId, promiseId: envelope.promiseId,
+      executionId: replay.jobId, contentSignature: envelope.contentSignature,
+    });
+    expect(received.request).toEqual(JSON.parse(JSON.stringify(replay.request)));
+    const [pool] = await db.select().from(solverExecutionPools)
+      .where(eq(solverExecutionPools.solverImplementationId, fixture.execution.revision.solverImplementationId!)).limit(1);
+    await db.execute(sql`INSERT INTO registered_remote_solvers(id,instance_id,instance_name,cpu_capacity,cpu_budget)
+      VALUES(${envelope.solverId}::uuid,${randomUUID()},'sealed dispatch mirror fixture',96,96)`);
+    try {
+      await db.update(solverExecutionPools).set({ enabled: true }).where(eq(solverExecutionPools.id, pool.id));
+      await verifyProgressiveWorkerJobMirror(db, envelope, executionStopProof, "never-authorized");
+    } finally {
+      await db.update(solverExecutionPools).set({ enabled: pool.enabled }).where(eq(solverExecutionPools.id, pool.id));
+      await db.execute(sql`DELETE FROM registered_remote_solvers WHERE id=${envelope.solverId}::uuid`);
+    }
+    // A worker restart must receive the same request, including the steady flags.
+    expect(verifyProgressiveRemoteExecution(JSON.parse(JSON.stringify(received)), {
+      solverId: envelope.solverId, promiseId: envelope.promiseId,
+      executionId: replay.jobId, contentSignature: envelope.contentSignature,
+    })).toEqual(received);
+    expect(await db.execute(sql`SELECT sim_job_id FROM progressive_cfd_attempts WHERE token=${fixture.leases[0].token}::uuid`))
+      .toEqual([{ sim_job_id: replay.jobId }]);
+  }, 120_000);
+
+  it.each([[32.319, 0.8, "pimpleFoam"], [166.319, undefined, "rhoPimpleFoam"]] as const)(
+    "uses full transient recovery only after exact diagnosed RANS evidence at %s", async (speed, minimumCriticalMach, family) => {
+      const fixture = await cfdEvidenceFixture(speed, 3, [], [0], false,
+        undefined, { chordM: 0.763197 }, undefined, false, false, 1, { minimumCriticalMach });
+      expect(fixture.composed.request.solver?.force_transient).toBe(false);
+      const resultAttemptId = await fixture.save(20, "rans", 0);
+      await fixture.record([resultAttemptId]);
+      await db.execute(sql`INSERT INTO result_classifications(result_attempt_id,airfoil_id,simulation_preset_revision_id,
+        aoa_deg,classifier_version,state,reasons) SELECT id,airfoil_id,simulation_preset_revision_id,aoa_deg,
+        'isolated-sealed-dispatch','needs_urans','{}' FROM result_attempts WHERE id=${resultAttemptId}::uuid`);
+      await acknowledgeProgressiveCfdExecutionStop(db, { simJobId: fixture.composed.jobId, proof: executionStopProof(fixture.engineJobId) });
+      await db.update(simJobs).set({ status: "failed", ingestedAt: new Date() }).where(eq(simJobs.id, fixture.composed.jobId));
+      expect(await recordProgressiveCfdRecoveryPlans(db, fixture.composed.jobId)).toBe(1);
+      expect(await settleProgressiveCfdExecution(db, fixture.composed.jobId)).toMatchObject({ retry: 1, complete: 0 });
+      const replacement = await claimProgressiveCfdBatch(db, { owner: "sealed-dispatch-recovery", leaseSeconds: 120,
+        solverBudgetVersion: 2, localTimeStepVersion: 1, preferredWorkId: fixture.leases[0].workId });
+      expect(replacement).toHaveLength(1);
+      expect(replacement[0]).toMatchObject({ recoveryParentJobId: fixture.composed.jobId,
+        recipe: { selection: { solver: family } } });
+      const recovery = await cfdEvidenceFixture(speed, 3, [], [0], false,
+        { campaignId: fixture.campaignId, leases: replacement });
+      expect(recovery.composed.request.solver).toMatchObject({ flow_solver_family: family,
+        force_transient: true, transient_fallback: true, urans_fidelity: "full" });
+      for (const key of ["nIterations", "convergenceTolerance", "momentumScheme", "transientCycles", "transientDiscardFraction", "transientMaxCourant"] as const)
+        expect(recovery.execution.snapshot.solver[key]).toEqual(fixture.execution.snapshot.solver[key]);
+      expect(recovery.execution.snapshot.mesh).toMatchObject(fixture.leases[0].recipe.mesh as Record<string, unknown>);
+      expect(recovery.execution.revision.id).not.toBe(fixture.execution.revision.id);
+      expect(await db.execute(sql`SELECT regime,valid_for_polar FROM result_attempts WHERE id=${resultAttemptId}::uuid`))
+        .toEqual([{ regime: "rans", valid_for_polar: false }]);
+      expect(await admission(() => composeProgressiveCfdJob(db, replacement, options)))
+        .toEqual({ ...recovery.composed, replayed: true });
+    }, 120_000);
+});
+
+describe("sealed dispatch cutover compatibility", () => {
+  it("replays historical mirrors, fences expired unmirrored identities without starting, and retains accepted URANS by stable id", async () => {
+    const fixture = await cfdEvidenceFixture(166.327, 3, [], [0, 2], false,
+      undefined, { chordM: 0.763199 }, 1, true, false, 1, { historicalTransient: true });
+    const lease = fixture.leases[0];
+    const [pool] = await db.select().from(solverExecutionPools)
+      .where(eq(solverExecutionPools.solverImplementationId, fixture.execution.revision.solverImplementationId!)).limit(1);
+    const [state] = await db.execute(sql`SELECT enabled FROM sweeper_state WHERE id=1`);
+    try {
+      await db.update(solverExecutionPools).set({ enabled: true }).where(eq(solverExecutionPools.id, pool.id));
+      await db.execute(sql`UPDATE sweeper_state SET enabled=true WHERE id=1`);
+      const replay = await composeProgressiveCfdJob(db, fixture.leases, { cpuSlots: 1, meshRecoveryVersion: 1,
+        solverBudgetVersion: 2, localTimeStepVersion: 1 });
+      expect(replay).toEqual({ ...fixture.composed, replayed: true });
+      await verifyHistoricalWorkerCutover(db, fixture.composed.jobId, replay.request, executionStopProof);
+      await db.update(simJobs).set({ engineJobId: fixture.engineJobId, status: "running" })
+        .where(eq(simJobs.id, fixture.composed.jobId));
+      const point = { ...periodicPoint(lease.alpha, 20, true), fidelity: "urans_full",
+        solver_active_seconds: 20, error: null, stalled: false,
+        engine: { ...fixture.composed.request.expected_engine!, build_id: "historical-cutover-fixture",
+          application_source_sha256: analysisContentHash({ fixture: fixture.composed.jobId }) } };
+      const id = await fixture.save(20, "urans", lease.alpha);
+      await db.update(resultAttempts).set({ cl: point.cl!, cd: point.cd!, cm: point.cm!, clCd: point.cl! / point.cd!,
+        status: "done", source: "solved", regime: "urans", methodKey: "openfoam.urans", validForPolar: true,
+        converged: true, unsteady: true, stalled: false, firstOrderFallback: false, error: null,
+        engineCaseSlug: point.case_slug, solverImplementationId: fixture.execution.revision.solverImplementationId,
+        evidencePayload: { ...point, fixture: "isolated pre-cutover accepted URANS" } }).where(eq(resultAttempts.id, id));
+      await db.execute(sql`INSERT INTO result_classifications(result_attempt_id,airfoil_id,simulation_preset_revision_id,
+        aoa_deg,classifier_version,state,reasons) SELECT id,airfoil_id,simulation_preset_revision_id,aoa_deg,
+        'isolated-pre-cutover-accepted','accepted','{}' FROM result_attempts WHERE id=${id}::uuid`);
+      await fixture.record([id]);
+      const [accepted] = await db.select().from(resultAttempts).where(eq(resultAttempts.id, id));
+      await db.update(results).set({ currentResultAttemptId: id, status: "done", source: "solved",
+        cl: point.cl!, cd: point.cd!, cm: point.cm!, clCd: point.cl! / point.cd! })
+        .where(eq(results.id, accepted.resultId));
+      const retained = async () => (await db.execute(sql`SELECT to_jsonb(raw) AS raw,to_jsonb(classification) AS classification,
+        to_jsonb(receipt) AS receipt,to_jsonb(result) AS result FROM result_attempts raw
+        JOIN result_classifications classification ON classification.result_attempt_id=raw.id
+        JOIN progressive_cfd_evidence receipt ON receipt.result_attempt_id=raw.id
+        JOIN results result ON result.id=raw.result_id WHERE raw.id=${id}::uuid`))[0];
+      const before = await retained();
+      const [airfoil] = await db.select().from(airfoils).where(eq(airfoils.id, lease.physical.airfoilId));
+      const readPublic = () => JSON.parse(execFileSync(process.execPath,
+        ["--import", "tsx", "test-support/historical-cutover-public.mjs", airfoil.slug, accepted.resultId, id],
+        { cwd: resolve(ROOT, "packages/db"), env: { ...process.env, DATABASE_URL: targetUrl.toString(),
+          NODE_ENV: "test", LOG_LEVEL: "silent" }, timeout: 30_000, encoding: "utf8" }));
+      expect(readPublic()).toMatchObject({ status: 200, cl: point.cl, cd: point.cd });
+      await acknowledgeProgressiveCfdExecutionStop(db, { simJobId: fixture.composed.jobId, proof: executionStopProof(fixture.engineJobId) });
+      await db.update(simJobs).set({ status: "done", ingestedAt: new Date() }).where(eq(simJobs.id, fixture.composed.jobId));
+      expect(await settleProgressiveCfdExecution(db, fixture.composed.jobId)).toMatchObject({ complete: 1, gaps: 0 });
+      const next = await claimProgressiveCfdBatch(db, { owner: "cutover-future-steady", leaseSeconds: 120,
+        maximumUnits: 1, preferredWorkId: lease.workId, solverBudgetVersion: 2, localTimeStepVersion: 1 });
+      expect(next).toHaveLength(1);
+      expect(next[0].alpha).toBe(2);
+      const future = await composeProgressiveCfdJob(db, next, { cpuSlots: 1, meshRecoveryVersion: 1,
+        solverBudgetVersion: 2, localTimeStepVersion: 1 });
+      expect(future.request.solver).toMatchObject({ flow_solver_family: "rhoSimpleFoam", force_transient: false });
+      expect(await retained()).toEqual(before);
+      expect(readPublic()).toMatchObject({ status: 200, cl: point.cl, cd: point.cd });
+    } finally {
+      await db.update(solverExecutionPools).set({ enabled: pool.enabled }).where(eq(solverExecutionPools.id, pool.id));
+      await db.execute(sql`UPDATE sweeper_state SET enabled=${state.enabled} WHERE id=1`);
+    }
+  }, 120_000);
 });

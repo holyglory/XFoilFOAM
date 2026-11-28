@@ -212,25 +212,9 @@ export async function composeProgressiveCfdJob(
       .limit(1);
     if (!airfoil || airfoil.archivedAt || airfoil.deletedAt)
       throw new Error("CFD profile is missing or inactive");
-    const recipeSelection = first.recipe.selection as
-      | Record<string, unknown>
-      | undefined;
-    const configuredRecipeSolver = recipeSelection?.solver as
-      | "simpleFoam"
-      | "pimpleFoam"
-      | "rhoSimpleFoam"
-      | "rhoPimpleFoam"
-      | "rhoCentralFoam"
-      | undefined;
-    const recipeSolver =
-      first.stage === 3 && configuredRecipeSolver === "simpleFoam"
-        ? "pimpleFoam"
-        : first.stage === 3 && configuredRecipeSolver === "rhoSimpleFoam"
-          ? "rhoPimpleFoam"
-          : configuredRecipeSolver;
     const transient = progressiveSolverIsTransient(
-      recipeSolver ?? execution.snapshot.solver.flowSolverFamily!,
-      recipeSolver ? undefined : execution.snapshot.solver.timeCoordinate,
+      execution.snapshot.solver.flowSolverFamily!,
+      execution.snapshot.solver.timeCoordinate,
     );
     const angles = leases
       .map((lease) => lease.alpha)
@@ -254,11 +238,22 @@ export async function composeProgressiveCfdJob(
       ransFailurePolicy:
         !transient && angles.length > 1 ? "abort_for_precalc" : "continue",
       cpuSlots: input.cpuSlots,
-      solverFamilyOverride: recipeSolver,
     });
     request.expected_execution_pool = pool.routingKey;
     request.expected_mesh_recovery_version = input.meshRecoveryVersion;
     request.solver = { ...request.solver, warm_start: true };
+    if (execution.continuationRequest) {
+      // A checkpoint resumes the original numerical request. A matching solver
+      // name alone cannot authorize different material, mesh or time controls.
+      for (const key of [
+        "expected_engine", "airfoil", "fluid", "flow_state", "roughness",
+        "mesh", "urans_mesh", "urans_precalc_mesh", "solver", "speeds",
+        "chord_lengths",
+      ] as const)
+        if (canonicalAnalysisJson(request[key] ?? null) !==
+            canonicalAnalysisJson(execution.continuationRequest[key] ?? null))
+          throw new Error("Progressive continuation differs from its source request");
+    }
     const configuredSolverProcesses =
       execution.snapshot.scheduling.solverProcesses;
     const solverProcesses = progressiveSolverProcessesForStage(

@@ -1,5 +1,4 @@
 import { progressiveSolverIsTransient } from "@aerodb/core";
-import { progressiveRemoteExecutionSolverFamily } from "./progressive-remote-jobs";
 import {
   progressiveSolverProcessesForStage,
 } from "./progressive-cfd-jobs";
@@ -174,10 +173,9 @@ export async function previewShortWork(
   const family = setup.solver.flowSolverFamily;
   const capacity = Number(bound.capacity);
   if (!family || !Number.isSafeInteger(capacity) || capacity < 1) return null;
-  const executionFamily = progressiveRemoteExecutionSolverFamily(stage, family);
   const transient = progressiveSolverIsTransient(
-    executionFamily,
-    executionFamily === family ? setup.solver.timeCoordinate : undefined,
+    family,
+    setup.solver.timeCoordinate,
   );
   const ranks = progressiveSolverProcessesForStage(
     stage,

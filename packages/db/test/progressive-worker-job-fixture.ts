@@ -73,6 +73,21 @@ export async function verifyProgressiveWorkerJobMirror(
     await db.execute(
       sql`UPDATE sync_sweep_promise_points SET aoa_deg = aoa_deg - 0.125 WHERE promise_id = ${promiseId}::uuid`,
     );
+    for (const solver of [
+      { ...envelope.request.solver,
+        flow_solver_family: envelope.request.solver?.flow_solver_family === "simpleFoam" ? "pimpleFoam" : "simpleFoam" },
+      { ...envelope.request.solver,
+        force_transient: !envelope.request.solver?.force_transient },
+    ] as const) {
+      const incompatible = sealProgressiveRemoteExecution({
+        solverId: envelope.solverId, promiseId, scope: envelope.scope,
+        request: { ...envelope.request, solver },
+      });
+      await expect(mirrorProgressiveRemoteJob(db, {
+        envelope: incompatible,
+        assignment: { ...assignment, contentSignature: incompatible.contentSignature },
+      })).rejects.toThrow(/exact assigned request|immutable numerical time coordinate/);
+    }
     await expect(
       mirrorProgressiveRemoteJob(db, {
         envelope,

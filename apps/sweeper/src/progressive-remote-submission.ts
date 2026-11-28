@@ -95,6 +95,11 @@ export async function submitProgressiveRemoteJob(
     throw new Error(
       "The progressive execution has no matching authenticated upstream",
     );
+  if (payload.progressiveStopOnly != null)
+    return {
+      kind: "stop_required",
+      reason: "The expired historical identity permits only a native cancellation fence",
+    };
   if (owned.intended)
     return {
       kind: "observe",
