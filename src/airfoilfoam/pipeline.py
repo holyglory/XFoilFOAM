@@ -19,6 +19,7 @@ import shutil
 import time
 import uuid
 from dataclasses import dataclass, field
+from functools import partial
 import math
 from pathlib import Path, PurePosixPath
 from typing import Callable, Optional
@@ -91,6 +92,7 @@ from .models import (
 from .openfoam.budget import (
     begin_case_budget,
     case_solver_seconds,
+    case_solver_active_seconds,
     case_solver_budget,
     case_solver_remaining_seconds,
 )
@@ -1360,6 +1362,8 @@ URANS_STABLE_RETAINED_CYCLES = 5.0
 #: tail) can never floor the whole-period count below the retention target.
 URANS_STABLE_STOP_MARGIN_CYCLES = 0.5
 URANS_MIN_FRAMES_PER_CYCLE = 20.0
+# Execution-only optimization: do not charge quick cases for a cold prefix parse.
+URANS_FORCE_HISTORY_REUSE_MIN_ACTIVE_SECONDS = 3600.0
 
 
 def _canonical_json_digest(payload: object) -> str:
@@ -3650,6 +3654,7 @@ def _make_urans_monitor(
     settled_max_courant: Optional[float] = None,
     startup_max_delta_t: Optional[float] = None,
     allow_quiet_startup_release: bool = False,
+    solver_active_seconds: Callable[[], float | None] | None = None,
 ) -> Callable[[], None]:
     configured_max_courant = (
         solver_params.transient_max_courant
@@ -3672,11 +3677,31 @@ def _make_urans_monitor(
         "impulse_recovery_armed": impulse_recovery_armed,
     }
 
+    live_reader = None
+
     def monitor() -> None:
+        nonlocal live_reader
         coeff_files = _transient_coeff_selection(tcase, coeff_start_time)
         if not coeff_files:
             return
-        result = stable_two_period_window(
+        if live_reader is None and solver_active_seconds is not None:
+            try:
+                active = solver_active_seconds()
+                eligible = (
+                    active is not None
+                    and math.isfinite(active)
+                    and active >= URANS_FORCE_HISTORY_REUSE_MIN_ACTIVE_SECONDS
+                )
+            except Exception:  # Timing must never disable the ordinary monitor.
+                eligible = False
+            if eligible:
+                from .postprocess.live_coefficients import LiveCoefficientReader
+
+                live_reader = LiveCoefficientReader()
+        window = stable_two_period_window
+        if live_reader is not None:
+            window = partial(window, live_reader=live_reader)
+        result = window(
             coeff_files,
             speed=spec.speed,
             chord=spec.chord,
@@ -5646,6 +5671,7 @@ def _run_transient_attempt(
                 solver_params=pass_params,
                 settled_max_courant=settled_max_courant,
                 startup_max_delta_t=pass_max_delta_t,
+                solver_active_seconds=lambda: case_solver_active_seconds(runner, spec),
             ),
         )
         wall_seconds += max(0.0, time.monotonic() - solve_started)

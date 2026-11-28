@@ -80,6 +80,19 @@ class BudgetedRunner(Runner):
         with budget.lock:
             return budget.consumed
 
+    def active_seconds(self, spec) -> float | None:
+        """The same live solver-only duration published by ``snapshot``, for one case."""
+        key = (float(spec.chord), float(spec.speed), float(spec.aoa_deg))
+        with self._cases_lock:
+            budget = self._cases.get(key)
+        if budget is None:
+            return None
+        with budget.lock:
+            started = budget.started_at
+            return budget.consumed + (
+                max(0.0, time.monotonic() - started) if started is not None else 0.0
+            )
+
     def snapshot(self) -> list[dict[str, float | bool]]:
         with self._cases_lock:
             cases = sorted(self._cases.items())
@@ -157,6 +170,11 @@ def register_case_budget(runner, spec) -> None:
 
 def case_solver_seconds(runner, spec) -> float | None:
     return runner.consumed(spec) if isinstance(runner, BudgetedRunner) else None
+
+
+def case_solver_active_seconds(runner, spec) -> float | None:
+    """Measured case execution, including a live solve; unknown runners stay unknown."""
+    return runner.active_seconds(spec) if isinstance(runner, BudgetedRunner) else None
 
 
 def case_solver_remaining_seconds(runner, spec) -> float | None:

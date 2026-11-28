@@ -2059,6 +2059,43 @@ def test_live_monitor_releases_startup_courant_only_after_repeatable_periods(
     assert "maxCo 4;" in (tcase / "system" / "controlDict").read_text()
 
 
+@pytest.mark.parametrize("active", [None, -1.0, 17.0, 3599.999, float("nan"), float("inf"), "unavailable", "absent"])
+def test_short_or_unproven_monitor_keeps_original_reader(tmp_path, monkeypatch, active):
+    from airfoilfoam.postprocess import live_coefficients
+
+    tcase = tmp_path / "transient"
+    (tcase / "system").mkdir(parents=True)
+    control = tcase / "system/controlDict"
+    control.write_text("maxCo 0.5;\nmaxDeltaT 0.00001;\nwriteInterval 0.1;\n")
+    original = control.read_bytes()
+    (tcase / "march_budget.json").write_text(json.dumps({"wall_start": 1, "budget_s": 43200, "end_t": 1}))
+    monkeypatch.setattr(pipeline, "_transient_coeff_selection", lambda *_a: [tcase / "coefficient.dat"])
+    calls = []
+
+    def window(*args, **kwargs):
+        assert "live_reader" not in kwargs
+        calls.append((args, kwargs))
+        return pipeline.StablePeriodResult(ok=False, reason="isolated unsettled history")
+
+    def forbidden(*_a, **_k):
+        pytest.fail("short or unknown-duration monitoring must not construct/read a prefix cache")
+
+    def elapsed():
+        if active == "unavailable":
+            raise RuntimeError("isolated unavailable timer")
+        return active
+
+    monkeypatch.setattr(pipeline, "stable_two_period_window", window)
+    monkeypatch.setattr(live_coefficients.LiveCoefficientReader, "__init__", forbidden)
+    monkeypatch.setattr(live_coefficients.LiveCoefficientReader, "read", forbidden)
+    kwargs = {} if active == "absent" else {"solver_active_seconds": elapsed}
+    monitor = pipeline._make_urans_monitor(tcase, CaseSpec(chord=1, speed=10, aoa_deg=8), **kwargs)
+    for _ in range(3):
+        monitor()
+    assert len(calls) == 3
+    assert control.read_bytes() == original
+
+
 @pytest.mark.parametrize(
     "trigger_reason",
     [

@@ -814,6 +814,153 @@ def test_stable_two_period_window_accepts_two_matching_periods_with_frames(tmp_p
     assert result.frames_per_cycle >= 20
 
 
+def test_live_monitor_reuses_only_exact_source_bytes(tmp_path: Path, monkeypatch):
+    from airfoilfoam.postprocess import live_coefficients
+    from airfoilfoam.postprocess.unsteady import coefficient_series
+
+    coeff = tmp_path / "0" / "coefficient.dat"
+    coeff.parent.mkdir()
+    _write_coeff(coeff, f=5, n=500, dt=0.002)
+    lines = coeff.read_bytes().splitlines(keepends=True)
+    original = b"".join(lines)
+    reader = live_coefficients.LiveCoefficientReader()
+    parsed = []
+    parse = live_coefficients._data_lines
+
+    def observe(source):
+        parsed.append(len(source))
+        return parse(source)
+
+    monkeypatch.setattr(live_coefficients, "_data_lines", observe)
+    frames = [i * 0.005 for i in range(200)]
+
+    def compare(paths):
+        kwargs = dict(speed=25, chord=1, frame_times=frames)
+        assert stable_two_period_window(paths, **kwargs, live_reader=reader) == stable_two_period_window(paths, **kwargs)
+        cached = reader.read(paths)
+        if cached is not None:
+            for observed, expected in zip(cached, coefficient_series(paths), strict=True):
+                assert observed.tobytes() == expected.tobytes()
+
+    coeff.write_bytes(b"".join(lines[:-8]))
+    compare([coeff])
+    coeff.write_bytes(original)
+    compare([coeff])
+    assert parsed == [len(lines) - 8, 8]
+    assert stable_two_period_window([coeff], speed=25, chord=1, frame_times=frames, live_reader=reader).ok
+
+    # Reuse an inode and size while changing one older value.
+    changed = original.replace(b"0.75", b"0.95", 1)
+    assert changed != original and len(changed) == len(original)
+    coeff.write_bytes(changed)
+    compare([coeff])
+    assert parsed[-1] == len(lines)
+    coeff.write_bytes(changed[:-10])
+    compare([coeff])
+    coeff.write_bytes(original + b"1.002 2 3 4 nan 6 7 8\n")
+    compare([coeff])
+    coeff.write_bytes(original + lines[-1])  # Duplicate timestamp.
+    compare([coeff])
+    coeff.write_bytes(original + b"# Time Cl Cd Cm\n1.002 0.7 0.3 -0.1\n")
+    compare([coeff])
+    restart = tmp_path / "0.5" / "coefficient.dat"
+    restart.parent.mkdir()
+    restart.write_bytes(lines[0])
+    compare([coeff, restart])  # A header-only successor still owns the old segment's seam.
+
+    # An atomic rotation must invalidate even an otherwise identical prefix.
+    coeff.write_bytes(original)
+    compare([coeff])
+    rotated = coeff.with_suffix(".new")
+    rotated.write_bytes(changed)
+    rotated.replace(coeff)
+    before = len(parsed)
+    compare([coeff])
+    assert parsed[before:] == [len(lines)]
+
+    # Complete truncation, then regrowth, must never retain the removed rows.
+    coeff.write_bytes(b"".join(lines[:100]))
+    compare([coeff])
+    coeff.write_bytes(original)
+    compare([coeff])
+    coeff.unlink()
+    kwargs = dict(speed=25, chord=1, frame_times=frames)
+    assert stable_two_period_window([coeff], **kwargs, live_reader=reader) == stable_two_period_window([coeff], **kwargs)
+    coeff.write_bytes(original)
+    compare([coeff])
+
+    # Both labelled layouts, headerless legacy rows, missing moments, and
+    # newline conventions retain the general reader's exact interpretation.
+    layouts = [
+        b"# Time Cd Cl CmPitch\n0 0.3 0.7 -0.1\n0.1 0.4 0.8 -0.2\n",
+        b"# Time Cm Cd Cl\n0 -0.1 0.3 0.7\n0.1 -0.2 0.4 0.8\n",
+        b"0 0.3 0 0 0.7 0 0 -0.1 0 0 0 0 0\n0.1 0.4 0 0 0.8 0 0 -0.2 0 0 0 0 0\n",
+        b"# Time Cd Cl\n0 0.3 0.7\n0.1 0.4 0.8\n",
+    ]
+    for raw in layouts:
+        coeff.write_bytes(raw)
+        compare([coeff])
+        coeff.write_bytes(raw.replace(b"\n", b"\r\n"))
+        compare([coeff])
+    for suffix in (
+        b"1.002 2 3\n",  # Ragged numeric row.
+        b"1.002 2 3 4 inf 6 7 8\n",
+        b"0.0000000000001 2 3 4 5 6 7 8\n",  # Older/near-duplicate time.
+        b"# ordinary appended comment\n",
+        b"unfinished row",  # The last write has not reached a newline.
+    ):
+        coeff.write_bytes(original)
+        compare([coeff])
+        with coeff.open("ab") as stream:
+            stream.write(suffix)
+        compare([coeff])
+    coeff.write_bytes(lines[0])
+    compare([coeff])
+    coeff.write_bytes(original)
+    compare([coeff])
+    compare((coeff,))
+    compare(coeff)  # Direct Path inputs deliberately keep the general reader.
+
+    # Oversized histories must decline the cache before reading or allocating
+    # their bytes. The production fallback, rather than a sampled history, owns them.
+    with coeff.open("ab") as stream:
+        stream.truncate(128 * 1024**2 + 1)
+    assert reader.read([coeff]) is None
+
+
+@pytest.mark.skipif(
+    not Path(".codex-artifacts/force-history-corpus").is_dir(),
+    reason="requires the private authenticated Nov 25 force-history capture",
+)
+def test_live_monitor_replays_authenticated_long_job_history():
+    """Exercise the actual closure on real output in the existing Python graph.
+
+    The caller stages a read-only corpus link and a 7756769e src snapshot.
+    Every channel byte, decision and dictionary effect must match the baseline.
+    The private inputs and measured artifacts never enter version control.
+    """
+    import subprocess
+    import sys
+    import os
+    import tempfile
+
+    output_root = Path(".codex-artifacts/force-history-gated-replay")
+    output_root.mkdir(exist_ok=True)
+    output = Path(tempfile.mkdtemp(prefix="replay-", dir=output_root)) / "summary.json"
+
+    subprocess.run(
+        [
+            sys.executable, "-B", "scripts/materials/compare_live_force_monitor.py",
+            "--corpus", ".codex-artifacts/force-history-corpus",
+            "--baseline", ".codex-artifacts/force-history-baseline",
+            "--candidate", ".",
+            "--output", str(output),
+        ],
+        check=True,
+        env={**os.environ, "OPENBLAS_NUM_THREADS": "1", "PYTHONDONTWRITEBYTECODE": "1"},
+    )
+
+
 def test_stable_two_period_window_requires_animation_frames(tmp_path: Path):
     coeff = tmp_path / "coefficient.dat"
     _write_coeff(coeff, f=5.0, n=500, dt=0.002)
